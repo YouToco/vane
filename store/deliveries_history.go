@@ -18,11 +18,6 @@ import (
 type DeliveryHistoryQuery struct {
 	PageSize  int    // <=0 → 20；钳上限 100
 	PageToken string // (created_at,id) 键集游标，本包编解码，调用方视为不透明串
-	// ScheduleID 非空时只看该任务的投递（6.6 任务详情页）：经 batch_id →
-	// push_batches.schedule_id 过滤。020 之前的历史批次 schedule_id 为 NULL、
-	// 历史账户级批次亦然，均不属于任何任务——过滤是诚实的“该任务推了什么”，
-	// 不是全账号历史的近似。空串 = 不过滤，行为与加列前逐字节一致。
-	ScheduleID string
 }
 
 // DeliveryHistoryItem 是推送历史一行：投递本体 + 内容摘要 + 该投递的全部反馈。
@@ -60,27 +55,13 @@ type DeliveryFeedback struct {
 func (s *Store) ListDeliveryHistory(ctx context.Context, userID int64, q DeliveryHistoryQuery) (items []DeliveryHistoryItem, total int64, next string, err error) {
 	pageSize := clampHistoryPageSize(q.PageSize)
 
-	// 任务过滤（6.6）：total 与页查询必须同谓词，否则前端进度条会撒谎。
-	scheduleJoin, scheduleCond := "", ""
-	if q.ScheduleID != "" {
-		scheduleJoin = ` JOIN push_batches pb ON pb.id = d.batch_id`
-		scheduleCond = ` AND pb.schedule_id = $2`
-	}
-
-	countArgs := []any{userID}
-	if q.ScheduleID != "" {
-		countArgs = append(countArgs, q.ScheduleID)
-	}
 	if err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM deliveries d`+scheduleJoin+` WHERE d.user_id = $1`+scheduleCond,
-		countArgs...).Scan(&total); err != nil {
+		`SELECT count(*) FROM deliveries d WHERE d.user_id = $1`,
+		userID).Scan(&total); err != nil {
 		return nil, 0, "", types.NewAppError(types.CodeDatabase, "统计推送历史总数", err)
 	}
 
 	args := []any{userID}
-	if q.ScheduleID != "" {
-		args = append(args, q.ScheduleID)
-	}
 	cursorCond := ""
 	if q.PageToken != "" {
 		cursorAt, cursorID, derr := decodeHistoryCursor(q.PageToken)
@@ -100,8 +81,8 @@ func (s *Store) ListDeliveryHistory(ctx context.Context, userID int64, q Deliver
 		        COALESCE(NULLIF(ci.title, ''), left(ci.content, 200), ''),
 		        COALESCE(ci.url, '')
 		 FROM deliveries d
-		 LEFT JOIN content_items ci ON ci.id = d.content_item_id`+scheduleJoin+`
-		 WHERE d.user_id = $1`+scheduleCond+cursorCond+
+		 LEFT JOIN content_items ci ON ci.id = d.content_item_id
+		 WHERE d.user_id = $1`+cursorCond+
 			fmt.Sprintf(` ORDER BY d.created_at DESC, d.id DESC LIMIT $%d`, len(args)),
 		args...)
 	if err != nil {

@@ -417,6 +417,28 @@ func TestSec_ProtectedEndpointsRequireSession(t *testing.T) {
 	}
 }
 
+// TestSec_RetiredScheduleDeliveryEndpointIsNotMounted locks the professional
+// task surface to canonical runs, Briefs and reports. Item-level delivery rows
+// remain an internal delivery/audit projection and the global history endpoint,
+// but must not reappear as a second task-content API.
+func TestSec_RetiredScheduleDeliveryEndpointIsNotMounted(t *testing.T) {
+	mux, fake := newAuthTestServer(t)
+	fake.addUser(t, "retired-deliveries@example.com", "user-password-123", 1)
+	login := postJSON(t, mux, "/api/auth/login", map[string]string{
+		"email": "retired-deliveries@example.com", "password": "user-password-123",
+	}, nil)
+	cookie := sessionCookieFrom(t, login)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/schedules/task-retired/deliveries", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("retired schedule deliveries status=%d want=404", rec.Code)
+	}
+}
+
 // TestSec_ExpiredSessionRejected：过期会话不得放行。
 func TestSec_ExpiredSessionRejected(t *testing.T) {
 	mux, fake := newAuthTestServer(t)
