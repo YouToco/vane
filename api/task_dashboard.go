@@ -199,42 +199,6 @@ func (s *server) handleListScheduleBatches(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, scheduleBatchesResp{Items: items, Total: total, NextPageToken: next})
 }
 
-// handleListScheduleDeliveries 返回单任务的推送记录：复用推送历史查询与 DTO
-// （deliveriesResp），只多一个任务过滤——前端两处消费同一形状。
-// GET /api/schedules/{id}/deliveries?page_size=20&page_token=... → 200 deliveriesResp
-func (s *server) handleListScheduleDeliveries(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		writeError(w, http.StatusBadRequest, "缺少 schedule id")
-		return
-	}
-	q, errMsg := parseHistoryQuery(r.URL.Query())
-	if errMsg != "" {
-		writeError(w, http.StatusBadRequest, errMsg)
-		return
-	}
-	userID, err := s.ownerUserID(r.Context())
-	if err != nil {
-		writeAppError(w, err)
-		return
-	}
-	if _, err := s.deps.Store.GetSchedule(r.Context(), id, userID); err != nil {
-		writeAppError(w, err)
-		return
-	}
-
-	q.ScheduleID = id
-	items, total, next, err := s.deps.Store.ListDeliveryHistory(r.Context(), userID, q)
-	if err != nil {
-		writeAppError(w, err)
-		return
-	}
-	if items == nil {
-		items = []store.DeliveryHistoryItem{}
-	}
-	writeJSON(w, http.StatusOK, deliveriesResp{Items: items, Total: total, NextPageToken: next})
-}
-
 // scheduleSummariesResp 是 GET /api/schedules/summary 的响应体。
 type scheduleSummariesResp struct {
 	Items []store.ScheduleRunSummary `json:"items"`

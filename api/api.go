@@ -196,7 +196,7 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)
 	inner.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
 
-	// M7 任务数据面端点（功能 6.6/6.7）：只读，任务详情/运行历史/任务推送/列表概览。
+	// M7 任务数据面端点（功能 6.6/6.7）：只读，任务详情/运行历史/简报/列表概览。
 	// "summary" 是字面段，ServeMux 精确度规则保证它优先于 {id} 通配匹配。
 	inner.HandleFunc("GET /api/schedules/summary", s.handleListScheduleSummaries)
 	inner.HandleFunc("GET /api/schedules/{id}", s.handleGetScheduleDetail)
@@ -211,7 +211,6 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/schedules/{id}/reports/{target_id}/deep-dive", s.handlePeriodicBriefDeepDive)
 	inner.HandleFunc("GET /api/schedules/{id}/report-settings", s.handleGetBriefReportSettings)
 	inner.HandleFunc("PATCH /api/schedules/{id}/report-settings", s.handlePatchBriefReportSettings)
-	inner.HandleFunc("GET /api/schedules/{id}/deliveries", s.handleListScheduleDeliveries)
 	inner.HandleFunc("POST /api/schedules/{id}/run", s.handleRunScheduleNow)
 	inner.HandleFunc("POST /api/schedules/{id}/pause", s.handlePauseSchedule)
 	inner.HandleFunc("POST /api/schedules/{id}/resume", s.handleResumeSchedule)

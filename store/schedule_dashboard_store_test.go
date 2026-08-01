@@ -13,7 +13,7 @@ import (
 )
 
 // TestScheduleDashboardStore 是 DATABASE_URL 门控的集成测试（M7 功能 6.6/6.7）：
-// 任务级数据面的五个读查询对着真库验证——运行概览、批次分页、任务过滤的投递历史、
+// 任务级数据面的读查询对着真库验证——运行概览、批次分页、
 // trace 归集成本，以及贯穿全部查询的归属隔离（他人任务恒不可见/恒为零）。
 func TestScheduleDashboardStore(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
@@ -237,53 +237,6 @@ func TestScheduleDashboardStore(t *testing.T) {
 		}
 		if len(none) != 0 || ftotal != 0 {
 			t.Errorf("他人任务批次应为空页: len=%d total=%d（外人批次 %d 泄漏）", len(none), ftotal, fb1)
-		}
-	})
-
-	t.Run("投递历史按任务过滤", func(t *testing.T) {
-		items, total, _, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{ScheduleID: schedID})
-		if err != nil {
-			t.Fatalf("ListDeliveryHistory(任务过滤) 失败: %v", err)
-		}
-		if total != 2 || len(items) != 2 {
-			t.Fatalf("任务过滤应恰得 b1 的 2 条投递: total=%d len=%d", total, len(items))
-		}
-		for _, it := range items {
-			if it.BatchID != b1 {
-				t.Errorf("串批投递: delivery %d 挂 batch %d, 期望 %d", it.ID, it.BatchID, b1)
-			}
-		}
-		// 外人以同一 schedule id 过滤：零行（user_id 谓词兜底）。
-		_, strangerTotal, _, err := st.ListDeliveryHistory(ctx, stranger.ID, DeliveryHistoryQuery{ScheduleID: schedID})
-		if err != nil {
-			t.Fatalf("外人过滤查询失败: %v", err)
-		}
-		if strangerTotal != 0 {
-			t.Errorf("外人按 owner 任务过滤应零行, 实得 total=%d", strangerTotal)
-		}
-		// 不带过滤的既有行为不受影响：至少包含这 2 条。
-		_, allTotal, _, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{})
-		if err != nil {
-			t.Fatalf("无过滤查询失败: %v", err)
-		}
-		if allTotal < 2 {
-			t.Errorf("无过滤总数应 >= 2, 实得 %d", allTotal)
-		}
-		// 过滤 + 键集翻页组合：游标占位序号在 ScheduleID 占了 $2 之后必须顺移，
-		// 错位会把游标值当 schedule_id 比较——page_size=1 逐页走完且不重不漏。
-		p1, _, tok, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{ScheduleID: schedID, PageSize: 1})
-		if err != nil {
-			t.Fatalf("过滤翻页第一页失败: %v", err)
-		}
-		if len(p1) != 1 || tok == "" {
-			t.Fatalf("过滤翻页第一页形状不符: len=%d tok=%q", len(p1), tok)
-		}
-		p2, _, _, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{ScheduleID: schedID, PageSize: 1, PageToken: tok})
-		if err != nil {
-			t.Fatalf("过滤翻页第二页失败: %v", err)
-		}
-		if len(p2) != 1 || p2[0].ID == p1[0].ID || p2[0].BatchID != b1 {
-			t.Fatalf("过滤翻页第二页应为另一条 b1 投递: p1=%+v p2=%+v", p1, p2)
 		}
 	})
 
