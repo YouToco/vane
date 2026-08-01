@@ -105,7 +105,8 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		TenantID: tenantID, UserID: userID, TaskID: taskID,
 	}
 	snapshotRef, err := st.CreateOrGetResearchRunSnapshotV3(
-		ctx, identity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t))
+		ctx, identity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
+		testResearchModelPolicyStoreV3(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +134,8 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.CreateOrGetResearchRunSnapshotV3(
-		ctx, mismatchIdentity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t)); err == nil {
+		ctx, mismatchIdentity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
+		testResearchModelPolicyStoreV3(t)); err == nil {
 		t.Fatal("definition schedule drift created a V3 snapshot")
 	}
 	if _, err := st.pool.Exec(ctx, `UPDATE schedules SET spec_json=$2 WHERE id=$1`,
@@ -143,13 +145,17 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	// Response-loss recovery reads the committed snapshot before consulting a
 	// changed/invalid worker policy.
 	replayedSnapshot, err := st.CreateOrGetResearchRunSnapshotV3(
-		ctx, identity, runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{})
+		ctx, identity, runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
+		runtimepolicy.ResearchModelPolicyV3{})
 	if err != nil || replayedSnapshot != snapshotRef {
 		t.Fatalf("snapshot first-writer replay=%+v err=%v", replayedSnapshot, err)
 	}
 	snapshotID := snapshotRef.SnapshotID
 	plan := researchRunPlanFixtureV3(t, digestA,
 		snapshotRef.CapabilityCatalogDigest, snapshotRef.ToolPolicyDigest, "Kimi pricing")
+	if recovered, found, err := st.LoadResearchRunPlanRefV3(ctx, identity, snapshotRef); err != nil || found || recovered != (types.ResearchRunPlanRefV3{}) {
+		t.Fatalf("empty plan recovery=%+v found=%v err=%v", recovered, found, err)
+	}
 	// Store and trigger both reject a plan bound to a non-V3 snapshot schema.
 	if _, err := st.pool.Exec(ctx,
 		`UPDATE task_run_snapshots SET reference_schema_version='vane.run-snapshot-ref/v2'
@@ -166,11 +172,32 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		snapshotID, types.ResearchRunSnapshotRefSchemaV3); err != nil {
 		t.Fatal(err)
 	}
+	driftedPlan := plan
+	driftedPlan.ToolPolicyDigest = strings.Repeat("c", 64)
+	driftedPayload, err := runcontext.EncodeResearchExecutionPlanV3(driftedPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO research_run_plans (
+		     tenant_id,user_id,task_id,run_snapshot_id,temporal_workflow_id,
+		     temporal_run_id,definition_digest,capability_catalog_digest,
+		     plan_digest,plan_payload,schema_version
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		tenantID, userID, taskID, snapshotID, workflowID, runID,
+		digestA, snapshotRef.CapabilityCatalogDigest,
+		researchRunSHA256(driftedPayload), driftedPayload, researchRunPlanSchemaV3,
+	); err == nil {
+		t.Fatal("database admitted a plan bound to a different Tool policy")
+	}
 	ref, err := st.CreateOrGetResearchRunPlanV3(ctx, CreateOrGetResearchRunPlanV3Params{
 		Identity: identity, RunSnapshotID: snapshotID, Plan: plan,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if recovered, found, err := st.LoadResearchRunPlanRefV3(ctx, identity, snapshotRef); err != nil || !found || recovered != ref {
+		t.Fatalf("sealed plan recovery=%+v found=%v err=%v", recovered, found, err)
 	}
 	if err := ref.ValidateFor(identity, snapshotID); err != nil {
 		t.Fatal(err)
@@ -474,7 +501,8 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		TenantID: tenantID, UserID: userID, TaskID: taskID,
 	}
 	manualSnapshot, err := st.CreateOrGetResearchRunSnapshotV3(
-		ctx, manualIdentity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t))
+		ctx, manualIdentity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
+		testResearchModelPolicyStoreV3(t))
 	if err != nil {
 		t.Fatalf("paused owner manual snapshot: %v", err)
 	}
@@ -567,6 +595,34 @@ func testResearchToolPolicyStoreV3(t *testing.T) runtimepolicy.ResearchToolPolic
 		})
 	}
 	policy, err := runtimepolicy.BuildResearchToolPolicyV3(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
+}
+
+func testResearchModelPolicyStoreV3(t *testing.T) runtimepolicy.ResearchModelPolicyV3 {
+	t.Helper()
+	policy, err := runtimepolicy.BuildResearchModelPolicyV3(runtimepolicy.ResearchModelPolicyV3{
+		Provider: runtimepolicy.ModelProviderDeepSeekV1,
+		Endpoint: runtimepolicy.EndpointRefV1{
+			ID: runtimepolicy.EndpointIDDeepSeekCompatiblePrimaryV1, Generation: 1,
+		},
+		CredentialRef: runtimepolicy.CredentialRefV1{
+			ID: runtimepolicy.CredentialIDLLMPrimaryV1, Generation: 1,
+		},
+		Planner: runtimepolicy.ResearchModelStageV3{
+			Stage: runtimepolicy.ResearchModelStagePlannerV3, Model: "strong-model",
+			MaxTokens: 4096, SystemPrompt: "Plan from the trusted task manual.",
+			RendererVersion: "research-planner.render/v3",
+		},
+		Synthesis: runtimepolicy.ResearchModelStageV3{
+			Stage: runtimepolicy.ResearchModelStageSynthesisV3, Model: "strong-model",
+			MaxTokens: 8192, SystemPrompt: "Synthesize without Tools.",
+			RendererVersion: "research-synthesis.render/v3",
+		},
+		QuotaBucket: "llm_tokens",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

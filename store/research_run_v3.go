@@ -39,6 +39,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 	identity types.RunIdentity,
 	policy runtimepolicy.BundleV1,
 	researchTools runtimepolicy.ResearchToolPolicyV3,
+	researchModel runtimepolicy.ResearchModelPolicyV3,
 ) (types.ResearchRunSnapshotRefV3, error) {
 	if identity.RunKind != types.RunSnapshotKindScheduled || identity.TenantID <= 0 ||
 		identity.UserID <= 0 || identity.TaskID == "" ||
@@ -92,6 +93,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		Identity: identity, DefinitionVersion: definitionVersion,
 		HistoryThroughUTC: cutoffText, Definition: definition, Policy: policy,
 		ResearchTools: researchTools,
+		ResearchModel: researchModel,
 	})
 	if err != nil || seal.DefinitionDigest != definitionDigest {
 		return types.ResearchRunSnapshotRefV3{}, researchRunIntegrityError()
@@ -108,7 +110,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		CapabilityCatalogDigest: seal.PolicyDigests.CapabilityCatalogDigest,
 		ToolPolicyDigest:        seal.ResearchToolPolicyDigest,
 		PromptPolicyDigest:      seal.PolicyDigests.PromptPolicyDigest,
-		ModelPolicyDigest:       seal.PolicyDigests.ModelPolicyDigest,
+		ModelPolicyDigest:       seal.ResearchModelPolicyDigest,
 		QuotaPolicyDigest:       seal.PolicyDigests.QuotaPolicyDigest,
 		PlannerBudget:           definition.PlannerBudget, HistoryThroughUTC: cutoffText,
 		PayloadDigest: seal.PayloadDigest,
@@ -129,7 +131,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		snapshotID, identity.TenantID, identity.UserID, identity.TaskID,
 		identity.TemporalWorkflowID, identity.TemporalRunID,
 		seal.PolicyDigests.CapabilityCatalogDigest, seal.ResearchToolPolicyDigest,
-		seal.PolicyDigests.PromptPolicyDigest, seal.PolicyDigests.ModelPolicyDigest,
+		seal.PolicyDigests.PromptPolicyDigest, seal.ResearchModelPolicyDigest,
 		seal.PolicyDigests.QuotaPolicyDigest, definitionDigest, seal.PayloadDigest,
 		ref.ReferenceDigest, types.ResearchRunSnapshotRefSchemaV3,
 		seal.CanonicalPayload, budgetJSON, cutoff,
@@ -240,7 +242,7 @@ func validateStoredResearchRunSnapshotV3(
 		seal.PolicyDigests.CapabilityCatalogDigest != snapshot.CapabilityCatalogDigest ||
 		seal.ResearchToolPolicyDigest != snapshot.ToolPolicyDigest ||
 		seal.PolicyDigests.PromptPolicyDigest != snapshot.PromptPolicyDigest ||
-		seal.PolicyDigests.ModelPolicyDigest != snapshot.ModelPolicyDigest ||
+		seal.ResearchModelPolicyDigest != snapshot.ModelPolicyDigest ||
 		seal.PolicyDigests.QuotaPolicyDigest != snapshot.QuotaPolicyDigest {
 		return types.ResearchRunSnapshotRefV3{}, researchRunIntegrityError()
 	}
@@ -457,6 +459,63 @@ func (s *Store) CreateOrGetResearchRunPlanV3(
 		return types.ResearchRunPlanRefV3{}, researchRunDatabaseError("commit research plan transaction", err)
 	}
 	return ref, nil
+}
+
+// LoadResearchRunPlanRefV3 is the recovery-first planner read. It returns only
+// the sealed Temporal-safe reference; a coordinator must call this before any
+// paid planning model so Activity retry or response loss cannot spend twice.
+func (s *Store) LoadResearchRunPlanRefV3(
+	ctx context.Context, identity types.RunIdentity,
+	snapshotRef types.ResearchRunSnapshotRefV3,
+) (types.ResearchRunPlanRefV3, bool, error) {
+	if err := snapshotRef.ValidateFor(identity); err != nil {
+		return types.ResearchRunPlanRefV3{}, false,
+			researchRunValidationError("research plan recovery snapshot is invalid")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return types.ResearchRunPlanRefV3{}, false,
+			researchRunDatabaseError("begin research plan recovery", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := setResearchRunScopeV3(ctx, tx, identity.TenantID, identity.UserID); err != nil {
+		return types.ResearchRunPlanRefV3{}, false, err
+	}
+	snapshot, found, err := loadResearchRunSnapshotRowV3(ctx, tx,
+		CreateOrGetTaskRunSnapshotParams{
+			TenantID: identity.TenantID, UserID: identity.UserID, TaskID: identity.TaskID,
+			TemporalWorkflowID: identity.TemporalWorkflowID,
+			TemporalRunID:      identity.TemporalRunID,
+		})
+	if err != nil {
+		return types.ResearchRunPlanRefV3{}, false, err
+	}
+	storedSnapshotRef, err := validateStoredResearchRunSnapshotV3(identity, snapshot)
+	if !found || err != nil || storedSnapshotRef != snapshotRef {
+		return types.ResearchRunPlanRefV3{}, false, researchRunIntegrityError()
+	}
+	row, found, err := loadResearchRunPlanV3(ctx, tx, identity, snapshotRef.SnapshotID)
+	if err != nil || !found {
+		if err != nil {
+			return types.ResearchRunPlanRefV3{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return types.ResearchRunPlanRefV3{}, false,
+				researchRunDatabaseError("commit empty research plan recovery", err)
+		}
+		return types.ResearchRunPlanRefV3{}, false, nil
+	}
+	ref, err := researchRunPlanRefV3(row)
+	if err != nil || ref.DefinitionDigest != snapshotRef.DefinitionDigest ||
+		ref.CapabilityCatalogDigest != snapshotRef.CapabilityCatalogDigest ||
+		ref.ToolPolicyDigest != snapshotRef.ToolPolicyDigest {
+		return types.ResearchRunPlanRefV3{}, false, researchRunIntegrityError()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.ResearchRunPlanRefV3{}, false,
+			researchRunDatabaseError("commit research plan recovery", err)
+	}
+	return ref, true, nil
 }
 
 func (s *Store) BeginResearchRunStepV3(

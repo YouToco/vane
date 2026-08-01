@@ -41,6 +41,7 @@ func TestResearchSnapshotV3CanonicalRoundTrip(t *testing.T) {
 		DefinitionVersion: 3, HistoryThroughUTC: "2026-08-01T12:34:56.123Z",
 		Definition: definition, Policy: testPolicyBundleV1(t),
 		ResearchTools: testResearchToolPolicyV3(t),
+		ResearchModel: testResearchModelPolicyV3(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -142,6 +143,34 @@ func testResearchToolPolicyV3(t *testing.T) runtimepolicy.ResearchToolPolicyV3 {
 		})
 	}
 	policy, err := runtimepolicy.BuildResearchToolPolicyV3(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
+}
+
+func testResearchModelPolicyV3(t *testing.T) runtimepolicy.ResearchModelPolicyV3 {
+	t.Helper()
+	policy, err := runtimepolicy.BuildResearchModelPolicyV3(runtimepolicy.ResearchModelPolicyV3{
+		Provider: runtimepolicy.ModelProviderDeepSeekV1,
+		Endpoint: runtimepolicy.EndpointRefV1{
+			ID: runtimepolicy.EndpointIDDeepSeekCompatiblePrimaryV1, Generation: 1,
+		},
+		CredentialRef: runtimepolicy.CredentialRefV1{
+			ID: runtimepolicy.CredentialIDLLMPrimaryV1, Generation: 1,
+		},
+		Planner: runtimepolicy.ResearchModelStageV3{
+			Stage: runtimepolicy.ResearchModelStagePlannerV3, Model: "strong-model",
+			MaxTokens: 4096, SystemPrompt: "Plan from the trusted task manual.",
+			RendererVersion: "research-planner.render/v3",
+		},
+		Synthesis: runtimepolicy.ResearchModelStageV3{
+			Stage: runtimepolicy.ResearchModelStageSynthesisV3, Model: "strong-model",
+			MaxTokens: 8192, SystemPrompt: "Synthesize without Tools.",
+			RendererVersion: "research-synthesis.render/v3",
+		},
+		QuotaBucket: "llm_tokens",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
