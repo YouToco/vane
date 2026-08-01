@@ -1,6 +1,6 @@
 # Agent-first 用户情报与证据契约
 
-> 状态：`vane.intelligence-catalog/v1` 数据层已落地；Agent 工具接线与 V3 运行时按发布列车继续推进。
+> 状态：`vane.intelligence-catalog/v1` 数据层与默认关闭的 Agent-first owner canary 已落地；V3 运行时按发布列车继续推进。
 
 ## 1. 产品边界
 
@@ -58,3 +58,12 @@
 4. 清理面：生产审计证明没有旧 pending/V1/V2 活跃工作流后，删除旧确认/Source/工具生产路径。
 
 整个列车不修改既有周一 9:00 正式调度。老板 Gate 只保留 V3 首个真实任务切流与全部旧运行路径删除。
+
+## 7. Agent-first owner canary
+
+- canary 同时要求本地开关与一个精确 `user_id`；进程内其他用户的新工具在声明面和执行面都不可用。
+- canary 普通聊天只暴露 `query_my_intelligence`、`manage_tasks`、`update_profile` 与已装配的公开研究工具；八个旧任务读写工具只留给明确的 Web/历史兼容通道。
+- Agent-first 不再隐式读取或注入画像；需要画像时模型显式查询 `profile`，因此画像影响会进入 exact tool evidence。
+- `manage_tasks` 在 authenticated scope 内重新解析全部目标，再调用只看本轮原话、动作、changes 和可读目标摘要的 `authorize_owner_action`。外部结果与历史不会进入裁决。
+- `run`/`delete` 强制使用每个任务的耐久幂等命令。批量部分失败仍继续处理其他目标，并把 completed/failed 写入动作回执；用户只看到可读名称。
+- 开启 exact evidence 后，任何 provider call identity、scope 或 session 不变量不匹配都会中止回复，不能回退到 legacy preview。presentation guard 和内部引用脱敏都发生在最终 turn 提交之前。

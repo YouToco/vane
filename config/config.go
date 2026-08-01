@@ -195,6 +195,13 @@ type PipelineConfig struct {
 // AgentConfig 是 agent loop 运行约束配置。
 type AgentConfig struct {
 	MaxTurns int `mapstructure:"max_turns"`
+	// AgentFirstOwnerCanary replaces the production owner chat surface with the
+	// small orthogonal query/manage/profile/research toolset. Dedicated Web
+	// create/edit lanes and A2A remain on their compatibility surfaces.
+	AgentFirstOwnerCanary bool `mapstructure:"agent_first_owner_canary"`
+	// AgentFirstCanaryUserID makes the owner canary an exact authenticated user
+	// rather than a process-wide switch. It is required when the canary is on.
+	AgentFirstCanaryUserID int64 `mapstructure:"agent_first_canary_user_id"`
 	// IntentToolkitsShadowEnabled computes the intent-routed first-request
 	// toolset without changing model-visible tools and records only aggregate
 	// old/new exposure differences. It is the default rollout stage.
@@ -387,6 +394,8 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.intent_toolkits_shadow_enabled", true)
+	v.SetDefault("agent.agent_first_owner_canary", false)
+	v.SetDefault("agent.agent_first_canary_user_id", int64(0))
 	v.SetDefault("agent.intent_toolkits_owner_canary", false)
 	v.SetDefault("agent.intent_toolkits_allow_all", false)
 	v.SetDefault("agent.definition_edit_enabled", false)
@@ -898,6 +907,9 @@ func (c *Config) Validate() error {
 		return errors.New(
 			"config: agent intent toolkits owner canary 与 allow_all 不能同时启用",
 		)
+	}
+	if c.Agent.AgentFirstOwnerCanary && c.Agent.AgentFirstCanaryUserID <= 0 {
+		return errors.New("config: agent-first owner canary 必须指定精确 canary user_id")
 	}
 	if c.LLM.CompiledEndpointGeneration == 0 {
 		c.LLM.CompiledEndpointGeneration = 1

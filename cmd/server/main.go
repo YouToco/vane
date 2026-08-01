@@ -657,6 +657,26 @@ func run() error {
 		st, sched, sched, endpoints, exaTools,
 		definitionEditToolController,
 	)
+	if cfg.Agent.AgentFirstOwnerCanary {
+		authorizer := agent.NewModelOwnerActionAuthorizer(
+			agentLLMClient, recorder, cfg.LLM.AgentModel,
+		)
+		withoutLegacyProfileWriter := tools[:0]
+		for _, tool := range tools {
+			if tool.Name() != "update_profile" {
+				withoutLegacyProfileWriter = append(withoutLegacyProfileWriter, tool)
+			}
+		}
+		tools = withoutLegacyProfileWriter
+		tools = append(tools,
+			agent.NewQueryMyIntelligenceTool(st),
+			agent.NewAuthorizedUpdateProfileTool(st, authorizer),
+			agent.NewManageTasksTool(agent.ManageTasksDeps{
+				Queries: st, Runner: sched, Deleter: sched,
+				Edits:      definitionEditController,
+				Authorizer: authorizer,
+			}))
+	}
 	agentLoop, err := agent.NewChecked(agent.Deps{
 		Client:     agentLLMClient,
 		Recorder:   recorder,
@@ -671,9 +691,12 @@ func run() error {
 		IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
 			!cfg.Agent.IntentToolkitsOwnerCanary &&
 			!cfg.Agent.IntentToolkitsAllowAll,
-		Endpoints:    endpoints,
-		ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
-		TaskCreation: creationCoordinator,
+		AgentFirstEnabled:      cfg.Agent.AgentFirstOwnerCanary,
+		AgentFirstCanaryUserID: cfg.Agent.AgentFirstCanaryUserID,
+		Endpoints:              endpoints,
+		ToolCalls:              agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
+		Evidence:               st,
+		TaskCreation:           creationCoordinator,
 		// The current controller serves direct durable execution only.
 		TaskDefinitionEdit: definitionEditController,
 	})

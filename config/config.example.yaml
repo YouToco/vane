@@ -96,6 +96,10 @@ pipeline:
   push_effect_recovery_canary_schedule_id: ""
 
 agent:
+  # Owner-only Agent-first canary. Keeps dedicated Web and A2A compatibility
+  # lanes unchanged while general chat uses query_my_intelligence/manage_tasks.
+  agent_first_owner_canary: false
+  agent_first_canary_user_id: 0
   max_turns: 20
   # 意图工具包发布顺序：默认只记录旧/新曝光差异；owner_canary 仅启用飞书 Owner；
   # 验收后关闭 canary 并显式打开 allow_all。owner_canary 与 allow_all 不可同时开启。

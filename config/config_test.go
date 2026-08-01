@@ -1449,6 +1449,8 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.executive_brief_web_projection_allow_all", cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll, false},
 		{"pipeline.executive_brief_renderer_canary_schedule_id", cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
+		{"agent.agent_first_owner_canary", cfg.Agent.AgentFirstOwnerCanary, false},
+		{"agent.agent_first_canary_user_id", cfg.Agent.AgentFirstCanaryUserID, int64(0)},
 		{"agent.intent_toolkits_shadow_enabled", cfg.Agent.IntentToolkitsShadowEnabled, true},
 		{"agent.intent_toolkits_owner_canary", cfg.Agent.IntentToolkitsOwnerCanary, false},
 		{"agent.intent_toolkits_allow_all", cfg.Agent.IntentToolkitsAllowAll, false},
@@ -1463,6 +1465,22 @@ func TestDefaults(t *testing.T) {
 }
 
 func TestLoadIntentToolkitsRollout(t *testing.T) {
+	t.Run("agent first owner canary from environment", func(t *testing.T) {
+		clearVaneEnv(t)
+		t.Setenv("VANE_AGENT_AGENT_FIRST_OWNER_CANARY", "true")
+		t.Setenv("VANE_AGENT_AGENT_FIRST_CANARY_USER_ID", "42")
+		cfg, err := Load(writeTempConfig(t, `
+db:
+  url: "postgres://test"
+`))
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.Agent.AgentFirstOwnerCanary || cfg.Agent.AgentFirstCanaryUserID != 42 {
+			t.Fatalf("agent-first rollout config = %+v", cfg.Agent)
+		}
+	})
+
 	t.Run("owner canary from environment", func(t *testing.T) {
 		clearVaneEnv(t)
 		t.Setenv("VANE_AGENT_INTENT_TOOLKITS_SHADOW_ENABLED", "false")
@@ -1478,6 +1496,19 @@ db:
 			!cfg.Agent.IntentToolkitsOwnerCanary ||
 			cfg.Agent.IntentToolkitsAllowAll {
 			t.Fatalf("rollout config = %+v", cfg.Agent)
+		}
+	})
+
+	t.Run("agent first canary requires exact user", func(t *testing.T) {
+		clearVaneEnv(t)
+		_, err := Load(writeTempConfig(t, `
+db:
+  url: "postgres://test"
+agent:
+  agent_first_owner_canary: true
+`))
+		if err == nil || !strings.Contains(err.Error(), "精确 canary user_id") {
+			t.Fatalf("Load() error = %v", err)
 		}
 	})
 
