@@ -279,6 +279,11 @@ const listSchedulesSchema = `{
     "query": {
       "type": "string",
       "description": "可选：按用户记得的连续原话筛选任务名称、描述或频率；省略时列出全部任务"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "paused", "all"],
+      "description": "可选：用户问正在运行/生效中的任务时传 active，问暂停任务时传 paused，明确问所有状态时传 all；省略等同 all"
     }
   },
   "additionalProperties": false
@@ -286,7 +291,7 @@ const listSchedulesSchema = `{
 
 func (t *listSchedulesTool) Name() string { return "list_schedules" }
 func (t *listSchedulesTool) Description() string {
-	return "列出用户当前的定时推送任务（含 id、触发频率、状态、描述）。可用用户原话筛选；无唯一结果时按可读名称追问，不能要求用户提供 id。"
+	return "列出用户当前的定时推送任务（含 id、触发频率、状态、描述）。可按用户原话和 active/paused 状态筛选；用户只问正在运行的任务时必须传 status=active。无唯一结果时按可读名称追问，不能要求用户提供 id。"
 }
 func (t *listSchedulesTool) Parameters() json.RawMessage {
 	return json.RawMessage(listSchedulesSchema)
@@ -294,7 +299,8 @@ func (t *listSchedulesTool) Parameters() json.RawMessage {
 
 func (t *listSchedulesTool) Execute(ctx context.Context, userID int64, raw json.RawMessage) (string, error) {
 	var args struct {
-		Query string `json:"query,omitempty"`
+		Query  string `json:"query,omitempty"`
+		Status string `json:"status,omitempty"`
 	}
 	if err := strictjson.DecodeExact(raw, &args); err != nil {
 		return "list_schedules 参数不是合法 JSON，或包含未知字段", nil
@@ -303,6 +309,20 @@ func (t *listSchedulesTool) Execute(ctx context.Context, userID int64, raw json.
 	if err != nil {
 		return "", err
 	}
+	status := strings.TrimSpace(strings.ToLower(args.Status))
+	switch status {
+	case "", "all":
+	case "active", "paused":
+		filtered := make([]types.Schedule, 0, len(list))
+		for _, sc := range list {
+			if string(sc.Status) == status {
+				filtered = append(filtered, sc)
+			}
+		}
+		list = filtered
+	default:
+		return "status 只能是 active、paused 或 all", nil
+	}
 	query := normalizeScheduleLookupText(args.Query)
 	if query != "" {
 		list = filterSchedulesByQuery(list, query)
@@ -310,6 +330,12 @@ func (t *listSchedulesTool) Execute(ctx context.Context, userID int64, raw json.
 	if len(list) == 0 {
 		if query != "" {
 			return "没有找到与该描述匹配的定时推送任务。", nil
+		}
+		if status == "active" {
+			return "当前没有正在运行的定时推送任务。", nil
+		}
+		if status == "paused" {
+			return "当前没有已暂停的定时推送任务。", nil
 		}
 		return "当前没有任何定时推送任务。", nil
 	}

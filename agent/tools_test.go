@@ -85,6 +85,25 @@ func TestListSchedulesToolAcceptsOmittedOptionalQuery(t *testing.T) {
 	}
 }
 
+func TestListSchedulesToolFiltersByStatus(t *testing.T) {
+	tool := &listSchedulesTool{st: fakeScheduleListStore{list: []types.Schedule{
+		{ID: "task-active", Status: types.ScheduleStatusActive,
+			NLDescription: "运行中", SpecJSON: json.RawMessage(`{"every_seconds":3600}`)},
+		{ID: "task-paused", Status: types.ScheduleStatusPaused,
+			NLDescription: "已暂停", SpecJSON: json.RawMessage(`{"every_seconds":3600}`)},
+	}}}
+	got, err := tool.Execute(
+		context.Background(), 7,
+		json.RawMessage(`{"status":"active"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "task-active") || strings.Contains(got, "task-paused") {
+		t.Fatalf("active filter result=%q", got)
+	}
+}
+
 func (f *fakeTaskRunTrigger) TriggerScheduleNowIdempotent(
 	_ context.Context,
 	scheduleID string,
@@ -199,10 +218,10 @@ func TestRunToolCallsScopesProviderCallIDToAgentTurn(t *testing.T) {
 	run := func(traceID string) {
 		t.Helper()
 		state := &toolRunState{
-			ownerRequest:           "立即执行一次任务",
-			allowedSideEffectTool:  "run_task_now",
-			successfulCalls:        make(map[string]struct{}),
-			failedCalls:            make(map[string]int),
+			ownerRequest:              "立即执行一次任务",
+			allowedSideEffectTool:     "run_task_now",
+			successfulCalls:           make(map[string]struct{}),
+			failedCalls:               make(map[string]int),
 			sideEffectConstrainedTurn: true,
 		}
 		ctx := context.WithValue(t.Context(), toolRunKey{}, state)
