@@ -1524,23 +1524,6 @@ export const api = {
       })),
     }));
   },
-  // 单任务推送记录与全局推送历史（listDeliveries）同形状（后端复用 deliveriesResp），
-  // 前端也复用 DeliveriesResp/DeliveryHistoryItem，渲染层两处共用组件。
-  scheduleDeliveries: (id: string, pageSize?: number, pageToken?: string) => {
-    const params = new URLSearchParams();
-    if (pageSize) params.set("page_size", String(pageSize));
-    if (pageToken) params.set("page_token", pageToken);
-    const qs = params.toString();
-    return request<DeliveriesResp>(
-      `/api/schedules/${encodeURIComponent(id)}/deliveries${qs ? "?" + qs : ""}`,
-    ).then((r) => ({
-      ...r,
-      items: arr(r.items).map((it) => ({
-        ...it,
-        feedbacks: arr(it.feedbacks),
-      })),
-    }));
-  },
   scheduleBriefs: (id: string, pageSize?: number, pageToken?: string) => {
     const params = new URLSearchParams();
     if (pageSize) params.set("page_size", String(pageSize));

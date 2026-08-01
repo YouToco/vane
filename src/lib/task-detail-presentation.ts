@@ -1,4 +1,4 @@
-import type { DeliveryHistoryItem, TaskLatestCheck } from "@/api";
+import type { TaskLatestCheck } from "@/api";
 
 export type TaskRunOutcome =
   | "completed"
@@ -31,12 +31,4 @@ export function canonicalCheckOutcome(
     return "completed";
   }
   return "incomplete";
-}
-
-// The task feed is ordered and paged by the row creation cursor. Showing sent_at
-// here would make the visible time disagree with that ordering.
-export function taskContentTimestamp(
-  item: Pick<DeliveryHistoryItem, "created_at" | "sent_at">,
-): string {
-  return item.created_at;
 }
