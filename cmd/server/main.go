@@ -82,7 +82,7 @@ func run() error {
 	cancelMigrate()
 	slog.Info("数据库迁移完成")
 
-	st, err := store.New(ctx, cfg.DB.URL)
+	st, err := store.NewWithResearchRuntime(ctx, cfg.DB.URL, cfg.DB.ResearchRuntimeURL)
 	if err != nil {
 		return fmt.Errorf("初始化数据库连接池: %w", err)
 	}

@@ -40,6 +40,7 @@ func newResearchBriefFixtureWithResultV3(
 ) researchBriefFixtureV3 {
 	t.Helper()
 	st := tenantTestStore(t)
+	useOwnerResearchRuntimeForTest(st)
 	ctx := t.Context()
 	userID := testUser(t, st)
 	var tenantID int64
@@ -51,6 +52,9 @@ func newResearchBriefFixtureWithResultV3(
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO memberships (tenant_id,user_id,role) VALUES ($1,$2,'owner')`,
 		tenantID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SeedTenantQuota(ctx, tenantID); err != nil {
 		t.Fatal(err)
 	}
 	taskID := "research-brief-v3-" + uuid.NewString()
@@ -141,6 +145,9 @@ func newResearchBriefFixtureWithResultV3(
 			Identity: identity, RunSnapshotID: snapshotRef.SnapshotID, PlanRef: planRef,
 			Ordinal: 0, Result: result, OriginalSize: len(result), TrustType: "external",
 			CostMicroUSD: 100,
+			ProviderCall: researchProviderCallV3ForTest(
+				researchExecutionTraceV3ForTest(t, identity, snapshotRef.SnapshotID,
+					planRef, 0, started.InvocationID), 100),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -150,18 +157,11 @@ func newResearchBriefFixtureWithResultV3(
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM brief_snapshots WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM task_run_content_provenance WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM task_run_outcomes WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_brief_syntheses WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_evidence WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_steps WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_plans WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM schedules WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM memberships WHERE tenant_id=$1`, tenantID)
+		if _, err := st.PurgeTenant(cleanupCtx, tenantID, false); err != nil {
+			t.Errorf("purge V3 research Brief fixture tenant: %v", err)
+			return
+		}
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM users WHERE id=$1`, userID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM tenants WHERE id=$1`, tenantID)
 	})
 	return researchBriefFixtureV3{
 		st: st, tenantID: tenantID, userID: userID, taskID: taskID,

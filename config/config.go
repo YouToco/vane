@@ -53,6 +53,9 @@ type ServerConfig struct {
 type DBConfig struct {
 	// URL 是 Postgres 连接串（必填），环境变量 VANE_DB_URL。
 	URL string `mapstructure:"url"`
+	// ResearchRuntimeURL 是 V3 情报运行专用的非 owner LOGIN 连接串。
+	// 留空时旧运行路径保持可用，但所有 V3 Store 入口 fail-closed。
+	ResearchRuntimeURL string `mapstructure:"research_runtime_url"`
 }
 
 // TemporalConfig 是 Temporal 集群与任务队列配置。
@@ -264,6 +267,7 @@ type A2AConfig struct {
 // （有默认值或出现在配置文件中）生效，纯环境变量运行时嵌套敏感键会漏读。
 var sensitiveKeys = []string{
 	"db.url",
+	"db.research_runtime_url",
 	"llm.api_key",
 	"llm.agent_api_key",
 	"fetch.tikhub_api_key",

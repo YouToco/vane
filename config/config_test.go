@@ -1656,6 +1656,19 @@ func TestValidateCompiledRouteGenerations(t *testing.T) {
 }
 
 // TestMissingDBURL 验证缺少 db.url 时 Load 报错。
+func TestResearchRuntimeURLFromEnvironment(t *testing.T) {
+	t.Setenv("VANE_DB_URL", "postgres://owner")
+	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://vane_research_runtime:secret@db/vane")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.DB.ResearchRuntimeURL,
+		"postgres://vane_research_runtime:secret@db/vane"; got != want {
+		t.Fatalf("db.research_runtime_url=%q, want %q", got, want)
+	}
+}
+
 func TestMissingDBURL(t *testing.T) {
 	clearVaneEnv(t)
 	skipIfSystemConfigExists(t)

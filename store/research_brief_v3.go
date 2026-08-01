@@ -231,7 +231,7 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 		params.SnapshotRef, params.PlanRef); err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, researchRunDatabaseError("begin research Brief synthesis transaction", err)
 	}
@@ -345,7 +345,7 @@ func (s *Store) ClaimResearchBriefSynthesisV3(
 	if err := validateResearchBriefSynthesisHandleV3(params); err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError("begin research Brief claim", err)
 	}
@@ -412,7 +412,7 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 		return types.ResearchBriefRefV3{}, researchRunValidationError("research Brief payload is invalid")
 	}
 	briefDigest := researchRunSHA256(briefPayload)
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return types.ResearchBriefRefV3{}, researchRunDatabaseError("begin research Brief finalization", err)
 	}
@@ -482,7 +482,7 @@ func (s *Store) FailResearchBriefSynthesisV3(
 		!validResearchRunErrorCode(params.FailureCode) {
 		return ResearchBriefSynthesisV3{}, researchRunValidationError("research Brief failure is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return ResearchBriefSynthesisV3{}, researchRunDatabaseError("begin research Brief failure", err)
 	}
@@ -530,7 +530,7 @@ func (s *Store) LoadResearchBriefSynthesisV3(
 	if err := validateResearchBriefSynthesisScopeV3(identity, snapshotRef, planRef); err != nil {
 		return ResearchBriefSynthesisV3{}, err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return ResearchBriefSynthesisV3{}, researchRunDatabaseError("begin research Brief read", err)
 	}
@@ -559,7 +559,7 @@ func (s *Store) LoadResearchBriefV3(
 	if err := ref.ValidateFor(identity, ref.RunSnapshotID, ref.PlanID); err != nil {
 		return ResearchBriefV3{}, researchRunValidationError("research Brief reference is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return ResearchBriefV3{}, researchRunDatabaseError("begin research Brief artifact read", err)
 	}
@@ -606,7 +606,7 @@ func (s *Store) LoadResearchHistoryChunkV3(
 		params.LimitChars < 1 || params.LimitChars > researchHistoryContextCharsV3 {
 		return ResearchHistoryChunkV3{}, researchRunValidationError("research history chunk cursor is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return ResearchHistoryChunkV3{}, researchRunDatabaseError("begin research history chunk read", err)
 	}

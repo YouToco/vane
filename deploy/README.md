@@ -49,6 +49,17 @@ chmod 600 /opt/vane/.env   # 密钥文件必须锁权限
 # 3. 起基础设施
 cd /opt/vane && docker compose up -d
 
+# 3a. 首次启用 V3 canary 前，为专用非 owner 登录设置独立密码。
+# migration 090 只创建 NOLOGIN 权限壳，不生成或保存密码。
+read -rsp 'V3 research DB password: ' VANE_RESEARCH_DB_PASSWORD; echo
+docker compose exec -T postgres psql -U vane -d vane \
+  -v runtime_password="$VANE_RESEARCH_DB_PASSWORD" <<'SQL'
+ALTER ROLE vane_research_runtime LOGIN PASSWORD :'runtime_password';
+SQL
+unset VANE_RESEARCH_DB_PASSWORD
+# 再把同一密码写入 chmod 600 的 /opt/vane/.env：
+# VANE_DB_RESEARCH_RUNTIME_URL=postgres://vane_research_runtime:<url-encoded-password>@127.0.0.1:5432/vane?sslmode=disable
+
 # 4. systemd
 cp /opt/vane/vane.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable vane
@@ -75,3 +86,8 @@ ss -ltnp | grep ':8080'
 
 真实密码/密钥只存在 VPS 的 `/opt/vane/.env` 和私有库 `YouToco/my-credentials`，
 绝不进本仓库。
+
+`VANE_DB_URL` 仅用于迁移、旧路径和租户硬删除；V3 Agent 研究必须使用
+`VANE_DB_RESEARCH_RUNTIME_URL`。后者登录用户固定为 `vane_research_runtime`，不能复用
+`vane`/Postgres owner。服务启动会验证其非 superuser、非 BYPASSRLS、非表 owner，且
+`RESET ROLE` 后仍无证据删除权限；校验失败时 V3 fail-closed。

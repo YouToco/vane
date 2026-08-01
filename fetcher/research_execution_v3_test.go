@@ -3,7 +3,6 @@ package fetcher
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -76,6 +75,36 @@ func TestNewResearchExecutorV3FailsClosedWithoutRetainedCredential(t *testing.T)
 	}
 }
 
+func TestResearchExecutionTraceV3BindsRunSnapshotPlanAndInvocation(t *testing.T) {
+	req := researchRequestV3ForTest(
+		"trace-binding", researchToolV3ForTest(t, "web_search", 7),
+		json.RawMessage(`{"query":"x"}`))
+	traceID, err := ResearchExecutionTraceV3(
+		req.Identity, req.RunSnapshotID, req.PlanDigest, req.Ordinal, req.InvocationID)
+	if err != nil || traceID != researchCallKeyV3(req) {
+		t.Fatalf("trace=%q private=%q err=%v", traceID, researchCallKeyV3(req), err)
+	}
+
+	mutations := []ResearchExecutionRequestV3{req, req, req, req, req}
+	mutations[0].Identity.TemporalRunID += "-other"
+	mutations[1].RunSnapshotID++
+	mutations[2].PlanDigest = strings.Repeat("b", 64)
+	mutations[3].Ordinal++
+	mutations[4].InvocationID += "-other"
+	for index, mutation := range mutations {
+		mutated, err := ResearchExecutionTraceV3(
+			mutation.Identity, mutation.RunSnapshotID,
+			mutation.PlanDigest, mutation.Ordinal, mutation.InvocationID)
+		if err != nil || mutated == traceID {
+			t.Fatalf("mutation %d was not bound: trace=%q err=%v", index, mutated, err)
+		}
+	}
+	if _, err := ResearchExecutionTraceV3(
+		req.Identity, req.RunSnapshotID, "invalid", req.Ordinal, req.InvocationID); err == nil {
+		t.Fatal("invalid plan digest produced an execution trace")
+	}
+}
+
 func researchRequestV3ForTest(
 	invocationID string,
 	tool runtimepolicy.ResearchToolDefinitionV3,
@@ -91,19 +120,7 @@ func researchRequestV3ForTest(
 		},
 		RunSnapshotID: 33,
 		PlanDigest:    strings.Repeat("a", 64),
-		InvocationID:  invocationID, Tool: tool, Arguments: arguments,
-	}
-}
-
-func allowResearchEffectV3(t *testing.T, calls *int) ResearchBeforeEffectV3 {
-	t.Helper()
-	return func(_ context.Context, effect ResearchEffectV3) error {
-		*calls++
-		if effect.Provider != "exa" || effect.BudgetBucket != "exa_calls" ||
-			effect.UsageQuantity <= 0 || effect.MaxCostMicroUSD != 50_000 {
-			t.Fatalf("unexpected effect reservation: %+v", effect)
-		}
-		return nil
+		Ordinal:       0, InvocationID: invocationID, Tool: tool, Arguments: arguments,
 	}
 }
 
@@ -120,14 +137,12 @@ func TestResearchExecutorV3SearchReturnsTypedExactReceipt(t *testing.T) {
 
 	executor := newResearchExecutorV3ForTest(t)
 	executor.search.searchURL = server.URL
-	effectCalls := 0
 	receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
 		"search-1", researchToolV3ForTest(t, "web_search", 7),
-		json.RawMessage(`{"include_domains":["kimi.com"],"query":"Kimi plans"}`)),
-		allowResearchEffectV3(t, &effectCalls))
+		json.RawMessage(`{"include_domains":["kimi.com"],"query":"Kimi plans"}`)))
 
-	if requests != 1 || effectCalls != 1 {
-		t.Fatalf("requests=%d effectCalls=%d, want exactly one each", requests, effectCalls)
+	if requests != 1 {
+		t.Fatalf("requests=%d, want exactly one", requests)
 	}
 	if receipt.Status != ResearchExecutionSuccessV3 || !receipt.Attempted ||
 		receipt.Provider != "exa" || !receipt.UsageKnown || receipt.UsageQuantity != 10 ||
@@ -164,16 +179,14 @@ func TestResearchExecutorV3ContentsReturnsTypedExactReceipt(t *testing.T) {
 
 	executor := newResearchExecutorV3ForTest(t)
 	executor.contents.contentURL = server.URL
-	effectCalls := 0
 	receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
 		"contents-1", researchToolV3ForTest(t, "web_contents", 7),
-		json.RawMessage(`{"page_url":"https://kimi.com/pricing"}`)),
-		allowResearchEffectV3(t, &effectCalls))
+		json.RawMessage(`{"page_url":"https://kimi.com/pricing"}`)))
 
-	if requests != 1 || effectCalls != 1 || receipt.Status != ResearchExecutionSuccessV3 ||
+	if requests != 1 || receipt.Status != ResearchExecutionSuccessV3 ||
 		!receipt.CostKnown || receipt.CostMicroUSD != 1000 ||
 		!strings.Contains(string(receipt.Result), `"text":"buy now"`) {
-		t.Fatalf("requests=%d effects=%d receipt=%+v", requests, effectCalls, receipt)
+		t.Fatalf("requests=%d receipt=%+v", requests, receipt)
 	}
 }
 
@@ -187,10 +200,9 @@ func TestResearchExecutorV3UnknownCostFailsClosed(t *testing.T) {
 
 	executor := newResearchExecutorV3ForTest(t)
 	executor.search.searchURL = server.URL
-	effects := 0
 	receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
 		"unknown-cost", researchToolV3ForTest(t, "web_search", 7),
-		json.RawMessage(`{"query":"x"}`)), allowResearchEffectV3(t, &effects))
+		json.RawMessage(`{"query":"x"}`)))
 
 	if requests != 1 || receipt.Status != ResearchExecutionIndeterminateV3 ||
 		receipt.CostKnown || receipt.CostMicroUSD != 0 ||
@@ -222,15 +234,14 @@ func TestResearchExecutorV3NeverRetriesProviderOrTreatsErrorBodyAsResult(t *test
 
 			executor := newResearchExecutorV3ForTest(t)
 			executor.search.searchURL = server.URL
-			effects := 0
 			receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
 				"no-retry-"+tc.name, researchToolV3ForTest(t, "web_search", 7),
-				json.RawMessage(`{"query":"x"}`)), allowResearchEffectV3(t, &effects))
+				json.RawMessage(`{"query":"x"}`)))
 
-			if requests != 1 || effects != 1 || receipt.Status != tc.want ||
+			if requests != 1 || receipt.Status != tc.want ||
 				len(receipt.Result) != 0 || receipt.HTTPStatus == nil ||
 				*receipt.HTTPStatus != tc.statusCode {
-				t.Fatalf("requests=%d effects=%d receipt=%+v", requests, effects, receipt)
+				t.Fatalf("requests=%d receipt=%+v", requests, receipt)
 			}
 		})
 	}
@@ -248,10 +259,9 @@ func TestResearchExecutorV3ProviderTruncationFailsClosed(t *testing.T) {
 	executor := newResearchExecutorV3ForTest(t)
 	executor.search.searchURL = server.URL
 	executor.search.maxBytes = 128
-	effects := 0
 	receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
 		"truncated", researchToolV3ForTest(t, "web_search", 7),
-		json.RawMessage(`{"query":"x"}`)), allowResearchEffectV3(t, &effects))
+		json.RawMessage(`{"query":"x"}`)))
 
 	if requests != 1 || receipt.Status != ResearchExecutionIndeterminateV3 ||
 		!receipt.ProviderTruncated || receipt.ErrorCode != ResearchExecutionProviderTruncatedV3 ||
@@ -260,7 +270,7 @@ func TestResearchExecutorV3ProviderTruncationFailsClosed(t *testing.T) {
 	}
 }
 
-func TestResearchExecutorV3RecoveryAndDeniedEffectNeverCallProvider(t *testing.T) {
+func TestResearchExecutorV3RecoveryNeverCallsProvider(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests++
@@ -276,26 +286,10 @@ func TestResearchExecutorV3RecoveryAndDeniedEffectNeverCallProvider(t *testing.T
 		executor.search.searchURL = server.URL
 		request := researchRequestV3ForTest("recover", tool, args)
 		request.FirstWriter = false
-		receipt := executor.ExecuteOnceV3(t.Context(), request,
-			func(context.Context, ResearchEffectV3) error {
-				t.Fatal("recovery must not enter effect reservation")
-				return nil
-			})
+		receipt := executor.ExecuteOnceV3(t.Context(), request)
 		if receipt.Status != ResearchExecutionDefiniteFailureV3 ||
 			receipt.ErrorCode != ResearchExecutionRecoveryNoReplayV3 || receipt.Attempted {
 			t.Fatalf("unexpected recovery receipt: %+v", receipt)
-		}
-	})
-
-	t.Run("reservation denied", func(t *testing.T) {
-		executor := newResearchExecutorV3ForTest(t)
-		executor.search.searchURL = server.URL
-		receipt := executor.ExecuteOnceV3(t.Context(),
-			researchRequestV3ForTest("denied", tool, args),
-			func(context.Context, ResearchEffectV3) error { return errors.New("denied") })
-		if receipt.Status != ResearchExecutionDefiniteFailureV3 ||
-			receipt.ErrorCode != ResearchExecutionEffectDeniedV3 || receipt.Attempted {
-			t.Fatalf("unexpected denied receipt: %+v", receipt)
 		}
 	})
 
@@ -314,11 +308,9 @@ func TestResearchExecutorV3RejectsCredentialAndProviderDriftBeforeEffect(t *test
 
 	executor := newResearchExecutorV3ForTest(t)
 	executor.search.searchURL = server.URL
-	effects := 0
 	drifted := researchToolV3ForTest(t, "web_search", 8)
 	receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
-		"drift", drifted, json.RawMessage(`{"query":"x"}`)),
-		allowResearchEffectV3(t, &effects))
+		"drift", drifted, json.RawMessage(`{"query":"x"}`)))
 	if receipt.Status != ResearchExecutionDefiniteFailureV3 ||
 		receipt.ErrorCode != ResearchExecutionRouteUnavailableV3 {
 		t.Fatalf("credential drift accepted: %+v", receipt)
@@ -326,8 +318,7 @@ func TestResearchExecutorV3RejectsCredentialAndProviderDriftBeforeEffect(t *test
 	nonCanonical := researchToolV3ForTest(t, "web_search", 7)
 	nonCanonical.SchemaDigest = ""
 	receipt = executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
-		"noncanonical", nonCanonical, json.RawMessage(`{"query":"x"}`)),
-		allowResearchEffectV3(t, &effects))
+		"noncanonical", nonCanonical, json.RawMessage(`{"query":"x"}`)))
 	if receipt.Status != ResearchExecutionDefiniteFailureV3 ||
 		receipt.ErrorCode != ResearchExecutionRouteUnavailableV3 {
 		t.Fatalf("noncanonical frozen grant accepted: %+v", receipt)
@@ -336,13 +327,12 @@ func TestResearchExecutorV3RejectsCredentialAndProviderDriftBeforeEffect(t *test
 	tikhub := researchToolV3ForTest(t, "web_search", 7)
 	tikhub.Provider = "tikhub"
 	receipt = executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
-		"tikhub", tikhub, json.RawMessage(`{"query":"x"}`)),
-		allowResearchEffectV3(t, &effects))
+		"tikhub", tikhub, json.RawMessage(`{"query":"x"}`)))
 	if receipt.Status != ResearchExecutionDefiniteFailureV3 ||
 		receipt.ErrorCode != ResearchExecutionRouteUnavailableV3 ||
-		requests != 0 || effects != 0 {
-		t.Fatalf("unknown-cost provider was not rejected before effect: receipt=%+v requests=%d effects=%d",
-			receipt, requests, effects)
+		requests != 0 {
+		t.Fatalf("unknown-cost provider was not rejected before effect: receipt=%+v requests=%d",
+			receipt, requests)
 	}
 }
 
@@ -361,12 +351,6 @@ func TestResearchExecutorV3SameInvocationAcrossRunsDoesNotCollideOrCrossReceipt(
 	executor := newResearchExecutorV3ForTest(t)
 	executor.search.searchURL = server.URL
 	tool := researchToolV3ForTest(t, "web_search", 7)
-	var effects atomic.Int32
-	gate := func(_ context.Context, _ ResearchEffectV3) error {
-		effects.Add(1)
-		return nil
-	}
-
 	requestsByRun := []ResearchExecutionRequestV3{
 		researchRequestV3ForTest("search-official", tool, json.RawMessage(`{"query":"x"}`)),
 		researchRequestV3ForTest("search-official", tool, json.RawMessage(`{"query":"x"}`)),
@@ -387,7 +371,7 @@ func TestResearchExecutorV3SameInvocationAcrossRunsDoesNotCollideOrCrossReceipt(
 		go func(index int) {
 			defer wg.Done()
 			receipts[index] = executor.ExecuteOnceV3(
-				context.Background(), requestsByRun[index], gate)
+				context.Background(), requestsByRun[index])
 		}(index)
 	}
 	for range 2 {
@@ -402,8 +386,8 @@ func TestResearchExecutorV3SameInvocationAcrossRunsDoesNotCollideOrCrossReceipt(
 	close(release)
 	wg.Wait()
 
-	if requests.Load() != 2 || effects.Load() != 2 {
-		t.Fatalf("requests=%d effects=%d, want two isolated calls", requests.Load(), effects.Load())
+	if requests.Load() != 2 {
+		t.Fatalf("requests=%d, want two isolated calls", requests.Load())
 	}
 	for index, receipt := range receipts {
 		if receipt.Status != ResearchExecutionSuccessV3 || receipt.Validate() != nil {

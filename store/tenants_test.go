@@ -25,6 +25,10 @@ func tenantTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("New() 失败: %v", err)
 	}
+	// Most Store integration tests provision one ephemeral owner URL. V3
+	// production code never falls back to it; dedicated runtime-login tests
+	// below exercise NewWithResearchRuntime and its authority probe separately.
+	st.beginResearchTx = st.pool.BeginTx
 	t.Cleanup(st.Close)
 	return st
 }

@@ -143,7 +143,15 @@ var purgeOrder = []purgeStep{
 	{"task_run_content_provenance", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	// Exact model/tool receipts reference immutable run snapshots from 082.
+	// A research spend settlement is the child of both its provider Tool call
+	// and immutable reservation, while a reservation binds its started step.
+	// Preserve the complete 090 child-first chain even while those two tables
+	// remain optional across a reversible migration rollout.
 	{"llm_calls", "tenant_id = $1"},
+	{"research_run_step_spend_settlements", "tenant_id = $1"},
+	// V3-bound Tool evidence is immutable under direct DELETE. Count it here
+	// for the purge report, then let the final tenants delete remove it through
+	// fk_tool_calls_tenant. This is the only structural delete authority.
 	{"tool_calls", "tenant_id = $1"},
 	// V3 research evidence binds its immutable started step; steps bind the
 	// per-run plan; plans bind the frozen run snapshot. Keep this exact
@@ -151,6 +159,7 @@ var purgeOrder = []purgeStep{
 	// Syntheses bind both the plan and snapshot, so they must lead the chain.
 	{"research_brief_syntheses", "tenant_id = $1"},
 	{"research_run_evidence", "tenant_id = $1"},
+	{"research_run_step_spend_reservations", "tenant_id = $1"},
 	{"research_run_steps", "tenant_id = $1"},
 	{"research_run_plans", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration
@@ -187,6 +196,17 @@ var purgeOrder = []purgeStep{
 	{"tenant_quota", "tenant_id = $1"},
 	{"memberships", "tenant_id = $1"},
 	{"invites", "consumed_by_tenant = $1"},
+}
+
+// Some immutable children are deliberately not directly deletable. They stay
+// in purgeOrder so schema coverage and reporting remain complete, but the
+// tenant root FK cascade is their sole delete authority.
+var tenantCascadePurgeTables = map[string]struct{}{
+	"tool_calls":                           {},
+	"research_run_step_spend_reservations": {},
+	"research_run_steps":                   {},
+	"research_run_plans":                   {},
+	"task_run_snapshots":                   {},
 }
 
 // purgeSharedTables 是**绝不能出现在 purgeOrder 里**的跨租户客观事实表（红线 I-A3）。
@@ -243,22 +263,24 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
 	}
 	var (
-		canonicalBriefStagesAvailable bool
-		profileEpochsAvailable        bool
-		profileEpochFencesAvailable   bool
-		profileCheckpointsAvailable   bool
-		profileEpochEventsAvailable   bool
-		profileEpochReceiptsAvailable bool
-		profileActivitiesAvailable    bool
-		executiveReceiptsAvailable    bool
-		executiveArtifactsAvailable   bool
-		reportSettingsAvailable       bool
-		periodicIntentsAvailable      bool
-		periodicReceiptsAvailable     bool
-		periodicReportsAvailable      bool
-		periodicDeliveriesAvailable   bool
-		researchBriefsAvailable       bool
-		researchEvidenceAvailable     bool
+		canonicalBriefStagesAvailable      bool
+		profileEpochsAvailable             bool
+		profileEpochFencesAvailable        bool
+		profileCheckpointsAvailable        bool
+		profileEpochEventsAvailable        bool
+		profileEpochReceiptsAvailable      bool
+		profileActivitiesAvailable         bool
+		executiveReceiptsAvailable         bool
+		executiveArtifactsAvailable        bool
+		reportSettingsAvailable            bool
+		periodicIntentsAvailable           bool
+		periodicReceiptsAvailable          bool
+		periodicReportsAvailable           bool
+		periodicDeliveriesAvailable        bool
+		researchBriefsAvailable            bool
+		researchEvidenceAvailable          bool
+		researchSpendSettlementsAvailable  bool
+		researchSpendReservationsAvailable bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -276,7 +298,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.periodic_brief_reports') IS NOT NULL,
 		        to_regclass('public.periodic_report_deliveries') IS NOT NULL,
 		        to_regclass('public.research_brief_syntheses') IS NOT NULL,
-		        to_regclass('public.research_run_evidence') IS NOT NULL`,
+		        to_regclass('public.research_run_evidence') IS NOT NULL,
+		        to_regclass('public.research_run_step_spend_settlements') IS NOT NULL,
+		        to_regclass('public.research_run_step_spend_reservations') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -294,31 +318,34 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&periodicDeliveriesAvailable,
 		&researchBriefsAvailable,
 		&researchEvidenceAvailable,
+		&researchSpendSettlementsAvailable,
+		&researchSpendReservationsAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
 	}
 	optionalPurgeTables := map[string]bool{
-		"canonical_brief_stages":             canonicalBriefStagesAvailable,
-		"profile_epochs":                     profileEpochsAvailable,
-		"profile_feedback_epoch_fences":      profileEpochFencesAvailable,
-		"profile_epoch_checkpoints":          profileCheckpointsAvailable,
-		"profile_epoch_events":               profileEpochEventsAvailable,
-		"profile_epoch_receipts":             profileEpochReceiptsAvailable,
-		"profile_epoch_activities":           profileActivitiesAvailable,
-		"executive_brief_synthesis_receipts": executiveReceiptsAvailable,
-		"executive_brief_artifacts":          executiveArtifactsAvailable,
-		"brief_report_settings":              reportSettingsAvailable,
-		"periodic_brief_intents":             periodicIntentsAvailable,
-		"periodic_synthesis_receipts":        periodicReceiptsAvailable,
-		"periodic_brief_reports":             periodicReportsAvailable,
-		"periodic_report_deliveries":         periodicDeliveriesAvailable,
-		"research_brief_syntheses":           researchBriefsAvailable,
-		"research_run_evidence":              researchEvidenceAvailable,
+		"canonical_brief_stages":               canonicalBriefStagesAvailable,
+		"profile_epochs":                       profileEpochsAvailable,
+		"profile_feedback_epoch_fences":        profileEpochFencesAvailable,
+		"profile_epoch_checkpoints":            profileCheckpointsAvailable,
+		"profile_epoch_events":                 profileEpochEventsAvailable,
+		"profile_epoch_receipts":               profileEpochReceiptsAvailable,
+		"profile_epoch_activities":             profileActivitiesAvailable,
+		"executive_brief_synthesis_receipts":   executiveReceiptsAvailable,
+		"executive_brief_artifacts":            executiveArtifactsAvailable,
+		"brief_report_settings":                reportSettingsAvailable,
+		"periodic_brief_intents":               periodicIntentsAvailable,
+		"periodic_synthesis_receipts":          periodicReceiptsAvailable,
+		"periodic_brief_reports":               periodicReportsAvailable,
+		"periodic_report_deliveries":           periodicDeliveriesAvailable,
+		"research_brief_syntheses":             researchBriefsAvailable,
+		"research_run_evidence":                researchEvidenceAvailable,
+		"research_run_step_spend_settlements":  researchSpendSettlementsAvailable,
+		"research_run_step_spend_reservations": researchSpendReservationsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
-		`SELECT set_config('app.tenant_id', $1, true),
-		        set_config('app.tenant_purge', 'on', true)`,
+		`SELECT set_config('app.tenant_id', $1, true)`,
 		fmt.Sprintf("%d", tenantID)); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "设置租户清理上下文", err)
@@ -448,6 +475,23 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			         FOR UPDATE /* tenant purge agent-session lock order */`,
 		},
 	}
+	if researchSpendReservationsAvailable {
+		// Provider settlement locks its immutable reservation before appending
+		// the settlement and Tool-call children. Drain that exact parent in the
+		// same schedule -> reservation order used by effect admission, after the
+		// tenant admission root has fenced new reservations. The conditional
+		// append keeps the current binary safe on either side of migration 090.
+		purgeLocks = append(purgeLocks, struct {
+			name  string
+			query string
+		}{
+			name: "research_run_step_spend_reservations",
+			query: `SELECT id FROM research_run_step_spend_reservations
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge research spend lock order */`,
+		})
+	}
 	for _, lock := range purgeLocks {
 		rows, lockErr := tx.Query(ctx, lock.query, tenantID)
 		if lockErr != nil {
@@ -470,6 +514,22 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			// Current binaries may finish an already-admitted tenant purge
 			// while a safely reversible migration has rolled back the
 			// corresponding optional table.
+			continue
+		}
+		if _, cascadeOnly := tenantCascadePurgeTables[st.table]; cascadeOnly {
+			// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；
+			// tenant_id 走参数化的 $1。真正删除由下方租户根 FK cascade 完成。
+			var count int64
+			if err := tx.QueryRow(ctx,
+				fmt.Sprintf("SELECT count(*) FROM %s WHERE %s", st.table, st.where),
+				tenantID).Scan(&count); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase,
+					fmt.Sprintf("统计租户 %d 的 %s", tenantID, st.table), err)
+			}
+			if count > 0 {
+				rep.Rows[st.table] = count
+				rep.Total += count
+			}
 			continue
 		}
 		// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；

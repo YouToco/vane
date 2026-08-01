@@ -17,11 +17,47 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+func researchProviderCallV3ForTest(traceID string, costMicroUSD int64) ResearchProviderCallV3 {
+	status := 200
+	return ResearchProviderCallV3{
+		TraceID: traceID, Provider: "exa", UsageQuantity: 10,
+		QuotaUnits: researchRunQuotaUnitsV3, HTTPStatus: &status, DurationMS: 25,
+		Attempted: true, CostKnown: true, CostMicroUSD: costMicroUSD,
+		PricingStatus: "provider_reported", CostCurrency: "USD",
+	}
+}
+
+func researchExecutionTraceV3ForTest(
+	t *testing.T,
+	identity types.RunIdentity,
+	snapshotID int64,
+	planRef types.ResearchRunPlanRefV3,
+	ordinal int,
+	invocationID string,
+) string {
+	t.Helper()
+	traceID, err := runcontext.ResearchExecutionTraceV3(
+		identity, snapshotID, planRef.PlanDigest, ordinal, invocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return traceID
+}
+
+// V3 production code requires a separately authenticated non-owner pool. These
+// ledger integration tests intentionally inject the schema-owner transaction
+// factory because they exercise row/trigger semantics, while constructor and
+// authority validation are covered independently in research_runtime_pool_test.
+func useOwnerResearchRuntimeForTest(st *Store) {
+	st.beginResearchTx = st.pool.BeginTx
+}
+
 func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
 		t.Skip("DATABASE_URL is required for V3 research ledger integration test")
 	}
 	st := tenantTestStore(t)
+	useOwnerResearchRuntimeForTest(st)
 	ctx := t.Context()
 	userID := testUser(t, st)
 	var tenantID int64
@@ -33,6 +69,9 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO memberships (tenant_id,user_id,role) VALUES ($1,$2,'owner')`,
 		tenantID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SeedTenantQuota(ctx, tenantID); err != nil {
 		t.Fatal(err)
 	}
 	taskID := "research-v3-" + uuid.NewString()
@@ -88,15 +127,11 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM schedule_commands WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_evidence WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_steps WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_plans WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM schedules WHERE tenant_id=$1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM memberships WHERE tenant_id=$1`, tenantID)
+		if _, err := st.PurgeTenant(cleanupCtx, tenantID, false); err != nil {
+			t.Errorf("purge V3 research fixture tenant: %v", err)
+			return
+		}
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM users WHERE id=$1`, userID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM tenants WHERE id=$1`, tenantID)
 	})
 
 	identity := types.RunIdentity{
@@ -407,10 +442,13 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		t.Fatal("raw completed step without exact evidence passed")
 	}
 	visibleResult := []byte(`{"status":"available","source":"official"}`)
+	providerTrace := researchExecutionTraceV3ForTest(
+		t, identity, snapshotID, ref, 0, started.InvocationID)
 	receipt, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
 		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
 		Result: visibleResult, OriginalSize: len(visibleResult) + 99,
 		TrustType: "external", CostMicroUSD: 21,
+		ProviderCall: researchProviderCallV3ForTest(providerTrace, 21),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -419,6 +457,7 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
 		Result: visibleResult, OriginalSize: len(visibleResult) + 99,
 		TrustType: "external", CostMicroUSD: 21,
+		ProviderCall: researchProviderCallV3ForTest(providerTrace, 21),
 	})
 	if err != nil || replayedReceipt != receipt {
 		t.Fatalf("receipt replay=%+v err=%v want=%+v", replayedReceipt, err, receipt)
@@ -427,6 +466,7 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
 		Result: []byte(`{"status":"different"}`), OriginalSize: 22,
 		TrustType: "external", CostMicroUSD: 21,
+		ProviderCall: researchProviderCallV3ForTest(providerTrace, 21),
 	}); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("conflicting receipt err=%v", err)
 	}

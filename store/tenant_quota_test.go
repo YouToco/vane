@@ -2,8 +2,12 @@ package store
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -358,6 +362,12 @@ func TestInvariant_EnforcementClaimIsTrue(t *testing.T) {
 		if pkg == "" {
 			continue // 显式声明未接线，另有守卫要求它必须被显式声明
 		}
+		if bucket == QuotaExaCalls {
+			// Exa 的 V3 扣减必须和 started step + spend reservation 在同一事务里。
+			// 普通 TryConsume 虽然也会扣桶，却不能证明副作用前已有不可变预留，
+			// 所以不能拿通用判据替代下面更窄的专用 invariant。
+			continue
+		}
 		files, err := filepath.Glob(filepath.Join("..", pkg, "*.go"))
 		if err != nil || len(files) == 0 {
 			t.Errorf("桶 %s 声称由包 %q 扣减，但该包不存在", bucket, pkg)
@@ -384,6 +394,98 @@ func TestInvariant_EnforcementClaimIsTrue(t *testing.T) {
 				"「声称已接线」和「真的在扣」是两回事，而前者会让人不再去查后者", bucket, pkg, pkg)
 		}
 	}
+}
+
+// TestInvariant_ExaCallsUsesResearchRunReservation 把 Exa 的接线钉在 V3
+// research step 的原子预留路径上。这里刻意不接受 TryConsume/TryConsumeForUser：
+// 这两个方法只能证明"某处扣过桶"，证明不了 started step、预算预留和配额扣减
+// 在同一个事务里提交，也挡不住响应丢失后的重放再次调用付费 provider。
+func TestInvariant_ExaCallsUsesResearchRunReservation(t *testing.T) {
+	if got := enforcedBuckets[QuotaExaCalls]; got != "store" {
+		t.Errorf("exa_calls 必须声明由 store 的 V3 research step 原子预留路径强制执行，实得 %q", got)
+	}
+
+	begin := productionStoreFunction(t, "BeginResearchRunStepV3")
+	if !callsFunction(begin, "consumeResearchRunQuotaV3") {
+		t.Fatal("BeginResearchRunStepV3 没有调用 consumeResearchRunQuotaV3 —— " +
+			"普通 TryConsume 不能替代 started step + spend reservation + 配额扣减的同事务提交")
+	}
+	if callsFunction(begin, "TryConsume") || callsFunction(begin, "TryConsumeForUser") {
+		t.Fatal("BeginResearchRunStepV3 不得用普通 TryConsume/TryConsumeForUser 扣 Exa 配额")
+	}
+
+	reserve := productionStoreFunction(t, "consumeResearchRunQuotaV3")
+	if !functionContainsString(reserve, "reserve_research_run_quota_v3") {
+		t.Fatal("consumeResearchRunQuotaV3 没有调用窄 SQL reserve_research_run_quota_v3")
+	}
+	if callsFunction(reserve, "TryConsume") || callsFunction(reserve, "TryConsumeForUser") {
+		t.Fatal("consumeResearchRunQuotaV3 不得回退到普通 TryConsume/TryConsumeForUser")
+	}
+}
+
+func productionStoreFunction(t *testing.T, name string) *ast.FuncDecl {
+	t.Helper()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("枚举 store 源码失败: %v", err)
+	}
+	fset := token.NewFileSet()
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("解析 %s 失败: %v", path, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if ok && fn.Name.Name == name {
+				return fn
+			}
+		}
+	}
+	t.Fatalf("store 生产源码里找不到函数 %s", name)
+	return nil
+}
+
+func callsFunction(fn *ast.FuncDecl, name string) bool {
+	found := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		ident, ok := call.Fun.(*ast.Ident)
+		if ok && ident.Name == name {
+			found = true
+			return false
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == name {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func functionContainsString(fn *ast.FuncDecl, needle string) bool {
+	found := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		literal, ok := node.(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			return true
+		}
+		value, err := strconv.Unquote(literal.Value)
+		if err == nil && strings.Contains(value, needle) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // TestInvariant_LLMBucketIsEnforced 单独把 LLM 桶钉住。

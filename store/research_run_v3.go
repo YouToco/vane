@@ -46,7 +46,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		identity.TemporalWorkflowID == "" || identity.TemporalRunID == "" {
 		return types.ResearchRunSnapshotRefV3{}, researchRunValidationError("research snapshot identity is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return types.ResearchRunSnapshotRefV3{}, researchRunDatabaseError("begin research snapshot transaction", err)
 	}
@@ -277,7 +277,7 @@ func (s *Store) LoadResearchRunSnapshotV3(
 	if err := ref.ValidateFor(identity); err != nil {
 		return runcontext.ResearchSnapshotSealV3{}, researchRunValidationError("research snapshot reference is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return runcontext.ResearchSnapshotSealV3{}, researchRunDatabaseError("begin research snapshot read", err)
 	}
@@ -319,13 +319,16 @@ const (
 )
 
 type ResearchRunStepExecutionV3 struct {
-	StepID        int64
-	FirstWriter   bool
-	Ordinal       int
-	InvocationID  string
-	ToolName      string
-	Arguments     json.RawMessage
-	RequestDigest string
+	StepID               int64
+	SpendReservationID   int64
+	FirstWriter          bool
+	Ordinal              int
+	InvocationID         string
+	ToolName             string
+	Arguments            json.RawMessage
+	RequestDigest        string
+	ReservedQuotaUnits   float64
+	ReservedCostMicroUSD int64
 }
 
 type CommitResearchRunStepV3Params struct {
@@ -337,6 +340,7 @@ type CommitResearchRunStepV3Params struct {
 	ResultDigest  string
 	CostMicroUSD  int64
 	ErrorCode     string
+	ProviderCall  ResearchProviderCallV3
 }
 
 // CommitResearchRunStepEvidenceV3Params is the only success path for a V3
@@ -352,6 +356,7 @@ type CommitResearchRunStepEvidenceV3Params struct {
 	OriginalSize  int
 	TrustType     string
 	CostMicroUSD  int64
+	ProviderCall  ResearchProviderCallV3
 }
 
 type ResearchRunStepEvidenceReceiptV3 struct {
@@ -417,7 +422,7 @@ func (s *Store) CreateOrGetResearchRunPlanV3(
 		return types.ResearchRunPlanRefV3{}, err
 	}
 
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return types.ResearchRunPlanRefV3{}, researchRunDatabaseError("begin research plan transaction", err)
 	}
@@ -438,17 +443,34 @@ func (s *Store) CreateOrGetResearchRunPlanV3(
 		if err := validateResearchPlanCreateV3(params); err != nil {
 			return types.ResearchRunPlanRefV3{}, err
 		}
+		plannerBudget, err := validateResearchPlanSnapshotPolicyV3(ctx, tx, params)
+		if err != nil {
+			return types.ResearchRunPlanRefV3{}, err
+		}
+		if len(params.Plan.Steps) > plannerBudget.MaxToolCalls {
+			return types.ResearchRunPlanRefV3{}, researchRunValidationError(
+				"research plan exceeds its frozen Tool-call budget")
+		}
 		payload, encodeErr := runcontext.EncodeResearchExecutionPlanV3(params.Plan)
 		if encodeErr != nil {
 			return types.ResearchRunPlanRefV3{}, researchRunValidationError("research plan payload is invalid")
 		}
 		planDigest := researchRunSHA256(payload)
-		if err := validateResearchPlanSnapshotPolicyV3(ctx, tx, params); err != nil {
-			return types.ResearchRunPlanRefV3{}, err
-		}
 		row, err = insertResearchRunPlanV3(ctx, tx, params, payload, planDigest)
 		if err != nil {
 			return types.ResearchRunPlanRefV3{}, err
+		}
+	} else {
+		storedPlan, decodeErr := runcontext.DecodeResearchExecutionPlanV3(row.PlanPayload)
+		if decodeErr != nil {
+			return types.ResearchRunPlanRefV3{}, researchRunIntegrityError()
+		}
+		recoveryParams := params
+		recoveryParams.Plan = storedPlan
+		plannerBudget, policyErr := validateResearchPlanSnapshotPolicyV3(
+			ctx, tx, recoveryParams)
+		if policyErr != nil || len(storedPlan.Steps) > plannerBudget.MaxToolCalls {
+			return types.ResearchRunPlanRefV3{}, researchRunIntegrityError()
 		}
 	}
 	ref, err := researchRunPlanRefV3(row)
@@ -472,7 +494,7 @@ func (s *Store) LoadResearchRunPlanRefV3(
 		return types.ResearchRunPlanRefV3{}, false,
 			researchRunValidationError("research plan recovery snapshot is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return types.ResearchRunPlanRefV3{}, false,
 			researchRunDatabaseError("begin research plan recovery", err)
@@ -528,7 +550,7 @@ func (s *Store) BeginResearchRunStepV3(
 	if err := planRef.ValidateFor(identity, runSnapshotID); err != nil || ordinal < 0 || ordinal >= 16 {
 		return ResearchRunStepExecutionV3{}, researchRunValidationError("research step scope is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return ResearchRunStepExecutionV3{}, researchRunDatabaseError("begin research step transaction", err)
 	}
@@ -537,6 +559,14 @@ func (s *Store) BeginResearchRunStepV3(
 		return ResearchRunStepExecutionV3{}, researchRunDatabaseError("lock research schema admission", err)
 	}
 	if err := setResearchRunScopeV3(ctx, tx, identity.TenantID, identity.UserID); err != nil {
+		return ResearchRunStepExecutionV3{}, err
+	}
+	if exists, err := lockTenantAdmissionRootShared(ctx, tx, identity.TenantID); err != nil {
+		return ResearchRunStepExecutionV3{}, researchRunDatabaseError("lock research spend tenant admission", err)
+	} else if !exists {
+		return ResearchRunStepExecutionV3{}, researchRunValidationError("research spend tenant is unavailable")
+	}
+	if err := lockResearchRunSpendBudgetV3(ctx, tx, identity.TemporalRunID, planRef.PlanDigest); err != nil {
 		return ResearchRunStepExecutionV3{}, err
 	}
 	if err := lockResearchRunStepV3(ctx, tx, identity.TemporalRunID, planRef.PlanDigest, ordinal); err != nil {
@@ -551,24 +581,55 @@ func (s *Store) BeginResearchRunStepV3(
 	}
 	step := plan.Steps[ordinal]
 	requestDigest := digestResearchRunStepRequestV3(ordinal, step)
-	var stepID int64
+	grant, plannerBudget, err := loadResearchRunToolGrantV3(
+		ctx, tx, identity, runSnapshotID, planRef, step.ToolName)
+	if err != nil {
+		return ResearchRunStepExecutionV3{}, err
+	}
+	if len(plan.Steps) > plannerBudget.MaxToolCalls || ordinal >= plannerBudget.MaxToolCalls {
+		return ResearchRunStepExecutionV3{}, researchRunIntegrityError()
+	}
+	var stepID, reservationID int64
+	var reservedQuotaUnits float64
+	var reservedCostMicroUSD int64
 	err = tx.QueryRow(ctx,
-		`SELECT id FROM research_run_steps
-		  WHERE tenant_id=$1 AND user_id=$2 AND temporal_run_id=$3
-		    AND plan_digest=$4 AND step_ordinal=$5 AND phase='started'
-		    AND plan_id=$6 AND invocation_id=$7 AND tool_name=$8
-		    AND request_digest=$9`,
+		`SELECT started.id,reservation.id,reservation.reserved_quota_units,
+		        reservation.reserved_cost_micro_usd
+		   FROM research_run_steps started
+		   JOIN research_run_step_spend_reservations reservation
+		     ON reservation.started_step_id=started.id
+		  WHERE started.tenant_id=$1 AND started.user_id=$2 AND started.temporal_run_id=$3
+		    AND started.plan_digest=$4 AND started.step_ordinal=$5 AND started.phase='started'
+		    AND started.plan_id=$6 AND started.invocation_id=$7 AND started.tool_name=$8
+		    AND started.request_digest=$9
+		    AND reservation.tenant_id=started.tenant_id
+		    AND reservation.user_id=started.user_id
+		    AND reservation.task_id=started.task_id
+		    AND reservation.plan_id=started.plan_id
+		    AND reservation.temporal_run_id=started.temporal_run_id
+		    AND reservation.plan_digest=started.plan_digest
+		    AND reservation.step_ordinal=started.step_ordinal
+		    AND reservation.invocation_id=started.invocation_id
+		    AND reservation.tool_name=started.tool_name
+		    AND reservation.request_digest=started.request_digest`,
 		identity.TenantID, identity.UserID, identity.TemporalRunID,
 		planRef.PlanDigest, ordinal, row.ID, step.InvocationID,
-		step.ToolName, requestDigest).Scan(&stepID)
+		step.ToolName, requestDigest).Scan(
+		&stepID, &reservationID, &reservedQuotaUnits, &reservedCostMicroUSD)
 	if err == nil {
+		if reservedQuotaUnits != researchRunQuotaUnitsV3 ||
+			reservedCostMicroUSD != grant.MaxCostMicroUSD {
+			return ResearchRunStepExecutionV3{}, researchRunIntegrityError()
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ResearchRunStepExecutionV3{}, researchRunDatabaseError("commit research step recovery", err)
 		}
 		return ResearchRunStepExecutionV3{
-			StepID: stepID, FirstWriter: false, Ordinal: ordinal,
+			StepID: stepID, SpendReservationID: reservationID,
+			FirstWriter: false, Ordinal: ordinal,
 			InvocationID: step.InvocationID, ToolName: step.ToolName,
-			RequestDigest: requestDigest,
+			RequestDigest: requestDigest, ReservedQuotaUnits: reservedQuotaUnits,
+			ReservedCostMicroUSD: reservedCostMicroUSD,
 		}, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -578,6 +639,14 @@ func (s *Store) BeginResearchRunStepV3(
 	// start is recoverable after pause/revocation so response loss cannot cause
 	// another provider call or strand an uninspectable run.
 	if err := authorizeResearchRunEffectV3(ctx, tx, identity); err != nil {
+		return ResearchRunStepExecutionV3{}, err
+	}
+	if err := admitResearchRunSpendBudgetV3(ctx, tx, identity, runSnapshotID,
+		plannerBudget.MaxCostMicroUSD, grant.MaxCostMicroUSD); err != nil {
+		return ResearchRunStepExecutionV3{}, err
+	}
+	if err := consumeResearchRunQuotaV3(ctx, tx, identity.TenantID,
+		QuotaBucket(grant.BudgetBucket), researchRunQuotaUnitsV3); err != nil {
 		return ResearchRunStepExecutionV3{}, err
 	}
 	err = tx.QueryRow(ctx,
@@ -594,14 +663,32 @@ func (s *Store) BeginResearchRunStepV3(
 	if err != nil {
 		return ResearchRunStepExecutionV3{}, researchRunDatabaseError("seal research step start", err)
 	}
+	err = tx.QueryRow(ctx,
+		`INSERT INTO research_run_step_spend_reservations (
+		     tenant_id,user_id,task_id,run_snapshot_id,plan_id,started_step_id,
+		     temporal_run_id,plan_digest,step_ordinal,invocation_id,tool_name,
+		     request_digest,tool_policy_digest,quota_bucket,reserved_quota_units,
+		     reserved_cost_micro_usd,schema_version
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+		 RETURNING id`,
+		identity.TenantID, identity.UserID, identity.TaskID, runSnapshotID,
+		row.ID, stepID, identity.TemporalRunID, planRef.PlanDigest, ordinal,
+		step.InvocationID, step.ToolName, requestDigest, planRef.ToolPolicyDigest,
+		grant.BudgetBucket, researchRunQuotaUnitsV3, grant.MaxCostMicroUSD,
+		researchRunSpendReservationSchemaV3,
+	).Scan(&reservationID)
+	if err != nil {
+		return ResearchRunStepExecutionV3{}, researchRunDatabaseError("seal research spend reservation", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ResearchRunStepExecutionV3{}, researchRunDatabaseError("commit research step start", err)
 	}
 	return ResearchRunStepExecutionV3{
-		StepID: stepID, FirstWriter: true,
+		StepID: stepID, SpendReservationID: reservationID, FirstWriter: true,
 		Ordinal: ordinal, InvocationID: step.InvocationID,
 		ToolName: step.ToolName, Arguments: append(json.RawMessage(nil), step.Arguments...),
-		RequestDigest: requestDigest,
+		RequestDigest: requestDigest, ReservedQuotaUnits: researchRunQuotaUnitsV3,
+		ReservedCostMicroUSD: grant.MaxCostMicroUSD,
 	}, nil
 }
 
@@ -616,7 +703,7 @@ func (s *Store) LoadResearchRunStepResolutionV3(
 		ordinal < 0 || ordinal >= planRef.StepCount {
 		return ResearchRunStepResolutionV3{}, researchRunValidationError("research step recovery scope is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return ResearchRunStepResolutionV3{}, researchRunDatabaseError("begin research step recovery", err)
 	}
@@ -698,6 +785,11 @@ func (s *Store) LoadResearchRunStepResolutionV3(
 		terminal.ErrorCode = *errorCode
 	}
 	resolution.Phase, resolution.Receipt = terminal.Phase, terminal
+	if err := validateResearchRunSpendSettlementV3(
+		ctx, tx, identity, runSnapshotID, row.ID, planRef.PlanDigest,
+		terminal, nil); err != nil {
+		return ResearchRunStepResolutionV3{}, err
+	}
 	if terminal.Phase == ResearchRunStepCompletedV3 {
 		var evidence ResearchRunEvidenceV3
 		evidence.Ordinal = ordinal
@@ -748,7 +840,7 @@ func (s *Store) CommitResearchRunStepV3(
 	if err := validateResearchRunStepCommitV3(params); err != nil {
 		return ResearchRunStepReceiptV3{}, err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return ResearchRunStepReceiptV3{}, researchRunDatabaseError("begin research step receipt transaction", err)
 	}
@@ -757,6 +849,18 @@ func (s *Store) CommitResearchRunStepV3(
 		return ResearchRunStepReceiptV3{}, researchRunDatabaseError("lock research schema admission", err)
 	}
 	if err := setResearchRunScopeV3(ctx, tx, params.Identity.TenantID, params.Identity.UserID); err != nil {
+		return ResearchRunStepReceiptV3{}, err
+	}
+	if exists, err := lockTenantAdmissionRootShared(ctx, tx,
+		params.Identity.TenantID); err != nil {
+		return ResearchRunStepReceiptV3{}, researchRunDatabaseError(
+			"lock research settlement tenant admission", err)
+	} else if !exists {
+		return ResearchRunStepReceiptV3{}, researchRunValidationError(
+			"research settlement tenant is unavailable")
+	}
+	if err := lockResearchRunSpendBudgetV3(ctx, tx, params.Identity.TemporalRunID,
+		params.PlanRef.PlanDigest); err != nil {
 		return ResearchRunStepReceiptV3{}, err
 	}
 	if err := lockResearchRunStepV3(ctx, tx, params.Identity.TemporalRunID, params.PlanRef.PlanDigest, params.Ordinal); err != nil {
@@ -771,16 +875,69 @@ func (s *Store) CommitResearchRunStepV3(
 		return ResearchRunStepReceiptV3{}, researchRunValidationError("research step ordinal is outside the plan")
 	}
 	step := plan.Steps[params.Ordinal]
+	if err := validateResearchProviderTraceV3(
+		params.Identity, params.RunSnapshotID, params.PlanRef.PlanDigest,
+		params.Ordinal, step, params.ProviderCall); err != nil {
+		return ResearchRunStepReceiptV3{}, err
+	}
 	requestDigest := digestResearchRunStepRequestV3(params.Ordinal, step)
+	var startedStepID int64
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM research_run_steps
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND plan_id=$4
+		    AND temporal_run_id=$5 AND plan_digest=$6 AND step_ordinal=$7
+		    AND phase='started' AND invocation_id=$8 AND tool_name=$9
+		    AND request_digest=$10`,
+		params.Identity.TenantID, params.Identity.UserID, params.Identity.TaskID,
+		row.ID, params.Identity.TemporalRunID, params.PlanRef.PlanDigest,
+		params.Ordinal, step.InvocationID, step.ToolName, requestDigest,
+	).Scan(&startedStepID); errors.Is(err, pgx.ErrNoRows) {
+		return ResearchRunStepReceiptV3{}, researchRunValidationError(
+			"research terminal step has no immutable start")
+	} else if err != nil {
+		return ResearchRunStepReceiptV3{}, researchRunDatabaseError(
+			"load research terminal start", err)
+	}
+	reservation, err := loadResearchRunSpendReservationV3(
+		ctx, tx, params.Identity, row.ID, startedStepID, params.Ordinal, requestDigest)
+	if err != nil {
+		return ResearchRunStepReceiptV3{}, err
+	}
+	if err := params.ProviderCall.validateForTerminal(
+		params.Phase, params.CostMicroUSD,
+		reservation.ReservedCostMicroUSD); err != nil {
+		return ResearchRunStepReceiptV3{}, err
+	}
 	if receipt, found, err := loadResearchRunTerminalStepV3(
 		ctx, tx, params, row.ID, step, requestDigest,
 	); err != nil {
 		return ResearchRunStepReceiptV3{}, err
 	} else if found {
+		if err := validateResearchRunSpendSettlementV3(
+			ctx, tx, params.Identity, params.RunSnapshotID, row.ID,
+			params.PlanRef.PlanDigest, receipt, &params.ProviderCall); err != nil {
+			return ResearchRunStepReceiptV3{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ResearchRunStepReceiptV3{}, researchRunDatabaseError("commit research step replay", err)
 		}
 		return receipt, nil
+	}
+	var toolCallID *int64
+	actualQuotaUnits := researchRunQuotaUnitsV3
+	if params.ProviderCall.Attempted {
+		sealedToolCallID, err := insertResearchProviderToolCallV3(
+			ctx, tx, params.Identity, reservation, params.ProviderCall.TraceID,
+			step.Arguments, nil, 0, params.ErrorCode, params.ProviderCall)
+		if err != nil {
+			return ResearchRunStepReceiptV3{}, err
+		}
+		toolCallID = &sealedToolCallID
+	} else {
+		// The immutable zero-usage settlement is the refund authority. Migration
+		// 090 applies the matching quota compensation in an AFTER INSERT trigger,
+		// so application code never recovers the schema-owner role.
+		actualQuotaUnits = 0
 	}
 	var stepID int64
 	err = tx.QueryRow(ctx,
@@ -799,6 +956,19 @@ func (s *Store) CommitResearchRunStepV3(
 	).Scan(&stepID)
 	if err != nil {
 		return ResearchRunStepReceiptV3{}, researchRunDatabaseError("seal research step terminal receipt", err)
+	}
+	pricingStatus := "unpriced"
+	currency := "USD"
+	if params.ProviderCall.Attempted && params.ProviderCall.CostKnown {
+		pricingStatus = params.ProviderCall.PricingStatus
+		currency = params.ProviderCall.CostCurrency
+	} else if params.ProviderCall.Attempted {
+		pricingStatus = "estimated"
+	}
+	if err := insertResearchRunSpendSettlementV3(
+		ctx, tx, params.Identity, reservation, stepID, params.Phase, toolCallID,
+		params.CostMicroUSD, actualQuotaUnits, pricingStatus, currency); err != nil {
+		return ResearchRunStepReceiptV3{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ResearchRunStepReceiptV3{}, researchRunDatabaseError("commit research step terminal receipt", err)
@@ -820,7 +990,7 @@ func (s *Store) CommitResearchRunStepEvidenceV3(
 		Phase: ResearchRunStepCompletedV3, ResultDigest: resultDigest,
 		CostMicroUSD: params.CostMicroUSD,
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
 	if err != nil {
 		return ResearchRunStepEvidenceReceiptV3{}, researchRunDatabaseError("begin research evidence transaction", err)
 	}
@@ -829,6 +999,18 @@ func (s *Store) CommitResearchRunStepEvidenceV3(
 		return ResearchRunStepEvidenceReceiptV3{}, researchRunDatabaseError("lock research schema admission", err)
 	}
 	if err := setResearchRunScopeV3(ctx, tx, params.Identity.TenantID, params.Identity.UserID); err != nil {
+		return ResearchRunStepEvidenceReceiptV3{}, err
+	}
+	if exists, err := lockTenantAdmissionRootShared(ctx, tx,
+		params.Identity.TenantID); err != nil {
+		return ResearchRunStepEvidenceReceiptV3{}, researchRunDatabaseError(
+			"lock research evidence tenant admission", err)
+	} else if !exists {
+		return ResearchRunStepEvidenceReceiptV3{}, researchRunValidationError(
+			"research evidence tenant is unavailable")
+	}
+	if err := lockResearchRunSpendBudgetV3(ctx, tx, params.Identity.TemporalRunID,
+		params.PlanRef.PlanDigest); err != nil {
 		return ResearchRunStepEvidenceReceiptV3{}, err
 	}
 	if err := lockResearchRunStepV3(ctx, tx, params.Identity.TemporalRunID,
@@ -844,12 +1026,22 @@ func (s *Store) CommitResearchRunStepEvidenceV3(
 		return ResearchRunStepEvidenceReceiptV3{}, researchRunValidationError("research evidence ordinal is outside the plan")
 	}
 	step := plan.Steps[params.Ordinal]
+	if err := validateResearchProviderTraceV3(
+		params.Identity, params.RunSnapshotID, params.PlanRef.PlanDigest,
+		params.Ordinal, step, params.ProviderCall); err != nil {
+		return ResearchRunStepEvidenceReceiptV3{}, err
+	}
 	requestDigest := digestResearchRunStepRequestV3(params.Ordinal, step)
 	if terminal, found, err := loadResearchRunTerminalStepV3(
 		ctx, tx, terminalParams, row.ID, step, requestDigest,
 	); err != nil {
 		return ResearchRunStepEvidenceReceiptV3{}, err
 	} else if found {
+		if err := validateResearchRunSpendSettlementV3(
+			ctx, tx, params.Identity, params.RunSnapshotID, row.ID,
+			params.PlanRef.PlanDigest, terminal, &params.ProviderCall); err != nil {
+			return ResearchRunStepEvidenceReceiptV3{}, err
+		}
 		receipt, err := loadResearchRunEvidenceReceiptV3(
 			ctx, tx, params, terminal, row.ID, step, requestDigest, resultDigest)
 		if err != nil {
@@ -874,6 +1066,26 @@ func (s *Store) CommitResearchRunStepEvidenceV3(
 		return ResearchRunStepEvidenceReceiptV3{}, researchRunValidationError("research evidence has no immutable start")
 	} else if err != nil {
 		return ResearchRunStepEvidenceReceiptV3{}, researchRunDatabaseError("load research evidence start", err)
+	}
+	reservation, err := loadResearchRunSpendReservationV3(
+		ctx, tx, params.Identity, row.ID, startedStepID, params.Ordinal, requestDigest)
+	if err != nil {
+		return ResearchRunStepEvidenceReceiptV3{}, err
+	}
+	if reservation.RunSnapshotID != params.RunSnapshotID ||
+		reservation.PlanDigest != params.PlanRef.PlanDigest ||
+		reservation.InvocationID != step.InvocationID || reservation.ToolName != step.ToolName {
+		return ResearchRunStepEvidenceReceiptV3{}, researchRunIntegrityError()
+	}
+	if params.CostMicroUSD > reservation.ReservedCostMicroUSD {
+		return ResearchRunStepEvidenceReceiptV3{}, researchRunValidationError(
+			"completed research spend exceeds its frozen Tool cap")
+	}
+	toolCallID, err := insertResearchProviderToolCallV3(
+		ctx, tx, params.Identity, reservation, params.ProviderCall.TraceID,
+		step.Arguments, params.Result, params.OriginalSize, "", params.ProviderCall)
+	if err != nil {
+		return ResearchRunStepEvidenceReceiptV3{}, err
 	}
 	truncated := params.OriginalSize > len(params.Result)
 	var evidenceID int64
@@ -906,6 +1118,14 @@ func (s *Store) CommitResearchRunStepEvidenceV3(
 		resultDigest, params.CostMicroUSD, researchRunStepSchemaV3,
 	).Scan(&terminalStepID); err != nil {
 		return ResearchRunStepEvidenceReceiptV3{}, researchRunDatabaseError("seal completed research step", err)
+	}
+	if err := insertResearchRunSpendSettlementV3(
+		ctx, tx, params.Identity, reservation, terminalStepID,
+		ResearchRunStepCompletedV3, &toolCallID, params.CostMicroUSD,
+		researchRunQuotaUnitsV3, params.ProviderCall.PricingStatus,
+		params.ProviderCall.CostCurrency,
+	); err != nil {
+		return ResearchRunStepEvidenceReceiptV3{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ResearchRunStepEvidenceReceiptV3{}, researchRunDatabaseError("commit research Tool evidence", err)
@@ -973,30 +1193,29 @@ func insertResearchRunPlanV3(
 
 func validateResearchPlanSnapshotPolicyV3(
 	ctx context.Context, tx pgx.Tx, params CreateOrGetResearchRunPlanV3Params,
-) error {
-	var capabilityDigest, toolPolicyDigest, definitionDigest string
-	err := tx.QueryRow(ctx,
-		`SELECT capability_catalog_digest,tool_policy_digest,definition_digest
-		   FROM task_run_snapshots
-		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4
-		    AND temporal_workflow_id=$5 AND temporal_run_id=$6
-		    AND reference_schema_version=$7`,
-		params.RunSnapshotID, params.Identity.TenantID, params.Identity.UserID,
-		params.Identity.TaskID, params.Identity.TemporalWorkflowID,
-		params.Identity.TemporalRunID, types.ResearchRunSnapshotRefSchemaV3,
-	).Scan(&capabilityDigest, &toolPolicyDigest, &definitionDigest)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return researchRunValidationError("research plan snapshot is unavailable")
-	}
+) (types.PlannerBudget, error) {
+	row, found, err := loadResearchRunSnapshotRowV3(ctx, tx,
+		CreateOrGetTaskRunSnapshotParams{
+			TenantID: params.Identity.TenantID, UserID: params.Identity.UserID,
+			TaskID:             params.Identity.TaskID,
+			TemporalWorkflowID: params.Identity.TemporalWorkflowID,
+			TemporalRunID:      params.Identity.TemporalRunID,
+		})
 	if err != nil {
-		return researchRunDatabaseError("validate research plan snapshot policy", err)
+		return types.PlannerBudget{}, err
 	}
-	if capabilityDigest != params.Plan.CapabilityCatalogDigest ||
-		toolPolicyDigest != params.Plan.ToolPolicyDigest ||
-		definitionDigest != params.Plan.DefinitionDigest {
-		return researchRunIntegrityError()
+	if !found || row.ID != params.RunSnapshotID {
+		return types.PlannerBudget{}, researchRunValidationError(
+			"research plan snapshot is unavailable")
 	}
-	return nil
+	ref, err := validateStoredResearchRunSnapshotV3(params.Identity, row)
+	if err != nil || ref.SnapshotID != params.RunSnapshotID ||
+		ref.CapabilityCatalogDigest != params.Plan.CapabilityCatalogDigest ||
+		ref.ToolPolicyDigest != params.Plan.ToolPolicyDigest ||
+		ref.DefinitionDigest != params.Plan.DefinitionDigest {
+		return types.PlannerBudget{}, researchRunIntegrityError()
+	}
+	return ref.PlannerBudget, nil
 }
 
 func loadResearchRunPlanV3(
@@ -1103,26 +1322,26 @@ func loadAndValidateResearchRunPlanV3(
 }
 
 func authorizeResearchRunEffectV3(ctx context.Context, tx pgx.Tx, identity types.RunIdentity) error {
-	var authorized bool
+	var authorized int
 	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (
-		     SELECT 1 FROM schedules schedule
-		     JOIN tenants tenant ON tenant.id=schedule.tenant_id AND tenant.status='active'
-		     JOIN memberships membership
-		       ON membership.tenant_id=schedule.tenant_id AND membership.user_id=schedule.user_id
-		    WHERE schedule.id=$1 AND schedule.tenant_id=$2 AND schedule.user_id=$3
-		      AND (schedule.status='active' OR (
-		          schedule.status='paused' AND public.authorize_manual_task_run_v1(
-		              schedule.tenant_id,schedule.user_id,schedule.id,$4
-		          )
-		      )) AND schedule.execution_mode='discover_at_run'
-		 )`, identity.TaskID, identity.TenantID, identity.UserID,
+		`SELECT 1 FROM schedules schedule
+		 JOIN tenants tenant ON tenant.id=schedule.tenant_id AND tenant.status='active'
+		 JOIN memberships membership
+		   ON membership.tenant_id=schedule.tenant_id AND membership.user_id=schedule.user_id
+		WHERE schedule.id=$1 AND schedule.tenant_id=$2 AND schedule.user_id=$3
+		  AND (schedule.status='active' OR (
+		      schedule.status='paused' AND public.authorize_manual_task_run_v1(
+		          schedule.tenant_id,schedule.user_id,schedule.id,$4
+		      )
+		  )) AND schedule.execution_mode='discover_at_run'
+		FOR SHARE OF schedule,tenant,membership`,
+		identity.TaskID, identity.TenantID, identity.UserID,
 		identity.TemporalWorkflowID).Scan(&authorized); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return types.NewAppError(types.CodeValidation,
+				"research run 当前不允许外部调用", types.ErrValidation)
+		}
 		return researchRunDatabaseError("authorize research run effect", err)
-	}
-	if !authorized {
-		return types.NewAppError(types.CodeValidation,
-			"research run 当前不允许外部调用", types.ErrValidation)
 	}
 	return nil
 }
@@ -1149,8 +1368,29 @@ func validateResearchRunStepEvidenceCommitV3(
 		bytes.IndexByte(params.Result, 0) >= 0 ||
 		params.OriginalSize < len(params.Result) || params.OriginalSize > 2147483647 ||
 		(params.TrustType != "local" && params.TrustType != "external") ||
-		params.CostMicroUSD < 0 {
+		params.CostMicroUSD < 0 ||
+		params.ProviderCall.validateForCompleted(params.CostMicroUSD) != nil {
 		return researchRunValidationError("research Tool evidence is invalid")
+	}
+	return nil
+}
+
+func validateResearchProviderTraceV3(
+	identity types.RunIdentity,
+	runSnapshotID int64,
+	planDigest string,
+	ordinal int,
+	step runcontext.ResearchPlanStepV3,
+	call ResearchProviderCallV3,
+) error {
+	if !call.Attempted {
+		return nil
+	}
+	expected, err := runcontext.ResearchExecutionTraceV3(
+		identity, runSnapshotID, planDigest, ordinal, step.InvocationID)
+	if err != nil || call.TraceID != expected {
+		return researchRunValidationError(
+			"research provider receipt does not match its immutable plan step")
 	}
 	return nil
 }
@@ -1283,7 +1523,7 @@ func setResearchRunScopeV3(ctx context.Context, tx pgx.Tx, tenantID, userID int6
 		strconv.FormatInt(tenantID, 10), strconv.FormatInt(userID, 10)); err != nil {
 		return researchRunDatabaseError("set research run scope", err)
 	}
-	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+researchRuntimeCapabilityRole); err != nil {
 		return researchRunDatabaseError("enter research run role", err)
 	}
 	return nil

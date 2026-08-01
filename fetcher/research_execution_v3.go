@@ -14,6 +14,7 @@ import (
 
 	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
@@ -46,27 +47,18 @@ const (
 	ResearchExecutionProviderUsageUnknownV3 ResearchExecutionErrorCodeV3 = "provider_usage_unknown"
 )
 
-// ResearchEffectV3 is the conservative reservation presented immediately
-// before the one provider call. MaxCostMicroUSD is the frozen admission cap,
-// not a prediction or an assertion about the eventual provider charge.
-type ResearchEffectV3 struct {
-	Provider        string  `json:"provider"`
-	BudgetBucket    string  `json:"budget_bucket"`
-	UsageQuantity   float64 `json:"usage_quantity"`
-	MaxCostMicroUSD int64   `json:"max_cost_micro_usd"`
-}
-
-type ResearchBeforeEffectV3 func(context.Context, ResearchEffectV3) error
-
 // ResearchExecutionRequestV3 contains the already-frozen Tool grant and
 // canonical arguments. FirstWriter is mandatory: a recovery path that did not
 // create the immutable started step must load the durable receipt and never
-// enter this network executor.
+// enter this network executor. Store.BeginResearchRunStepV3 is the single
+// durable effect gate; the executor deliberately has no second callback that
+// could disagree with or bypass that claim.
 type ResearchExecutionRequestV3 struct {
 	FirstWriter   bool                                   `json:"first_writer"`
 	Identity      types.RunIdentity                      `json:"identity"`
 	RunSnapshotID int64                                  `json:"run_snapshot_id"`
 	PlanDigest    string                                 `json:"plan_digest"`
+	Ordinal       int                                    `json:"ordinal"`
 	InvocationID  string                                 `json:"invocation_id"`
 	Tool          runtimepolicy.ResearchToolDefinitionV3 `json:"tool"`
 	Arguments     json.RawMessage                        `json:"arguments"`
@@ -78,6 +70,7 @@ type ResearchExecutionRequestV3 struct {
 // present and therefore can never be mistaken for model-visible evidence.
 type ResearchExecutionReceiptV3 struct {
 	Status               ResearchExecutionStatusV3    `json:"status"`
+	TraceID              string                       `json:"trace_id,omitempty"`
 	Provider             string                       `json:"provider,omitempty"`
 	Attempted            bool                         `json:"attempted"`
 	UsageQuantity        float64                      `json:"usage_quantity"`
@@ -86,6 +79,7 @@ type ResearchExecutionReceiptV3 struct {
 	CostKnown            bool                         `json:"cost_known"`
 	ProviderTruncated    bool                         `json:"provider_truncated"`
 	HTTPStatus           *int                         `json:"http_status,omitempty"`
+	DurationMS           int                          `json:"duration_ms"`
 	Result               []byte                       `json:"result,omitempty"`
 	NormalizedResultSize int                          `json:"normalized_result_size"`
 	ModelResultTruncated bool                         `json:"model_result_truncated"`
@@ -99,6 +93,12 @@ func (r ResearchExecutionReceiptV3) Validate() error {
 	if r.Provider != "" && r.Provider != "exa" {
 		return types.NewAppError(types.CodeValidation,
 			"research V3 provider receipt is invalid", nil)
+	}
+	if r.DurationMS < 0 || r.DurationMS > 86_400_000 ||
+		(r.Attempted && !validResearchDigestV3(r.TraceID)) ||
+		(!r.Attempted && (r.TraceID != "" || r.DurationMS != 0)) {
+		return types.NewAppError(types.CodeValidation,
+			"research V3 provider trace receipt is invalid", nil)
 	}
 	if r.HTTPStatus != nil && (*r.HTTPStatus < 100 || *r.HTTPStatus > 599) {
 		return types.NewAppError(types.CodeValidation,
@@ -177,7 +177,6 @@ func NewResearchExecutorV3(cfg config.FetchConfig) (*ResearchExecutorV3, error) 
 func (e *ResearchExecutorV3) ExecuteOnceV3(
 	ctx context.Context,
 	req ResearchExecutionRequestV3,
-	beforeEffect ResearchBeforeEffectV3,
 ) ResearchExecutionReceiptV3 {
 	if !req.FirstWriter {
 		return researchFailureReceiptV3(
@@ -227,20 +226,9 @@ func (e *ResearchExecutorV3) ExecuteOnceV3(
 	defer e.recorder.end(callKey)
 
 	admitted := false
-	gate := func(effectCtx context.Context) error {
-		if beforeEffect == nil {
-			return types.NewAppError(types.CodeValidation,
-				"research V3 effect reservation is unavailable", nil)
-		}
-		err := beforeEffect(effectCtx, ResearchEffectV3{
-			Provider: "exa", BudgetBucket: req.Tool.BudgetBucket,
-			UsageQuantity:   researchExpectedUsageV3(req.Tool.Name),
-			MaxCostMicroUSD: req.Tool.MaxCostMicroUSD,
-		})
-		if err == nil {
-			admitted = true
-		}
-		return err
+	gate := func(context.Context) error {
+		admitted = true
+		return nil
 	}
 	callCtx := WithBindingRunAttribution(
 		ctx, callKey, req.Identity.TenantID, req.Identity.UserID, req.RunSnapshotID)
@@ -265,14 +253,14 @@ func (e *ResearchExecutorV3) ExecuteOnceV3(
 				ResearchExecutionDefiniteFailureV3, "exa", false,
 				ResearchExecutionEffectDeniedV3)
 		}
-		return e.failedProviderReceiptV3(providerReceipt, recorded)
+		return e.failedProviderReceiptV3(providerReceipt, recorded, callKey)
 	}
 	if !admitted {
 		return researchFailureReceiptV3(
 			ResearchExecutionDefiniteFailureV3, "exa", false,
 			ResearchExecutionEffectDeniedV3)
 	}
-	return e.successProviderReceiptV3(req.Tool, items, providerReceipt, recorded)
+	return e.successProviderReceiptV3(req.Tool, items, providerReceipt, recorded, callKey)
 }
 
 func (e *ResearchExecutorV3) matchesFrozenRouteV3(
@@ -292,12 +280,14 @@ func (e *ResearchExecutorV3) matchesFrozenRouteV3(
 }
 
 func (e *ResearchExecutorV3) failedProviderReceiptV3(
-	call types.ToolCall, recorded bool,
+	call types.ToolCall, recorded bool, callKey string,
 ) ResearchExecutionReceiptV3 {
 	if !recorded {
-		return researchFailureReceiptV3(
+		receipt := researchFailureReceiptV3(
 			ResearchExecutionIndeterminateV3, "exa", true,
 			ResearchExecutionProviderReceiptV3)
+		receipt.TraceID = callKey
+		return receipt
 	}
 	receipt := researchReceiptFromCallV3(call)
 	receipt.Status = ResearchExecutionIndeterminateV3
@@ -317,11 +307,14 @@ func (e *ResearchExecutorV3) successProviderReceiptV3(
 	items []types.ContentItem,
 	call types.ToolCall,
 	recorded bool,
+	callKey string,
 ) ResearchExecutionReceiptV3 {
 	if !recorded {
-		return researchFailureReceiptV3(
+		receipt := researchFailureReceiptV3(
 			ResearchExecutionIndeterminateV3, "exa", true,
 			ResearchExecutionProviderReceiptV3)
+		receipt.TraceID = callKey
+		return receipt
 	}
 	receipt := researchReceiptFromCallV3(call)
 	if call.ResultSize > e.providerBodyCapV3(call.ToolName) {
@@ -401,9 +394,10 @@ func researchDocumentsV3(items []types.ContentItem) []researchDocumentV3 {
 
 func researchReceiptFromCallV3(call types.ToolCall) ResearchExecutionReceiptV3 {
 	receipt := ResearchExecutionReceiptV3{
-		Provider: "exa", Attempted: true,
+		TraceID: call.TraceID, Provider: "exa", Attempted: true,
 		UsageQuantity: call.UsageQuantity,
 		UsageKnown:    finitePositiveV3(call.UsageQuantity),
+		DurationMS:    call.DurationMs,
 	}
 	if call.HTTPStatus != nil && *call.HTTPStatus > 0 {
 		status := *call.HTTPStatus
@@ -430,13 +424,6 @@ func researchFailureReceiptV3(
 	}
 }
 
-func researchExpectedUsageV3(toolName string) float64 {
-	if toolName == "web_search" {
-		return exaDefaultNumResults
-	}
-	return 1
-}
-
 func finitePositiveV3(value float64) bool {
 	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
@@ -454,25 +441,27 @@ func validResearchDigestV3(value string) bool {
 	return err == nil
 }
 
+// ResearchExecutionTraceV3 derives the immutable provider-call claim shared by
+// the network executor and the persistence coordinator. A receipt is valid for
+// exactly one authenticated run snapshot, frozen plan, and invocation.
+func ResearchExecutionTraceV3(
+	identity types.RunIdentity,
+	runSnapshotID int64,
+	planDigest string,
+	ordinal int,
+	invocationID string,
+) (string, error) {
+	return runcontext.ResearchExecutionTraceV3(
+		identity, runSnapshotID, planDigest, ordinal, invocationID)
+}
+
 func researchCallKeyV3(req ResearchExecutionRequestV3) string {
-	payload, err := json.Marshal(struct {
-		TenantID      int64  `json:"tenant_id"`
-		UserID        int64  `json:"user_id"`
-		TemporalRunID string `json:"temporal_run_id"`
-		RunSnapshotID int64  `json:"run_snapshot_id"`
-		PlanDigest    string `json:"plan_digest"`
-		InvocationID  string `json:"invocation_id"`
-	}{
-		TenantID: req.Identity.TenantID, UserID: req.Identity.UserID,
-		TemporalRunID: req.Identity.TemporalRunID,
-		RunSnapshotID: req.RunSnapshotID, PlanDigest: req.PlanDigest,
-		InvocationID: req.InvocationID,
-	})
+	traceID, err := ResearchExecutionTraceV3(
+		req.Identity, req.RunSnapshotID, req.PlanDigest, req.Ordinal, req.InvocationID)
 	if err != nil {
 		return ""
 	}
-	sum := sha256.Sum256(payload)
-	return hex.EncodeToString(sum[:])
+	return traceID
 }
 
 func researchReceiptMatchesRequestV3(

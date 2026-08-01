@@ -9,6 +9,8 @@ server:
 
 db:
   url: "" # VANE_DB_URL
+  # V3 专用非 owner LOGIN；留空会安全禁用 V3，不影响旧任务。
+  research_runtime_url: "" # VANE_DB_RESEARCH_RUNTIME_URL
 
 temporal:
   host: "127.0.0.1:7233"
