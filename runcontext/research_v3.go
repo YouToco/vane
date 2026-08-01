@@ -37,6 +37,7 @@ type ResearchExecutionPlanV3 struct {
 	SchemaVersion           string               `json:"schema_version"`
 	DefinitionDigest        string               `json:"definition_digest"`
 	CapabilityCatalogDigest string               `json:"capability_catalog_digest"`
+	ToolPolicyDigest        string               `json:"tool_policy_digest"`
 	Steps                   []ResearchPlanStepV3 `json:"steps"`
 }
 
@@ -46,33 +47,37 @@ type ResearchSnapshotV3 struct {
 	HistoryThroughUTC string
 	Definition        taskstate.ApprovedDefinitionV3
 	Policy            runtimepolicy.BundleV1
+	ResearchTools     runtimepolicy.ResearchToolPolicyV3
 }
 
 type ResearchSnapshotPayloadV3 struct {
-	SchemaVersion          string                         `json:"schema_version"`
-	TenantID               int64                          `json:"tenant_id"`
-	UserID                 int64                          `json:"user_id"`
-	TaskID                 string                         `json:"task_id"`
-	TemporalWorkflowID     string                         `json:"temporal_workflow_id"`
-	TemporalRunID          string                         `json:"temporal_run_id"`
-	RunKind                types.RunSnapshotKind          `json:"run_kind"`
-	Mode                   types.ExecutionMode            `json:"mode"`
-	DefinitionVersion      int64                          `json:"definition_version"`
-	DefinitionDigest       string                         `json:"definition_digest"`
-	HistoryThroughUTC      string                         `json:"history_through_utc"`
-	Policies               PolicyPayloadsV1               `json:"policies"`
-	PlannerBudget          types.PlannerBudget            `json:"planner_budget"`
-	Definition             taskstate.ApprovedDefinitionV3 `json:"definition"`
-	ReferenceSchemaVersion string                         `json:"reference_schema_version"`
+	SchemaVersion          string                             `json:"schema_version"`
+	TenantID               int64                              `json:"tenant_id"`
+	UserID                 int64                              `json:"user_id"`
+	TaskID                 string                             `json:"task_id"`
+	TemporalWorkflowID     string                             `json:"temporal_workflow_id"`
+	TemporalRunID          string                             `json:"temporal_run_id"`
+	RunKind                types.RunSnapshotKind              `json:"run_kind"`
+	Mode                   types.ExecutionMode                `json:"mode"`
+	DefinitionVersion      int64                              `json:"definition_version"`
+	DefinitionDigest       string                             `json:"definition_digest"`
+	HistoryThroughUTC      string                             `json:"history_through_utc"`
+	Policies               PolicyPayloadsV1                   `json:"policies"`
+	ResearchTools          runtimepolicy.ResearchToolPolicyV3 `json:"research_tools"`
+	PlannerBudget          types.PlannerBudget                `json:"planner_budget"`
+	Definition             taskstate.ApprovedDefinitionV3     `json:"definition"`
+	ReferenceSchemaVersion string                             `json:"reference_schema_version"`
 }
 
 type ResearchSnapshotSealV3 struct {
-	CanonicalPayload []byte
-	DefinitionDigest string
-	PolicyDigests    types.RuntimePolicyDigests
-	PayloadDigest    string
-	Payload          ResearchSnapshotPayloadV3
-	Policy           runtimepolicy.BundleV1
+	CanonicalPayload         []byte
+	DefinitionDigest         string
+	PolicyDigests            types.RuntimePolicyDigests
+	ResearchToolPolicyDigest string
+	PayloadDigest            string
+	Payload                  ResearchSnapshotPayloadV3
+	Policy                   runtimepolicy.BundleV1
+	ResearchTools            runtimepolicy.ResearchToolPolicyV3
 }
 
 func SealResearchSnapshotV3(snapshot ResearchSnapshotV3) (ResearchSnapshotSealV3, error) {
@@ -99,6 +104,16 @@ func SealResearchSnapshotV3(snapshot ResearchSnapshotV3) (ResearchSnapshotSealV3
 	if err != nil {
 		return ResearchSnapshotSealV3{}, err
 	}
+	researchToolPayload, err := runtimepolicy.EncodeResearchToolPolicyV3(snapshot.ResearchTools)
+	if err != nil {
+		return ResearchSnapshotSealV3{}, err
+	}
+	normalizedResearchTools, err := runtimepolicy.DecodeResearchToolPolicyV3(researchToolPayload)
+	if err != nil {
+		return ResearchSnapshotSealV3{}, err
+	}
+	researchToolSum := sha256.Sum256(researchToolPayload)
+	researchToolDigest := hex.EncodeToString(researchToolSum[:])
 	payload := ResearchSnapshotPayloadV3{
 		SchemaVersion: ResearchSnapshotPayloadSchemaV3,
 		TenantID:      identity.TenantID, UserID: identity.UserID, TaskID: identity.TaskID,
@@ -107,7 +122,8 @@ func SealResearchSnapshotV3(snapshot ResearchSnapshotV3) (ResearchSnapshotSealV3
 		Mode:              types.ExecutionModeDiscoverAtRun,
 		DefinitionVersion: snapshot.DefinitionVersion,
 		DefinitionDigest:  definitionDigest, HistoryThroughUTC: snapshot.HistoryThroughUTC,
-		Policies: policyPayloads, PlannerBudget: snapshot.Definition.PlannerBudget,
+		Policies: policyPayloads, ResearchTools: normalizedResearchTools,
+		PlannerBudget:          snapshot.Definition.PlannerBudget,
 		Definition:             snapshot.Definition,
 		ReferenceSchemaVersion: types.ResearchRunSnapshotRefSchemaV3,
 	}
@@ -118,7 +134,8 @@ func SealResearchSnapshotV3(snapshot ResearchSnapshotV3) (ResearchSnapshotSealV3
 	return ResearchSnapshotSealV3{
 		CanonicalPayload: canonical, DefinitionDigest: definitionDigest,
 		PolicyDigests: policyDigests, PayloadDigest: researchPayloadDigestV3(canonical),
-		Payload: payload, Policy: normalizedPolicy,
+		ResearchToolPolicyDigest: researchToolDigest,
+		Payload:                  payload, Policy: normalizedPolicy, ResearchTools: normalizedResearchTools,
 	}, nil
 }
 
@@ -143,12 +160,14 @@ func DecodeResearchSnapshotPayloadV3(payload []byte) (ResearchSnapshotSealV3, er
 		DefinitionVersion: decoded.DefinitionVersion,
 		HistoryThroughUTC: decoded.HistoryThroughUTC,
 		Definition:        decoded.Definition, Policy: policy,
+		ResearchTools: decoded.ResearchTools,
 	})
 	if err != nil || decoded.SchemaVersion != ResearchSnapshotPayloadSchemaV3 ||
 		decoded.Mode != types.ExecutionModeDiscoverAtRun ||
 		decoded.ReferenceSchemaVersion != types.ResearchRunSnapshotRefSchemaV3 ||
 		decoded.DefinitionDigest != sealed.DefinitionDigest ||
 		decoded.PlannerBudget != decoded.Definition.PlannerBudget ||
+		decoded.ResearchTools.Validate() != nil ||
 		!bytes.Equal(payload, sealed.CanonicalPayload) {
 		return ResearchSnapshotSealV3{}, invalidResearchPlan("snapshot payload integrity is invalid")
 	}
@@ -165,7 +184,7 @@ type ResearchToolCanonicalizerV3 func(string, json.RawMessage) (json.RawMessage,
 type researchExecutionPlanWireV3 ResearchExecutionPlanV3
 
 func BuildResearchExecutionPlanV3(
-	definitionDigest, capabilityCatalogDigest string,
+	definitionDigest, capabilityCatalogDigest, toolPolicyDigest string,
 	steps []ResearchPlanStepV3,
 	canonicalize ResearchToolCanonicalizerV3,
 ) (ResearchExecutionPlanV3, error) {
@@ -185,6 +204,7 @@ func BuildResearchExecutionPlanV3(
 		SchemaVersion:           ResearchExecutionPlanSchemaV3,
 		DefinitionDigest:        definitionDigest,
 		CapabilityCatalogDigest: capabilityCatalogDigest,
+		ToolPolicyDigest:        toolPolicyDigest,
 		Steps:                   prepared,
 	})
 	if err != nil {
@@ -253,6 +273,7 @@ func normalizeResearchExecutionPlanV3(
 	if plan.SchemaVersion != ResearchExecutionPlanSchemaV3 ||
 		!validResearchDigest(plan.DefinitionDigest) ||
 		!validResearchDigest(plan.CapabilityCatalogDigest) ||
+		!validResearchDigest(plan.ToolPolicyDigest) ||
 		len(plan.Steps) == 0 || len(plan.Steps) > maxResearchPlanSteps {
 		return ResearchExecutionPlanV3{}, invalidResearchPlan("plan envelope is invalid")
 	}

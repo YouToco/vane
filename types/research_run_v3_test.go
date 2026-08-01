@@ -63,7 +63,8 @@ func TestResearchRunPlanRefV3SealsAllScopeFields(t *testing.T) {
 		TemporalRunID:      identity.TemporalRunID, TenantID: identity.TenantID,
 		UserID: identity.UserID, TaskID: identity.TaskID,
 		DefinitionDigest: digest, CapabilityCatalogDigest: digest, PlanDigest: digest,
-		StepCount: 2,
+		ToolPolicyDigest: digest,
+		StepCount:        2,
 	})
 	if err != nil {
 		t.Fatal(err)

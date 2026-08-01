@@ -113,6 +113,7 @@ func (s *researchWorkflowV3Stubs) register(env *testsuite.TestWorkflowEnvironmen
 			UserID: in.UserID, TaskID: in.TaskID,
 			DefinitionDigest:        in.Snapshot.DefinitionDigest,
 			CapabilityCatalogDigest: in.Snapshot.CapabilityCatalogDigest,
+			ToolPolicyDigest:        in.Snapshot.ToolPolicyDigest,
 			PlanDigest:              strings.Repeat("b", 64),
 			StepCount:               2,
 		})

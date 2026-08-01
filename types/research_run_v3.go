@@ -153,6 +153,7 @@ type ResearchRunPlanRefV3 struct {
 	TaskID                  string `json:"task_id"`
 	DefinitionDigest        string `json:"definition_digest"`
 	CapabilityCatalogDigest string `json:"capability_catalog_digest"`
+	ToolPolicyDigest        string `json:"tool_policy_digest"`
 	PlanDigest              string `json:"plan_digest"`
 	StepCount               int    `json:"step_count"`
 	ReferenceDigest         string `json:"reference_digest"`
@@ -169,6 +170,7 @@ type researchRunPlanRefDigestV3 struct {
 	TaskID                  string `json:"task_id"`
 	DefinitionDigest        string `json:"definition_digest"`
 	CapabilityCatalogDigest string `json:"capability_catalog_digest"`
+	ToolPolicyDigest        string `json:"tool_policy_digest"`
 	PlanDigest              string `json:"plan_digest"`
 	StepCount               int    `json:"step_count"`
 }
@@ -212,7 +214,8 @@ func validateResearchRunPlanRefFieldsV3(r ResearchRunPlanRefV3, requireDigest bo
 		!boundedResearchRefText(r.TemporalWorkflowID, 512) ||
 		!boundedResearchRefText(r.TemporalRunID, 512) ||
 		!researchSHA256(r.DefinitionDigest) ||
-		!researchSHA256(r.CapabilityCatalogDigest) || !researchSHA256(r.PlanDigest) ||
+		!researchSHA256(r.CapabilityCatalogDigest) ||
+		!researchSHA256(r.ToolPolicyDigest) || !researchSHA256(r.PlanDigest) ||
 		r.StepCount <= 0 || r.StepCount > 16 ||
 		(requireDigest && !researchSHA256(r.ReferenceDigest)) {
 		return NewAppError(CodeValidation, "research plan 引用无效", ErrValidation)
@@ -226,7 +229,8 @@ func researchRunPlanReferenceDigestV3(r ResearchRunPlanRefV3) (string, error) {
 		RunSnapshotID: r.RunSnapshotID, TemporalWorkflowID: r.TemporalWorkflowID,
 		TemporalRunID: r.TemporalRunID, TenantID: r.TenantID, UserID: r.UserID,
 		TaskID: r.TaskID, DefinitionDigest: r.DefinitionDigest,
-		CapabilityCatalogDigest: r.CapabilityCatalogDigest, PlanDigest: r.PlanDigest,
+		CapabilityCatalogDigest: r.CapabilityCatalogDigest,
+		ToolPolicyDigest:        r.ToolPolicyDigest, PlanDigest: r.PlanDigest,
 		StepCount: r.StepCount,
 	})
 	if err != nil {

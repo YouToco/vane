@@ -38,6 +38,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 	ctx context.Context,
 	identity types.RunIdentity,
 	policy runtimepolicy.BundleV1,
+	researchTools runtimepolicy.ResearchToolPolicyV3,
 ) (types.ResearchRunSnapshotRefV3, error) {
 	if identity.RunKind != types.RunSnapshotKindScheduled || identity.TenantID <= 0 ||
 		identity.UserID <= 0 || identity.TaskID == "" ||
@@ -90,6 +91,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 	seal, err := runcontext.SealResearchSnapshotV3(runcontext.ResearchSnapshotV3{
 		Identity: identity, DefinitionVersion: definitionVersion,
 		HistoryThroughUTC: cutoffText, Definition: definition, Policy: policy,
+		ResearchTools: researchTools,
 	})
 	if err != nil || seal.DefinitionDigest != definitionDigest {
 		return types.ResearchRunSnapshotRefV3{}, researchRunIntegrityError()
@@ -104,7 +106,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		TenantID: identity.TenantID, UserID: identity.UserID, TaskID: identity.TaskID,
 		DefinitionVersion: definitionVersion, DefinitionDigest: definitionDigest,
 		CapabilityCatalogDigest: seal.PolicyDigests.CapabilityCatalogDigest,
-		ToolPolicyDigest:        seal.PolicyDigests.ToolPolicyDigest,
+		ToolPolicyDigest:        seal.ResearchToolPolicyDigest,
 		PromptPolicyDigest:      seal.PolicyDigests.PromptPolicyDigest,
 		ModelPolicyDigest:       seal.PolicyDigests.ModelPolicyDigest,
 		QuotaPolicyDigest:       seal.PolicyDigests.QuotaPolicyDigest,
@@ -126,7 +128,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		           $12,'',$13,$14,$15,$16,$17,$18)`,
 		snapshotID, identity.TenantID, identity.UserID, identity.TaskID,
 		identity.TemporalWorkflowID, identity.TemporalRunID,
-		seal.PolicyDigests.CapabilityCatalogDigest, seal.PolicyDigests.ToolPolicyDigest,
+		seal.PolicyDigests.CapabilityCatalogDigest, seal.ResearchToolPolicyDigest,
 		seal.PolicyDigests.PromptPolicyDigest, seal.PolicyDigests.ModelPolicyDigest,
 		seal.PolicyDigests.QuotaPolicyDigest, definitionDigest, seal.PayloadDigest,
 		ref.ReferenceDigest, types.ResearchRunSnapshotRefSchemaV3,
@@ -236,7 +238,7 @@ func validateStoredResearchRunSnapshotV3(
 	if err != nil || seal.PayloadDigest != snapshot.PayloadDigest ||
 		seal.DefinitionDigest != snapshot.DefinitionDigest ||
 		seal.PolicyDigests.CapabilityCatalogDigest != snapshot.CapabilityCatalogDigest ||
-		seal.PolicyDigests.ToolPolicyDigest != snapshot.ToolPolicyDigest ||
+		seal.ResearchToolPolicyDigest != snapshot.ToolPolicyDigest ||
 		seal.PolicyDigests.PromptPolicyDigest != snapshot.PromptPolicyDigest ||
 		seal.PolicyDigests.ModelPolicyDigest != snapshot.ModelPolicyDigest ||
 		seal.PolicyDigests.QuotaPolicyDigest != snapshot.QuotaPolicyDigest {
@@ -337,7 +339,8 @@ type CommitResearchRunStepV3Params struct {
 
 // CommitResearchRunStepEvidenceV3Params is the only success path for a V3
 // Tool step. Result contains exactly the UTF-8 bytes shown to the model after
-// runtime truncation; OriginalSize records the provider result size.
+// runtime truncation; OriginalSize records normalized pre-bound bytes. A
+// provider's own size/truncation belongs to its separately typed receipt.
 type CommitResearchRunStepEvidenceV3Params struct {
 	Identity      types.RunIdentity
 	RunSnapshotID int64
@@ -399,6 +402,7 @@ type researchRunPlanRowV3 struct {
 	TemporalRunID           string
 	DefinitionDigest        string
 	CapabilityCatalogDigest string
+	ToolPolicyDigest        string
 	PlanDigest              string
 	PlanPayload             []byte
 }
@@ -437,6 +441,9 @@ func (s *Store) CreateOrGetResearchRunPlanV3(
 			return types.ResearchRunPlanRefV3{}, researchRunValidationError("research plan payload is invalid")
 		}
 		planDigest := researchRunSHA256(payload)
+		if err := validateResearchPlanSnapshotPolicyV3(ctx, tx, params); err != nil {
+			return types.ResearchRunPlanRefV3{}, err
+		}
 		row, err = insertResearchRunPlanV3(ctx, tx, params, payload, planDigest)
 		if err != nil {
 			return types.ResearchRunPlanRefV3{}, err
@@ -857,7 +864,7 @@ func validateResearchPlanCreateV3(params CreateOrGetResearchRunPlanV3Params) err
 		return err
 	}
 	if params.Plan.Validate() != nil || params.Plan.DefinitionDigest == "" ||
-		params.Plan.CapabilityCatalogDigest == "" {
+		params.Plan.CapabilityCatalogDigest == "" || params.Plan.ToolPolicyDigest == "" {
 		return researchRunValidationError("research plan payload is invalid")
 	}
 	return nil
@@ -901,7 +908,36 @@ func insertResearchRunPlanV3(
 		}
 		return researchRunPlanRowV3{}, researchRunDatabaseError("insert research run plan", err)
 	}
+	row.ToolPolicyDigest = params.Plan.ToolPolicyDigest
 	return row, nil
+}
+
+func validateResearchPlanSnapshotPolicyV3(
+	ctx context.Context, tx pgx.Tx, params CreateOrGetResearchRunPlanV3Params,
+) error {
+	var capabilityDigest, toolPolicyDigest, definitionDigest string
+	err := tx.QueryRow(ctx,
+		`SELECT capability_catalog_digest,tool_policy_digest,definition_digest
+		   FROM task_run_snapshots
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4
+		    AND temporal_workflow_id=$5 AND temporal_run_id=$6
+		    AND reference_schema_version=$7`,
+		params.RunSnapshotID, params.Identity.TenantID, params.Identity.UserID,
+		params.Identity.TaskID, params.Identity.TemporalWorkflowID,
+		params.Identity.TemporalRunID, types.ResearchRunSnapshotRefSchemaV3,
+	).Scan(&capabilityDigest, &toolPolicyDigest, &definitionDigest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return researchRunValidationError("research plan snapshot is unavailable")
+	}
+	if err != nil {
+		return researchRunDatabaseError("validate research plan snapshot policy", err)
+	}
+	if capabilityDigest != params.Plan.CapabilityCatalogDigest ||
+		toolPolicyDigest != params.Plan.ToolPolicyDigest ||
+		definitionDigest != params.Plan.DefinitionDigest {
+		return researchRunIntegrityError()
+	}
+	return nil
 }
 
 func loadResearchRunPlanV3(
@@ -939,6 +975,19 @@ func loadResearchRunPlanV3(
 		plan.CapabilityCatalogDigest != row.CapabilityCatalogDigest {
 		return researchRunPlanRowV3{}, false, researchRunIntegrityError()
 	}
+	var snapshotToolPolicyDigest string
+	if err := tx.QueryRow(ctx,
+		`SELECT tool_policy_digest FROM task_run_snapshots
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4
+		    AND temporal_workflow_id=$5 AND temporal_run_id=$6
+		    AND reference_schema_version=$7`,
+		snapshotID, identity.TenantID, identity.UserID, identity.TaskID,
+		identity.TemporalWorkflowID, identity.TemporalRunID,
+		types.ResearchRunSnapshotRefSchemaV3,
+	).Scan(&snapshotToolPolicyDigest); err != nil || plan.ToolPolicyDigest != snapshotToolPolicyDigest {
+		return researchRunPlanRowV3{}, false, researchRunIntegrityError()
+	}
+	row.ToolPolicyDigest = plan.ToolPolicyDigest
 	return row, true, nil
 }
 
@@ -964,6 +1013,7 @@ func researchRunPlanRefV3(row researchRunPlanRowV3) (types.ResearchRunPlanRefV3,
 		TenantID: row.TenantID, UserID: row.UserID, TaskID: row.TaskID,
 		DefinitionDigest:        row.DefinitionDigest,
 		CapabilityCatalogDigest: row.CapabilityCatalogDigest,
+		ToolPolicyDigest:        row.ToolPolicyDigest,
 		PlanDigest:              row.PlanDigest,
 		StepCount:               len(plan.Steps),
 	})
@@ -979,12 +1029,14 @@ func loadAndValidateResearchRunPlanV3(
 	}
 	if !found || row.ID != ref.PlanID || row.PlanDigest != ref.PlanDigest ||
 		row.DefinitionDigest != ref.DefinitionDigest ||
-		row.CapabilityCatalogDigest != ref.CapabilityCatalogDigest {
+		row.CapabilityCatalogDigest != ref.CapabilityCatalogDigest ||
+		row.ToolPolicyDigest != ref.ToolPolicyDigest {
 		return runcontext.ResearchExecutionPlanV3{}, researchRunPlanRowV3{}, researchRunConflictError()
 	}
 	plan, err := runcontext.DecodeResearchExecutionPlanV3(row.PlanPayload)
 	if err != nil || plan.DefinitionDigest != row.DefinitionDigest ||
 		plan.CapabilityCatalogDigest != row.CapabilityCatalogDigest ||
+		plan.ToolPolicyDigest != row.ToolPolicyDigest ||
 		len(plan.Steps) != ref.StepCount {
 		return runcontext.ResearchExecutionPlanV3{}, researchRunPlanRowV3{}, researchRunIntegrityError()
 	}

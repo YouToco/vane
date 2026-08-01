@@ -105,7 +105,7 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		TenantID: tenantID, UserID: userID, TaskID: taskID,
 	}
 	snapshotRef, err := st.CreateOrGetResearchRunSnapshotV3(
-		ctx, identity, testCompiledRunPolicyV1(t))
+		ctx, identity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.CreateOrGetResearchRunSnapshotV3(
-		ctx, mismatchIdentity, testCompiledRunPolicyV1(t)); err == nil {
+		ctx, mismatchIdentity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t)); err == nil {
 		t.Fatal("definition schedule drift created a V3 snapshot")
 	}
 	if _, err := st.pool.Exec(ctx, `UPDATE schedules SET spec_json=$2 WHERE id=$1`,
@@ -143,13 +143,13 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	// Response-loss recovery reads the committed snapshot before consulting a
 	// changed/invalid worker policy.
 	replayedSnapshot, err := st.CreateOrGetResearchRunSnapshotV3(
-		ctx, identity, runtimepolicy.BundleV1{})
+		ctx, identity, runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{})
 	if err != nil || replayedSnapshot != snapshotRef {
 		t.Fatalf("snapshot first-writer replay=%+v err=%v", replayedSnapshot, err)
 	}
 	snapshotID := snapshotRef.SnapshotID
 	plan := researchRunPlanFixtureV3(t, digestA,
-		snapshotRef.CapabilityCatalogDigest, "Kimi pricing")
+		snapshotRef.CapabilityCatalogDigest, snapshotRef.ToolPolicyDigest, "Kimi pricing")
 	// Store and trigger both reject a plan bound to a non-V3 snapshot schema.
 	if _, err := st.pool.Exec(ctx,
 		`UPDATE task_run_snapshots SET reference_schema_version='vane.run-snapshot-ref/v2'
@@ -474,12 +474,12 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		TenantID: tenantID, UserID: userID, TaskID: taskID,
 	}
 	manualSnapshot, err := st.CreateOrGetResearchRunSnapshotV3(
-		ctx, manualIdentity, testCompiledRunPolicyV1(t))
+		ctx, manualIdentity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t))
 	if err != nil {
 		t.Fatalf("paused owner manual snapshot: %v", err)
 	}
 	manualPlan := researchRunPlanFixtureV3(t, digestA,
-		manualSnapshot.CapabilityCatalogDigest, "manual Kimi pricing")
+		manualSnapshot.CapabilityCatalogDigest, manualSnapshot.ToolPolicyDigest, "manual Kimi pricing")
 	manualRef, err := st.CreateOrGetResearchRunPlanV3(ctx, CreateOrGetResearchRunPlanV3Params{
 		Identity: manualIdentity, RunSnapshotID: manualSnapshot.SnapshotID, Plan: manualPlan,
 	})
@@ -524,15 +524,15 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 }
 
 func researchRunPlanFixtureV3(
-	t *testing.T, definitionDigest, catalogDigest, query string,
+	t *testing.T, definitionDigest, catalogDigest, toolPolicyDigest, query string,
 ) runcontext.ResearchExecutionPlanV3 {
 	t.Helper()
 	arguments, _ := json.Marshal(map[string]any{"query": query})
 	plan, err := runcontext.BuildResearchExecutionPlanV3(
-		definitionDigest, catalogDigest,
+		definitionDigest, catalogDigest, toolPolicyDigest,
 		[]runcontext.ResearchPlanStepV3{
 			{InvocationID: "search-official", ToolName: "web_search", Arguments: arguments},
-			{InvocationID: "read-official", ToolName: "read_page", Arguments: json.RawMessage(`{"url":"https://www.kimi.com/membership/pricing"}`)},
+			{InvocationID: "read-official", ToolName: "web_contents", Arguments: json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing"}`)},
 		},
 		func(_ string, raw json.RawMessage) (json.RawMessage, error) { return raw, nil },
 	)
@@ -540,4 +540,35 @@ func researchRunPlanFixtureV3(
 		t.Fatal(err)
 	}
 	return plan
+}
+
+func testResearchToolPolicyStoreV3(t *testing.T) runtimepolicy.ResearchToolPolicyV3 {
+	t.Helper()
+	tools := make([]runtimepolicy.ResearchToolDefinitionV3, 0, 2)
+	for _, item := range []struct {
+		name           string
+		implementation runtimepolicy.ResearchToolImplementationV3
+	}{
+		{"web_search", runtimepolicy.ResearchToolExaSearchV3},
+		{"web_contents", runtimepolicy.ResearchToolExaContentsV3},
+	} {
+		tools = append(tools, runtimepolicy.ResearchToolDefinitionV3{
+			Name: item.name, Description: "Test scheduled public read",
+			Parameters:     json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`),
+			Implementation: item.implementation, ImplementationGeneration: 1,
+			Provider: "exa", Effects: []runtimepolicy.ResearchToolEffectV3{
+				runtimepolicy.ResearchToolEffectBillableV3,
+				runtimepolicy.ResearchToolEffectNetworkReadV3,
+				runtimepolicy.ResearchToolEffectTrustTaintV3,
+			}, ResultTrust: runtimepolicy.ResearchToolTrustExternalV3,
+			BudgetBucket: "exa_calls", CredentialRef: runtimepolicy.CredentialRefV1{
+				ID: runtimepolicy.CredentialIDExaPrimaryV1, Generation: 1,
+			}, MaxCostMicroUSD: 10_000,
+		})
+	}
+	policy, err := runtimepolicy.BuildResearchToolPolicyV3(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
 }
