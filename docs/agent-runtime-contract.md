@@ -5,6 +5,9 @@
 > 写入口，但 Agent 以 server-owned receipt 自动授权推进，不再发行新确认卡。
 > 2026-07-29 起 Agent 只从任务手册选择版本化 Tool。旧 target projection
 > 仅作为可恢复 v1 Run 与历史内容证据的迁移兼容根。
+> 2026-08-01 起交互 Agent 的用户历史读取统一迁移到
+> [Agent-first 用户情报与证据契约](agent-first-intelligence-contract.md)。该契约不改变
+> V1/V2 replay；V3 切流前本文件中的 compiled/discover_at_run 仍只描述历史运行面。
 
 ## 1. 产品语义
 

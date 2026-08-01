@@ -95,6 +95,13 @@ var purgeOrder = []purgeStep{
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"task_creation_operations", "tenant_id = $1"},
+	// Agent-first query audits and exact model-visible evidence are children of
+	// the session/tool ledgers. They are retained for normal task/session life
+	// and removed only by this explicit tenant erasure path.
+	{"agent_intelligence_access_denials", "presented_tenant_id = $1"},
+	{"agent_intelligence_query_audits", "tenant_id = $1"},
+	{"agent_turn_records", "tenant_id = $1"},
+	{"agent_tool_evidence", "tenant_id = $1"},
 	{"agent_turn_context_snapshots", "tenant_id = $1"},
 	{"agent_session_fact_outbox", "tenant_id = $1"},
 	// Projection authority and semantic events reference agent_sessions by the

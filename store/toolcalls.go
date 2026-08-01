@@ -141,6 +141,110 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 	return id, nil
 }
 
+// insertToolCallTx writes the legacy observability row inside a caller-owned
+// transaction. AgentTurnRecordV1 uses this to commit tool_calls and the exact
+// model-visible evidence as one atomic unit.
+func insertToolCallTx(ctx context.Context, tx pgx.Tx, c *types.ToolCall) (int64, error) {
+	if c == nil || c.TenantID == nil || *c.TenantID <= 0 ||
+		c.UserID == nil || *c.UserID <= 0 || c.SessionID == nil || *c.SessionID <= 0 {
+		return 0, types.NewAppError(types.CodeValidation,
+			"Agent tool_calls 必须携带 exact tenant/user/session", types.ErrValidation)
+	}
+	c.Provider = strings.ToLower(strings.TrimSpace(c.Provider))
+	if c.UsageQuantity <= 0 {
+		c.UsageQuantity = 1
+	}
+	cands := c.CandidateTools
+	if cands == nil {
+		cands = []string{}
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`,
+		providerPricingLedgerLock,
+	); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "锁定供应商价格账本", err)
+	}
+	var id int64
+	err := tx.QueryRow(ctx,
+		`WITH stamp AS (
+		   SELECT statement_timestamp() AS at
+		 ),
+		 billable AS (
+		   SELECT $11 = '' AND (
+		            ($19 = 'tikhub' AND $10 = 200)
+		         OR ($19 <> 'tikhub' AND $10 BETWEEN 200 AND 299)
+		          ) AS ok
+		 ),
+		 price AS (
+		   SELECT pr.id, pr.currency,
+		          pr.request_unit_price
+		          + GREATEST($20::numeric - pr.request_included_quantity, 0)
+		            * pr.request_additional_unit_price AS amount,
+		          pr.resource = '*' AS wildcard
+		     FROM provider_price_rules pr, stamp
+		    WHERE pr.provider = $19
+		      AND pr.meter = 'request'
+		      AND pr.resource IN ($6, '*')
+		      AND pr.effective_from <= stamp.at
+		      AND (pr.effective_to IS NULL OR pr.effective_to > stamp.at)
+		    ORDER BY (pr.resource = $6) DESC, pr.effective_from DESC, pr.id DESC
+		    LIMIT 1
+		 )
+		 INSERT INTO tool_calls (
+			trace_id, user_id, session_id, tool_name, tool_kind,
+			endpoint_path, arguments, result_preview, result_size, http_status,
+			error_type, error, duration_ms, retrieval_query, candidate_tools,
+			cost_usd, source_id, tenant_id,
+			provider, usage_quantity, pricing_rule_id, pricing_status,
+			cost_amount, cost_currency, run_snapshot_id, created_at
+		 ) VALUES (
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9, $10,
+			$11, $12, $13, $14, $15,
+			CASE
+			  WHEN $16::numeric IS NOT NULL THEN $16::numeric
+			  WHEN (SELECT ok FROM billable)
+			       AND (SELECT currency FROM price) = 'USD'
+			    THEN (SELECT amount FROM price)
+			  ELSE NULL
+			END,
+			$17, $18,
+			$19, $20,
+			CASE WHEN $16::numeric IS NOT NULL THEN NULL
+			     WHEN (SELECT ok FROM billable) THEN (SELECT id FROM price)
+			     ELSE NULL END,
+			CASE
+			  WHEN $16::numeric IS NOT NULL THEN 'provider_reported'
+			  WHEN $19 = '' OR NOT COALESCE((SELECT ok FROM billable), false)
+			    THEN 'unpriced'
+			  WHEN NOT EXISTS (SELECT 1 FROM price) THEN 'unpriced'
+			  WHEN (SELECT wildcard FROM price) THEN 'estimated'
+			  ELSE 'calculated'
+			END,
+			CASE
+			  WHEN $16::numeric IS NOT NULL THEN $16::numeric
+			  WHEN (SELECT ok FROM billable) THEN (SELECT amount FROM price)
+			  ELSE NULL
+			END,
+			CASE
+			  WHEN $16::numeric IS NOT NULL THEN 'USD'
+			  WHEN (SELECT ok FROM billable) THEN (SELECT currency FROM price)
+			  ELSE NULL
+			END,
+			$21,(SELECT at FROM stamp)
+		 ) RETURNING id`,
+		c.TraceID, c.UserID, c.SessionID, c.ToolName, c.ToolKind,
+		c.EndpointPath, c.Arguments, c.ResultPreview, c.ResultSize, c.HTTPStatus,
+		c.ErrorType, c.Error, c.DurationMs, c.RetrievalQuery, cands,
+		c.CostUSD, c.SourceID, c.TenantID, c.Provider, c.UsageQuantity,
+		c.RunSnapshotID,
+	).Scan(&id)
+	if err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "写入 Agent tool_calls 记录", err)
+	}
+	return id, nil
+}
+
 // CountTikHubEndpointCallsSince 统计 since 以来 TikHub 端点（按次计费面）的调用次数，
 // 供每日限额判定（滚动 24h 窗口，见 agent 端点工具）。系统级不分用户：TikHub 计费
 // 是全局成本，单 owner MVP 下二者等价。命中 idx_tool_calls_kind_created。
