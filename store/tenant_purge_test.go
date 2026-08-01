@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/agentledger"
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
 
@@ -91,6 +92,67 @@ func TestInvariant_PurgeListNeverTouchesSharedFacts(t *testing.T) {
 			t.Errorf("**红线 I-A3 被破坏**：%s 是跨租户客观事实（同一篇内容被多个租户的信源指向），"+
 				"出现在 purgeOrder 里意味着删一个租户会删掉别的租户还在用的数据——不可逆", shared)
 		}
+	}
+}
+
+func TestInvariant_ResearchBriefSynthesisPurgesBeforeResearchParents(t *testing.T) {
+	positions := map[string]int{}
+	for index, step := range purgeOrder {
+		positions[step.table] = index
+	}
+	child, ok := positions["research_brief_syntheses"]
+	if !ok {
+		t.Fatal("research_brief_syntheses missing from purgeOrder")
+	}
+	for _, parent := range []string{
+		"research_run_evidence", "research_run_steps", "research_run_plans",
+		"task_run_snapshots",
+	} {
+		parentPosition, exists := positions[parent]
+		if !exists || child >= parentPosition {
+			t.Fatalf("research_brief_syntheses position=%d must precede %s position=%d",
+				child, parent, parentPosition)
+		}
+	}
+}
+
+func TestPurgeTenant_RemovesResearchBriefSynthesis(t *testing.T) {
+	f := newResearchBriefFixtureV3(t, taskstate.NotificationThresholdMajorV3, true)
+	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(t.Context(),
+		researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatalf("prepare research Brief synthesis fixture: %v", err)
+	}
+	if prepared.Synthesis.ID <= 0 {
+		t.Fatal("research Brief synthesis fixture was not persisted")
+	}
+
+	dryRun, err := f.st.PurgeTenant(t.Context(), f.tenantID, true)
+	if err != nil {
+		t.Fatalf("dry-run tenant purge: %v", err)
+	}
+	if got := dryRun.Rows["research_brief_syntheses"]; got != 1 {
+		t.Fatalf("dry-run research Brief synthesis rows=%d, want 1", got)
+	}
+	var retained int
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM research_brief_syntheses WHERE id=$1`,
+		prepared.Synthesis.ID).Scan(&retained); err != nil || retained != 1 {
+		t.Fatalf("dry-run did not roll back synthesis delete: count=%d err=%v", retained, err)
+	}
+
+	report, err := f.st.PurgeTenant(t.Context(), f.tenantID, false)
+	if err != nil {
+		t.Fatalf("real tenant purge: %v", err)
+	}
+	if got := report.Rows["research_brief_syntheses"]; got != 1 {
+		t.Fatalf("real purge research Brief synthesis rows=%d, want 1", got)
+	}
+	var remaining int
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM research_brief_syntheses WHERE id=$1`,
+		prepared.Synthesis.ID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("research Brief synthesis survived purge: count=%d err=%v", remaining, err)
 	}
 }
 

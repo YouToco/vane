@@ -148,6 +148,8 @@ var purgeOrder = []purgeStep{
 	// V3 research evidence binds its immutable started step; steps bind the
 	// per-run plan; plans bind the frozen run snapshot. Keep this exact
 	// child-first order so explicit tenant erasure leaves no research history.
+	// Syntheses bind both the plan and snapshot, so they must lead the chain.
+	{"research_brief_syntheses", "tenant_id = $1"},
 	{"research_run_evidence", "tenant_id = $1"},
 	{"research_run_steps", "tenant_id = $1"},
 	{"research_run_plans", "tenant_id = $1"},
@@ -255,6 +257,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		periodicReceiptsAvailable     bool
 		periodicReportsAvailable      bool
 		periodicDeliveriesAvailable   bool
+		researchBriefsAvailable       bool
 		researchEvidenceAvailable     bool
 	)
 	if err := tx.QueryRow(ctx,
@@ -272,6 +275,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.periodic_synthesis_receipts') IS NOT NULL,
 		        to_regclass('public.periodic_brief_reports') IS NOT NULL,
 		        to_regclass('public.periodic_report_deliveries') IS NOT NULL,
+		        to_regclass('public.research_brief_syntheses') IS NOT NULL,
 		        to_regclass('public.research_run_evidence') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
@@ -288,6 +292,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&periodicReceiptsAvailable,
 		&periodicReportsAvailable,
 		&periodicDeliveriesAvailable,
+		&researchBriefsAvailable,
 		&researchEvidenceAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
@@ -308,6 +313,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"periodic_synthesis_receipts":        periodicReceiptsAvailable,
 		"periodic_brief_reports":             periodicReportsAvailable,
 		"periodic_report_deliveries":         periodicDeliveriesAvailable,
+		"research_brief_syntheses":           researchBriefsAvailable,
 		"research_run_evidence":              researchEvidenceAvailable,
 	}
 	if _, err := tx.Exec(ctx,

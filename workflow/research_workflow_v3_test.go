@@ -264,3 +264,14 @@ func TestResearchWorkflowV3FailureHistorySanitizesCoordinatorError(t *testing.T)
 		t.Fatalf("sanitized failure lost controlled code: %v", err)
 	}
 }
+
+func TestResearchV3SynthesisHasOneStoreOnlyRecoveryAttempt(t *testing.T) {
+	synthesis := researchV3SynthesisOptions()
+	if synthesis.RetryPolicy == nil || synthesis.RetryPolicy.MaximumAttempts != 2 {
+		t.Fatalf("synthesis retry policy=%+v", synthesis.RetryPolicy)
+	}
+	effect := researchV3SideEffectOptions()
+	if effect.RetryPolicy == nil || effect.RetryPolicy.MaximumAttempts != 1 {
+		t.Fatalf("ordinary effect retry policy=%+v", effect.RetryPolicy)
+	}
+}

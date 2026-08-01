@@ -59,11 +59,12 @@ func runResearchPipelineV3(
 		}
 	}
 	var brief ResearchBriefRefV3
+	synthesisCtx := workflow.WithActivityOptions(ctx, researchV3SynthesisOptions())
 	if err := workflow.ExecuteActivity(
-		planCtx, a.SynthesizeResearchBriefV3, SynthesizeResearchBriefV3Input{
+		synthesisCtx, a.SynthesizeResearchBriefV3, SynthesizeResearchBriefV3Input{
 			ResearchRunV3Input: run, Plan: planned.Plan,
 		},
-	).Get(planCtx, &brief); err != nil {
+	).Get(synthesisCtx, &brief); err != nil {
 		return err
 	}
 	if err := brief.ValidateFor(identity, prepared.Snapshot.SnapshotID, planned.Plan.PlanID); err != nil {
@@ -82,6 +83,20 @@ func runResearchPipelineV3(
 		return err
 	}
 	return receipt.Validate(brief.BriefID)
+}
+
+// Synthesis gets exactly one recovery attempt. The first Store claim is the
+// paid-model authorization point; if its worker disappears, the retry reaches
+// the same immutable row and closes spending as ambiguous without another
+// provider call. Tool and delivery Activities retain their independent
+// single-attempt effect contracts.
+func researchV3SynthesisOptions() workflow.ActivityOptions {
+	return workflow.ActivityOptions{
+		StartToCloseTimeout: 5 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 2, NonRetryableErrorTypes: nonRetryableCodes,
+		},
+	}
 }
 
 func researchV3SideEffectOptions() workflow.ActivityOptions {
