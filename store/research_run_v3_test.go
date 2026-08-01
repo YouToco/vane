@@ -114,6 +114,17 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		snapshotRef.PlannerBudget != definition.PlannerBudget {
 		t.Fatalf("snapshot ref=%+v err=%v", snapshotRef, err)
 	}
+	loadedSnapshot, err := st.LoadResearchRunSnapshotV3(ctx, identity, snapshotRef)
+	if err != nil || loadedSnapshot.Payload.Definition.TaskManual != definition.TaskManual ||
+		loadedSnapshot.Payload.Definition.TaskName != definition.TaskName ||
+		loadedSnapshot.Payload.DefinitionDigest != digestA {
+		t.Fatalf("loaded V3 snapshot=%+v err=%v", loadedSnapshot.Payload, err)
+	}
+	tamperedSnapshotRef := snapshotRef
+	tamperedSnapshotRef.PayloadDigest = strings.Repeat("b", 64)
+	if _, err := st.LoadResearchRunSnapshotV3(ctx, identity, tamperedSnapshotRef); err == nil {
+		t.Fatal("tampered V3 snapshot reference loaded")
+	}
 	mismatchIdentity := identity
 	mismatchIdentity.TemporalRunID = "run-" + uuid.NewString()
 	if _, err := st.pool.Exec(ctx,

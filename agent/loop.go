@@ -20,7 +20,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -3735,20 +3734,11 @@ func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64,
 	return result, rec, err
 }
 
-const maxModelVisibleToolResultBytes = 256 * 1024
-
 func boundModelVisibleResult(result string) (string, int) {
-	originalSize := len(result)
-	if originalSize <= maxModelVisibleToolResultBytes {
-		return result, originalSize
-	}
-	const suffix = "…"
-	cut := maxModelVisibleToolResultBytes - len(suffix)
-	for cut > 0 && !utf8.ValidString(result[:cut]) {
-		cut--
-	}
-	return result[:cut] + suffix, originalSize
+	return types.BoundModelVisibleToolResultUTF8(result)
 }
+
+const maxModelVisibleToolResultBytes = types.MaxModelVisibleToolResultBytes
 
 func (l *Loop) captureExactToolEvidence(
 	ctx context.Context,

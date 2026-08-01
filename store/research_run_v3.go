@@ -263,6 +263,48 @@ func validateStoredResearchRunSnapshotV3(
 	return ref, nil
 }
 
+// LoadResearchRunSnapshotV3 opens a sealed snapshot only inside an Activity.
+// The payload contains the task manual and runtime policies and must never be
+// returned through Temporal history; callers keep only the validated ref there.
+func (s *Store) LoadResearchRunSnapshotV3(
+	ctx context.Context, identity types.RunIdentity,
+	ref types.ResearchRunSnapshotRefV3,
+) (runcontext.ResearchSnapshotSealV3, error) {
+	if err := ref.ValidateFor(identity); err != nil {
+		return runcontext.ResearchSnapshotSealV3{}, researchRunValidationError("research snapshot reference is invalid")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return runcontext.ResearchSnapshotSealV3{}, researchRunDatabaseError("begin research snapshot read", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := setResearchRunScopeV3(ctx, tx, identity.TenantID, identity.UserID); err != nil {
+		return runcontext.ResearchSnapshotSealV3{}, err
+	}
+	row, found, err := loadResearchRunSnapshotRowV3(ctx, tx, CreateOrGetTaskRunSnapshotParams{
+		TenantID: identity.TenantID, UserID: identity.UserID, TaskID: identity.TaskID,
+		TemporalWorkflowID: identity.TemporalWorkflowID, TemporalRunID: identity.TemporalRunID,
+	})
+	if err != nil {
+		return runcontext.ResearchSnapshotSealV3{}, err
+	}
+	if !found {
+		return runcontext.ResearchSnapshotSealV3{}, researchRunValidationError("research snapshot is unavailable")
+	}
+	storedRef, err := validateStoredResearchRunSnapshotV3(identity, row)
+	if err != nil || storedRef != ref {
+		return runcontext.ResearchSnapshotSealV3{}, researchRunIntegrityError()
+	}
+	seal, err := runcontext.DecodeResearchSnapshotPayloadV3(row.Payload)
+	if err != nil || seal.PayloadDigest != ref.PayloadDigest {
+		return runcontext.ResearchSnapshotSealV3{}, researchRunIntegrityError()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return runcontext.ResearchSnapshotSealV3{}, researchRunDatabaseError("commit research snapshot read", err)
+	}
+	return seal, nil
+}
+
 type ResearchRunStepPhaseV3 string
 
 const (
@@ -992,7 +1034,7 @@ func validateResearchRunStepEvidenceCommitV3(
 ) error {
 	if err := params.PlanRef.ValidateFor(params.Identity, params.RunSnapshotID); err != nil ||
 		params.Ordinal < 0 || params.Ordinal >= params.PlanRef.StepCount ||
-		len(params.Result) > 256<<10 || !utf8.Valid(params.Result) ||
+		len(params.Result) > types.MaxModelVisibleToolResultBytes || !utf8.Valid(params.Result) ||
 		bytes.IndexByte(params.Result, 0) >= 0 ||
 		params.OriginalSize < len(params.Result) || params.OriginalSize > 2147483647 ||
 		(params.TrustType != "local" && params.TrustType != "external") ||
