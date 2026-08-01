@@ -406,20 +406,15 @@ func TestInvariant_ExaCallsUsesResearchRunReservation(t *testing.T) {
 	}
 
 	begin := productionStoreFunction(t, "BeginResearchRunStepV3")
-	if !callsFunction(begin, "consumeResearchRunQuotaV3") {
-		t.Fatal("BeginResearchRunStepV3 没有调用 consumeResearchRunQuotaV3 —— " +
-			"普通 TryConsume 不能替代 started step + spend reservation + 配额扣减的同事务提交")
+	if !functionContainsString(begin, "admit_research_run_tool_step_cap_v1") {
+		t.Fatal("BeginResearchRunStepV3 没有调用 capability-bound 原子 Tool admission")
 	}
 	if callsFunction(begin, "TryConsume") || callsFunction(begin, "TryConsumeForUser") {
 		t.Fatal("BeginResearchRunStepV3 不得用普通 TryConsume/TryConsumeForUser 扣 Exa 配额")
 	}
-
-	reserve := productionStoreFunction(t, "consumeResearchRunQuotaV3")
-	if !functionContainsString(reserve, "reserve_research_run_quota_v3") {
-		t.Fatal("consumeResearchRunQuotaV3 没有调用窄 SQL reserve_research_run_quota_v3")
-	}
-	if callsFunction(reserve, "TryConsume") || callsFunction(reserve, "TryConsumeForUser") {
-		t.Fatal("consumeResearchRunQuotaV3 不得回退到普通 TryConsume/TryConsumeForUser")
+	if callsFunction(begin, "consumeResearchRunQuotaV3") ||
+		functionContainsString(begin, "reserve_research_run_quota_v3") {
+		t.Fatal("BeginResearchRunStepV3 不得回退到可独立重放的旧 quota primitive")
 	}
 }
 

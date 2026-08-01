@@ -7,6 +7,9 @@ server:
   # 确需对外监听改 "0.0.0.0:8080" 或用 VANE_SERVER_ADDR 覆盖（记得同时收好防火墙）。
   addr: "127.0.0.1:8080"
 
+research_gateway:
+  socket_path: "/run/vane-research-gateway/gateway.sock"
+
 db:
   url: "" # VANE_DB_URL
   # V3 专用非 owner LOGIN；留空会安全禁用 V3，不影响旧任务。

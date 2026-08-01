@@ -260,11 +260,11 @@ func loadResearchRunToolGrantV3(
 }
 
 func lockResearchRunSpendBudgetV3(
-	ctx context.Context, tx pgx.Tx, temporalRunID, planDigest string,
+	ctx context.Context, tx pgx.Tx, temporalRunID string,
 ) error {
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
-		"research-spend/v3:"+temporalRunID+":"+planDigest); err != nil {
+		"research-spend/v3:"+temporalRunID+":budget"); err != nil {
 		return researchRunDatabaseError("lock research run spend budget", err)
 	}
 	return nil

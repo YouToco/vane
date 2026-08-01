@@ -1,0 +1,15 @@
+[Unit]
+Description=Vane isolated research provider gateway socket
+Before=vane-research-gateway.service vane.service
+
+[Socket]
+ListenStream=/run/vane-research-gateway/gateway.sock
+SocketUser=vane-research-gateway
+SocketGroup=vane
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+Accept=no
+
+[Install]
+WantedBy=sockets.target

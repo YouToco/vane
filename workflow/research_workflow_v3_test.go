@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
@@ -15,17 +16,18 @@ import (
 )
 
 type researchWorkflowV3Stubs struct {
-	threshold    string
-	significance types.ResearchBriefSignificanceV3
-	mu           sync.Mutex
-	calls        []string
+	threshold       string
+	significance    types.ResearchBriefSignificanceV3
+	deliveryAllowed bool
+	mu              sync.Mutex
+	calls           []string
 }
 
 type researchV3FailingRuntime struct{ err error }
 
 func (r researchV3FailingRuntime) Prepare(
 	_ context.Context, identity types.RunIdentity,
-) (types.ResearchRunSnapshotRefV3, bool, error) {
+) (types.ResearchRunSnapshotRefV3, bool, bool, error) {
 	digest := strings.Repeat("a", 64)
 	ref, err := types.SealResearchRunSnapshotRefV3(types.ResearchRunSnapshotRefV3{
 		SnapshotID: 11, TemporalWorkflowID: identity.TemporalWorkflowID,
@@ -38,7 +40,7 @@ func (r researchV3FailingRuntime) Prepare(
 			MaxTokens: 32768, MaxCostMicroUSD: 1_000_000, DurationMs: 300_000},
 		HistoryThroughUTC: "2026-08-01T12:34:56Z", PayloadDigest: digest,
 	})
-	return ref, true, err
+	return ref, true, false, err
 }
 
 func (r researchV3FailingRuntime) Plan(
@@ -103,7 +105,10 @@ func (s *researchWorkflowV3Stubs) register(env *testsuite.TestWorkflowEnvironmen
 	}
 	reg("PrepareResearchRunV3", func(ctx context.Context, p PushParams) (PrepareResearchRunV3Result, error) {
 		s.record("prepare")
-		return PrepareResearchRunV3Result{Authorized: true, Snapshot: s.snapshot(ctx, p)}, nil
+		return PrepareResearchRunV3Result{
+			Authorized: true, DeliveryAllowed: s.deliveryAllowed,
+			Snapshot: s.snapshot(ctx, p),
+		}, nil
 	})
 	reg("PlanResearchRunV3", func(_ context.Context, in ResearchRunV3Input) (PlanResearchRunV3Result, error) {
 		s.record("plan")
@@ -188,6 +193,7 @@ func TestResearchWorkflowV3UsesSealedDeliveryDecision(t *testing.T) {
 			env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "wf-research-v3-" + test.name})
 			stubs := &researchWorkflowV3Stubs{
 				threshold: test.threshold, significance: test.significance,
+				deliveryAllowed: true,
 			}
 			stubs.register(env)
 			env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
@@ -205,6 +211,34 @@ func TestResearchWorkflowV3UsesSealedDeliveryDecision(t *testing.T) {
 				t.Fatalf("calls=%v want=%v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestResearchWorkflowV3HardNoDeliveryOverridesMajorBrief(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "wf-research-v3-hard-no-delivery"})
+	stubs := &researchWorkflowV3Stubs{
+		significance: types.ResearchBriefSignificanceMajorV3,
+		// The synthesized Brief deliberately requires delivery. This durable
+		// shadow-run authority bit must prevent the delivery Activity itself.
+		deliveryAllowed: false,
+	}
+	stubs.register(env)
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: 7, UserID: 42, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeDiscoverAtRun,
+		RuntimeVersion: ResearchRuntimeV3, ScheduleID: "task-v3",
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	stubs.mu.Lock()
+	got := append([]string(nil), stubs.calls...)
+	stubs.mu.Unlock()
+	want := []string{"prepare", "plan", "step:0", "step:1", "synthesize"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("hard-no-delivery calls=%v want=%v", got, want)
 	}
 }
 
@@ -265,13 +299,25 @@ func TestResearchWorkflowV3FailureHistorySanitizesCoordinatorError(t *testing.T)
 	}
 }
 
-func TestResearchV3SynthesisHasOneStoreOnlyRecoveryAttempt(t *testing.T) {
+func TestResearchV3ReceiptBackedStagesHaveOneStoreOnlyRecoveryAttempt(t *testing.T) {
 	synthesis := researchV3SynthesisOptions()
 	if synthesis.RetryPolicy == nil || synthesis.RetryPolicy.MaximumAttempts != 2 {
 		t.Fatalf("synthesis retry policy=%+v", synthesis.RetryPolicy)
 	}
-	effect := researchV3SideEffectOptions()
-	if effect.RetryPolicy == nil || effect.RetryPolicy.MaximumAttempts != 1 {
-		t.Fatalf("ordinary effect retry policy=%+v", effect.RetryPolicy)
+	if synthesis.StartToCloseTimeout <= 10*time.Minute {
+		t.Fatalf("synthesis timeout %v cannot reach gateway recovery fence",
+			synthesis.StartToCloseTimeout)
+	}
+	recovery := researchV3StoreRecoveryOptions()
+	if recovery.RetryPolicy == nil || recovery.RetryPolicy.MaximumAttempts != 2 {
+		t.Fatalf("planner/tool recovery policy=%+v", recovery.RetryPolicy)
+	}
+	if recovery.StartToCloseTimeout <= 10*time.Minute {
+		t.Fatalf("recovery timeout %v cannot reach gateway recovery fence",
+			recovery.StartToCloseTimeout)
+	}
+	delivery := researchV3DeliveryOptions()
+	if delivery.RetryPolicy == nil || delivery.RetryPolicy.MaximumAttempts != 1 {
+		t.Fatalf("delivery retry policy=%+v", delivery.RetryPolicy)
 	}
 }

@@ -1,0 +1,32 @@
+[Unit]
+Description=Vane isolated research provider gateway
+After=network-online.target docker.service vane-migrate.service
+Wants=network-online.target
+Requires=vane-migrate.service vane-research-gateway.socket
+
+[Service]
+Type=simple
+User=vane-research-gateway
+Group=vane-research-gateway
+WorkingDirectory=/opt/vane
+EnvironmentFile=/opt/vane/env/research-gateway.env
+LoadCredential=gateway_db_url:/etc/vane/credentials/gateway_db_url
+LoadCredential=llm_api_key_gen1:/etc/vane/credentials/research_llm_api_key_gen1
+ExecStart=/opt/vane/bin/vane-research-gateway
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

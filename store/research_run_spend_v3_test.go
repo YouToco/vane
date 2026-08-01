@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -146,12 +147,7 @@ func newResearchRunSpendFixtureWithToolBudgetV3(
 	if createPlan {
 		plan := researchRunPlanFixtureV3(t, digest, snapshotRef.CapabilityCatalogDigest,
 			snapshotRef.ToolPolicyDigest, "Kimi pricing")
-		planRef, err = st.CreateOrGetResearchRunPlanV3(ctx, CreateOrGetResearchRunPlanV3Params{
-			Identity: identity, RunSnapshotID: snapshotRef.SnapshotID, Plan: plan,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		planRef, _ = createResearchPlanFromReceiptV3(t, st, identity, snapshotRef, plan)
 	}
 	return researchRunSpendFixtureV3{
 		store: st, tenantID: tenantID, userID: userID, identity: identity,
@@ -315,9 +311,11 @@ func TestResearchRunSpendQuotaFailsClosedPostgres(t *testing.T) {
 }
 
 func TestResearchRunSpendConcurrentOrdinalsRespectRunBudgetPostgres(t *testing.T) {
-	// Both frozen Tool grants reserve 10,000 micro-USD. A run budget of exactly
-	// 10,000 admits one ordinal and must serialize the other behind the run lock.
-	f := newResearchRunSpendFixtureV3(t, 10_000)
+	// The receipt-backed fixture spends three micro-USD on the completed planner
+	// call. Both frozen Tool grants reserve another 10,000, so a run budget of
+	// exactly 10,003 admits one ordinal and serializes the other behind the run
+	// lock without pretending planning was free.
+	f := newResearchRunSpendFixtureV3(t, 10_003)
 	type result struct {
 		ordinal   int
 		execution ResearchRunStepExecutionV3
@@ -364,9 +362,10 @@ func TestResearchRunSpendConcurrentOrdinalsRespectRunBudgetPostgres(t *testing.T
 }
 
 func TestResearchRunSpendSettlementControlsLaterBudgetPostgres(t *testing.T) {
-	t.Run("actual below reservation releases run budget", func(t *testing.T) {
-		// The second 10,000 reservation cannot fit while the first reservation is
-		// open, but it can fit after the first settles at an actual cost of 4,000.
+	t.Run("actual below reservation retains admitted cost floor", func(t *testing.T) {
+		// Tool admission is a permanent quota and cost floor. A provider reporting
+		// 4,000 after a 10,000 admission must not release authority for another
+		// provider call that the run budget could not originally admit.
 		f := newResearchRunSpendFixtureV3(t, 15_000)
 		first, err := f.begin(t, 0)
 		if err != nil || !first.FirstWriter {
@@ -387,12 +386,12 @@ func TestResearchRunSpendSettlementControlsLaterBudgetPostgres(t *testing.T) {
 			t.Fatal(err)
 		}
 		second, err := f.begin(t, 1)
-		if err != nil || !second.FirstWriter || second.ReservedCostMicroUSD != 10_000 {
-			t.Fatalf("settled budget was not released: second=%+v err=%v", second, err)
+		if !errors.Is(err, ErrQuotaExceeded) || second.StepID != 0 {
+			t.Fatalf("settlement released the permanent Tool floor: second=%+v err=%v", second, err)
 		}
 		starts, reservations := f.spendCounts(t)
-		if starts != 2 || reservations != 2 || f.quotaTokens(t) != 8 {
-			t.Fatalf("low-cost settlement accounting drifted: starts=%d reservations=%d tokens=%v",
+		if starts != 1 || reservations != 1 || f.quotaTokens(t) != 9 {
+			t.Fatalf("Tool cost-floor accounting drifted: starts=%d reservations=%d tokens=%v",
 				starts, reservations, f.quotaTokens(t))
 		}
 	})
@@ -525,6 +524,7 @@ func TestResearchRunSpendUnattemptedFailureReplayPostgres(t *testing.T) {
 	}
 	var toolCalls, settlements int
 	var actualQuota float64
+	var quotaFloorPolicy int
 	if err := f.store.pool.QueryRow(t.Context(), `
 		SELECT
 		  (SELECT count(*) FROM tool_calls
@@ -533,14 +533,18 @@ func TestResearchRunSpendUnattemptedFailureReplayPostgres(t *testing.T) {
 		    WHERE tenant_id=$1 AND temporal_run_id=$2),
 		  (SELECT actual_quota_units::double precision
 		     FROM research_run_step_spend_settlements
+		    WHERE tenant_id=$1 AND temporal_run_id=$2),
+		  (SELECT quota_floor_policy_version
+		     FROM research_run_step_spend_settlements
 		    WHERE tenant_id=$1 AND temporal_run_id=$2)`,
 		f.tenantID, f.identity.TemporalRunID).Scan(
-		&toolCalls, &settlements, &actualQuota); err != nil {
+		&toolCalls, &settlements, &actualQuota, &quotaFloorPolicy); err != nil {
 		t.Fatal(err)
 	}
-	if toolCalls != 0 || settlements != 1 || actualQuota != 0 || f.quotaTokens(t) != 10 {
-		t.Fatalf("unattempted replay accounting: calls=%d settlements=%d actual=%v tokens=%v",
-			toolCalls, settlements, actualQuota, f.quotaTokens(t))
+	if toolCalls != 0 || settlements != 1 || actualQuota != 0 ||
+		quotaFloorPolicy != 1 || f.quotaTokens(t) != 9 {
+		t.Fatalf("unattempted replay accounting: calls=%d settlements=%d actual=%v policy=%d tokens=%v",
+			toolCalls, settlements, actualQuota, quotaFloorPolicy, f.quotaTokens(t))
 	}
 }
 
@@ -725,7 +729,7 @@ func TestResearchRunSpendConcurrentSettlementPrecedesBeginPostgres(t *testing.T)
 	})
 	if _, err := blocker.Exec(t.Context(),
 		`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
-		"research-spend/v3:"+f.identity.TemporalRunID+":"+f.planRef.PlanDigest); err != nil {
+		"research-spend/v3:"+f.identity.TemporalRunID+":budget"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -834,7 +838,8 @@ func TestResearchRunSpendPlanExceedingMaxToolCallsFailsClosedPostgres(t *testing
 }
 
 func researchSpendVisibleAsExecutorV3(
-	t *testing.T, st *Store, scopeTenantID, scopeUserID, reservationID, settlementID int64,
+	t *testing.T, st *Store, bearerHex string,
+	scopeTenantID, scopeUserID, reservationID, settlementID int64,
 ) (int, int) {
 	t.Helper()
 	tx, err := st.pool.Begin(t.Context())
@@ -843,8 +848,10 @@ func researchSpendVisibleAsExecutorV3(
 	}
 	defer func() { _ = tx.Rollback(t.Context()) }()
 	if _, err := tx.Exec(t.Context(),
-		`SELECT set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true)`,
-		strconv.FormatInt(scopeTenantID, 10), strconv.FormatInt(scopeUserID, 10)); err != nil {
+		`SELECT set_config('app.research_run_capability_v1',$1,true),
+		        set_config('app.tenant_id',$2,true),set_config('app.user_id',$3,true)`,
+		bearerHex, strconv.FormatInt(scopeTenantID, 10),
+		strconv.FormatInt(scopeUserID, 10)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(t.Context(), `SET LOCAL ROLE `+researchRuntimeCapabilityRole); err != nil {
@@ -952,8 +959,14 @@ func TestResearchRunSpendLedgersEnforceTenantAndUserRLSPostgres(t *testing.T) {
 		&reservationRow, &settlementRow); err != nil {
 		t.Fatal(err)
 	}
+	capability, err := owner.store.resolveResearchRunCapabilityV1(
+		t.Context(), owner.snapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bearerHex := hex.EncodeToString(capability.raw[:])
 
-	if reservations, settlements := researchSpendVisibleAsExecutorV3(t, owner.store,
+	if reservations, settlements := researchSpendVisibleAsExecutorV3(t, owner.store, bearerHex,
 		owner.tenantID, owner.userID, reservationID, settlementID); reservations != 1 || settlements != 1 {
 		t.Fatalf("owner scope cannot read its spend ledger: reservations=%d settlements=%d",
 			reservations, settlements)
@@ -967,7 +980,7 @@ func TestResearchRunSpendLedgersEnforceTenantAndUserRLSPostgres(t *testing.T) {
 		{name: "same tenant cross user", tenantID: owner.tenantID, userID: foreign.userID},
 	} {
 		t.Run(scope.name, func(t *testing.T) {
-			if reservations, settlements := researchSpendVisibleAsExecutorV3(t, owner.store,
+			if reservations, settlements := researchSpendVisibleAsExecutorV3(t, owner.store, bearerHex,
 				scope.tenantID, scope.userID, reservationID, settlementID); reservations != 0 || settlements != 0 {
 				t.Fatalf("forged scope exposed spend ledger: reservations=%d settlements=%d",
 					reservations, settlements)

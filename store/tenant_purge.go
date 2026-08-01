@@ -147,7 +147,9 @@ var purgeOrder = []purgeStep{
 	// and immutable reservation, while a reservation binds its started step.
 	// Preserve the complete 090 child-first chain even while those two tables
 	// remain optional across a reversible migration rollout.
+	{"research_run_llm_spend_settlements", "tenant_id = $1"},
 	{"llm_calls", "tenant_id = $1"},
+	{"research_run_llm_spend_reservations", "tenant_id = $1"},
 	{"research_run_step_spend_settlements", "tenant_id = $1"},
 	// V3-bound Tool evidence is immutable under direct DELETE. Count it here
 	// for the purge report, then let the final tenants delete remove it through
@@ -162,6 +164,9 @@ var purgeOrder = []purgeStep{
 	{"research_run_step_spend_reservations", "tenant_id = $1"},
 	{"research_run_steps", "tenant_id = $1"},
 	{"research_run_plans", "tenant_id = $1"},
+	// Capability hashes are children of the exact immutable snapshot. They are
+	// never directly visible or deletable by the runtime executor.
+	{"research_run_capabilities", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration
 	// 031, so batches must be gone before either the marked parent or its
 	// sidecar. A marked run also points at its immutable cutover event; parents
@@ -202,11 +207,20 @@ var purgeOrder = []purgeStep{
 // in purgeOrder so schema coverage and reporting remain complete, but the
 // tenant root FK cascade is their sole delete authority.
 var tenantCascadePurgeTables = map[string]struct{}{
+	"llm_calls":                            {},
+	"research_run_llm_spend_settlements":   {},
+	"research_run_llm_spend_reservations":  {},
 	"tool_calls":                           {},
 	"research_run_step_spend_reservations": {},
 	"research_run_steps":                   {},
 	"research_run_plans":                   {},
+	"research_run_capabilities":            {},
 	"task_run_snapshots":                   {},
+	// A cutover event is referenced by immutable snapshots that are themselves
+	// deleted only by the tenant root cascade. Count both parents for the purge
+	// report, then let the same root delete remove them atomically; deleting the
+	// event directly first would violate the snapshot's exact-event fence.
+	"task_run_snapshot_v2_cutover_events": {},
 }
 
 // purgeSharedTables 是**绝不能出现在 purgeOrder 里**的跨租户客观事实表（红线 I-A3）。
@@ -279,8 +293,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		periodicDeliveriesAvailable        bool
 		researchBriefsAvailable            bool
 		researchEvidenceAvailable          bool
+		researchLLMSettlementsAvailable    bool
+		researchLLMReservationsAvailable   bool
 		researchSpendSettlementsAvailable  bool
 		researchSpendReservationsAvailable bool
+		researchRunCapabilitiesAvailable   bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -299,8 +316,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.periodic_report_deliveries') IS NOT NULL,
 		        to_regclass('public.research_brief_syntheses') IS NOT NULL,
 		        to_regclass('public.research_run_evidence') IS NOT NULL,
+		        to_regclass('public.research_run_llm_spend_settlements') IS NOT NULL,
+		        to_regclass('public.research_run_llm_spend_reservations') IS NOT NULL,
 		        to_regclass('public.research_run_step_spend_settlements') IS NOT NULL,
-		        to_regclass('public.research_run_step_spend_reservations') IS NOT NULL`,
+		        to_regclass('public.research_run_step_spend_reservations') IS NOT NULL,
+		        to_regclass('public.research_run_capabilities') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -318,8 +338,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&periodicDeliveriesAvailable,
 		&researchBriefsAvailable,
 		&researchEvidenceAvailable,
+		&researchLLMSettlementsAvailable,
+		&researchLLMReservationsAvailable,
 		&researchSpendSettlementsAvailable,
 		&researchSpendReservationsAvailable,
+		&researchRunCapabilitiesAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -341,8 +364,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"periodic_report_deliveries":           periodicDeliveriesAvailable,
 		"research_brief_syntheses":             researchBriefsAvailable,
 		"research_run_evidence":                researchEvidenceAvailable,
+		"research_run_llm_spend_settlements":   researchLLMSettlementsAvailable,
+		"research_run_llm_spend_reservations":  researchLLMReservationsAvailable,
 		"research_run_step_spend_settlements":  researchSpendSettlementsAvailable,
 		"research_run_step_spend_reservations": researchSpendReservationsAvailable,
+		"research_run_capabilities":            researchRunCapabilitiesAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
@@ -492,6 +518,18 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			         FOR UPDATE /* tenant purge research spend lock order */`,
 		})
 	}
+	if researchLLMReservationsAvailable {
+		purgeLocks = append(purgeLocks, struct {
+			name  string
+			query string
+		}{
+			name: "research_run_llm_spend_reservations",
+			query: `SELECT id FROM research_run_llm_spend_reservations
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge research llm spend lock order */`,
+		})
+	}
 	for _, lock := range purgeLocks {
 		rows, lockErr := tx.Query(ctx, lock.query, tenantID)
 		if lockErr != nil {
@@ -516,7 +554,17 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			// corresponding optional table.
 			continue
 		}
-		if _, cascadeOnly := tenantCascadePurgeTables[st.table]; cascadeOnly {
+		_, cascadeOnly := tenantCascadePurgeTables[st.table]
+		// Migration 091 upgrades llm_calls -> tenants to ON DELETE CASCADE so
+		// bound immutable evidence can be removed only by the tenant root. Its
+		// reversible Down restores the legacy non-cascading FK. A current binary
+		// can therefore run against schema 090 and must directly remove legacy,
+		// unbound calls before deleting the tenant instead of merely counting
+		// them and then failing at the parent FK.
+		if st.table == "llm_calls" && !researchLLMReservationsAvailable {
+			cascadeOnly = false
+		}
+		if cascadeOnly {
 			// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；
 			// tenant_id 走参数化的 $1。真正删除由下方租户根 FK cascade 完成。
 			var count int64

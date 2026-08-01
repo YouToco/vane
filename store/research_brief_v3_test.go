@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -126,12 +127,7 @@ func newResearchBriefFixtureWithResultV3(
 	if err != nil {
 		t.Fatal(err)
 	}
-	planRef, err := st.CreateOrGetResearchRunPlanV3(ctx, CreateOrGetResearchRunPlanV3Params{
-		Identity: identity, RunSnapshotID: snapshotRef.SnapshotID, Plan: plan,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	planRef, _ := createResearchPlanFromReceiptV3(t, st, identity, snapshotRef, plan)
 	started, err := st.BeginResearchRunStepV3(ctx, identity, snapshotRef.SnapshotID, planRef, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -235,18 +231,14 @@ func finalizeResearchBriefFixtureV3(
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle := ClaimResearchBriefSynthesisV3Params{
-		Identity: f.identity, SnapshotRef: f.snapshotRef, PlanRef: f.planRef,
-		SynthesisID: prepared.Synthesis.ID, RequestDigest: prepared.Synthesis.RequestDigest,
-	}
-	if claim, err := f.st.ClaimResearchBriefSynthesisV3(t.Context(), handle); err != nil || !claim.Claimed {
-		t.Fatalf("fixture claim=%+v err=%v", claim, err)
-	}
+	handle, reservation := claimResearchBriefWithPendingReceiptV3(t, f, prepared.Synthesis)
+	payload := researchBriefPayloadV3(t, prepared.Synthesis, significance,
+		"foreign owner history")
+	settleResearchBriefReceiptV3(t, f, reservation, prepared.Synthesis, payload)
 	ref, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
 		FinalizeResearchBriefSynthesisV3Params{
 			ClaimResearchBriefSynthesisV3Params: handle,
-			BriefPayload: researchBriefPayloadV3(t, prepared.Synthesis, significance,
-				"foreign owner history"),
+			BriefPayload:                        payload,
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -397,18 +389,17 @@ func TestResearchBriefSynthesisV3PostgresLifecycleAndIsolation(t *testing.T) {
 	if err != nil || replay.FirstWriter || replay.Synthesis.ID != prepared.ID {
 		t.Fatalf("canonical replay=%+v err=%v", replay, err)
 	}
-	handle := ClaimResearchBriefSynthesisV3Params{
-		Identity: f.identity, SnapshotRef: f.snapshotRef, PlanRef: f.planRef,
-		SynthesisID: prepared.ID, RequestDigest: prepared.RequestDigest,
-	}
+	handle, reservation := claimResearchBriefWithPendingReceiptV3(t, f, prepared)
 	claim, err := f.st.ClaimResearchBriefSynthesisV3(ctx, handle)
-	if err != nil || !claim.Claimed || claim.Synthesis.Status != ResearchBriefSynthesisSpendingV3 ||
+	if err != nil || claim.Claimed || claim.ReceiptState != ResearchBriefLLMReceiptPendingV3 ||
+		claim.Synthesis.Status != ResearchBriefSynthesisSpendingV3 ||
 		claim.Synthesis.SpendingStartedAt == nil {
 		t.Fatalf("claim=%+v err=%v", claim, err)
 	}
 	payload := researchBriefPayloadV3(t, prepared,
 		types.ResearchBriefSignificanceQualifiedV3,
 		"仍需预约，未达到重大更新门槛。")
+	settleResearchBriefReceiptV3(t, f, reservation, prepared, payload)
 	badDecisionTx, err := f.st.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -549,19 +540,15 @@ func TestResearchBriefSynthesisV3StoreNotificationMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle := ClaimResearchBriefSynthesisV3Params{
-				Identity: f.identity, SnapshotRef: f.snapshotRef, PlanRef: f.planRef,
-				SynthesisID:   prepared.Synthesis.ID,
-				RequestDigest: prepared.Synthesis.RequestDigest,
-			}
-			if claim, err := f.st.ClaimResearchBriefSynthesisV3(t.Context(), handle); err != nil || !claim.Claimed {
-				t.Fatalf("claim=%+v err=%v", claim, err)
-			}
+			handle, reservation := claimResearchBriefWithPendingReceiptV3(
+				t, f, prepared.Synthesis)
+			payload := researchBriefPayloadV3(t, prepared.Synthesis,
+				test.significance, test.name)
+			settleResearchBriefReceiptV3(t, f, reservation, prepared.Synthesis, payload)
 			ref, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
 				FinalizeResearchBriefSynthesisV3Params{
 					ClaimResearchBriefSynthesisV3Params: handle,
-					BriefPayload: researchBriefPayloadV3(t, prepared.Synthesis,
-						test.significance, test.name),
+					BriefPayload:                        payload,
 				})
 			if err != nil {
 				t.Fatal(err)
@@ -606,45 +593,52 @@ func TestResearchBriefSynthesisV3RequiresCompleteEvidenceAndFailsIdempotently(t 
 	if err != nil || replay.ID != failed.ID {
 		t.Fatalf("failure replay=%+v err=%v", replay, err)
 	}
-	if _, err := complete.st.ClaimResearchBriefSynthesisV3(t.Context(), handle); err != nil {
-		t.Fatalf("terminal claim read should be idempotent: %v", err)
+	if _, err := complete.st.ClaimResearchBriefSynthesisV3(t.Context(), handle); err == nil {
+		t.Fatal("legacy NULL-bound terminal row authorized a model claim")
 	}
 }
 
-func TestResearchBriefSynthesisV3SpendingRecoveryIsAmbiguousAndNeverRetries(t *testing.T) {
+func TestResearchBriefSynthesisV3SpendingRecoveryIsReceiptFirstAndNeverRetriesPending(t *testing.T) {
 	f := newResearchBriefFixtureV3(t, taskstate.NotificationThresholdMajorV3, true)
 	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(t.Context(),
 		researchBriefPrepareParamsV3(f))
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle := ClaimResearchBriefSynthesisV3Params{
-		Identity: f.identity, SnapshotRef: f.snapshotRef, PlanRef: f.planRef,
-		SynthesisID: prepared.Synthesis.ID, RequestDigest: prepared.Synthesis.RequestDigest,
-	}
-	claim, err := f.st.ClaimResearchBriefSynthesisV3(t.Context(), handle)
-	if err != nil || !claim.Claimed {
-		t.Fatalf("claim=%+v err=%v", claim, err)
-	}
+	handle, reservation := claimResearchBriefWithPendingReceiptV3(t, f, prepared.Synthesis)
 	recovery, err := f.st.ClaimResearchBriefSynthesisV3(t.Context(), handle)
-	ambiguous := recovery.Synthesis
-	if err != nil || ambiguous.Status != ResearchBriefSynthesisAmbiguousV3 ||
-		recovery.Claimed ||
-		ambiguous.FinalizedAt == nil || ambiguous.DeliveryRequired == nil ||
-		*ambiguous.DeliveryRequired {
+	spending := recovery.Synthesis
+	if err != nil || spending.Status != ResearchBriefSynthesisSpendingV3 ||
+		recovery.Claimed || recovery.ReceiptState != ResearchBriefLLMReceiptPendingV3 ||
+		spending.FinalizedAt != nil || spending.DeliveryRequired != nil {
 		t.Fatalf("recovery=%+v err=%v", recovery, err)
 	}
 	replay, err := f.st.ClaimResearchBriefSynthesisV3(t.Context(), handle)
-	if err != nil || replay.Claimed || replay.Synthesis.Status != ResearchBriefSynthesisAmbiguousV3 {
+	if err != nil || replay.Claimed || replay.ReceiptState != ResearchBriefLLMReceiptPendingV3 ||
+		replay.Synthesis.Status != ResearchBriefSynthesisSpendingV3 {
 		t.Fatalf("recovery claim=%+v err=%v", replay, err)
 	}
+	payload := researchBriefPayloadV3(t, prepared.Synthesis,
+		types.ResearchBriefSignificanceMajorV3, "resume only from durable receipt")
 	if _, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
 		FinalizeResearchBriefSynthesisV3Params{
 			ClaimResearchBriefSynthesisV3Params: handle,
-			BriefPayload: researchBriefPayloadV3(t, prepared.Synthesis,
-				types.ResearchBriefSignificanceMajorV3, "must not finalize"),
+			BriefPayload:                        payload,
 		}); err == nil {
-		t.Fatal("ambiguous paid synthesis was retried/finalized")
+		t.Fatal("pending synthesis receipt finalized")
+	}
+	receipt := settleResearchBriefReceiptV3(t, f, reservation, prepared.Synthesis, payload)
+	recovered, err := f.st.ClaimResearchBriefSynthesisV3(t.Context(), handle)
+	if err != nil || recovered.Claimed ||
+		recovered.ReceiptState != ResearchBriefLLMReceiptCompletedV3 ||
+		recovered.LLMCallID != receipt.LLMCallID {
+		t.Fatalf("completed receipt recovery=%+v err=%v", recovered, err)
+	}
+	if _, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
+		FinalizeResearchBriefSynthesisV3Params{
+			ClaimResearchBriefSynthesisV3Params: handle, BriefPayload: payload,
+		}); err != nil {
+		t.Fatalf("receipt-backed finalization: %v", err)
 	}
 }
 
@@ -896,30 +890,25 @@ func TestResearchBriefSynthesisV3LateHistoryCommitCannotChangeFrozenTop20(t *tes
 		t.Fatalf("frozen history=%+v", frozen)
 	}
 	frozenRank20 := frozen.Items[19].RecordID
-	handle := ClaimResearchBriefSynthesisV3Params{
-		Identity: f.identity, SnapshotRef: f.snapshotRef, PlanRef: f.planRef,
-		SynthesisID: prepared.Synthesis.ID, RequestDigest: prepared.Synthesis.RequestDigest,
-	}
-	if claim, err := f.st.ClaimResearchBriefSynthesisV3(t.Context(), handle); err != nil || !claim.Claimed {
-		t.Fatalf("claim=%+v err=%v", claim, err)
-	}
+	handle, reservation := claimResearchBriefWithPendingReceiptV3(t, f, prepared.Synthesis)
 	if err := lateTx.Commit(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
-	checkTx, err := f.st.pool.Begin(t.Context())
+	checkTx, scopedRef, err := f.st.beginScopedResearchRunTransactionV3(
+		t.Context(), pgx.TxOptions{}, f.identity, f.snapshotRef.SnapshotID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = checkTx.Rollback(t.Context()) }()
-	if err := setResearchRunScopeV3(t.Context(), checkTx, f.tenantID, f.userID); err != nil {
-		t.Fatal(err)
+	if scopedRef != f.snapshotRef {
+		t.Fatalf("scoped snapshot=%+v want %+v", scopedRef, f.snapshotRef)
 	}
 	var lateVisible, rank20StillDynamic bool
 	if err := checkTx.QueryRow(t.Context(),
-		`SELECT EXISTS (SELECT 1 FROM read_research_history_v3($1,$2,$3,$4,$5)
+		`SELECT EXISTS (SELECT 1 FROM read_research_history_cap_v3($1,$2,$3,$4,$5)
 		                       WHERE record_id=$6),
-		        EXISTS (SELECT 1 FROM read_research_history_v3($1,$2,$3,$4,$5)
+		        EXISTS (SELECT 1 FROM read_research_history_cap_v3($1,$2,$3,$4,$5)
 		                       WHERE record_id=$7)`,
 		f.tenantID, f.userID, f.taskID, f.snapshotRef.SnapshotID, f.planRef.PlanID,
 		strconv.FormatInt(lateID, 10), frozenRank20,
@@ -940,11 +929,13 @@ func TestResearchBriefSynthesisV3LateHistoryCommitCannotChangeFrozenTop20(t *tes
 		t.Fatalf("frozen prepare replay=%+v err=%v", replay, err)
 	}
 
+	payload := researchBriefPayloadV3(t, prepared.Synthesis,
+		types.ResearchBriefSignificanceMajorV3, "late commit cannot alter frozen history")
+	settleResearchBriefReceiptV3(t, f, reservation, prepared.Synthesis, payload)
 	if _, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
 		FinalizeResearchBriefSynthesisV3Params{
 			ClaimResearchBriefSynthesisV3Params: handle,
-			BriefPayload: researchBriefPayloadV3(t, prepared.Synthesis,
-				types.ResearchBriefSignificanceMajorV3, "late commit cannot alter frozen history"),
+			BriefPayload:                        payload,
 		}); err != nil {
 		t.Fatalf("finalize after late commit: %v", err)
 	}
@@ -965,13 +956,7 @@ func TestResearchBriefSynthesisV3DatabaseRejectsMalformedBriefContract(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle := ClaimResearchBriefSynthesisV3Params{
-		Identity: f.identity, SnapshotRef: f.snapshotRef, PlanRef: f.planRef,
-		SynthesisID: prepared.Synthesis.ID, RequestDigest: prepared.Synthesis.RequestDigest,
-	}
-	if claim, err := f.st.ClaimResearchBriefSynthesisV3(t.Context(), handle); err != nil || !claim.Claimed {
-		t.Fatalf("claim=%+v err=%v", claim, err)
-	}
+	_, _ = claimResearchBriefWithPendingReceiptV3(t, f, prepared.Synthesis)
 	var evidence researchEvidenceManifestV3
 	if err := json.Unmarshal(prepared.Synthesis.EvidenceManifest, &evidence); err != nil || len(evidence.Items) == 0 {
 		t.Fatalf("Evidence=%+v err=%v", evidence, err)

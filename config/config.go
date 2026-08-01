@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -26,17 +27,22 @@ var defaultConfigPaths = []string{
 
 // Config 是 Vane 的全量配置，结构与 config.example.yaml 一一对应。
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	DB       DBConfig       `mapstructure:"db"`
-	Temporal TemporalConfig `mapstructure:"temporal"`
-	LLM      LLMConfig      `mapstructure:"llm"`
-	Fetch    FetchConfig    `mapstructure:"fetch"`
-	Pipeline PipelineConfig `mapstructure:"pipeline"`
-	Agent    AgentConfig    `mapstructure:"agent"`
-	Log      LogConfig      `mapstructure:"log"`
+	Server          ServerConfig          `mapstructure:"server"`
+	DB              DBConfig              `mapstructure:"db"`
+	Temporal        TemporalConfig        `mapstructure:"temporal"`
+	LLM             LLMConfig             `mapstructure:"llm"`
+	Fetch           FetchConfig           `mapstructure:"fetch"`
+	Pipeline        PipelineConfig        `mapstructure:"pipeline"`
+	Agent           AgentConfig           `mapstructure:"agent"`
+	Log             LogConfig             `mapstructure:"log"`
+	ResearchGateway ResearchGatewayConfig `mapstructure:"research_gateway"`
 
 	Dashboard DashboardConfig `mapstructure:"dashboard"`
 	A2A       A2AConfig       `mapstructure:"a2a"`
+}
+
+type ResearchGatewayConfig struct {
+	SocketPath string `mapstructure:"socket_path"`
 }
 
 // ServerConfig 是 HTTP 服务配置。
@@ -56,6 +62,18 @@ type DBConfig struct {
 	// ResearchRuntimeURL 是 V3 情报运行专用的非 owner LOGIN 连接串。
 	// 留空时旧运行路径保持可用，但所有 V3 Store 入口 fail-closed。
 	ResearchRuntimeURL string `mapstructure:"research_runtime_url"`
+	// ResearchCapabilityKeyID identifies the active HMAC key. Retired keys must
+	// be retained for at least the longest V3 workflow/retry window.
+	ResearchCapabilityKeyID string `mapstructure:"research_capability_key_id"`
+	// ResearchCapabilityKeyHex is exactly 32 random bytes encoded as lowercase
+	// hex. It is control-plane authority and must only be supplied by secret env.
+	ResearchCapabilityKeyHex string `mapstructure:"research_capability_key_hex"`
+	// ResearchCapabilityRetiredKeys retains derivation-only keys as
+	// "kid=64hex,kid2=64hex" for workflows issued before rotation.
+	ResearchCapabilityRetiredKeys string `mapstructure:"research_capability_retired_keys"`
+	// ResearchCapabilityTTLDays must cover the maximum workflow, retry and
+	// Temporal retention window. Default 90 days.
+	ResearchCapabilityTTLDays int `mapstructure:"research_capability_ttl_days"`
 }
 
 // TemporalConfig 是 Temporal 集群与任务队列配置。
@@ -268,6 +286,9 @@ type A2AConfig struct {
 var sensitiveKeys = []string{
 	"db.url",
 	"db.research_runtime_url",
+	"db.research_capability_key_id",
+	"db.research_capability_key_hex",
+	"db.research_capability_retired_keys",
 	"llm.api_key",
 	"llm.agent_api_key",
 	"fetch.tikhub_api_key",
@@ -319,6 +340,7 @@ func setDefaults(v *viper.Viper) {
 	// 默认只绑 loopback：生产走 Caddy(host 网络)反代 127.0.0.1:8080，8080 不该对公网可达。
 	// 需对外监听时用 VANE_SERVER_ADDR / 配置文件显式覆盖（见 ServerConfig.Addr）。
 	v.SetDefault("server.addr", "127.0.0.1:8080")
+	v.SetDefault("research_gateway.socket_path", "/run/vane-research-gateway/gateway.sock")
 	// Dashboard 前端生产源。设默认值兼有两个作用：生产零配置即放行正确源；
 	// 让 dashboard.origin 成为 Viper 的"已知键"，VANE_DASHBOARD_ORIGIN 可覆盖（见 sensitiveKeys 注释）。
 	v.SetDefault("dashboard.origin", "https://vane.zhuoqidev.com")
@@ -326,6 +348,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("temporal.host", "127.0.0.1:7233")
 	v.SetDefault("temporal.namespace", "default")
 	v.SetDefault("temporal.task_queue", "vane-push")
+	v.SetDefault("db.research_capability_ttl_days", 90)
 
 	v.SetDefault("llm.provider", "deepseek")
 	v.SetDefault("llm.base_url", "https://api.deepseek.com")
@@ -441,6 +464,25 @@ func readConfigFile(v *viper.Viper, path string) error {
 // Validate 校验必填项并补齐零值默认值。
 // 允许在 Unmarshal 后单独调用（如配置热更新场景）。
 func (c *Config) Validate() error {
+	c.DB.ResearchCapabilityKeyID = strings.TrimSpace(c.DB.ResearchCapabilityKeyID)
+	c.DB.ResearchCapabilityKeyHex = strings.TrimSpace(c.DB.ResearchCapabilityKeyHex)
+	c.DB.ResearchCapabilityRetiredKeys = strings.TrimSpace(
+		c.DB.ResearchCapabilityRetiredKeys)
+	if c.DB.ResearchCapabilityTTLDays == 0 {
+		c.DB.ResearchCapabilityTTLDays = 90
+	}
+	if c.DB.ResearchCapabilityTTLDays < 7 || c.DB.ResearchCapabilityTTLDays > 400 {
+		return errors.New("config: db.research_capability_ttl_days 必须在 7–400 天")
+	}
+	if strings.TrimSpace(c.DB.ResearchRuntimeURL) != "" {
+		if c.DB.ResearchCapabilityKeyID == "" || c.DB.ResearchCapabilityKeyHex == "" {
+			return errors.New("config: V3 research runtime 要求 research capability key")
+		}
+		if len(c.DB.ResearchCapabilityKeyHex) != 64 ||
+			strings.ToLower(c.DB.ResearchCapabilityKeyHex) != c.DB.ResearchCapabilityKeyHex {
+			return errors.New("config: db.research_capability_key_hex 必须是 32-byte lowercase hex")
+		}
+	}
 	rawCanaryID := c.Pipeline.PlaybookPromptCanaryScheduleID
 	canaryID := strings.TrimSpace(rawCanaryID)
 	if c.Pipeline.PlaybookPromptsEnabled && rawCanaryID != "" && canaryID == "" {
@@ -903,6 +945,20 @@ func (c *Config) Validate() error {
 	if c.DB.URL == "" {
 		return errors.New("config: db.url 必填（可通过环境变量 VANE_DB_URL 设置）")
 	}
+	rawGatewaySocket := c.ResearchGateway.SocketPath
+	gatewaySocket := strings.TrimSpace(rawGatewaySocket)
+	// Validate is also called on directly constructed Config values. Preserve
+	// the same isolated default as Load, while still rejecting an explicitly
+	// supplied whitespace-only path.
+	if rawGatewaySocket == "" {
+		gatewaySocket = "/run/vane-research-gateway/gateway.sock"
+	}
+	if gatewaySocket == "" || len(gatewaySocket) > 255 ||
+		!strings.HasPrefix(gatewaySocket, "/") || path.Clean(gatewaySocket) != gatewaySocket ||
+		strings.ContainsRune(gatewaySocket, 0) {
+		return errors.New("config: research_gateway.socket_path 必须是规范的绝对 Unix socket 路径")
+	}
+	c.ResearchGateway.SocketPath = gatewaySocket
 	if _, err := c.LLM.AgentClientConfig(); err != nil {
 		return err
 	}

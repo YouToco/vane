@@ -29,12 +29,21 @@ const (
 
 type ResearchBriefSynthesisStatusV3 string
 
+type ResearchBriefLLMReceiptStateV3 string
+
 const (
 	ResearchBriefSynthesisPreparedV3  ResearchBriefSynthesisStatusV3 = "prepared"
 	ResearchBriefSynthesisSpendingV3  ResearchBriefSynthesisStatusV3 = "spending"
 	ResearchBriefSynthesisFinalizedV3 ResearchBriefSynthesisStatusV3 = "finalized"
 	ResearchBriefSynthesisAmbiguousV3 ResearchBriefSynthesisStatusV3 = "ambiguous"
 	ResearchBriefSynthesisFailedV3    ResearchBriefSynthesisStatusV3 = "failed"
+)
+
+const (
+	ResearchBriefLLMReceiptPendingV3       ResearchBriefLLMReceiptStateV3 = "pending"
+	ResearchBriefLLMReceiptCompletedV3     ResearchBriefLLMReceiptStateV3 = "completed"
+	ResearchBriefLLMReceiptFailedV3        ResearchBriefLLMReceiptStateV3 = "failed"
+	ResearchBriefLLMReceiptIndeterminateV3 ResearchBriefLLMReceiptStateV3 = "indeterminate"
 )
 
 type PrepareResearchBriefSynthesisV3Params struct {
@@ -44,35 +53,36 @@ type PrepareResearchBriefSynthesisV3Params struct {
 }
 
 type ResearchBriefSynthesisV3 struct {
-	ID                    int64
-	TenantID              int64
-	UserID                int64
-	TaskID                string
-	RunSnapshotID         int64
-	PlanID                int64
-	TemporalWorkflowID    string
-	TemporalRunID         string
-	DefinitionDigest      string
-	PlanDigest            string
-	NotificationThreshold string
-	RequestDigest         string
-	ContextPayload        []byte
-	ContextDigest         string
-	EvidenceManifest      []byte
-	EvidenceDigest        string
-	HistoryManifest       []byte
-	HistoryDigest         string
-	Status                ResearchBriefSynthesisStatusV3
-	Significance          types.ResearchBriefSignificanceV3
-	Decision              types.ResearchBriefDecisionV3
-	DeliveryRequired      *bool
-	BriefPayload          []byte
-	BriefDigest           string
-	FailureCode           string
-	SpendingStartedAt     *time.Time
-	FinalizedAt           *time.Time
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
+	ID                        int64
+	TenantID                  int64
+	UserID                    int64
+	TaskID                    string
+	RunSnapshotID             int64
+	PlanID                    int64
+	TemporalWorkflowID        string
+	TemporalRunID             string
+	DefinitionDigest          string
+	PlanDigest                string
+	NotificationThreshold     string
+	RequestDigest             string
+	ContextPayload            []byte
+	ContextDigest             string
+	EvidenceManifest          []byte
+	EvidenceDigest            string
+	HistoryManifest           []byte
+	HistoryDigest             string
+	SynthesisLLMReservationID *int64
+	Status                    ResearchBriefSynthesisStatusV3
+	Significance              types.ResearchBriefSignificanceV3
+	Decision                  types.ResearchBriefDecisionV3
+	DeliveryRequired          *bool
+	BriefPayload              []byte
+	BriefDigest               string
+	FailureCode               string
+	SpendingStartedAt         *time.Time
+	FinalizedAt               *time.Time
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
 }
 
 type PrepareResearchBriefSynthesisV3Result struct {
@@ -81,16 +91,19 @@ type PrepareResearchBriefSynthesisV3Result struct {
 }
 
 type ClaimResearchBriefSynthesisV3Params struct {
-	Identity      types.RunIdentity
-	SnapshotRef   types.ResearchRunSnapshotRefV3
-	PlanRef       types.ResearchRunPlanRefV3
-	SynthesisID   int64
-	RequestDigest string
+	Identity                  types.RunIdentity
+	SnapshotRef               types.ResearchRunSnapshotRefV3
+	PlanRef                   types.ResearchRunPlanRefV3
+	SynthesisID               int64
+	RequestDigest             string
+	SynthesisLLMReservationID int64
 }
 
 type ClaimResearchBriefSynthesisV3Result struct {
-	Synthesis ResearchBriefSynthesisV3
-	Claimed   bool
+	Synthesis    ResearchBriefSynthesisV3
+	Claimed      bool
+	ReceiptState ResearchBriefLLMReceiptStateV3
+	LLMCallID    int64
 }
 
 type FinalizeResearchBriefSynthesisV3Params struct {
@@ -231,16 +244,17 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 		params.SnapshotRef, params.PlanRef); err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, err
 	}
-	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
+	tx, scopedRef, err := s.beginScopedResearchRunTransactionV3(
+		ctx, pgx.TxOptions{}, params.Identity, params.SnapshotRef.SnapshotID)
 	if err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, researchRunDatabaseError("begin research Brief synthesis transaction", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if scopedRef != params.SnapshotRef {
+		return PrepareResearchBriefSynthesisV3Result{}, researchRunIntegrityError()
+	}
 	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, researchRunDatabaseError("lock research Brief schema admission", err)
-	}
-	if err := setResearchRunScopeV3(ctx, tx, params.Identity.TenantID, params.Identity.UserID); err != nil {
-		return PrepareResearchBriefSynthesisV3Result{}, err
 	}
 	tenantExists, err := lockTenantAdmissionRootShared(ctx, tx, params.Identity.TenantID)
 	if err != nil {
@@ -345,13 +359,18 @@ func (s *Store) ClaimResearchBriefSynthesisV3(
 	if err := validateResearchBriefSynthesisHandleV3(params); err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, err
 	}
-	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
+	if params.SynthesisLLMReservationID <= 0 {
+		return ClaimResearchBriefSynthesisV3Result{},
+			researchRunValidationError("research Brief model reservation is invalid")
+	}
+	tx, scopedRef, err := s.beginScopedResearchRunTransactionV3(
+		ctx, pgx.TxOptions{}, params.Identity, params.SnapshotRef.SnapshotID)
 	if err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError("begin research Brief claim", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := setResearchRunScopeV3(ctx, tx, params.Identity.TenantID, params.Identity.UserID); err != nil {
-		return ClaimResearchBriefSynthesisV3Result{}, err
+	if scopedRef != params.SnapshotRef {
+		return ClaimResearchBriefSynthesisV3Result{}, researchRunIntegrityError()
 	}
 	if err := lockResearchBriefSynthesisV3(ctx, tx, params.Identity.TemporalRunID); err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, err
@@ -361,50 +380,69 @@ func (s *Store) ClaimResearchBriefSynthesisV3(
 		return ClaimResearchBriefSynthesisV3Result{}, err
 	}
 	if row.Status == ResearchBriefSynthesisSpendingV3 {
-		row, err = scanResearchBriefSynthesisV3(tx.QueryRow(ctx,
-			`UPDATE research_brief_syntheses
-			    SET status='ambiguous',delivery_required=false,
-			        failure_code='model_receipt_unknown'
-			  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND status='spending'
-			  RETURNING `+researchBriefSynthesisColumnsV3,
-			params.SynthesisID, params.Identity.TenantID, params.Identity.UserID))
+		if row.SynthesisLLMReservationID == nil ||
+			*row.SynthesisLLMReservationID != params.SynthesisLLMReservationID {
+			return ClaimResearchBriefSynthesisV3Result{}, researchRunConflictError()
+		}
+		state, callID, err := loadResearchBriefLLMReceiptStateV3(ctx, tx, params, row)
 		if err != nil {
-			return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError(
-				"close interrupted research Brief synthesis", err)
+			return ClaimResearchBriefSynthesisV3Result{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError(
-				"commit interrupted research Brief synthesis", err)
+				"commit research Brief receipt recovery", err)
 		}
-		return ClaimResearchBriefSynthesisV3Result{Synthesis: row}, nil
+		return ClaimResearchBriefSynthesisV3Result{
+			Synthesis: row, ReceiptState: state, LLMCallID: callID,
+		}, nil
 	}
 	if row.Status != ResearchBriefSynthesisPreparedV3 {
+		if row.SynthesisLLMReservationID == nil ||
+			*row.SynthesisLLMReservationID != params.SynthesisLLMReservationID {
+			return ClaimResearchBriefSynthesisV3Result{}, researchRunConflictError()
+		}
+		state, callID, err := loadResearchBriefLLMReceiptStateV3(ctx, tx, params, row)
+		if err != nil {
+			return ClaimResearchBriefSynthesisV3Result{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError("commit research Brief claim replay", err)
 		}
-		return ClaimResearchBriefSynthesisV3Result{Synthesis: row}, nil
+		return ClaimResearchBriefSynthesisV3Result{
+			Synthesis: row, ReceiptState: state, LLMCallID: callID,
+		}, nil
 	}
 	if err := authorizeResearchRunEffectV3(ctx, tx, params.Identity); err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, err
 	}
 	row, err = scanResearchBriefSynthesisV3(tx.QueryRow(ctx,
-		`UPDATE research_brief_syntheses SET status='spending'
+		`UPDATE research_brief_syntheses
+		    SET status='spending',synthesis_llm_spend_reservation_id=$4
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND status='prepared'
 		  RETURNING `+researchBriefSynthesisColumnsV3,
-		params.SynthesisID, params.Identity.TenantID, params.Identity.UserID))
+		params.SynthesisID, params.Identity.TenantID, params.Identity.UserID,
+		params.SynthesisLLMReservationID))
 	if err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError("claim research Brief synthesis spend", err)
+	}
+	state, callID, err := loadResearchBriefLLMReceiptStateV3(ctx, tx, params, row)
+	if err != nil {
+		return ClaimResearchBriefSynthesisV3Result{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError("commit research Brief synthesis claim", err)
 	}
-	return ClaimResearchBriefSynthesisV3Result{Synthesis: row, Claimed: true}, nil
+	return ClaimResearchBriefSynthesisV3Result{
+		Synthesis: row, Claimed: state == ResearchBriefLLMReceiptPendingV3,
+		ReceiptState: state, LLMCallID: callID,
+	}, nil
 }
 
 func (s *Store) FinalizeResearchBriefSynthesisV3(
 	ctx context.Context, params FinalizeResearchBriefSynthesisV3Params,
 ) (types.ResearchBriefRefV3, error) {
-	if err := validateResearchBriefSynthesisHandleV3(params.ClaimResearchBriefSynthesisV3Params); err != nil {
+	if err := validateResearchBriefSynthesisHandleV3(params.ClaimResearchBriefSynthesisV3Params); err != nil ||
+		params.SynthesisLLMReservationID <= 0 {
 		return types.ResearchBriefRefV3{}, researchRunValidationError("research Brief finalization is invalid")
 	}
 	brief, briefPayload, err := types.DecodeResearchBriefPayloadV3(params.BriefPayload)
@@ -412,13 +450,14 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 		return types.ResearchBriefRefV3{}, researchRunValidationError("research Brief payload is invalid")
 	}
 	briefDigest := researchRunSHA256(briefPayload)
-	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
+	tx, scopedRef, err := s.beginScopedResearchRunTransactionV3(
+		ctx, pgx.TxOptions{}, params.Identity, params.SnapshotRef.SnapshotID)
 	if err != nil {
 		return types.ResearchBriefRefV3{}, researchRunDatabaseError("begin research Brief finalization", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := setResearchRunScopeV3(ctx, tx, params.Identity.TenantID, params.Identity.UserID); err != nil {
-		return types.ResearchBriefRefV3{}, err
+	if scopedRef != params.SnapshotRef {
+		return types.ResearchBriefRefV3{}, researchRunIntegrityError()
 	}
 	if err := lockResearchBriefSynthesisV3(ctx, tx, params.Identity.TemporalRunID); err != nil {
 		return types.ResearchBriefRefV3{}, err
@@ -427,6 +466,18 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 		params.ClaimResearchBriefSynthesisV3Params)
 	if err != nil {
 		return types.ResearchBriefRefV3{}, err
+	}
+	if row.SynthesisLLMReservationID == nil ||
+		*row.SynthesisLLMReservationID != params.SynthesisLLMReservationID {
+		return types.ResearchBriefRefV3{}, researchRunConflictError()
+	}
+	receiptState, _, err := loadResearchBriefLLMReceiptStateV3(ctx, tx,
+		params.ClaimResearchBriefSynthesisV3Params, row)
+	if err != nil {
+		return types.ResearchBriefRefV3{}, err
+	}
+	if receiptState != ResearchBriefLLMReceiptCompletedV3 {
+		return types.ResearchBriefRefV3{}, researchRunConflictError()
 	}
 	if row.Status == ResearchBriefSynthesisFinalizedV3 {
 		if row.Significance != brief.Significance || row.BriefDigest != briefDigest ||
@@ -482,13 +533,14 @@ func (s *Store) FailResearchBriefSynthesisV3(
 		!validResearchRunErrorCode(params.FailureCode) {
 		return ResearchBriefSynthesisV3{}, researchRunValidationError("research Brief failure is invalid")
 	}
-	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{})
+	tx, scopedRef, err := s.beginScopedResearchRunTransactionV3(
+		ctx, pgx.TxOptions{}, params.Identity, params.SnapshotRef.SnapshotID)
 	if err != nil {
 		return ResearchBriefSynthesisV3{}, researchRunDatabaseError("begin research Brief failure", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := setResearchRunScopeV3(ctx, tx, params.Identity.TenantID, params.Identity.UserID); err != nil {
-		return ResearchBriefSynthesisV3{}, err
+	if scopedRef != params.SnapshotRef {
+		return ResearchBriefSynthesisV3{}, researchRunIntegrityError()
 	}
 	if err := lockResearchBriefSynthesisV3(ctx, tx, params.Identity.TemporalRunID); err != nil {
 		return ResearchBriefSynthesisV3{}, err
@@ -497,6 +549,12 @@ func (s *Store) FailResearchBriefSynthesisV3(
 		params.ClaimResearchBriefSynthesisV3Params)
 	if err != nil {
 		return ResearchBriefSynthesisV3{}, err
+	}
+	if (row.SynthesisLLMReservationID == nil && params.SynthesisLLMReservationID > 0) ||
+		(row.SynthesisLLMReservationID != nil &&
+			(params.SynthesisLLMReservationID <= 0 ||
+				*row.SynthesisLLMReservationID != params.SynthesisLLMReservationID)) {
+		return ResearchBriefSynthesisV3{}, researchRunConflictError()
 	}
 	if row.Status == params.Status && row.FailureCode == params.FailureCode {
 		if err := tx.Commit(ctx); err != nil {
@@ -530,13 +588,14 @@ func (s *Store) LoadResearchBriefSynthesisV3(
 	if err := validateResearchBriefSynthesisScopeV3(identity, snapshotRef, planRef); err != nil {
 		return ResearchBriefSynthesisV3{}, err
 	}
-	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, scopedRef, err := s.beginScopedResearchRunTransactionV3(
+		ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly}, identity, snapshotRef.SnapshotID)
 	if err != nil {
 		return ResearchBriefSynthesisV3{}, researchRunDatabaseError("begin research Brief read", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := setResearchRunScopeV3(ctx, tx, identity.TenantID, identity.UserID); err != nil {
-		return ResearchBriefSynthesisV3{}, err
+	if scopedRef != snapshotRef {
+		return ResearchBriefSynthesisV3{}, researchRunIntegrityError()
 	}
 	row, found, err := loadResearchBriefSynthesisByPlanV3(ctx, tx, identity,
 		snapshotRef.SnapshotID, planRef.PlanID)
@@ -559,14 +618,12 @@ func (s *Store) LoadResearchBriefV3(
 	if err := ref.ValidateFor(identity, ref.RunSnapshotID, ref.PlanID); err != nil {
 		return ResearchBriefV3{}, researchRunValidationError("research Brief reference is invalid")
 	}
-	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, _, err := s.beginScopedResearchRunTransactionV3(
+		ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly}, identity, ref.RunSnapshotID)
 	if err != nil {
 		return ResearchBriefV3{}, researchRunDatabaseError("begin research Brief artifact read", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := setResearchRunScopeV3(ctx, tx, identity.TenantID, identity.UserID); err != nil {
-		return ResearchBriefV3{}, err
-	}
 	row, err := scanResearchBriefSynthesisV3(tx.QueryRow(ctx,
 		`SELECT `+researchBriefSynthesisColumnsV3+`
 		   FROM research_brief_syntheses
@@ -606,13 +663,15 @@ func (s *Store) LoadResearchHistoryChunkV3(
 		params.LimitChars < 1 || params.LimitChars > researchHistoryContextCharsV3 {
 		return ResearchHistoryChunkV3{}, researchRunValidationError("research history chunk cursor is invalid")
 	}
-	tx, err := s.beginResearchTransaction(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, scopedRef, err := s.beginScopedResearchRunTransactionV3(
+		ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly}, params.Identity,
+		params.SnapshotRef.SnapshotID)
 	if err != nil {
 		return ResearchHistoryChunkV3{}, researchRunDatabaseError("begin research history chunk read", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := setResearchRunScopeV3(ctx, tx, params.Identity.TenantID, params.Identity.UserID); err != nil {
-		return ResearchHistoryChunkV3{}, err
+	if scopedRef != params.SnapshotRef {
+		return ResearchHistoryChunkV3{}, researchRunIntegrityError()
 	}
 	row, err := loadAndValidateResearchBriefSynthesisHandleV3(ctx, tx,
 		params.ClaimResearchBriefSynthesisV3Params)
@@ -638,7 +697,7 @@ func (s *Store) LoadResearchHistoryChunkV3(
 	err = tx.QueryRow(ctx,
 		`SELECT record_id,chunk_offset_chars,next_offset_chars,total_chars,total_bytes,
 		        chunk_text,chunk_digest,full_digest,complete
-		   FROM read_research_history_content_v3($1,$2,$3,$4,$5,$6,$7,$8)`,
+		   FROM read_research_history_content_cap_v3($1,$2,$3,$4,$5,$6,$7,$8)`,
 		params.Identity.TenantID, params.Identity.UserID, params.Identity.TaskID,
 		params.SynthesisID, params.RequestDigest, params.RecordID,
 		params.OffsetChars, params.LimitChars).Scan(
@@ -797,7 +856,7 @@ func buildResearchHistoryManifestV3(
 		`SELECT kind,record_id,run_snapshot_id,generated_at,digest,coverage,
 		        payload_text,gap_reason,context_stored_size,context_visible_size,
 		        context_visible_digest,context_truncated,candidate_count
-		   FROM read_research_history_v3($1,$2,$3,$4,$5)`,
+		   FROM read_research_history_cap_v3($1,$2,$3,$4,$5)`,
 		identity.TenantID, identity.UserID, identity.TaskID,
 		snapshotRef.SnapshotID, currentPlanID)
 	if err != nil {
@@ -973,7 +1032,8 @@ const researchBriefSynthesisColumnsV3 = `
     id,tenant_id,user_id,task_id,run_snapshot_id,plan_id,
     temporal_workflow_id,temporal_run_id,definition_digest,plan_digest,
     notification_threshold,request_digest,context_payload,context_digest,
-    evidence_manifest,evidence_digest,history_manifest,history_digest,status,
+    evidence_manifest,evidence_digest,history_manifest,history_digest,
+    synthesis_llm_spend_reservation_id,status,
     significance,decision,delivery_required,brief_payload,brief_digest,failure_code,
     spending_started_at,finalized_at,created_at,updated_at`
 
@@ -990,7 +1050,8 @@ func scanResearchBriefSynthesisV3(scanner researchBriefSynthesisScannerV3) (
 		&row.DefinitionDigest, &row.PlanDigest, &row.NotificationThreshold,
 		&row.RequestDigest, &row.ContextPayload, &row.ContextDigest,
 		&row.EvidenceManifest, &row.EvidenceDigest, &row.HistoryManifest,
-		&row.HistoryDigest, &status, &significance, &decision, &row.DeliveryRequired,
+		&row.HistoryDigest, &row.SynthesisLLMReservationID, &status,
+		&significance, &decision, &row.DeliveryRequired,
 		&row.BriefPayload, &briefDigest, &row.FailureCode, &row.SpendingStartedAt,
 		&row.FinalizedAt, &row.CreatedAt, &row.UpdatedAt)
 	if err != nil {
@@ -1011,6 +1072,50 @@ func scanResearchBriefSynthesisV3(scanner researchBriefSynthesisScannerV3) (
 	row.HistoryManifest = append([]byte(nil), row.HistoryManifest...)
 	row.BriefPayload = append([]byte(nil), row.BriefPayload...)
 	return row, nil
+}
+
+func loadResearchBriefLLMReceiptStateV3(
+	ctx context.Context, tx pgx.Tx, params ClaimResearchBriefSynthesisV3Params,
+	row ResearchBriefSynthesisV3,
+) (ResearchBriefLLMReceiptStateV3, int64, error) {
+	if row.SynthesisLLMReservationID == nil {
+		// NULL is reserved for rows created before migration 092. Those rows are
+		// readable, but can never authorize a new provider call or finalization.
+		return "", 0, nil
+	}
+	if *row.SynthesisLLMReservationID != params.SynthesisLLMReservationID {
+		return "", 0, researchRunConflictError()
+	}
+	reservation, err := loadResearchRunLLMReservationByIDV3(ctx, tx,
+		params.Identity, params.SnapshotRef, params.SynthesisLLMReservationID, false)
+	if err != nil {
+		return "", 0, err
+	}
+	if reservation.Stage != ResearchRunLLMStageSynthesisV3 ||
+		reservation.RoundOrdinal != 0 || reservation.SubjectID != row.ID {
+		return "", 0, researchRunIntegrityError()
+	}
+	receipt, settled, err := loadResearchRunLLMSettlementV3(ctx, tx, reservation)
+	if err != nil {
+		return "", 0, err
+	}
+	if !settled {
+		return ResearchBriefLLMReceiptPendingV3, 0, nil
+	}
+	switch receipt.Outcome {
+	case ResearchRunLLMCompletedV3:
+		if !receipt.Attempted || !receipt.UsageKnown || receipt.DefinitelyZeroUsage ||
+			receipt.LLMCallID <= 0 || receipt.ErrorCode != "" {
+			return "", 0, researchRunIntegrityError()
+		}
+		return ResearchBriefLLMReceiptCompletedV3, receipt.LLMCallID, nil
+	case ResearchRunLLMFailedV3:
+		return ResearchBriefLLMReceiptFailedV3, receipt.LLMCallID, nil
+	case ResearchRunLLMIndeterminateV3:
+		return ResearchBriefLLMReceiptIndeterminateV3, receipt.LLMCallID, nil
+	default:
+		return "", 0, researchRunIntegrityError()
+	}
 }
 
 func loadResearchBriefSynthesisByPlanV3(

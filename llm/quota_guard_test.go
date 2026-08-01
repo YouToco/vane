@@ -58,6 +58,16 @@ var upstreamEntries = []upstreamEntry{
 	},
 }
 
+// externallySettledUpstreamEntries are measured adapters whose caller has
+// already durably reserved spend and must atomically persist the returned
+// receipt. They intentionally cannot use Recorder or the legacy live-quota
+// gate because doing so would double-charge and split the V3 transaction.
+// Keep this list narrow: each entry needs dedicated behavior tests proving its
+// pre-send boundary and terminal accounting classification.
+var externallySettledUpstreamEntries = map[string]bool{
+	"DoMeasuredV3": true,
+}
+
 func parseLLMFile(t *testing.T, name string) (*token.FileSet, *ast.File) {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -191,6 +201,9 @@ func TestInvariant_NoUnguardedUpstreamEntry(t *testing.T) {
 	registered := map[string]bool{}
 	for _, e := range upstreamEntries {
 		registered[e.fn] = true
+	}
+	for fn := range externallySettledUpstreamEntries {
+		registered[fn] = true
 	}
 	// 发请求的底层方法：它们是 Client 上真正打 HTTP 的那两个。
 	lowLevel := map[string]bool{"Complete": true, "Chat": true}

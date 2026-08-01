@@ -191,6 +191,13 @@ func do(
 	// 事前预扣，与 DoChat 保持相同的保守语义。若 HTTP 200 业务形态不合法
 	// 但上游已返回 usage，metadata-only resp 仍会按真实 token 对账。
 	actualTokens := call.PromptTokens + call.CompletionTokens
+	if resp != nil && !resp.UsageReported {
+		reconcileQuota = false
+		slog.Warn("llm: response omitted usage, retaining conservative precharge",
+			"trace_id", meta.TraceID,
+			"model", c.requestModel(req.Model),
+			"reserved_tokens", reserved)
+	}
 	if err != nil && resp == nil && types.CodeOf(err) == types.CodeLLMUnavailable {
 		reconcileQuota = false
 		slog.Warn("llm: 响应用量未知，保留单轮调用的保守预扣",

@@ -50,6 +50,7 @@ func researchExecutionTraceV3ForTest(
 // authority validation are covered independently in research_runtime_pool_test.
 func useOwnerResearchRuntimeForTest(st *Store) {
 	st.beginResearchTx = st.pool.BeginTx
+	st.beginGatewayTx = st.pool.BeginTx
 }
 
 func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
@@ -225,12 +226,7 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	); err == nil {
 		t.Fatal("database admitted a plan bound to a different Tool policy")
 	}
-	ref, err := st.CreateOrGetResearchRunPlanV3(ctx, CreateOrGetResearchRunPlanV3Params{
-		Identity: identity, RunSnapshotID: snapshotID, Plan: plan,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	ref, _ := createResearchPlanFromReceiptV3(t, st, identity, snapshotRef, plan)
 	if recovered, found, err := st.LoadResearchRunPlanRefV3(ctx, identity, snapshotRef); err != nil || !found || recovered != ref {
 		t.Fatalf("sealed plan recovery=%+v found=%v err=%v", recovered, found, err)
 	}
@@ -548,12 +544,8 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	}
 	manualPlan := researchRunPlanFixtureV3(t, digestA,
 		manualSnapshot.CapabilityCatalogDigest, manualSnapshot.ToolPolicyDigest, "manual Kimi pricing")
-	manualRef, err := st.CreateOrGetResearchRunPlanV3(ctx, CreateOrGetResearchRunPlanV3Params{
-		Identity: manualIdentity, RunSnapshotID: manualSnapshot.SnapshotID, Plan: manualPlan,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	manualRef, _ := createResearchPlanFromReceiptV3(
+		t, st, manualIdentity, manualSnapshot, manualPlan)
 	if manualStart, err := st.BeginResearchRunStepV3(
 		ctx, manualIdentity, manualSnapshot.SnapshotID, manualRef, 0,
 	); err != nil || !manualStart.FirstWriter {

@@ -31,11 +31,11 @@ func TestResearchV3TransactionsUseDedicatedRuntimeGuard(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := string(source)
-		if strings.Contains(text, "s.beginTx(") || strings.Contains(text, "s.pool.") {
-			t.Fatalf("%s bypasses the dedicated V3 runtime transaction boundary", name)
+		if strings.Contains(text, "setResearchRunScopeV3(") {
+			t.Fatalf("%s retains caller-selected tenant/user authority", name)
 		}
-		if !strings.Contains(text, "s.beginResearchTransaction(") {
-			t.Fatalf("%s has no dedicated V3 runtime transaction", name)
+		if !strings.Contains(text, "beginScopedResearchRunTransactionV3(") {
+			t.Fatalf("%s has no per-run capability transaction", name)
 		}
 	}
 }
@@ -142,7 +142,11 @@ func TestNewWithResearchRuntimeAcceptsRestrictedLoginPostgres(t *testing.T) {
 	}
 	researchConfig.User = url.UserPassword("vane_research_runtime", password)
 	researchURL := researchConfig.String()
-	st, err := NewWithResearchRuntime(t.Context(), dbURL, researchURL)
+	st, err := NewWithResearchRuntimeCapability(t.Context(), dbURL, researchURL,
+		ResearchRunCapabilityConfigV1{
+			ActiveKeyID:  "runtime-test-active",
+			ActiveKeyHex: strings.Repeat("51", 32),
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,14 +308,8 @@ func TestNewWithResearchRuntimeAcceptsRestrictedLoginPostgres(t *testing.T) {
 	runtimePlan := researchRunPlanFixtureV3(
 		t, runtimeFixture.definitionDigest, runtimeSnapshot.CapabilityCatalogDigest,
 		runtimeSnapshot.ToolPolicyDigest, "restricted runtime Kimi pricing")
-	runtimePlanRef, err := st.CreateOrGetResearchRunPlanV3(t.Context(),
-		CreateOrGetResearchRunPlanV3Params{
-			Identity: runtimeFixture.identity, RunSnapshotID: runtimeSnapshot.SnapshotID,
-			Plan: runtimePlan,
-		})
-	if err != nil {
-		t.Fatalf("restricted runtime freeze V3 plan: %v", err)
-	}
+	runtimePlanRef, _ := createResearchPlanFromReceiptV3(
+		t, st, runtimeFixture.identity, runtimeSnapshot, runtimePlan)
 	runtimeFixture.planRef = runtimePlanRef
 	execution, err := runtimeFixture.begin(t, 0)
 	if err != nil {

@@ -1,4 +1,4 @@
-// vane server 入口：加载配置 → 初始化日志 → 自动迁移 → 建库连接 →
+// vane server 入口：加载配置 → 初始化日志 → 建库连接 →
 // LLM 客户端/记账 → 飞书 Manager → HTTP 服务（healthz/readyz + Dashboard API）→ 优雅关停。
 package main
 
@@ -37,6 +37,7 @@ import (
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/pusher"
 	"github.com/YouToco/vane/pushrecovery"
+	"github.com/YouToco/vane/researchgateway"
 	"github.com/YouToco/vane/runoutcome"
 	"github.com/YouToco/vane/runtimeconfig"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -72,20 +73,24 @@ func run() error {
 
 	initLogger(cfg.Log.Level)
 
-	// MVP 决策：启动时自动执行数据库迁移，失败则拒绝启动。
-	// 60s 上限覆盖"VPS 开机时 Postgres 容器尚未就绪"的等待窗口；SIGTERM 可提前中断。
-	migrateCtx, cancelMigrate := context.WithTimeout(ctx, 60*time.Second)
-	if err := store.Migrate(migrateCtx, cfg.DB.URL); err != nil {
-		cancelMigrate()
-		return fmt.Errorf("数据库迁移: %w", err)
-	}
-	cancelMigrate()
-	slog.Info("数据库迁移完成")
-
-	st, err := store.NewWithResearchRuntime(ctx, cfg.DB.URL, cfg.DB.ResearchRuntimeURL)
+	st, err := store.NewServerRuntimeWithResearchRuntimeCapability(
+		ctx, cfg.DB.URL, cfg.DB.ResearchRuntimeURL,
+		store.ResearchRunCapabilityConfigV1{
+			ActiveKeyID:  cfg.DB.ResearchCapabilityKeyID,
+			ActiveKeyHex: cfg.DB.ResearchCapabilityKeyHex,
+			RetiredKeys:  cfg.DB.ResearchCapabilityRetiredKeys,
+			TTL:          time.Duration(cfg.DB.ResearchCapabilityTTLDays) * 24 * time.Hour,
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("初始化数据库连接池: %w", err)
 	}
+	gatewayClient, err := researchgateway.NewUnixClientV1(cfg.ResearchGateway.SocketPath)
+	if err != nil {
+		st.Close()
+		return fmt.Errorf("初始化 research gateway client: %w", err)
+	}
+	_ = gatewayClient // V3 LLM activity wiring lands with the process rollout.
 
 	// LLM 客户端 + 调用记账（写库失败只记日志，不影响主流程）。
 	llmClient := llm.New(cfg.LLM)

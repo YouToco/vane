@@ -16,7 +16,11 @@ import (
 // Every method must finish its immutable Store commit before returning; the
 // Activity result contains only safe references and digests.
 type ResearchRuntimeCoordinatorV3 interface {
-	Prepare(context.Context, types.RunIdentity) (types.ResearchRunSnapshotRefV3, bool, error)
+	Prepare(context.Context, types.RunIdentity) (
+		snapshot types.ResearchRunSnapshotRefV3,
+		authorized, deliveryAllowed bool,
+		err error,
+	)
 	Plan(context.Context, types.RunIdentity, types.ResearchRunSnapshotRefV3, string) (types.ResearchRunPlanRefV3, error)
 	ExecuteStep(context.Context, types.RunIdentity, types.ResearchRunSnapshotRefV3, types.ResearchRunPlanRefV3, int, string) (ResearchStepReceiptV3, error)
 	Synthesize(context.Context, types.RunIdentity, types.ResearchRunSnapshotRefV3, types.ResearchRunPlanRefV3, string) (ResearchBriefRefV3, error)
@@ -24,15 +28,16 @@ type ResearchRuntimeCoordinatorV3 interface {
 }
 
 type PrepareResearchRunV3Result struct {
-	Authorized bool                           `json:"authorized"`
-	Snapshot   types.ResearchRunSnapshotRefV3 `json:"snapshot"`
+	Authorized      bool                           `json:"authorized"`
+	DeliveryAllowed bool                           `json:"delivery_allowed"`
+	Snapshot        types.ResearchRunSnapshotRefV3 `json:"snapshot"`
 }
 
 func (r PrepareResearchRunV3Result) ValidateFor(identity types.RunIdentity) error {
 	if !r.Authorized {
-		if r.Snapshot != (types.ResearchRunSnapshotRefV3{}) {
+		if r.DeliveryAllowed || r.Snapshot != (types.ResearchRunSnapshotRefV3{}) {
 			return types.NewAppError(types.CodeValidation,
-				"unauthorized research preparation returned a snapshot", nil)
+				"unauthorized research preparation returned runtime authority", nil)
 		}
 		return nil
 	}
@@ -123,11 +128,13 @@ func (a *Activities) PrepareResearchRunV3(
 		return PrepareResearchRunV3Result{}, researchV3ActivityError(ctx, "prepare", types.NewAppError(
 			types.CodeValidation, "research V3 preparation is unavailable", err))
 	}
-	ref, authorized, err := a.researchRuntimeV3.Prepare(ctx, identity)
+	ref, authorized, deliveryAllowed, err := a.researchRuntimeV3.Prepare(ctx, identity)
 	if err != nil {
 		return PrepareResearchRunV3Result{}, researchV3ActivityError(ctx, "prepare", err)
 	}
-	result := PrepareResearchRunV3Result{Authorized: authorized}
+	result := PrepareResearchRunV3Result{
+		Authorized: authorized, DeliveryAllowed: deliveryAllowed,
+	}
 	if authorized {
 		result.Snapshot = ref
 	}

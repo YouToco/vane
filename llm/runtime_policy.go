@@ -73,6 +73,26 @@ func (r *RuntimeModelResolverV1) ResolveRuntimeModelPolicyV1(
 	return client, nil
 }
 
+// ResolveRuntimeModelRouteV1 resolves the exact opaque route references used
+// by Research V3. The gateway receives these references from the immutable run
+// snapshot, never from its HTTP caller, and never falls back to a current key.
+func (r *RuntimeModelResolverV1) ResolveRuntimeModelRouteV1(
+	provider runtimepolicy.ModelProviderIDV1,
+	endpoint runtimepolicy.EndpointRefV1,
+	credential runtimepolicy.CredentialRefV1,
+) (*Client, error) {
+	if r == nil {
+		return nil, fmt.Errorf("llm: runtime model resolver is nil")
+	}
+	client := r.routes[runtimeModelRouteKeyV1{
+		provider: provider, endpoint: endpoint, credential: credential,
+	}]
+	if client == nil {
+		return nil, fmt.Errorf("llm: retained runtime model route is unavailable")
+	}
+	return client, nil
+}
+
 // ValidateRuntimeModelPolicyV1 resolves the controlled V1 route to this
 // client. Endpoint URLs and credential values remain private client fields;
 // the snapshot contains only purpose-bound aliases and generations.

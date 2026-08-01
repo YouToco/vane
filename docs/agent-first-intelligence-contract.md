@@ -67,3 +67,44 @@
 - `manage_tasks` 在 authenticated scope 内重新解析全部目标，再调用只看本轮原话、动作、changes 和可读目标摘要的 `authorize_owner_action`。外部结果与历史不会进入裁决。
 - `run`/`delete` 强制使用每个任务的耐久幂等命令。批量部分失败仍继续处理其他目标，并把 completed/failed 写入动作回执；用户只看到可读名称。
 - 开启 exact evidence 后，任何 provider call identity、scope 或 session 不变量不匹配都会中止回复，不能回退到 legacy preview。presentation guard 和内部引用脱敏都发生在最终 turn 提交之前。
+
+## 8. V3 运行权限与付费调用回执
+
+`app.tenant_id` / `app.user_id` 只用于兼容过滤，不能作为 V3 的授权根。每个 V3
+快照在控制面事务中同时登记一个 exact-run capability hash；Activity 根据不可变快照引用和
+进程密钥环重新派生 bearer，并只用 `SET LOCAL` 安装到单个受限事务。bearer 不进入
+Temporal 参数、日志、错误或 JSON。能力绑定 snapshot、tenant、user、task、workflow、run
+和 reference digest；active key 可轮换，retired derivation key 必须保留到最长 Temporal
+恢复窗口之后。默认能力寿命为 90 天，部署值不得短于 Temporal retention。
+
+模型调用采用三层职责分离：
+
+1. 普通 V3 executor 只能申请不可变 reservation，不能直接写 `llm_calls`、结算或读取网关密钥；
+2. 独立 OS 进程和 gateway login 在真正发 HTTP 前原子写入 `send_started`，模型返回后对
+   exact request/response/usage/outcome 生成 HMAC 回执；主进程只可通过校验 peer UID 的
+   Unix Socket 提交 reservation、digest 与 opaque capability，不能提交 prompt、模型或 usage；
+3. PostgreSQL verifier 在 claim 时校验 live run capability，并在 terminal settlement 校验
+   reservation、已授权 send marker、签名、时间窗和冻结 prompt，再原子写入调用证据与成本。
+   capability 后续过期/撤销只能阻止新 claim，不能阻断已付费 effect 的结算。Plan/Brief 只接受
+   `verified_gateway` 回执。
+
+Provider 路由同样属于冻结快照：gateway 从数据库取得 provider、endpoint ID/generation 与
+credential ID/generation，再由其私有 retained-route registry 解析具体 HTTPS endpoint 和
+systemd credential。轮换必须新增 generation 并保留旧 route 到最长 Temporal 恢复窗口之后；
+缺少旧 generation 时在网络请求前 fail-closed，绝不回退到“当前 key”。
+
+恢复语义是保守且不重复付费：没有 `send_started` 的 reservation 可以安全继续；存在 marker
+却没有完整签名回执时，禁止再次调用 provider；同一 Activity 用 exact binding 轮询，十分钟
+恢复门槛后由 gateway 根据数据库中的冻结请求骨架签发 `indeterminate` 回执并保留全额预留。
+Activity 单次预算必须大于该门槛；Provider 完成后的相同 settlement 会做有界幂等重试。
+低报、零报、缺 usage 或执行器伪造的用量均不能
+触发退款；真实用量高于预留时记入债务并阻止后续超额轮次。
+
+Tool 调用同样采用 reservation floor：原子 admission 扣下的 `exa_calls` 是最低收费，后续
+`attempted=false`、零用量或无 Tool call 的 settlement 只能记录结果，不能补回配额。096
+之前已经发生的退款保持历史原样，不做猜测性回填；恢复重放只读取同一不可变 settlement，
+因此既不会再次扣减，也不会产生补偿。完整 Tool provider receipt/gateway 属于后续独立边界。
+
+当前生产开关继续 fail-closed：在独立 runtime/gateway 连接、能力密钥环、真实 PostgreSQL
+攻击测试和 receipt-first coordinator 全部装配前，V3 Activity 虽已注册但没有可执行 runtime；
+影子运行也不得借用旧 executor 或绕过签名结算。

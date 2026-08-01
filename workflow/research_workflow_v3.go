@@ -35,11 +35,11 @@ func runResearchPipelineV3(
 		TenantID: p.TenantID, UserID: p.UserID, TaskID: p.ScheduleID,
 		TraceID: traceID, Snapshot: prepared.Snapshot,
 	}
-	planCtx := workflow.WithActivityOptions(ctx, researchV3SideEffectOptions())
+	recoveryCtx := workflow.WithActivityOptions(ctx, researchV3StoreRecoveryOptions())
 	var planned PlanResearchRunV3Result
 	if err := workflow.ExecuteActivity(
-		planCtx, a.PlanResearchRunV3, run,
-	).Get(planCtx, &planned); err != nil {
+		recoveryCtx, a.PlanResearchRunV3, run,
+	).Get(recoveryCtx, &planned); err != nil {
 		return err
 	}
 	if err := planned.ValidateFor(identity, prepared.Snapshot.SnapshotID); err != nil {
@@ -48,10 +48,10 @@ func runResearchPipelineV3(
 	for ordinal := 0; ordinal < planned.Plan.StepCount; ordinal++ {
 		var receipt ResearchStepReceiptV3
 		if err := workflow.ExecuteActivity(
-			planCtx, a.ExecuteResearchStepV3, ExecuteResearchStepV3Input{
+			recoveryCtx, a.ExecuteResearchStepV3, ExecuteResearchStepV3Input{
 				ResearchRunV3Input: run, Plan: planned.Plan, Ordinal: ordinal,
 			},
-		).Get(planCtx, &receipt); err != nil {
+		).Get(recoveryCtx, &receipt); err != nil {
 			return err
 		}
 		if err := receipt.Validate(ordinal); err != nil {
@@ -70,10 +70,10 @@ func runResearchPipelineV3(
 	if err := brief.ValidateFor(identity, prepared.Snapshot.SnapshotID, planned.Plan.PlanID); err != nil {
 		return err
 	}
-	if !brief.DeliveryRequired {
+	if !prepared.DeliveryAllowed || !brief.DeliveryRequired {
 		return nil
 	}
-	deliveryCtx := workflow.WithActivityOptions(ctx, researchV3SideEffectOptions())
+	deliveryCtx := workflow.WithActivityOptions(ctx, researchV3DeliveryOptions())
 	var receipt ResearchDeliveryReceiptV3
 	if err := workflow.ExecuteActivity(
 		deliveryCtx, a.DeliverResearchBriefV3, DeliverResearchBriefV3Input{
@@ -85,21 +85,33 @@ func runResearchPipelineV3(
 	return receipt.Validate(brief.BriefID)
 }
 
-// Synthesis gets exactly one recovery attempt. The first Store claim is the
-// paid-model authorization point; if its worker disappears, the retry reaches
-// the same immutable row and closes spending as ambiguous without another
-// provider call. Tool and delivery Activities retain their independent
-// single-attempt effect contracts.
+// Planner, Tool execution and synthesis each get exactly one Store-only
+// recovery attempt. Their coordinators retain the actual provider call behind
+// an immutable first-writer/receipt gate, so a second Activity attempt may only
+// recover or conservatively settle that durable state. Delivery keeps its
+// separate single-attempt contract until its own receipt-backed coordinator is
+// wired for live canary traffic.
 func researchV3SynthesisOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
-		StartToCloseTimeout: 5 * time.Minute,
+		// Gateway abandoned-claim recovery becomes legal after ten minutes.
+		// Keep the same idempotent Activity alive beyond that durable fence.
+		StartToCloseTimeout: 15 * time.Minute,
 		RetryPolicy: &temporal.RetryPolicy{
 			MaximumAttempts: 2, NonRetryableErrorTypes: nonRetryableCodes,
 		},
 	}
 }
 
-func researchV3SideEffectOptions() workflow.ActivityOptions {
+func researchV3StoreRecoveryOptions() workflow.ActivityOptions {
+	return workflow.ActivityOptions{
+		StartToCloseTimeout: 15 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 2, NonRetryableErrorTypes: nonRetryableCodes,
+		},
+	}
+}
+
+func researchV3DeliveryOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
 		StartToCloseTimeout: 5 * time.Minute,
 		RetryPolicy: &temporal.RetryPolicy{

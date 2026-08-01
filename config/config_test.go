@@ -1659,6 +1659,8 @@ func TestValidateCompiledRouteGenerations(t *testing.T) {
 func TestResearchRuntimeURLFromEnvironment(t *testing.T) {
 	t.Setenv("VANE_DB_URL", "postgres://owner")
 	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://vane_research_runtime:secret@db/vane")
+	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "research-cap-2026-08")
+	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
 	cfg, err := Load("")
 	if err != nil {
 		t.Fatal(err)
@@ -1666,6 +1668,56 @@ func TestResearchRuntimeURLFromEnvironment(t *testing.T) {
 	if got, want := cfg.DB.ResearchRuntimeURL,
 		"postgres://vane_research_runtime:secret@db/vane"; got != want {
 		t.Fatalf("db.research_runtime_url=%q, want %q", got, want)
+	}
+	if cfg.DB.ResearchCapabilityKeyID != "research-cap-2026-08" ||
+		cfg.DB.ResearchCapabilityKeyHex != strings.Repeat("42", 32) {
+		t.Fatal("research capability key was not loaded from environment")
+	}
+}
+
+func TestResearchGatewaySocketUsesIsolatedUnixDefault(t *testing.T) {
+	t.Setenv("VANE_DB_URL", "postgres://runtime")
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.ResearchGateway.SocketPath,
+		"/run/vane-research-gateway/gateway.sock"; got != want {
+		t.Fatalf("research gateway socket = %q, want %q", got, want)
+	}
+}
+
+func TestResearchGatewaySocketRejectsRelativeOrUncleanPath(t *testing.T) {
+	for _, value := range []string{"gateway.sock", "/run/vane/../gateway.sock", "   "} {
+		t.Run(strings.ReplaceAll(value, "/", "_"), func(t *testing.T) {
+			t.Setenv("VANE_DB_URL", "postgres://runtime")
+			t.Setenv("VANE_RESEARCH_GATEWAY_SOCKET_PATH", value)
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(configPath); err == nil {
+				t.Fatalf("accepted unsafe research gateway socket %q", value)
+			}
+		})
+	}
+}
+
+func TestResearchRuntimeRequiresCapabilityKey(t *testing.T) {
+	cfg := Config{DB: DBConfig{
+		URL: "postgres://owner", ResearchRuntimeURL: "postgres://runtime",
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "capability") {
+		t.Fatalf("missing research capability key returned %v", err)
+	}
+	cfg.DB.ResearchCapabilityKeyID = "active"
+	cfg.DB.ResearchCapabilityKeyHex = strings.Repeat("ab", 32)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid research capability key was rejected: %v", err)
 	}
 }
 
