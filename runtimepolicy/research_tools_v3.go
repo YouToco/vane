@@ -173,10 +173,12 @@ func normalizeResearchToolDefinitionV3(tool ResearchToolDefinitionV3) (ResearchT
 		return ResearchToolDefinitionV3{}, err
 	}
 	sum := sha256.Sum256(canonicalSchema)
-	if tool.SchemaDigest != hex.EncodeToString(sum[:]) {
+	expectedSchemaDigest := hex.EncodeToString(sum[:])
+	if tool.SchemaDigest != "" && tool.SchemaDigest != expectedSchemaDigest {
 		return ResearchToolDefinitionV3{}, invalidPolicy("research tool schema digest differs")
 	}
 	tool.Parameters = canonicalSchema
+	tool.SchemaDigest = expectedSchemaDigest
 	tool.Effects = slices.Clone(expectedEffects)
 	return tool, nil
 }
