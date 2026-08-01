@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -84,11 +85,11 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		 WHERE id=$1`, taskID, digestA); err != nil {
 		t.Fatal(err)
 	}
-	digestC := strings.Repeat("c", 64)
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM schedule_commands WHERE tenant_id=$1`, tenantID)
+		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_evidence WHERE tenant_id=$1`, tenantID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_steps WHERE tenant_id=$1`, tenantID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM research_run_plans WHERE tenant_id=$1`, tenantID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id=$1`, tenantID)
@@ -230,19 +231,26 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	var planUpdate, planDelete, planTruncate, stepUpdate, stepDelete, stepTruncate bool
+	var evidenceUpdate, evidenceDelete, evidenceTruncate bool
 	if err := st.pool.QueryRow(ctx,
 		`SELECT has_table_privilege('vane_app','research_run_plans','UPDATE'),
 		        has_table_privilege('vane_app','research_run_plans','DELETE'),
 		        has_table_privilege('vane_app','research_run_plans','TRUNCATE'),
 		        has_table_privilege('vane_app','research_run_steps','UPDATE'),
 		        has_table_privilege('vane_app','research_run_steps','DELETE'),
-		        has_table_privilege('vane_app','research_run_steps','TRUNCATE')`,
-	).Scan(&planUpdate, &planDelete, &planTruncate, &stepUpdate, &stepDelete, &stepTruncate); err != nil {
+		        has_table_privilege('vane_app','research_run_steps','TRUNCATE'),
+		        has_table_privilege('vane_app','research_run_evidence','UPDATE'),
+		        has_table_privilege('vane_app','research_run_evidence','DELETE'),
+		        has_table_privilege('vane_app','research_run_evidence','TRUNCATE')`,
+	).Scan(&planUpdate, &planDelete, &planTruncate, &stepUpdate, &stepDelete, &stepTruncate,
+		&evidenceUpdate, &evidenceDelete, &evidenceTruncate); err != nil {
 		t.Fatal(err)
 	}
-	if planUpdate || planDelete || planTruncate || stepUpdate || stepDelete || stepTruncate {
-		t.Fatalf("append-only grants drifted: plan=%v/%v/%v step=%v/%v/%v",
-			planUpdate, planDelete, planTruncate, stepUpdate, stepDelete, stepTruncate)
+	if planUpdate || planDelete || planTruncate || stepUpdate || stepDelete || stepTruncate ||
+		evidenceUpdate || evidenceDelete || evidenceTruncate {
+		t.Fatalf("append-only grants drifted: plan=%v/%v/%v step=%v/%v/%v evidence=%v/%v/%v",
+			planUpdate, planDelete, planTruncate, stepUpdate, stepDelete, stepTruncate,
+			evidenceUpdate, evidenceDelete, evidenceTruncate)
 	}
 	var publicExecute bool
 	var functionOwner string
@@ -279,8 +287,15 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 		t.Fatalf("started=%+v", started)
 	}
 	replayedStart, err := st.BeginResearchRunStepV3(ctx, identity, snapshotID, ref, 0)
-	if err != nil || replayedStart.StepID != started.StepID || replayedStart.FirstWriter {
+	if err != nil || replayedStart.StepID != started.StepID || replayedStart.FirstWriter ||
+		len(replayedStart.Arguments) != 0 {
 		t.Fatalf("start replay=%+v err=%v", replayedStart, err)
+	}
+	startedResolution, err := st.LoadResearchRunStepResolutionV3(
+		ctx, identity, snapshotID, ref, 0)
+	if err != nil || startedResolution.Phase != ResearchRunStepStartedV3 ||
+		startedResolution.Evidence != nil {
+		t.Fatalf("started resolution=%+v err=%v", startedResolution, err)
 	}
 	stepRLSTx, err := st.pool.Begin(ctx)
 	if err != nil {
@@ -306,31 +321,112 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	if err := stepRLSTx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CommitResearchRunStepV3(ctx, CommitResearchRunStepV3Params{
+	if _, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
 		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 1,
-		Phase: ResearchRunStepCompletedV3, ResultDigest: digestC,
+		Result: []byte("result without start"), OriginalSize: 20, TrustType: "external",
 	}); err == nil {
-		t.Fatal("terminal step without an immutable start passed")
+		t.Fatal("evidence without an immutable start passed")
 	}
-	receipt, err := st.CommitResearchRunStepV3(ctx, CommitResearchRunStepV3Params{
+	if _, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
 		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
-		Phase: ResearchRunStepCompletedV3, ResultDigest: digestC, CostMicroUSD: 21,
+		Result: []byte{0xff}, OriginalSize: 1, TrustType: "external",
+	}); err == nil {
+		t.Fatal("invalid UTF-8 evidence passed")
+	}
+	// The deferred inverse fence prevents an evidence-only transaction.
+	orphanResult := []byte(`{"orphan":true}`)
+	orphanTx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = orphanTx.Exec(ctx,
+		`INSERT INTO research_run_evidence (
+		     tenant_id,user_id,task_id,plan_id,started_step_id,temporal_run_id,
+		     plan_digest,step_ordinal,invocation_id,tool_name,request_digest,
+		     result_bytes,result_digest,original_size,truncated,trust_type,schema_version
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,0,$8,$9,$10,$11,$12,$13,false,'external',$14)`,
+		tenantID, userID, taskID, ref.PlanID, started.StepID,
+		identity.TemporalRunID, ref.PlanDigest, started.InvocationID,
+		started.ToolName, started.RequestDigest, orphanResult,
+		researchRunSHA256(orphanResult), len(orphanResult), researchRunEvidenceSchemaV3)
+	if err != nil {
+		_ = orphanTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := orphanTx.Commit(ctx); err == nil {
+		t.Fatal("evidence-only transaction committed")
+	}
+	// Even an owner-side raw completion cannot bypass the exact-evidence fence.
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO research_run_steps (
+		     tenant_id,user_id,task_id,plan_id,temporal_run_id,plan_digest,
+		     step_ordinal,phase,invocation_id,tool_name,request_digest,
+		     result_digest,cost_micro_usd,error_code,schema_version
+		 ) VALUES ($1,$2,$3,$4,$5,$6,0,'completed',$7,$8,$9,$10,21,NULL,$11)`,
+		tenantID, userID, taskID, ref.PlanID, identity.TemporalRunID, ref.PlanDigest,
+		started.InvocationID, started.ToolName, started.RequestDigest,
+		strings.Repeat("c", 64), researchRunStepSchemaV3); err == nil {
+		t.Fatal("raw completed step without exact evidence passed")
+	}
+	visibleResult := []byte(`{"status":"available","source":"official"}`)
+	receipt, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
+		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
+		Result: visibleResult, OriginalSize: len(visibleResult) + 99,
+		TrustType: "external", CostMicroUSD: 21,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayedReceipt, err := st.CommitResearchRunStepV3(ctx, CommitResearchRunStepV3Params{
+	replayedReceipt, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
 		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
-		Phase: ResearchRunStepCompletedV3, ResultDigest: digestC, CostMicroUSD: 21,
+		Result: visibleResult, OriginalSize: len(visibleResult) + 99,
+		TrustType: "external", CostMicroUSD: 21,
 	})
 	if err != nil || replayedReceipt != receipt {
 		t.Fatalf("receipt replay=%+v err=%v want=%+v", replayedReceipt, err, receipt)
 	}
-	if _, err := st.CommitResearchRunStepV3(ctx, CommitResearchRunStepV3Params{
+	if _, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
 		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
-		Phase: ResearchRunStepCompletedV3, ResultDigest: strings.Repeat("b", 64), CostMicroUSD: 21,
+		Result: []byte(`{"status":"different"}`), OriginalSize: 22,
+		TrustType: "external", CostMicroUSD: 21,
 	}); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("conflicting receipt err=%v", err)
+	}
+	if receipt.EvidenceID <= 0 || !receipt.Truncated ||
+		receipt.OriginalSize != len(visibleResult)+99 || receipt.TrustType != "external" {
+		t.Fatalf("evidence receipt=%+v", receipt)
+	}
+	completedResolution, err := st.LoadResearchRunStepResolutionV3(
+		ctx, identity, snapshotID, ref, 0)
+	if err != nil || completedResolution.Phase != ResearchRunStepCompletedV3 ||
+		completedResolution.Evidence == nil ||
+		!bytes.Equal(completedResolution.Evidence.Result, visibleResult) ||
+		completedResolution.Evidence.EvidenceID != receipt.EvidenceID {
+		t.Fatalf("completed resolution=%+v err=%v", completedResolution, err)
+	}
+	evidenceRLSTx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer evidenceRLSTx.Rollback(ctx)
+	if _, err := evidenceRLSTx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true)`,
+		strconv.FormatInt(tenantID, 10), strconv.FormatInt(otherUserID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := evidenceRLSTx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceRLSTx.QueryRow(ctx,
+		`SELECT count(*) FROM research_run_evidence WHERE id=$1`, receipt.EvidenceID,
+	).Scan(&foreignVisible); err != nil {
+		t.Fatal(err)
+	}
+	if foreignVisible != 0 {
+		t.Fatalf("cross-user RLS exposed %d evidence rows", foreignVisible)
+	}
+	if err := evidenceRLSTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
 	}
 
 	foreignIdentity := identity
@@ -340,6 +436,11 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	}
 	if _, err := st.pool.Exec(ctx, `UPDATE schedules SET status='paused' WHERE id=$1`, taskID); err != nil {
 		t.Fatal(err)
+	}
+	pausedRecovery, err := st.BeginResearchRunStepV3(ctx, identity, snapshotID, ref, 0)
+	if err != nil || pausedRecovery.FirstWriter || pausedRecovery.StepID != started.StepID ||
+		len(pausedRecovery.Arguments) != 0 {
+		t.Fatalf("paused response-loss recovery=%+v err=%v", pausedRecovery, err)
 	}
 	if _, err := st.BeginResearchRunStepV3(ctx, identity, snapshotID, ref, 1); err == nil {
 		t.Fatal("paused task admitted a new external step")
@@ -391,7 +492,7 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	); err == nil {
 		t.Fatal("blocked manual command admitted another external step")
 	}
-	var starts, terminals int
+	var starts, terminals, evidenceRows int
 	if err := st.pool.QueryRow(ctx,
 		`SELECT count(*) FILTER (WHERE phase='started'),
 		        count(*) FILTER (WHERE phase<>'started')
@@ -400,6 +501,14 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	}
 	if starts != 1 || terminals != 1 {
 		t.Fatalf("step rows started=%d terminal=%d", starts, terminals)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM research_run_evidence WHERE plan_id=$1`, ref.PlanID,
+	).Scan(&evidenceRows); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceRows != 1 {
+		t.Fatalf("evidence rows=%d", evidenceRows)
 	}
 }
 

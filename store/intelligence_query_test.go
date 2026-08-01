@@ -67,6 +67,10 @@ func TestIntelligenceCursorBindsScopeAndQuery(t *testing.T) {
 	if err != nil || len(gotAfter) != 2 || string(gotAfter[1]) != `"task-kimi"` {
 		t.Fatalf("verify after=%q err=%v", gotAfter, err)
 	}
+	tamperedCursor := "A" + cursor[1:]
+	if cursor[0] == 'A' {
+		tamperedCursor = "B" + cursor[1:]
+	}
 	for name, candidate := range map[string]struct {
 		scope  IntelligenceScope
 		digest string
@@ -76,7 +80,7 @@ func TestIntelligenceCursorBindsScopeAndQuery(t *testing.T) {
 		"user":   {IntelligenceScope{TenantID: 11, UserID: 99, TaskID: "task-kimi"}, strings.Repeat("a", 64), cursor},
 		"task":   {IntelligenceScope{TenantID: 11, UserID: 12, TaskID: "other"}, strings.Repeat("a", 64), cursor},
 		"query":  {scope, strings.Repeat("b", 64), cursor},
-		"bytes":  {scope, strings.Repeat("a", 64), cursor[:len(cursor)-1] + "A"},
+		"bytes":  {scope, strings.Repeat("a", 64), tamperedCursor},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := st.verifyIntelligenceCursor(t.Context(), candidate.scope, candidate.digest, candidate.cursor); !errors.Is(err, types.ErrValidation) {

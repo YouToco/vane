@@ -145,6 +145,12 @@ var purgeOrder = []purgeStep{
 	// Exact model/tool receipts reference immutable run snapshots from 082.
 	{"llm_calls", "tenant_id = $1"},
 	{"tool_calls", "tenant_id = $1"},
+	// V3 research evidence binds its immutable started step; steps bind the
+	// per-run plan; plans bind the frozen run snapshot. Keep this exact
+	// child-first order so explicit tenant erasure leaves no research history.
+	{"research_run_evidence", "tenant_id = $1"},
+	{"research_run_steps", "tenant_id = $1"},
+	{"research_run_plans", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration
 	// 031, so batches must be gone before either the marked parent or its
 	// sidecar. A marked run also points at its immutable cutover event; parents
@@ -249,6 +255,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		periodicReceiptsAvailable     bool
 		periodicReportsAvailable      bool
 		periodicDeliveriesAvailable   bool
+		researchEvidenceAvailable     bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -264,7 +271,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.periodic_brief_intents') IS NOT NULL,
 		        to_regclass('public.periodic_synthesis_receipts') IS NOT NULL,
 		        to_regclass('public.periodic_brief_reports') IS NOT NULL,
-		        to_regclass('public.periodic_report_deliveries') IS NOT NULL`,
+		        to_regclass('public.periodic_report_deliveries') IS NOT NULL,
+		        to_regclass('public.research_run_evidence') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -280,6 +288,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&periodicReceiptsAvailable,
 		&periodicReportsAvailable,
 		&periodicDeliveriesAvailable,
+		&researchEvidenceAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -299,6 +308,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"periodic_synthesis_receipts":        periodicReceiptsAvailable,
 		"periodic_brief_reports":             periodicReportsAvailable,
 		"periodic_report_deliveries":         periodicDeliveriesAvailable,
+		"research_run_evidence":              researchEvidenceAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true),
