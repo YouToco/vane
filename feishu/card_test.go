@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -68,6 +69,41 @@ func TestBuildReplyCard(t *testing.T) {
 	}
 	if card.Body.Elements[0].Content != markdown {
 		t.Errorf("markdown 正文经转义后不一致:\n得到 %q\n期望 %q", card.Body.Elements[0].Content, markdown)
+	}
+}
+
+func TestBuildReplyCardLimitsMarkdownTables(t *testing.T) {
+	one := "| 事实 | 证据 |\n|---|---|\n| 存在 | 任务列表 |"
+	second := "| 句子 | 类型 |\n|---|---|\n| 正常运行 | 无依据 |"
+	third := "| 修正 | 依据 |\n|---|---|\n| 仅确认已启用 | 调度状态 |"
+	markdown := one + "\n\n" + second + "\n\n" + third
+
+	raw := BuildReplyCard(markdown)
+	var card struct {
+		Body struct {
+			Elements []struct {
+				Content string `json:"content"`
+			} `json:"elements"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(raw), &card); err != nil {
+		t.Fatal(err)
+	}
+	got := card.Body.Elements[0].Content
+	if !strings.Contains(got, one) {
+		t.Fatalf("first table was not preserved: %q", got)
+	}
+	if strings.Contains(got, "| 句子 | 类型 |") ||
+		strings.Contains(got, "| 修正 | 依据 |") {
+		t.Fatalf("later tables were not flattened: %q", got)
+	}
+	for _, want := range []string{
+		"**句子：** 正常运行", "**类型：** 无依据",
+		"**修正：** 仅确认已启用", "**依据：** 调度状态",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("flattened reply missing %q: %q", want, got)
+		}
 	}
 }
 

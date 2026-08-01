@@ -82,11 +82,23 @@ type profileStore interface {
 	UpsertProfileFields(ctx context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error)
 }
 
+type scheduleListStore interface {
+	ListSchedulesByUser(ctx context.Context, userID int64) ([]types.Schedule, error)
+}
+
 // playbookStore is deliberately read-only. The task manual is the user-facing
 // task definition; internal execution calls are inspected through run
 // provenance, not exposed as a second editable product object.
 type playbookStore interface {
 	GetSchedulePlaybook(ctx context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error)
+}
+
+type taskRunEvidenceStore interface {
+	GetLatestTaskRunEvidenceV1(
+		ctx context.Context,
+		userID int64,
+		taskID string,
+	) (*store.TaskLatestRunEvidenceV1, error)
 }
 
 // BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单的静态部分（契约 §10）：
@@ -119,6 +131,9 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, runner TaskRunTrigg
 			Effects(EffectStateWrite, EffectDirectOwnerWrite), BudgetNone),
 			ExposureIntent, IntentProfile, ResultTrustLocal, true)),
 		newToolSpec(&viewTaskPlaybookTool{st: st}, withToolSurface(ownerPolicy(
+			Effects(EffectInternalRead), BudgetNone),
+			ExposureIntent, IntentTasks, ResultTrustLocal, false)),
+		newToolSpec(&viewTaskLatestRunTool{st: st}, withToolSurface(ownerPolicy(
 			Effects(EffectInternalRead), BudgetNone),
 			ExposureIntent, IntentTasks, ResultTrustLocal, false)),
 	}
@@ -255,7 +270,7 @@ func summarizeFallback(action string, args json.RawMessage) string {
 // Task inventory is the only persistent user-facing collection.
 
 type listSchedulesTool struct {
-	st *store.Store
+	st scheduleListStore
 }
 
 const listSchedulesSchema = `{
@@ -279,7 +294,7 @@ func (t *listSchedulesTool) Parameters() json.RawMessage {
 
 func (t *listSchedulesTool) Execute(ctx context.Context, userID int64, raw json.RawMessage) (string, error) {
 	var args struct {
-		Query string `json:"query"`
+		Query string `json:"query,omitempty"`
 	}
 	if err := strictjson.DecodeExact(raw, &args); err != nil {
 		return "list_schedules 参数不是合法 JSON，或包含未知字段", nil
@@ -331,11 +346,47 @@ func filterSchedulesByQuery(
 		haystack := normalizeScheduleLookupText(
 			sc.NLDescription + " " + formatSpecJSON(sc.SpecJSON),
 		)
-		if strings.Contains(haystack, normalizedQuery) {
+		if scheduleLookupMatches(haystack, normalizedQuery) {
 			filtered = append(filtered, sc)
 		}
 	}
 	return filtered
+}
+
+func scheduleLookupMatches(haystack, query string) bool {
+	if strings.Contains(haystack, query) {
+		return true
+	}
+	// Users commonly remember a product/person name plus wording that differs
+	// from the saved description (for example “Kimi 套餐” versus “Kimi 会员定价”).
+	// A distinctive Latin/digit token is a useful fallback and remains much
+	// narrower than fuzzy matching the whole Chinese sentence.
+	for _, token := range scheduleLookupLatinTokens(query) {
+		if len([]rune(token)) >= 3 && strings.Contains(haystack, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func scheduleLookupLatinTokens(value string) []string {
+	var tokens []string
+	var current strings.Builder
+	flush := func() {
+		if current.Len() > 0 {
+			tokens = append(tokens, current.String())
+			current.Reset()
+		}
+	}
+	for _, r := range strings.ToLower(value) {
+		if r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			current.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return tokens
 }
 
 // formatSpecJSON 把镜像表里的 spec JSONB 渲染成中文频率描述；解析失败时
@@ -1059,3 +1110,58 @@ func renderPlaybook(pb *types.SchedulePlaybook) string {
 	}
 	return fmt.Sprintf("任务手册（id=%s）：\n%s", pb.ScheduleID, content)
 }
+
+const viewTaskLatestRunSchema = `{
+  "type": "object",
+  "properties": {
+    "schedule_id": {"type": "string", "description": "要查看最近运行证据的定时任务 id（先用 list_schedules 查询）"}
+  },
+  "required": ["schedule_id"],
+  "additionalProperties": false
+}`
+
+type viewTaskLatestRunTool struct {
+	st taskRunEvidenceStore
+}
+
+func (t *viewTaskLatestRunTool) Name() string { return "view_task_latest_run" }
+func (t *viewTaskLatestRunTool) Description() string {
+	return "查看某个任务最近一次已完成运行的精确证据：完成时间、运行结局、来源覆盖、实际工具及 HTTP 状态、推送结局和未推送闸门。回答最近是否运行、实际调用了什么或为什么没推送时必须使用本工具，不能从任务手册推断。"
+}
+func (t *viewTaskLatestRunTool) Parameters() json.RawMessage {
+	return json.RawMessage(viewTaskLatestRunSchema)
+}
+func (t *viewTaskLatestRunTool) Execute(
+	ctx context.Context,
+	userID int64,
+	raw json.RawMessage,
+) (string, error) {
+	var args struct {
+		ScheduleID string `json:"schedule_id"`
+	}
+	if err := strictjson.DecodeExact(raw, &args); err != nil {
+		return "view_task_latest_run 参数不是合法 JSON，或包含未知字段", nil
+	}
+	taskID := strings.TrimSpace(args.ScheduleID)
+	if taskID == "" {
+		return "schedule_id 必须是非空字符串（可先用 list_schedules 查询）", nil
+	}
+	evidence, err := t.st.GetLatestTaskRunEvidenceV1(ctx, userID, taskID)
+	if err != nil {
+		if errors.Is(err, types.ErrNotFound) {
+			return "没有找到你的这个定时任务；请先用 list_schedules 按名称重新定位。", nil
+		}
+		return "", err
+	}
+	if evidence == nil {
+		return "该任务存在，但还没有任何已完成的运行记录。不能据此声称它已经正常运行。", nil
+	}
+	rawEvidence, err := json.Marshal(evidence)
+	if err != nil {
+		return "", err
+	}
+	return "最近运行证据（仅来自系统运行记录，不含任务手册推断）：\n" +
+		string(rawEvidence) +
+		"\n注意：该证据只含结构化运行元数据，不含网页正文或页面当前业务状态；不能用 quiet、active 或未推送闸门推断‘仍不可购买’等页面事实。", nil
+}
+func (t *viewTaskLatestRunTool) Summarize(json.RawMessage) string { return "" }

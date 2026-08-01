@@ -20,6 +20,7 @@ const cardTitle = "见微 Vane"
 // 选 2.0 schema 而非 v1 的原因：markdown 在 2.0 里是 body.elements 下的
 // 一等元素，不必像 v1 那样绕 div+lark_md 的嵌套写法（见 M2 事实基准）。
 func BuildReplyCard(markdown string) string {
+	markdown = limitReplyMarkdownTables(markdown)
 	card := map[string]any{
 		"schema": "2.0",
 		// A6 的耐久创建回执会通过 Im.Message.Patch 原地兑现最终结果。
@@ -38,6 +39,109 @@ func BuildReplyCard(markdown string) string {
 	// map[string]any + 纯字符串值不会触发 Marshal 错误，忽略 err 是安全的。
 	raw, _ := json.Marshal(card)
 	return string(raw)
+}
+
+// Feishu currently rejects an interactive card containing multiple Markdown
+// tables with code 230099 / 11310. Keep the first table and render later ones
+// as readable field lists so a correct agent answer is never silently lost.
+func limitReplyMarkdownTables(markdown string) string {
+	lines := strings.Split(markdown, "\n")
+	out := make([]string, 0, len(lines))
+	tables := 0
+	inFence := false
+	for i := 0; i < len(lines); {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "```") {
+			inFence = !inFence
+			out = append(out, lines[i])
+			i++
+			continue
+		}
+		if inFence {
+			out = append(out, lines[i])
+			i++
+			continue
+		}
+		header, ok := markdownTableRow(lines[i])
+		if !ok || i+1 >= len(lines) || !markdownTableSeparator(lines[i+1]) {
+			out = append(out, lines[i])
+			i++
+			continue
+		}
+		end := i + 2
+		rows := make([][]string, 0)
+		for end < len(lines) {
+			row, rowOK := markdownTableRow(lines[end])
+			if !rowOK {
+				break
+			}
+			rows = append(rows, row)
+			end++
+		}
+		tables++
+		if tables == 1 {
+			out = append(out, lines[i:end]...)
+		} else {
+			out = append(out, markdownTableAsList(header, rows)...)
+		}
+		i = end
+	}
+	return strings.Join(out, "\n")
+}
+
+func markdownTableRow(line string) ([]string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.Contains(trimmed, "|") {
+		return nil, false
+	}
+	trimmed = strings.TrimPrefix(trimmed, "|")
+	trimmed = strings.TrimSuffix(trimmed, "|")
+	parts := strings.Split(trimmed, "|")
+	if len(parts) < 2 {
+		return nil, false
+	}
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts, true
+}
+
+func markdownTableSeparator(line string) bool {
+	cells, ok := markdownTableRow(line)
+	if !ok {
+		return false
+	}
+	for _, cell := range cells {
+		cell = strings.TrimSpace(strings.Trim(cell, ":"))
+		if len(cell) < 3 || strings.Trim(cell, "-") != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func markdownTableAsList(header []string, rows [][]string) []string {
+	if len(rows) == 0 {
+		return []string{strings.Join(header, " ｜ ")}
+	}
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		fields := make([]string, 0, len(row))
+		for i, value := range row {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			if i < len(header) && strings.TrimSpace(header[i]) != "" {
+				fields = append(fields, "**"+strings.TrimSpace(header[i])+"：** "+value)
+			} else {
+				fields = append(fields, value)
+			}
+		}
+		if len(fields) != 0 {
+			out = append(out, "- "+strings.Join(fields, "；"))
+		}
+	}
+	return out
 }
 
 // Feedback-card callback values.

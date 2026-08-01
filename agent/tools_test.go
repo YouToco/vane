@@ -47,6 +47,44 @@ func TestFilterSchedulesByQueryRequiresContiguousReadableMatch(t *testing.T) {
 	}
 }
 
+func TestFilterSchedulesByQueryFallsBackToDistinctiveProductToken(t *testing.T) {
+	list := []types.Schedule{{
+		ID:            "task-kimi",
+		NLDescription: "每小时检查 Kimi 会员定价页面的购买状态",
+		SpecJSON:      json.RawMessage(`{"every_seconds":3600}`),
+	}}
+	got := filterSchedulesByQuery(
+		list,
+		normalizeScheduleLookupText("Kimi 套餐可购买监测"),
+	)
+	if len(got) != 1 || got[0].ID != "task-kimi" {
+		t.Fatalf("matches=%+v, want task-kimi", got)
+	}
+}
+
+type fakeScheduleListStore struct {
+	list []types.Schedule
+	err  error
+}
+
+func (f fakeScheduleListStore) ListSchedulesByUser(
+	context.Context,
+	int64,
+) ([]types.Schedule, error) {
+	return f.list, f.err
+}
+
+func TestListSchedulesToolAcceptsOmittedOptionalQuery(t *testing.T) {
+	tool := &listSchedulesTool{st: fakeScheduleListStore{}}
+	got, err := tool.Execute(context.Background(), 7, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "当前没有任何定时推送任务。" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func (f *fakeTaskRunTrigger) TriggerScheduleNowIdempotent(
 	_ context.Context,
 	scheduleID string,
@@ -591,6 +629,34 @@ type fakePlaybookStore struct {
 	books  map[string]*types.SchedulePlaybook
 	owner  map[string]int64
 	getErr error
+}
+
+type fakeTaskRunEvidenceStore struct {
+	evidence *store.TaskLatestRunEvidenceV1
+	err      error
+}
+
+func (f fakeTaskRunEvidenceStore) GetLatestTaskRunEvidenceV1(
+	context.Context,
+	int64,
+	string,
+) (*store.TaskLatestRunEvidenceV1, error) {
+	return f.evidence, f.err
+}
+
+func TestViewTaskLatestRunToolDoesNotInferMissingRuns(t *testing.T) {
+	tool := &viewTaskLatestRunTool{st: fakeTaskRunEvidenceStore{}}
+	got, err := tool.Execute(
+		context.Background(), 7,
+		json.RawMessage(`{"schedule_id":"task-kimi"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "还没有任何已完成的运行记录") ||
+		!strings.Contains(got, "不能据此声称") {
+		t.Fatalf("unexpected no-run evidence reply: %q", got)
+	}
 }
 
 func newFakePlaybookStore() *fakePlaybookStore {
