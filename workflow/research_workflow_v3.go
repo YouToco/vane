@@ -66,10 +66,10 @@ func runResearchPipelineV3(
 	).Get(planCtx, &brief); err != nil {
 		return err
 	}
-	if err := brief.Validate(identity, prepared.Snapshot.SnapshotID, planned.Plan.PlanID); err != nil {
+	if err := brief.ValidateFor(identity, prepared.Snapshot.SnapshotID, planned.Plan.PlanID); err != nil {
 		return err
 	}
-	if !brief.MajorUpdate {
+	if !brief.DeliveryRequired {
 		return nil
 	}
 	deliveryCtx := workflow.WithActivityOptions(ctx, researchV3SideEffectOptions())

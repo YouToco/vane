@@ -15,9 +15,10 @@ import (
 )
 
 type researchWorkflowV3Stubs struct {
-	major bool
-	mu    sync.Mutex
-	calls []string
+	threshold    string
+	significance types.ResearchBriefSignificanceV3
+	mu           sync.Mutex
+	calls        []string
 }
 
 type researchV3FailingRuntime struct{ err error }
@@ -130,12 +131,32 @@ func (s *researchWorkflowV3Stubs) register(env *testsuite.TestWorkflowEnvironmen
 	})
 	reg("SynthesizeResearchBriefV3", func(_ context.Context, in SynthesizeResearchBriefV3Input) (ResearchBriefRefV3, error) {
 		s.record("synthesize")
-		return SealResearchBriefRefV3(ResearchBriefRefV3{
+		threshold := s.threshold
+		if threshold == "" {
+			threshold = "major_updates_only"
+		}
+		significance := s.significance
+		if significance == "" {
+			significance = types.ResearchBriefSignificanceNoneV3
+		}
+		deliver := significance == types.ResearchBriefSignificanceMajorV3 ||
+			(threshold == "all_qualified_updates" &&
+				significance == types.ResearchBriefSignificanceQualifiedV3)
+		decision := types.ResearchBriefDecisionQuietV3
+		if deliver {
+			decision = types.ResearchBriefDecisionDeliverV3
+		}
+		return types.SealResearchBriefRefV3(types.ResearchBriefRefV3{
 			BriefID: 50, RunSnapshotID: in.Snapshot.SnapshotID,
 			PlanID: in.Plan.PlanID, TenantID: in.TenantID,
 			UserID: in.UserID, TaskID: in.TaskID,
-			BriefDigest:    strings.Repeat("e", 64),
-			EvidenceDigest: strings.Repeat("f", 64), MajorUpdate: s.major,
+			TemporalWorkflowID: in.Snapshot.TemporalWorkflowID,
+			TemporalRunID:      in.Snapshot.TemporalRunID,
+			DefinitionDigest:   in.Snapshot.DefinitionDigest,
+			PlanDigest:         in.Plan.PlanDigest, RequestDigest: strings.Repeat("2", 64),
+			BriefDigest: strings.Repeat("e", 64), EvidenceDigest: strings.Repeat("f", 64),
+			HistoryDigest: strings.Repeat("3", 64), NotificationThreshold: threshold,
+			Significance: significance, Decision: decision, DeliveryRequired: deliver,
 		})
 	})
 	reg("DeliverResearchBriefV3", func(_ context.Context, in DeliverResearchBriefV3Input) (ResearchDeliveryReceiptV3, error) {
@@ -147,20 +168,27 @@ func (s *researchWorkflowV3Stubs) register(env *testsuite.TestWorkflowEnvironmen
 	})
 }
 
-func TestResearchWorkflowV3QuietAndMajorUpdateGate(t *testing.T) {
+func TestResearchWorkflowV3UsesSealedDeliveryDecision(t *testing.T) {
 	for _, test := range []struct {
-		name  string
-		major bool
-		want  []string
+		name         string
+		threshold    string
+		significance types.ResearchBriefSignificanceV3
+		want         []string
 	}{
 		{name: "quiet", want: []string{"prepare", "plan", "step:0", "step:1", "synthesize"}},
-		{name: "major", major: true, want: []string{"prepare", "plan", "step:0", "step:1", "synthesize", "deliver"}},
+		{name: "qualified", threshold: "all_qualified_updates",
+			significance: types.ResearchBriefSignificanceQualifiedV3,
+			want:         []string{"prepare", "plan", "step:0", "step:1", "synthesize", "deliver"}},
+		{name: "major", significance: types.ResearchBriefSignificanceMajorV3,
+			want: []string{"prepare", "plan", "step:0", "step:1", "synthesize", "deliver"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var suite testsuite.WorkflowTestSuite
 			env := suite.NewTestWorkflowEnvironment()
 			env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "wf-research-v3-" + test.name})
-			stubs := &researchWorkflowV3Stubs{major: test.major}
+			stubs := &researchWorkflowV3Stubs{
+				threshold: test.threshold, significance: test.significance,
+			}
 			stubs.register(env)
 			env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
 				TenantID: 7, UserID: 42, RunKind: PushRunKindScheduled,

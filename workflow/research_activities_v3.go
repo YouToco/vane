@@ -3,9 +3,7 @@ package workflow
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"strings"
 
 	"go.temporal.io/sdk/activity"
@@ -90,92 +88,7 @@ type SynthesizeResearchBriefV3Input struct {
 	Plan types.ResearchRunPlanRefV3 `json:"plan"`
 }
 
-type ResearchBriefRefV3 struct {
-	SchemaVersion   string `json:"schema_version"`
-	BriefID         int64  `json:"brief_id"`
-	RunSnapshotID   int64  `json:"run_snapshot_id"`
-	PlanID          int64  `json:"plan_id"`
-	TenantID        int64  `json:"tenant_id"`
-	UserID          int64  `json:"user_id"`
-	TaskID          string `json:"task_id"`
-	BriefDigest     string `json:"brief_digest"`
-	EvidenceDigest  string `json:"evidence_digest"`
-	MajorUpdate     bool   `json:"major_update"`
-	ReferenceDigest string `json:"reference_digest"`
-}
-
-type researchBriefRefDigestV3 struct {
-	SchemaVersion  string `json:"schema_version"`
-	BriefID        int64  `json:"brief_id"`
-	RunSnapshotID  int64  `json:"run_snapshot_id"`
-	PlanID         int64  `json:"plan_id"`
-	TenantID       int64  `json:"tenant_id"`
-	UserID         int64  `json:"user_id"`
-	TaskID         string `json:"task_id"`
-	BriefDigest    string `json:"brief_digest"`
-	EvidenceDigest string `json:"evidence_digest"`
-	MajorUpdate    bool   `json:"major_update"`
-}
-
-const researchBriefRefSchemaV3 = "vane.research-brief-ref/v3"
-
-func SealResearchBriefRefV3(r ResearchBriefRefV3) (ResearchBriefRefV3, error) {
-	r.SchemaVersion = researchBriefRefSchemaV3
-	r.ReferenceDigest = ""
-	if err := r.validateFields(); err != nil {
-		return ResearchBriefRefV3{}, err
-	}
-	digest, err := digestResearchBriefRefV3(r)
-	if err != nil {
-		return ResearchBriefRefV3{}, err
-	}
-	r.ReferenceDigest = digest
-	return r, nil
-}
-
-func (r ResearchBriefRefV3) Validate(
-	identity types.RunIdentity, snapshotID, planID int64,
-) error {
-	if err := r.validateFields(); err != nil || !researchV3Digest(r.ReferenceDigest) ||
-		r.TenantID != identity.TenantID || r.UserID != identity.UserID ||
-		r.TaskID != identity.TaskID || r.RunSnapshotID != snapshotID || r.PlanID != planID {
-		return types.NewAppError(types.CodeValidation,
-			"research Brief reference is invalid", err)
-	}
-	expected, err := digestResearchBriefRefV3(r)
-	if err != nil || subtle.ConstantTimeCompare([]byte(expected), []byte(r.ReferenceDigest)) != 1 {
-		return types.NewAppError(types.CodeValidation,
-			"research Brief reference digest is invalid", err)
-	}
-	return nil
-}
-
-func (r ResearchBriefRefV3) validateFields() error {
-	if r.BriefID <= 0 || r.SchemaVersion != researchBriefRefSchemaV3 ||
-		r.RunSnapshotID <= 0 ||
-		r.PlanID <= 0 || r.TenantID <= 0 || r.UserID <= 0 ||
-		!researchV3Text(r.TaskID, 255) || !researchV3Digest(r.BriefDigest) ||
-		!researchV3Digest(r.EvidenceDigest) {
-		return types.NewAppError(types.CodeValidation,
-			"research Brief reference is invalid", nil)
-	}
-	return nil
-}
-
-func digestResearchBriefRefV3(r ResearchBriefRefV3) (string, error) {
-	payload, err := json.Marshal(researchBriefRefDigestV3{
-		SchemaVersion: r.SchemaVersion, BriefID: r.BriefID,
-		RunSnapshotID: r.RunSnapshotID, PlanID: r.PlanID,
-		TenantID: r.TenantID, UserID: r.UserID, TaskID: r.TaskID,
-		BriefDigest: r.BriefDigest, EvidenceDigest: r.EvidenceDigest,
-		MajorUpdate: r.MajorUpdate,
-	})
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(payload)
-	return hex.EncodeToString(sum[:]), nil
-}
+type ResearchBriefRefV3 = types.ResearchBriefRefV3
 
 type DeliverResearchBriefV3Input struct {
 	ResearchRunV3Input
@@ -277,7 +190,7 @@ func (a *Activities) SynthesizeResearchBriefV3(
 	if err != nil {
 		return ResearchBriefRefV3{}, researchV3ActivityError(ctx, "synthesize", err)
 	}
-	if err := brief.Validate(identity, in.Snapshot.SnapshotID, in.Plan.PlanID); err != nil {
+	if err := brief.ValidateFor(identity, in.Snapshot.SnapshotID, in.Plan.PlanID); err != nil {
 		return ResearchBriefRefV3{}, researchV3ActivityError(ctx, "synthesize", err)
 	}
 	return brief, nil
@@ -287,9 +200,9 @@ func (a *Activities) DeliverResearchBriefV3(
 	ctx context.Context, in DeliverResearchBriefV3Input,
 ) (ResearchDeliveryReceiptV3, error) {
 	identity, err := validateResearchRunV3Input(ctx, in.ResearchRunV3Input)
-	if err != nil || a.researchRuntimeV3 == nil || !in.Brief.MajorUpdate ||
+	if err != nil || a.researchRuntimeV3 == nil || !in.Brief.DeliveryRequired ||
 		in.Plan.ValidateFor(identity, in.Snapshot.SnapshotID) != nil ||
-		in.Brief.Validate(identity, in.Snapshot.SnapshotID, in.Plan.PlanID) != nil {
+		in.Brief.ValidateFor(identity, in.Snapshot.SnapshotID, in.Plan.PlanID) != nil {
 		return ResearchDeliveryReceiptV3{}, researchV3ActivityError(ctx, "deliver", types.NewAppError(
 			types.CodeValidation, "research V3 delivery is unavailable", err))
 	}
