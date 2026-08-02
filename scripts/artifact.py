@@ -16,6 +16,10 @@ from typing import Iterable
 SCHEMA = 1
 MAX_TOTAL_SIZE = 1_000_000_000
 MAX_FILE_SIZE = 500_000_000
+SERVER_RELEASE_CONTRACT = (
+    "vane.server-release-contract/v1 primary_store=owner_compat_v1 "
+    "research_store=restricted_v1"
+)
 BACKEND_FILES = {
     "bin/vane": 0o755,
     "bin/useradmin": 0o755,
@@ -23,6 +27,7 @@ BACKEND_FILES = {
     "bin/runtimeadmin": 0o755,
     "bin/vane-migrate": 0o755,
     "bin/vane-research-gateway": 0o755,
+    "bin/vane-research-prepare": 0o755,
     "bin/researchshadow": 0o755,
     "bin/researchcutover": 0o755,
     "deploy/Caddyfile": 0o644,
@@ -102,8 +107,19 @@ def source_files(component: str, source: Path) -> list[tuple[str, Path, int]]:
     return candidates
 
 
-def pack(component: str, source: Path, source_sha: str, output: Path) -> None:
+def pack(
+    component: str,
+    source: Path,
+    source_sha: str,
+    output: Path,
+    server_release_contract: str | None = None,
+) -> None:
     source_sha = validate_sha(source_sha)
+    if component == "backend":
+        if server_release_contract != SERVER_RELEASE_CONTRACT:
+            raise ValueError("backend server release contract is not exact")
+    elif server_release_contract is not None:
+        raise ValueError("frontend artifact cannot carry a server release contract")
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -145,6 +161,8 @@ def pack(component: str, source: Path, source_sha: str, output: Path) -> None:
         "archive_size": archive_path.stat().st_size,
         "files": manifest_files,
     }
+    if component == "backend":
+        manifest["server_release_contract"] = server_release_contract
     manifest_path = output / f"{component}-{source_sha}.manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -201,23 +219,26 @@ def validate(
     )
     if not isinstance(manifest, dict):
         raise ValueError("manifest root must be an object")
-    exact_keys(
-        manifest,
-        (
-            "schema",
-            "component",
-            "source_sha",
-            "archive",
-            "archive_sha256",
-            "archive_size",
-            "files",
-        ),
-        "manifest",
-    )
+    manifest_keys = [
+        "schema",
+        "component",
+        "source_sha",
+        "archive",
+        "archive_sha256",
+        "archive_size",
+        "files",
+    ]
+    if component == "backend":
+        manifest_keys.append("server_release_contract")
+    exact_keys(manifest, manifest_keys, "manifest")
     if manifest["schema"] != SCHEMA:
         raise ValueError("unsupported manifest schema")
     if manifest["component"] != component or manifest["source_sha"] != source_sha:
         raise ValueError("manifest component or source SHA does not match the plan")
+    if component == "backend" and (
+        manifest["server_release_contract"] != SERVER_RELEASE_CONTRACT
+    ):
+        raise ValueError("backend server release contract is not exact")
     if manifest["archive"] != archive_name:
         raise ValueError("manifest archive name is not exact")
     archive_path = input_dir / archive_name
@@ -322,7 +343,8 @@ def validate(
         if component == "backend":
             for binary in (
                 "vane", "useradmin", "gate", "runtimeadmin", "vane-migrate",
-                "vane-research-gateway", "researchshadow", "researchcutover",
+                "vane-research-gateway", "vane-research-prepare",
+                "researchshadow", "researchcutover",
             ):
                 data = (output_dir / "bin" / binary).read_bytes()
                 if f"vcs.revision={source_sha}".encode() not in data:
@@ -343,13 +365,20 @@ def main() -> None:
         sub.add_argument("--sha", required=True)
         if command == "pack":
             sub.add_argument("--source", type=Path, required=True)
+            sub.add_argument("--server-release-contract")
         else:
             sub.add_argument("--input", type=Path, required=True)
         sub.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     if args.command == "pack":
-        pack(args.component, args.source, args.sha, args.output)
+        pack(
+            args.component,
+            args.source,
+            args.sha,
+            args.output,
+            args.server_release_contract,
+        )
     else:
         validate(args.component, args.sha, args.input, args.output)
 

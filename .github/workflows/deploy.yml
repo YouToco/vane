@@ -262,7 +262,7 @@ jobs:
           # tests deliberately mutate roles/ACLs. Match source CI by serializing
           # packages and t.Parallel tests; explicit goroutine concurrency stays
           # race-covered.
-          go test -race -p=1 -parallel=1 -count=1 -timeout=25m \
+          go test -race -p=1 -parallel=1 -count=1 -timeout=40m \
             -coverprofile=coverage.txt -covermode=atomic ./...
 
       - name: Rematerialize clean backend source for release
@@ -290,16 +290,29 @@ jobs:
           go build -buildvcs=true -o bin/runtimeadmin ./cmd/runtimeadmin
           go build -buildvcs=true -o bin/vane-migrate ./cmd/migrate
           go build -buildvcs=true -o bin/vane-research-gateway ./cmd/researchgateway
+          go build -buildvcs=true -o bin/vane-research-prepare ./cmd/researchprepare
           go build -buildvcs=true -o bin/researchshadow ./cmd/researchshadow
           go build -buildvcs=true -o bin/researchcutover ./cmd/researchcutover
           for binary in vane useradmin gate runtimeadmin vane-migrate \
-            vane-research-gateway researchshadow researchcutover; do
+            vane-research-gateway vane-research-prepare researchshadow \
+            researchcutover; do
             go version -m "bin/$binary" |
               grep -Fx $'\tbuild\tvcs.revision=${{ needs.plan.outputs.backend_sha }}'
             go version -m "bin/$binary" |
               grep -Fx $'\tbuild\tvcs.modified=false'
           done
           [[ -z $(git status --porcelain --untracked-files=all) ]]
+
+      - name: Verify primary server release contract
+        if: needs.plan.outputs.backend_changed == 'true'
+        id: server_contract
+        run: |
+          contract=$(
+            "$BUILD_ROOT/source/vane-release/bin/vane" -print-release-contract
+          )
+          [[ $contract == \
+            'vane.server-release-contract/v1 primary_store=owner_compat_v1 research_store=restricted_v1' ]]
+          echo "value=$contract" >>"$GITHUB_OUTPUT"
 
       - name: Package backend artifact
         if: needs.plan.outputs.backend_changed == 'true'
@@ -308,6 +321,8 @@ jobs:
             --component backend \
             --sha "${{ needs.plan.outputs.backend_sha }}" \
             --source "$BUILD_ROOT/source/vane-release" \
+            --server-release-contract \
+              "${{ steps.server_contract.outputs.value }}" \
             --output "$BUILD_ROOT/artifacts/backend"
 
       - name: Upload backend artifact

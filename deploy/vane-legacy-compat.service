@@ -1,0 +1,22 @@
+[Unit]
+Description=Vane server (owner database compatibility release fence)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vane
+Group=vane
+WorkingDirectory=/opt/vane
+EnvironmentFile=/opt/vane/env/server-owner-compat.env
+ExecStart=/opt/vane/bin/vane
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

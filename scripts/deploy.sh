@@ -140,9 +140,10 @@ deploy_backend() {
     exit 1
   }
 
-  local binary infra
+  local binary infra legacy_compat_unit
   for binary in vane useradmin gate runtimeadmin vane-migrate \
-    vane-research-gateway researchshadow researchcutover; do
+    vane-research-gateway vane-research-prepare researchshadow \
+    researchcutover; do
     [[ -x $payload/bin/$binary ]] || {
       echo "missing verified backend binary: $binary" >&2
       exit 1
@@ -165,6 +166,11 @@ deploy_backend() {
       exit 1
     }
   done
+  legacy_compat_unit=$(dirname "$0")/../deploy/vane-legacy-compat.service
+  [[ -f $legacy_compat_unit && ! -L $legacy_compat_unit ]] || {
+    echo "audited legacy compatibility unit is unavailable" >&2
+    exit 1
+  }
 
   local actual_fingerprint
   local -a scp_opts
@@ -224,6 +230,7 @@ deploy_backend() {
     "$payload/bin/runtimeadmin" \
     "$payload/bin/vane-migrate" \
     "$payload/bin/vane-research-gateway" \
+    "$payload/bin/vane-research-prepare" \
     "$payload/bin/researchshadow" \
     "$payload/bin/researchcutover" \
     "$backend_ssh_target:$backend_remote_stage/bin/"
@@ -234,6 +241,7 @@ deploy_backend() {
     "$payload/deploy/vane-migrate.service" \
     "$payload/deploy/vane-research-gateway.service" \
     "$payload/deploy/vane-research-gateway.socket" \
+    "$legacy_compat_unit" \
     "$backend_ssh_target:$backend_remote_stage/"
   scp "${scp_opts[@]}" \
     "$payload/deploy/dynamicconfig/development-sql.yaml" \

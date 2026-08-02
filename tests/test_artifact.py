@@ -77,6 +77,77 @@ class ArtifactValidationTest(unittest.TestCase):
     def test_wrong_source_sha_is_rejected(self) -> None:
         self.assert_rejected(self.good, OTHER_SHA)
 
+    def test_backend_round_trip_includes_research_prepare(self) -> None:
+        source = self.root / "backend-source"
+        for name, mode in artifact.BACKEND_FILES.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if name.startswith("bin/"):
+                path.write_bytes(
+                    f"fixture vcs.revision={SHA} vcs.modified=false\n".encode()
+                )
+            else:
+                path.write_text(f"fixture {name}\n", encoding="utf-8")
+            path.chmod(mode)
+        packed = self.root / "backend-packed"
+        artifact.pack(
+            "backend",
+            source,
+            SHA,
+            packed,
+            artifact.SERVER_RELEASE_CONTRACT,
+        )
+        output = self.root / "backend-verified"
+        artifact.validate("backend", SHA, packed, output)
+        self.assertTrue((output / "bin/vane-research-prepare").is_file())
+        manifest = json.loads(
+            (packed / f"backend-{SHA}.manifest.json").read_text(encoding="utf-8")
+        )
+        prepare_entry = next(
+            entry
+            for entry in manifest["files"]
+            if entry["path"] == "bin/vane-research-prepare"
+        )
+        self.assertEqual(
+            prepare_entry["mode"],
+            0o755,
+        )
+
+    def test_backend_pack_fails_without_research_prepare(self) -> None:
+        source = self.root / "backend-incomplete"
+        for name, mode in artifact.BACKEND_FILES.items():
+            if name == "bin/vane-research-prepare":
+                continue
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n", encoding="utf-8")
+            path.chmod(mode)
+        with self.assertRaises((ValueError, OSError)):
+            artifact.pack(
+                "backend",
+                source,
+                SHA,
+                self.root / "backend-rejected",
+                artifact.SERVER_RELEASE_CONTRACT,
+            )
+
+    def test_backend_pack_requires_exact_server_release_contract(self) -> None:
+        source = self.root / "backend-contract-source"
+        for name, mode in artifact.BACKEND_FILES.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n", encoding="utf-8")
+            path.chmod(mode)
+        for contract in (None, "owner_compat_v1", artifact.SERVER_RELEASE_CONTRACT + " "):
+            with self.subTest(contract=contract), self.assertRaises(ValueError):
+                artifact.pack(
+                    "backend",
+                    source,
+                    SHA,
+                    self.root / f"backend-contract-{len(str(contract))}",
+                    contract,
+                )
+
     def test_extra_artifact_input_is_rejected(self) -> None:
         case = self.copy_case("extra-input")
         (case / "unexpected").write_text("x", encoding="ascii")

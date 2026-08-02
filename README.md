@@ -54,6 +54,61 @@ Aliyun CDN and Cloudflare Pages succeed. If backend succeeds and frontend fails,
 backend state remains truthfully advanced; the next poll rebuilds and retries
 only the frontend.
 
+The primary server runtime currently has an explicit temporary release fence.
+Until the complete Store recovery/reconciliation and tenant-RLS graph passes a
+real PostgreSQL gate, deployment preserves the proven `User=root` plus
+`EnvironmentFile=/opt/vane/.env` contract only as a rollback-compatible input.
+The new explicit control-repository unit,
+`deploy/vane-legacy-compat.service`, runs as `User=vane`/`Group=vane` so its
+Unix-socket peer UID continues to match the research gateway contract. Its
+dedicated `/opt/vane/env/server-owner-compat.env` is root:vane mode 0640 and
+contains the owner-compatible primary DSN. An active legacy release remains
+available through split bootstrap and is drained only after preflight. A known
+inactive or failed split b9 release is snapshotted together with both its
+restricted `server.env` and the separately trusted owner `.env`, then converged
+to the audited legacy contract. Any failed recutover restores the complete
+previous binary, unit, and environment and deliberately leaves that previously
+inactive release disabled. Missing, changed, or non-owner `.env` data fails
+closed.
+The cutover environment keeps the snapshotted, root-owned and non-group/other-
+writable owner `VANE_DB_URL` unchanged and
+imports only an exact allowlist of research-runtime, capability-key, gateway-
+socket, and V3/push-recovery canary settings from the gated restricted
+`server.env`. Migration and gateway DSNs, `POSTGRES_PASSWORD`, and gateway
+process credentials are stripped; values are compared without being logged.
+The restricted `server.env` itself is normalized from the legacy vane:vane
+mode 0600 state to root:vane mode 0640 before success and is verified
+non-writable by `vane`, so the primary process cannot alter the allowlist used
+by a later deployment. Rollback restores the exact earlier ownership/content
+contract when recutover fails.
+The gateway continues to allow only the real `vane` UID via `SO_PEERCRED`, while
+its database and LLM credential files remain gateway-user mode 0400 and are
+explicitly verified unreadable by the primary `vane` process.
+The reviewed split primary unit is installed only as
+`/opt/vane/vane.service.deferred` and is never made
+live by this release path. This does not undo the independently isolated
+one-shot `vane-migrate` process or the split research gateway service and
+credentials. Removing the fence requires the Store RLS graph gate, not merely
+a new server binary.
+
+The source server must also print the exact side-effect-free release receipt
+`vane.server-release-contract/v1 primary_store=owner_compat_v1
+research_store=restricted_v1` for `-print-release-contract`. The no-production-
+secret build step executes that probe and binds the exact result into the
+strict backend manifest; artifact validation rejects a missing or altered
+receipt. The remote deploy repeats the probe with an empty environment before
+bootstrap. This binds source intent, the transferred binary, and the audited
+live unit without granting the build process any production credentials.
+
+The backend artifact also carries the owner-only rollout utility
+`vane-research-prepare`. Deployment verifies its exact source revision and
+installs it beside the other operational binaries, but never starts it or adds
+it to the long-lived server unit. An operator must run it explicitly as the
+dedicated `vane-migrate` system user with `CREDENTIALS_DIRECTORY` pointing at
+the split, mode-0400 migration-owner credential. The owner database URL is
+therefore never copied into the server environment, and merely deploying a new
+release cannot prepare or roll back a V3 task.
+
 The Aliyun line first requires a closed Vite manifest dependency graph and
 content-addressed names for every runtime JavaScript/CSS object referenced by
 HTML or the Vite manifest. It then publishes every non-HTML object without

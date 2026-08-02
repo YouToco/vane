@@ -14,30 +14,572 @@ stage=$1
 }
 old_vane_recovery_required=false
 old_vane_restart_safe=false
-vane_binary_replaced=false
+previous_vane_snapshot_ready=false
+previous_vane_restart_expected=false
+preserve_vane_snapshot=false
+rollback_dir=/opt/vane/.rollback-vane-${stage##*/.deploy-}
+research_primary_env_keys=(
+  VANE_DB_RESEARCH_RUNTIME_URL
+  VANE_DB_RESEARCH_CAPABILITY_KEY_ID
+  VANE_DB_RESEARCH_CAPABILITY_KEY_HEX
+  VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS
+  VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS
+  VANE_RESEARCH_GATEWAY_SOCKET_PATH
+  VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID
+  VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID
+  VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID
+)
+[[ $rollback_dir =~ ^/opt/vane/\.rollback-vane-[0-9a-f]{40}-[0-9]+-[0-9]+$ ]] || {
+  echo "unsafe vane rollback path" >&2
+  exit 1
+}
+
+snapshot_previous_vane_release() {
+  local live_binary=/opt/vane/bin/vane
+  local live_unit=/etc/systemd/system/vane.service
+  local runtime_env_path environment_count server_env_state legacy_env_state
+  local owner_compat_env_state
+
+  [[ ! -e $rollback_dir && ! -L $rollback_dir ]] || {
+    echo "vane rollback snapshot path already exists" >&2
+    return 1
+  }
+  [[ -f $live_binary && ! -L $live_binary &&
+     -f $live_unit && ! -L $live_unit ]] || {
+    echo "active vane release cannot be snapshotted safely" >&2
+    return 1
+  }
+  environment_count=$(grep -Ec '^EnvironmentFile=' "$live_unit" || true)
+  [[ $environment_count -eq 1 ]] || {
+    echo "active vane unit must have exactly one runtime environment" >&2
+    return 1
+  }
+  if grep -Fxq 'EnvironmentFile=/opt/vane/.env' "$live_unit"; then
+    runtime_env_path=/opt/vane/.env
+  elif grep -Fxq 'EnvironmentFile=/opt/vane/env/server.env' "$live_unit"; then
+    runtime_env_path=/opt/vane/env/server.env
+  elif grep -Fxq \
+    'EnvironmentFile=/opt/vane/env/server-owner-compat.env' "$live_unit"; then
+    runtime_env_path=/opt/vane/env/server-owner-compat.env
+  else
+    echo "active vane unit has an unsupported runtime environment" >&2
+    return 1
+  fi
+  [[ -f $runtime_env_path && ! -L $runtime_env_path ]] || {
+    echo "active vane runtime environment cannot be snapshotted safely" >&2
+    return 1
+  }
+  if [[ -e /opt/vane/env/server.env || -L /opt/vane/env/server.env ]]; then
+    [[ -f /opt/vane/env/server.env && ! -L /opt/vane/env/server.env ]] || {
+      echo "server runtime environment is not a regular file" >&2
+      return 1
+    }
+    server_env_state=present
+  else
+    server_env_state=absent
+  fi
+  if [[ -e /opt/vane/.env || -L /opt/vane/.env ]]; then
+    [[ -f /opt/vane/.env && ! -L /opt/vane/.env ]] || {
+      echo "legacy owner environment is not a regular file" >&2
+      return 1
+    }
+    legacy_env_state=present
+  else
+    legacy_env_state=absent
+  fi
+  if [[ -e /opt/vane/env/server-owner-compat.env ||
+        -L /opt/vane/env/server-owner-compat.env ]]; then
+    [[ -f /opt/vane/env/server-owner-compat.env &&
+       ! -L /opt/vane/env/server-owner-compat.env ]] || {
+      echo "owner-compatible environment is not a regular file" >&2
+      return 1
+    }
+    owner_compat_env_state=present
+  else
+    owner_compat_env_state=absent
+  fi
+
+  install -d -o root -g root -m 0700 "$rollback_dir"
+  cp --archive --reflink=auto -- "$live_binary" "$rollback_dir/vane"
+  cp --archive --reflink=auto -- "$live_unit" "$rollback_dir/vane.service"
+  cp --archive --reflink=auto -- "$runtime_env_path" "$rollback_dir/runtime.env"
+  printf '%s\n' "$runtime_env_path" >"$rollback_dir/runtime-env-path"
+  printf '%s\n' "$server_env_state" >"$rollback_dir/server-env-state"
+  printf '%s\n' "$legacy_env_state" >"$rollback_dir/legacy-env-state"
+  printf '%s\n' "$owner_compat_env_state" \
+    >"$rollback_dir/owner-compat-env-state"
+  if [[ $server_env_state == present &&
+        $runtime_env_path != /opt/vane/env/server.env ]]; then
+    cp --archive --reflink=auto -- /opt/vane/env/server.env \
+      "$rollback_dir/server.env"
+  fi
+  if [[ $legacy_env_state == present && $runtime_env_path != /opt/vane/.env ]]; then
+    cp --archive --reflink=auto -- /opt/vane/.env "$rollback_dir/legacy.env"
+  fi
+  if [[ $owner_compat_env_state == present &&
+        $runtime_env_path != /opt/vane/env/server-owner-compat.env ]]; then
+    cp --archive --reflink=auto -- /opt/vane/env/server-owner-compat.env \
+      "$rollback_dir/owner-compat.env"
+  fi
+  previous_vane_snapshot_ready=true
+}
+
+assert_legacy_owner_environment() {
+  local legacy_env_state legacy_db_url legacy_mode
+  read -r legacy_env_state <"$rollback_dir/legacy-env-state"
+  [[ $legacy_env_state == present && -f /opt/vane/.env &&
+     ! -L /opt/vane/.env ]] || {
+    echo "trusted legacy owner environment is unavailable" >&2
+    return 1
+  }
+  legacy_mode=$(stat -c '%a' /opt/vane/.env)
+  [[ $(stat -c '%U' /opt/vane/.env) == root &&
+     $legacy_mode =~ ^[0-7]{3,4}$ &&
+     $((8#$legacy_mode & 0022)) -eq 0 ]] || {
+    echo "legacy owner environment has unsafe ownership or write mode" >&2
+    return 1
+  }
+  if [[ -f $rollback_dir/legacy.env ]]; then
+    cmp -s -- "$rollback_dir/legacy.env" /opt/vane/.env || {
+      echo "legacy owner environment drifted after its rollback snapshot" >&2
+      return 1
+    }
+  else
+    cmp -s -- "$rollback_dir/runtime.env" /opt/vane/.env || {
+      echo "legacy owner environment drifted after its rollback snapshot" >&2
+      return 1
+    }
+  fi
+  legacy_db_url=$(legacy_env_value VANE_DB_URL)
+  [[ $legacy_db_url == postgres://vane:* &&
+     $legacy_db_url != postgres://vane_server_runtime:* ]] || {
+    echo "primary runtime release fence requires the legacy owner database DSN" >&2
+    return 1
+  }
+}
+
+# Temporary release fence: the primary Store still contains recovery and
+# reconciliation paths which are not proven safe under vane_server_runtime.
+# Keep the proven owner-compatible process contract until the complete Store
+# RLS graph has a real PostgreSQL gate. Research migration and gateway
+# processes remain independently split below.
+assert_legacy_primary_runtime_contract() {
+  local live_unit=/etc/systemd/system/vane.service runtime_env_path
+  [[ $previous_vane_snapshot_ready == true ]] || {
+    echo "primary runtime release fence has no active release snapshot" >&2
+    return 1
+  }
+  read -r runtime_env_path <"$rollback_dir/runtime-env-path"
+  [[ $runtime_env_path == /opt/vane/.env &&
+     $(grep -Ec '^User=' "$live_unit" || true) -eq 1 &&
+     $(grep -c -Fx 'User=root' "$live_unit" || true) -eq 1 &&
+     $(grep -Ec '^EnvironmentFile=' "$live_unit" || true) -eq 1 &&
+     $(grep -c -Fx 'EnvironmentFile=/opt/vane/.env' \
+       "$live_unit" || true) -eq 1 &&
+     $(grep -Ec '^ExecStart=' "$live_unit" || true) -eq 1 &&
+     $(grep -c -Fx 'ExecStart=/opt/vane/bin/vane' \
+       "$live_unit" || true) -eq 1 ]] || {
+    echo "primary runtime release fence requires legacy root + .env contract" >&2
+    return 1
+  }
+  assert_legacy_owner_environment
+  cmp -s -- "$rollback_dir/vane.service" "$live_unit" &&
+    cmp -s -- "$rollback_dir/runtime.env" /opt/vane/.env || {
+      echo "primary runtime contract drifted after its rollback snapshot" >&2
+      return 1
+    }
+}
+
+assert_known_split_primary_runtime_contract() {
+  local live_unit=/etc/systemd/system/vane.service runtime_env_path
+  read -r runtime_env_path <"$rollback_dir/runtime-env-path"
+  [[ $previous_vane_snapshot_ready == true &&
+     $runtime_env_path == /opt/vane/env/server.env &&
+     $(grep -Ec '^User=' "$live_unit" || true) -eq 1 &&
+     $(grep -c -Fx 'User=vane' "$live_unit" || true) -eq 1 &&
+     $(grep -Ec '^EnvironmentFile=' "$live_unit" || true) -eq 1 &&
+     $(grep -c -Fx 'EnvironmentFile=/opt/vane/env/server.env' \
+       "$live_unit" || true) -eq 1 &&
+     $(grep -Ec '^ExecStart=' "$live_unit" || true) -eq 1 &&
+     $(grep -c -Fx 'ExecStart=/opt/vane/bin/vane' \
+       "$live_unit" || true) -eq 1 ]] || {
+    echo "inactive primary runtime is not the known split contract" >&2
+    return 1
+  }
+  cmp -s -- "$rollback_dir/vane.service" "$live_unit" &&
+    cmp -s -- "$rollback_dir/runtime.env" /opt/vane/env/server.env || {
+      echo "split primary runtime drifted after its rollback snapshot" >&2
+      return 1
+    }
+  assert_legacy_owner_environment
+}
+
+validate_legacy_compat_unit() {
+  local unit=$1
+  [[ -f $unit && ! -L $unit &&
+     $(grep -Ec '^User=' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'User=vane' "$unit" || true) -eq 1 &&
+     $(grep -Ec '^Group=' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'Group=vane' "$unit" || true) -eq 1 &&
+     $(grep -Ec '^WorkingDirectory=' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'WorkingDirectory=/opt/vane' "$unit" || true) -eq 1 &&
+     $(grep -Ec '^EnvironmentFile=' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx \
+       'EnvironmentFile=/opt/vane/env/server-owner-compat.env' \
+       "$unit" || true) -eq 1 &&
+     $(grep -Ec '^ExecStart=' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'ExecStart=/opt/vane/bin/vane' "$unit" || true) -eq 1 &&
+     $(grep -Ec '^Exec(StartPre|StartPost|Reload)=' "$unit" || true) -eq 0 &&
+     $(grep -c -Fx 'NoNewPrivileges=yes' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'ProtectSystem=strict' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'ProtectHome=yes' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'PrivateTmp=yes' "$unit" || true) -eq 1 ]] || {
+    echo "legacy compatibility unit does not match the audited contract" >&2
+    return 1
+  }
+}
+
+owner_snapshot_path() {
+  if [[ -f $rollback_dir/legacy.env ]]; then
+    printf '%s' "$rollback_dir/legacy.env"
+  else
+    printf '%s' "$rollback_dir/runtime.env"
+  fi
+}
+
+exact_env_line() {
+  local path=$1 name=$2
+  [[ -f $path && ! -L $path &&
+     $(grep -c "^${name}=" "$path" || true) -eq 1 ]] || return 1
+  grep "^${name}=" "$path"
+}
+
+assert_research_settings_exact() {
+  local destination=$1 source=${2:-/opt/vane/env/server.env}
+  local name source_line dest_line
+  [[ -f $source && ! -L $source && -f $destination &&
+     ! -L $destination ]] || return 1
+  [[ $(stat -c '%U:%G:%a' "$source") == root:vane:640 ]] || {
+    echo "restricted server environment has unsafe ownership or mode" >&2
+    return 1
+  }
+  if LC_ALL=C grep -q $'\r' "$source" "$destination"; then
+    echo "runtime environment contains a carriage return" >&2
+    return 1
+  fi
+  for name in "${research_primary_env_keys[@]}"; do
+    source_line=$(exact_env_line "$source" "$name") || {
+      echo "restricted server environment is missing a required research setting: $name" >&2
+      return 1
+    }
+    dest_line=$(exact_env_line "$destination" "$name") || {
+      echo "owner-compatible environment is missing a required research setting: $name" >&2
+      return 1
+    }
+    [[ $dest_line == "$source_line" ]] || {
+      echo "owner-compatible research setting does not match restricted source: $name" >&2
+      return 1
+    }
+  done
+  if grep -Eq \
+    '^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_GATEWAY_[A-Z0-9_]+)=' \
+    "$destination"; then
+    echo "owner-compatible environment contains a forbidden process credential" >&2
+    return 1
+  fi
+}
+
+build_owner_compatible_environment() {
+  local owner_env_source=$1 destination=$2
+  local server_env_source=${3:-/opt/vane/env/server.env} name
+  [[ -f $owner_env_source && ! -L $owner_env_source &&
+     -f $server_env_source && ! -L $server_env_source ]] || {
+    echo "owner-compatible environment inputs are unavailable" >&2
+    return 1
+  }
+  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_GATEWAY_[A-Z0-9_]+|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID)=/' \
+    "$owner_env_source" >"$destination"
+  for name in "${research_primary_env_keys[@]}"; do
+    exact_env_line "$server_env_source" "$name" >>"$destination" || {
+      echo "restricted server environment is missing a required research setting: $name" >&2
+      return 1
+    }
+  done
+  assert_research_settings_exact "$destination" "$server_env_source"
+}
+
+assert_restricted_server_environment_readonly() {
+  [[ -f /opt/vane/env/server.env && ! -L /opt/vane/env/server.env &&
+     $(stat -c '%U:%G:%a' /opt/vane/env/server.env) == root:vane:640 ]] || {
+    echo "restricted server environment is not root-owned read-only runtime data" >&2
+    return 1
+  }
+  if runuser -u vane -- test -w /opt/vane/env/server.env; then
+    echo "primary service user can write the restricted server environment" >&2
+    return 1
+  fi
+}
+
+assert_audited_legacy_primary_runtime_contract() {
+  local owner_env_source snapshot_db_url live_db_url
+  validate_legacy_compat_unit /etc/systemd/system/vane.service
+  [[ -f /opt/vane/env/server-owner-compat.env &&
+     ! -L /opt/vane/env/server-owner-compat.env &&
+     $(stat -c '%U:%G:%a' /opt/vane/env/server-owner-compat.env) == \
+       root:vane:640 ]] || {
+    echo "owner-compatible environment has unsafe ownership or mode" >&2
+    return 1
+  }
+  owner_env_source=$(owner_snapshot_path)
+  snapshot_db_url=$(sed -n 's/^VANE_DB_URL=//p' "$owner_env_source")
+  live_db_url=$(sed -n 's/^VANE_DB_URL=//p' \
+    /opt/vane/env/server-owner-compat.env)
+  [[ -n $snapshot_db_url && $live_db_url == "$snapshot_db_url" &&
+     $live_db_url == postgres://vane:* &&
+     $live_db_url != postgres://vane_server_runtime:* ]] || {
+    echo "owner database DSN changed during compatibility cutover" >&2
+    return 1
+  }
+  assert_research_settings_exact /opt/vane/env/server-owner-compat.env
+}
+
+assert_existing_audited_primary_runtime_contract() {
+  assert_audited_legacy_primary_runtime_contract
+  cmp -s -- "$rollback_dir/vane.service" \
+    /etc/systemd/system/vane.service &&
+    cmp -s -- "$rollback_dir/runtime.env" \
+      /opt/vane/env/server-owner-compat.env || {
+      echo "audited primary runtime drifted after its rollback snapshot" >&2
+      return 1
+    }
+}
+
+commit_legacy_primary_release() {
+  local owner_env_source
+  [[ $previous_vane_snapshot_ready == true &&
+     -f /opt/vane/bin/vane.next && ! -L /opt/vane/bin/vane.next &&
+     -f /opt/vane/vane-legacy-compat.service &&
+     ! -L /opt/vane/vane-legacy-compat.service ]] || {
+    echo "new legacy-compatible primary release is incomplete" >&2
+    return 1
+  }
+  assert_legacy_owner_environment || return 1
+  validate_legacy_compat_unit /opt/vane/vane-legacy-compat.service || return 1
+  owner_env_source=$(owner_snapshot_path)
+  [[ -f $owner_env_source && ! -L $owner_env_source ]] || {
+    echo "trusted owner environment snapshot is unavailable" >&2
+    return 1
+  }
+
+  rm -f -- /etc/systemd/system/vane.service.release-next \
+    /opt/vane/env/server-owner-compat.env.release-next \
+    /opt/vane/env/server.env.release-next
+  install -m 0644 /opt/vane/vane-legacy-compat.service \
+    /etc/systemd/system/vane.service.release-next
+  cp --archive --reflink=auto -- /opt/vane/env/server.env \
+    /opt/vane/env/server.env.release-next
+  chown root:vane /opt/vane/env/server.env.release-next
+  chmod 0640 /opt/vane/env/server.env.release-next
+  build_owner_compatible_environment "$owner_env_source" \
+    /opt/vane/env/server-owner-compat.env.release-next \
+    /opt/vane/env/server.env.release-next || return 1
+  chown root:vane /opt/vane/env/server-owner-compat.env.release-next
+  chmod 0640 /opt/vane/env/server-owner-compat.env.release-next
+
+  # No process may observe a mixed binary/unit/environment release. Disable
+  # boot activation, commit every staged member, reload, then explicitly
+  # enable and start the complete audited contract.
+  systemctl disable vane.service >/dev/null
+  mv -f -- /opt/vane/bin/vane.next /opt/vane/bin/vane
+  mv -f -- /etc/systemd/system/vane.service.release-next \
+    /etc/systemd/system/vane.service
+  mv -f -- /opt/vane/env/server-owner-compat.env.release-next \
+    /opt/vane/env/server-owner-compat.env
+  mv -f -- /opt/vane/env/server.env.release-next \
+    /opt/vane/env/server.env
+  systemctl daemon-reload
+  assert_restricted_server_environment_readonly || return 1
+  assert_audited_legacy_primary_runtime_contract || return 1
+  systemctl enable vane.service >/dev/null
+  systemctl start vane.service
+  wait_for_vane_ready
+}
+
+restore_previous_vane_release() (
+  set -euo pipefail
+  local runtime_env_path server_env_state legacy_env_state state attempt
+  local owner_compat_env_state
+  [[ $previous_vane_snapshot_ready == true && -d $rollback_dir &&
+     ! -L $rollback_dir ]] || return 1
+  read -r runtime_env_path <"$rollback_dir/runtime-env-path"
+  read -r server_env_state <"$rollback_dir/server-env-state"
+  read -r legacy_env_state <"$rollback_dir/legacy-env-state"
+  read -r owner_compat_env_state <"$rollback_dir/owner-compat-env-state"
+  case "$runtime_env_path" in
+    /opt/vane/.env|/opt/vane/env/server.env|/opt/vane/env/server-owner-compat.env) ;;
+    *) echo "rollback snapshot has an unsafe runtime environment path" >&2; return 1 ;;
+  esac
+  [[ $server_env_state == present || $server_env_state == absent ]] || {
+    echo "rollback snapshot has an invalid server environment state" >&2
+    return 1
+  }
+  [[ $legacy_env_state == present || $legacy_env_state == absent ]] || {
+    echo "rollback snapshot has an invalid legacy environment state" >&2
+    return 1
+  }
+  [[ $owner_compat_env_state == present ||
+     $owner_compat_env_state == absent ]] || {
+    echo "rollback snapshot has an invalid owner-compatible environment state" >&2
+    return 1
+  }
+  [[ -f $rollback_dir/vane && ! -L $rollback_dir/vane &&
+     -f $rollback_dir/vane.service && ! -L $rollback_dir/vane.service &&
+     -f $rollback_dir/runtime.env && ! -L $rollback_dir/runtime.env &&
+     -d /opt/vane/bin && ! -L /opt/vane/bin &&
+     -d /opt/vane/env && ! -L /opt/vane/env &&
+     -d /etc/systemd/system && ! -L /etc/systemd/system ]] || {
+    echo "rollback snapshot or destination is unsafe" >&2
+    return 1
+  }
+  [[ $(grep -Ec '^EnvironmentFile=' "$rollback_dir/vane.service" || true) -eq 1 &&
+     $(grep -c -F "EnvironmentFile=$runtime_env_path" \
+       "$rollback_dir/vane.service" || true) -eq 1 ]] || {
+    echo "rollback unit and runtime environment snapshot do not match" >&2
+    return 1
+  }
+  if [[ $server_env_state == present &&
+        $runtime_env_path != /opt/vane/env/server.env ]]; then
+    [[ -f $rollback_dir/server.env && ! -L $rollback_dir/server.env ]] || {
+      echo "rollback server environment snapshot is unavailable" >&2
+      return 1
+    }
+  fi
+  if [[ $legacy_env_state == present && $runtime_env_path != /opt/vane/.env ]]; then
+    [[ -f $rollback_dir/legacy.env && ! -L $rollback_dir/legacy.env ]] || {
+      echo "rollback legacy environment snapshot is unavailable" >&2
+      return 1
+    }
+  fi
+  if [[ $owner_compat_env_state == present &&
+        $runtime_env_path != /opt/vane/env/server-owner-compat.env ]]; then
+    [[ -f $rollback_dir/owner-compat.env &&
+       ! -L $rollback_dir/owner-compat.env ]] || {
+      echo "rollback owner-compatible environment snapshot is unavailable" >&2
+      return 1
+    }
+  fi
+
+  # Stop all restart attempts before replacing any member of the runtime
+  # contract. If a later filesystem operation fails, the service stays down;
+  # it can never start a mixed binary/unit/environment release.
+  systemctl stop vane.service
+  state=$(systemctl is-active vane.service 2>/dev/null || true)
+  [[ $state == inactive ]] || {
+    echo "failed vane release did not become inactive for rollback (state=$state)" >&2
+    return 1
+  }
+  # Remove boot activation before the multi-file commit. A host interruption
+  # during restoration therefore leaves the service disabled as well as
+  # stopped; only the complete old contract is enabled again below.
+  systemctl disable vane.service >/dev/null
+
+  rm -f -- /opt/vane/bin/vane.rollback-next \
+    /etc/systemd/system/vane.service.rollback-next \
+    "$runtime_env_path.rollback-next" \
+    /opt/vane/env/server.env.rollback-next \
+    /opt/vane/.env.rollback-next \
+    /opt/vane/env/server-owner-compat.env.rollback-next
+  cp --archive --reflink=auto -- "$rollback_dir/vane" \
+    /opt/vane/bin/vane.rollback-next
+  cp --archive --reflink=auto -- "$rollback_dir/vane.service" \
+    /etc/systemd/system/vane.service.rollback-next
+  cp --archive --reflink=auto -- "$rollback_dir/runtime.env" \
+    "$runtime_env_path.rollback-next"
+  if [[ $server_env_state == present &&
+        $runtime_env_path != /opt/vane/env/server.env ]]; then
+    cp --archive --reflink=auto -- "$rollback_dir/server.env" \
+      /opt/vane/env/server.env.rollback-next
+  fi
+  if [[ $legacy_env_state == present && $runtime_env_path != /opt/vane/.env ]]; then
+    cp --archive --reflink=auto -- "$rollback_dir/legacy.env" \
+      /opt/vane/.env.rollback-next
+  fi
+  if [[ $owner_compat_env_state == present &&
+        $runtime_env_path != /opt/vane/env/server-owner-compat.env ]]; then
+    cp --archive --reflink=auto -- "$rollback_dir/owner-compat.env" \
+      /opt/vane/env/server-owner-compat.env.rollback-next
+  fi
+
+  mv -f -- /opt/vane/bin/vane.rollback-next /opt/vane/bin/vane
+  mv -f -- /etc/systemd/system/vane.service.rollback-next \
+    /etc/systemd/system/vane.service
+  mv -f -- "$runtime_env_path.rollback-next" "$runtime_env_path"
+  if [[ $runtime_env_path != /opt/vane/env/server.env ]]; then
+    if [[ $server_env_state == present ]]; then
+      mv -f -- /opt/vane/env/server.env.rollback-next \
+        /opt/vane/env/server.env
+    else
+      rm -f -- /opt/vane/env/server.env
+    fi
+  fi
+  if [[ $runtime_env_path != /opt/vane/.env ]]; then
+    if [[ $legacy_env_state == present ]]; then
+      mv -f -- /opt/vane/.env.rollback-next /opt/vane/.env
+    else
+      rm -f -- /opt/vane/.env
+    fi
+  fi
+  if [[ $runtime_env_path != /opt/vane/env/server-owner-compat.env ]]; then
+    if [[ $owner_compat_env_state == present ]]; then
+      mv -f -- /opt/vane/env/server-owner-compat.env.rollback-next \
+        /opt/vane/env/server-owner-compat.env
+    else
+      rm -f -- /opt/vane/env/server-owner-compat.env
+    fi
+  fi
+
+  systemctl daemon-reload
+  if [[ $previous_vane_restart_expected != true ]]; then
+    echo "previous inactive vane runtime contract restored and left disabled" >&2
+    return 0
+  fi
+  systemctl enable vane.service >/dev/null
+  systemctl start vane.service
+  for attempt in {1..12}; do
+    if systemctl is-active --quiet vane.service && vane_ready; then
+      echo "previous vane runtime contract recovery verified" >&2
+      return 0
+    fi
+    sleep 5
+  done
+  echo "previous vane runtime contract recovery failed readiness" >&2
+  return 1
+)
 
 cleanup_remote_deploy() {
-  local status=$? attempt
+  local status=$?
   trap - EXIT
   set +e
   if [[ $old_vane_recovery_required == true ]]; then
-    if [[ $vane_binary_replaced == false && $old_vane_restart_safe == true ]]; then
-      echo "deployment failed after a proven clean drain; restarting untouched previous vane" >&2
-      systemctl start vane.service || true
-      for attempt in {1..12}; do
-        if systemctl is-active --quiet vane.service && vane_ready; then
-          echo "previous vane service recovery verified" >&2
-          break
-        fi
-        sleep 5
-      done
-      if ! systemctl is-active --quiet vane.service || ! vane_ready; then
-        echo "previous vane service recovery failed" >&2
+    if [[ $old_vane_restart_safe == true &&
+          $previous_vane_snapshot_ready == true ]]; then
+      echo "deployment failed after a proven clean drain;" \
+        "restoring the previous vane runtime contract" >&2
+      if ! restore_previous_vane_release; then
+        preserve_vane_snapshot=true
+        echo "previous vane runtime contract recovery failed; service remains" \
+          "stopped and snapshot is preserved at $rollback_dir" >&2
       fi
-    elif [[ $vane_binary_replaced == true ]]; then
-      echo "new vane failed before readiness; automatic binary rollback is unsafe" >&2
     else
-      echo "old vane drain was not proven clean; automatic restart is unsafe" >&2
+      preserve_vane_snapshot=true
+      echo "old vane drain or rollback snapshot was not proven safe; automatic recovery is refused" >&2
+    fi
+  fi
+  if [[ -e $rollback_dir || -L $rollback_dir ]]; then
+    if [[ $preserve_vane_snapshot == true ]]; then
+      echo "vane rollback snapshot retained: $rollback_dir" >&2
+    else
+      rm -rf -- "$rollback_dir"
     fi
   fi
   rm -rf -- "$stage"
@@ -118,17 +660,118 @@ gateway_uid=$(id -u vane-research-gateway)
 install -d -m 0755 /opt/vane/bin /opt/vane/dynamicconfig /opt/vane/env
 install -d -o root -g root -m 0700 /etc/vane /etc/vane/credentials
 
+# Snapshot the complete live process contract before split-runtime bootstrap
+# can create or update server.env. The previous b9 deployment may be inactive
+# or failed under the reviewed split unit; that state is accepted only when a
+# trustworthy legacy owner environment is also available for convergence.
+initial_vane_state=$(systemctl is-active vane.service 2>/dev/null || true)
+case "$initial_vane_state" in
+  active)
+    previous_vane_restart_expected=true
+    snapshot_previous_vane_release
+    if grep -Fxq 'EnvironmentFile=/opt/vane/.env' \
+      /etc/systemd/system/vane.service; then
+      assert_legacy_primary_runtime_contract
+    else
+      assert_existing_audited_primary_runtime_contract
+    fi
+    ;;
+  inactive|failed)
+    previous_vane_restart_expected=false
+    snapshot_previous_vane_release
+    if grep -Fxq 'EnvironmentFile=/opt/vane/.env' \
+      /etc/systemd/system/vane.service; then
+      assert_legacy_primary_runtime_contract
+    elif grep -Fxq \
+      'EnvironmentFile=/opt/vane/env/server-owner-compat.env' \
+      /etc/systemd/system/vane.service; then
+      assert_existing_audited_primary_runtime_contract
+    else
+      assert_known_split_primary_runtime_contract
+    fi
+    systemctl stop vane.service
+    [[ $(systemctl is-active vane.service 2>/dev/null || true) == inactive ]] || {
+      echo "inactive vane transition could not be made quiescent" >&2
+      exit 1
+    }
+    inactive_leftover_pids=
+    for process_exe in /proc/[0-9]*/exe; do
+      executable=$(readlink "$process_exe" 2>/dev/null || true)
+      case "$executable" in
+        "/opt/vane/bin/vane"|"/opt/vane/bin/vane (deleted)")
+          pid=${process_exe#/proc/}
+          pid=${pid%/exe}
+          inactive_leftover_pids="$inactive_leftover_pids $pid"
+          ;;
+      esac
+    done
+    [[ -z $inactive_leftover_pids ]] || {
+      echo "inactive vane contract still has processes:$inactive_leftover_pids" >&2
+      exit 1
+    }
+    # From this point, any bootstrap failure restores the complete split
+    # contract but deliberately leaves its previous inactive state disabled.
+    old_vane_recovery_required=true
+    old_vane_restart_safe=true
+    ;;
+  *)
+    echo "unsupported initial vane service state: $initial_vane_state" >&2
+    exit 1
+    ;;
+esac
+
 # The new server binary stays beside the live binary until the old worker has
 # drained. Migration/bootstrap failures therefore leave the proven worker and
 # its old unit untouched.
+validate_legacy_compat_unit "$stage/vane-legacy-compat.service"
+expected_server_release_contract='vane.server-release-contract/v1 primary_store=owner_compat_v1 research_store=restricted_v1'
+actual_server_release_contract=$(
+  env -i PATH=/usr/bin:/bin "$stage/bin/vane" -print-release-contract
+)
+[[ $actual_server_release_contract == "$expected_server_release_contract" ]] || {
+  echo "incoming vane binary has an unexpected release contract" >&2
+  exit 1
+}
+
+assert_gateway_peer_and_credential_boundary() {
+  local allowed_uid credential
+  [[ -f /opt/vane/env/research-gateway.env &&
+     ! -L /opt/vane/env/research-gateway.env &&
+     $(grep -c '^VANE_GATEWAY_ALLOWED_UID=' \
+       /opt/vane/env/research-gateway.env || true) -eq 1 ]] || {
+    echo "research gateway peer UID contract is unavailable" >&2
+    return 1
+  }
+  allowed_uid=$(sed -n 's/^VANE_GATEWAY_ALLOWED_UID=//p' \
+    /opt/vane/env/research-gateway.env)
+  [[ $allowed_uid == "$vane_uid" ]] || {
+    echo "research gateway peer UID does not match the primary service user" >&2
+    return 1
+  }
+  for credential in gateway_db_url research_llm_api_key_gen1; do
+    [[ $(stat -c '%U:%G:%a' "/etc/vane/credentials/$credential") == \
+       vane-research-gateway:vane-research-gateway:400 ]] || {
+      echo "gateway credential ownership or mode is unsafe: $credential" >&2
+      return 1
+    }
+    if runuser -u vane -- test -r "/etc/vane/credentials/$credential"; then
+      echo "primary service user can read a gateway credential: $credential" >&2
+      return 1
+    fi
+  done
+}
 install -m 0755 "$stage/bin/vane" /opt/vane/bin/vane.next
 for binary in useradmin gate runtimeadmin vane-migrate vane-research-gateway \
-  researchshadow researchcutover; do
+  vane-research-prepare researchshadow researchcutover; do
   install -m 0755 "$stage/bin/$binary" "/opt/vane/bin/$binary"
 done
 install -m 0644 "$stage/Caddyfile" /opt/vane/Caddyfile
 install -m 0644 "$stage/docker-compose.yml" /opt/vane/docker-compose.yml
-install -m 0644 "$stage/vane.service" /opt/vane/vane.service
+# Keep the reviewed split unit available for the later RLS-graph cutover, but
+# never install it as the live primary unit while the release fence is active.
+install -m 0644 "$stage/vane.service" /opt/vane/vane.service.deferred
+install -m 0644 "$stage/vane-legacy-compat.service" \
+  /opt/vane/vane-legacy-compat.service
 install -m 0644 "$stage/vane-migrate.service" /opt/vane/vane-migrate.service
 install -m 0644 "$stage/vane-research-gateway.service" \
   /opt/vane/vane-research-gateway.service
@@ -275,7 +918,7 @@ if [[ ! -f $bootstrap_marker ]]; then
     } | docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U vane -d vane
   )
 
-  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_GATEWAY_[A-Z0-9_]+|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID)=/' \
+  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_GATEWAY_[A-Z0-9_]+|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID)=/' \
     /opt/vane/.env >/opt/vane/env/server.env.next
   {
     printf 'VANE_DB_URL=postgres://vane_server_runtime:%s@127.0.0.1:5432/vane?sslmode=disable\n' \
@@ -292,6 +935,7 @@ if [[ ! -f $bootstrap_marker ]]; then
     # cannot smuggle a canary into this infrastructure migration.
     printf 'VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID=\n'
     printf 'VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID=\n'
+    printf 'VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID=\n'
   } >>/opt/vane/env/server.env.next
   chown vane:vane /opt/vane/env/server.env.next
   chmod 0600 /opt/vane/env/server.env.next
@@ -338,8 +982,9 @@ for credential in migration_db_url gateway_db_url research_llm_api_key_gen1; do
     exit 1
   }
 done
-chown vane:vane /opt/vane/env/server.env
-chmod 0600 /opt/vane/env/server.env
+chown root:vane /opt/vane/env/server.env
+chmod 0640 /opt/vane/env/server.env
+assert_restricted_server_environment_readonly
 chown vane-research-gateway:vane-research-gateway \
   /opt/vane/env/research-gateway.env \
   /etc/vane/credentials/gateway_db_url \
@@ -347,6 +992,7 @@ chown vane-research-gateway:vane-research-gateway \
 chmod 0600 /opt/vane/env/research-gateway.env
 chmod 0400 /etc/vane/credentials/gateway_db_url \
   /etc/vane/credentials/research_llm_api_key_gen1
+assert_gateway_peer_and_credential_boundary
 grep -Eq '^VANE_DB_URL=postgres://vane_server_runtime:' \
   /opt/vane/env/server.env
 grep -Eq '^VANE_DB_RESEARCH_RUNTIME_URL=postgres://vane_research_runtime:' \
@@ -478,15 +1124,10 @@ wait_for_vane_ready() {
 # Migration 047's cross-version writer fence requires proof that the previous
 # worker completed its own graceful shutdown before the new binary starts.
 if systemctl is-active --quiet vane; then
-  [[ -f /opt/vane/bin/vane && ! -L /opt/vane/bin/vane &&
-     -f /etc/systemd/system/vane.service &&
-     ! -L /etc/systemd/system/vane.service ]] || {
-    echo "active vane release cannot be backed up safely" >&2
+  [[ $previous_vane_snapshot_ready == true ]] || {
+    echo "active vane release has no complete rollback snapshot" >&2
     exit 1
   }
-  install -m 0755 /opt/vane/bin/vane /opt/vane/bin/vane.previous
-  install -m 0644 /etc/systemd/system/vane.service \
-    /opt/vane/vane.service.previous
   old_invocation=$(systemctl show vane --property=InvocationID --value)
   drain_started_at=$(date +%s)
   test -n "$old_invocation"
@@ -553,17 +1194,10 @@ if [[ -n $leftover_pids ]]; then
   exit 1
 fi
 old_vane_restart_safe=true
+old_vane_recovery_required=true
 
 echo "old vane worker drain verified; starting roll-forward binary"
-vane_binary_replaced=true
-install -m 0755 /opt/vane/bin/vane.next /opt/vane/bin/vane
-rm -f /opt/vane/bin/vane.next
-install -m 0644 /opt/vane/vane.service /etc/systemd/system/vane.service
-systemctl daemon-reload
-systemctl enable vane.service >/dev/null
-systemctl start vane
-wait_for_vane_ready
-old_vane_recovery_required=false
+commit_legacy_primary_release
 
 ctype=$(
   curl -sSL -o /dev/null -w '%{content_type}' --max-time 10 \
@@ -580,3 +1214,4 @@ echo "deploy verified: readyz OK"
 
 # Red (1) and probe failure (2) fail the deployment; yellow remains exit 0.
 /opt/vane/bin/gate -env /opt/vane/env/server.env
+old_vane_recovery_required=false
