@@ -16,6 +16,9 @@ const ResearchModelPolicySchemaVersionV3 = "vane.runtime-research-model-policy/v
 const (
 	ResearchModelStagePlannerV3   = "research_planner"
 	ResearchModelStageSynthesisV3 = "research_synthesis"
+
+	ResearchPlannerRendererVersionV3  = "research-planner.render/v3"
+	ResearchPlannerRendererVersionV31 = "research-planner.render/v3.1"
 )
 
 type ResearchModelStageV3 struct {

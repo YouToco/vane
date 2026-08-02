@@ -49,8 +49,10 @@ go run ./cmd/researchshadow -task-id <schedule-id> -user-id <owner-user-id> -ide
 1. Planner 仅依据当前任务手册与冻结工具目录生成计划。
    Planner 输入必须显式携带输出字段契约（顶层 `schema_version`、`steps`，step 内
    `invocation_id`、`tool_name`、`arguments`）；只给私有 schema 名称不构成可执行契约。
-   解码器拒绝重复键、未知键和缺失字段，但必须接受等价的空白与字段顺序；持久化层再生成
-   canonical plan，不能要求远端模型猜测 Go 编码器的字节表示。
+   `v3.1` 解码器拒绝重复键、未知键和缺失字段，但接受等价的空白与字段顺序；持久化层再
+   生成 canonical plan，不能要求远端模型猜测 Go 编码器的字节表示。
+   Prompt、correction 与 decoder 必须按快照冻结的 renderer 分派：历史 `v3` 原字节回放，
+   `v3.1` 使用显式字段契约；未知版本 fail-closed。
 2. 每个 Tool 只有一个 first-writer provider effect，Evidence 保存的是模型实际可见结果。
 3. Brief 引用当前 Evidence，并按历史 Observation 做对比。
 4. 无重大更新时 Brief 为 quiet，且没有 delivery 记录、飞书消息或推送副作用。

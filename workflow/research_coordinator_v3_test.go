@@ -266,7 +266,8 @@ func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffect
 
 func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(t *testing.T) {
 	valid := []byte(`{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"Kimi pricing"}}]}`)
-	steps, err := decodeResearchPlannerCompletionV3(valid)
+	steps, err := decodeResearchPlannerCompletionV3(
+		valid, runtimepolicy.ResearchPlannerRendererVersionV3)
 	if err != nil || len(steps) != 1 || steps[0].ToolName != "web_search" {
 		t.Fatalf("valid planner output steps=%+v err=%v", steps, err)
 	}
@@ -274,8 +275,16 @@ func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(
 		"    \"arguments\": {\"query\": \"Kimi pricing\"},\n" +
 		"    \"invocation_id\": \"search-official\"\n  }],\n" +
 		"  \"schema_version\": \"vane.research-planner-output/v3\"\n}")
-	if steps, err := decodeResearchPlannerCompletionV3(formatted); err != nil || len(steps) != 1 {
+	if _, err := decodeResearchPlannerCompletionV3(
+		formatted, runtimepolicy.ResearchPlannerRendererVersionV3); err == nil {
+		t.Fatal("legacy renderer accepted non-canonical settled completion")
+	}
+	if steps, err := decodeResearchPlannerCompletionV3(
+		formatted, runtimepolicy.ResearchPlannerRendererVersionV31); err != nil || len(steps) != 1 {
 		t.Fatalf("formatted exact planner output steps=%+v err=%v", steps, err)
+	}
+	if _, err := decodeResearchPlannerCompletionV3(formatted, "unknown-renderer"); err == nil {
+		t.Fatal("unknown renderer accepted planner output")
 	}
 	for name, raw := range map[string][]byte{
 		"markdown":  []byte("```json\n" + string(valid) + "\n```"),
@@ -283,7 +292,8 @@ func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(
 		"duplicate": []byte(`{"schema_version":"vane.research-planner-output/v3","schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"Kimi"}}]}`),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decodeResearchPlannerCompletionV3(raw); err == nil {
+			if _, err := decodeResearchPlannerCompletionV3(
+				raw, runtimepolicy.ResearchPlannerRendererVersionV31); err == nil {
 				t.Fatal("non-exact planner output was accepted")
 			}
 		})
@@ -294,6 +304,7 @@ func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *test
 	_, snapshot, _, _ := researchBridgeFixtureV3(t)
 	snapshot.PlannerBudget.MaxPlannerRounds = 2
 	seal := runcontext.ResearchSnapshotSealV3{ResearchTools: coordinatorResearchToolsV3(t)}
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV31
 	seal.Payload.PlannerBudget.MaxToolCalls = 4
 	seal.Payload.Definition.TaskName = "Kimi plan watch"
 	seal.Payload.Definition.TaskManual = "Check official pricing and compare history."
@@ -353,6 +364,7 @@ func TestResearchPlannerRoundsExhaustionIsNonRetryableAndRecoverySafe(t *testing
 	_, snapshot, _, _ := researchBridgeFixtureV3(t)
 	snapshot.PlannerBudget.MaxPlannerRounds = 2
 	seal := runcontext.ResearchSnapshotSealV3{ResearchTools: coordinatorResearchToolsV3(t)}
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV3
 	settled := map[int]storepkg.ResearchRunLLMReceiptV3{}
 	providerEffects := 0
 	execute := func(_ context.Context, round int, _ string) (
@@ -391,6 +403,7 @@ func TestResearchPlannerPromptContainsOnlyFrozenInternalInputs(t *testing.T) {
 		},
 		ResearchTools: tools,
 	}
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV31
 	seal.Payload.Definition.TaskName = "Kimi plan watch"
 	seal.Payload.Definition.TaskManual = "Check official pricing and compare history."
 	prompt, err := buildResearchPlannerPromptV3(seal)
@@ -406,7 +419,7 @@ func TestResearchPlannerPromptContainsOnlyFrozenInternalInputs(t *testing.T) {
 			t.Fatalf("planner prompt leaked or accepted non-planning input %q: %s", forbidden, prompt)
 		}
 	}
-	var decoded researchPlannerPromptV3
+	var decoded researchPlannerPromptV31
 	if err := json.Unmarshal([]byte(prompt), &decoded); err != nil ||
 		decoded.TaskManual != seal.Payload.Definition.TaskManual {
 		t.Fatalf("planner prompt is not the frozen canonical environment: %s err=%v", prompt, err)
@@ -420,6 +433,96 @@ func TestResearchPlannerPromptContainsOnlyFrozenInternalInputs(t *testing.T) {
 		!contract.SingleJSONObject || !strings.Contains(contract.ToolNameRule, "allowed_tools") ||
 		!strings.Contains(contract.ArgumentsRule, "parameters") {
 		t.Fatalf("planner response contract is incomplete: %+v", contract)
+	}
+}
+
+func TestResearchPlannerRendererV3PreservesFrozenPromptBytes(t *testing.T) {
+	seal := runcontext.ResearchSnapshotSealV3{}
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV3
+	seal.Payload.HistoryThroughUTC = "2026-08-01T00:00:00Z"
+	seal.Payload.PlannerBudget.MaxToolCalls = 4
+	seal.Payload.Definition.TaskName = "Kimi plan watch"
+	seal.Payload.Definition.TaskManual = "Check official pricing."
+	prompt, err := buildResearchPlannerPromptV3(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"schema_version":"vane.research-planner-input/v3","task_name":"Kimi plan watch","task_manual":"Check official pricing.","history_through_utc":"2026-08-01T00:00:00Z","max_tool_calls":4,"allowed_tools":[],"response_schema":"vane.research-planner-output/v3"}`
+	if prompt != want {
+		t.Fatalf("legacy prompt bytes drifted:\n got %s\nwant %s", prompt, want)
+	}
+	correction, err := buildResearchPlannerCorrectionPromptV3(
+		prompt, runtimepolicy.ResearchPlannerRendererVersionV3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCorrection := `{"schema_version":"vane.research-planner-correction/v3","instruction":"The previous response failed the strict schema or canonicalization contract. Return only one canonical JSON object matching the required response schema.","planner_input":` + want + `}`
+	if correction != wantCorrection {
+		t.Fatalf("legacy correction bytes drifted:\n got %s\nwant %s", correction, wantCorrection)
+	}
+	seal.ResearchModel.Planner.RendererVersion = "unknown-renderer"
+	if _, err := buildResearchPlannerPromptV3(seal); err == nil {
+		t.Fatal("unknown frozen renderer built a planner prompt")
+	}
+}
+
+func TestResearchPlannerRendererV3ReservationReplayKeepsPromptAndSettledSemantics(t *testing.T) {
+	_, snapshot, _, _ := researchBridgeFixtureV3(t)
+	snapshot.PlannerBudget.MaxPlannerRounds = 2
+	seal := runcontext.ResearchSnapshotSealV3{ResearchTools: coordinatorResearchToolsV3(t)}
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV3
+	seal.Payload.PlannerBudget.MaxToolCalls = 4
+	seal.Payload.Definition.TaskName = "Kimi plan watch"
+	seal.Payload.Definition.TaskManual = "Check official pricing."
+	initialPrompt, err := buildResearchPlannerPromptV3(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	correctionPrompt, err := buildResearchPlannerCorrectionPromptV3(
+		initialPrompt, runtimepolicy.ResearchPlannerRendererVersionV3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := `{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"Kimi pricing"}}]}`
+	settled := map[int]storepkg.ResearchRunLLMReceiptV3{}
+	providerEffects := 0
+	prompts := make([]string, 0, 4)
+	execute := func(_ context.Context, round int, prompt string) (
+		storepkg.ResearchRunLLMReceiptV3,
+		storepkg.ResearchRunLLMSpendReservationV3, error,
+	) {
+		prompts = append(prompts, prompt)
+		reservation := storepkg.ResearchRunLLMSpendReservationV3{
+			ReservationID: int64(round + 1), RequestDigest: strings.Repeat("b", 64),
+		}
+		if receipt, ok := settled[round]; ok {
+			return receipt, reservation, nil
+		}
+		providerEffects++
+		completion := "invalid"
+		if round == 1 {
+			completion = good
+		}
+		receipt := storepkg.ResearchRunLLMReceiptV3{Call: types.LLMCall{Completion: completion}}
+		settled[round] = receipt
+		return receipt, reservation, nil
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		plan, reservation, err := executeResearchPlannerRoundsV3(
+			t.Context(), snapshot, seal, initialPrompt, execute)
+		if err != nil || len(plan.Steps) != 1 || reservation.ReservationID != 2 {
+			t.Fatalf("attempt=%d plan=%+v reservation=%+v err=%v",
+				attempt, plan, reservation, err)
+		}
+	}
+	wantPrompts := []string{initialPrompt, correctionPrompt, initialPrompt, correctionPrompt}
+	if !reflect.DeepEqual(prompts, wantPrompts) || providerEffects != 2 {
+		t.Fatalf("prompts=%v provider_effects=%d", prompts, providerEffects)
+	}
+	formattedSettled := []byte(" " + good)
+	if _, err := decodeResearchPlannerCompletionV3(
+		formattedSettled, runtimepolicy.ResearchPlannerRendererVersionV3); err == nil {
+		t.Fatal("legacy settled completion changed meaning during recovery")
 	}
 }
 
@@ -485,7 +588,7 @@ func coordinatorResearchModelV3(t *testing.T) runtimepolicy.ResearchModelPolicyV
 		Planner: runtimepolicy.ResearchModelStageV3{
 			Stage: runtimepolicy.ResearchModelStagePlannerV3, Model: "strong-model",
 			MaxTokens: 4096, SystemPrompt: "Plan from the trusted task manual.",
-			RendererVersion: "research-planner.render/v3",
+			RendererVersion: runtimepolicy.ResearchPlannerRendererVersionV3,
 		},
 		Synthesis: runtimepolicy.ResearchModelStageV3{
 			Stage: runtimepolicy.ResearchModelStageSynthesisV3, Model: "strong-model",
