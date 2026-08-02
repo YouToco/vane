@@ -50,20 +50,27 @@ func TestMigration104ResearchPlanReceiptProjectionPostgres(t *testing.T) {
 		t.Fatal("representation-only planner formatting did not match durable Plan steps")
 	}
 
-	mutations := []string{
-		strings.Replace(formattedCompletion, "web_contents", "read_page", 1),
-		strings.Replace(formattedCompletion, `"invocation_id":"1"`, `"invocation_id":"2"`, 1),
-		strings.Replace(formattedCompletion, `"schema_version": "vane.research-planner-output/v3"`, `"schema_version": "vane.research-planner-output/v3", "extra": true`, 1),
-		strings.Replace(string(plan), `"schema_version":"vane.research-execution-plan/v3"`, `"schema_version":"vane.research-execution-plan/v3","extra":true`, 1),
+	mutations := []struct {
+		plan       []byte
+		completion string
+	}{
+		{plan, strings.Replace(formattedCompletion, "web_contents", "read_page", 1)},
+		{plan, strings.Replace(formattedCompletion, `"invocation_id":"1"`, `"invocation_id":"2"`, 1)},
+		{plan, strings.Replace(formattedCompletion, `"schema_version": "vane.research-planner-output/v3"`, `"schema_version": "vane.research-planner-output/v3", "extra": true`, 1)},
+		{plan, `{"schema_version":"wrong","schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"1","tool_name":"web_contents","arguments":{"page_url":"https://www.kimi.com/membership/pricing"}}]}`},
+		{plan, `{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"wrong","invocation_id":"1","tool_name":"web_contents","arguments":{"page_url":"https://www.kimi.com/membership/pricing"}}]}`},
+		{plan, `{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"1","tool_name":"wrong","tool_name":"web_contents","arguments":{"page_url":"https://www.kimi.com/membership/pricing"}}]}`},
+		{plan, `{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"1","tool_name":"web_contents","arguments":{"page_url":"https://attacker.invalid","page_url":"https://www.kimi.com/membership/pricing"}}]}`},
+		{[]byte(strings.Replace(string(plan), `"schema_version":"vane.research-execution-plan/v3"`, `"schema_version":"wrong","schema_version":"vane.research-execution-plan/v3"`, 1)), formattedCompletion},
+		{[]byte(strings.Replace(string(plan), `"page_url":"https://www.kimi.com/membership/pricing"`, `"page_url":"https://attacker.invalid","page_url":"https://www.kimi.com/membership/pricing"`, 1)), formattedCompletion},
+		{[]byte(strings.Replace(string(plan), `"schema_version":"vane.research-execution-plan/v3"`, `"schema_version":"vane.research-execution-plan/v3","extra":true`, 1)), formattedCompletion},
+		{plan, `{"schema_version":`},
+		{[]byte(`{"schema_version":`), formattedCompletion},
 	}
 	for index, mutation := range mutations {
-		candidatePlan, candidateCompletion := plan, mutation
-		if index == len(mutations)-1 {
-			candidatePlan, candidateCompletion = []byte(mutation), formattedCompletion
-		}
 		if err := db.QueryRowContext(t.Context(),
 			`SELECT research_plan_matches_planner_completion_v1($1,$2)`,
-			candidatePlan, candidateCompletion).Scan(&matches); err != nil {
+			mutation.plan, mutation.completion).Scan(&matches); err != nil {
 			t.Fatalf("mutation %d query: %v", index, err)
 		}
 		if matches {
@@ -121,7 +128,8 @@ func TestMigration104SQLKeepsReceiptAndSnapshotBoundaries(t *testing.T) {
 		"research_plan_matches_planner_completion_v1",
 		"vane.research-planner-output/v3",
 		"vane.research-execution-plan/v3",
-		"convert_from(plan_payload,'UTF8')::jsonb->'steps'",
+		"IS JSON OBJECT WITH UNIQUE KEYS",
+		"plan_text::jsonb->'steps'",
 		"REVOKE ALL ON FUNCTION research_plan_matches_planner_completion_v1",
 	} {
 		if !strings.Contains(sqlText, required) {

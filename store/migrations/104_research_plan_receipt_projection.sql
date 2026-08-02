@@ -27,31 +27,39 @@ IMMUTABLE
 STRICT
 SET search_path=pg_catalog,public,pg_temp
 AS $$
-    SELECT
-        jsonb_typeof(convert_from(plan_payload,'UTF8')::jsonb)='object'
-        AND jsonb_typeof(planner_completion::jsonb)='object'
-        AND convert_from(plan_payload,'UTF8')::jsonb = jsonb_build_object(
-            'schema_version',
-                convert_from(plan_payload,'UTF8')::jsonb->'schema_version',
-            'definition_digest',
-                convert_from(plan_payload,'UTF8')::jsonb->'definition_digest',
-            'capability_catalog_digest',
-                convert_from(plan_payload,'UTF8')::jsonb->'capability_catalog_digest',
-            'tool_policy_digest',
-                convert_from(plan_payload,'UTF8')::jsonb->'tool_policy_digest',
-            'steps',convert_from(plan_payload,'UTF8')::jsonb->'steps'
-        )
-        AND convert_from(plan_payload,'UTF8')::jsonb->>'schema_version'
-                ='vane.research-execution-plan/v3'
-        AND planner_completion::jsonb = jsonb_build_object(
-            'schema_version',planner_completion::jsonb->'schema_version',
-            'steps',planner_completion::jsonb->'steps'
-        )
-        AND planner_completion::jsonb->>'schema_version'
-                ='vane.research-planner-output/v3'
-        AND jsonb_typeof(planner_completion::jsonb->'steps')='array'
-        AND convert_from(plan_payload,'UTF8')::jsonb->'steps'
-                =planner_completion::jsonb->'steps'
+    WITH input AS (
+        SELECT convert_from(plan_payload,'UTF8') AS plan_text
+    )
+    SELECT CASE
+        -- jsonb silently keeps the last duplicate key.  Preserve the raw-byte
+        -- strictness of the Go decoder before any cast can erase ambiguity;
+        -- WITH UNIQUE KEYS recursively covers step and arguments objects.
+        WHEN NOT (plan_text IS JSON OBJECT WITH UNIQUE KEYS)
+          OR NOT (planner_completion IS JSON OBJECT WITH UNIQUE KEYS)
+        THEN false
+        ELSE
+            jsonb_typeof(plan_text::jsonb)='object'
+            AND jsonb_typeof(planner_completion::jsonb)='object'
+            AND plan_text::jsonb = jsonb_build_object(
+                'schema_version',plan_text::jsonb->'schema_version',
+                'definition_digest',plan_text::jsonb->'definition_digest',
+                'capability_catalog_digest',
+                    plan_text::jsonb->'capability_catalog_digest',
+                'tool_policy_digest',plan_text::jsonb->'tool_policy_digest',
+                'steps',plan_text::jsonb->'steps'
+            )
+            AND plan_text::jsonb->>'schema_version'
+                    ='vane.research-execution-plan/v3'
+            AND planner_completion::jsonb = jsonb_build_object(
+                'schema_version',planner_completion::jsonb->'schema_version',
+                'steps',planner_completion::jsonb->'steps'
+            )
+            AND planner_completion::jsonb->>'schema_version'
+                    ='vane.research-planner-output/v3'
+            AND jsonb_typeof(planner_completion::jsonb->'steps')='array'
+            AND plan_text::jsonb->'steps'=planner_completion::jsonb->'steps'
+        END
+      FROM input
 $$;
 -- +goose StatementEnd
 

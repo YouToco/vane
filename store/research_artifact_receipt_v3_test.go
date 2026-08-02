@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/YouToco/vane/runcontext"
@@ -212,6 +213,30 @@ func TestResearchRunPlanV3RequiresSemanticallyEqualCompletedReceiptPostgres(t *t
 	}
 
 	payload := researchPlannerCompletionFromPlanV3(t, plan)
+	validCompletion := string(payload)
+	duplicateCompletions := []string{
+		strings.Replace(validCompletion,
+			`{"schema_version":`, `{"schema_version":"wrong","schema_version":`, 1),
+		strings.Replace(validCompletion,
+			`{"invocation_id":`, `{"invocation_id":"wrong","invocation_id":`, 1),
+		strings.Replace(validCompletion,
+			`"tool_name":"web_search"`,
+			`"tool_name":"wrong","tool_name":"web_search"`, 1),
+		strings.Replace(validCompletion,
+			`{"query":"Kimi pricing"}`,
+			`{"query":"attacker-visible-first","query":"Kimi pricing"}`, 1),
+	}
+	for index, completion := range duplicateCompletions {
+		reservation := reserveAndSettle(index+1, completion)
+		if _, err := f.store.CreateOrGetResearchRunPlanV3(t.Context(),
+			CreateOrGetResearchRunPlanV3Params{
+				Identity: f.identity, RunSnapshotID: f.snapshotRef.SnapshotID,
+				PlannerLLMReservationID: reservation.ReservationID, Plan: plan,
+			}); err == nil {
+			t.Fatalf("database admitted duplicate-key planner receipt mutation %d", index)
+		}
+	}
+
 	var semantic any
 	if err := json.Unmarshal(payload, &semantic); err != nil {
 		t.Fatal(err)
@@ -220,7 +245,7 @@ func TestResearchRunPlanV3RequiresSemanticallyEqualCompletedReceiptPostgres(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	equivalent := reserveAndSettle(1, string(pretty))
+	equivalent := reserveAndSettle(len(duplicateCompletions)+1, string(pretty))
 	if _, err := f.store.CreateOrGetResearchRunPlanV3(t.Context(),
 		CreateOrGetResearchRunPlanV3Params{
 			Identity: f.identity, RunSnapshotID: f.snapshotRef.SnapshotID,
