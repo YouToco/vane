@@ -153,7 +153,7 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		}
 
 		// 经读侧回来（探针/看板走的就是这条路）。
-		sums, err := st.ListPushBatchSummaries(ctx, u.ID, time.Now().Add(-time.Hour), 10)
+		sums, err := st.ListPushBatchSummaries(ctx, 1, u.ID, time.Now().Add(-time.Hour), 10)
 		if err != nil {
 			t.Fatalf("ListPushBatchSummaries() 失败: %v", err)
 		}
@@ -186,6 +186,86 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		if got.StageCounts.Scored != nil || got.StageCounts.Selected != nil || got.StageCounts.Cards != nil {
 			t.Errorf("dedup 闸门之后的阶段没跑，必须是 nil，实得 %+v", got.StageCounts)
 		}
+	})
+
+	t.Run("owner 读取不聚合其他租户或用户的脏投递", func(t *testing.T) {
+		batchID, err := st.CreatePushBatchIdempotent(
+			ctx, u.ID, "tr-owner-bypass-"+uuid.NewString(), "")
+		if err != nil {
+			t.Fatalf("创建目标批次失败: %v", err)
+		}
+		other, err := st.UpsertUserByOpenID(ctx,
+			"test_cross_delivery_"+uuid.NewString(), "cross-delivery-test")
+		if err != nil {
+			t.Fatalf("创建其他用户失败: %v", err)
+		}
+		var otherTenantID int64
+		if err := st.pool.QueryRow(ctx,
+			`INSERT INTO tenants DEFAULT VALUES RETURNING id`).Scan(&otherTenantID); err != nil {
+			t.Fatalf("创建其他租户失败: %v", err)
+		}
+		if _, err := st.pool.Exec(ctx,
+			`INSERT INTO memberships (tenant_id,user_id,role) VALUES ($1,$2,'owner')`,
+			otherTenantID, other.ID); err != nil {
+			t.Fatalf("创建其他租户 membership 失败: %v", err)
+		}
+		// migration 061 已阻止新写入错配 batch identity；这里临时关闭
+		// replication triggers 只为模拟 061 之前的历史脏行/owner 灾难恢复导入。
+		// 被测读取必须在 schema owner 绕过 RLS 时仍不聚合这类遗留数据。
+		fixtureTx, err := st.pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("开启脏数据夹具事务失败: %v", err)
+		}
+		defer func() { _ = fixtureTx.Rollback(context.WithoutCancel(ctx)) }()
+		if _, err := fixtureTx.Exec(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
+			t.Fatalf("关闭夹具触发器失败: %v", err)
+		}
+		if _, err := fixtureTx.Exec(ctx,
+			`INSERT INTO deliveries
+			    (tenant_id,batch_id,user_id,score,status,card_json)
+			 VALUES ($1,$2,$3,99,'sent','{}')`,
+			otherTenantID, batchID, other.ID); err != nil {
+			t.Fatalf("构造历史跨租户脏投递失败: %v", err)
+		}
+		if err := fixtureTx.Commit(ctx); err != nil {
+			t.Fatalf("提交历史脏投递夹具失败: %v", err)
+		}
+		t.Cleanup(func() {
+			cleanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			for _, cleanup := range []struct {
+				name string
+				sql  string
+				args []any
+			}{
+				{"脏投递", `DELETE FROM deliveries WHERE user_id=$1`, []any{other.ID}},
+				{"其他 membership", `DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`, []any{otherTenantID, other.ID}},
+				{"其他租户", `DELETE FROM tenants WHERE id=$1`, []any{otherTenantID}},
+				{"其他用户", `DELETE FROM users WHERE id=$1`, []any{other.ID}},
+			} {
+				if _, err := st.pool.Exec(cleanCtx, cleanup.sql, cleanup.args...); err != nil {
+					t.Errorf("清理%s失败: %v", cleanup.name, err)
+				}
+			}
+		})
+
+		// st 是 schema-owner Store，能绕过 RLS；因此本断言只会被 JOIN
+		// 自身的 tenant/user 谓词保护，正面覆盖 owner-bypass 反例。
+		summaries, err := st.ListPushBatchSummaries(
+			ctx, 1, u.ID, time.Now().Add(-time.Hour), 50)
+		if err != nil {
+			t.Fatalf("读取目标批次失败: %v", err)
+		}
+		for _, summary := range summaries {
+			if summary.ID == batchID {
+				if summary.DeliveryCount != 0 || summary.SentCount != 0 ||
+					summary.MaxScore != nil || summary.MinScore != nil {
+					t.Fatalf("跨租户脏投递污染目标批次: %+v", summary)
+				}
+				return
+			}
+		}
+		t.Fatalf("目标批次 %d 未返回", batchID)
 	})
 
 	t.Run("同幂等键重复记账复用同一行", func(t *testing.T) {
