@@ -356,6 +356,16 @@ if grep -Eq '^POSTGRES_PASSWORD=|^VANE_DB_URL=postgres://vane:' \
   echo "server environment contains an owner credential" >&2
   exit 1
 fi
+# DirectoryMode in the socket unit only applies when systemd creates the
+# directory. Repair upgrades from the original root:root 0750 directory too,
+# while refusing a replaced path. The directory is traversable but not
+# listable; the socket inode remains gateway:vane 0660.
+if [[ -L /run/vane-research-gateway || \
+      (-e /run/vane-research-gateway && ! -d /run/vane-research-gateway) ]]; then
+  echo "research gateway runtime path is not a real directory" >&2
+  exit 1
+fi
+install -d -o root -g root -m 0711 /run/vane-research-gateway
 systemctl enable --now vane-research-gateway.socket
 systemctl restart vane-research-gateway.service
 gateway_exe=
@@ -376,6 +386,10 @@ done
   echo "research gateway preflight is not running the installed binary" >&2
   systemctl status vane-research-gateway.service --no-pager --full >&2 || true
   journalctl -u vane-research-gateway.service --no-pager -o cat -n 100 >&2 || true
+  exit 1
+}
+[[ $(stat -c '%U:%G:%a' /run/vane-research-gateway) == root:root:711 ]] || {
+  echo "research gateway runtime directory ownership or mode is unsafe" >&2
   exit 1
 }
 [[ $(stat -c '%U:%G:%a' /run/vane-research-gateway/gateway.sock) == \

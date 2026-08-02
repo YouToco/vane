@@ -81,6 +81,29 @@ class BackendRuntimeContractTest(unittest.TestCase):
             remote,
         )
         self.assertIn("gateway_http_code == 405", remote)
+        self.assertIn("runuser -u vane -- curl", remote)
+        self.assertIn(
+            "install -d -o root -g root -m 0711 /run/vane-research-gateway",
+            remote,
+        )
+        self.assertIn("-L /run/vane-research-gateway", remote)
+        self.assertIn("! -d /run/vane-research-gateway", remote)
+        self.assertIn(
+            "stat -c '%U:%G:%a' /run/vane-research-gateway) == root:root:711",
+            remote,
+        )
+        self.assertLess(
+            remote.index(
+                "install -d -o root -g root -m 0711 /run/vane-research-gateway"
+            ),
+            remote.index("systemctl enable --now vane-research-gateway.socket"),
+        )
+        self.assertLess(
+            remote.index(
+                "install -d -o root -g root -m 0711 /run/vane-research-gateway"
+            ),
+            remote.index("runuser -u vane -- curl"),
+        )
         self.assertIn("capability_source=legacy", remote)
         self.assertIn("capability_retired", remote)
         self.assertIn(
