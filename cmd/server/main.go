@@ -155,8 +155,8 @@ func run() error {
 				for _, bucket := range []store.QuotaBucket{
 					store.QuotaLLMTokens, store.QuotaExaCalls,
 				} {
-					if _, err := researchControlStore.LoadQuotaRule(
-						ctx, identity.TenantID, bucket,
+					if _, err := researchControlStore.LoadResearchQuotaRuleV3(
+						ctx, identity, bucket,
 					); err != nil {
 						return runtimepolicy.BundleV1{},
 							runtimepolicy.ResearchToolPolicyV3{},

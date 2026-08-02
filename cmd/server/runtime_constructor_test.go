@@ -34,7 +34,7 @@ func TestResearchV3UsesIndependentRestrictedControlStore(t *testing.T) {
 		"store.NewServerRuntimeWithResearchRuntimeCapability(",
 		"ctx, cfg.DB.ResearchControlURL, cfg.DB.ResearchRuntimeURL,",
 		"researchControlStore, gatewayClient, researchExecutor,",
-		"researchControlStore.LoadQuotaRule(",
+		"researchControlStore.LoadResearchQuotaRuleV3(",
 		"researchControlStore, push,",
 		"newResearchV3DeliveryTargetResolver(researchControlStore, manager)",
 		"closeStores := func() { closeServerStores(st, researchControlStore) }",

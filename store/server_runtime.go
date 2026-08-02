@@ -63,6 +63,7 @@ var serverRuntimeProtectedRelations = []string{
 var serverRuntimeForbiddenReadRelations = []string{
 	"public.research_llm_gateway_frozen_requests",
 	"public.research_run_capabilities",
+	"public.tenant_quota",
 }
 
 // ProvisionServerRuntime installs the cluster-global runtime shell only after
@@ -176,6 +177,19 @@ func initializeServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 	}
 	if sessionUser != serverRuntimeLoginRole || currentUser != "vane_app" {
 		return errors.New("server runtime default capability is unsafe")
+	}
+	var quotaResolver, directQuotaRead bool
+	if err := conn.QueryRow(ctx, `
+		SELECT has_function_privilege(current_user,
+		         'public.resolve_research_quota_rule_v1(bigint,bigint,text,text)',
+		         'EXECUTE'),
+		       has_table_privilege(current_user,'public.tenant_quota','SELECT') OR
+		       has_any_column_privilege(current_user,'public.tenant_quota','SELECT')`,
+	).Scan(&quotaResolver, &directQuotaRead); err != nil {
+		return fmt.Errorf("verify server quota projection: %w", err)
+	}
+	if !quotaResolver || directQuotaRead {
+		return errors.New("server runtime quota projection is unsafe")
 	}
 	return nil
 }

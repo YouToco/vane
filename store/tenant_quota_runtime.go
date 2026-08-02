@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"github.com/YouToco/vane/types"
+	"github.com/jackc/pgx/v5"
 )
 
 // QuotaRule is a live tenant bucket configuration. It is used only to verify
@@ -45,6 +46,47 @@ func (s *Store) LoadQuotaRule(ctx context.Context, tenantID int64, bucket QuotaB
 	}
 	if err := rule.Validate(); err != nil {
 		return QuotaRule{}, err
+	}
+	return rule, nil
+}
+
+// LoadResearchQuotaRuleV3 reads only the rate/burst policy for the exact
+// authenticated research task. The long-lived server runtime deliberately has
+// no direct tenant_quota privilege: a SECURITY DEFINER projection verifies the
+// bound tenant/user/task and never exposes the mutable token balance.
+func (s *Store) LoadResearchQuotaRuleV3(
+	ctx context.Context, identity types.RunIdentity, bucket QuotaBucket,
+) (QuotaRule, error) {
+	rule := QuotaRule{Bucket: bucket}
+	if identity.Validate() != nil ||
+		identity.RunKind != types.RunSnapshotKindScheduled || !bucket.Valid() {
+		return QuotaRule{}, types.NewAppError(types.CodeValidation,
+			"research V3 配额查询参数无效", types.ErrValidation)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return QuotaRule{}, classifyQuotaErr(err, "开始 research V3 配额规则查询")
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3AppScopeTx(
+		ctx, tx, identity.TenantID, identity.UserID,
+	); err != nil {
+		return QuotaRule{}, err
+	}
+	if err := tx.QueryRow(ctx, `
+		SELECT out_rate,out_burst
+		  FROM resolve_research_quota_rule_v1($1,$2,$3,$4)`,
+		identity.TenantID, identity.UserID, identity.TaskID, string(bucket),
+	).Scan(&rule.Rate, &rule.Burst); err != nil {
+		return QuotaRule{}, classifyQuotaErr(err,
+			fmt.Sprintf("读取 research V3 配额规则（tenant=%d bucket=%s）",
+				identity.TenantID, bucket))
+	}
+	if err := rule.Validate(); err != nil {
+		return QuotaRule{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return QuotaRule{}, classifyQuotaErr(err, "提交 research V3 配额规则查询")
 	}
 	return rule, nil
 }

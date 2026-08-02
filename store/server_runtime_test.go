@@ -89,7 +89,7 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 	})
 	researchURL := roleTestURL(t, scratchURL, researchRuntimeLoginRole,
 		researchPassword)
-	if _, err := provider.UpTo(t.Context(), 102); err != nil {
+	if _, err := provider.UpTo(t.Context(), 103); err != nil {
 		t.Fatal(err)
 	}
 
@@ -267,6 +267,9 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 			tenantID, user.ID); err != nil {
 			t.Fatal(err)
 		}
+		if err := ownerStore.SeedTenantQuota(t.Context(), tenantID); err != nil {
+			t.Fatal(err)
+		}
 		taskID := "v3-runtime-" + uuid.NewString()
 		if _, err := owner.ExecContext(t.Context(), `INSERT INTO schedules
 			(id,tenant_id,user_id,nl_description,spec_json,scope_json,status,push_strictness)
@@ -313,6 +316,50 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		identity := types.RunIdentity{TemporalWorkflowID: "research-v3-shadow-" + strings.Repeat("2", 64),
 			TemporalRunID: "runtime-run-" + uuid.NewString(), RunKind: types.RunSnapshotKindScheduled,
 			TenantID: tenantID, UserID: user.ID, TaskID: taskID}
+		quota, err := runtimeStore.LoadResearchQuotaRuleV3(
+			t.Context(), identity, QuotaLLMTokens)
+		if err != nil || quota.Rate <= 0 || quota.Burst <= 0 {
+			t.Fatalf("runtime V3 quota projection=%+v err=%v", quota, err)
+		}
+		for name, mutate := range map[string]func(*types.RunIdentity){
+			"tenant": func(value *types.RunIdentity) { value.TenantID++ },
+			"user":   func(value *types.RunIdentity) { value.UserID++ },
+			"task":   func(value *types.RunIdentity) { value.TaskID = "foreign-task" },
+		} {
+			t.Run("quota projection rejects foreign "+name, func(t *testing.T) {
+				foreign := identity
+				mutate(&foreign)
+				if _, err := runtimeStore.LoadResearchQuotaRuleV3(
+					t.Context(), foreign, QuotaLLMTokens,
+				); !errors.Is(err, ErrQuotaExceeded) {
+					t.Fatalf("foreign %s quota err=%v", name, err)
+				}
+			})
+		}
+		if _, err := runtimeStore.pool.Exec(t.Context(),
+			`SELECT rate,burst FROM tenant_quota LIMIT 1`); err == nil {
+			t.Fatal("vane_app read tenant_quota directly")
+		}
+		unbound, err := runtimeStore.pool.Begin(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := unbound.Exec(t.Context(), `SELECT * FROM
+			resolve_research_quota_rule_v1($1,$2,$3,$4)`, tenantID, user.ID,
+			taskID, string(QuotaLLMTokens)); err == nil {
+			t.Fatal("quota projection accepted an unbound transaction")
+		}
+		_ = unbound.Rollback(t.Context())
+		executor, err := pgx.Connect(t.Context(), researchURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = executor.Close(t.Context()) }()
+		if _, err := executor.Exec(t.Context(), `SELECT * FROM
+			resolve_research_quota_rule_v1($1,$2,$3,$4)`, tenantID, user.ID,
+			taskID, string(QuotaLLMTokens)); err == nil {
+			t.Fatal("research executor invoked the control quota projection")
+		}
 		ref, err := runtimeStore.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
 			testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
 			testResearchModelPolicyStoreV3(t))
