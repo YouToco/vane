@@ -1659,6 +1659,7 @@ func TestValidateCompiledRouteGenerations(t *testing.T) {
 func TestResearchRuntimeURLFromEnvironment(t *testing.T) {
 	t.Setenv("VANE_DB_URL", "postgres://owner")
 	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://vane_research_runtime:secret@db/vane")
+	t.Setenv("VANE_DB_RESEARCH_CONTROL_URL", "postgres://vane_server_runtime:secret@db/vane")
 	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "research-cap-2026-08")
 	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
 	cfg, err := Load("")
@@ -1668,6 +1669,10 @@ func TestResearchRuntimeURLFromEnvironment(t *testing.T) {
 	if got, want := cfg.DB.ResearchRuntimeURL,
 		"postgres://vane_research_runtime:secret@db/vane"; got != want {
 		t.Fatalf("db.research_runtime_url=%q, want %q", got, want)
+	}
+	if got, want := cfg.DB.ResearchControlURL,
+		"postgres://vane_server_runtime:secret@db/vane"; got != want {
+		t.Fatalf("db.research_control_url=%q, want %q", got, want)
 	}
 	if cfg.DB.ResearchCapabilityKeyID != "research-cap-2026-08" ||
 		cfg.DB.ResearchCapabilityKeyHex != strings.Repeat("42", 32) {
@@ -1718,6 +1723,25 @@ func TestResearchRuntimeRequiresCapabilityKey(t *testing.T) {
 	cfg.DB.ResearchCapabilityKeyHex = strings.Repeat("ab", 32)
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid research capability key was rejected: %v", err)
+	}
+}
+
+func TestResearchV3CanaryRequiresIndependentControlURL(t *testing.T) {
+	cfg := Config{
+		DB: DBConfig{
+			URL: "postgres://owner", ResearchRuntimeURL: "postgres://research",
+			ResearchCapabilityKeyID:  "active",
+			ResearchCapabilityKeyHex: strings.Repeat("ab", 32),
+		},
+		Fetch:    FetchConfig{ExaAPIKey: "exa"},
+		Pipeline: PipelineConfig{ResearchV3ShadowCanaryScheduleID: "kimi-v5"},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "research_control_url") {
+		t.Fatalf("missing research control URL returned %v", err)
+	}
+	cfg.DB.ResearchControlURL = "postgres://vane_server_runtime@db/vane"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid independent research control URL was rejected: %v", err)
 	}
 }
 

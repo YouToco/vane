@@ -91,6 +91,39 @@ func TestResearchLLMProcessGatewayBindingV1ReplayAndRedactionPostgres(t *testing
 	runtime := newResearchProcessBindingServerRuntimeV1(t)
 	f, reservation := newResearchProcessBindingFixtureV1(t,
 		"process binding replay and redaction")
+	var controlSession, controlRole, researchSession, researchRole string
+	if err := runtime.pool.QueryRow(t.Context(), `SELECT session_user,current_user`).Scan(
+		&controlSession, &controlRole,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.researchPool.QueryRow(t.Context(), `SELECT session_user,current_user`).Scan(
+		&researchSession, &researchRole,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if controlSession != serverRuntimeLoginRole || controlRole != "vane_app" ||
+		researchSession != researchRuntimeLoginRole ||
+		researchRole != researchRuntimeLoginRole {
+		t.Fatalf("unsafe split runtime identities: control=%s/%s research=%s/%s",
+			controlSession, controlRole, researchSession, researchRole)
+	}
+	if _, err := f.store.ResolveResearchLLMProcessGatewayBindingV1(
+		t.Context(), f.identity, f.snapshotRef, reservation.ReservationID,
+	); err == nil || !strings.Contains(err.Error(), "invalid process gateway binding scope") {
+		t.Fatalf("schema owner unexpectedly substituted for research control: %v", err)
+	}
+	var denied int64
+	if err := runtime.researchPool.QueryRow(t.Context(),
+		`SELECT out_reservation_id
+		   FROM bind_research_llm_process_gateway_v1($1,$2,$3,$4,$5,$6,$7,$8)`,
+		f.identity.TenantID, f.identity.UserID, f.identity.TaskID,
+		f.identity.TemporalWorkflowID, f.identity.TemporalRunID,
+		f.snapshotRef.SnapshotID, f.snapshotRef.ReferenceDigest,
+		reservation.ReservationID,
+	).Scan(&denied); err == nil {
+		t.Fatal("research executor unexpectedly substituted for research control")
+	}
 	first, err := runtime.ResolveResearchLLMProcessGatewayBindingV1(
 		t.Context(), f.identity, f.snapshotRef, reservation.ReservationID)
 	if err != nil {

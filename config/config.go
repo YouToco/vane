@@ -63,6 +63,10 @@ type DBConfig struct {
 	// ResearchRuntimeURL 是 V3 情报运行专用的非 owner LOGIN 连接串。
 	// 留空时旧运行路径保持可用，但所有 V3 Store 入口 fail-closed。
 	ResearchRuntimeURL string `mapstructure:"research_runtime_url"`
+	// ResearchControlURL is the independently authenticated vane_server_runtime
+	// connection used by the V3 control plane. It must never be the schema-owner
+	// URL or the paid executor URL.
+	ResearchControlURL string `mapstructure:"research_control_url"`
 	// ResearchCapabilityKeyID identifies the active HMAC key. Retired keys must
 	// be retained for at least the longest V3 workflow/retry window.
 	ResearchCapabilityKeyID string `mapstructure:"research_capability_key_id"`
@@ -293,6 +297,7 @@ type A2AConfig struct {
 var sensitiveKeys = []string{
 	"db.url",
 	"db.research_runtime_url",
+	"db.research_control_url",
 	"db.research_capability_key_id",
 	"db.research_capability_key_hex",
 	"db.research_capability_retired_keys",
@@ -1034,6 +1039,9 @@ func (c *Config) Validate() error {
 		c.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
 		if strings.TrimSpace(c.DB.ResearchRuntimeURL) == "" {
 			return errors.New("config: Research V3 runtime 要求 db.research_runtime_url")
+		}
+		if strings.TrimSpace(c.DB.ResearchControlURL) == "" {
+			return errors.New("config: Research V3 runtime 要求 db.research_control_url")
 		}
 		if c.DB.ResearchCapabilityKeyID == "" ||
 			len(c.DB.ResearchCapabilityKeyHex) != 64 {

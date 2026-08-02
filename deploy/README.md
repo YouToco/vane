@@ -88,6 +88,7 @@ SQL
 unset VANE_RESEARCH_DB_PASSWORD VANE_GATEWAY_DB_PASSWORD VANE_SERVER_DB_PASSWORD
 # 将 server/runtime URL 写入 /opt/vane/env/server.env：
 # VANE_DB_URL=postgres://vane_server_runtime:<server-password>@127.0.0.1:5432/vane?sslmode=disable
+# VANE_DB_RESEARCH_CONTROL_URL=postgres://vane_server_runtime:<server-password>@127.0.0.1:5432/vane?sslmode=disable
 # VANE_DB_RESEARCH_RUNTIME_URL=postgres://vane_research_runtime:<url-encoded-password>@127.0.0.1:5432/vane?sslmode=disable
 # 将 gateway URL 与 Provider key 分别写入以下 0400 credential 文件：
 install -o vane-research-gateway -g vane-research-gateway -m 0400 /dev/null /etc/vane/credentials/gateway_db_url

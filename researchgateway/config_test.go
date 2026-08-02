@@ -10,7 +10,8 @@ import (
 func setMinimalProcessConfigV1(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{"VANE_DB_URL",
-		"VANE_DB_RESEARCH_RUNTIME_URL", "VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL",
+		"VANE_DB_RESEARCH_RUNTIME_URL", "VANE_DB_RESEARCH_CONTROL_URL",
+		"VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL",
 		"VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", "VANE_LLM_API_KEY",
 		"VANE_LLM_AGENT_API_KEY", "VANE_FETCH_EXA_API_KEY", "VANE_FETCH_TIKHUB_API_KEY",
 		"VANE_GATEWAY_DB_URL", "VANE_GATEWAY_LLM_API_KEY"} {
@@ -82,6 +83,16 @@ func TestLoadProcessConfigV1RejectsMainSecretsWithoutEchoingValue(t *testing.T) 
 	_, err := LoadProcessConfigV1()
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestLoadProcessConfigV1RejectsResearchControlURL(t *testing.T) {
+	setMinimalProcessConfigV1(t)
+	const secret = "postgres://vane_server_runtime:must-not-appear@db/vane"
+	t.Setenv("VANE_DB_RESEARCH_CONTROL_URL", secret)
+	_, err := LoadProcessConfigV1()
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("research control credential accepted or leaked: %v", err)
 	}
 }
 
