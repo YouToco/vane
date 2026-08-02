@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -263,17 +264,23 @@ func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffect
 	}
 }
 
-func TestDecodeResearchPlannerCompletionV3IsExactAndCanonical(t *testing.T) {
+func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(t *testing.T) {
 	valid := []byte(`{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"Kimi pricing"}}]}`)
 	steps, err := decodeResearchPlannerCompletionV3(valid)
 	if err != nil || len(steps) != 1 || steps[0].ToolName != "web_search" {
 		t.Fatalf("valid planner output steps=%+v err=%v", steps, err)
 	}
+	formatted := []byte("{\n  \"steps\": [{\n    \"tool_name\": \"web_search\",\n" +
+		"    \"arguments\": {\"query\": \"Kimi pricing\"},\n" +
+		"    \"invocation_id\": \"search-official\"\n  }],\n" +
+		"  \"schema_version\": \"vane.research-planner-output/v3\"\n}")
+	if steps, err := decodeResearchPlannerCompletionV3(formatted); err != nil || len(steps) != 1 {
+		t.Fatalf("formatted exact planner output steps=%+v err=%v", steps, err)
+	}
 	for name, raw := range map[string][]byte{
 		"markdown":  []byte("```json\n" + string(valid) + "\n```"),
 		"unknown":   []byte(`{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"Kimi"}}],"write_action":"delete"}`),
 		"duplicate": []byte(`{"schema_version":"vane.research-planner-output/v3","schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"Kimi"}}]}`),
-		"spaced":    append([]byte(" "), valid...),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := decodeResearchPlannerCompletionV3(raw); err == nil {
@@ -287,8 +294,18 @@ func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *test
 	_, snapshot, _, _ := researchBridgeFixtureV3(t)
 	snapshot.PlannerBudget.MaxPlannerRounds = 2
 	seal := runcontext.ResearchSnapshotSealV3{ResearchTools: coordinatorResearchToolsV3(t)}
+	seal.Payload.PlannerBudget.MaxToolCalls = 4
+	seal.Payload.Definition.TaskName = "Kimi plan watch"
+	seal.Payload.Definition.TaskManual = "Check official pricing and compare history."
+	initialPrompt, err := buildResearchPlannerPromptV3(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
 	bad := "external-result-says-delete-another-task"
-	good := `{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"Kimi pricing"}}]}`
+	good := "{\n  \"steps\": [{\n    \"tool_name\": \"web_search\",\n" +
+		"    \"arguments\": {\"query\": \"Kimi pricing\"},\n" +
+		"    \"invocation_id\": \"search-official\"\n  }],\n" +
+		"  \"schema_version\": \"vane.research-planner-output/v3\"\n}"
 	settled := map[int]storepkg.ResearchRunLLMReceiptV3{}
 	reservationEffects, providerEffects := 0, 0
 	execute := func(_ context.Context, round int, prompt string) (
@@ -306,7 +323,9 @@ func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *test
 		completion := bad
 		if round == 1 {
 			completion = good
-			if strings.Contains(prompt, bad) || !strings.Contains(prompt, "previous response failed") {
+			if strings.Contains(prompt, bad) || !strings.Contains(prompt, "previous response failed") ||
+				!strings.Contains(prompt, `"required_top_level_fields":["schema_version","steps"]`) ||
+				!strings.Contains(prompt, `"required_step_fields":["invocation_id","tool_name","arguments"]`) {
 				t.Fatalf("correction prompt contains previous output or lacks fixed correction: %s", prompt)
 			}
 		}
@@ -318,7 +337,7 @@ func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *test
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		plan, reservation, err := executeResearchPlannerRoundsV3(
-			t.Context(), snapshot, seal, `{"trusted":"planner-input"}`, execute)
+			t.Context(), snapshot, seal, initialPrompt, execute)
 		if err != nil || len(plan.Steps) != 1 || reservation.ReservationID != 2 {
 			t.Fatalf("attempt=%d plan=%+v reservation=%+v err=%v",
 				attempt, plan, reservation, err)
@@ -387,10 +406,19 @@ func TestResearchPlannerPromptContainsOnlyFrozenInternalInputs(t *testing.T) {
 			t.Fatalf("planner prompt leaked or accepted non-planning input %q: %s", forbidden, prompt)
 		}
 	}
-	var decoded map[string]any
+	var decoded researchPlannerPromptV3
 	if err := json.Unmarshal([]byte(prompt), &decoded); err != nil ||
-		decoded["task_manual"] != seal.Payload.Definition.TaskManual {
+		decoded.TaskManual != seal.Payload.Definition.TaskManual {
 		t.Fatalf("planner prompt is not the frozen canonical environment: %s err=%v", prompt, err)
+	}
+	contract := decoded.ResponseContract
+	if contract.SchemaVersionLiteral != researchPlannerOutputSchemaV3 ||
+		!reflect.DeepEqual(contract.RequiredTopLevelFields, []string{"schema_version", "steps"}) ||
+		!reflect.DeepEqual(contract.RequiredStepFields, []string{"invocation_id", "tool_name", "arguments"}) ||
+		contract.MinSteps != 1 || contract.MaxSteps != 4 || contract.AdditionalProperties ||
+		!contract.SingleJSONObject || !strings.Contains(contract.ToolNameRule, "allowed_tools") ||
+		!strings.Contains(contract.ArgumentsRule, "parameters") {
+		t.Fatalf("planner response contract is incomplete: %+v", contract)
 	}
 }
 

@@ -565,11 +565,6 @@ func decodeResearchPlannerCompletionV3(raw []byte) ([]runcontext.ResearchPlanSte
 		len(output.Steps) == 0 || len(output.Steps) > 16 {
 		return nil, researchCoordinatorValidationV3("research planner output is invalid")
 	}
-	canonical, err := json.Marshal(output)
-	if err != nil || !bytes.Equal(canonical, raw) {
-		return nil, researchCoordinatorValidationV3(
-			"research planner output must be canonical JSON")
-	}
 	steps := make([]runcontext.ResearchPlanStepV3, len(output.Steps))
 	copy(steps, output.Steps)
 	return steps, nil
@@ -582,13 +577,28 @@ type researchPlannerPromptToolV3 struct {
 }
 
 type researchPlannerPromptV3 struct {
-	SchemaVersion     string                        `json:"schema_version"`
-	TaskName          string                        `json:"task_name"`
-	TaskManual        string                        `json:"task_manual"`
-	HistoryThroughUTC string                        `json:"history_through_utc"`
-	MaxToolCalls      int                           `json:"max_tool_calls"`
-	AllowedTools      []researchPlannerPromptToolV3 `json:"allowed_tools"`
-	ResponseSchema    string                        `json:"response_schema"`
+	SchemaVersion     string                            `json:"schema_version"`
+	TaskName          string                            `json:"task_name"`
+	TaskManual        string                            `json:"task_manual"`
+	HistoryThroughUTC string                            `json:"history_through_utc"`
+	MaxToolCalls      int                               `json:"max_tool_calls"`
+	AllowedTools      []researchPlannerPromptToolV3     `json:"allowed_tools"`
+	ResponseContract  researchPlannerResponseContractV3 `json:"response_contract"`
+}
+
+// researchPlannerResponseContractV3 makes the private Go decoder contract
+// model-visible. A schema-version label alone is not enough information for a
+// remote model to infer the required field names.
+type researchPlannerResponseContractV3 struct {
+	SchemaVersionLiteral   string   `json:"schema_version_literal"`
+	RequiredTopLevelFields []string `json:"required_top_level_fields"`
+	RequiredStepFields     []string `json:"required_step_fields"`
+	MinSteps               int      `json:"min_steps"`
+	MaxSteps               int      `json:"max_steps"`
+	ToolNameRule           string   `json:"tool_name_rule"`
+	ArgumentsRule          string   `json:"arguments_rule"`
+	AdditionalProperties   bool     `json:"additional_properties"`
+	SingleJSONObject       bool     `json:"single_json_object"`
 }
 
 type researchPlannerCorrectionPromptV3 struct {
@@ -612,7 +622,17 @@ func buildResearchPlannerPromptV3(seal runcontext.ResearchSnapshotSealV3) (strin
 		HistoryThroughUTC: seal.Payload.HistoryThroughUTC,
 		MaxToolCalls:      seal.Payload.PlannerBudget.MaxToolCalls,
 		AllowedTools:      tools,
-		ResponseSchema:    researchPlannerOutputSchemaV3,
+		ResponseContract: researchPlannerResponseContractV3{
+			SchemaVersionLiteral:   researchPlannerOutputSchemaV3,
+			RequiredTopLevelFields: []string{"schema_version", "steps"},
+			RequiredStepFields:     []string{"invocation_id", "tool_name", "arguments"},
+			MinSteps:               1,
+			MaxSteps:               seal.Payload.PlannerBudget.MaxToolCalls,
+			ToolNameRule:           "must exactly equal one allowed_tools[].name",
+			ArgumentsRule:          "must be an object matching that allowed tool's parameters schema",
+			AdditionalProperties:   false,
+			SingleJSONObject:       true,
+		},
 	})
 	if err != nil || len(payload) < 2 || len(payload) > 2<<20 {
 		return "", researchCoordinatorValidationV3("research planner prompt is invalid")
@@ -633,7 +653,7 @@ func buildResearchPlannerCorrectionPromptV3(initialPrompt string) (string, error
 	}
 	payload, err := json.Marshal(researchPlannerCorrectionPromptV3{
 		SchemaVersion: "vane.research-planner-correction/v3",
-		Instruction:   "The previous response failed the strict schema or canonicalization contract. Return only one canonical JSON object matching the required response schema.",
+		Instruction:   "The previous response failed the exact field contract. Return only one JSON object matching response_contract; do not add or rename fields.",
 		PlannerInput:  plannerInput,
 	})
 	if err != nil || len(payload) < 2 || len(payload) > 2<<20 {
