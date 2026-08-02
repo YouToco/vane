@@ -358,16 +358,24 @@ if grep -Eq '^POSTGRES_PASSWORD=|^VANE_DB_URL=postgres://vane:' \
 fi
 systemctl enable --now vane-research-gateway.socket
 systemctl restart vane-research-gateway.service
-if ! systemctl is-active --quiet vane-research-gateway.service; then
-  echo "research gateway preflight did not become active" >&2
-  systemctl status vane-research-gateway.service --no-pager --full >&2 || true
-  journalctl -u vane-research-gateway.service --no-pager -o cat -n 100 >&2 || true
-  exit 1
-fi
-gateway_exe=$(readlink /proc/"$(systemctl show vane-research-gateway.service \
-  --property=MainPID --value)"/exe 2>/dev/null || true)
+gateway_exe=
+for attempt in {1..12}; do
+  gateway_exe=
+  gateway_pid=$(systemctl show vane-research-gateway.service \
+    --property=MainPID --value)
+  if [[ $gateway_pid =~ ^[1-9][0-9]*$ ]]; then
+    gateway_exe=$(readlink /proc/"$gateway_pid"/exe 2>/dev/null || true)
+  fi
+  if [[ $gateway_exe == /opt/vane/bin/vane-research-gateway ]] && \
+     systemctl is-active --quiet vane-research-gateway.service; then
+    break
+  fi
+  sleep 1
+done
 [[ $gateway_exe == /opt/vane/bin/vane-research-gateway ]] || {
   echo "research gateway preflight is not running the installed binary" >&2
+  systemctl status vane-research-gateway.service --no-pager --full >&2 || true
+  journalctl -u vane-research-gateway.service --no-pager -o cat -n 100 >&2 || true
   exit 1
 }
 [[ $(stat -c '%U:%G:%a' /run/vane-research-gateway/gateway.sock) == \

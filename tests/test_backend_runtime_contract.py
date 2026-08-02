@@ -75,6 +75,11 @@ class BackendRuntimeContractTest(unittest.TestCase):
             remote.index("systemctl stop vane"),
         )
         self.assertIn("gateway_exe=$(readlink", remote)
+        self.assertIn(
+            "for attempt in {1..12}; do\n  gateway_exe=\n"
+            "  gateway_pid=$(systemctl show",
+            remote,
+        )
         self.assertIn("gateway_http_code == 405", remote)
         self.assertIn("capability_source=legacy", remote)
         self.assertIn("capability_retired", remote)
