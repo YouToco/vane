@@ -275,7 +275,7 @@ jobs:
             "${{ needs.plan.outputs.backend_sha }}" \
             "$BUILD_ROOT/source/vane-release"
 
-      - name: Build four backend release binaries
+      - name: Build complete backend release runtime
         if: needs.plan.outputs.backend_changed == 'true'
         env:
           CGO_ENABLED: "0"
@@ -288,7 +288,12 @@ jobs:
           go build -buildvcs=true -o bin/useradmin ./cmd/useradmin
           go build -buildvcs=true -o bin/gate ./cmd/gate
           go build -buildvcs=true -o bin/runtimeadmin ./cmd/runtimeadmin
-          for binary in vane useradmin gate runtimeadmin; do
+          go build -buildvcs=true -o bin/vane-migrate ./cmd/migrate
+          go build -buildvcs=true -o bin/vane-research-gateway ./cmd/researchgateway
+          go build -buildvcs=true -o bin/researchshadow ./cmd/researchshadow
+          go build -buildvcs=true -o bin/researchcutover ./cmd/researchcutover
+          for binary in vane useradmin gate runtimeadmin vane-migrate \
+            vane-research-gateway researchshadow researchcutover; do
             go version -m "bin/$binary" |
               grep -Fx $'\tbuild\tvcs.revision=${{ needs.plan.outputs.backend_sha }}'
             go version -m "bin/$binary" |

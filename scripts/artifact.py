@@ -21,9 +21,16 @@ BACKEND_FILES = {
     "bin/useradmin": 0o755,
     "bin/gate": 0o755,
     "bin/runtimeadmin": 0o755,
+    "bin/vane-migrate": 0o755,
+    "bin/vane-research-gateway": 0o755,
+    "bin/researchshadow": 0o755,
+    "bin/researchcutover": 0o755,
     "deploy/Caddyfile": 0o644,
     "deploy/docker-compose.yml": 0o644,
     "deploy/vane.service": 0o644,
+    "deploy/vane-migrate.service": 0o644,
+    "deploy/vane-research-gateway.service": 0o644,
+    "deploy/vane-research-gateway.socket": 0o644,
     "deploy/dynamicconfig/development-sql.yaml": 0o644,
 }
 
@@ -313,7 +320,10 @@ def validate(
                 raise ValueError("tar is missing allowlisted files")
 
         if component == "backend":
-            for binary in ("vane", "useradmin", "gate", "runtimeadmin"):
+            for binary in (
+                "vane", "useradmin", "gate", "runtimeadmin", "vane-migrate",
+                "vane-research-gateway", "researchshadow", "researchcutover",
+            ):
                 data = (output_dir / "bin" / binary).read_bytes()
                 if f"vcs.revision={source_sha}".encode() not in data:
                     raise ValueError(f"{binary} lacks exact vcs.revision build info")

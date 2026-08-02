@@ -141,7 +141,8 @@ deploy_backend() {
   }
 
   local binary infra
-  for binary in vane useradmin gate runtimeadmin; do
+  for binary in vane useradmin gate runtimeadmin vane-migrate \
+    vane-research-gateway researchshadow researchcutover; do
     [[ -x $payload/bin/$binary ]] || {
       echo "missing verified backend binary: $binary" >&2
       exit 1
@@ -155,6 +156,9 @@ deploy_backend() {
     Caddyfile \
     docker-compose.yml \
     vane.service \
+    vane-migrate.service \
+    vane-research-gateway.service \
+    vane-research-gateway.socket \
     dynamicconfig/development-sql.yaml; do
     [[ -f $payload/deploy/$infra && ! -L $payload/deploy/$infra ]] || {
       echo "missing verified backend infra file: $infra" >&2
@@ -218,11 +222,18 @@ deploy_backend() {
     "$payload/bin/useradmin" \
     "$payload/bin/gate" \
     "$payload/bin/runtimeadmin" \
+    "$payload/bin/vane-migrate" \
+    "$payload/bin/vane-research-gateway" \
+    "$payload/bin/researchshadow" \
+    "$payload/bin/researchcutover" \
     "$backend_ssh_target:$backend_remote_stage/bin/"
   scp "${scp_opts[@]}" \
     "$payload/deploy/Caddyfile" \
     "$payload/deploy/docker-compose.yml" \
     "$payload/deploy/vane.service" \
+    "$payload/deploy/vane-migrate.service" \
+    "$payload/deploy/vane-research-gateway.service" \
+    "$payload/deploy/vane-research-gateway.socket" \
     "$backend_ssh_target:$backend_remote_stage/"
   scp "${scp_opts[@]}" \
     "$payload/deploy/dynamicconfig/development-sql.yaml" \
