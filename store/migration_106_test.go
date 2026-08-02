@@ -216,6 +216,221 @@ func TestResearchShadowSnapshotSerializesRevocationWithoutDeadlockPostgres(t *te
 	}
 }
 
+func TestMigration106RawRestrictedSnapshotInsertUsesTriggerFencePostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
+	prepare := researchV3PreparePolicyForTest()
+	prepare.TenantID, prepare.UserID, prepare.TaskID, prepare.IdempotencyKey =
+		tenantID, userID, taskID, "raw-trigger-fence"
+	if _, err := st.PrepareResearchV3Definition(t.Context(), prepare); err != nil {
+		t.Fatal(err)
+	}
+	policy := testCompiledRunPolicyV1(t)
+	tools := testResearchToolPolicyStoreV3(t)
+	model := testResearchModelPolicyStoreV3(t)
+	templateIdentity := types.RunIdentity{
+		TemporalWorkflowID: "research-v3-shadow-" + strings.Repeat("a", 64),
+		TemporalRunID:      "raw-template-" + uuid.NewString(),
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           tenantID, UserID: userID, TaskID: taskID,
+	}
+	template, err := st.CreateOrGetResearchRunSnapshotV3(
+		t.Context(), templateIdentity, policy, tools, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const gateKey = "test/migration106/raw-shadow-snapshot-gate"
+	if _, err := st.pool.Exec(t.Context(), `
+		CREATE FUNCTION test_pause_raw_shadow_snapshot_106() RETURNS trigger
+		LANGUAGE plpgsql SET search_path=pg_catalog,public,pg_temp AS $$
+		BEGIN
+		    PERFORM pg_advisory_xact_lock(hashtextextended(
+		        'test/migration106/raw-shadow-snapshot-gate',0));
+		    RETURN NEW;
+		END $$;
+		CREATE TRIGGER zz_test_pause_raw_shadow_snapshot_106
+		BEFORE INSERT ON task_run_snapshots
+		FOR EACH ROW WHEN (NEW.reference_schema_version=
+		    'vane.research-run-snapshot-ref/v3')
+		EXECUTE FUNCTION test_pause_raw_shadow_snapshot_106()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		if _, err := st.pool.Exec(ctx, `
+			DROP TRIGGER IF EXISTS zz_test_pause_raw_shadow_snapshot_106
+			    ON task_run_snapshots;
+			DROP FUNCTION IF EXISTS test_pause_raw_shadow_snapshot_106()`); err != nil {
+			t.Errorf("drop raw snapshot gate: %v", err)
+		}
+	})
+
+	ctx := t.Context()
+	gate, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Rollback(ctx)
+	if _, err := gate.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, gateKey); err != nil {
+		t.Fatal(err)
+	}
+	var gatePID int
+	if err := gate.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&gatePID); err != nil {
+		t.Fatal(err)
+	}
+
+	revoke, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revoke.Rollback(ctx)
+	var revokePID int
+	if err := revoke.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&revokePID); err != nil {
+		t.Fatal(err)
+	}
+	var one int
+	if err := revoke.QueryRow(ctx, `SELECT 1 FROM memberships
+		WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE`, tenantID, userID).Scan(&one); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Rollback(ctx)
+	if _, err := raw.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true),
+		set_config('app.user_id',$2,true)`, strconv.FormatInt(tenantID, 10),
+		strconv.FormatInt(userID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	var rawPID int
+	if err := raw.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&rawPID); err != nil {
+		t.Fatal(err)
+	}
+	rawWorkflow := "research-v3-shadow-" + strings.Repeat("b", 64)
+	rawRun := "raw-trigger-" + uuid.NewString()
+	rawInserted := make(chan error, 1)
+	go func() {
+		_, insertErr := raw.Exec(ctx, `INSERT INTO task_run_snapshots (
+			tenant_id,user_id,task_id,temporal_workflow_id,temporal_run_id,
+			run_kind,execution_mode,adaptive_version,capability_catalog_digest,
+			tool_policy_digest,prompt_policy_digest,model_policy_digest,
+			quota_policy_digest,definition_digest,plan_digest,payload_digest,
+			reference_digest,reference_schema_version,payload,budget,v2_cutover_event_id
+		) SELECT tenant_id,user_id,task_id,$1,$2,run_kind,execution_mode,
+			adaptive_version,capability_catalog_digest,tool_policy_digest,
+			prompt_policy_digest,model_policy_digest,quota_policy_digest,
+			definition_digest,plan_digest,payload_digest,reference_digest,
+			reference_schema_version,payload,budget,v2_cutover_event_id
+		FROM task_run_snapshots WHERE id=$3`, rawWorkflow, rawRun, template.SnapshotID)
+		rawInserted <- insertErr
+	}()
+	waitForBackendBlockedByPIDV3(t, st, rawPID, gatePID,
+		"restricted raw snapshot trigger gate")
+
+	revoked := make(chan error, 1)
+	go func() {
+		_, revokeErr := revoke.Exec(ctx, `UPDATE memberships SET role='member'
+			WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID)
+		revoked <- revokeErr
+	}()
+	waitForBackendAdvisoryLockV3(t, st, revokePID,
+		"restricted raw snapshot revocation")
+	if err := gate.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-rawInserted:
+		if err != nil {
+			t.Fatalf("restricted raw snapshot insert: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restricted raw snapshot insert did not leave its gate")
+	}
+	if err := raw.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-revoked:
+		if err != nil {
+			t.Fatalf("restricted raw snapshot revocation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restricted raw snapshot revocation did not serialize")
+	}
+	if err := revoke.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var count int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM task_run_snapshots
+		WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND temporal_run_id=$4`,
+		tenantID, userID, taskID, rawRun).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("restricted raw snapshot count=%d err=%v", count, err)
+	}
+	denied, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer denied.Rollback(ctx)
+	if _, err := denied.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true),
+		set_config('app.user_id',$2,true)`, strconv.FormatInt(tenantID, 10),
+		strconv.FormatInt(userID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := denied.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := denied.Exec(ctx, `INSERT INTO task_run_snapshots (
+		tenant_id,user_id,task_id,temporal_workflow_id,temporal_run_id,
+		run_kind,execution_mode,adaptive_version,capability_catalog_digest,
+		tool_policy_digest,prompt_policy_digest,model_policy_digest,
+		quota_policy_digest,definition_digest,plan_digest,payload_digest,
+		reference_digest,reference_schema_version,payload,budget,v2_cutover_event_id
+	) SELECT tenant_id,user_id,task_id,$1,$2,run_kind,execution_mode,
+		adaptive_version,capability_catalog_digest,tool_policy_digest,
+		prompt_policy_digest,model_policy_digest,quota_policy_digest,
+		definition_digest,plan_digest,payload_digest,reference_digest,
+		reference_schema_version,payload,budget,v2_cutover_event_id
+	FROM task_run_snapshots WHERE id=$3`,
+		"research-v3-shadow-"+strings.Repeat("c", 64),
+		"raw-denied-"+uuid.NewString(), template.SnapshotID); err == nil {
+		t.Fatal("restricted raw snapshot escaped committed owner revocation")
+	}
+}
+
+func waitForBackendBlockedByPIDV3(
+	t *testing.T, st *Store, pid, blockerPID int, label string,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := st.pool.QueryRow(t.Context(), `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			 WHERE datname=current_database() AND pid=$1
+			   AND wait_event_type='Lock' AND wait_event='advisory'
+			   AND $2=ANY(pg_blocking_pids(pid))
+		)`, pid, blockerPID).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s did not reach its advisory gate", label)
+}
+
 func waitForResearchSnapshotRunLockV3(
 	t *testing.T, st *Store, blockerPID int, temporalRunID string,
 ) {
