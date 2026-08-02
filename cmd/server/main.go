@@ -1125,7 +1125,13 @@ func run() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /readyz", handleReadyz(st))
+	readinessStores := []readyzStore{st}
+	if researchControlStore != nil {
+		// The control Store Ping covers both its vane_server_runtime control pool
+		// and the independently authenticated research executor pool.
+		readinessStores = append(readinessStores, researchControlStore)
+	}
+	mux.HandleFunc("GET /readyz", handleReadyz(readinessStores...))
 	// principal 解析器：全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 过渡期实现是「全局 owner 回退 + 租户恒为 1」，行为与收敛前逐字一致；
 	// 真实认证落地后只换这一处构造，api/a2a/gate 三处调用点零改动。
@@ -1414,12 +1420,29 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, `{"status":"ok"}`)
 }
 
-// handleReadyz 是就绪探针：DB Ping 通过返回 200，否则 503。
-func handleReadyz(st *store.Store) http.HandlerFunc {
+type readyzStore interface {
+	Ping(context.Context) error
+}
+
+// handleReadyz 是就绪探针：所有已启用 Store 的连接池 Ping 通过返回 200，否则 503。
+func handleReadyz(stores ...readyzStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
-		if err := st.Ping(ctx); err != nil {
+		results := make(chan error, len(stores))
+		for _, st := range stores {
+			go func() { results <- st.Ping(ctx) }()
+		}
+		var pingErrs []error
+		if len(stores) == 0 {
+			pingErrs = append(pingErrs, errors.New("readyz Store 未配置"))
+		}
+		for range stores {
+			if err := <-results; err != nil {
+				pingErrs = append(pingErrs, err)
+			}
+		}
+		if err := errors.Join(pingErrs...); err != nil {
 			slog.Warn("readyz 数据库探活失败", "err", err)
 			writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable"}`)
 			return

@@ -38,6 +38,8 @@ func TestResearchV3UsesIndependentRestrictedControlStore(t *testing.T) {
 		"researchControlStore, push,",
 		"newResearchV3DeliveryTargetResolver(researchControlStore, manager)",
 		"closeStores := func() { closeServerStores(st, researchControlStore) }",
+		"readinessStores = append(readinessStores, researchControlStore)",
+		"handleReadyz(readinessStores...)",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("research control Store wiring is missing %q", required)
