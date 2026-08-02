@@ -42,12 +42,7 @@ func ResearchShadowWorkflowV3(ctx workflow.Context, in ResearchShadowInputV3) er
 		return err
 	}
 	var activities *Activities
-	return runResearchPipelineV3(ctx, PushParams{
-		TenantID:       in.TenantID,
-		UserID:         in.UserID,
-		RunKind:        PushRunKindScheduled,
-		ExecutionMode:  types.ExecutionModeDiscoverAtRun,
-		RuntimeVersion: ResearchRuntimeV3,
-		ScheduleID:     in.TaskID,
+	return runResearchPipelineV3(ctx, ResearchScheduledInputV3{
+		TenantID: in.TenantID, UserID: in.UserID, TaskID: in.TaskID,
 	}, traceID, activities, false)
 }

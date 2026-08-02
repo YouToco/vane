@@ -81,6 +81,10 @@ var purgeOrder = []purgeStep{
 	// tombstones survive normal task deletion. Tenant hard-delete explicitly
 	// removes it before the tenant/user parents.
 	{"schedule_commands", "tenant_id = $1"},
+	// Cutover journal is the authority child; both retain rollback evidence
+	// during ordinary task life and are removed only by explicit tenant purge.
+	{"research_v3_cutover_operations", "tenant_id = $1"},
+	{"research_v3_delivery_authorities", "tenant_id = $1"},
 	// 无 tenant_id、经 schedules 反查的两张（正因为没有 tenant_id，
 	// 「按 tenant_id 列对账」的守卫看不见它们，必须靠外键可达性那条守卫兜住）。
 	{"schedule_playbooks", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
@@ -110,6 +114,9 @@ var purgeOrder = []purgeStep{
 	// by writers, but purge already pre-locks session roots before child deletes.
 	{"agent_session_projection_authority_events", "tenant_id = $1"},
 	{"agent_events", "tenant_id = $1"},
+	// V3 delivery anchors reference the effect and projections, so they are the
+	// first child in the durable delivery chain.
+	{"research_brief_deliveries", "tenant_id = $1"},
 	// External effect checkpoints bind exact delivery, batch, and immutable run
 	// identities, so they must be removed before all three parent aggregates.
 	{"push_effects", "tenant_id = $1"},
@@ -298,6 +305,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		researchSpendSettlementsAvailable  bool
 		researchSpendReservationsAvailable bool
 		researchRunCapabilitiesAvailable   bool
+		researchBriefDeliveriesAvailable   bool
+		researchV3AuthoritiesAvailable     bool
+		researchV3CutoversAvailable        bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -320,7 +330,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.research_run_llm_spend_reservations') IS NOT NULL,
 		        to_regclass('public.research_run_step_spend_settlements') IS NOT NULL,
 		        to_regclass('public.research_run_step_spend_reservations') IS NOT NULL,
-		        to_regclass('public.research_run_capabilities') IS NOT NULL`,
+		        to_regclass('public.research_run_capabilities') IS NOT NULL,
+		        to_regclass('public.research_brief_deliveries') IS NOT NULL,
+		        to_regclass('public.research_v3_delivery_authorities') IS NOT NULL,
+		        to_regclass('public.research_v3_cutover_operations') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -343,6 +356,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&researchSpendSettlementsAvailable,
 		&researchSpendReservationsAvailable,
 		&researchRunCapabilitiesAvailable,
+		&researchBriefDeliveriesAvailable,
+		&researchV3AuthoritiesAvailable,
+		&researchV3CutoversAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -369,6 +385,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"research_run_step_spend_settlements":  researchSpendSettlementsAvailable,
 		"research_run_step_spend_reservations": researchSpendReservationsAvailable,
 		"research_run_capabilities":            researchRunCapabilitiesAvailable,
+		"research_brief_deliveries":            researchBriefDeliveriesAvailable,
+		"research_v3_delivery_authorities":     researchV3AuthoritiesAvailable,
+		"research_v3_cutover_operations":       researchV3CutoversAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
@@ -413,9 +432,34 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	// child-first DELETE sequence, whose statement order need not equal lock
 	// order once every conflicting row is already fenced.
 	purgeLocks := []struct {
-		name  string
-		query string
+		name     string
+		query    string
+		optional bool
 	}{
+		{
+			name: "research_v3_cutover_operations",
+			query: `SELECT id FROM research_v3_cutover_operations
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge V3 cutover journal lock order */`,
+			optional: true,
+		},
+		{
+			name: "research_v3_delivery_authorities",
+			query: `SELECT generation FROM research_v3_delivery_authorities
+			         WHERE tenant_id = $1
+			         ORDER BY user_id,task_id,generation
+			         FOR UPDATE /* tenant purge V3 authority lock order */`,
+			optional: true,
+		},
+		{
+			name: "research_brief_deliveries",
+			query: `SELECT id FROM research_brief_deliveries
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge research delivery lock order */`,
+			optional: true,
+		},
 		{
 			name: "push_batches",
 			query: `SELECT id FROM push_batches
@@ -508,8 +552,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		// tenant admission root has fenced new reservations. The conditional
 		// append keeps the current binary safe on either side of migration 090.
 		purgeLocks = append(purgeLocks, struct {
-			name  string
-			query string
+			name     string
+			query    string
+			optional bool
 		}{
 			name: "research_run_step_spend_reservations",
 			query: `SELECT id FROM research_run_step_spend_reservations
@@ -520,8 +565,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	}
 	if researchLLMReservationsAvailable {
 		purgeLocks = append(purgeLocks, struct {
-			name  string
-			query string
+			name     string
+			query    string
+			optional bool
 		}{
 			name: "research_run_llm_spend_reservations",
 			query: `SELECT id FROM research_run_llm_spend_reservations
@@ -531,6 +577,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		})
 	}
 	for _, lock := range purgeLocks {
+		if lock.optional && !optionalPurgeTables[lock.name] {
+			continue
+		}
 		rows, lockErr := tx.Query(ctx, lock.query, tenantID)
 		if lockErr != nil {
 			return nil, types.NewAppError(types.CodeDatabase,

@@ -39,6 +39,14 @@ func newResearchBriefFixtureWithResultV3(
 	t *testing.T, threshold taskstate.NotificationThresholdV3, completeEvidence bool,
 	evidenceResult []byte,
 ) researchBriefFixtureV3 {
+	return newResearchBriefFixtureWithAuthorityV3(
+		t, threshold, completeEvidence, evidenceResult, "")
+}
+
+func newResearchBriefFixtureWithAuthorityV3(
+	t *testing.T, threshold taskstate.NotificationThresholdV3, completeEvidence bool,
+	evidenceResult []byte, authorityToken string,
+) researchBriefFixtureV3 {
 	t.Helper()
 	st := tenantTestStore(t)
 	useOwnerResearchRuntimeForTest(st)
@@ -106,17 +114,38 @@ func newResearchBriefFixtureWithResultV3(
 		taskID, definitionDigest); err != nil {
 		t.Fatal(err)
 	}
+	if authorityToken != "" {
+		authoritySum := sha256.Sum256([]byte(authorityToken))
+		if _, err := st.pool.Exec(ctx, `
+			INSERT INTO research_v3_delivery_authorities (
+			 tenant_id,user_id,task_id,generation,definition_version,
+			 definition_digest,target_action_digest,action_authorization_digest,
+			 status,enabled_at
+			) VALUES ($1,$2,$3,1,1,$4,$5,$6,'enabled',clock_timestamp())`,
+			tenantID, userID, taskID, definitionDigest, strings.Repeat("a", 64),
+			hex.EncodeToString(authoritySum[:])); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	identity := types.RunIdentity{
 		TemporalWorkflowID: "workflow-" + taskID, TemporalRunID: "run-" + uuid.NewString(),
 		RunKind: types.RunSnapshotKindScheduled, TenantID: tenantID, UserID: userID, TaskID: taskID,
 	}
 	researchTools := researchBriefToolPolicyV3(t)
-	snapshotRef, err := st.CreateOrGetResearchRunSnapshotV3(
+	snapshotRef, err := st.CreateOrGetResearchRunSnapshotWithAuthorityV3(
 		ctx, identity, testCompiledRunPolicyV1(t), researchTools,
-		testResearchModelPolicyStoreV3(t))
+		testResearchModelPolicyStoreV3(t), authorityToken)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if authorityToken != "" {
+		if _, err := st.pool.Exec(ctx, `
+			DELETE FROM research_v3_delivery_authorities
+			 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+			tenantID, userID, taskID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	arguments := json.RawMessage(`{"query":"Kimi membership pricing"}`)
 	plan, err := runcontext.BuildResearchExecutionPlanV3(

@@ -566,6 +566,10 @@ type Activities struct {
 	canonicalBriefRendererTaskID     string
 	canonicalBriefDashboardOrigin    string
 	researchRuntimeV3                ResearchRuntimeCoordinatorV3
+	researchDeliveryV3               interface {
+		Deliver(context.Context, types.RunIdentity, types.ResearchRunSnapshotRefV3,
+			types.ResearchRunPlanRefV3, ResearchBriefRefV3, string) (ResearchDeliveryReceiptV3, error)
+	}
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding

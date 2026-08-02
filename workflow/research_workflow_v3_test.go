@@ -26,7 +26,7 @@ type researchWorkflowV3Stubs struct {
 type researchV3FailingRuntime struct{ err error }
 
 func (r researchV3FailingRuntime) Prepare(
-	_ context.Context, identity types.RunIdentity,
+	_ context.Context, identity types.RunIdentity, _ string,
 ) (types.ResearchRunSnapshotRefV3, bool, bool, error) {
 	digest := strings.Repeat("a", 64)
 	ref, err := types.SealResearchRunSnapshotRefV3(types.ResearchRunSnapshotRefV3{
@@ -77,7 +77,7 @@ func (s *researchWorkflowV3Stubs) record(call string) {
 }
 
 func (s *researchWorkflowV3Stubs) snapshot(
-	ctx context.Context, p PushParams,
+	ctx context.Context, p ResearchScheduledInputV3,
 ) types.ResearchRunSnapshotRefV3 {
 	info := activity.GetInfo(ctx)
 	digest := strings.Repeat("a", 64)
@@ -85,7 +85,7 @@ func (s *researchWorkflowV3Stubs) snapshot(
 		SnapshotID: 11, TemporalWorkflowID: info.WorkflowExecution.ID,
 		TemporalRunID: info.WorkflowExecution.RunID,
 		RunKind:       types.RunSnapshotKindScheduled, TenantID: p.TenantID,
-		UserID: p.UserID, TaskID: p.ScheduleID, DefinitionVersion: 1,
+		UserID: p.UserID, TaskID: p.TaskID, DefinitionVersion: 1,
 		DefinitionDigest: digest, CapabilityCatalogDigest: digest,
 		ToolPolicyDigest: digest, PromptPolicyDigest: digest,
 		ModelPolicyDigest: digest, QuotaPolicyDigest: digest,
@@ -103,7 +103,7 @@ func (s *researchWorkflowV3Stubs) register(env *testsuite.TestWorkflowEnvironmen
 	reg := func(name string, fn any) {
 		env.RegisterActivityWithOptions(fn, activity.RegisterOptions{Name: name})
 	}
-	reg("PrepareResearchRunV3", func(ctx context.Context, p PushParams) (PrepareResearchRunV3Result, error) {
+	reg("PrepareResearchRunV3", func(ctx context.Context, p ResearchScheduledInputV3) (PrepareResearchRunV3Result, error) {
 		s.record("prepare")
 		return PrepareResearchRunV3Result{
 			Authorized: true, DeliveryAllowed: s.deliveryAllowed,
@@ -196,10 +196,9 @@ func TestResearchWorkflowV3UsesSealedDeliveryDecision(t *testing.T) {
 				deliveryAllowed: true,
 			}
 			stubs.register(env)
-			env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
-				TenantID: 7, UserID: 42, RunKind: PushRunKindScheduled,
-				ExecutionMode:  types.ExecutionModeDiscoverAtRun,
-				RuntimeVersion: ResearchRuntimeV3, ScheduleID: "task-v3",
+			env.ExecuteWorkflow(ResearchScheduledWorkflowV3, ResearchScheduledInputV3{
+				TenantID: 7, UserID: 42, TaskID: "task-v3",
+				ActionAuthorizationToken: strings.Repeat("a", 64),
 			})
 			if err := env.GetWorkflowError(); err != nil {
 				t.Fatal(err)
@@ -225,10 +224,9 @@ func TestResearchWorkflowV3HardNoDeliveryOverridesMajorBrief(t *testing.T) {
 		deliveryAllowed: false,
 	}
 	stubs.register(env)
-	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
-		TenantID: 7, UserID: 42, RunKind: PushRunKindScheduled,
-		ExecutionMode:  types.ExecutionModeDiscoverAtRun,
-		RuntimeVersion: ResearchRuntimeV3, ScheduleID: "task-v3",
+	env.ExecuteWorkflow(ResearchScheduledWorkflowV3, ResearchScheduledInputV3{
+		TenantID: 7, UserID: 42, TaskID: "task-v3",
+		ActionAuthorizationToken: strings.Repeat("b", 64),
 	})
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatal(err)
@@ -263,6 +261,30 @@ func TestResearchShadowWorkflowV3NeverDeliversEvenIfCoordinatorAllows(t *testing
 	want := []string{"prepare", "plan", "step:0", "step:1", "synthesize"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("shadow calls=%v want=%v", got, want)
+	}
+}
+
+func TestResearchScheduledWorkflowV3UsesIndependentAuthorizedWire(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "wf-research-v3-formal"})
+	stubs := &researchWorkflowV3Stubs{
+		significance: types.ResearchBriefSignificanceMajorV3, deliveryAllowed: true,
+	}
+	stubs.register(env)
+	env.ExecuteWorkflow(ResearchScheduledWorkflowV3, ResearchScheduledInputV3{
+		TenantID: 7, UserID: 42, TaskID: "task-v3",
+		ActionAuthorizationToken: strings.Repeat("a", 64),
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	stubs.mu.Lock()
+	got := append([]string(nil), stubs.calls...)
+	stubs.mu.Unlock()
+	want := []string{"prepare", "plan", "step:0", "step:1", "synthesize", "deliver"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("formal V3 calls=%v want=%v", got, want)
 	}
 }
 
@@ -306,10 +328,9 @@ func TestResearchWorkflowV3FailureHistorySanitizesCoordinatorError(t *testing.T)
 	env := suite.NewTestWorkflowEnvironment()
 	env.RegisterActivity(a.PrepareResearchRunV3)
 	env.RegisterActivity(a.PlanResearchRunV3)
-	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
-		TenantID: 7, UserID: 42, RunKind: PushRunKindScheduled,
-		ExecutionMode:  types.ExecutionModeDiscoverAtRun,
-		RuntimeVersion: ResearchRuntimeV3, ScheduleID: "task-v3",
+	env.ExecuteWorkflow(ResearchScheduledWorkflowV3, ResearchScheduledInputV3{
+		TenantID: 7, UserID: 42, TaskID: "task-v3",
+		ActionAuthorizationToken: strings.Repeat("c", 64),
 	})
 	err := env.GetWorkflowError()
 	if err == nil {
@@ -341,7 +362,11 @@ func TestResearchV3ReceiptBackedStagesHaveOneStoreOnlyRecoveryAttempt(t *testing
 			recovery.StartToCloseTimeout)
 	}
 	delivery := researchV3DeliveryOptions()
-	if delivery.RetryPolicy == nil || delivery.RetryPolicy.MaximumAttempts != 1 {
+	if delivery.RetryPolicy == nil || delivery.RetryPolicy.MaximumAttempts != 2 {
 		t.Fatalf("delivery retry policy=%+v", delivery.RetryPolicy)
+	}
+	if delivery.StartToCloseTimeout <= 10*time.Minute {
+		t.Fatalf("delivery timeout %v cannot reach receipt recovery fence",
+			delivery.StartToCloseTimeout)
 	}
 }

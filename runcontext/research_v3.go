@@ -42,33 +42,39 @@ type ResearchExecutionPlanV3 struct {
 }
 
 type ResearchSnapshotV3 struct {
-	Identity          types.RunIdentity
-	DefinitionVersion int64
-	HistoryThroughUTC string
-	Definition        taskstate.ApprovedDefinitionV3
-	Policy            runtimepolicy.BundleV1
-	ResearchTools     runtimepolicy.ResearchToolPolicyV3
-	ResearchModel     runtimepolicy.ResearchModelPolicyV3
+	Identity                  types.RunIdentity
+	DefinitionVersion         int64
+	HistoryThroughUTC         string
+	Definition                taskstate.ApprovedDefinitionV3
+	Policy                    runtimepolicy.BundleV1
+	ResearchTools             runtimepolicy.ResearchToolPolicyV3
+	ResearchModel             runtimepolicy.ResearchModelPolicyV3
+	AuthorityGeneration       int64
+	TargetActionDigest        string
+	ActionAuthorizationDigest string
 }
 
 type ResearchSnapshotPayloadV3 struct {
-	SchemaVersion          string                              `json:"schema_version"`
-	TenantID               int64                               `json:"tenant_id"`
-	UserID                 int64                               `json:"user_id"`
-	TaskID                 string                              `json:"task_id"`
-	TemporalWorkflowID     string                              `json:"temporal_workflow_id"`
-	TemporalRunID          string                              `json:"temporal_run_id"`
-	RunKind                types.RunSnapshotKind               `json:"run_kind"`
-	Mode                   types.ExecutionMode                 `json:"mode"`
-	DefinitionVersion      int64                               `json:"definition_version"`
-	DefinitionDigest       string                              `json:"definition_digest"`
-	HistoryThroughUTC      string                              `json:"history_through_utc"`
-	Policies               PolicyPayloadsV1                    `json:"policies"`
-	ResearchTools          runtimepolicy.ResearchToolPolicyV3  `json:"research_tools"`
-	ResearchModel          runtimepolicy.ResearchModelPolicyV3 `json:"research_model"`
-	PlannerBudget          types.PlannerBudget                 `json:"planner_budget"`
-	Definition             taskstate.ApprovedDefinitionV3      `json:"definition"`
-	ReferenceSchemaVersion string                              `json:"reference_schema_version"`
+	SchemaVersion             string                              `json:"schema_version"`
+	TenantID                  int64                               `json:"tenant_id"`
+	UserID                    int64                               `json:"user_id"`
+	TaskID                    string                              `json:"task_id"`
+	TemporalWorkflowID        string                              `json:"temporal_workflow_id"`
+	TemporalRunID             string                              `json:"temporal_run_id"`
+	RunKind                   types.RunSnapshotKind               `json:"run_kind"`
+	Mode                      types.ExecutionMode                 `json:"mode"`
+	DefinitionVersion         int64                               `json:"definition_version"`
+	DefinitionDigest          string                              `json:"definition_digest"`
+	AuthorityGeneration       int64                               `json:"authority_generation,omitempty"`
+	TargetActionDigest        string                              `json:"target_action_digest,omitempty"`
+	ActionAuthorizationDigest string                              `json:"action_authorization_digest,omitempty"`
+	HistoryThroughUTC         string                              `json:"history_through_utc"`
+	Policies                  PolicyPayloadsV1                    `json:"policies"`
+	ResearchTools             runtimepolicy.ResearchToolPolicyV3  `json:"research_tools"`
+	ResearchModel             runtimepolicy.ResearchModelPolicyV3 `json:"research_model"`
+	PlannerBudget             types.PlannerBudget                 `json:"planner_budget"`
+	Definition                taskstate.ApprovedDefinitionV3      `json:"definition"`
+	ReferenceSchemaVersion    string                              `json:"reference_schema_version"`
 }
 
 type ResearchSnapshotSealV3 struct {
@@ -93,7 +99,9 @@ func SealResearchSnapshotV3(snapshot ResearchSnapshotV3) (ResearchSnapshotSealV3
 		snapshot.Definition.ExecutionMode != types.ExecutionModeDiscoverAtRun ||
 		snapshot.Definition.TenantID != identity.TenantID ||
 		snapshot.Definition.UserID != identity.UserID ||
-		snapshot.Definition.TaskID != identity.TaskID {
+		snapshot.Definition.TaskID != identity.TaskID ||
+		!validResearchSnapshotAuthorityV3(snapshot.AuthorityGeneration,
+			snapshot.TargetActionDigest, snapshot.ActionAuthorizationDigest) {
 		return ResearchSnapshotSealV3{}, invalidResearchPlan("snapshot identity is invalid")
 	}
 	through, err := time.Parse(time.RFC3339Nano, snapshot.HistoryThroughUTC)
@@ -136,7 +144,10 @@ func SealResearchSnapshotV3(snapshot ResearchSnapshotV3) (ResearchSnapshotSealV3
 		Mode:              types.ExecutionModeDiscoverAtRun,
 		DefinitionVersion: snapshot.DefinitionVersion,
 		DefinitionDigest:  definitionDigest, HistoryThroughUTC: snapshot.HistoryThroughUTC,
-		Policies: policyPayloads, ResearchTools: normalizedResearchTools,
+		AuthorityGeneration:       snapshot.AuthorityGeneration,
+		TargetActionDigest:        snapshot.TargetActionDigest,
+		ActionAuthorizationDigest: snapshot.ActionAuthorizationDigest,
+		Policies:                  policyPayloads, ResearchTools: normalizedResearchTools,
 		ResearchModel:          normalizedResearchModel,
 		PlannerBudget:          snapshot.Definition.PlannerBudget,
 		Definition:             snapshot.Definition,
@@ -177,8 +188,11 @@ func DecodeResearchSnapshotPayloadV3(payload []byte) (ResearchSnapshotSealV3, er
 		DefinitionVersion: decoded.DefinitionVersion,
 		HistoryThroughUTC: decoded.HistoryThroughUTC,
 		Definition:        decoded.Definition, Policy: policy,
-		ResearchTools: decoded.ResearchTools,
-		ResearchModel: decoded.ResearchModel,
+		AuthorityGeneration:       decoded.AuthorityGeneration,
+		TargetActionDigest:        decoded.TargetActionDigest,
+		ActionAuthorizationDigest: decoded.ActionAuthorizationDigest,
+		ResearchTools:             decoded.ResearchTools,
+		ResearchModel:             decoded.ResearchModel,
 	})
 	if err != nil || decoded.SchemaVersion != ResearchSnapshotPayloadSchemaV3 ||
 		decoded.Mode != types.ExecutionModeDiscoverAtRun ||
@@ -191,6 +205,22 @@ func DecodeResearchSnapshotPayloadV3(payload []byte) (ResearchSnapshotSealV3, er
 		return ResearchSnapshotSealV3{}, invalidResearchPlan("snapshot payload integrity is invalid")
 	}
 	return sealed, nil
+}
+
+func validResearchSnapshotAuthorityV3(generation int64, targetDigest, authorizationDigest string) bool {
+	if generation == 0 && targetDigest == "" && authorizationDigest == "" {
+		return true
+	}
+	return generation > 0 && validResearchDigestV3(targetDigest) &&
+		validResearchDigestV3(authorizationDigest)
+}
+
+func validResearchDigestV3(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func researchPayloadDigestV3(payload []byte) string {

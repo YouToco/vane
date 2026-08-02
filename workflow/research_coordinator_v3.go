@@ -34,9 +34,9 @@ type ResearchRuntimePolicyBuilderV3 func(
 type ResearchRuntimeAuthorizerV3 func(types.RunIdentity) bool
 
 type researchRuntimeStoreV3 interface {
-	CreateOrGetResearchRunSnapshotV3(context.Context, types.RunIdentity,
+	CreateOrGetResearchRunSnapshotWithAuthorityV3(context.Context, types.RunIdentity,
 		runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
-		runtimepolicy.ResearchModelPolicyV3) (types.ResearchRunSnapshotRefV3, error)
+		runtimepolicy.ResearchModelPolicyV3, string) (types.ResearchRunSnapshotRefV3, error)
 	LoadResearchRunSnapshotV3(context.Context, types.RunIdentity,
 		types.ResearchRunSnapshotRefV3) (runcontext.ResearchSnapshotSealV3, error)
 	LoadResearchRunPlanRefV3(context.Context, types.RunIdentity,
@@ -119,7 +119,7 @@ func researchDependencyNilV3(value any) bool {
 }
 
 func (r *ProductionResearchRuntimeV3) Prepare(
-	ctx context.Context, identity types.RunIdentity,
+	ctx context.Context, identity types.RunIdentity, authorityToken string,
 ) (types.ResearchRunSnapshotRefV3, bool, bool, error) {
 	if r == nil || identity.Validate() != nil ||
 		identity.RunKind != types.RunSnapshotKindScheduled {
@@ -137,8 +137,8 @@ func (r *ProductionResearchRuntimeV3) Prepare(
 		return types.ResearchRunSnapshotRefV3{}, false, false,
 			researchCoordinatorValidationV3("research V3 runtime policy is invalid")
 	}
-	snapshot, err := r.store.CreateOrGetResearchRunSnapshotV3(
-		ctx, identity, policy, tools, model)
+	snapshot, err := r.store.CreateOrGetResearchRunSnapshotWithAuthorityV3(
+		ctx, identity, policy, tools, model, authorityToken)
 	if err != nil {
 		return types.ResearchRunSnapshotRefV3{}, false, false, err
 	}
@@ -147,7 +147,7 @@ func (r *ProductionResearchRuntimeV3) Prepare(
 			researchCoordinatorValidationV3("research V3 snapshot is invalid")
 	}
 	// Hard-dark invariant: artifact authority never implies delivery authority.
-	return snapshot, true, false, nil
+	return snapshot, true, snapshot.AuthorityGeneration > 0, nil
 }
 
 func (r *ProductionResearchRuntimeV3) Plan(

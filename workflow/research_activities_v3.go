@@ -16,7 +16,7 @@ import (
 // Every method must finish its immutable Store commit before returning; the
 // Activity result contains only safe references and digests.
 type ResearchRuntimeCoordinatorV3 interface {
-	Prepare(context.Context, types.RunIdentity) (
+	Prepare(context.Context, types.RunIdentity, string) (
 		snapshot types.ResearchRunSnapshotRefV3,
 		authorized, deliveryAllowed bool,
 		err error,
@@ -120,15 +120,26 @@ func WithResearchRuntimeV3(runtime ResearchRuntimeCoordinatorV3) ActivitiesOptio
 	return func(a *Activities) { a.researchRuntimeV3 = runtime }
 }
 
+// WithResearchDeliveryV3 installs the independently reviewed receipt-backed
+// provider boundary. Omitting it keeps production delivery hard-dark even when
+// the artifact runtime is present.
+func WithResearchDeliveryV3(delivery interface {
+	Deliver(context.Context, types.RunIdentity, types.ResearchRunSnapshotRefV3,
+		types.ResearchRunPlanRefV3, ResearchBriefRefV3, string) (ResearchDeliveryReceiptV3, error)
+}) ActivitiesOption {
+	return func(a *Activities) { a.researchDeliveryV3 = delivery }
+}
+
 func (a *Activities) PrepareResearchRunV3(
-	ctx context.Context, p PushParams,
+	ctx context.Context, p ResearchScheduledInputV3,
 ) (PrepareResearchRunV3Result, error) {
-	identity, err := researchActivityIdentityV3(ctx, p.TenantID, p.UserID, p.ScheduleID)
-	if err != nil || a.researchRuntimeV3 == nil || !validResearchV3PushParams(p) {
+	identity, err := researchActivityIdentityV3(ctx, p.TenantID, p.UserID, p.TaskID)
+	if err != nil || a.researchRuntimeV3 == nil {
 		return PrepareResearchRunV3Result{}, researchV3ActivityError(ctx, "prepare", types.NewAppError(
 			types.CodeValidation, "research V3 preparation is unavailable", err))
 	}
-	ref, authorized, deliveryAllowed, err := a.researchRuntimeV3.Prepare(ctx, identity)
+	ref, authorized, deliveryAllowed, err := a.researchRuntimeV3.Prepare(
+		ctx, identity, p.ActionAuthorizationToken)
 	if err != nil {
 		return PrepareResearchRunV3Result{}, researchV3ActivityError(ctx, "prepare", err)
 	}
@@ -207,14 +218,15 @@ func (a *Activities) DeliverResearchBriefV3(
 	ctx context.Context, in DeliverResearchBriefV3Input,
 ) (ResearchDeliveryReceiptV3, error) {
 	identity, err := validateResearchRunV3Input(ctx, in.ResearchRunV3Input)
-	if err != nil || a.researchRuntimeV3 == nil || !in.Brief.DeliveryRequired ||
+	if err != nil || a.researchRuntimeV3 == nil || a.researchDeliveryV3 == nil ||
+		!in.Brief.DeliveryRequired ||
 		in.Plan.ValidateFor(identity, in.Snapshot.SnapshotID) != nil ||
 		in.Brief.ValidateFor(identity, in.Snapshot.SnapshotID, in.Plan.PlanID) != nil {
 		return ResearchDeliveryReceiptV3{}, researchV3ActivityError(ctx, "deliver", types.NewAppError(
 			types.CodeValidation, "research V3 delivery is unavailable", err))
 	}
-	receipt, err := a.researchRuntimeV3.Deliver(
-		ctx, identity, in.Snapshot, in.Plan, in.Brief, in.TraceID)
+	receipt, err := a.researchDeliveryV3.Deliver(ctx, identity, in.Snapshot, in.Plan,
+		in.Brief, in.TraceID)
 	if err != nil {
 		return ResearchDeliveryReceiptV3{}, researchV3ActivityError(ctx, "deliver", err)
 	}

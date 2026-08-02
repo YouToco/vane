@@ -3,7 +3,10 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -357,6 +360,11 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 		); err != nil {
 			return err
 		}
+		if err := settleResearchBriefDeliveryReceiptV3(
+			ctx, tx, prepared, receipt.ProviderMessageID,
+		); err != nil {
+			return err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return pushEffectDatabaseError(
 				"commit sent delivery receipt replay", err)
@@ -423,9 +431,105 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 	); err != nil {
 		return err
 	}
+	if err := settleResearchBriefDeliveryReceiptV3(
+		ctx, tx, prepared, receipt.ProviderMessageID,
+	); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return pushEffectDatabaseError(
 			"commit sent delivery receipt transaction", err)
+	}
+	return nil
+}
+
+// settleResearchBriefDeliveryReceiptV3 is an optional extension of the
+// existing effect settlement transaction. Legacy/compiled effects have no V3
+// anchor and are left byte-for-byte unchanged; a V3 effect seals its receipt
+// in the same commit as effect, delivery, and batch terminal state.
+func settleResearchBriefDeliveryReceiptV3(
+	ctx context.Context, tx pgx.Tx, prepared pusheffect.Prepared,
+	providerMessageID string,
+) error {
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.user_id',$1,true)`,
+		fmt.Sprint(prepared.UserID)); err != nil {
+		return pushEffectDatabaseError(
+			"set research delivery receipt user scope", err)
+	}
+	var anchorTableAvailable bool
+	if err := tx.QueryRow(ctx,
+		`SELECT to_regclass('public.research_brief_deliveries') IS NOT NULL`,
+	).Scan(&anchorTableAvailable); err != nil {
+		return pushEffectDatabaseError(
+			"check research delivery receipt schema", err)
+	}
+	if !anchorTableAvailable {
+		if prepared.StepID == "research-brief-delivery/v3" {
+			return pushEffectIntegrity()
+		}
+		return nil
+	}
+	var (
+		id, batchID, deliveryID        int64
+		status, effectID, cardDigest   string
+		storedMessageID, receiptDigest string
+		sentAt                         *time.Time
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT id,batch_id,delivery_id,status,effect_id,card_digest,
+		       provider_message_id,receipt_digest,sent_at
+		  FROM research_brief_deliveries
+		 WHERE tenant_id=$1 AND user_id=$2 AND effect_id=$3
+		 FOR UPDATE`, prepared.TenantID, prepared.UserID, prepared.ID).Scan(
+		&id, &batchID, &deliveryID, &status, &effectID, &cardDigest,
+		&storedMessageID, &receiptDigest, &sentAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if prepared.StepID == "research-brief-delivery/v3" {
+			return pushEffectIntegrity()
+		}
+		return nil
+	}
+	if err != nil {
+		return pushEffectDatabaseError("lock research delivery receipt", err)
+	}
+	cardSum := sha256.Sum256(prepared.Card)
+	expectedCardDigest := hex.EncodeToString(cardSum[:])
+	if id <= 0 || batchID != prepared.BatchID ||
+		len(prepared.DeliveryIDs) != 1 || deliveryID != prepared.DeliveryIDs[0] ||
+		effectID != prepared.ID || cardDigest != expectedCardDigest {
+		return pushEffectConflict("research delivery receipt aggregate differs")
+	}
+	if status == "sent" {
+		if storedMessageID != providerMessageID || sentAt == nil ||
+			!validResearchRunDigest(receiptDigest) {
+			return pushEffectConflict("research delivery sent receipt differs")
+		}
+		return nil
+	}
+	if status != "prepared" || storedMessageID != "" || receiptDigest != "" || sentAt != nil {
+		return pushEffectConflict("research delivery receipt state differs")
+	}
+	var sealedDigest string
+	err = tx.QueryRow(ctx, `
+		UPDATE research_brief_deliveries
+		   SET status='sent',provider_message_id=$4::text,
+		       receipt_digest=encode(sha256(convert_to(concat_ws(E'\n',
+		           'vane.research-brief-delivery-receipt/v3',id::text,
+		           brief_id::text,effect_id,brief_reference_digest,brief_digest,
+		           card_digest,$4::text,'sent'
+		       ),'UTF8')),'hex')
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND status='prepared'
+		 RETURNING receipt_digest`, id, prepared.TenantID, prepared.UserID,
+		providerMessageID).Scan(&sealedDigest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pushEffectConflict("research delivery receipt lost its fence")
+	}
+	if err != nil {
+		return pushEffectDatabaseError("seal research delivery receipt", err)
+	}
+	if !validResearchRunDigest(sealedDigest) {
+		return pushEffectIntegrity()
 	}
 	return nil
 }

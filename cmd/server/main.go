@@ -362,6 +362,7 @@ func run() error {
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, temporalWorkerOptions())
 	w.RegisterWorkflow(workflow.PushPipelineWorkflow)
 	w.RegisterWorkflow(workflow.ResearchShadowWorkflowV3)
+	w.RegisterWorkflow(workflow.ResearchScheduledWorkflowV3)
 	w.RegisterWorkflow(periodicbrief.WorkflowV1)
 	// 逐个注册（非整体 Register）：漏注册不会启动失败，而是每批推送在该活动上
 	// 重试到超时——EvolveProfile 的错误被 workflow 刻意吞掉，漏注册只会表现为

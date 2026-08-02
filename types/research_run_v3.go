@@ -19,46 +19,52 @@ const (
 // while keeping all bodies, prompts, model settings and Tool schemas out of
 // Temporal history.
 type ResearchRunSnapshotRefV3 struct {
-	SchemaVersion           string          `json:"schema_version"`
-	SnapshotID              int64           `json:"snapshot_id"`
-	TemporalWorkflowID      string          `json:"temporal_workflow_id"`
-	TemporalRunID           string          `json:"temporal_run_id"`
-	RunKind                 RunSnapshotKind `json:"run_kind"`
-	TenantID                int64           `json:"tenant_id"`
-	UserID                  int64           `json:"user_id"`
-	TaskID                  string          `json:"task_id"`
-	DefinitionVersion       int64           `json:"definition_version"`
-	DefinitionDigest        string          `json:"definition_digest"`
-	CapabilityCatalogDigest string          `json:"capability_catalog_digest"`
-	ToolPolicyDigest        string          `json:"tool_policy_digest"`
-	PromptPolicyDigest      string          `json:"prompt_policy_digest"`
-	ModelPolicyDigest       string          `json:"model_policy_digest"`
-	QuotaPolicyDigest       string          `json:"quota_policy_digest"`
-	PlannerBudget           PlannerBudget   `json:"planner_budget"`
-	HistoryThroughUTC       string          `json:"history_through_utc"`
-	PayloadDigest           string          `json:"payload_digest"`
-	ReferenceDigest         string          `json:"reference_digest"`
+	SchemaVersion             string          `json:"schema_version"`
+	SnapshotID                int64           `json:"snapshot_id"`
+	TemporalWorkflowID        string          `json:"temporal_workflow_id"`
+	TemporalRunID             string          `json:"temporal_run_id"`
+	RunKind                   RunSnapshotKind `json:"run_kind"`
+	TenantID                  int64           `json:"tenant_id"`
+	UserID                    int64           `json:"user_id"`
+	TaskID                    string          `json:"task_id"`
+	DefinitionVersion         int64           `json:"definition_version"`
+	DefinitionDigest          string          `json:"definition_digest"`
+	AuthorityGeneration       int64           `json:"authority_generation,omitempty"`
+	TargetActionDigest        string          `json:"target_action_digest,omitempty"`
+	ActionAuthorizationDigest string          `json:"action_authorization_digest,omitempty"`
+	CapabilityCatalogDigest   string          `json:"capability_catalog_digest"`
+	ToolPolicyDigest          string          `json:"tool_policy_digest"`
+	PromptPolicyDigest        string          `json:"prompt_policy_digest"`
+	ModelPolicyDigest         string          `json:"model_policy_digest"`
+	QuotaPolicyDigest         string          `json:"quota_policy_digest"`
+	PlannerBudget             PlannerBudget   `json:"planner_budget"`
+	HistoryThroughUTC         string          `json:"history_through_utc"`
+	PayloadDigest             string          `json:"payload_digest"`
+	ReferenceDigest           string          `json:"reference_digest"`
 }
 
 type researchRunSnapshotRefDigestV3 struct {
-	SchemaVersion           string          `json:"schema_version"`
-	SnapshotID              int64           `json:"snapshot_id"`
-	TemporalWorkflowID      string          `json:"temporal_workflow_id"`
-	TemporalRunID           string          `json:"temporal_run_id"`
-	RunKind                 RunSnapshotKind `json:"run_kind"`
-	TenantID                int64           `json:"tenant_id"`
-	UserID                  int64           `json:"user_id"`
-	TaskID                  string          `json:"task_id"`
-	DefinitionVersion       int64           `json:"definition_version"`
-	DefinitionDigest        string          `json:"definition_digest"`
-	CapabilityCatalogDigest string          `json:"capability_catalog_digest"`
-	ToolPolicyDigest        string          `json:"tool_policy_digest"`
-	PromptPolicyDigest      string          `json:"prompt_policy_digest"`
-	ModelPolicyDigest       string          `json:"model_policy_digest"`
-	QuotaPolicyDigest       string          `json:"quota_policy_digest"`
-	PlannerBudget           PlannerBudget   `json:"planner_budget"`
-	HistoryThroughUTC       string          `json:"history_through_utc"`
-	PayloadDigest           string          `json:"payload_digest"`
+	SchemaVersion             string          `json:"schema_version"`
+	SnapshotID                int64           `json:"snapshot_id"`
+	TemporalWorkflowID        string          `json:"temporal_workflow_id"`
+	TemporalRunID             string          `json:"temporal_run_id"`
+	RunKind                   RunSnapshotKind `json:"run_kind"`
+	TenantID                  int64           `json:"tenant_id"`
+	UserID                    int64           `json:"user_id"`
+	TaskID                    string          `json:"task_id"`
+	DefinitionVersion         int64           `json:"definition_version"`
+	DefinitionDigest          string          `json:"definition_digest"`
+	AuthorityGeneration       int64           `json:"authority_generation,omitempty"`
+	TargetActionDigest        string          `json:"target_action_digest,omitempty"`
+	ActionAuthorizationDigest string          `json:"action_authorization_digest,omitempty"`
+	CapabilityCatalogDigest   string          `json:"capability_catalog_digest"`
+	ToolPolicyDigest          string          `json:"tool_policy_digest"`
+	PromptPolicyDigest        string          `json:"prompt_policy_digest"`
+	ModelPolicyDigest         string          `json:"model_policy_digest"`
+	QuotaPolicyDigest         string          `json:"quota_policy_digest"`
+	PlannerBudget             PlannerBudget   `json:"planner_budget"`
+	HistoryThroughUTC         string          `json:"history_through_utc"`
+	PayloadDigest             string          `json:"payload_digest"`
 }
 
 func SealResearchRunSnapshotRefV3(
@@ -108,6 +114,8 @@ func validateResearchRunSnapshotRefFieldsV3(
 		!boundedResearchRefText(r.TemporalWorkflowID, 512) ||
 		!boundedResearchRefText(r.TemporalRunID, 512) ||
 		!researchSHA256(r.DefinitionDigest) ||
+		!validResearchV3SnapshotAuthority(r.AuthorityGeneration,
+			r.TargetActionDigest, r.ActionAuthorizationDigest) ||
 		!researchSHA256(r.CapabilityCatalogDigest) ||
 		!researchSHA256(r.ToolPolicyDigest) || !researchSHA256(r.PromptPolicyDigest) ||
 		!researchSHA256(r.ModelPolicyDigest) || !researchSHA256(r.QuotaPolicyDigest) ||
@@ -127,8 +135,11 @@ func researchRunSnapshotReferenceDigestV3(r ResearchRunSnapshotRefV3) (string, e
 		TemporalWorkflowID: r.TemporalWorkflowID, TemporalRunID: r.TemporalRunID,
 		RunKind: r.RunKind, TenantID: r.TenantID, UserID: r.UserID, TaskID: r.TaskID,
 		DefinitionVersion: r.DefinitionVersion, DefinitionDigest: r.DefinitionDigest,
-		CapabilityCatalogDigest: r.CapabilityCatalogDigest,
-		ToolPolicyDigest:        r.ToolPolicyDigest, PromptPolicyDigest: r.PromptPolicyDigest,
+		AuthorityGeneration:       r.AuthorityGeneration,
+		TargetActionDigest:        r.TargetActionDigest,
+		ActionAuthorizationDigest: r.ActionAuthorizationDigest,
+		CapabilityCatalogDigest:   r.CapabilityCatalogDigest,
+		ToolPolicyDigest:          r.ToolPolicyDigest, PromptPolicyDigest: r.PromptPolicyDigest,
 		ModelPolicyDigest: r.ModelPolicyDigest, QuotaPolicyDigest: r.QuotaPolicyDigest,
 		PlannerBudget: r.PlannerBudget, HistoryThroughUTC: r.HistoryThroughUTC,
 		PayloadDigest: r.PayloadDigest,
@@ -138,6 +149,13 @@ func researchRunSnapshotReferenceDigestV3(r ResearchRunSnapshotRefV3) (string, e
 	}
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func validResearchV3SnapshotAuthority(generation int64, targetDigest, authorizationDigest string) bool {
+	if generation == 0 && targetDigest == "" && authorizationDigest == "" {
+		return true
+	}
+	return generation > 0 && researchSHA256(targetDigest) && researchSHA256(authorizationDigest)
 }
 
 // ResearchRunPlanRefV3 is the only plan value allowed in Temporal history.

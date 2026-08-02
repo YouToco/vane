@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -41,6 +42,21 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 	researchTools runtimepolicy.ResearchToolPolicyV3,
 	researchModel runtimepolicy.ResearchModelPolicyV3,
 ) (types.ResearchRunSnapshotRefV3, error) {
+	return s.CreateOrGetResearchRunSnapshotWithAuthorityV3(
+		ctx, identity, policy, researchTools, researchModel, "")
+}
+
+// CreateOrGetResearchRunSnapshotWithAuthorityV3 binds an optional exact
+// Schedule Action capability into the immutable snapshot. Empty is the shadow
+// path and can never later acquire delivery authority.
+func (s *Store) CreateOrGetResearchRunSnapshotWithAuthorityV3(
+	ctx context.Context,
+	identity types.RunIdentity,
+	policy runtimepolicy.BundleV1,
+	researchTools runtimepolicy.ResearchToolPolicyV3,
+	researchModel runtimepolicy.ResearchModelPolicyV3,
+	authorityToken string,
+) (types.ResearchRunSnapshotRefV3, error) {
 	if identity.RunKind != types.RunSnapshotKindScheduled || identity.TenantID <= 0 ||
 		identity.UserID <= 0 || identity.TaskID == "" ||
 		identity.TemporalWorkflowID == "" || identity.TemporalRunID == "" {
@@ -70,6 +86,9 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		if err != nil {
 			return types.ResearchRunSnapshotRefV3{}, err
 		}
+		if err := validateResearchSnapshotAuthorityTokenV3(ref, authorityToken); err != nil {
+			return types.ResearchRunSnapshotRefV3{}, err
+		}
 		if err := s.registerResearchRunCapabilityInControlTxV1(ctx, tx, ref); err != nil {
 			return types.ResearchRunSnapshotRefV3{}, err
 		}
@@ -89,6 +108,11 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 	if err != nil {
 		return types.ResearchRunSnapshotRefV3{}, err
 	}
+	authority, err := loadResearchSnapshotAuthorityV3(
+		ctx, tx, identity, definitionVersion, definitionDigest, authorityToken)
+	if err != nil {
+		return types.ResearchRunSnapshotRefV3{}, err
+	}
 	var cutoff time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&cutoff); err != nil {
 		return types.ResearchRunSnapshotRefV3{}, researchRunDatabaseError("freeze research history cutoff", err)
@@ -98,7 +122,9 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		Identity: identity, DefinitionVersion: definitionVersion,
 		HistoryThroughUTC: cutoffText, Definition: definition, Policy: policy,
 		ResearchTools: researchTools,
-		ResearchModel: researchModel,
+		ResearchModel: researchModel, AuthorityGeneration: authority.Generation,
+		TargetActionDigest:        authority.TargetActionDigest,
+		ActionAuthorizationDigest: authority.ActionAuthorizationDigest,
 	})
 	if err != nil || seal.DefinitionDigest != definitionDigest {
 		return types.ResearchRunSnapshotRefV3{}, researchRunIntegrityError()
@@ -112,12 +138,15 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		TemporalRunID: identity.TemporalRunID, RunKind: identity.RunKind,
 		TenantID: identity.TenantID, UserID: identity.UserID, TaskID: identity.TaskID,
 		DefinitionVersion: definitionVersion, DefinitionDigest: definitionDigest,
-		CapabilityCatalogDigest: seal.PolicyDigests.CapabilityCatalogDigest,
-		ToolPolicyDigest:        seal.ResearchToolPolicyDigest,
-		PromptPolicyDigest:      seal.PolicyDigests.PromptPolicyDigest,
-		ModelPolicyDigest:       seal.ResearchModelPolicyDigest,
-		QuotaPolicyDigest:       seal.PolicyDigests.QuotaPolicyDigest,
-		PlannerBudget:           definition.PlannerBudget, HistoryThroughUTC: cutoffText,
+		AuthorityGeneration:       authority.Generation,
+		TargetActionDigest:        authority.TargetActionDigest,
+		ActionAuthorizationDigest: authority.ActionAuthorizationDigest,
+		CapabilityCatalogDigest:   seal.PolicyDigests.CapabilityCatalogDigest,
+		ToolPolicyDigest:          seal.ResearchToolPolicyDigest,
+		PromptPolicyDigest:        seal.PolicyDigests.PromptPolicyDigest,
+		ModelPolicyDigest:         seal.ResearchModelPolicyDigest,
+		QuotaPolicyDigest:         seal.PolicyDigests.QuotaPolicyDigest,
+		PlannerBudget:             definition.PlannerBudget, HistoryThroughUTC: cutoffText,
 		PayloadDigest: seal.PayloadDigest,
 	})
 	if err != nil {
@@ -158,6 +187,73 @@ func (s *Store) CreateOrGetResearchRunSnapshotV3(
 		return types.ResearchRunSnapshotRefV3{}, err
 	}
 	return ref, nil
+}
+
+type researchSnapshotAuthorityV3 struct {
+	Generation                int64
+	TargetActionDigest        string
+	ActionAuthorizationDigest string
+}
+
+func loadResearchSnapshotAuthorityV3(
+	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
+	definitionVersion int64, definitionDigest, token string,
+) (researchSnapshotAuthorityV3, error) {
+	if token == "" {
+		return researchSnapshotAuthorityV3{}, nil
+	}
+	if strings.TrimSpace(token) != token || len(token) < 32 || len(token) > 512 {
+		return researchSnapshotAuthorityV3{}, researchRunValidationError(
+			"research snapshot Action authority is invalid")
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,101))`,
+		fmt.Sprintf("%d/%d/%s", identity.TenantID, identity.UserID, identity.TaskID)); err != nil {
+		return researchSnapshotAuthorityV3{}, researchRunDatabaseError(
+			"lock research snapshot Action authority", err)
+	}
+	var authority researchSnapshotAuthorityV3
+	err := tx.QueryRow(ctx, `
+		SELECT generation,target_action_digest,action_authorization_digest
+		  FROM research_v3_delivery_authorities
+		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
+		   AND definition_version=$4 AND definition_digest=$5
+		   AND status='enabled'`, identity.TenantID, identity.UserID,
+		identity.TaskID, definitionVersion, definitionDigest).Scan(
+		&authority.Generation, &authority.TargetActionDigest,
+		&authority.ActionAuthorizationDigest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return researchSnapshotAuthorityV3{}, researchRunConflictError()
+	}
+	if err != nil {
+		return researchSnapshotAuthorityV3{}, researchRunDatabaseError(
+			"load research snapshot Action authority", err)
+	}
+	tokenSum := sha256.Sum256([]byte(token))
+	tokenDigest := hex.EncodeToString(tokenSum[:])
+	if subtle.ConstantTimeCompare([]byte(tokenDigest),
+		[]byte(authority.ActionAuthorizationDigest)) != 1 {
+		return researchSnapshotAuthorityV3{}, researchRunConflictError()
+	}
+	return authority, nil
+}
+
+func validateResearchSnapshotAuthorityTokenV3(
+	ref types.ResearchRunSnapshotRefV3, token string,
+) error {
+	if token == "" {
+		if ref.AuthorityGeneration != 0 || ref.TargetActionDigest != "" ||
+			ref.ActionAuthorizationDigest != "" {
+			return researchRunConflictError()
+		}
+		return nil
+	}
+	tokenSum := sha256.Sum256([]byte(token))
+	tokenDigest := hex.EncodeToString(tokenSum[:])
+	if ref.AuthorityGeneration <= 0 || subtle.ConstantTimeCompare(
+		[]byte(tokenDigest), []byte(ref.ActionAuthorizationDigest)) != 1 {
+		return researchRunConflictError()
+	}
+	return nil
 }
 
 // loadResearchRunSnapshotRowV3 intentionally bypasses the legacy V1/V2
@@ -261,16 +357,19 @@ func validateStoredResearchRunSnapshotV3(
 		SnapshotID: snapshot.ID, TemporalWorkflowID: identity.TemporalWorkflowID,
 		TemporalRunID: identity.TemporalRunID, RunKind: identity.RunKind,
 		TenantID: identity.TenantID, UserID: identity.UserID, TaskID: identity.TaskID,
-		DefinitionVersion:       seal.Payload.DefinitionVersion,
-		DefinitionDigest:        snapshot.DefinitionDigest,
-		CapabilityCatalogDigest: snapshot.CapabilityCatalogDigest,
-		ToolPolicyDigest:        snapshot.ToolPolicyDigest,
-		PromptPolicyDigest:      snapshot.PromptPolicyDigest,
-		ModelPolicyDigest:       snapshot.ModelPolicyDigest,
-		QuotaPolicyDigest:       snapshot.QuotaPolicyDigest,
-		PlannerBudget:           seal.Payload.PlannerBudget,
-		HistoryThroughUTC:       seal.Payload.HistoryThroughUTC,
-		PayloadDigest:           snapshot.PayloadDigest,
+		DefinitionVersion:         seal.Payload.DefinitionVersion,
+		DefinitionDigest:          snapshot.DefinitionDigest,
+		AuthorityGeneration:       seal.Payload.AuthorityGeneration,
+		TargetActionDigest:        seal.Payload.TargetActionDigest,
+		ActionAuthorizationDigest: seal.Payload.ActionAuthorizationDigest,
+		CapabilityCatalogDigest:   snapshot.CapabilityCatalogDigest,
+		ToolPolicyDigest:          snapshot.ToolPolicyDigest,
+		PromptPolicyDigest:        snapshot.PromptPolicyDigest,
+		ModelPolicyDigest:         snapshot.ModelPolicyDigest,
+		QuotaPolicyDigest:         snapshot.QuotaPolicyDigest,
+		PlannerBudget:             seal.Payload.PlannerBudget,
+		HistoryThroughUTC:         seal.Payload.HistoryThroughUTC,
+		PayloadDigest:             snapshot.PayloadDigest,
 	})
 	if err != nil || ref.ReferenceDigest != snapshot.ReferenceDigest {
 		return types.ResearchRunSnapshotRefV3{}, researchRunIntegrityError()

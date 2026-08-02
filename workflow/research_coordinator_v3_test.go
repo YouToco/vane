@@ -17,18 +17,19 @@ import (
 type coordinatorStoreFakeV3 struct {
 	researchRuntimeStoreV3
 	createSnapshot func(context.Context, types.RunIdentity, runtimepolicy.BundleV1,
-		runtimepolicy.ResearchToolPolicyV3, runtimepolicy.ResearchModelPolicyV3) (types.ResearchRunSnapshotRefV3, error)
+		runtimepolicy.ResearchToolPolicyV3, runtimepolicy.ResearchModelPolicyV3, string) (types.ResearchRunSnapshotRefV3, error)
 	beginStep func(context.Context, types.RunIdentity, int64,
 		types.ResearchRunPlanRefV3, int) (storepkg.ResearchRunStepExecutionV3, error)
 	loadResolution func(context.Context, types.RunIdentity, int64,
 		types.ResearchRunPlanRefV3, int) (storepkg.ResearchRunStepResolutionV3, error)
 }
 
-func (f *coordinatorStoreFakeV3) CreateOrGetResearchRunSnapshotV3(
+func (f *coordinatorStoreFakeV3) CreateOrGetResearchRunSnapshotWithAuthorityV3(
 	ctx context.Context, identity types.RunIdentity, policy runtimepolicy.BundleV1,
 	tools runtimepolicy.ResearchToolPolicyV3, model runtimepolicy.ResearchModelPolicyV3,
+	authorityToken string,
 ) (types.ResearchRunSnapshotRefV3, error) {
-	return f.createSnapshot(ctx, identity, policy, tools, model)
+	return f.createSnapshot(ctx, identity, policy, tools, model, authorityToken)
 }
 
 func (f *coordinatorStoreFakeV3) BeginResearchRunStepV3(
@@ -70,6 +71,7 @@ func TestProductionResearchRuntimeV3IsDeliveryHardDark(t *testing.T) {
 	store := &coordinatorStoreFakeV3{createSnapshot: func(
 		_ context.Context, got types.RunIdentity, gotPolicy runtimepolicy.BundleV1,
 		gotTools runtimepolicy.ResearchToolPolicyV3, gotModel runtimepolicy.ResearchModelPolicyV3,
+		_ string,
 	) (types.ResearchRunSnapshotRefV3, error) {
 		if got != identity || gotPolicy.Validate() != nil ||
 			gotTools.Validate() != nil || gotModel.Validate() != nil {
@@ -90,7 +92,7 @@ func TestProductionResearchRuntimeV3IsDeliveryHardDark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotSnapshot, authorized, deliveryAllowed, err := runtime.Prepare(t.Context(), identity)
+	gotSnapshot, authorized, deliveryAllowed, err := runtime.Prepare(t.Context(), identity, "")
 	if err != nil || !authorized || deliveryAllowed || gotSnapshot != snapshot {
 		t.Fatalf("Prepare snapshot=%+v authorized=%v delivery=%v err=%v",
 			gotSnapshot, authorized, deliveryAllowed, err)
@@ -98,6 +100,47 @@ func TestProductionResearchRuntimeV3IsDeliveryHardDark(t *testing.T) {
 	if _, err := runtime.Deliver(t.Context(), identity, snapshot, plan,
 		types.ResearchBriefRefV3{}, "trace"); types.CodeOf(err) != types.CodeValidation || types.IsRetryable(err) {
 		t.Fatalf("Deliver error=%v, want non-retryable hard-dark rejection", err)
+	}
+}
+
+func TestProductionResearchRuntimeV3FreezesExactActionAuthority(t *testing.T) {
+	identity, snapshot, _, _ := researchBridgeFixtureV3(t)
+	snapshot.AuthorityGeneration = 7
+	snapshot.TargetActionDigest = strings.Repeat("8", 64)
+	snapshot.ActionAuthorizationDigest = strings.Repeat("9", 64)
+	snapshot.ReferenceDigest = ""
+	var err error
+	snapshot, err = types.SealResearchRunSnapshotRefV3(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantToken := "research-v3-action-authority-token-1234567890"
+	store := &coordinatorStoreFakeV3{createSnapshot: func(
+		_ context.Context, got types.RunIdentity, _ runtimepolicy.BundleV1,
+		_ runtimepolicy.ResearchToolPolicyV3, _ runtimepolicy.ResearchModelPolicyV3,
+		token string,
+	) (types.ResearchRunSnapshotRefV3, error) {
+		if got != identity || token != wantToken {
+			t.Fatalf("authority input identity=%+v token=%q", got, token)
+		}
+		return snapshot, nil
+	}}
+	runtime, err := NewProductionResearchRuntimeV3(
+		store, coordinatorGatewayFakeV3{}, &coordinatorExecutorFakeV3{},
+		func(context.Context, types.RunIdentity) (
+			runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
+			runtimepolicy.ResearchModelPolicyV3, error,
+		) {
+			return validToolRuntimePolicyV2(t), coordinatorResearchToolsV3(t),
+				coordinatorResearchModelV3(t), nil
+		}, func(types.RunIdentity) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, authorized, deliveryAllowed, err := runtime.Prepare(t.Context(), identity, wantToken)
+	if err != nil || !authorized || !deliveryAllowed || got != snapshot {
+		t.Fatalf("Prepare authority snapshot=%+v authorized=%v delivery=%v err=%v",
+			got, authorized, deliveryAllowed, err)
 	}
 }
 
@@ -150,7 +193,7 @@ func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffect
 	policyCalls, storeCalls := 0, 0
 	store := &coordinatorStoreFakeV3{createSnapshot: func(
 		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
-		runtimepolicy.ResearchToolPolicyV3, runtimepolicy.ResearchModelPolicyV3,
+		runtimepolicy.ResearchToolPolicyV3, runtimepolicy.ResearchModelPolicyV3, string,
 	) (types.ResearchRunSnapshotRefV3, error) {
 		storeCalls++
 		return types.ResearchRunSnapshotRefV3{}, nil
@@ -170,7 +213,7 @@ func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffect
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, authorized, deliveryAllowed, err := runtime.Prepare(t.Context(), identity)
+	snapshot, authorized, deliveryAllowed, err := runtime.Prepare(t.Context(), identity, "")
 	if err != nil || authorized || deliveryAllowed ||
 		snapshot != (types.ResearchRunSnapshotRefV3{}) ||
 		policyCalls != 0 || storeCalls != 0 {
