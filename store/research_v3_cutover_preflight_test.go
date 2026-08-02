@@ -80,20 +80,34 @@ func TestResearchV3CutoverShadowPreflightPostgres(t *testing.T) {
 		}
 	})
 
-	t.Run("formal authority snapshot cannot impersonate shadow", func(t *testing.T) {
+	t.Run("formal authority snapshot cannot create shadow Tool evidence", func(t *testing.T) {
 		f := newResearchBriefFixtureWithWorkflowV3(t,
-			taskstate.NotificationThresholdMajorV3, true, nil,
+			taskstate.NotificationThresholdMajorV3, false, nil,
 			strings.Repeat("b", 64),
 			"research-v3-shadow-"+strings.Repeat("c", 64))
-		finalizeResearchBriefFixtureV3(t, f, types.ResearchBriefSignificanceMajorV3)
-		head, err := f.st.LoadCurrentResearchApprovedDefinitionV3Head(
-			t.Context(), f.tenantID, f.userID, f.taskID)
-		if err != nil {
+		if f.beginErr == nil || types.CodeOf(f.beginErr) != types.CodeDatabase {
+			t.Fatalf("authority-bearing shadow Tool admission err=%v", f.beginErr)
+		}
+		var steps, reservations int
+		if err := f.st.pool.QueryRow(t.Context(), `SELECT
+			(SELECT count(*) FROM research_run_steps WHERE plan_id=$1),
+			(SELECT count(*) FROM research_run_step_spend_reservations WHERE plan_id=$1)`,
+			f.planRef.PlanID).Scan(&steps, &reservations); err != nil {
 			t.Fatal(err)
 		}
-		if err := f.st.RequireSuccessfulResearchV3ShadowPreflight(
-			t.Context(), f.tenantID, f.userID, f.taskID, head); types.CodeOf(err) != types.CodeConflict {
-			t.Fatalf("authority-bearing shadow preflight err=%v", err)
+		if steps != 0 || reservations != 0 {
+			t.Fatalf("denied authority-bearing shadow spent steps=%d reservations=%d",
+				steps, reservations)
+		}
+		var tokens, burst float64
+		if err := f.st.pool.QueryRow(t.Context(), `SELECT tokens,burst
+			FROM tenant_quota WHERE tenant_id=$1 AND bucket='exa_calls'`,
+			f.tenantID).Scan(&tokens, &burst); err != nil {
+			t.Fatal(err)
+		}
+		if tokens != burst {
+			t.Fatalf("denied authority-bearing shadow debited quota tokens=%v burst=%v",
+				tokens, burst)
 		}
 	})
 
