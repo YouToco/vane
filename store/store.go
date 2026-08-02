@@ -20,6 +20,7 @@ type Store struct {
 	pool                         *pgxpool.Pool
 	researchPool                 *pgxpool.Pool
 	gatewayPool                  *pgxpool.Pool
+	readinessProbe               func(context.Context) error
 	beginTx                      func(context.Context, pgx.TxOptions) (pgx.Tx, error)
 	beginResearchTx              func(context.Context, pgx.TxOptions) (pgx.Tx, error)
 	beginGatewayTx               func(context.Context, pgx.TxOptions) (pgx.Tx, error)
@@ -637,6 +638,11 @@ func (s *Store) loadIntelligenceCursorKeysLocked(ctx context.Context) error {
 func (s *Store) Ping(ctx context.Context) error {
 	if err := s.pool.Ping(ctx); err != nil {
 		return err
+	}
+	if s.readinessProbe != nil {
+		if err := s.readinessProbe(ctx); err != nil {
+			return err
+		}
 	}
 	if s.researchPool != nil {
 		if err := s.researchPool.Ping(ctx); err != nil {

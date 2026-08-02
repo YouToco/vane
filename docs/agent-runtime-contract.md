@@ -265,6 +265,13 @@ capability catalog、Tool/prompt/model/quota policy，以及 planner budget。Te
 V1/V2 snapshot reader 与 admission function 不修改；migration 只按 reference schema 把 V3
 写入路由到独立准入围栏。
 
+V3 control Store 必须使用 `vane_server_runtime` 登录并默认进入受限 `vane_app`，不能因
+准备阶段需要 quota policy 而回退 schema owner。它没有 `tenant_quota` 的表级或列级读取权；
+只允许通过 exact tenant/user/task 绑定的 `SECURITY DEFINER` 投影读取 `rate/burst`，不得读取
+或返回当前 `tokens` 余额。实际预扣与结算继续只属于按 run capability 隔离的 paid executor。
+缺少投影、scope 不匹配、任务/租户/owner membership 非 active，均须在 snapshot、LLM 和 Tool
+调用前 fail-closed；server startup/ready Gate 必须证明投影可用且直接 quota 读取仍被拒绝。
+
 Planner 输出的 canonical plan 先写入 append-only `research_run_plans`，Workflow 只接收
 `vane.research-run-plan-ref/v3`。每个外部 Tool 调用必须先在 `research_run_steps` 写入唯一
 `started` receipt，之后才能 I/O；completed/failed/indeterminate 终态必须绑定同一 plan、ordinal、

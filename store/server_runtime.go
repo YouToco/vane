@@ -63,6 +63,7 @@ var serverRuntimeProtectedRelations = []string{
 var serverRuntimeForbiddenReadRelations = []string{
 	"public.research_llm_gateway_frozen_requests",
 	"public.research_run_capabilities",
+	"public.tenant_quota",
 }
 
 // ProvisionServerRuntime installs the cluster-global runtime shell only after
@@ -116,7 +117,9 @@ func NewServerRuntime(ctx context.Context, runtimeURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: server runtime: %w", err)
 	}
-	return newStore(pool, nil), nil
+	store := newStore(pool, nil)
+	store.readinessProbe = store.verifyServerRuntimeQuotaProjection
+	return store, nil
 }
 
 // NewServerRuntimeWithResearchRuntimeCapability is the server-runtime
@@ -134,6 +137,7 @@ func NewServerRuntimeWithResearchRuntimeCapability(
 	}
 	if strings.TrimSpace(researchRuntimeURL) == "" {
 		store := newStore(pool, nil)
+		store.readinessProbe = store.verifyServerRuntimeQuotaProjection
 		if capability.ActiveKeyID != "" || capability.ActiveKeyHex != "" ||
 			capability.RetiredKeys != "" {
 			if err := store.configureResearchRunCapabilityV1(capability); err != nil {
@@ -151,6 +155,7 @@ func NewServerRuntimeWithResearchRuntimeCapability(
 		return nil, fmt.Errorf("store: V3 research runtime: %w", err)
 	}
 	store := newStore(pool, researchPool)
+	store.readinessProbe = store.verifyServerRuntimeQuotaProjection
 	if capability.ActiveKeyID == "" || capability.ActiveKeyHex == "" {
 		store.Close()
 		return nil, errors.New("store: V3 research capability key is required")
@@ -177,7 +182,44 @@ func initializeServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 	if sessionUser != serverRuntimeLoginRole || currentUser != "vane_app" {
 		return errors.New("server runtime default capability is unsafe")
 	}
+	if err := verifyServerRuntimeQuotaProjection(ctx, conn); err != nil {
+		return err
+	}
 	return nil
+}
+
+type serverRuntimeQuotaProjectionQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func verifyServerRuntimeQuotaProjection(
+	ctx context.Context, querier serverRuntimeQuotaProjectionQuerier,
+) error {
+	authorityRoles := append([]string{serverRuntimeLoginRole},
+		serverRuntimeCapabilityRoles...)
+	var quotaResolver, directQuotaRead bool
+	if err := querier.QueryRow(ctx, `
+		SELECT has_function_privilege(current_user,
+		         'public.resolve_research_quota_rule_v1(bigint,bigint,text,text)',
+		         'EXECUTE'),
+		       COALESCE((SELECT bool_or(
+		         has_table_privilege(role_name,'public.tenant_quota','SELECT') OR
+		         has_any_column_privilege(role_name,'public.tenant_quota','SELECT'))
+		         FROM unnest($1::text[]) AS role_name),false)`, authorityRoles,
+	).Scan(&quotaResolver, &directQuotaRead); err != nil {
+		return fmt.Errorf("verify server quota projection: %w", err)
+	}
+	if !quotaResolver || directQuotaRead {
+		return errors.New("server runtime quota projection is unsafe")
+	}
+	return nil
+}
+
+func (s *Store) verifyServerRuntimeQuotaProjection(ctx context.Context) error {
+	if s == nil || s.pool == nil {
+		return errors.New("server runtime quota projection Store is unavailable")
+	}
+	return verifyServerRuntimeQuotaProjection(ctx, s.pool)
 }
 
 func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error {
