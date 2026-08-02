@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,23 @@ func newResearchRunSpendFixtureWithModelPolicyV3(
 	modelPolicy runtimepolicy.ResearchModelPolicyV3,
 ) researchRunSpendFixtureV3 {
 	t.Helper()
+	return newResearchRunSpendFixtureModeV3(t, maxRunCostMicroUSD,
+		maxToolCalls, createPlan, modelPolicy, false)
+}
+
+func newResearchShadowRunSpendFixtureV3(
+	t *testing.T, maxRunCostMicroUSD int64,
+) researchRunSpendFixtureV3 {
+	t.Helper()
+	return newResearchRunSpendFixtureModeV3(t, maxRunCostMicroUSD,
+		16, true, testResearchModelPolicyStoreV3(t), true)
+}
+
+func newResearchRunSpendFixtureModeV3(
+	t *testing.T, maxRunCostMicroUSD int64, maxToolCalls int, createPlan bool,
+	modelPolicy runtimepolicy.ResearchModelPolicyV3, shadow bool,
+) researchRunSpendFixtureV3 {
+	t.Helper()
 	if os.Getenv("DATABASE_URL") == "" {
 		t.Skip("DATABASE_URL is required for V3 research spend integration tests")
 	}
@@ -80,8 +98,13 @@ func newResearchRunSpendFixtureWithModelPolicyV3(
 	}
 
 	taskID := "research-spend-v3-" + uuid.NewString()
+	workflowID := "workflow-" + taskID
+	if shadow {
+		digest := sha256.Sum256([]byte(taskID))
+		workflowID = "research-v3-shadow-" + hex.EncodeToString(digest[:])
+	}
 	identity := types.RunIdentity{
-		TemporalWorkflowID: "workflow-" + taskID,
+		TemporalWorkflowID: workflowID,
 		TemporalRunID:      "run-" + uuid.NewString(),
 		RunKind:            types.RunSnapshotKindScheduled,
 		TenantID:           tenantID,
@@ -96,6 +119,12 @@ func newResearchRunSpendFixtureWithModelPolicyV3(
 		           '{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}',
 		           '{}','active','strict')`,
 		taskID, tenantID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO schedule_playbooks (schedule_id,content,fetch_plan)
+		 VALUES ($1,$2,'{}')`, taskID,
+		"检查 Kimi 官方套餐并交叉核验；没有重大更新不推送。"); err != nil {
 		t.Fatal(err)
 	}
 	definition, err := taskstate.BuildApprovedDefinitionV3(taskstate.ApprovedDefinitionInputV3{
@@ -140,7 +169,31 @@ func newResearchRunSpendFixtureWithModelPolicyV3(
 		digest, payload, "test-v3-spend:"+uuid.NewString()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.pool.Exec(ctx,
+	if shadow {
+		baselineDigest, err := sealResearchV3SourceBaseline(
+			definition, types.StrictnessStrict, types.ExecutionModeCompiled, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var operationID int64
+		if err := st.pool.QueryRow(ctx,
+			`INSERT INTO research_v3_definition_prepare_operations (
+			     tenant_id,user_id,task_id,idempotency_key,target_definition_version,
+			     target_definition_digest,source_baseline_digest,original_execution_mode
+			 ) VALUES ($1,$2,$3,$4,1,$5,$6,'compiled') RETURNING id`,
+			tenantID, userID, taskID, "shadow-tool-admission-"+uuid.NewString(),
+			digest, baselineDigest).Scan(&operationID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.pool.Exec(ctx,
+			`INSERT INTO research_v3_prepared_definition_heads (
+			     tenant_id,user_id,task_id,definition_version,definition_digest,
+			     prepare_operation_id,base_execution_mode,source_baseline_digest
+			 ) VALUES ($1,$2,$3,1,$4,$5,'compiled',$6)`,
+			tenantID, userID, taskID, digest, operationID, baselineDigest); err != nil {
+			t.Fatal(err)
+		}
+	} else if _, err := st.pool.Exec(ctx,
 		`UPDATE schedules
 		    SET execution_mode='discover_at_run',approved_definition_version=1,
 		        approved_definition_digest=$2

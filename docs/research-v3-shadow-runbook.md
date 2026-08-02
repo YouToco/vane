@@ -12,6 +12,10 @@ Research V3 shadow 是正式切流前的独立技术验证路径。它读取 del
 - Shadow 使用独立 Workflow ID，不读取、不更新、不触发原 Schedule；原 cron、时区、Overlap、Action 和下次周一 09:00 执行时间均保持不变。
 - Scheduler 再核验任务 owner、active 状态与 exact prepared `vane.task-approved-definition/v3` sidecar；不会回退读取正式 head。
 - Coordinator 在任何 Store、模型或网络副作用前再次核验精确任务授权。
+- 每个 Shadow Tool first-writer 还会在数据库内重新核验：exact shadow Workflow、不可变
+  snapshot、owner/active 租户与任务、当前 prepared head 及其 prepare journal 必须完全一致；
+  正式 Schedule 可保持 `compiled`。撤销 sidecar 后只允许已有 ordinal 的幂等恢复，禁止任何
+  新 Tool effect。正式运行仍逐字沿用 `discover_at_run`/manual-run authority 原规则。
 - 即使 coordinator 错误返回 `delivery_allowed=true`，Shadow Workflow 仍跳过投递。
 
 ## 执行
