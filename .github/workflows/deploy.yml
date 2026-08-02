@@ -311,7 +311,7 @@ jobs:
             "$BUILD_ROOT/source/vane-release/bin/vane" -print-release-contract
           )
           [[ $contract == \
-            'vane.server-release-contract/v1 primary_store=owner_compat_v1 research_store=restricted_v1' ]]
+            'vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1' ]]
           echo "value=$contract" >>"$GITHUB_OUTPUT"
 
       - name: Package backend artifact

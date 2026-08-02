@@ -18,7 +18,7 @@ previous_vane_snapshot_ready=false
 previous_vane_restart_expected=false
 preserve_vane_snapshot=false
 rollback_dir=/opt/vane/.rollback-vane-${stage##*/.deploy-}
-research_primary_env_keys=(
+research_legacy_env_keys=(
   VANE_DB_RESEARCH_RUNTIME_URL
   VANE_DB_RESEARCH_CAPABILITY_KEY_ID
   VANE_DB_RESEARCH_CAPABILITY_KEY_HEX
@@ -28,6 +28,10 @@ research_primary_env_keys=(
   VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID
   VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID
   VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID
+)
+research_primary_env_keys=(
+  VANE_DB_RESEARCH_CONTROL_URL
+  "${research_legacy_env_keys[@]}"
 )
 [[ $rollback_dir =~ ^/opt/vane/\.rollback-vane-[0-9a-f]{40}-[0-9]+-[0-9]+$ ]] || {
   echo "unsafe vane rollback path" >&2
@@ -289,6 +293,46 @@ assert_research_settings_exact() {
   fi
 }
 
+assert_legacy_research_settings_exact() {
+  local destination=$1 source=${2:-/opt/vane/env/server.env}
+  local name source_line dest_line
+  [[ -f $source && ! -L $source && -f $destination &&
+     ! -L $destination ]] || return 1
+  [[ $(stat -c '%U:%G:%a' "$source") == root:vane:640 ]] || {
+    echo "restricted server environment has unsafe ownership or mode" >&2
+    return 1
+  }
+  [[ $(grep -c '^VANE_DB_RESEARCH_CONTROL_URL=' "$source" || true) -eq 0 &&
+     $(grep -c '^VANE_DB_RESEARCH_CONTROL_URL=' "$destination" || true) -eq 0 ]] || {
+    echo "legacy owner-compatible contract has an unexpected research control Store" >&2
+    return 1
+  }
+  if LC_ALL=C grep -q $'\r' "$source" "$destination"; then
+    echo "runtime environment contains a carriage return" >&2
+    return 1
+  fi
+  for name in "${research_legacy_env_keys[@]}"; do
+    source_line=$(exact_env_line "$source" "$name") || {
+      echo "legacy restricted environment is missing a required research setting: $name" >&2
+      return 1
+    }
+    dest_line=$(exact_env_line "$destination" "$name") || {
+      echo "legacy owner-compatible environment is missing a required research setting: $name" >&2
+      return 1
+    }
+    [[ $dest_line == "$source_line" ]] || {
+      echo "legacy owner-compatible research setting drifted: $name" >&2
+      return 1
+    }
+  done
+  if grep -Eq \
+    '^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_GATEWAY_[A-Z0-9_]+)=' \
+    "$destination"; then
+    echo "legacy owner-compatible environment contains a forbidden process credential" >&2
+    return 1
+  fi
+}
+
 build_owner_compatible_environment() {
   local owner_env_source=$1 destination=$2
   local server_env_source=${3:-/opt/vane/env/server.env} name
@@ -297,7 +341,7 @@ build_owner_compatible_environment() {
     echo "owner-compatible environment inputs are unavailable" >&2
     return 1
   }
-  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_GATEWAY_[A-Z0-9_]+|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID)=/' \
+  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_GATEWAY_[A-Z0-9_]+|VANE_DB_RESEARCH_CONTROL_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID)=/' \
     "$owner_env_source" >"$destination"
   for name in "${research_primary_env_keys[@]}"; do
     exact_env_line "$server_env_source" "$name" >>"$destination" || {
@@ -308,19 +352,67 @@ build_owner_compatible_environment() {
   assert_research_settings_exact "$destination" "$server_env_source"
 }
 
+stage_research_control_environment() {
+  local source=$1 destination=$2
+  local next=${destination}.stage-next
+  local count primary_line primary_url control_line
+  [[ $source == /opt/vane/env/server.env &&
+     $destination == /opt/vane/env/server.env.release-next ]] || {
+    echo "unsafe research control environment staging path" >&2
+    return 1
+  }
+  [[ -f $source && ! -L $source ]] || {
+    echo "restricted server environment is unavailable" >&2
+    return 1
+  }
+  count=$(grep -c '^VANE_DB_RESEARCH_CONTROL_URL=' "$source" || true)
+  primary_line=$(exact_env_line "$source" VANE_DB_URL) || {
+    echo "restricted server environment has no exact primary runtime DSN" >&2
+    return 1
+  }
+  primary_url=${primary_line#VANE_DB_URL=}
+  [[ $primary_url == postgres://vane_server_runtime:* ]] || {
+    echo "research control Store requires the restricted server runtime DSN" >&2
+    return 1
+  }
+  rm -f -- "$next" "$destination"
+  awk '!/^VANE_DB_RESEARCH_CONTROL_URL=/' "$source" >"$next"
+  case "$count" in
+    0)
+      printf 'VANE_DB_RESEARCH_CONTROL_URL=%s\n' "$primary_url" >>"$next"
+      ;;
+    1)
+      control_line=$(exact_env_line "$source" VANE_DB_RESEARCH_CONTROL_URL) || return 1
+      [[ ${control_line#VANE_DB_RESEARCH_CONTROL_URL=} == "$primary_url" ]] || {
+        echo "research control Store DSN does not match restricted server runtime" >&2
+        return 1
+      }
+      printf '%s\n' "$control_line" >>"$next"
+      ;;
+    *)
+      echo "restricted server environment has duplicate research control DSNs" >&2
+      return 1
+      ;;
+  esac
+  chown root:vane "$next"
+  chmod 0640 "$next"
+  mv -f -- "$next" "$destination"
+}
+
 assert_restricted_server_environment_readonly() {
-  [[ -f /opt/vane/env/server.env && ! -L /opt/vane/env/server.env &&
-     $(stat -c '%U:%G:%a' /opt/vane/env/server.env) == root:vane:640 ]] || {
+  local path=${1:-/opt/vane/env/server.env}
+  [[ -f $path && ! -L $path &&
+     $(stat -c '%U:%G:%a' "$path") == root:vane:640 ]] || {
     echo "restricted server environment is not root-owned read-only runtime data" >&2
     return 1
   }
-  if runuser -u vane -- test -w /opt/vane/env/server.env; then
+  if runuser -u vane -- test -w "$path"; then
     echo "primary service user can write the restricted server environment" >&2
     return 1
   fi
 }
 
-assert_audited_legacy_primary_runtime_contract() {
+assert_owner_compatible_primary_identity() {
   local owner_env_source snapshot_db_url live_db_url
   validate_legacy_compat_unit /etc/systemd/system/vane.service
   [[ -f /opt/vane/env/server-owner-compat.env &&
@@ -338,13 +430,42 @@ assert_audited_legacy_primary_runtime_contract() {
      $live_db_url == postgres://vane:* &&
      $live_db_url != postgres://vane_server_runtime:* ]] || {
     echo "owner database DSN changed during compatibility cutover" >&2
+     return 1
+  }
+}
+
+assert_audited_legacy_primary_runtime_contract() {
+  local research_control_url
+  assert_owner_compatible_primary_identity
+  research_control_url=$(sed -n 's/^VANE_DB_RESEARCH_CONTROL_URL=//p' \
+    /opt/vane/env/server-owner-compat.env)
+  [[ $research_control_url == postgres://vane_server_runtime:* ]] || {
+    echo "owner-compatible environment has no restricted research control Store" >&2
     return 1
   }
   assert_research_settings_exact /opt/vane/env/server-owner-compat.env
 }
 
+assert_audited_legacy_primary_runtime_contract_v1() {
+  assert_owner_compatible_primary_identity
+  assert_legacy_research_settings_exact \
+    /opt/vane/env/server-owner-compat.env
+}
+
 assert_existing_audited_primary_runtime_contract() {
-  assert_audited_legacy_primary_runtime_contract
+  local live_count restricted_count
+  live_count=$(grep -c '^VANE_DB_RESEARCH_CONTROL_URL=' \
+    /opt/vane/env/server-owner-compat.env || true)
+  restricted_count=$(grep -c '^VANE_DB_RESEARCH_CONTROL_URL=' \
+    /opt/vane/env/server.env || true)
+  if [[ $live_count -eq 0 && $restricted_count -eq 0 ]]; then
+    assert_audited_legacy_primary_runtime_contract_v1
+  elif [[ $live_count -eq 1 && $restricted_count -eq 1 ]]; then
+    assert_audited_legacy_primary_runtime_contract
+  else
+    echo "owner-compatible runtime has a mixed research control contract" >&2
+    return 1
+  fi
   cmp -s -- "$rollback_dir/vane.service" \
     /etc/systemd/system/vane.service &&
     cmp -s -- "$rollback_dir/runtime.env" \
@@ -372,14 +493,16 @@ commit_legacy_primary_release() {
   }
 
   rm -f -- /etc/systemd/system/vane.service.release-next \
-    /opt/vane/env/server-owner-compat.env.release-next \
-    /opt/vane/env/server.env.release-next
+    /opt/vane/env/server-owner-compat.env.release-next
+  [[ -f /opt/vane/env/server.env.release-next &&
+     ! -L /opt/vane/env/server.env.release-next ]] || {
+    echo "staged restricted server environment is unavailable" >&2
+    return 1
+  }
   install -m 0644 /opt/vane/vane-legacy-compat.service \
     /etc/systemd/system/vane.service.release-next
-  cp --archive --reflink=auto -- /opt/vane/env/server.env \
-    /opt/vane/env/server.env.release-next
-  chown root:vane /opt/vane/env/server.env.release-next
-  chmod 0640 /opt/vane/env/server.env.release-next
+  assert_restricted_server_environment_readonly \
+    /opt/vane/env/server.env.release-next || return 1
   build_owner_compatible_environment "$owner_env_source" \
     /opt/vane/env/server-owner-compat.env.release-next \
     /opt/vane/env/server.env.release-next || return 1
@@ -582,6 +705,10 @@ cleanup_remote_deploy() {
       rm -rf -- "$rollback_dir"
     fi
   fi
+  rm -f -- /etc/systemd/system/vane.service.release-next \
+    /opt/vane/env/server-owner-compat.env.release-next \
+    /opt/vane/env/server.env.release-next \
+    /opt/vane/env/server.env.release-next.stage-next
   rm -rf -- "$stage"
   exit "$status"
 }
@@ -724,7 +851,7 @@ esac
 # drained. Migration/bootstrap failures therefore leave the proven worker and
 # its old unit untouched.
 validate_legacy_compat_unit "$stage/vane-legacy-compat.service"
-expected_server_release_contract='vane.server-release-contract/v1 primary_store=owner_compat_v1 research_store=restricted_v1'
+expected_server_release_contract='vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1'
 actual_server_release_contract=$(
   env -i PATH=/usr/bin:/bin "$stage/bin/vane" -print-release-contract
 )
@@ -918,10 +1045,12 @@ if [[ ! -f $bootstrap_marker ]]; then
     } | docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U vane -d vane
   )
 
-  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_GATEWAY_[A-Z0-9_]+|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID)=/' \
+  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_URL|VANE_DB_RESEARCH_CONTROL_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_GATEWAY_[A-Z0-9_]+|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID)=/' \
     /opt/vane/.env >/opt/vane/env/server.env.next
   {
     printf 'VANE_DB_URL=postgres://vane_server_runtime:%s@127.0.0.1:5432/vane?sslmode=disable\n' \
+      "$server_password"
+    printf 'VANE_DB_RESEARCH_CONTROL_URL=postgres://vane_server_runtime:%s@127.0.0.1:5432/vane?sslmode=disable\n' \
       "$server_password"
     printf 'VANE_DB_RESEARCH_RUNTIME_URL=postgres://vane_research_runtime:%s@127.0.0.1:5432/vane?sslmode=disable\n' \
       "$research_password"
@@ -975,6 +1104,8 @@ fi
 [[ -s /opt/vane/env/server.env && ! -L /opt/vane/env/server.env ]] || exit 1
 [[ -s /opt/vane/env/research-gateway.env && \
    ! -L /opt/vane/env/research-gateway.env ]] || exit 1
+stage_research_control_environment /opt/vane/env/server.env \
+  /opt/vane/env/server.env.release-next
 for credential in migration_db_url gateway_db_url research_llm_api_key_gen1; do
   [[ -s /etc/vane/credentials/$credential && \
      ! -L /etc/vane/credentials/$credential ]] || {
@@ -985,6 +1116,8 @@ done
 chown root:vane /opt/vane/env/server.env
 chmod 0640 /opt/vane/env/server.env
 assert_restricted_server_environment_readonly
+assert_restricted_server_environment_readonly \
+  /opt/vane/env/server.env.release-next
 chown vane-research-gateway:vane-research-gateway \
   /opt/vane/env/research-gateway.env \
   /etc/vane/credentials/gateway_db_url \
@@ -994,11 +1127,13 @@ chmod 0400 /etc/vane/credentials/gateway_db_url \
   /etc/vane/credentials/research_llm_api_key_gen1
 assert_gateway_peer_and_credential_boundary
 grep -Eq '^VANE_DB_URL=postgres://vane_server_runtime:' \
-  /opt/vane/env/server.env
+  /opt/vane/env/server.env.release-next
+grep -Eq '^VANE_DB_RESEARCH_CONTROL_URL=postgres://vane_server_runtime:' \
+  /opt/vane/env/server.env.release-next
 grep -Eq '^VANE_DB_RESEARCH_RUNTIME_URL=postgres://vane_research_runtime:' \
-  /opt/vane/env/server.env
+  /opt/vane/env/server.env.release-next
 if grep -Eq '^POSTGRES_PASSWORD=|^VANE_DB_URL=postgres://vane:' \
-  /opt/vane/env/server.env; then
+  /opt/vane/env/server.env.release-next; then
   echo "server environment contains an owner credential" >&2
   exit 1
 fi
@@ -1064,7 +1199,7 @@ done
 
 # Validate the complete new process configuration and non-owner database path
 # while the proven old worker is still serving traffic.
-/opt/vane/bin/gate -env /opt/vane/env/server.env >/dev/null
+/opt/vane/bin/gate -env /opt/vane/env/server.env.release-next >/dev/null
 
 # scp/install replaces a single-file bind mount's inode. Compare the container
 # view with the host content; only a container recreation repairs a detached

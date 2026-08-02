@@ -27,6 +27,161 @@ def extract_gateway_boundary() -> str:
 
 
 class RemoteBackendRecoveryTest(unittest.TestCase):
+    def test_active_owner_v1_contract_converges_to_v2_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            opt = (root / "opt/vane").as_posix()
+            systemd = (root / "etc/systemd/system").as_posix()
+            stage = f"{opt}/.deploy-{SHA}-1-1"
+            recovery = extract_recovery().replace("/opt/vane", opt).replace(
+                "/etc/systemd/system", systemd
+            )
+            shared = (
+                "VANE_DB_RESEARCH_RUNTIME_URL="
+                "postgres://vane_research_runtime:research@db/vane\n"
+                "VANE_DB_RESEARCH_CAPABILITY_KEY_ID=fixture\n"
+                f"VANE_DB_RESEARCH_CAPABILITY_KEY_HEX={'a' * 64}\n"
+                "VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS=\n"
+                "VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS=90\n"
+                "VANE_RESEARCH_GATEWAY_SOCKET_PATH=/run/gateway.sock\n"
+                "VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID=kimi\n"
+                "VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID=\n"
+                "VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID=\n"
+            )
+            owner = "VANE_DB_URL=postgres://vane:owner@db/vane\n" + shared
+            restricted = (
+                "VANE_DB_URL=postgres://vane_server_runtime:server@db/vane\n"
+                + shared
+            )
+            unit = (
+                "[Service]\nUser=vane\nGroup=vane\n"
+                f"WorkingDirectory={opt}\n"
+                f"EnvironmentFile={opt}/env/server-owner-compat.env\n"
+                f"ExecStart={opt}/bin/vane\n"
+                "NoNewPrivileges=yes\nProtectSystem=strict\n"
+                "ProtectHome=yes\nPrivateTmp=yes\n"
+            )
+            script = (
+                "set -euo pipefail\n"
+                f"stage={shlex.quote(stage)}\n"
+                f"{recovery}\n"
+                "stat() { if [[ ${2:-} == %U:%G:%a ]]; then "
+                "printf 'root:vane:640\\n'; else command stat \"$@\"; fi; }\n"
+                "chown() { :; }\n"
+                "chmod() { :; }\n"
+                f"mkdir -p {shlex.quote(opt + '/bin')} "
+                f"{shlex.quote(opt + '/env')} {shlex.quote(systemd)} "
+                '"$rollback_dir"\n'
+                f"printf %s {shlex.quote(owner)} >"
+                f"{shlex.quote(opt + '/.env')}\n"
+                f"printf %s {shlex.quote(owner)} >"
+                f"{shlex.quote(opt + '/env/server-owner-compat.env')}\n"
+                f"printf %s {shlex.quote(restricted)} >"
+                f"{shlex.quote(opt + '/env/server.env')}\n"
+                f"printf %s {shlex.quote(unit)} >"
+                f"{shlex.quote(systemd + '/vane.service')}\n"
+                f"cp {shlex.quote(systemd + '/vane.service')} "
+                '"$rollback_dir/vane.service"\n'
+                f"cp {shlex.quote(opt + '/env/server-owner-compat.env')} "
+                '"$rollback_dir/runtime.env"\n'
+                f"cp {shlex.quote(opt + '/.env')} "
+                '"$rollback_dir/legacy.env"\n'
+                f"printf '%s\\n' {shlex.quote(opt + '/env/server-owner-compat.env')} "
+                '>"$rollback_dir/runtime-env-path"\n'
+                "previous_vane_snapshot_ready=true\n"
+                "assert_existing_audited_primary_runtime_contract\n"
+                f"stage_research_control_environment "
+                f"{shlex.quote(opt + '/env/server.env')} "
+                f"{shlex.quote(opt + '/env/server.env.release-next')}\n"
+                "build_owner_compatible_environment "
+                '"$rollback_dir/legacy.env" '
+                f"{shlex.quote(opt + '/env/server-owner-compat.env.next')} "
+                f"{shlex.quote(opt + '/env/server.env.release-next')}\n"
+                f"mv {shlex.quote(opt + '/env/server-owner-compat.env.next')} "
+                f"{shlex.quote(opt + '/env/server-owner-compat.env')}\n"
+                f"mv {shlex.quote(opt + '/env/server.env.release-next')} "
+                f"{shlex.quote(opt + '/env/server.env')}\n"
+                "assert_audited_legacy_primary_runtime_contract\n"
+                f"cat {shlex.quote(opt + '/env/server-owner-compat.env')}\n"
+            )
+            result = subprocess.run(
+                [BASH], input=script.encode(), capture_output=True, check=False
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        output = result.stdout.decode()
+        self.assertEqual(output.count("VANE_DB_RESEARCH_CONTROL_URL="), 1)
+        self.assertIn(
+            "VANE_DB_RESEARCH_CONTROL_URL="
+            "postgres://vane_server_runtime:server@db/vane\n",
+            output,
+        )
+
+    def run_research_control_convergence(
+        self, initial: str
+    ) -> subprocess.CompletedProcess[bytes]:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            opt = (root / "opt/vane").as_posix()
+            stage = f"{opt}/.deploy-{SHA}-1-1"
+            recovery = extract_recovery().replace("/opt/vane", opt)
+            script = (
+                "set -euo pipefail\n"
+                f"stage={shlex.quote(stage)}\n"
+                f"{recovery}\n"
+                "chown() { :; }\n"
+                "chmod() { :; }\n"
+                f"mkdir -p {shlex.quote(opt + '/env')}\n"
+                f"printf %s {shlex.quote(initial)} >"
+                f"{shlex.quote(opt + '/env/server.env')}\n"
+                f"stage_research_control_environment "
+                f"{shlex.quote(opt + '/env/server.env')} "
+                f"{shlex.quote(opt + '/env/server.env.release-next')}\n"
+                "set +e\n"
+                "(false; cleanup_remote_deploy)\n"
+                "cleanup_status=$?\n"
+                "set -e\n"
+                "[[ $cleanup_status -eq 1 ]]\n"
+                f"! grep -q '^VANE_DB_RESEARCH_CONTROL_URL=' "
+                f"{shlex.quote(opt + '/env/server.env')}\n"
+                f"[[ ! -e {shlex.quote(opt + '/env/server.env.release-next')} ]]\n"
+                f"stage_research_control_environment "
+                f"{shlex.quote(opt + '/env/server.env')} "
+                f"{shlex.quote(opt + '/env/server.env.release-next')}\n"
+                f"cat {shlex.quote(opt + '/env/server.env.release-next')}\n"
+            )
+            return subprocess.run(
+                [BASH], input=script.encode(), capture_output=True, check=False
+            )
+
+    def test_research_control_url_converges_once_from_restricted_primary(self) -> None:
+        result = self.run_research_control_convergence(
+            "VANE_DB_URL=postgres://vane_server_runtime:secret@db/vane\nKEEP=1\n"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        output = result.stdout.decode()
+        self.assertEqual(output.count("VANE_DB_RESEARCH_CONTROL_URL="), 1)
+        self.assertIn(
+            "VANE_DB_RESEARCH_CONTROL_URL="
+            "postgres://vane_server_runtime:secret@db/vane\n",
+            output,
+        )
+        self.assertIn("KEEP=1\n", output)
+
+    def test_research_control_url_rejects_identity_drift(self) -> None:
+        result = self.run_research_control_convergence(
+            "VANE_DB_URL=postgres://vane_server_runtime:secret@db/vane\n"
+            "VANE_DB_RESEARCH_CONTROL_URL="
+            "postgres://vane_research_runtime:wrong@db/vane\n"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            b"research control Store DSN does not match restricted server runtime",
+            result.stderr,
+        )
+
     def run_gateway_boundary(
         self, *, allowed_uid: str = "4242", primary_can_read: bool = False
     ) -> subprocess.CompletedProcess[bytes]:
@@ -268,7 +423,7 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                 "}\n"
                 "SERVER_ENV_HARDENED=false\n"
                 "chown() {\n"
-                "  if [[ $1 == root:vane && ${!#} == *server.env.release-next ]]; then\n"
+                "  if [[ $1 == root:vane && ${!#} == *server.env.release-next* ]]; then\n"
                 "    SERVER_ENV_HARDENED=true\n"
                 "    printf 'harden restricted server env\\n' >>\"$LOG\"\n"
                 "  fi\n"
@@ -309,6 +464,7 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                 f"printf '[Service]\\nUser=vane\\nEnvironmentFile={opt}/env/server.env\\n"
                 f"ExecStart={opt}/bin/vane\\n' >{shlex.quote(systemd + '/vane.service')}\n"
                 f"printf 'VANE_DB_URL=postgres://vane_server_runtime:split@db/vane\\n"
+                "VANE_DB_RESEARCH_CONTROL_URL=postgres://vane_server_runtime:split@db/vane\\n"
                 "VANE_DB_RESEARCH_RUNTIME_URL=postgres://vane_research_runtime:research-secret@db/vane\\n"
                 "VANE_DB_RESEARCH_CAPABILITY_KEY_ID=fixture-key\\n"
                 f"VANE_DB_RESEARCH_CAPABILITY_KEY_HEX={'a' * 64}\\n"
@@ -335,6 +491,9 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                 "EOF\n"
                 "old_vane_recovery_required=true\n"
                 "old_vane_restart_safe=true\n"
+                f"stage_research_control_environment "
+                f"{shlex.quote(opt + '/env/server.env')} "
+                f"{shlex.quote(opt + '/env/server.env.release-next')}\n"
                 "set +e\n"
                 "commit_legacy_primary_release\n"
                 "commit_status=$?\n"
@@ -492,6 +651,11 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
             state["owner_compat_env"].startswith(
                 "VANE_DB_URL=postgres://vane:owner@db/vane\nOWNER_ONLY=1\n"
             )
+        )
+        self.assertIn(
+            "VANE_DB_RESEARCH_CONTROL_URL="
+            "postgres://vane_server_runtime:split@db/vane\n",
+            state["owner_compat_env"],
         )
         self.assertIn(
             "VANE_DB_RESEARCH_RUNTIME_URL="

@@ -17,8 +17,8 @@ SCHEMA = 1
 MAX_TOTAL_SIZE = 1_000_000_000
 MAX_FILE_SIZE = 500_000_000
 SERVER_RELEASE_CONTRACT = (
-    "vane.server-release-contract/v1 primary_store=owner_compat_v1 "
-    "research_store=restricted_v1"
+    "vane.server-release-contract/v2 primary_store=owner_compat_v1 "
+    "research_control_store=restricted_v1 research_store=restricted_v1"
 )
 BACKEND_FILES = {
     "bin/vane": 0o755,

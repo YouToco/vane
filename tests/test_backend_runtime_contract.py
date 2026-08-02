@@ -65,8 +65,8 @@ class BackendRuntimeContractTest(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         remote = REMOTE.read_text(encoding="utf-8")
         exact = (
-            "vane.server-release-contract/v1 primary_store=owner_compat_v1 "
-            "research_store=restricted_v1"
+            "vane.server-release-contract/v2 primary_store=owner_compat_v1 "
+            "research_control_store=restricted_v1 research_store=restricted_v1"
         )
 
         self.assertIn("-print-release-contract", workflow)
@@ -163,7 +163,17 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertIn("commit_legacy_primary_release", remote)
         self.assertIn("build_owner_compatible_environment", remote)
         self.assertIn("assert_research_settings_exact", remote)
+        self.assertIn("stage_research_control_environment", remote)
+        self.assertIn(
+            "research control Store DSN does not match restricted server runtime",
+            remote,
+        )
+        self.assertIn(
+            "/opt/vane/bin/gate -env /opt/vane/env/server.env.release-next",
+            remote,
+        )
         for setting in (
+            "VANE_DB_RESEARCH_CONTROL_URL",
             "VANE_DB_RESEARCH_RUNTIME_URL",
             "VANE_DB_RESEARCH_CAPABILITY_KEY_ID",
             "VANE_DB_RESEARCH_CAPABILITY_KEY_HEX",
@@ -176,12 +186,16 @@ class BackendRuntimeContractTest(unittest.TestCase):
         ):
             self.assertIn(setting, remote)
         self.assertIn("owner database DSN changed during compatibility cutover", remote)
+        self.assertIn(
+            "owner-compatible environment has no restricted research control Store",
+            remote,
+        )
         self.assertIn("contains a forbidden process credential", remote)
         self.assertIn("assert_gateway_peer_and_credential_boundary", remote)
         self.assertIn("assert_restricted_server_environment_readonly", remote)
         self.assertIn("chown root:vane /opt/vane/env/server.env", remote)
         self.assertIn("chmod 0640 /opt/vane/env/server.env", remote)
-        self.assertIn("runuser -u vane -- test -w /opt/vane/env/server.env", remote)
+        self.assertIn('runuser -u vane -- test -w "$path"', remote)
         self.assertIn("VANE_GATEWAY_ALLOWED_UID", remote)
         self.assertIn("runuser -u vane -- test -r", remote)
         self.assertIn(
