@@ -217,7 +217,8 @@ func executeResearchPlannerRoundsV3(
 			storepkg.ResearchRunLLMSpendReservationV3{},
 			researchCoordinatorValidationV3("research planner correction budget is invalid")
 	}
-	correctionPrompt, err := buildResearchPlannerCorrectionPromptV3(initialPrompt)
+	correctionPrompt, err := buildResearchPlannerCorrectionPromptV3(
+		initialPrompt, seal.ResearchModel.Planner.RendererVersion)
 	if err != nil {
 		return runcontext.ResearchExecutionPlanV3{},
 			storepkg.ResearchRunLLMSpendReservationV3{}, err
@@ -247,7 +248,8 @@ func researchPlanFromCompletionV3(
 	snapshot types.ResearchRunSnapshotRefV3,
 	seal runcontext.ResearchSnapshotSealV3, completion []byte,
 ) (runcontext.ResearchExecutionPlanV3, error) {
-	steps, err := decodeResearchPlannerCompletionV3(completion)
+	steps, err := decodeResearchPlannerCompletionV3(
+		completion, seal.ResearchModel.Planner.RendererVersion)
 	if err != nil {
 		return runcontext.ResearchExecutionPlanV3{}, err
 	}
@@ -555,7 +557,9 @@ type researchPlannerOutputV3 struct {
 	Steps         []runcontext.ResearchPlanStepV3 `json:"steps"`
 }
 
-func decodeResearchPlannerCompletionV3(raw []byte) ([]runcontext.ResearchPlanStepV3, error) {
+func decodeResearchPlannerCompletionV3(
+	raw []byte, rendererVersion string,
+) ([]runcontext.ResearchPlanStepV3, error) {
 	if len(raw) < 2 || len(raw) > 256<<10 {
 		return nil, researchCoordinatorValidationV3("research planner output is invalid")
 	}
@@ -565,10 +569,20 @@ func decodeResearchPlannerCompletionV3(raw []byte) ([]runcontext.ResearchPlanSte
 		len(output.Steps) == 0 || len(output.Steps) > 16 {
 		return nil, researchCoordinatorValidationV3("research planner output is invalid")
 	}
-	canonical, err := json.Marshal(output)
-	if err != nil || !bytes.Equal(canonical, raw) {
+	switch rendererVersion {
+	case runtimepolicy.ResearchPlannerRendererVersionV3:
+		canonical, err := json.Marshal(output)
+		if err != nil || !bytes.Equal(canonical, raw) {
+			return nil, researchCoordinatorValidationV3(
+				"research planner output must be canonical JSON")
+		}
+	case runtimepolicy.ResearchPlannerRendererVersionV31:
+		// v3.1 keeps the exact semantic shape but accepts representation-only
+		// whitespace and object-key order. The durable plan is canonicalized by
+		// BuildResearchExecutionPlanV3 before it can be persisted.
+	default:
 		return nil, researchCoordinatorValidationV3(
-			"research planner output must be canonical JSON")
+			"research planner renderer is unavailable")
 	}
 	steps := make([]runcontext.ResearchPlanStepV3, len(output.Steps))
 	copy(steps, output.Steps)
@@ -591,6 +605,32 @@ type researchPlannerPromptV3 struct {
 	ResponseSchema    string                        `json:"response_schema"`
 }
 
+type researchPlannerPromptV31 struct {
+	SchemaVersion     string                            `json:"schema_version"`
+	TaskName          string                            `json:"task_name"`
+	TaskManual        string                            `json:"task_manual"`
+	HistoryThroughUTC string                            `json:"history_through_utc"`
+	MaxToolCalls      int                               `json:"max_tool_calls"`
+	AllowedTools      []researchPlannerPromptToolV3     `json:"allowed_tools"`
+	ResponseContract  researchPlannerResponseContractV3 `json:"response_contract"`
+}
+
+// researchPlannerResponseContractV3 makes the private Go decoder contract
+// model-visible. A schema-version label alone is not enough information for a
+// remote model to infer the required field names.
+type researchPlannerResponseContractV3 struct {
+	SchemaVersionLiteral       string   `json:"schema_version_literal"`
+	RequiredTopLevelFields     []string `json:"required_top_level_fields"`
+	RequiredStepFields         []string `json:"required_step_fields"`
+	MinSteps                   int      `json:"min_steps"`
+	MaxSteps                   int      `json:"max_steps"`
+	ToolNameRule               string   `json:"tool_name_rule"`
+	ArgumentsRule              string   `json:"arguments_rule"`
+	ExtraTopLevelFieldsAllowed bool     `json:"extra_top_level_fields_allowed"`
+	ExtraStepFieldsAllowed     bool     `json:"extra_step_fields_allowed"`
+	SingleJSONObject           bool     `json:"single_json_object"`
+}
+
 type researchPlannerCorrectionPromptV3 struct {
 	SchemaVersion string          `json:"schema_version"`
 	Instruction   string          `json:"instruction"`
@@ -598,6 +638,20 @@ type researchPlannerCorrectionPromptV3 struct {
 }
 
 func buildResearchPlannerPromptV3(seal runcontext.ResearchSnapshotSealV3) (string, error) {
+	switch seal.ResearchModel.Planner.RendererVersion {
+	case runtimepolicy.ResearchPlannerRendererVersionV3:
+		return buildResearchPlannerPromptLegacyV3(seal)
+	case runtimepolicy.ResearchPlannerRendererVersionV31:
+		return buildResearchPlannerPromptV31(seal)
+	default:
+		return "", researchCoordinatorValidationV3(
+			"research planner renderer is unavailable")
+	}
+}
+
+func researchPlannerPromptToolsV3(
+	seal runcontext.ResearchSnapshotSealV3,
+) []researchPlannerPromptToolV3 {
 	tools := make([]researchPlannerPromptToolV3, len(seal.ResearchTools.AllowedTools))
 	for index, tool := range seal.ResearchTools.AllowedTools {
 		tools[index] = researchPlannerPromptToolV3{
@@ -605,13 +659,19 @@ func buildResearchPlannerPromptV3(seal runcontext.ResearchSnapshotSealV3) (strin
 			Parameters: append(json.RawMessage(nil), tool.Parameters...),
 		}
 	}
+	return tools
+}
+
+func buildResearchPlannerPromptLegacyV3(
+	seal runcontext.ResearchSnapshotSealV3,
+) (string, error) {
 	payload, err := json.Marshal(researchPlannerPromptV3{
 		SchemaVersion:     "vane.research-planner-input/v3",
 		TaskName:          seal.Payload.Definition.TaskName,
 		TaskManual:        seal.Payload.Definition.TaskManual,
 		HistoryThroughUTC: seal.Payload.HistoryThroughUTC,
 		MaxToolCalls:      seal.Payload.PlannerBudget.MaxToolCalls,
-		AllowedTools:      tools,
+		AllowedTools:      researchPlannerPromptToolsV3(seal),
 		ResponseSchema:    researchPlannerOutputSchemaV3,
 	})
 	if err != nil || len(payload) < 2 || len(payload) > 2<<20 {
@@ -620,7 +680,38 @@ func buildResearchPlannerPromptV3(seal runcontext.ResearchSnapshotSealV3) (strin
 	return string(payload), nil
 }
 
-func buildResearchPlannerCorrectionPromptV3(initialPrompt string) (string, error) {
+func buildResearchPlannerPromptV31(
+	seal runcontext.ResearchSnapshotSealV3,
+) (string, error) {
+	payload, err := json.Marshal(researchPlannerPromptV31{
+		SchemaVersion:     "vane.research-planner-input/v3",
+		TaskName:          seal.Payload.Definition.TaskName,
+		TaskManual:        seal.Payload.Definition.TaskManual,
+		HistoryThroughUTC: seal.Payload.HistoryThroughUTC,
+		MaxToolCalls:      seal.Payload.PlannerBudget.MaxToolCalls,
+		AllowedTools:      researchPlannerPromptToolsV3(seal),
+		ResponseContract: researchPlannerResponseContractV3{
+			SchemaVersionLiteral:       researchPlannerOutputSchemaV3,
+			RequiredTopLevelFields:     []string{"schema_version", "steps"},
+			RequiredStepFields:         []string{"invocation_id", "tool_name", "arguments"},
+			MinSteps:                   1,
+			MaxSteps:                   seal.Payload.PlannerBudget.MaxToolCalls,
+			ToolNameRule:               "must exactly equal one allowed_tools[].name",
+			ArgumentsRule:              "must be an object matching that allowed tool's parameters schema",
+			ExtraTopLevelFieldsAllowed: false,
+			ExtraStepFieldsAllowed:     false,
+			SingleJSONObject:           true,
+		},
+	})
+	if err != nil || len(payload) < 2 || len(payload) > 2<<20 {
+		return "", researchCoordinatorValidationV3("research planner prompt is invalid")
+	}
+	return string(payload), nil
+}
+
+func buildResearchPlannerCorrectionPromptV3(
+	initialPrompt, rendererVersion string,
+) (string, error) {
 	var plannerInput json.RawMessage
 	if strictjson.DecodeExact([]byte(initialPrompt), &plannerInput) != nil {
 		return "", researchCoordinatorValidationV3(
@@ -631,9 +722,19 @@ func buildResearchPlannerCorrectionPromptV3(initialPrompt string) (string, error
 		return "", researchCoordinatorValidationV3(
 			"research planner correction input must be canonical")
 	}
+	instruction := ""
+	switch rendererVersion {
+	case runtimepolicy.ResearchPlannerRendererVersionV3:
+		instruction = "The previous response failed the strict schema or canonicalization contract. Return only one canonical JSON object matching the required response schema."
+	case runtimepolicy.ResearchPlannerRendererVersionV31:
+		instruction = "The previous response failed the exact field contract. Return only one JSON object matching response_contract; do not add or rename fields."
+	default:
+		return "", researchCoordinatorValidationV3(
+			"research planner renderer is unavailable")
+	}
 	payload, err := json.Marshal(researchPlannerCorrectionPromptV3{
 		SchemaVersion: "vane.research-planner-correction/v3",
-		Instruction:   "The previous response failed the strict schema or canonicalization contract. Return only one canonical JSON object matching the required response schema.",
+		Instruction:   instruction,
 		PlannerInput:  plannerInput,
 	})
 	if err != nil || len(payload) < 2 || len(payload) > 2<<20 {
