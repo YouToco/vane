@@ -7,7 +7,10 @@ ListenStream=/run/vane-research-gateway/gateway.sock
 SocketUser=vane-research-gateway
 SocketGroup=vane
 SocketMode=0660
-DirectoryMode=0750
+# systemd creates the parent directory as root:root. It must be traversable by
+# the unprivileged vane client, but need not be listable; access to the endpoint
+# itself remains limited by SocketGroup=vane and SocketMode=0660.
+DirectoryMode=0711
 RemoveOnStop=yes
 Accept=no
 
