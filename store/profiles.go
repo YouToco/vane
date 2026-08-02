@@ -74,13 +74,28 @@ func (s *Store) GetProfileForTenant(ctx context.Context, tenantID, userID int64)
 	if tenantID <= 0 || userID <= 0 {
 		return nil, types.NewAppError(types.CodeValidation, "画像租户范围无效", types.ErrValidation)
 	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "开启租户画像读取事务", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL search_path = pg_catalog, public, pg_temp`); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "固定租户画像读取 search_path", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		strconv.FormatInt(tenantID, 10), strconv.FormatInt(userID, 10)); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "设置租户画像读取范围", err)
+	}
 	var p types.Profile
-	err := scanProfileWithAuthority(s.pool.QueryRow(ctx,
-		`SELECT `+profileColumnsQualified+`,s.active_epoch,s.version
-		   FROM profiles p
-		   JOIN profile_claim_states s
-		     ON s.tenant_id=p.tenant_id AND s.user_id=p.user_id
-		  WHERE p.tenant_id = $1 AND p.user_id = $2`,
+	err = scanProfile(tx.QueryRow(ctx,
+		`SELECT `+profileColumns+`
+		   FROM profiles
+		  WHERE tenant_id = $1 AND user_id = $2`,
 		tenantID, userID), &p)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -89,6 +104,29 @@ func (s *Store) GetProfileForTenant(ctx context.Context, tenantID, userID int64)
 		}
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("查询租户 %d 的用户 %d 画像", tenantID, userID), err)
+	}
+	// vane_app intentionally sees no claim-state version. Read that second
+	// half through the exact-subject claim authority in the same repeatable
+	// read snapshot. This preserves the complete Profile contract (including
+	// the surrogate id used by evolve ledgers) without widening vane_app or
+	// granting profile billing columns to the claim role.
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "进入租户画像读取 authority", err)
+	}
+	if err := tx.QueryRow(ctx,
+		`SELECT active_epoch,version
+		   FROM profile_claim_states
+		  WHERE tenant_id=$1 AND user_id=$2`,
+		tenantID, userID).Scan(&p.ProfileEpoch, &p.ProfileVersion); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, types.NewAppError(types.CodeNotFound,
+				fmt.Sprintf("租户 %d 的用户 %d 无画像 authority", tenantID, userID), err)
+		}
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询租户 %d 的用户 %d 画像 authority", tenantID, userID), err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "提交租户画像读取事务", err)
 	}
 	return &p, nil
 }

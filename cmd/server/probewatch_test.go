@@ -62,39 +62,42 @@ func TestNextDailyProbeAt(t *testing.T) {
 type fakeProbeStore struct {
 	quality        types.ScoreQualityStat
 	failListTraces error
+	profileTenant  int64
+	profileUser    int64
 }
 
-func (f *fakeProbeStore) ListScoreTraceStats(context.Context, time.Time, int) ([]types.ScoreTraceStat, error) {
+func (f *fakeProbeStore) ListScoreTraceStats(context.Context, int64, time.Time, int) ([]types.ScoreTraceStat, error) {
 	return nil, f.failListTraces
 }
-func (f *fakeProbeStore) GetScoreQualityStat(context.Context, time.Time) (types.ScoreQualityStat, error) {
+func (f *fakeProbeStore) GetScoreQualityStat(context.Context, int64, time.Time) (types.ScoreQualityStat, error) {
 	return f.quality, nil
 }
-func (f *fakeProbeStore) ListScoreDistribution(context.Context, time.Time) ([]types.ScoreBucket, error) {
+func (f *fakeProbeStore) ListScoreDistribution(context.Context, int64, time.Time) ([]types.ScoreBucket, error) {
 	return nil, nil
 }
-func (f *fakeProbeStore) GetScoreLivenessStat(context.Context, time.Time, int) (types.ScoreLivenessStat, error) {
+func (f *fakeProbeStore) GetScoreLivenessStat(context.Context, int64, time.Time, int) (types.ScoreLivenessStat, error) {
 	return types.ScoreLivenessStat{}, nil
 }
-func (f *fakeProbeStore) GetProfileInjectionStat(context.Context, time.Time) (types.ProfileInjectionStat, error) {
+func (f *fakeProbeStore) GetProfileInjectionStat(context.Context, int64, time.Time) (types.ProfileInjectionStat, error) {
 	return types.ProfileInjectionStat{}, nil
 }
-func (f *fakeProbeStore) GetNegTailStat(context.Context, time.Time, string) (types.NegTailStat, error) {
+func (f *fakeProbeStore) GetNegTailStat(context.Context, int64, time.Time, string) (types.NegTailStat, error) {
 	return types.NegTailStat{}, nil
 }
-func (f *fakeProbeStore) ListSpanDayCosts(context.Context, time.Time) ([]types.SpanDayCost, error) {
+func (f *fakeProbeStore) ListSpanDayCosts(context.Context, int64, time.Time) ([]types.SpanDayCost, error) {
 	return nil, nil
 }
-func (f *fakeProbeStore) ListModelUsage(context.Context, time.Time) ([]types.ModelUsage, error) {
+func (f *fakeProbeStore) ListModelUsage(context.Context, int64, time.Time) ([]types.ModelUsage, error) {
 	return nil, nil
 }
-func (f *fakeProbeStore) GetEvolveCallStat(context.Context, int64, time.Time) (types.EvolveCallStat, error) {
+func (f *fakeProbeStore) GetEvolveCallStat(context.Context, int64, int64, time.Time) (types.EvolveCallStat, error) {
 	return types.EvolveCallStat{}, nil
 }
-func (f *fakeProbeStore) ListPushBatchSummaries(context.Context, int64, time.Time, int) ([]types.PushBatchSummary, error) {
+func (f *fakeProbeStore) ListPushBatchSummaries(context.Context, int64, int64, time.Time, int) ([]types.PushBatchSummary, error) {
 	return nil, nil
 }
-func (f *fakeProbeStore) GetProfile(context.Context, int64) (*types.Profile, error) {
+func (f *fakeProbeStore) GetProfileForTenant(_ context.Context, tenantID, userID int64) (*types.Profile, error) {
+	f.profileTenant, f.profileUser = tenantID, userID
 	return nil, types.ErrNotFound
 }
 func (f *fakeProbeStore) CountA2ATasks(context.Context) (int64, error) { return 0, nil }
@@ -105,7 +108,7 @@ func (f *fakePrincipal) FromContext(context.Context) (auth.Principal, error) {
 	if f.err != nil {
 		return auth.Principal{}, f.err
 	}
-	return auth.Principal{UserID: 1}, nil
+	return auth.Principal{TenantID: 7, UserID: 1}, nil
 }
 
 type fakeOwner struct{ openID string }
@@ -163,6 +166,15 @@ func newTestWatcher(st probe.Store, pr principalSource, owner ownerOpenIDProvide
 func newTestWatcherFP(st probe.Store, fps fingerprintStore, push cardPusher) *probeWatcher {
 	return newProbeWatcher(st, fps, &fakePrincipal{}, &fakeOwner{openID: "ou_x"}, push,
 		func(md string) string { return md })
+}
+
+func TestRunOncePassesExactPrincipalToProbe(t *testing.T) {
+	st := &fakeProbeStore{}
+	pw := newTestWatcher(st, &fakePrincipal{}, &fakeOwner{openID: "ou_x"}, &fakePusher{})
+	pw.runOnce(t.Context())
+	if st.profileTenant != 7 || st.profileUser != 1 {
+		t.Fatalf("profile scope=%d/%d, want 7/1", st.profileTenant, st.profileUser)
+	}
 }
 
 func TestRunOnceRedAlertsOnceUntilChange(t *testing.T) {

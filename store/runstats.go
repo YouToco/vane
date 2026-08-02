@@ -10,6 +10,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/YouToco/vane/types"
 )
 
@@ -33,9 +35,10 @@ type SpanRunStat struct {
 }
 
 // ListSpanRunStats 返回窗口内按 span 聚合的运行统计，按调用量降序。
-func (s *Store) ListSpanRunStats(ctx context.Context, since time.Time) ([]SpanRunStat, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT span_name,
+func (s *Store) ListSpanRunStats(ctx context.Context, tenantID int64, since time.Time) ([]SpanRunStat, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) ([]SpanRunStat, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT span_name,
 		        count(*)::int,
 		        count(*) FILTER (WHERE error <> '')::int,
 		        sum(cost_usd)::float8,
@@ -45,28 +48,29 @@ func (s *Store) ListSpanRunStats(ctx context.Context, since time.Time) ([]SpanRu
 		        coalesce(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)::float8,
 		        count(*) FILTER (WHERE prefix_cache_hit IS TRUE)::int,
 		        count(prefix_cache_hit)::int
-		 FROM llm_calls
-		 WHERE created_at >= $1
+			 FROM llm_calls
+			 WHERE created_at >= $1 AND tenant_id = $2
 		 GROUP BY span_name
 		 ORDER BY count(*) DESC, span_name`,
-		since)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "查询 span 运行统计", err)
-	}
-	defer rows.Close()
-
-	var out []SpanRunStat
-	for rows.Next() {
-		var r SpanRunStat
-		if err := rows.Scan(&r.SpanName, &r.Calls, &r.Errors, &r.CostUSD,
-			&r.PromptTokens, &r.CompletionTokens, &r.AvgLatencyMs, &r.P95LatencyMs,
-			&r.CacheHits, &r.CacheKnown); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描 span 运行统计行", err)
+			since, tenantID)
+		if err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "查询 span 运行统计", err)
 		}
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历 span 运行统计结果集", err)
-	}
-	return out, nil
+		defer rows.Close()
+
+		var out []SpanRunStat
+		for rows.Next() {
+			var r SpanRunStat
+			if err := rows.Scan(&r.SpanName, &r.Calls, &r.Errors, &r.CostUSD,
+				&r.PromptTokens, &r.CompletionTokens, &r.AvgLatencyMs, &r.P95LatencyMs,
+				&r.CacheHits, &r.CacheKnown); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase, "扫描 span 运行统计行", err)
+			}
+			out = append(out, r)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "遍历 span 运行统计结果集", err)
+		}
+		return out, nil
+	})
 }

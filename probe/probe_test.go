@@ -41,40 +41,44 @@ type fakeStore struct {
 	a2aErr   error
 
 	// 回声位：记录 Run 实际传下来的参数，用于断言窗口与期望串没接反。
-	gotSince      time.Time
-	gotInjSince   time.Time
-	gotNegSince   time.Time
-	gotMinN       int
-	gotFloor      int
-	gotTail       string
-	gotBatchSince time.Time
-	gotBatchLimit int
+	gotSince         time.Time
+	gotInjSince      time.Time
+	gotNegSince      time.Time
+	gotMinN          int
+	gotFloor         int
+	gotTail          string
+	gotBatchSince    time.Time
+	gotBatchLimit    int
+	gotTenantID      int64
+	gotUserID        int64
+	gotQueryTenantID int64
 }
 
-func (f *fakeStore) ListScoreTraceStats(_ context.Context, since time.Time, minN int) ([]types.ScoreTraceStat, error) {
+func (f *fakeStore) ListScoreTraceStats(_ context.Context, tenantID int64, since time.Time, minN int) ([]types.ScoreTraceStat, error) {
+	f.gotQueryTenantID = tenantID
 	f.gotSince, f.gotMinN = since, minN
 	return f.traces, nil
 }
 
-func (f *fakeStore) GetScoreQualityStat(context.Context, time.Time) (types.ScoreQualityStat, error) {
+func (f *fakeStore) GetScoreQualityStat(context.Context, int64, time.Time) (types.ScoreQualityStat, error) {
 	return f.quality, nil
 }
 
-func (f *fakeStore) ListScoreDistribution(context.Context, time.Time) ([]types.ScoreBucket, error) {
+func (f *fakeStore) ListScoreDistribution(context.Context, int64, time.Time) ([]types.ScoreBucket, error) {
 	return f.dist, nil
 }
 
-func (f *fakeStore) GetScoreLivenessStat(_ context.Context, _ time.Time, floor int) (types.ScoreLivenessStat, error) {
+func (f *fakeStore) GetScoreLivenessStat(_ context.Context, _ int64, _ time.Time, floor int) (types.ScoreLivenessStat, error) {
 	f.gotFloor = floor
 	return f.liveness, nil
 }
 
-func (f *fakeStore) GetProfileInjectionStat(_ context.Context, since time.Time) (types.ProfileInjectionStat, error) {
+func (f *fakeStore) GetProfileInjectionStat(_ context.Context, _ int64, since time.Time) (types.ProfileInjectionStat, error) {
 	f.gotInjSince = since
 	return f.inj, nil
 }
 
-func (f *fakeStore) GetNegTailStat(_ context.Context, since time.Time, expectedTail string) (types.NegTailStat, error) {
+func (f *fakeStore) GetNegTailStat(_ context.Context, _ int64, since time.Time, expectedTail string) (types.NegTailStat, error) {
 	f.gotNegSince = since
 	f.gotTail = expectedTail
 	n := f.neg
@@ -82,25 +86,26 @@ func (f *fakeStore) GetNegTailStat(_ context.Context, since time.Time, expectedT
 	return n, nil
 }
 
-func (f *fakeStore) ListSpanDayCosts(context.Context, time.Time) ([]types.SpanDayCost, error) {
+func (f *fakeStore) ListSpanDayCosts(context.Context, int64, time.Time) ([]types.SpanDayCost, error) {
 	return f.costs, nil
 }
 
-func (f *fakeStore) ListModelUsage(context.Context, time.Time) ([]types.ModelUsage, error) {
+func (f *fakeStore) ListModelUsage(context.Context, int64, time.Time) ([]types.ModelUsage, error) {
 	return f.models, nil
 }
 
-func (f *fakeStore) GetEvolveCallStat(context.Context, int64, time.Time) (types.EvolveCallStat, error) {
+func (f *fakeStore) GetEvolveCallStat(context.Context, int64, int64, time.Time) (types.EvolveCallStat, error) {
 	return f.evolve, nil
 }
 
-func (f *fakeStore) ListPushBatchSummaries(_ context.Context, _ int64, since time.Time, limit int) ([]types.PushBatchSummary, error) {
+func (f *fakeStore) ListPushBatchSummaries(_ context.Context, _, _ int64, since time.Time, limit int) ([]types.PushBatchSummary, error) {
 	f.gotBatchSince, f.gotBatchLimit = since, limit
 	return f.batches, nil
 }
 
-// GetProfile 以 ErrNotFound 表达"尚未首采"——不是错误（probe.go:145 同此语义）。
-func (f *fakeStore) GetProfile(context.Context, int64) (*types.Profile, error) {
+// GetProfileForTenant 以 ErrNotFound 表达"尚未首采"——不是错误。
+func (f *fakeStore) GetProfileForTenant(_ context.Context, tenantID, userID int64) (*types.Profile, error) {
+	f.gotTenantID, f.gotUserID = tenantID, userID
 	if f.profile == nil {
 		return nil, types.ErrNotFound
 	}
@@ -673,7 +678,7 @@ func TestRun_WiringAndWindows(t *testing.T) {
 			LastEvolvedFeedbackID: 42,
 		},
 	}
-	rep, err := Run(t.Context(), f, 7, now, 0)
+	rep, err := Run(t.Context(), f, 3, 7, now, 0)
 	if err != nil {
 		t.Fatalf("Run() 失败: %v", err)
 	}
@@ -714,6 +719,13 @@ func TestRun_WiringAndWindows(t *testing.T) {
 	}
 	if rep.UserID != 7 {
 		t.Errorf("UserID 应回填 7，实际 %d", rep.UserID)
+	}
+	if f.gotTenantID != 3 || f.gotUserID != 7 {
+		t.Errorf("画像读取必须收到精确 tenant/user=3/7，实际 %d/%d",
+			f.gotTenantID, f.gotUserID)
+	}
+	if f.gotQueryTenantID != 3 {
+		t.Errorf("观测查询必须收到精确 tenant=3，实际 %d", f.gotQueryTenantID)
 	}
 
 	// 9 条判定齐全且 ID 唯一——看板与 cmd/gate 都按 ID 索引
@@ -759,7 +771,7 @@ func TestRun_WiringAndWindows(t *testing.T) {
 func TestRun_ExplicitWindow(t *testing.T) {
 	now := time.Date(2026, 7, 16, 8, 30, 0, 0, time.UTC)
 	f := &fakeStore{}
-	rep, err := Run(t.Context(), f, 1, now, 72*time.Hour)
+	rep, err := Run(t.Context(), f, 3, 1, now, 72*time.Hour)
 	if err != nil {
 		t.Fatalf("Run() 失败: %v", err)
 	}
@@ -779,7 +791,7 @@ func TestRun_ProfileNotFoundIsNotAnError(t *testing.T) {
 		profile: nil, // → ErrNotFound
 		inj:     types.ProfileInjectionStat{Total: 50, Absent: 50},
 	}
-	rep, err := Run(t.Context(), f, 1, now, 0)
+	rep, err := Run(t.Context(), f, 3, 1, now, 0)
 	if err != nil {
 		t.Fatalf("画像 NotFound 不应让 Run 失败: %v", err)
 	}
@@ -819,7 +831,7 @@ func TestRun_BlankProfileRowMatchesRuntimeNoProfileSemantics(t *testing.T) {
 		inj: types.ProfileInjectionStat{Total: 1, Absent: 1},
 	}
 
-	rep, err := Run(t.Context(), f, 1, now, 24*time.Hour)
+	rep, err := Run(t.Context(), f, 3, 1, now, 24*time.Hour)
 	if err != nil {
 		t.Fatalf("Run() 失败: %v", err)
 	}
@@ -856,7 +868,7 @@ func TestRun_InjectionWindowClampedToProfileCreation(t *testing.T) {
 			UpdatedAt: created,
 		},
 	}
-	if _, err := Run(t.Context(), f, 7, now, 0); err != nil {
+	if _, err := Run(t.Context(), f, 3, 7, now, 0); err != nil {
 		t.Fatalf("Run() 失败: %v", err)
 	}
 	if !f.gotInjSince.Equal(created) {
@@ -881,7 +893,7 @@ func TestJudgeA2ATasks(t *testing.T) {
 
 	t.Run("查询报错red且Run不中断", func(t *testing.T) {
 		f := &fakeStore{a2aErr: errors.New(`relation "a2a_tasks" does not exist`)}
-		rep, err := Run(t.Context(), f, 7, now, 24*time.Hour)
+		rep, err := Run(t.Context(), f, 3, 7, now, 24*time.Hour)
 		if err != nil {
 			t.Fatalf("P-A2A 报错不得中断 Run（应就地记 red），实际 err=%v", err)
 		}
@@ -893,7 +905,7 @@ func TestJudgeA2ATasks(t *testing.T) {
 
 	t.Run("零行green", func(t *testing.T) {
 		f := &fakeStore{a2aCount: 0}
-		rep, err := Run(t.Context(), f, 7, now, 24*time.Hour)
+		rep, err := Run(t.Context(), f, 3, 7, now, 24*time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}

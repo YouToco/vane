@@ -57,8 +57,8 @@ func TestListSpanRunStats(t *testing.T) {
 		_, err := st.pool.Exec(ctx,
 			`INSERT INTO llm_calls (trace_id, span_name, provider, model,
 			     prompt_tokens, completion_tokens, latency_ms, cost_usd,
-			     prefix_cache_hit, error, created_at)
-			 VALUES ($1, $2, 'test', 'test-model', $3, $4, $5, $6, $7, $8, $9)`,
+			     prefix_cache_hit, error, tenant_id, created_at)
+			 VALUES ($1, $2, 'test', 'test-model', $3, $4, $5, $6, $7, $8, 1, $9)`,
 			uuid.NewString(), span, r.prompt, r.compl, r.latency, r.cost,
 			r.cache, r.errStr, now.Add(-r.age))
 		if err != nil {
@@ -76,7 +76,7 @@ func TestListSpanRunStats(t *testing.T) {
 		cleanupExec(ctx, t, st, `DELETE FROM llm_calls WHERE span_name = $1`, span)
 	})
 
-	stats, err := st.ListSpanRunStats(ctx, now.Add(-24*time.Hour))
+	stats, err := st.ListSpanRunStats(ctx, 1, now.Add(-24*time.Hour))
 	if err != nil {
 		t.Fatalf("ListSpanRunStats() 失败: %v", err)
 	}

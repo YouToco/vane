@@ -153,7 +153,8 @@ func (pw *probeWatcher) runOnce(ctx context.Context) {
 		return
 	}
 
-	rep, err := probe.Run(rctx, pw.st, p.UserID, time.Now().UTC(), probe.DefaultWindow)
+	rep, err := probe.Run(rctx, pw.st, int64(p.TenantID), p.UserID,
+		time.Now().UTC(), probe.DefaultWindow)
 	if err != nil {
 		slog.Error("probewatch: 探针执行失败", "err", err)
 		pw.alert(ctx, openID, probeFailureFingerprint, renderProbeFailure(err))

@@ -69,16 +69,17 @@ func (s *server) handleObservability(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 单 owner 模型：探针 ④⑤⑦ 的画像/演化判定都以 owner 为对象。
-	// 无 owner 时 ownerUserID 回 CodeConflict → writeAppError 映射成 409，
+	// 无 owner 时 Principal resolver 回 CodeConflict → writeAppError 映射成 409，
 	// 语义是"飞书向导还没走完"而非故障，与 M3 端点一致，不在这里另造。
-	userID, err := s.ownerUserID(r.Context())
+	principal, err := s.deps.Principal.FromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
 
 	// now 显式取 UTC：探针内部一律 UTC，换算只在前端（红线 6 的三时区陷阱）。
-	rep, err := probe.Run(r.Context(), s.deps.Store, userID, time.Now().UTC(), window)
+	rep, err := probe.Run(r.Context(), s.deps.Store,
+		int64(principal.TenantID), principal.UserID, time.Now().UTC(), window)
 	if err != nil {
 		writeAppError(w, err)
 		return
