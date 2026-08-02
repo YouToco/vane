@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/YouToco/vane/runcontext"
@@ -61,16 +62,30 @@ func commitResearchRunLLMReceiptForTestV3(
 // createResearchPlanFromReceiptV3 gives Store integration fixtures the same
 // receipt-first ordering required from production: reserve, persist the exact
 // model-visible JSON response and only then admit the typed Plan artifact.
+func researchPlannerCompletionFromPlanV3(
+	t *testing.T, plan runcontext.ResearchExecutionPlanV3,
+) []byte {
+	t.Helper()
+	payload, err := json.Marshal(struct {
+		SchemaVersion string                          `json:"schema_version"`
+		Steps         []runcontext.ResearchPlanStepV3 `json:"steps"`
+	}{
+		SchemaVersion: "vane.research-planner-output/v3",
+		Steps:         plan.Steps,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
 func createResearchPlanFromReceiptV3(
 	t *testing.T, st *Store, identity types.RunIdentity,
 	snapshot types.ResearchRunSnapshotRefV3, plan runcontext.ResearchExecutionPlanV3,
 ) (types.ResearchRunPlanRefV3, ResearchRunLLMSpendReservationV3) {
 	t.Helper()
 	ensureResearchLLMPriceV3(t, st)
-	payload, err := runcontext.EncodeResearchExecutionPlanV3(plan)
-	if err != nil {
-		t.Fatal(err)
-	}
+	payload := researchPlannerCompletionFromPlanV3(t, plan)
 	const userPrompt = "Return the frozen research Plan as JSON."
 	reservation, err := st.BeginResearchRunLLMSpendV3(t.Context(),
 		BeginResearchRunLLMSpendV3Params{
@@ -197,10 +212,31 @@ func TestResearchRunPlanV3RequiresSemanticallyEqualCompletedReceiptPostgres(t *t
 		t.Fatal("database admitted a Plan different from the completed receipt")
 	}
 
-	payload, err := runcontext.EncodeResearchExecutionPlanV3(plan)
-	if err != nil {
-		t.Fatal(err)
+	payload := researchPlannerCompletionFromPlanV3(t, plan)
+	validCompletion := string(payload)
+	duplicateCompletions := []string{
+		strings.Replace(validCompletion,
+			`{"schema_version":`, `{"schema_version":"wrong","schema_version":`, 1),
+		strings.Replace(validCompletion,
+			`{"invocation_id":`, `{"invocation_id":"wrong","invocation_id":`, 1),
+		strings.Replace(validCompletion,
+			`"tool_name":"web_search"`,
+			`"tool_name":"wrong","tool_name":"web_search"`, 1),
+		strings.Replace(validCompletion,
+			`{"query":"Kimi pricing"}`,
+			`{"query":"attacker-visible-first","query":"Kimi pricing"}`, 1),
 	}
+	for index, completion := range duplicateCompletions {
+		reservation := reserveAndSettle(index+1, completion)
+		if _, err := f.store.CreateOrGetResearchRunPlanV3(t.Context(),
+			CreateOrGetResearchRunPlanV3Params{
+				Identity: f.identity, RunSnapshotID: f.snapshotRef.SnapshotID,
+				PlannerLLMReservationID: reservation.ReservationID, Plan: plan,
+			}); err == nil {
+			t.Fatalf("database admitted duplicate-key planner receipt mutation %d", index)
+		}
+	}
+
 	var semantic any
 	if err := json.Unmarshal(payload, &semantic); err != nil {
 		t.Fatal(err)
@@ -209,7 +245,7 @@ func TestResearchRunPlanV3RequiresSemanticallyEqualCompletedReceiptPostgres(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	equivalent := reserveAndSettle(1, string(pretty))
+	equivalent := reserveAndSettle(len(duplicateCompletions)+1, string(pretty))
 	if _, err := f.store.CreateOrGetResearchRunPlanV3(t.Context(),
 		CreateOrGetResearchRunPlanV3Params{
 			Identity: f.identity, RunSnapshotID: f.snapshotRef.SnapshotID,
