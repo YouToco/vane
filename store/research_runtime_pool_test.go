@@ -157,6 +157,25 @@ func TestNewWithResearchRuntimeAcceptsRestrictedLoginPostgres(t *testing.T) {
 	if err := st.Ping(t.Context()); err != nil {
 		t.Fatalf("research runtime is not ready: %v", err)
 	}
+	var (
+		primarySessionUser string
+		primaryCurrentUser string
+		primaryOwnsStore   bool
+	)
+	if err := st.pool.QueryRow(t.Context(), `
+		SELECT session_user,current_user,class.relowner=role.oid
+		  FROM pg_catalog.pg_class class
+		  JOIN pg_catalog.pg_namespace namespace
+		    ON namespace.oid=class.relnamespace
+		  JOIN pg_catalog.pg_roles role ON role.rolname=current_user
+		 WHERE namespace.nspname='public' AND class.relname='schedules'`,
+	).Scan(&primarySessionUser, &primaryCurrentUser, &primaryOwnsStore); err != nil {
+		t.Fatal(err)
+	}
+	if primarySessionUser != primaryCurrentUser || !primaryOwnsStore {
+		t.Fatalf("primary compatibility Store is not the schema owner: session=%q current=%q owns=%t",
+			primarySessionUser, primaryCurrentUser, primaryOwnsStore)
+	}
 
 	tx, err := st.beginResearchTransaction(t.Context(), pgx.TxOptions{})
 	if err != nil {

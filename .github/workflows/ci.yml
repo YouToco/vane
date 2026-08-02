@@ -54,13 +54,13 @@ jobs:
         run: go run ./cmd/agenttoolinventory -check
 
       - name: Test
-        # The migration-heavy store package can exceed 15 minutes on a clean
+        # The migration-heavy store package can exceed 25 minutes on a clean
         # race+coverage run. Every DB-backed package shares this one PostgreSQL
         # service, and some security tests deliberately mutate roles and ACLs.
         # Serialize packages and t.Parallel tests so those global mutations
         # cannot make unrelated lease/clock tests fail nondeterministically.
         # Explicit goroutine concurrency inside tests remains race-covered.
-        run: go test -race -p=1 -parallel=1 -timeout=25m -coverprofile=coverage.txt -covermode=atomic ./...
+        run: go test -race -p=1 -parallel=1 -timeout=40m -coverprofile=coverage.txt -covermode=atomic ./...
         env:
           DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
 

@@ -640,6 +640,7 @@ func taskDefinitionEditStartupStoreCalls(
 			receiver, receiverOK := taskDefinitionEditStoreUnparen(selector.X).(*ast.Ident)
 			return receiverOK && receiver.Name == "store" &&
 				(selector.Sel.Name == "New" || selector.Sel.Name == "NewWithResearchRuntime" ||
+					selector.Sel.Name == "NewWithResearchRuntimeCapability" ||
 					selector.Sel.Name == "NewServerRuntimeWithResearchRuntimeCapability")
 		})
 		if !constructsStore {

@@ -54,7 +54,17 @@ import (
 // 值 = CHANGELOG 最上方已发布版本号，随发版手动同步；不为此新增 ldflags 基建。
 const vaneVersion = "0.5.1"
 
+// serverReleaseContractV1 is a machine-readable, side-effect-free deployment
+// assertion.  The control plane checks this exact value before it is allowed
+// to pair a binary with the temporary owner-compatible primary Store contract.
+// V3 execution remains on the independently authenticated research runtime.
+const serverReleaseContractV1 = "vane.server-release-contract/v1 primary_store=owner_compat_v1 research_store=restricted_v1"
+
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "-print-release-contract" {
+		fmt.Println(serverReleaseContractV1)
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "vane: %v\n", err)
 		os.Exit(1)
@@ -74,7 +84,15 @@ func run() error {
 
 	initLogger(cfg.Log.Level)
 
-	st, err := store.NewServerRuntimeWithResearchRuntimeCapability(
+	// The primary Store still contains retained recovery and reconciliation
+	// readers which enumerate tenant shards before re-entering a tenant-scoped
+	// role.  Running that graph as vane_server_runtime currently turns some of
+	// those reads into either permission errors or RLS-empty success.  Keep the
+	// primary pool on the schema-owner compatibility boundary until the full
+	// recovery catalog and every per-tenant reader have passed the real
+	// PostgreSQL server-runtime gate.  Paid V3 execution remains isolated on the
+	// independent research runtime pool below.
+	st, err := store.NewWithResearchRuntimeCapability(
 		ctx, cfg.DB.URL, cfg.DB.ResearchRuntimeURL,
 		store.ResearchRunCapabilityConfigV1{
 			ActiveKeyID:  cfg.DB.ResearchCapabilityKeyID,
