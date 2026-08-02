@@ -20,6 +20,7 @@ type ResearchV3DefinitionPrepareOperation struct {
 	IdempotencyKey       string
 	Target               ResearchV3DefinitionHead
 	PreviousPreparedHead *ResearchV3DefinitionHead
+	SourceBaselineDigest string
 	OriginalMode         ExecutionMode
 	OriginalHead         *ResearchV3DefinitionHead
 	Phase                ResearchV3DefinitionPreparePhase

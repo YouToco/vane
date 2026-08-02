@@ -30,10 +30,13 @@ Research V3 shadow 是正式切流前的独立技术验证路径。它读取 del
 
 ```powershell
 $env:VANE_MIGRATION_DB_URL = "<one-shot migration owner DSN>"
-go run ./cmd/researchprepare -operation prepare -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <stable-prepare-key> -policy-file <policy.json>
+/opt/vane/bin/vane-research-prepare -operation prepare -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <stable-prepare-key> -policy-file <policy.json>
 ```
 
 Prepare 重试必须复用同一个 key。相同 key 但 task projection/policy 不同会 fail-closed；旧 immutable definition 不会覆盖或删除。
+`vane-research-prepare rollback` 只允许在尚未创建切流 journal 时执行；一旦
+cutover 进入 prepared、pause 或后续恢复阶段，sidecar 会被硬围栏保留，必须先由
+`vane-research-cutover rollback` 收敛到 `rolled_back`，避免调度已暂停但定义被删除。
 
 ```powershell
 go run ./cmd/researchshadow -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <stable-key>
@@ -81,5 +84,5 @@ Rollback 首先撤销数据库投递 authority，然后暂停、恢复冻结的�
 若只需撤销尚未切流的 prepared sidecar：
 
 ```powershell
-go run ./cmd/researchprepare -operation rollback -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <same-stable-prepare-key>
+/opt/vane/bin/vane-research-prepare -operation rollback -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <same-stable-prepare-key>
 ```

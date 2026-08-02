@@ -1,5 +1,11 @@
 # Vane 部署
 
+`vane-deploy` 必须构建并安装一次性控制面产物
+`bin/vane-research-prepare` 到 `/opt/vane/bin/vane-research-prepare`。它不是
+systemd 常驻服务，只能按 V3 shadow runbook 临时执行，并只在该进程中注入
+migration-owner 凭证；长期运行的 `vane` 服务不得获得该凭证或
+`vane_research_v3_cutover_operator` 角色。
+
 目标环境：ByteVirt VPS（Debian 11，2C/4G/40G），域名 `vane.zhuoqidev.com`。
 
 ## 架构

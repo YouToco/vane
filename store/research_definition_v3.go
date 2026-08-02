@@ -20,12 +20,23 @@ func (s *Store) HasCurrentResearchApprovedDefinitionV3(
 	if err := validateTaskStateScope(tenantID, userID, taskID); err != nil {
 		return false, err
 	}
-	head, err := loadPreparedResearchV3HeadTx(ctx, s.pool, tenantID, userID, taskID, false)
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return false, taskStateDatabaseError("begin research V3 preflight", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3AppScopeTx(ctx, tx, tenantID, userID); err != nil {
+		return false, err
+	}
+	head, err := loadPreparedResearchV3HeadTx(ctx, tx, tenantID, userID, taskID, false)
 	if types.CodeOf(err) == types.CodeNotFound || errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, taskStateDatabaseError("commit research V3 preflight", err)
 	}
 	return head.Version > 0, nil
 }

@@ -344,8 +344,16 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 			if !bytes.Equal(desc.GetConflictToken(), op.FrozenConflictToken) {
 				return types.ResearchV3CutoverOperation{}, c.abortUnownedSchedulePause(ctx, op)
 			}
-			op, err = c.advance(ctx, op, types.ResearchV3CutoverPrepared,
+			current := op
+			op, err = c.advance(ctx, current, types.ResearchV3CutoverPrepared,
 				types.ResearchV3CutoverPauseRequested)
+			if err != nil && types.CodeOf(err) == types.CodeConflict {
+				op, err = c.recoverForwardStoreConflict(ctx, current, err)
+				if err != nil {
+					return types.ResearchV3CutoverOperation{}, err
+				}
+				continue
+			}
 		case types.ResearchV3CutoverPauseRequested:
 			if observed.target {
 				return types.ResearchV3CutoverOperation{}, c.rollbackCutoverConflict(ctx, op,
@@ -356,16 +364,32 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 				if !observed.paused {
 					return types.ResearchV3CutoverOperation{}, c.abortUnownedSchedulePause(ctx, op)
 				}
-				op, err = c.advance(ctx, op, types.ResearchV3CutoverPauseRequested,
+				current := op
+				op, err = c.advance(ctx, current, types.ResearchV3CutoverPauseRequested,
 					types.ResearchV3CutoverPaused)
+				if err != nil && types.CodeOf(err) == types.CodeConflict {
+					op, err = c.recoverForwardStoreConflict(ctx, current, err)
+					if err != nil {
+						return types.ResearchV3CutoverOperation{}, err
+					}
+					continue
+				}
 			} else if !observed.paused {
 				if !bytes.Equal(desc.GetConflictToken(), op.FrozenConflictToken) {
 					return types.ResearchV3CutoverOperation{}, c.abortUnownedSchedulePause(ctx, op)
 				}
 				err = c.casState(ctx, op, desc, frozen, false, true, "pause")
 				if err == nil {
-					op, err = c.advance(ctx, op, types.ResearchV3CutoverPauseRequested,
+					current := op
+					op, err = c.advance(ctx, current, types.ResearchV3CutoverPauseRequested,
 						types.ResearchV3CutoverPaused)
+					if err != nil && types.CodeOf(err) == types.CodeConflict {
+						op, err = c.recoverForwardStoreConflict(ctx, current, err)
+						if err != nil {
+							return types.ResearchV3CutoverOperation{}, err
+						}
+						continue
+					}
 				}
 			} else {
 				// Re-submit the exact initial-token/request-id mutation. Temporal's
@@ -381,8 +405,16 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 				if err != nil {
 					return types.ResearchV3CutoverOperation{}, c.abortUnownedSchedulePause(ctx, op)
 				}
-				op, err = c.advance(ctx, op, types.ResearchV3CutoverPauseRequested,
+				current := op
+				op, err = c.advance(ctx, current, types.ResearchV3CutoverPauseRequested,
 					types.ResearchV3CutoverPaused)
+				if err != nil && types.CodeOf(err) == types.CodeConflict {
+					op, err = c.recoverForwardStoreConflict(ctx, current, err)
+					if err != nil {
+						return types.ResearchV3CutoverOperation{}, err
+					}
+					continue
+				}
 			}
 		case types.ResearchV3CutoverPaused:
 			if observed.target {
@@ -392,7 +424,15 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 				err = types.NewAppError(types.CodeConflict,
 					"research V3 cutover lost its paused fence", types.ErrConflict)
 			} else {
-				op, err = c.journal.PromoteResearchV3PreparedDefinition(ctx, op)
+				current := op
+				op, err = c.journal.PromoteResearchV3PreparedDefinition(ctx, current)
+				if err != nil && types.CodeOf(err) == types.CodeConflict {
+					op, err = c.recoverForwardStoreConflict(ctx, current, err)
+					if err != nil {
+						return types.ResearchV3CutoverOperation{}, err
+					}
+					continue
+				}
 			}
 		case types.ResearchV3CutoverDefinitionPromoted:
 			if !observed.paused {
@@ -403,7 +443,11 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 				op, err = c.advance(ctx, current, types.ResearchV3CutoverDefinitionPromoted,
 					types.ResearchV3CutoverActionSwapped)
 				if err != nil && types.CodeOf(err) == types.CodeConflict {
-					return types.ResearchV3CutoverOperation{}, c.rollbackCutoverConflict(ctx, current, err)
+					op, err = c.recoverForwardStoreConflict(ctx, current, err)
+					if err != nil {
+						return types.ResearchV3CutoverOperation{}, err
+					}
+					continue
 				}
 			} else if err = c.journal.RecheckResearchV3CutoverDefinition(ctx, op); err == nil {
 				err = c.casAction(ctx, op, desc, frozen, target, "swap-action")
@@ -419,7 +463,11 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 				var advanced types.ResearchV3CutoverOperation
 				advanced, err = c.advance(ctx, current, types.ResearchV3CutoverActionSwapped, types.ResearchV3CutoverActive)
 				if err != nil && types.CodeOf(err) == types.CodeConflict {
-					return types.ResearchV3CutoverOperation{}, c.rollbackCutoverConflict(ctx, current, err)
+					op, err = c.recoverForwardStoreConflict(ctx, current, err)
+					if err != nil {
+						return types.ResearchV3CutoverOperation{}, err
+					}
+					continue
 				}
 				if err == nil {
 					op = advanced
@@ -853,6 +901,30 @@ func (c *researchV3CutoverCoordinator) advance(
 		return op, err
 	}
 	return advanced, nil
+}
+
+// recoverForwardStoreConflict separates a stale optimistic checkpoint from a
+// verified definition drift. A second Resume may have legally advanced the
+// same journal; compensating that stale caller would undo another caller's
+// owned Temporal mutation.
+func (c *researchV3CutoverCoordinator) recoverForwardStoreConflict(
+	ctx context.Context, stale types.ResearchV3CutoverOperation, cause error,
+) (types.ResearchV3CutoverOperation, error) {
+	latest, found, err := c.journal.LoadResearchV3Cutover(
+		ctx, stale.TenantID, stale.UserID, stale.TaskID, stale.IdempotencyKey)
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	if !found {
+		return types.ResearchV3CutoverOperation{}, cause
+	}
+	if latest.Phase != stale.Phase {
+		return latest, nil
+	}
+	if errors.Is(cause, types.ErrResearchV3CutoverDrift) {
+		return types.ResearchV3CutoverOperation{}, c.rollbackCutoverConflict(ctx, latest, cause)
+	}
+	return types.ResearchV3CutoverOperation{}, cause
 }
 
 func cloneDescribedScheduleV3(

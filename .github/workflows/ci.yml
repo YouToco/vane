@@ -73,4 +73,6 @@ jobs:
           DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
 
       - name: Build
-        run: go build -o bin/vane ./cmd/server
+        run: |
+          go build -o bin/vane ./cmd/server
+          go build -o bin/vane-research-prepare ./cmd/researchprepare

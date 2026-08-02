@@ -69,6 +69,15 @@ func (s *Store) CreateOrGetResearchRunSnapshotWithAuthorityV3(
 		return types.ResearchRunSnapshotRefV3{}, researchRunDatabaseError("begin research snapshot transaction", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3AppScopeTx(
+		ctx, tx, identity.TenantID, identity.UserID); err != nil {
+		return types.ResearchRunSnapshotRefV3{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,101))`,
+		fmt.Sprintf("%d/%d/%s", identity.TenantID, identity.UserID, identity.TaskID)); err != nil {
+		return types.ResearchRunSnapshotRefV3{}, researchRunDatabaseError(
+			"lock research V3 task baseline", err)
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1,$2))`,
 		identity.TemporalRunID, taskRunSnapshotLockSeed); err != nil {
@@ -285,6 +294,15 @@ func loadResearchRunSnapshotRowV3(
 func loadCurrentResearchDefinitionV3(
 	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
 ) (int64, string, taskstate.ApprovedDefinitionV3, error) {
+	if isExactResearchV3ShadowWorkflowID(identity.TemporalWorkflowID) {
+		binding, err := loadPreparedResearchV3BindingTx(
+			ctx, tx, identity.TenantID, identity.UserID, identity.TaskID, true,
+			researchV3ExpectBaseOrTargetHead)
+		if err != nil {
+			return 0, "", taskstate.ApprovedDefinitionV3{}, err
+		}
+		return binding.Target.Version, binding.Target.Digest, binding.Definition, nil
+	}
 	var version int64
 	var digest, schemaVersion string
 	var payload, scheduleSpec []byte
@@ -309,26 +327,6 @@ func loadCurrentResearchDefinitionV3(
 		    )) AND schedule.execution_mode='discover_at_run'
 		  FOR SHARE OF schedule`
 	args := []any{identity.TaskID, identity.TenantID, identity.UserID, identity.TemporalWorkflowID}
-	if isExactResearchV3ShadowWorkflowID(identity.TemporalWorkflowID) {
-		query = `SELECT head.definition_version,head.definition_digest,
-		        definition.schema_version,definition.payload,schedule.spec_json
-		   FROM schedules schedule
-		   JOIN tenants tenant ON tenant.id=schedule.tenant_id AND tenant.status='active'
-		   JOIN memberships membership
-		     ON membership.tenant_id=schedule.tenant_id AND membership.user_id=schedule.user_id
-		   JOIN research_v3_prepared_definition_heads head
-		     ON head.tenant_id=schedule.tenant_id AND head.user_id=schedule.user_id
-		    AND head.task_id=schedule.id
-		   JOIN task_approved_definition_versions definition
-		     ON definition.tenant_id=head.tenant_id AND definition.user_id=head.user_id
-		    AND definition.task_id=head.task_id AND definition.version=head.definition_version
-		    AND definition.definition_digest=head.definition_digest
-		    AND definition.execution_mode=head.execution_mode
-		  WHERE schedule.id=$1 AND schedule.tenant_id=$2 AND schedule.user_id=$3
-		    AND schedule.status='active' AND head.execution_mode='discover_at_run'
-		  FOR SHARE OF schedule,head`
-		args = args[:3]
-	}
 	err := tx.QueryRow(ctx, query, args...).Scan(
 		&version, &digest, &schemaVersion, &payload, &scheduleSpec)
 	if errors.Is(err, pgx.ErrNoRows) {

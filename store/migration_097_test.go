@@ -61,8 +61,14 @@ func TestMigration097DownRefusesClaimedUnsettledProviderEffectPostgres(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Migration 102 is deliberately irreversible because its cutover recovery
+	// state cannot be reconstructed by DDL rollback. On a latest-schema binary,
+	// that stronger outer fence may reject DownTo before migration 097 gets a
+	// chance to evaluate its own claimed-effect fence; either rejection must
+	// leave the 097 recovery rows and gateway privilege untouched below.
 	if _, err := provider.DownTo(t.Context(), 96); err == nil ||
-		!strings.Contains(err.Error(), "cannot remove frozen or issued process gateway effects") {
+		(!strings.Contains(err.Error(), "cannot remove frozen or issued process gateway effects") &&
+			!strings.Contains(err.Error(), "irreversible V3 prepare/cutover recovery migration")) {
 		t.Fatalf("097 Down did not fail closed after unsettled claim: %v", err)
 	}
 

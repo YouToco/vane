@@ -19,17 +19,19 @@ import (
 )
 
 type researchV3CutoverJournalFake struct {
-	schedule         *types.Schedule
-	head             types.ResearchV3DefinitionHead
-	op               types.ResearchV3CutoverOperation
-	recheckErr       error
-	preflightErr     error
-	revoked          bool
-	advanceLostPhase types.ResearchV3CutoverPhase
-	advanceLost      bool
-	advanceConflict  types.ResearchV3CutoverPhase
-	onBegin          func()
-	events           []string
+	schedule          *types.Schedule
+	head              types.ResearchV3DefinitionHead
+	op                types.ResearchV3CutoverOperation
+	recheckErr        error
+	preflightErr      error
+	revoked           bool
+	advanceLostPhase  types.ResearchV3CutoverPhase
+	advanceLost       bool
+	advanceConflict   types.ResearchV3CutoverPhase
+	advanceConcurrent types.ResearchV3CutoverPhase
+	promoteConcurrent bool
+	onBegin           func()
+	events            []string
 }
 
 func (f *researchV3CutoverJournalFake) GetSchedule(
@@ -102,6 +104,10 @@ func (f *researchV3CutoverJournalFake) PromoteResearchV3PreparedDefinition(
 	}
 	f.op.Phase = types.ResearchV3CutoverDefinitionPromoted
 	f.events = append(f.events, "phase:"+string(f.op.Phase))
+	if f.promoteConcurrent {
+		f.promoteConcurrent = false
+		return types.ResearchV3CutoverOperation{}, types.ErrConflict
+	}
 	return f.op, nil
 }
 
@@ -140,10 +146,14 @@ func (f *researchV3CutoverJournalFake) AdvanceResearchV3Cutover(
 	}
 	if next == f.advanceConflict {
 		return types.ResearchV3CutoverOperation{}, types.NewAppError(
-			types.CodeConflict, "definition head drifted", types.ErrConflict)
+			types.CodeConflict, "definition head drifted", types.ErrResearchV3CutoverDrift)
 	}
 	f.op.Phase = next
 	f.events = append(f.events, "phase:"+string(next))
+	if next == f.advanceConcurrent {
+		f.advanceConcurrent = ""
+		return types.ResearchV3CutoverOperation{}, types.ErrConflict
+	}
 	if next == f.advanceLostPhase && !f.advanceLost {
 		f.advanceLost = true
 		return types.ResearchV3CutoverOperation{}, errors.New("checkpoint response lost")
@@ -423,6 +433,43 @@ func TestResearchV3CutoverDefinitionDriftAfterTemporalCASRollsBack(t *testing.T)
 				len(remote.updates) != tc.wantUpdates || !proto.Equal(remote.schedule, original) {
 				t.Fatalf("err=%v revoked=%t phase=%s updates=%d", err, journal.revoked,
 					journal.op.Phase, len(remote.updates))
+			}
+		})
+	}
+}
+
+func TestResearchV3CutoverConcurrentResumeAdoptsAdvancedCheckpoint(t *testing.T) {
+	tests := []struct {
+		name       string
+		concurrent types.ResearchV3CutoverPhase
+		promote    bool
+	}{
+		{name: "stale_prepared", concurrent: types.ResearchV3CutoverPauseRequested},
+		{name: "stale_pause_requested_after_pause_cas", concurrent: types.ResearchV3CutoverPaused},
+		{name: "stale_paused_promote", promote: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			journal := researchV3CutoverJournalForTest()
+			journal.advanceConcurrent = tc.concurrent
+			journal.promoteConcurrent = tc.promote
+			original := researchV3MondaySchedule(t)
+			remote := &researchV3ScheduleRemoteFake{
+				schedule: proto.Clone(original).(*schedulepb.Schedule),
+			}
+			coordinator := researchV3CutoverCoordinatorForTest(t, journal, remote)
+			op, err := coordinator.Cutover(t.Context(), researchV3CutoverRequest{
+				TaskID: "task-kimi", UserID: 42, IdempotencyKey: "concurrent-" + tc.name,
+			})
+			if err != nil || op.Phase != types.ResearchV3CutoverActive || journal.revoked {
+				t.Fatalf("err=%v phase=%s revoked=%t", err, op.Phase, journal.revoked)
+			}
+			if remote.schedule.GetState().GetPaused() ||
+				remote.schedule.GetAction().GetStartWorkflow().GetWorkflowType().GetName() !=
+					workflow.ResearchScheduledWorkflowV3Name {
+				t.Fatalf("coordinator failed to converge after stale checkpoint: paused=%t workflow=%q",
+					remote.schedule.GetState().GetPaused(),
+					remote.schedule.GetAction().GetStartWorkflow().GetWorkflowType().GetName())
 			}
 		})
 	}

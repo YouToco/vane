@@ -310,6 +310,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		researchBriefDeliveriesAvailable   bool
 		researchV3AuthoritiesAvailable     bool
 		researchV3CutoversAvailable        bool
+		researchV3PrepareHeadsAvailable    bool
+		researchV3PrepareOpsAvailable      bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -335,7 +337,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.research_run_capabilities') IS NOT NULL,
 		        to_regclass('public.research_brief_deliveries') IS NOT NULL,
 		        to_regclass('public.research_v3_delivery_authorities') IS NOT NULL,
-		        to_regclass('public.research_v3_cutover_operations') IS NOT NULL`,
+		        to_regclass('public.research_v3_cutover_operations') IS NOT NULL,
+		        to_regclass('public.research_v3_prepared_definition_heads') IS NOT NULL,
+		        to_regclass('public.research_v3_definition_prepare_operations') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -361,35 +365,39 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&researchBriefDeliveriesAvailable,
 		&researchV3AuthoritiesAvailable,
 		&researchV3CutoversAvailable,
+		&researchV3PrepareHeadsAvailable,
+		&researchV3PrepareOpsAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
 	}
 	optionalPurgeTables := map[string]bool{
-		"canonical_brief_stages":               canonicalBriefStagesAvailable,
-		"profile_epochs":                       profileEpochsAvailable,
-		"profile_feedback_epoch_fences":        profileEpochFencesAvailable,
-		"profile_epoch_checkpoints":            profileCheckpointsAvailable,
-		"profile_epoch_events":                 profileEpochEventsAvailable,
-		"profile_epoch_receipts":               profileEpochReceiptsAvailable,
-		"profile_epoch_activities":             profileActivitiesAvailable,
-		"executive_brief_synthesis_receipts":   executiveReceiptsAvailable,
-		"executive_brief_artifacts":            executiveArtifactsAvailable,
-		"brief_report_settings":                reportSettingsAvailable,
-		"periodic_brief_intents":               periodicIntentsAvailable,
-		"periodic_synthesis_receipts":          periodicReceiptsAvailable,
-		"periodic_brief_reports":               periodicReportsAvailable,
-		"periodic_report_deliveries":           periodicDeliveriesAvailable,
-		"research_brief_syntheses":             researchBriefsAvailable,
-		"research_run_evidence":                researchEvidenceAvailable,
-		"research_run_llm_spend_settlements":   researchLLMSettlementsAvailable,
-		"research_run_llm_spend_reservations":  researchLLMReservationsAvailable,
-		"research_run_step_spend_settlements":  researchSpendSettlementsAvailable,
-		"research_run_step_spend_reservations": researchSpendReservationsAvailable,
-		"research_run_capabilities":            researchRunCapabilitiesAvailable,
-		"research_brief_deliveries":            researchBriefDeliveriesAvailable,
-		"research_v3_delivery_authorities":     researchV3AuthoritiesAvailable,
-		"research_v3_cutover_operations":       researchV3CutoversAvailable,
+		"canonical_brief_stages":                    canonicalBriefStagesAvailable,
+		"profile_epochs":                            profileEpochsAvailable,
+		"profile_feedback_epoch_fences":             profileEpochFencesAvailable,
+		"profile_epoch_checkpoints":                 profileCheckpointsAvailable,
+		"profile_epoch_events":                      profileEpochEventsAvailable,
+		"profile_epoch_receipts":                    profileEpochReceiptsAvailable,
+		"profile_epoch_activities":                  profileActivitiesAvailable,
+		"executive_brief_synthesis_receipts":        executiveReceiptsAvailable,
+		"executive_brief_artifacts":                 executiveArtifactsAvailable,
+		"brief_report_settings":                     reportSettingsAvailable,
+		"periodic_brief_intents":                    periodicIntentsAvailable,
+		"periodic_synthesis_receipts":               periodicReceiptsAvailable,
+		"periodic_brief_reports":                    periodicReportsAvailable,
+		"periodic_report_deliveries":                periodicDeliveriesAvailable,
+		"research_brief_syntheses":                  researchBriefsAvailable,
+		"research_run_evidence":                     researchEvidenceAvailable,
+		"research_run_llm_spend_settlements":        researchLLMSettlementsAvailable,
+		"research_run_llm_spend_reservations":       researchLLMReservationsAvailable,
+		"research_run_step_spend_settlements":       researchSpendSettlementsAvailable,
+		"research_run_step_spend_reservations":      researchSpendReservationsAvailable,
+		"research_run_capabilities":                 researchRunCapabilitiesAvailable,
+		"research_brief_deliveries":                 researchBriefDeliveriesAvailable,
+		"research_v3_delivery_authorities":          researchV3AuthoritiesAvailable,
+		"research_v3_cutover_operations":            researchV3CutoversAvailable,
+		"research_v3_prepared_definition_heads":     researchV3PrepareHeadsAvailable,
+		"research_v3_definition_prepare_operations": researchV3PrepareOpsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
@@ -442,11 +450,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			name: "research_v3_prepared_definition_heads",
 			query: `SELECT task_id FROM research_v3_prepared_definition_heads
 			         WHERE tenant_id = $1 ORDER BY user_id,task_id FOR UPDATE`,
+			optional: true,
 		},
 		{
 			name: "research_v3_definition_prepare_operations",
 			query: `SELECT id FROM research_v3_definition_prepare_operations
 			         WHERE tenant_id = $1 ORDER BY id FOR UPDATE`,
+			optional: true,
 		},
 		{
 			name: "research_v3_cutover_operations",

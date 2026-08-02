@@ -83,6 +83,11 @@ func newResearchBriefFixtureWithWorkflowV3(
 		taskID, tenantID, userID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.pool.Exec(ctx, `INSERT INTO schedule_playbooks
+		(schedule_id,content,fetch_plan) VALUES($1,$2,'{}')`, taskID,
+		"检查 Kimi 官方套餐；没有达到门槛不推送。"); err != nil {
+		t.Fatal(err)
+	}
 	definition, err := taskstate.BuildApprovedDefinitionV3(taskstate.ApprovedDefinitionInputV3{
 		TenantID: tenantID, UserID: userID, TaskID: taskID,
 		TaskName: "Kimi pricing", TaskManual: "检查 Kimi 官方套餐；没有达到门槛不推送。",
@@ -107,6 +112,12 @@ func newResearchBriefFixtureWithWorkflowV3(
 	}
 	definitionPayload, _ := taskstate.EncodeApprovedDefinitionV3(definition)
 	definitionDigest, _ := taskstate.DigestApprovedDefinitionV3(definition)
+	baseHead := &types.ResearchV3DefinitionHead{Version: 1, Digest: definitionDigest}
+	baselineDigest, err := sealResearchV3SourceBaseline(
+		definition, types.StrictnessStrict, types.ExecutionModeDiscoverAtRun, baseHead)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO task_approved_definition_versions (
 		     tenant_id,user_id,task_id,version,schema_version,execution_mode,
@@ -129,17 +140,19 @@ func newResearchBriefFixtureWithWorkflowV3(
 	if err := st.pool.QueryRow(ctx,
 		`INSERT INTO research_v3_definition_prepare_operations
 		 (tenant_id,user_id,task_id,idempotency_key,target_definition_version,
-		  target_definition_digest,original_execution_mode,
+		  target_definition_digest,source_baseline_digest,original_execution_mode,
 		  original_definition_version,original_definition_digest)
-		 VALUES($1,$2,$3,$4,1,$5,'discover_at_run',1,$5) RETURNING id`,
-		tenantID, userID, taskID, "fixture-"+uuid.NewString(), definitionDigest,
+		 VALUES($1,$2,$3,$4,1,$5,$6,'discover_at_run',1,$5) RETURNING id`,
+		tenantID, userID, taskID, "fixture-"+uuid.NewString(), definitionDigest, baselineDigest,
 	).Scan(&prepareOperationID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO research_v3_prepared_definition_heads
-		 (tenant_id,user_id,task_id,definition_version,definition_digest,prepare_operation_id)
-		 VALUES($1,$2,$3,1,$4,$5)`, tenantID, userID, taskID, definitionDigest, prepareOperationID); err != nil {
+		 (tenant_id,user_id,task_id,definition_version,definition_digest,prepare_operation_id,
+		  base_execution_mode,base_definition_version,base_definition_digest,source_baseline_digest)
+		 VALUES($1,$2,$3,1,$4,$5,'discover_at_run',1,$4,$6)`, tenantID, userID,
+		taskID, definitionDigest, prepareOperationID, baselineDigest); err != nil {
 		t.Fatal(err)
 	}
 	if authorityToken != "" {

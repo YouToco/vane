@@ -3,9 +3,11 @@ package store
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -28,6 +30,19 @@ func researchV3PreparePolicyForTest() taskstate.ResearchV3DefinitionPrepareParam
 			MaxPlannerRounds: 8, MaxToolCalls: 16, MaxTokens: 32768,
 			MaxCostMicroUSD: 1_000_000, DurationMs: 300_000,
 		},
+	}
+}
+
+func researchV3CutoverParamsForTest(tenantID, userID int64, taskID, key string,
+	head types.ResearchV3DefinitionHead,
+) types.BeginResearchV3CutoverParams {
+	frozen, token, target := []byte("frozen-schedule"), []byte("conflict-token"), []byte("target-action")
+	digest := func(payload []byte) string { sum := sha256.Sum256(payload); return hex.EncodeToString(sum[:]) }
+	return types.BeginResearchV3CutoverParams{
+		TenantID: tenantID, UserID: userID, TaskID: taskID, IdempotencyKey: key,
+		Definition: head, FrozenSchedule: frozen, FrozenScheduleDigest: digest(frozen),
+		FrozenConflictToken: token, ConflictTokenDigest: digest(token), TargetAction: target,
+		TargetActionDigest: digest(target), ActionAuthorizationDigest: strings.Repeat("0", 64),
 	}
 }
 
@@ -55,6 +70,42 @@ func researchV3PrepareFixture(t *testing.T) (*Store, int64, int64, string) {
 	if _, err := st.pool.Exec(t.Context(),
 		`INSERT INTO schedule_playbooks(schedule_id,content,fetch_plan)
 		 VALUES($1,'检查 Kimi 官方套餐与购买入口；交叉核验；没有重大更新不推送。','{}')`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	call, err := taskstate.BuildToolInvocationV1(
+		"web_search", "v1", json.RawMessage(`{"query":"Kimi official pricing"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := taskstate.BuildApprovedDefinitionV2(taskstate.ApprovedDefinitionInputV2{
+		TenantID: tenantID, UserID: userID, TaskID: taskID,
+		NLDescription: "Kimi 套餐可购买性",
+		SpecJSON:      json.RawMessage(`{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}`),
+		ScopeJSON:     json.RawMessage(`{"top_n":5}`),
+		TaskManual:    "检查 Kimi 官方套餐与购买入口；交叉核验；没有重大更新不推送。",
+		Strictness:    types.StrictnessStrict, ToolCalls: []taskstate.ToolInvocationV1{call},
+		ExecutionMode:  types.ExecutionModeCompiled,
+		DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
+		BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := taskstate.EncodeApprovedDefinitionV2(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDigest := digestTaskStatePayload(payload)
+	if _, err := st.pool.Exec(t.Context(), `INSERT INTO task_approved_definition_versions
+		(tenant_id,user_id,task_id,version,schema_version,execution_mode,
+		 definition_digest,payload,operation_ref)
+		VALUES($1,$2,$3,1,$4,'compiled',$5,$6,$7)`, tenantID, userID, taskID,
+		legacy.SchemaVersion, legacyDigest, payload, "v3-prepare-legacy:"+taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(), `UPDATE schedules SET
+		approved_definition_version=1,approved_definition_digest=$1 WHERE id=$2`,
+		legacyDigest, taskID); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -89,6 +140,11 @@ func TestResearchV3DefinitionPrepareSidecarPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if op.OriginalMode != types.ExecutionModeCompiled || op.OriginalHead == nil ||
+		op.OriginalHead.Version != *beforeVersion || op.OriginalHead.Digest != *beforeDigest ||
+		!validDigestSyntaxV3(op.SourceBaselineDigest) {
+		t.Fatalf("prepare did not freeze exact V2 head: %+v", op)
+	}
 	replayed, err := st.PrepareResearchV3Definition(ctx, p)
 	if err != nil || replayed.ID != op.ID || replayed.Target != op.Target {
 		t.Fatalf("replay=%+v err=%v", replayed, err)
@@ -103,7 +159,10 @@ func TestResearchV3DefinitionPrepareSidecarPostgres(t *testing.T) {
 	if err := st.pool.QueryRow(ctx, `SELECT spec_json::text,scope_json::text,status,execution_mode,approved_definition_version,approved_definition_digest FROM schedules WHERE id=$1`, taskID).Scan(&afterSpec, &afterScope, &afterStatus, &afterMode, &afterVersion, &afterDigest); err != nil {
 		t.Fatal(err)
 	}
-	if beforeSpec != afterSpec || beforeScope != afterScope || beforeStatus != afterStatus || beforeMode != afterMode || beforeVersion != nil || afterVersion != nil || beforeDigest != nil || afterDigest != nil {
+	if beforeSpec != afterSpec || beforeScope != afterScope || beforeStatus != afterStatus ||
+		beforeMode != afterMode || beforeVersion == nil || afterVersion == nil ||
+		*beforeVersion != *afterVersion || beforeDigest == nil || afterDigest == nil ||
+		*beforeDigest != *afterDigest {
 		t.Fatalf("prepare mutated production schedule: before=%q/%q/%q/%q after=%q/%q/%q/%q", beforeSpec, beforeScope, beforeStatus, beforeMode, afterSpec, afterScope, afterStatus, afterMode)
 	}
 
@@ -138,6 +197,286 @@ func TestResearchV3DefinitionPrepareRequiresOwnerPostgres(t *testing.T) {
 	p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey = tenantID, userID, taskID, "not-owner"
 	if _, err := st.PrepareResearchV3Definition(t.Context(), p); types.CodeOf(err) != types.CodeNotFound {
 		t.Fatalf("non-owner prepare err=%v", err)
+	}
+}
+
+func TestResearchV3ShadowAdmissionFencesConcurrentOwnerRevocationPostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	tests := []struct {
+		name   string
+		mutate string
+	}{
+		{name: "tenant_suspended", mutate: `UPDATE tenants SET status='suspended' WHERE id=$1`},
+		{name: "owner_downgraded", mutate: `UPDATE memberships SET role='member' WHERE tenant_id=$1 AND user_id=$2`},
+	}
+	for index, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, tenantID, userID, taskID := researchV3PrepareFixture(t)
+			p := researchV3PreparePolicyForTest()
+			p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey =
+				tenantID, userID, taskID, "admission-fence"
+			if _, err := st.PrepareResearchV3Definition(t.Context(), p); err != nil {
+				t.Fatal(err)
+			}
+
+			mutation, err := st.pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = mutation.Rollback(t.Context()) }()
+			args := []any{tenantID}
+			if tc.name == "owner_downgraded" {
+				args = append(args, userID)
+			}
+			identity := types.RunIdentity{
+				TemporalWorkflowID: "research-v3-shadow-" + strings.Repeat(string(rune('6'+index)), 64),
+				TemporalRunID:      "admission-" + uuid.NewString(), RunKind: types.RunSnapshotKindScheduled,
+				TenantID: tenantID, UserID: userID, TaskID: taskID,
+			}
+			policy := testCompiledRunPolicyV1(t)
+			tools := testResearchToolPolicyStoreV3(t)
+			model := testResearchModelPolicyStoreV3(t)
+			mutationReady := make(chan error, 1)
+			go func() {
+				_, mutateErr := mutation.Exec(t.Context(), tc.mutate, args...)
+				mutationReady <- mutateErr
+			}()
+			select {
+			case mutateErr := <-mutationReady:
+				if mutateErr != nil {
+					t.Fatal(mutateErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("authorization mutation did not acquire its task fence")
+			}
+			result := make(chan error, 1)
+			go func() {
+				_, createErr := st.CreateOrGetResearchRunSnapshotV3(
+					t.Context(), identity, policy, tools, model)
+				result <- createErr
+			}()
+
+			deadline := time.Now().Add(5 * time.Second)
+			blockedAtAdmission := false
+			for !blockedAtAdmission && time.Now().Before(deadline) {
+				select {
+				case createErr := <-result:
+					t.Fatalf("snapshot escaped concurrent authorization fence before commit: %v", createErr)
+				default:
+				}
+				if err := st.pool.QueryRow(t.Context(), `SELECT EXISTS (
+					SELECT 1 FROM pg_stat_activity
+					 WHERE datname=current_database() AND pid<>pg_backend_pid()
+					   AND state='active' AND wait_event_type='Lock' AND wait_event='advisory'
+				)`).Scan(&blockedAtAdmission); err != nil {
+					t.Fatal(err)
+				}
+				if !blockedAtAdmission {
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if !blockedAtAdmission {
+				t.Fatal("snapshot did not reach the authorization admission lock")
+			}
+			if err := mutation.Commit(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case createErr := <-result:
+				if createErr == nil {
+					t.Fatal("snapshot was admitted after authorization revocation committed")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("snapshot remained blocked after authorization mutation committed")
+			}
+			var count int
+			if err := st.pool.QueryRow(t.Context(), `SELECT count(*) FROM task_run_snapshots
+				WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND temporal_run_id=$4`,
+				tenantID, userID, taskID, identity.TemporalRunID).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("revoked shadow snapshot count=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func TestResearchV3PreparedBindingRejectsSourceDriftPostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	tests := []struct {
+		name   string
+		mutate string
+	}{
+		{"name", `UPDATE schedules SET nl_description='changed name' WHERE id=$1`},
+		{"manual", `UPDATE schedule_playbooks SET content='changed manual' WHERE schedule_id=$1`},
+		{"spec", `UPDATE schedules SET spec_json='{"cron":"5 9 * * 1","tz":"Asia/Shanghai"}' WHERE id=$1`},
+		{"policy", `UPDATE schedules SET push_strictness='loose' WHERE id=$1`},
+		{"legacy head", `UPDATE schedules SET approved_definition_version=NULL,approved_definition_digest=NULL WHERE id=$1`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, tenantID, userID, taskID := researchV3PrepareFixture(t)
+			p := researchV3PreparePolicyForTest()
+			p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey = tenantID, userID, taskID, "drift"
+			original, err := st.PrepareResearchV3Definition(t.Context(), p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.pool.Exec(t.Context(), tc.mutate, taskID); err != nil {
+				t.Fatal(err)
+			}
+			identity := types.RunIdentity{TemporalWorkflowID: "research-v3-shadow-" + strings.Repeat("1", 64), TemporalRunID: "run-" + uuid.NewString(), RunKind: types.RunSnapshotKindScheduled, TenantID: tenantID, UserID: userID, TaskID: taskID}
+			if _, err := st.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
+				testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
+				testResearchModelPolicyStoreV3(t)); types.CodeOf(err) != types.CodeConflict {
+				t.Fatalf("drift shadow err=%v", err)
+			}
+			var count int
+			if err := st.pool.QueryRow(t.Context(), `SELECT count(*) FROM task_run_snapshots
+				WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND temporal_run_id=$4`,
+				tenantID, userID, taskID, identity.TemporalRunID).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("drift persisted snapshot count=%d err=%v", count, err)
+			}
+			p.IdempotencyKey = "drift-reprepare"
+			reprepared, err := st.PrepareResearchV3Definition(t.Context(), p)
+			if err != nil || reprepared.Target == original.Target ||
+				reprepared.SourceBaselineDigest == original.SourceBaselineDigest {
+				t.Fatalf("reprepare=%+v original=%+v err=%v", reprepared, original, err)
+			}
+			identity.TemporalWorkflowID = "research-v3-shadow-" + strings.Repeat("4", 64)
+			identity.TemporalRunID = "run-" + uuid.NewString()
+			ref, err := st.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
+				testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
+				testResearchModelPolicyStoreV3(t))
+			if err != nil || ref.DefinitionVersion != reprepared.Target.Version ||
+				ref.DefinitionDigest != reprepared.Target.Digest {
+				t.Fatalf("reprepared shadow=%+v err=%v", ref, err)
+			}
+		})
+	}
+}
+
+func TestResearchV3CutoverRevalidatesDriftAndFencesPrepareRollbackPostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
+	p := researchV3PreparePolicyForTest()
+	p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey = tenantID, userID, taskID, "fenced"
+	prepared, err := st.PrepareResearchV3Definition(t.Context(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.BeginResearchV3Cutover(t.Context(),
+		researchV3CutoverParamsForTest(tenantID, userID, taskID, "fenced-cutover", prepared.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err = st.AdvanceResearchV3Cutover(t.Context(), op,
+		types.ResearchV3CutoverPrepared, types.ResearchV3CutoverPauseRequested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err = st.AdvanceResearchV3Cutover(t.Context(), op,
+		types.ResearchV3CutoverPauseRequested, types.ResearchV3CutoverPaused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RollbackResearchV3DefinitionPrepare(t.Context(), tenantID, userID,
+		taskID, p.IdempotencyKey); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("in-flight prepare rollback err=%v", err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE schedules SET push_strictness='normal' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PromoteResearchV3PreparedDefinition(t.Context(), op); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("post-pause drift promotion err=%v", err)
+	}
+	var mode string
+	var version int64
+	if err := st.pool.QueryRow(t.Context(), `SELECT execution_mode,approved_definition_version
+		FROM schedules WHERE id=$1`, taskID).Scan(&mode, &version); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "compiled" || version != 1 {
+		t.Fatalf("failed promotion mutated legacy head: mode=%s version=%d", mode, version)
+	}
+}
+
+func TestResearchV3CutoverBeginRejectsDriftAfterSuccessfulShadowPostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
+	p := researchV3PreparePolicyForTest()
+	p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey = tenantID, userID, taskID, "shadow-then-drift"
+	prepared, err := st.PrepareResearchV3Definition(t.Context(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := types.RunIdentity{TemporalWorkflowID: "research-v3-shadow-" + strings.Repeat("3", 64),
+		TemporalRunID: "run-" + uuid.NewString(), RunKind: types.RunSnapshotKindScheduled,
+		TenantID: tenantID, UserID: userID, TaskID: taskID}
+	if _, err := st.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
+		testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
+		testResearchModelPolicyStoreV3(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(), `UPDATE schedule_playbooks
+		SET content='manual edited after shadow' WHERE schedule_id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.BeginResearchV3Cutover(t.Context(),
+		researchV3CutoverParamsForTest(tenantID, userID, taskID, "begin-after-drift", prepared.Target)); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("begin after drift err=%v", err)
+	}
+	var count int
+	if err := st.pool.QueryRow(t.Context(), `SELECT count(*) FROM research_v3_cutover_operations
+		WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`, tenantID, userID, taskID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("drift began cutover count=%d err=%v", count, err)
+	}
+}
+
+func TestResearchV3PrepareJournalDoesNotBlockTaskDeletionPostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	for _, rolledBack := range []bool{false, true} {
+		name := "prepared"
+		if rolledBack {
+			name = "rolled_back"
+		}
+		t.Run(name, func(t *testing.T) {
+			st, tenantID, userID, taskID := researchV3PrepareFixture(t)
+			p := researchV3PreparePolicyForTest()
+			p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey = tenantID, userID, taskID, "delete"
+			if _, err := st.PrepareResearchV3Definition(t.Context(), p); err != nil {
+				t.Fatal(err)
+			}
+			if rolledBack {
+				if _, err := st.RollbackResearchV3DefinitionPrepare(
+					t.Context(), tenantID, userID, taskID, p.IdempotencyKey); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := st.pool.Exec(t.Context(), `DELETE FROM schedules
+				WHERE tenant_id=$1 AND user_id=$2 AND id=$3`, tenantID, userID, taskID); err != nil {
+				t.Fatalf("delete task with %s prepare journal: %v", name, err)
+			}
+			var operations, definitions int
+			if err := st.pool.QueryRow(t.Context(), `SELECT
+				(SELECT count(*) FROM research_v3_definition_prepare_operations
+				 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3),
+				(SELECT count(*) FROM task_approved_definition_versions
+				 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3)`, tenantID, userID, taskID).Scan(
+				&operations, &definitions); err != nil || operations != 0 || definitions != 0 {
+				t.Fatalf("delete cascade operations=%d definitions=%d err=%v",
+					operations, definitions, err)
+			}
+		})
 	}
 }
 
@@ -180,6 +519,18 @@ func TestResearchV3CutoverPromotesAndRestoresDefinitionHeadPostgres(t *testing.T
 	if mode != "discover_at_run" || status != "active" || spec != `{"tz": "Asia/Shanghai", "cron": "0 9 * * 1"}` || version != prepared.Target.Version || headDigest != prepared.Target.Digest {
 		t.Fatalf("promoted schedule=%s/%s/%s/%d/%s", mode, status, spec, version, headDigest)
 	}
+	if err := st.RecheckResearchV3CutoverDefinition(ctx, op); err != nil {
+		t.Fatalf("post-promotion stage-aware recheck: %v", err)
+	}
+	shadowIdentity := types.RunIdentity{TemporalWorkflowID: "research-v3-shadow-" + strings.Repeat("5", 64),
+		TemporalRunID: "post-promote-" + uuid.NewString(), RunKind: types.RunSnapshotKindScheduled,
+		TenantID: tenantID, UserID: userID, TaskID: taskID}
+	ref, err := st.CreateOrGetResearchRunSnapshotV3(ctx, shadowIdentity,
+		testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
+		testResearchModelPolicyStoreV3(t))
+	if err != nil || ref.DefinitionDigest != prepared.Target.Digest {
+		t.Fatalf("post-promotion delivery-dark shadow=%+v err=%v", ref, err)
+	}
 	if err := st.RevokeResearchV3DeliveryAuthority(ctx, op); err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +547,9 @@ func TestResearchV3CutoverPromotesAndRestoresDefinitionHeadPostgres(t *testing.T
 	if err := st.pool.QueryRow(ctx, `SELECT execution_mode,status,spec_json::text,approved_definition_version,approved_definition_digest FROM schedules WHERE id=$1`, taskID).Scan(&mode, &status, &spec, &restoredVersion, &restoredDigest); err != nil {
 		t.Fatal(err)
 	}
-	if mode != "compiled" || status != "active" || restoredVersion != nil || restoredDigest != nil {
+	if mode != "compiled" || status != "active" || restoredVersion == nil ||
+		restoredDigest == nil || *restoredVersion != 1 ||
+		*restoredDigest != prepared.OriginalHead.Digest {
 		t.Fatalf("restored schedule=%s/%s/%v/%v", mode, status, restoredVersion, restoredDigest)
 	}
 }
