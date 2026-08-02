@@ -38,6 +38,8 @@ import (
 var obsRunBase = time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC).
 	AddDate(0, 0, rand.IntN(500000))
 
+const obsTenantID int64 = 1
+
 // obsWindow 为一个子测试圈出独占的远期窗口，返回窗口起点（恰好落在 UTC 日界）。
 //
 // 前置清理不是多余的：上一次跑到一半崩掉会留下残行，而残行在这里表现为
@@ -83,10 +85,10 @@ func insertLLMCall(ctx context.Context, t *testing.T, st *Store, r llmRow) {
 	}
 	_, err := st.pool.Exec(ctx,
 		`INSERT INTO llm_calls
-		     (trace_id, span_name, user_id, model, user_prompt, completion, completion_tokens,
+		     (trace_id, span_name, user_id, tenant_id, model, user_prompt, completion, completion_tokens,
 		      error, cost_usd, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		r.TraceID, r.SpanName, r.UserID, r.Model, r.UserPrompt, r.Completion, r.CompletionTokens,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		r.TraceID, r.SpanName, r.UserID, obsTenantID, r.Model, r.UserPrompt, r.Completion, r.CompletionTokens,
 		r.Error, r.CostUSD, r.CreatedAt)
 	if err != nil {
 		t.Fatalf("插入合成 llm_calls 行失败: %v", err)
@@ -150,7 +152,7 @@ func TestObservabilityStore(t *testing.T) {
 			insertLLMCall(ctx, t, st, llmRow{TraceID: "obs-varied", Completion: c, CreatedAt: at.Add(time.Minute)})
 		}
 
-		got, err := st.ListScoreTraceStats(ctx, base, 5)
+		got, err := st.ListScoreTraceStats(ctx, obsTenantID, base, 5)
 		if err != nil {
 			t.Fatalf("ListScoreTraceStats() 失败: %v", err)
 		}
@@ -201,7 +203,7 @@ func TestObservabilityStore(t *testing.T) {
 		insertLLMCall(ctx, t, st, llmRow{Completion: "95", Error: "429", CreatedAt: at})
 		insertLLMCall(ctx, t, st, llmRow{SpanName: cardgenSpan, Completion: "99", CreatedAt: at})
 
-		got, err := st.GetScoreLivenessStat(ctx, base, 20)
+		got, err := st.GetScoreLivenessStat(ctx, obsTenantID, base, 20)
 		if err != nil {
 			t.Fatalf("GetScoreLivenessStat() 失败: %v", err)
 		}
@@ -261,7 +263,7 @@ func TestObservabilityStore(t *testing.T) {
 		// cardgen 的空输出不该污染打分统计。
 		insertLLMCall(ctx, t, st, llmRow{SpanName: cardgenSpan, Completion: "", CreatedAt: at})
 
-		got, err := st.GetScoreQualityStat(ctx, base)
+		got, err := st.GetScoreQualityStat(ctx, obsTenantID, base)
 		if err != nil {
 			t.Fatalf("GetScoreQualityStat() 失败: %v", err)
 		}
@@ -301,7 +303,7 @@ func TestObservabilityStore(t *testing.T) {
 		insertLLMCall(ctx, t, st, llmRow{Completion: "50", Error: "429", CreatedAt: at})
 		insertLLMCall(ctx, t, st, llmRow{SpanName: cardgenSpan, Completion: "50", CreatedAt: at})
 
-		got, err := st.ListScoreDistribution(ctx, base)
+		got, err := st.ListScoreDistribution(ctx, obsTenantID, base)
 		if err != nil {
 			t.Fatalf("ListScoreDistribution() 失败: %v", err)
 		}
@@ -384,7 +386,7 @@ func TestObservabilityStore(t *testing.T) {
 		insertLLMCall(ctx, t, st, llmRow{SpanName: cardgenSpan,
 			UserPrompt: "用户画像：暂无" + tail, CreatedAt: at})
 
-		got, err := st.GetProfileInjectionStat(ctx, base)
+		got, err := st.GetProfileInjectionStat(ctx, obsTenantID, base)
 		if err != nil {
 			t.Fatalf("GetProfileInjectionStat() 失败: %v", err)
 		}
@@ -444,7 +446,7 @@ func TestObservabilityStore(t *testing.T) {
 				"\n【待评估内容】\n标题：U\n【待评估内容结束】",
 			CreatedAt: at})
 
-		got, err := st.GetNegTailStat(ctx, base, tail)
+		got, err := st.GetNegTailStat(ctx, obsTenantID, base, tail)
 		if err != nil {
 			t.Fatalf("GetNegTailStat() 失败: %v", err)
 		}
@@ -462,7 +464,7 @@ func TestObservabilityStore(t *testing.T) {
 
 		// 期望串为空 = 当前画像没有负面句 → 探针不适用，直接返回不打 DB。
 		// 若这里去查库，position('' IN …) 恒 >0 会让 Intact==Total 恒成立 → 恒绿。
-		empty, err := st.GetNegTailStat(ctx, base, "")
+		empty, err := st.GetNegTailStat(ctx, obsTenantID, base, "")
 		if err != nil {
 			t.Fatalf("GetNegTailStat(\"\") 失败: %v", err)
 		}
@@ -486,7 +488,7 @@ func TestObservabilityStore(t *testing.T) {
 		insertLLMCall(ctx, t, st, llmRow{UserID: &userIn, Completion: "85",
 			CreatedAt: base.Add(3 * time.Hour)})
 
-		got, err := st.GetEvolveCallStat(ctx, userIn, base)
+		got, err := st.GetEvolveCallStat(ctx, obsTenantID, userIn, base)
 		if err != nil {
 			t.Fatalf("GetEvolveCallStat() 失败: %v", err)
 		}
@@ -503,7 +505,7 @@ func TestObservabilityStore(t *testing.T) {
 		// 被 since 卡掉的话「未写回」永远判不出来。
 		insertLLMCall(ctx, t, st, llmRow{SpanName: evolveSpan, UserID: &userOld,
 			CreatedAt: base.AddDate(0, 0, -3)})
-		got, err = st.GetEvolveCallStat(ctx, userOld, base)
+		got, err = st.GetEvolveCallStat(ctx, obsTenantID, userOld, base)
 		if err != nil {
 			t.Fatalf("GetEvolveCallStat() 失败: %v", err)
 		}
@@ -516,7 +518,7 @@ func TestObservabilityStore(t *testing.T) {
 		}
 
 		// 用户 C：从未演化 → LastCallAt 为 nil（max() 对空集返回 NULL）。
-		got, err = st.GetEvolveCallStat(ctx, userNone, base)
+		got, err = st.GetEvolveCallStat(ctx, obsTenantID, userNone, base)
 		if err != nil {
 			t.Fatalf("GetEvolveCallStat() 失败: %v", err)
 		}
@@ -543,7 +545,7 @@ func TestObservabilityStore(t *testing.T) {
 		insertLLMCall(ctx, t, st, llmRow{SpanName: cardgenSpan, CostUSD: 0.000008,
 			CreatedAt: day1.Add(12 * time.Hour)})
 
-		got, err := st.ListSpanDayCosts(ctx, base)
+		got, err := st.ListSpanDayCosts(ctx, obsTenantID, base)
 		if err != nil {
 			t.Fatalf("ListSpanDayCosts() 失败: %v", err)
 		}

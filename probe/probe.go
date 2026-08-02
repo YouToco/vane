@@ -52,17 +52,17 @@ type Result struct {
 // Store 是探针所需的数据面窄接口，生产实现为 *store.Store。
 // 定义在消费方（本包）是仓库既有约定：便于单测替身，无需起 DB。
 type Store interface {
-	ListScoreTraceStats(ctx context.Context, since time.Time, minN int) ([]types.ScoreTraceStat, error)
-	GetScoreQualityStat(ctx context.Context, since time.Time) (types.ScoreQualityStat, error)
-	ListScoreDistribution(ctx context.Context, since time.Time) ([]types.ScoreBucket, error)
-	GetScoreLivenessStat(ctx context.Context, since time.Time, floor int) (types.ScoreLivenessStat, error)
-	GetProfileInjectionStat(ctx context.Context, since time.Time) (types.ProfileInjectionStat, error)
-	GetNegTailStat(ctx context.Context, since time.Time, expectedTail string) (types.NegTailStat, error)
-	ListSpanDayCosts(ctx context.Context, since time.Time) ([]types.SpanDayCost, error)
-	ListModelUsage(ctx context.Context, since time.Time) ([]types.ModelUsage, error)
-	GetEvolveCallStat(ctx context.Context, userID int64, since time.Time) (types.EvolveCallStat, error)
-	ListPushBatchSummaries(ctx context.Context, userID int64, since time.Time, limit int) ([]types.PushBatchSummary, error)
-	GetProfile(ctx context.Context, userID int64) (*types.Profile, error)
+	ListScoreTraceStats(ctx context.Context, tenantID int64, since time.Time, minN int) ([]types.ScoreTraceStat, error)
+	GetScoreQualityStat(ctx context.Context, tenantID int64, since time.Time) (types.ScoreQualityStat, error)
+	ListScoreDistribution(ctx context.Context, tenantID int64, since time.Time) ([]types.ScoreBucket, error)
+	GetScoreLivenessStat(ctx context.Context, tenantID int64, since time.Time, floor int) (types.ScoreLivenessStat, error)
+	GetProfileInjectionStat(ctx context.Context, tenantID int64, since time.Time) (types.ProfileInjectionStat, error)
+	GetNegTailStat(ctx context.Context, tenantID int64, since time.Time, expectedTail string) (types.NegTailStat, error)
+	ListSpanDayCosts(ctx context.Context, tenantID int64, since time.Time) ([]types.SpanDayCost, error)
+	ListModelUsage(ctx context.Context, tenantID int64, since time.Time) ([]types.ModelUsage, error)
+	GetEvolveCallStat(ctx context.Context, tenantID, userID int64, since time.Time) (types.EvolveCallStat, error)
+	ListPushBatchSummaries(ctx context.Context, tenantID, userID int64, since time.Time, limit int) ([]types.PushBatchSummary, error)
+	GetProfileForTenant(ctx context.Context, tenantID, userID int64) (*types.Profile, error)
 	CountA2ATasks(ctx context.Context) (int64, error)
 }
 
@@ -149,7 +149,7 @@ func (r Report) Worst() Status {
 //
 // now 由调用方注入而非内部 time.Now()：单测要能钉死时间窗，
 // 且 CLI/API 两个出口共用同一个"现在"避免跨查询漂移。
-func Run(ctx context.Context, st Store, userID int64, now time.Time, window time.Duration) (Report, error) {
+func Run(ctx context.Context, st Store, tenantID, userID int64, now time.Time, window time.Duration) (Report, error) {
 	if window <= 0 {
 		window = DefaultWindow
 	}
@@ -165,7 +165,7 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 
 	// 画像先取：探针 ④⑤⑦ 的判定都以"owner 到底有没有可用画像"为前提。
 	// NotFound 不是错误——首采前画像本就不存在（profilehint/cache.go:35 同此语义）。
-	prof, err := st.GetProfile(ctx, userID)
+	prof, err := st.GetProfileForTenant(ctx, tenantID, userID)
 	if err != nil && !errors.Is(err, types.ErrNotFound) {
 		return rep, err
 	}
@@ -177,16 +177,16 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 	// Gate 必须复用同一个定义，不能把“数据库有一行”误报成“注入失效”。
 	hasProfile := profilehint.Build(prof) != ""
 
-	if rep.ScoreTraces, err = st.ListScoreTraceStats(ctx, since, minTraceN); err != nil {
+	if rep.ScoreTraces, err = st.ListScoreTraceStats(ctx, tenantID, since, minTraceN); err != nil {
 		return rep, err
 	}
-	if rep.Quality, err = st.GetScoreQualityStat(ctx, since); err != nil {
+	if rep.Quality, err = st.GetScoreQualityStat(ctx, tenantID, since); err != nil {
 		return rep, err
 	}
-	if rep.ScoreDistribution, err = st.ListScoreDistribution(ctx, since); err != nil {
+	if rep.ScoreDistribution, err = st.ListScoreDistribution(ctx, tenantID, since); err != nil {
 		return rep, err
 	}
-	if rep.Liveness, err = st.GetScoreLivenessStat(ctx, since, lowBandCeil()); err != nil {
+	if rep.Liveness, err = st.GetScoreLivenessStat(ctx, tenantID, since, lowBandCeil()); err != nil {
 		return rep, err
 	}
 	// 注入（④）与保尾（⑤）统计的窗口起点钳到画像创建时刻：画像存在**之前**的
@@ -203,20 +203,20 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 	if hasProfile && prof.CreatedAt.After(injSince) {
 		injSince = prof.CreatedAt
 	}
-	if rep.Injection, err = st.GetProfileInjectionStat(ctx, injSince); err != nil {
+	if rep.Injection, err = st.GetProfileInjectionStat(ctx, tenantID, injSince); err != nil {
 		return rep, err
 	}
 	// 期望负面句必须由 profilehint 亲自算（见 profilehint.NegTail 的注释）。
-	if rep.NegTail, err = st.GetNegTailStat(ctx, injSince, profilehint.NegTail(prof)); err != nil {
+	if rep.NegTail, err = st.GetNegTailStat(ctx, tenantID, injSince, profilehint.NegTail(prof)); err != nil {
 		return rep, err
 	}
-	if rep.Costs, err = st.ListSpanDayCosts(ctx, since); err != nil {
+	if rep.Costs, err = st.ListSpanDayCosts(ctx, tenantID, since); err != nil {
 		return rep, err
 	}
-	if rep.Models, err = st.ListModelUsage(ctx, since); err != nil {
+	if rep.Models, err = st.ListModelUsage(ctx, tenantID, since); err != nil {
 		return rep, err
 	}
-	evolveStat, err := st.GetEvolveCallStat(ctx, userID, since)
+	evolveStat, err := st.GetEvolveCallStat(ctx, tenantID, userID, since)
 	if err != nil {
 		return rep, err
 	}
@@ -228,7 +228,7 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 		rep.Evolve.SummaryRunes = len([]rune(prof.Summary))
 	}
 	// 批次历史用自己的长窗口：它是给人看趋势的展示数据，不参与任何红线判定。
-	if rep.Batches, err = st.ListPushBatchSummaries(ctx, userID,
+	if rep.Batches, err = st.ListPushBatchSummaries(ctx, tenantID, userID,
 		now.Add(-batchHistoryWindow), batchHistoryLimit); err != nil {
 		return rep, err
 	}

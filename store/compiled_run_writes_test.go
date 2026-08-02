@@ -298,7 +298,7 @@ func TestCompiledRunWrites_ExactTenantRevocationAndDurableReceipt(t *testing.T) 
 			compiledPushBatchPhysicalKeyV1(f.refA.SnapshotID, sharedKey))
 	}
 	summaries, err := f.base.st.ListPushBatchSummaries(
-		ctx, f.idA.UserID, time.Now().Add(-time.Hour), 100)
+		ctx, f.idA.TenantID, f.idA.UserID, time.Now().Add(-time.Hour), 100)
 	if err != nil {
 		t.Fatalf("list compiled batch summaries: %v", err)
 	}

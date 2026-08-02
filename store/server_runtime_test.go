@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
 
+	"github.com/YouToco/vane/probe"
 	"github.com/YouToco/vane/types"
 )
 
@@ -121,6 +123,95 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		if _, err := tx.Exec(t.Context(),
 			`SET LOCAL ROLE vane_intelligence_reader`); err != nil {
 			t.Fatalf("explicit allowlisted Store role: %v", err)
+		}
+	})
+
+	t.Run("exact profile and observability reads are tenant scoped", func(t *testing.T) {
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		user, err := st.UpsertUserByOpenID(t.Context(),
+			"ou-server-runtime-profile", "runtime profile")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`INSERT INTO memberships (tenant_id,user_id,role)
+			 VALUES (1,$1,'owner') ON CONFLICT DO NOTHING`, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		industry := "software"
+		if _, err := st.UpsertProfileFields(t.Context(), user.ID,
+			&industry, nil, []string{"agent"}); err != nil {
+			t.Fatal(err)
+		}
+		profile, err := st.GetProfileForTenant(t.Context(), 1, user.ID)
+		if err != nil {
+			t.Fatalf("scoped profile read through server runtime: %v", err)
+		}
+		if profile.ID <= 0 || profile.UserID != user.ID || profile.Industry != industry ||
+			profile.ProfileEpoch != 0 || profile.ProfileVersion != 0 {
+			t.Fatalf("unexpected scoped profile: %+v", profile)
+		}
+		if _, err := st.GetProfileForTenant(t.Context(), 2, user.ID); !errors.Is(err, types.ErrNotFound) {
+			t.Fatalf("cross-tenant profile read must fail closed, got %v", err)
+		}
+		now := time.Now().UTC()
+		if _, err := owner.ExecContext(t.Context(),
+			`INSERT INTO llm_calls
+			    (trace_id,span_name,user_id,tenant_id,provider,model,
+			     user_prompt,completion,completion_tokens,error,created_at)
+			 VALUES ('server-runtime-bad-score','score',$1,1,'test','test-model',
+			         '用户画像：行业：software','',16,'',$2)`,
+			user.ID, now.Add(-time.Minute)); err != nil {
+			t.Fatalf("insert tenant bad score fixture: %v", err)
+		}
+		report, err := probe.Run(t.Context(), st, 1, user.ID,
+			now, probe.DefaultWindow)
+		if err != nil {
+			t.Fatalf("full gate read surface through server runtime: %v", err)
+		}
+		if len(report.Results) != 9 {
+			t.Fatalf("full gate result count=%d", len(report.Results))
+		}
+		emptyOutputStatus := probe.Status("")
+		for _, result := range report.Results {
+			if result.ID == "empty_completion" {
+				emptyOutputStatus = result.Status
+				break
+			}
+		}
+		if report.Quality.EmptyNoError != 1 || emptyOutputStatus != probe.StatusRed ||
+			report.Worst() != probe.StatusRed {
+			t.Fatalf("tenant bad score must make Gate red, quality=%+v worst=%s",
+				report.Quality, report.Worst())
+		}
+		crossTenantReport, err := probe.Run(t.Context(), st, 2, user.ID,
+			now, probe.DefaultWindow)
+		if err != nil {
+			t.Fatalf("cross-tenant Gate read: %v", err)
+		}
+		if crossTenantReport.Quality.EmptyNoError != 0 ||
+			crossTenantReport.Worst() == probe.StatusRed {
+			t.Fatalf("tenant 2 must not see tenant 1 bad score, quality=%+v worst=%s",
+				crossTenantReport.Quality, crossTenantReport.Worst())
+		}
+		stats, err := st.ListSpanRunStats(t.Context(), 1, now.Add(-probe.DefaultWindow))
+		if err != nil {
+			t.Fatalf("tenant runstats: %v", err)
+		}
+		if len(stats) != 1 || stats[0].SpanName != "score" || stats[0].Calls != 1 {
+			t.Fatalf("tenant runstats must include bad score, got %+v", stats)
+		}
+		crossTenantStats, err := st.ListSpanRunStats(
+			t.Context(), 2, now.Add(-probe.DefaultWindow))
+		if err != nil {
+			t.Fatalf("cross-tenant runstats: %v", err)
+		}
+		if len(crossTenantStats) != 0 {
+			t.Fatalf("tenant 2 must not see tenant 1 runstats, got %+v", crossTenantStats)
 		}
 	})
 

@@ -8,7 +8,7 @@
 // （exit 2）都会把 deploy job 打红——服务此刻已在跑新代码（无自动回滚），流水线红
 // 是"部署已生效但体检不过"的强信号，与 probewatch 的飞书告警卡双通道。
 //
-// 为什么走 DB 直连（store.New）而不打 /api/admin/observability：
+// 为什么走 DB 直连（store.NewServerRuntime）而不打 /api/admin/observability：
 // post-deploy 在 VPS 上执行，本来就有库权限（与 vane.service 同宿主、同 VANE_DB_URL），
 // 走 HTTP 要额外带 Dashboard 密码、还要 Caddy 与 HTTP server 都已就绪——
 // 而"刚部署完服务还没起来"恰恰是探针最该说话的时刻，此时 HTTP 出口自己先挂了，
@@ -99,7 +99,11 @@ func run() int {
 
 	// 刻意不调 store.Migrate（cmd/server 启动时已跑过）：本工具是只读探针，
 	// 给"看指标"附带改 schema 的能力毫无收益——post-deploy 时 vane.service 早已迁移完毕。
-	st, err := store.New(ctx, cfg.DB.URL)
+	// Gate receives the same non-owner DSN as vane.service. Enter the exact
+	// default vane_app capability and validate the runtime shell; store.New
+	// would leave current_user at the inert NOINHERIT login and make every
+	// business-table probe fail before the old worker is drained.
+	st, err := store.NewServerRuntime(ctx, cfg.DB.URL)
 	if err != nil {
 		slog.Error("gate: 连接数据库失败", "err", err)
 		fmt.Fprintln(os.Stderr, "gate: 连接数据库失败——请确认 Postgres 可达且连接串正确")
@@ -107,18 +111,23 @@ func run() int {
 	}
 	defer st.Close()
 
-	uid := *userID
-	if uid == 0 {
-		if uid, err = resolveOwnerUserID(ctx, st); err != nil {
+	var principal auth.Principal
+	if *userID == 0 {
+		if principal, err = resolveOwnerPrincipal(ctx, st); err != nil {
 			slog.Error("gate: 解析 owner 失败", "err", err)
 			fmt.Fprintln(os.Stderr, "gate: "+userMessage(err, "解析 owner 失败"))
 			return exitFailure
 		}
+	} else if principal, err = resolveExplicitPrincipal(ctx, st, *userID); err != nil {
+		slog.Error("gate: 解析显式用户租户失败", "err", err)
+		fmt.Fprintln(os.Stderr, "gate: "+userMessage(err, "解析显式用户租户失败"))
+		return exitFailure
 	}
 
 	// now 在此注入且取 UTC：DB 是 UTC，探针内部一律 UTC，换算只在前端（红线 6）。
 	// 由调用方给"现在"也保证一轮内所有查询共用同一时间原点（见 probe.Run 注释）。
-	rep, err := probe.Run(ctx, st, uid, time.Now().UTC(), *window)
+	rep, err := probe.Run(ctx, st, int64(principal.TenantID), principal.UserID,
+		time.Now().UTC(), *window)
 	if err != nil {
 		slog.Error("gate: 探针执行失败", "err", err)
 		fmt.Fprintln(os.Stderr, "gate: "+userMessage(err, "探针查询失败"))
@@ -233,7 +242,7 @@ type ownerRecord struct {
 	Name   string `json:"name"`
 }
 
-// resolveOwnerUserID 把「当前 principal」解析成 users 表主键。
+// resolveOwnerPrincipal 把当前 owner 解析成不可猜测的租户/用户二元组。
 //
 // 逻辑本体已收敛到 auth 包（企业级契约 §1.1，不变量 I-A1）——收敛前这里是
 // api.ownerUserID 的第三份逐字副本（因为那是 api 包的未导出方法，cmd 拿不到）。
@@ -245,17 +254,48 @@ type ownerRecord struct {
 // 继承自 auth 包的已知取舍（不是本工具引入）：解析会写一次库（UpsertUserByOpenID），
 // 但恒为幂等命中——owner 记录只在 owner 给机器人发过消息后才存在，而那条路径已建好
 // user 行。要彻底零写入就用 -user 显式指定 userID。
-func resolveOwnerUserID(ctx context.Context, st *store.Store) (int64, error) {
+func resolveOwnerPrincipal(ctx context.Context, st *store.Store) (auth.Principal, error) {
 	p, err := auth.NewOwnerResolver(st, feishu.SettingKeyOwner).FromContext(ctx)
 	if err != nil {
 		var ae *types.AppError
 		if errors.As(err, &ae) && ae.Code == types.CodeConflict {
-			return 0, types.NewAppError(types.CodeConflict,
+			return auth.Principal{}, types.NewAppError(types.CodeConflict,
 				"尚未捕获 owner，请先在飞书给机器人发一条消息，或用 -user 显式指定 userID", err)
 		}
-		return 0, err
+		return auth.Principal{}, err
 	}
-	return p.UserID, nil
+	return p, nil
+}
+
+// resolveExplicitPrincipal keeps -user useful without letting the probe infer
+// a tenant from row visibility or list order. A user with zero or multiple
+// memberships is not an exact authority and therefore fails closed.
+func resolveExplicitPrincipal(ctx context.Context, st *store.Store, userID int64) (auth.Principal, error) {
+	if userID <= 0 {
+		return auth.Principal{}, types.NewAppError(types.CodeValidation, "userID 必须为正整数", nil)
+	}
+	memberships, err := st.ListMembershipsByUser(ctx, userID)
+	if err != nil {
+		return auth.Principal{}, err
+	}
+	return explicitPrincipalFromMemberships(userID, memberships)
+}
+
+func explicitPrincipalFromMemberships(userID int64, memberships []types.Membership) (auth.Principal, error) {
+	if userID <= 0 {
+		return auth.Principal{}, types.NewAppError(types.CodeValidation, "userID 必须为正整数", nil)
+	}
+	if len(memberships) == 0 {
+		return auth.Principal{}, types.NewAppError(types.CodeNotFound, "显式用户没有可用租户 membership", nil)
+	}
+	if len(memberships) != 1 {
+		return auth.Principal{}, types.NewAppError(types.CodeConflict,
+			"显式用户属于多个租户，gate 拒绝猜测画像范围", nil)
+	}
+	return auth.Principal{
+		TenantID: types.TenantID(memberships[0].TenantID),
+		UserID:   userID,
+	}, nil
 }
 
 // userMessage 从错误链里取 AppError.Message 作为给人看的文案（红线 3）：

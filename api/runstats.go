@@ -27,8 +27,9 @@ type runstatsResp struct {
 // handleRunstats 返回窗口内的运行统计。
 // GET /api/admin/runstats?window_hours=24 → 200 runstatsResp
 //
-// 不解析 owner：llm_calls 的成本/延迟统计是系统级的（含无 user_id 的行），
-// 单用户阶段全库即 owner 视角；窗口校验复用 parseWindowHours（1h–30 天）。
+// 统计严格使用当前平台 owner principal 的租户范围。即使现阶段只有一个 owner，
+// 也不能依赖“全库即 owner 视角”：非 owner server runtime 下未安装 tenant GUC
+// 会被 RLS 静默过滤成空看板。窗口校验复用 parseWindowHours（1h–30 天）。
 func (s *server) handleRunstats(w http.ResponseWriter, r *http.Request) {
 	if !s.requirePlatformOwner(w, r) {
 		return
@@ -41,18 +42,24 @@ func (s *server) handleRunstats(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	since := now.Add(-window)
+	principal, err := s.deps.Principal.FromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	tenantID := int64(principal.TenantID)
 
-	spans, err := s.deps.Store.ListSpanRunStats(r.Context(), since)
+	spans, err := s.deps.Store.ListSpanRunStats(r.Context(), tenantID, since)
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
-	days, err := s.deps.Store.ListSpanDayCosts(r.Context(), since)
+	days, err := s.deps.Store.ListSpanDayCosts(r.Context(), tenantID, since)
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
-	models, err := s.deps.Store.ListModelUsage(r.Context(), since)
+	models, err := s.deps.Store.ListModelUsage(r.Context(), tenantID, since)
 	if err != nil {
 		writeAppError(w, err)
 		return

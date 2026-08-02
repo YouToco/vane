@@ -4,11 +4,52 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/profilehint"
 	"github.com/YouToco/vane/types"
 )
+
+// withTenantObservabilityRead installs the tenant RLS identity on the same
+// transaction that performs an observability query. A SQL tenant predicate is
+// not a substitute: under the non-owner server runtime, an unset GUC makes RLS
+// silently return zero rows and can turn a red Gate into a vacuous yellow pass.
+func withTenantObservabilityRead[T any](
+	ctx context.Context,
+	s *Store,
+	tenantID int64,
+	read func(pgx.Tx) (T, error),
+) (T, error) {
+	var zero T
+	if tenantID <= 0 {
+		return zero, types.NewAppError(
+			types.CodeValidation, "观测数据租户范围无效", types.ErrValidation)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return zero, types.NewAppError(types.CodeDatabase, "开启租户观测读取事务", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL search_path = pg_catalog, public, pg_temp`); err != nil {
+		return zero, types.NewAppError(types.CodeDatabase, "固定租户观测读取 search_path", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true)`,
+		strconv.FormatInt(tenantID, 10)); err != nil {
+		return zero, types.NewAppError(types.CodeDatabase, "设置租户观测读取范围", err)
+	}
+	value, err := read(tx)
+	if err != nil {
+		return zero, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return zero, types.NewAppError(types.CodeDatabase, "提交租户观测读取事务", err)
+	}
+	return value, nil
+}
 
 // Gate 服务端探针的数据面查询（M5 契约 §16）。只读、只聚合，不写任何表。
 //
@@ -58,34 +99,37 @@ const (
 // error=” 过滤是必须的：失败行 completion 恒为 ”（llm/do.go 只在成功分支赋值），
 // 混进来会让 distinct 既可能虚高（多一个 ”）也可能虚低（整批失败时 distinct=1），
 // 两个方向都是误判。
-func (s *Store) ListScoreTraceStats(ctx context.Context, since time.Time, minN int) ([]types.ScoreTraceStat, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT trace_id, count(*)::int, count(DISTINCT completion)::int, min(created_at),
+func (s *Store) ListScoreTraceStats(ctx context.Context, tenantID int64, since time.Time, minN int) ([]types.ScoreTraceStat, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) ([]types.ScoreTraceStat, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT trace_id, count(*)::int, count(DISTINCT completion)::int, min(created_at),
 		        min(completion), max(completion_tokens)::int
-		 FROM llm_calls
-		 WHERE span_name = $1 AND error = '' AND created_at >= $2
+			 FROM llm_calls
+			 WHERE span_name = $1 AND error = '' AND created_at >= $2
+			   AND tenant_id = $4
 		 GROUP BY trace_id
 		 HAVING count(*) >= $3
 		 ORDER BY min(created_at) DESC`,
-		scoreSpan, since, minN)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "查询打分批次区分度", err)
-	}
-	defer rows.Close()
-
-	var out []types.ScoreTraceStat
-	for rows.Next() {
-		var st types.ScoreTraceStat
-		if err := rows.Scan(&st.TraceID, &st.N, &st.DistinctCompletions, &st.StartedAt,
-			&st.MinCompletion, &st.MaxCompletionTokens); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描打分批次统计行", err)
+			scoreSpan, since, minN, tenantID)
+		if err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "查询打分批次区分度", err)
 		}
-		out = append(out, st)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历打分批次统计结果集", err)
-	}
-	return out, nil
+		defer rows.Close()
+
+		var out []types.ScoreTraceStat
+		for rows.Next() {
+			var st types.ScoreTraceStat
+			if err := rows.Scan(&st.TraceID, &st.N, &st.DistinctCompletions, &st.StartedAt,
+				&st.MinCompletion, &st.MaxCompletionTokens); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase, "扫描打分批次统计行", err)
+			}
+			out = append(out, st)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "遍历打分批次统计结果集", err)
+		}
+		return out, nil
+	})
 }
 
 // GetScoreQualityStat 返回窗口内的打分质量四联计数（探针 ②③）。
@@ -94,21 +138,23 @@ func (s *Store) ListScoreTraceStats(ctx context.Context, since time.Time, minN i
 //   - error<>”            → 调用失败，条目被跳过，**没发分**（不是回退）
 //   - error=” 且无数字    → 静默回退中位分 50（含空 completion）
 //   - error=” 且 completion=”→ M3 事故的精确形状（DisableThinking 回归）
-func (s *Store) GetScoreQualityStat(ctx context.Context, since time.Time) (types.ScoreQualityStat, error) {
-	var st types.ScoreQualityStat
-	err := s.pool.QueryRow(ctx,
-		`SELECT
+func (s *Store) GetScoreQualityStat(ctx context.Context, tenantID int64, since time.Time) (types.ScoreQualityStat, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) (types.ScoreQualityStat, error) {
+		var st types.ScoreQualityStat
+		err := tx.QueryRow(ctx,
+			`SELECT
 		     count(*) FILTER (WHERE error = '')::int,
 		     count(*) FILTER (WHERE error = '' AND completion !~ '[0-9]')::int,
 		     count(*) FILTER (WHERE error = '' AND completion = '')::int,
 		     count(*) FILTER (WHERE error <> '')::int
-		 FROM llm_calls
-		 WHERE span_name = $1 AND created_at >= $2`,
-		scoreSpan, since).Scan(&st.OKTotal, &st.NoDigit, &st.EmptyNoError, &st.Errored)
-	if err != nil {
-		return st, types.NewAppError(types.CodeDatabase, "查询打分质量统计", err)
-	}
-	return st, nil
+			 FROM llm_calls
+			 WHERE span_name = $1 AND created_at >= $2 AND tenant_id = $3`,
+			scoreSpan, since, tenantID).Scan(&st.OKTotal, &st.NoDigit, &st.EmptyNoError, &st.Errored)
+		if err != nil {
+			return st, types.NewAppError(types.CodeDatabase, "查询打分质量统计", err)
+		}
+		return st, nil
+	})
 }
 
 // ListScoreDistribution 返回窗口内的分数分布直方图（10 个宽度为 10 的桶）。
@@ -121,42 +167,45 @@ func (s *Store) GetScoreQualityStat(ctx context.Context, since time.Time) (types
 //
 // width_bucket(x,0,100,10) 对 x=100 返回 11（右开区间之外），故 LEAST 折回第 10 桶，
 // 使末桶语义为闭区间 [90,100]。
-func (s *Store) ListScoreDistribution(ctx context.Context, since time.Time) ([]types.ScoreBucket, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT b, count(*)::int FROM (
+func (s *Store) ListScoreDistribution(ctx context.Context, tenantID int64, since time.Time) ([]types.ScoreBucket, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) ([]types.ScoreBucket, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT b, count(*)::int FROM (
 		     SELECT LEAST(10, width_bucket(
 		         LEAST(100, GREATEST(0,
 		             substring(completion from '-?[0-9]+\.?[0-9]*')::numeric)),
 		         0, 100, 10)) AS b
 		     FROM llm_calls
-		     WHERE span_name = $1 AND error = '' AND created_at >= $2
+			     WHERE span_name = $1 AND error = '' AND created_at >= $2
+			       AND tenant_id = $3
 		       AND completion ~ '[0-9]'
 		 ) t
 		 GROUP BY b ORDER BY b`,
-		scoreSpan, since)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "查询分数分布", err)
-	}
-	defer rows.Close()
+			scoreSpan, since, tenantID)
+		if err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "查询分数分布", err)
+		}
+		defer rows.Close()
 
-	// 预置 10 个空桶：直方图要的是完整轮廓，缺桶应显示为 0 而不是消失。
-	buckets := make([]types.ScoreBucket, 10)
-	for i := range buckets {
-		buckets[i] = types.ScoreBucket{Lo: i * 10, Hi: i*10 + 10}
-	}
-	for rows.Next() {
-		var b, n int
-		if err := rows.Scan(&b, &n); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描分数分布行", err)
+		// 预置 10 个空桶：直方图要的是完整轮廓，缺桶应显示为 0 而不是消失。
+		buckets := make([]types.ScoreBucket, 10)
+		for i := range buckets {
+			buckets[i] = types.ScoreBucket{Lo: i * 10, Hi: i*10 + 10}
 		}
-		if b >= 1 && b <= 10 {
-			buckets[b-1].Count = n
+		for rows.Next() {
+			var b, n int
+			if err := rows.Scan(&b, &n); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase, "扫描分数分布行", err)
+			}
+			if b >= 1 && b <= 10 {
+				buckets[b-1].Count = n
+			}
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历分数分布结果集", err)
-	}
-	return buckets, nil
+		if err := rows.Err(); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "遍历分数分布结果集", err)
+		}
+		return buckets, nil
+	})
 }
 
 // GetScoreLivenessStat 返回窗口内"高分存在性"计数（探针 §16.8）。
@@ -166,23 +215,26 @@ func (s *Store) ListScoreDistribution(ctx context.Context, since time.Time) ([]t
 //
 // 提数表达式与 ListScoreDistribution 逐字相同（含"正则零括号"的取舍，见其注释）：
 // 两个查询消费同一个 parseScore 语义，表达式分叉等于探针之间口径漂移。
-func (s *Store) GetScoreLivenessStat(ctx context.Context, since time.Time, floor int) (types.ScoreLivenessStat, error) {
-	var st types.ScoreLivenessStat
-	err := s.pool.QueryRow(ctx,
-		`SELECT count(*)::int,
+func (s *Store) GetScoreLivenessStat(ctx context.Context, tenantID int64, since time.Time, floor int) (types.ScoreLivenessStat, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) (types.ScoreLivenessStat, error) {
+		var st types.ScoreLivenessStat
+		err := tx.QueryRow(ctx,
+			`SELECT count(*)::int,
 		        count(*) FILTER (WHERE sc > $3)::int
 		 FROM (
 		     SELECT LEAST(100, GREATEST(0,
 		         substring(completion from '-?[0-9]+\.?[0-9]*')::numeric)) AS sc
 		     FROM llm_calls
-		     WHERE span_name = $1 AND error = '' AND created_at >= $2
+			     WHERE span_name = $1 AND error = '' AND created_at >= $2
+			       AND tenant_id = $4
 		       AND completion ~ '[0-9]'
 		 ) t`,
-		scoreSpan, since, floor).Scan(&st.Parsable, &st.AboveFloor)
-	if err != nil {
-		return st, types.NewAppError(types.CodeDatabase, "查询高分存在性统计", err)
-	}
-	return st, nil
+			scoreSpan, since, floor, tenantID).Scan(&st.Parsable, &st.AboveFloor)
+		if err != nil {
+			return st, types.NewAppError(types.CodeDatabase, "查询高分存在性统计", err)
+		}
+		return st, nil
+	})
 }
 
 // GetProfileInjectionStat 返回窗口内画像注入生效性统计（探针 ④）。
@@ -193,22 +245,24 @@ func (s *Store) GetScoreLivenessStat(ctx context.Context, since time.Time, floor
 //
 // 注意 deep_dive span 对本探针天然免疫：它在无画像时整行省略而非写"暂无"
 // （deepdive.go:252），故永远不会命中。那条链路的降级要靠 deepdive.go:271 的 WARN。
-func (s *Store) GetProfileInjectionStat(ctx context.Context, since time.Time) (types.ProfileInjectionStat, error) {
-	var st types.ProfileInjectionStat
-	err := s.pool.QueryRow(ctx,
-		`SELECT
+func (s *Store) GetProfileInjectionStat(ctx context.Context, tenantID int64, since time.Time) (types.ProfileInjectionStat, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) (types.ProfileInjectionStat, error) {
+		var st types.ProfileInjectionStat
+		err := tx.QueryRow(ctx,
+			`SELECT
 		     count(*)::int,
 		     count(*) FILTER (WHERE user_prompt LIKE $3)::int,
 		     count(*) FILTER (WHERE user_prompt LIKE $4 AND user_prompt NOT LIKE $3)::int
-		 FROM llm_calls
-		 WHERE span_name = $1 AND created_at >= $2`,
-		scoreSpan, since, profileAbsentPrefix+"%", profileHintPrefix+"%").
-		Scan(&st.Total, &st.Absent, &st.Present)
-	if err != nil {
-		return st, types.NewAppError(types.CodeDatabase, "查询画像注入统计", err)
-	}
-	st.Unrecognized = st.Total - st.Absent - st.Present
-	return st, nil
+			 FROM llm_calls
+			 WHERE span_name = $1 AND created_at >= $2 AND tenant_id = $5`,
+			scoreSpan, since, profileAbsentPrefix+"%", profileHintPrefix+"%", tenantID).
+			Scan(&st.Total, &st.Absent, &st.Present)
+		if err != nil {
+			return st, types.NewAppError(types.CodeDatabase, "查询画像注入统计", err)
+		}
+		st.Unrecognized = st.Total - st.Absent - st.Present
+		return st, nil
+	})
 }
 
 // GetNegTailStat 统计窗口内打分调用的负面句保尾情况（探针 ⑤）。
@@ -233,24 +287,30 @@ func (s *Store) GetProfileInjectionStat(ctx context.Context, since time.Time) (t
 //
 // 刻意**不**要求以句号收尾：句号来自演化 prompt 规则 2 的格式约定，是模型的合规行为，
 // 模型偶尔漏写就会让探针假红——而那是格式问题，不是 F1 要管的截断。判据只该反映被测性质。
-func (s *Store) GetNegTailStat(ctx context.Context, since time.Time, expectedTail string) (types.NegTailStat, error) {
+func (s *Store) GetNegTailStat(ctx context.Context, tenantID int64, since time.Time, expectedTail string) (types.NegTailStat, error) {
 	st := types.NegTailStat{ExpectedTail: expectedTail}
+	if tenantID <= 0 {
+		return st, types.NewAppError(
+			types.CodeValidation, "观测数据租户范围无效", types.ErrValidation)
+	}
 	if expectedTail == "" {
 		return st, nil // 当前画像无负面句，探针不适用；不打 DB
 	}
-	err := s.pool.QueryRow(ctx,
-		`SELECT
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) (types.NegTailStat, error) {
+		err := tx.QueryRow(ctx,
+			`SELECT
 		     count(*)::int,
 		     count(*) FILTER (WHERE split_part(user_prompt, E'\n', 1) LIKE '%' || $3 || '%')::int,
 		     count(*) FILTER (WHERE split_part(user_prompt, E'\n', 1) ~ ($3 || '[^' || $4 || ']*$'))::int
-		 FROM llm_calls
-		 WHERE span_name = $1 AND created_at >= $2`,
-		scoreSpan, since, profilehint.NegPrefix, profilehint.EllipsisRune).
-		Scan(&st.Total, &st.WithTail, &st.Intact)
-	if err != nil {
-		return st, types.NewAppError(types.CodeDatabase, "查询负面清单保尾统计", err)
-	}
-	return st, nil
+			 FROM llm_calls
+			 WHERE span_name = $1 AND created_at >= $2 AND tenant_id = $5`,
+			scoreSpan, since, profilehint.NegPrefix, profilehint.EllipsisRune, tenantID).
+			Scan(&st.Total, &st.WithTail, &st.Intact)
+		if err != nil {
+			return st, types.NewAppError(types.CodeDatabase, "查询负面清单保尾统计", err)
+		}
+		return st, nil
+	})
 }
 
 // ListSpanDayCosts 返回窗口内按 (UTC 日, span) 聚合的成本（探针 ⑥）。
@@ -258,79 +318,85 @@ func (s *Store) GetNegTailStat(ctx context.Context, since time.Time, expectedTai
 // 日界固定 UTC：created_at 是 TIMESTAMPTZ（UTC），而 VPS 本地是 EDT、Boss 读的是
 // 北京时间，三个时区（红线 6）。探针内部认 DB 原生时区，换算只在前端做——
 // 内部一出现本地时区，"哪天"就会随执行环境漂。
-func (s *Store) ListSpanDayCosts(ctx context.Context, since time.Time) ([]types.SpanDayCost, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+func (s *Store) ListSpanDayCosts(ctx context.Context, tenantID int64, since time.Time) ([]types.SpanDayCost, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) ([]types.SpanDayCost, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
 		        span_name, count(*)::int, sum(cost_usd)::float8
-		 FROM llm_calls
-		 WHERE created_at >= $1
+			 FROM llm_calls
+			 WHERE created_at >= $1 AND tenant_id = $2
 		 GROUP BY 1, 2
 		 ORDER BY 1 DESC, 2`,
-		since)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "查询按 span 分日成本", err)
-	}
-	defer rows.Close()
-
-	var out []types.SpanDayCost
-	for rows.Next() {
-		var c types.SpanDayCost
-		if err := rows.Scan(&c.Day, &c.SpanName, &c.Calls, &c.CostUSD); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描 span 成本行", err)
+			since, tenantID)
+		if err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "查询按 span 分日成本", err)
 		}
-		out = append(out, c)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历 span 成本结果集", err)
-	}
-	return out, nil
+		defer rows.Close()
+
+		var out []types.SpanDayCost
+		for rows.Next() {
+			var c types.SpanDayCost
+			if err := rows.Scan(&c.Day, &c.SpanName, &c.Calls, &c.CostUSD); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase, "扫描 span 成本行", err)
+			}
+			out = append(out, c)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "遍历 span 成本结果集", err)
+		}
+		return out, nil
+	})
 }
 
 // ListModelUsage 返回窗口内按 model 聚合的调用量与成本（探针 ⑥ 伴生：计价漂移）。
-func (s *Store) ListModelUsage(ctx context.Context, since time.Time) ([]types.ModelUsage, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT model, count(*)::int, sum(cost_usd)::float8
-		 FROM llm_calls
-		 WHERE created_at >= $1
+func (s *Store) ListModelUsage(ctx context.Context, tenantID int64, since time.Time) ([]types.ModelUsage, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) ([]types.ModelUsage, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT model, count(*)::int, sum(cost_usd)::float8
+			 FROM llm_calls
+			 WHERE created_at >= $1 AND tenant_id = $2
 		 GROUP BY model
 		 ORDER BY count(*) DESC, model`,
-		since)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "查询 model 用量", err)
-	}
-	defer rows.Close()
-
-	var out []types.ModelUsage
-	for rows.Next() {
-		var m types.ModelUsage
-		if err := rows.Scan(&m.Model, &m.Calls, &m.CostUSD); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描 model 用量行", err)
+			since, tenantID)
+		if err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "查询 model 用量", err)
 		}
-		out = append(out, m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历 model 用量结果集", err)
-	}
-	return out, nil
+		defer rows.Close()
+
+		var out []types.ModelUsage
+		for rows.Next() {
+			var m types.ModelUsage
+			if err := rows.Scan(&m.Model, &m.Calls, &m.CostUSD); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase, "扫描 model 用量行", err)
+			}
+			out = append(out, m)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "遍历 model 用量结果集", err)
+		}
+		return out, nil
+	})
 }
 
 // GetEvolveCallStat 返回该用户的演化调用统计（探针 ⑦ 的 llm_calls 一侧）。
 // LastCallAt 刻意不受 since 约束——见 types.EvolveCallStat 的字段注释。
-func (s *Store) GetEvolveCallStat(ctx context.Context, userID int64, since time.Time) (types.EvolveCallStat, error) {
-	var st types.EvolveCallStat
-	err := s.pool.QueryRow(ctx,
-		`SELECT
+func (s *Store) GetEvolveCallStat(ctx context.Context, tenantID, userID int64, since time.Time) (types.EvolveCallStat, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) (types.EvolveCallStat, error) {
+		var st types.EvolveCallStat
+		err := tx.QueryRow(ctx,
+			`SELECT
 		     count(*) FILTER (WHERE created_at >= $3)::int,
 		     count(*) FILTER (WHERE created_at >= $3 AND error <> '')::int,
 		     max(created_at)
-		 FROM llm_calls
-		 WHERE span_name = $1 AND user_id = $2`,
-		evolveSpan, userID, since).Scan(&st.Calls, &st.Errored, &st.LastCallAt)
-	if err != nil {
-		return st, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("查询用户 %d 的演化调用统计", userID), err)
-	}
-	return st, nil
+			 FROM llm_calls
+			 WHERE span_name = $1 AND user_id = $2 AND tenant_id = $4`,
+			evolveSpan, userID, since, tenantID).Scan(&st.Calls, &st.Errored, &st.LastCallAt)
+		if err != nil {
+			return st, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("查询用户 %d 的演化调用统计", userID), err)
+		}
+		return st, nil
+	})
 }
 
 // ListPushBatchSummaries 返回该用户最近的推送批次（含投递计数与原始分极值）。
@@ -349,53 +415,56 @@ func (s *Store) GetEvolveCallStat(ctx context.Context, userID int64, since time.
 //
 // 无 ORDER BY 稳定性问题：created_at 有 DEFAULT now() 且同批次 id 单调，
 // 用 (created_at DESC, id DESC) 保证并列时序稳定。
-func (s *Store) ListPushBatchSummaries(ctx context.Context, userID int64, since time.Time, limit int) ([]types.PushBatchSummary, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT b.id, b.status, b.exit_gate, b.stage_counts, b.created_at, b.idempotency_key,
+func (s *Store) ListPushBatchSummaries(ctx context.Context, tenantID, userID int64, since time.Time, limit int) ([]types.PushBatchSummary, error) {
+	return withTenantObservabilityRead(ctx, s, tenantID, func(tx pgx.Tx) ([]types.PushBatchSummary, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT b.id, b.status, b.exit_gate, b.stage_counts, b.created_at, b.idempotency_key,
 		        b.run_snapshot_id,
 		        count(d.id)::int,
 		        count(d.id) FILTER (WHERE d.status = $4)::int,
 		        max(d.score)::float8, min(d.score)::float8
-		 FROM push_batches b
-		 LEFT JOIN deliveries d ON d.batch_id = b.id
-		 WHERE b.user_id = $1 AND b.created_at >= $2
+			 FROM push_batches b
+			 LEFT JOIN deliveries d
+			   ON d.batch_id = b.id AND d.tenant_id = $5 AND d.user_id = $1
+			 WHERE b.user_id = $1 AND b.created_at >= $2 AND b.tenant_id = $5
 		 GROUP BY b.id
 		 ORDER BY b.created_at DESC, b.id DESC
 		 LIMIT $3`,
-		userID, since, limit, types.DeliveryStatusSent)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("查询用户 %d 的推送批次历史", userID), err)
-	}
-	defer rows.Close()
-
-	var out []types.PushBatchSummary
-	for rows.Next() {
-		var b types.PushBatchSummary
-		// stage_counts 先落 []byte 再解：JSONB NOT NULL DEFAULT '{}'（009），
-		// 空对象解出全 nil 的 PipelineCounts，恰是"这些阶段没记录"的正确语义。
-		var countsJSON []byte
-		var runSnapshotID *int64
-		if err := rows.Scan(&b.ID, &b.Status, &b.ExitGate, &countsJSON, &b.CreatedAt, &b.IdempotencyKey,
-			&runSnapshotID, &b.DeliveryCount, &b.SentCount, &b.MaxScore, &b.MinScore); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描推送批次统计行", err)
-		}
-		if runSnapshotID != nil {
-			logicalKey, ok := compiledPushBatchLogicalKey(*runSnapshotID, b.IdempotencyKey)
-			if !ok {
-				return nil, types.NewAppError(types.CodeDatabase,
-					fmt.Sprintf("解析批次 %d 的运行幂等键", b.ID), nil)
-			}
-			b.IdempotencyKey = logicalKey
-		}
-		if err := json.Unmarshal(countsJSON, &b.StageCounts); err != nil {
+			userID, since, limit, types.DeliveryStatusSent, tenantID)
+		if err != nil {
 			return nil, types.NewAppError(types.CodeDatabase,
-				fmt.Sprintf("解析批次 %d 的漏斗计数", b.ID), err)
+				fmt.Sprintf("查询用户 %d 的推送批次历史", userID), err)
 		}
-		out = append(out, b)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历推送批次结果集", err)
-	}
-	return out, nil
+		defer rows.Close()
+
+		var out []types.PushBatchSummary
+		for rows.Next() {
+			var b types.PushBatchSummary
+			// stage_counts 先落 []byte 再解：JSONB NOT NULL DEFAULT '{}'（009），
+			// 空对象解出全 nil 的 PipelineCounts，恰是"这些阶段没记录"的正确语义。
+			var countsJSON []byte
+			var runSnapshotID *int64
+			if err := rows.Scan(&b.ID, &b.Status, &b.ExitGate, &countsJSON, &b.CreatedAt, &b.IdempotencyKey,
+				&runSnapshotID, &b.DeliveryCount, &b.SentCount, &b.MaxScore, &b.MinScore); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase, "扫描推送批次统计行", err)
+			}
+			if runSnapshotID != nil {
+				logicalKey, ok := compiledPushBatchLogicalKey(*runSnapshotID, b.IdempotencyKey)
+				if !ok {
+					return nil, types.NewAppError(types.CodeDatabase,
+						fmt.Sprintf("解析批次 %d 的运行幂等键", b.ID), nil)
+				}
+				b.IdempotencyKey = logicalKey
+			}
+			if err := json.Unmarshal(countsJSON, &b.StageCounts); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase,
+					fmt.Sprintf("解析批次 %d 的漏斗计数", b.ID), err)
+			}
+			out = append(out, b)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "遍历推送批次结果集", err)
+		}
+		return out, nil
+	})
 }
