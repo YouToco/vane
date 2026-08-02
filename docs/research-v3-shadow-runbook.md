@@ -51,6 +51,10 @@ go run ./cmd/researchshadow -task-id <schedule-id> -user-id <owner-user-id> -ide
    `invocation_id`、`tool_name`、`arguments`）；只给私有 schema 名称不构成可执行契约。
    `v3.1` 解码器拒绝重复键、未知键和缺失字段，但接受等价的空白与字段顺序；持久化层再
    生成 canonical plan，不能要求远端模型猜测 Go 编码器的字节表示。
+   LLM receipt 只与模型实际拥有的 `schema_version + steps` 响应投影做 JSON 语义绑定；
+   runtime 注入的 definition/catalog/Tool-policy digests 由 run snapshot admission fence
+   独立约束。不得把两种不同所有权的信封做整份 JSON 相等比较，也不得为绕过 receipt
+   而放松步骤投影的一致性。
    Prompt、correction 与 decoder 必须按快照冻结的 renderer 分派：历史 `v3` 原字节回放，
    `v3.1` 使用显式字段契约；未知版本 fail-closed。
 2. 每个 Tool 只有一个 first-writer provider effect，Evidence 保存的是模型实际可见结果。

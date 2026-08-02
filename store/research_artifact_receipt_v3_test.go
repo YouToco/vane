@@ -61,16 +61,30 @@ func commitResearchRunLLMReceiptForTestV3(
 // createResearchPlanFromReceiptV3 gives Store integration fixtures the same
 // receipt-first ordering required from production: reserve, persist the exact
 // model-visible JSON response and only then admit the typed Plan artifact.
+func researchPlannerCompletionFromPlanV3(
+	t *testing.T, plan runcontext.ResearchExecutionPlanV3,
+) []byte {
+	t.Helper()
+	payload, err := json.Marshal(struct {
+		SchemaVersion string                          `json:"schema_version"`
+		Steps         []runcontext.ResearchPlanStepV3 `json:"steps"`
+	}{
+		SchemaVersion: "vane.research-planner-output/v3",
+		Steps:         plan.Steps,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
 func createResearchPlanFromReceiptV3(
 	t *testing.T, st *Store, identity types.RunIdentity,
 	snapshot types.ResearchRunSnapshotRefV3, plan runcontext.ResearchExecutionPlanV3,
 ) (types.ResearchRunPlanRefV3, ResearchRunLLMSpendReservationV3) {
 	t.Helper()
 	ensureResearchLLMPriceV3(t, st)
-	payload, err := runcontext.EncodeResearchExecutionPlanV3(plan)
-	if err != nil {
-		t.Fatal(err)
-	}
+	payload := researchPlannerCompletionFromPlanV3(t, plan)
 	const userPrompt = "Return the frozen research Plan as JSON."
 	reservation, err := st.BeginResearchRunLLMSpendV3(t.Context(),
 		BeginResearchRunLLMSpendV3Params{
@@ -197,10 +211,7 @@ func TestResearchRunPlanV3RequiresSemanticallyEqualCompletedReceiptPostgres(t *t
 		t.Fatal("database admitted a Plan different from the completed receipt")
 	}
 
-	payload, err := runcontext.EncodeResearchExecutionPlanV3(plan)
-	if err != nil {
-		t.Fatal(err)
-	}
+	payload := researchPlannerCompletionFromPlanV3(t, plan)
 	var semantic any
 	if err := json.Unmarshal(payload, &semantic); err != nil {
 		t.Fatal(err)
