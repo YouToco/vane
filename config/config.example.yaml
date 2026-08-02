@@ -14,6 +14,8 @@ db:
   url: "" # VANE_DB_URL
   # V3 专用非 owner LOGIN；留空会安全禁用 V3，不影响旧任务。
   research_runtime_url: "" # VANE_DB_RESEARCH_RUNTIME_URL
+  # V3 控制面专用 vane_server_runtime LOGIN；不得使用 owner 或 executor URL。
+  research_control_url: "" # VANE_DB_RESEARCH_CONTROL_URL
 
 temporal:
   host: "127.0.0.1:7233"

@@ -41,6 +41,7 @@ var credentialNameV1 = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 
 func LoadProcessConfigV1() (ProcessConfigV1, error) {
 	for _, forbidden := range []string{"VANE_DB_URL", "VANE_DB_RESEARCH_RUNTIME_URL",
+		"VANE_DB_RESEARCH_CONTROL_URL",
 		"VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL", "VANE_DB_RESEARCH_CAPABILITY_KEY_HEX",
 		"VANE_GATEWAY_DB_URL", "VANE_GATEWAY_LLM_API_KEY", "VANE_LLM_API_KEY",
 		"VANE_FETCH_EXA_API_KEY", "VANE_FETCH_TIKHUB_API_KEY", "VANE_LLM_AGENT_API_KEY"} {

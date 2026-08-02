@@ -54,20 +54,38 @@ import (
 // 值 = CHANGELOG 最上方已发布版本号，随发版手动同步；不为此新增 ldflags 基建。
 const vaneVersion = "0.5.1"
 
-// serverReleaseContractV1 is a machine-readable, side-effect-free deployment
+// serverReleaseContractV2 is a machine-readable, side-effect-free deployment
 // assertion.  The control plane checks this exact value before it is allowed
 // to pair a binary with the temporary owner-compatible primary Store contract.
 // V3 execution remains on the independently authenticated research runtime.
-const serverReleaseContractV1 = "vane.server-release-contract/v1 primary_store=owner_compat_v1 research_store=restricted_v1"
+const serverReleaseContractV2 = "vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1"
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "-print-release-contract" {
-		fmt.Println(serverReleaseContractV1)
+		fmt.Println(serverReleaseContractV2)
 		return
 	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "vane: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+func closeServerStores(primary, researchControl *store.Store) {
+	if researchControl != nil && researchControl != primary {
+		researchControl.Close()
+	}
+	if primary != nil {
+		primary.Close()
+	}
+}
+
+func closeServerStartupResources(closeTemporal, closeStores func()) {
+	if closeTemporal != nil {
+		closeTemporal()
+	}
+	if closeStores != nil {
+		closeStores()
 	}
 }
 
@@ -90,36 +108,44 @@ func run() error {
 	// those reads into either permission errors or RLS-empty success.  Keep the
 	// primary pool on the schema-owner compatibility boundary until the full
 	// recovery catalog and every per-tenant reader have passed the real
-	// PostgreSQL server-runtime gate.  Paid V3 execution remains isolated on the
-	// independent research runtime pool below.
-	st, err := store.NewWithResearchRuntimeCapability(
-		ctx, cfg.DB.URL, cfg.DB.ResearchRuntimeURL,
-		store.ResearchRunCapabilityConfigV1{
-			ActiveKeyID:  cfg.DB.ResearchCapabilityKeyID,
-			ActiveKeyHex: cfg.DB.ResearchCapabilityKeyHex,
-			RetiredKeys:  cfg.DB.ResearchCapabilityRetiredKeys,
-			TTL:          time.Duration(cfg.DB.ResearchCapabilityTTLDays) * 24 * time.Hour,
-		},
-	)
+	// PostgreSQL server-runtime gate. It deliberately carries no research pool
+	// or V3 capability keyring.
+	st, err := store.New(ctx, cfg.DB.URL)
 	if err != nil {
 		return fmt.Errorf("初始化数据库连接池: %w", err)
 	}
+	var researchControlStore *store.Store
+	closeStores := func() { closeServerStores(st, researchControlStore) }
 	gatewayClient, err := researchgateway.NewUnixClientV1(cfg.ResearchGateway.SocketPath)
 	if err != nil {
-		st.Close()
+		closeStores()
 		return fmt.Errorf("初始化 research gateway client: %w", err)
 	}
 	var researchRuntimeOption workflow.ActivitiesOption
 	var researchDeliveryOption workflow.ActivitiesOption
 	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
 		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+		researchControlStore, err = store.NewServerRuntimeWithResearchRuntimeCapability(
+			ctx, cfg.DB.ResearchControlURL, cfg.DB.ResearchRuntimeURL,
+			store.ResearchRunCapabilityConfigV1{
+				ActiveKeyID:  cfg.DB.ResearchCapabilityKeyID,
+				ActiveKeyHex: cfg.DB.ResearchCapabilityKeyHex,
+				RetiredKeys:  cfg.DB.ResearchCapabilityRetiredKeys,
+				TTL: time.Duration(cfg.DB.ResearchCapabilityTTLDays) *
+					24 * time.Hour,
+			},
+		)
+		if err != nil {
+			closeStores()
+			return fmt.Errorf("初始化 research V3 control Store: %w", err)
+		}
 		researchExecutor, executorErr := fetcher.NewResearchExecutorV3(cfg.Fetch)
 		if executorErr != nil {
-			st.Close()
+			closeStores()
 			return fmt.Errorf("初始化 research V3 executor: %w", executorErr)
 		}
 		researchRuntime, runtimeErr := workflow.NewProductionResearchRuntimeV3(
-			st, gatewayClient, researchExecutor,
+			researchControlStore, gatewayClient, researchExecutor,
 			func(ctx context.Context, identity types.RunIdentity) (
 				runtimepolicy.BundleV1,
 				runtimepolicy.ResearchToolPolicyV3,
@@ -129,7 +155,9 @@ func run() error {
 				for _, bucket := range []store.QuotaBucket{
 					store.QuotaLLMTokens, store.QuotaExaCalls,
 				} {
-					if _, err := st.LoadQuotaRule(ctx, identity.TenantID, bucket); err != nil {
+					if _, err := researchControlStore.LoadQuotaRule(
+						ctx, identity.TenantID, bucket,
+					); err != nil {
 						return runtimepolicy.BundleV1{},
 							runtimepolicy.ResearchToolPolicyV3{},
 							runtimepolicy.ResearchModelPolicyV3{}, err
@@ -158,7 +186,7 @@ func run() error {
 			},
 		)
 		if runtimeErr != nil {
-			st.Close()
+			closeStores()
 			return fmt.Errorf("初始化 research V3 coordinator: %w", runtimeErr)
 		}
 		researchRuntimeOption = workflow.WithResearchRuntimeV3(researchRuntime)
@@ -168,7 +196,7 @@ func run() error {
 	llmClient := llm.New(cfg.LLM)
 	agentLLMConfig, err := cfg.LLM.AgentClientConfig()
 	if err != nil {
-		st.Close()
+		closeStores()
 		return fmt.Errorf("初始化 Agent LLM 路由: %w", err)
 	}
 	agentLLMClient := llm.New(agentLLMConfig)
@@ -186,7 +214,7 @@ func run() error {
 		Client: llmClient,
 	})
 	if err != nil {
-		st.Close()
+		closeStores()
 		return fmt.Errorf("初始化 compiled LLM 路由: %w", err)
 	}
 
@@ -202,7 +230,7 @@ func run() error {
 		Namespace: cfg.Temporal.Namespace,
 	})
 	if err != nil {
-		st.Close()
+		closeStores()
 		return fmt.Errorf("连接 Temporal(%s): %w", cfg.Temporal.Host, err)
 	}
 
@@ -219,12 +247,13 @@ func run() error {
 	push := pusher.New(manager)
 	if cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
 		delivery, deliveryErr := workflow.NewReceiptBackedResearchDeliveryV3(
-			st, push, newResearchV3DeliveryTargetResolver(st, manager),
+			researchControlStore, push,
+			newResearchV3DeliveryTargetResolver(researchControlStore, manager),
 			renderResearchBriefCardV3,
 		)
 		if deliveryErr != nil {
 			temporalClient.Close()
-			st.Close()
+			closeStores()
 			return fmt.Errorf("初始化 research V3 receipt-backed delivery: %w", deliveryErr)
 		}
 		researchDeliveryOption = workflow.WithResearchDeliveryV3(delivery)
@@ -376,7 +405,7 @@ func run() error {
 		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID)
 	if err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("装配周期 Brief Activities: %w", err)
 	}
 	slog.Info("task playbook prompt policy configured",
@@ -503,7 +532,7 @@ func run() error {
 		slog.Default())
 	if err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("装配周期 Brief coordinator: %w", err)
 	}
 	periodicRecoveryRunner, err := periodicbrief.NewRecoveryRunner(
@@ -512,7 +541,7 @@ func run() error {
 		slog.Default())
 	if err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("装配周期 Brief recovery: %w", err)
 	}
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
@@ -527,7 +556,7 @@ func run() error {
 	cancelRoleGate()
 	if roleGateErr != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("任务定义编辑受限角色 Gate: %w", roleGateErr)
 	}
 	commandRoleGateCtx, cancelCommandRoleGate := context.WithTimeout(
@@ -539,7 +568,7 @@ func run() error {
 	cancelCommandRoleGate()
 	if commandRoleGateErr != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("任务命令受限角色 Gate: %w", commandRoleGateErr)
 	}
 	environmentGateCtx, cancelEnvironmentGate := context.WithTimeout(ctx, 90*time.Second)
@@ -549,7 +578,7 @@ func run() error {
 	cancelEnvironmentGate()
 	if environmentGateErr != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("任务定义编辑 Temporal 环境 Gate: %w", environmentGateErr)
 	}
 
@@ -560,7 +589,7 @@ func run() error {
 	// across a live operation marker.
 	if err := definitionEditCoordinator.RecoverStaleOnce(ctx); err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("任务定义编辑首轮恢复 Gate: %w", err)
 	}
 	scheduleCommandStartupCtx, cancelScheduleCommandStartup :=
@@ -572,7 +601,7 @@ func run() error {
 	cancelScheduleCommandStartup()
 	if scheduleCommandStartupErr != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf(
 			"任务命令首轮恢复 Gate（%s budget）: %w",
 			scheduler.ScheduleCommandRecoveryPassTimeout,
@@ -581,7 +610,7 @@ func run() error {
 	}
 	if err := sched.ReconcileActions(ctx); err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("scheduler: 存量调度 Action reconcile 安全 Gate: %w", err)
 	}
 
@@ -594,35 +623,35 @@ func run() error {
 	)
 	if err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("装配 run outcome recovery: %w", err)
 	}
 	if err := outcomeRecoveryRunner.RunStartup(ctx); err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("run outcome recovery 首轮恢复 Gate: %w", err)
 	}
 	executiveRecoveryRunner, err :=
 		executivebriefrecovery.NewRunner(st, slog.Default())
 	if err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("装配 executive Brief recovery: %w", err)
 	}
 	if err := executiveRecoveryRunner.RunStartup(ctx); err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf(
 			"executive Brief recovery 首轮恢复 Gate: %w", err)
 	}
 	if err := periodicCoordinator.RunStartup(ctx); err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("周期 Brief coordinator 首轮 Gate: %w", err)
 	}
 	if err := periodicRecoveryRunner.RunStartup(ctx); err != nil {
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("周期 Brief recovery 首轮 Gate: %w", err)
 	}
 
@@ -636,7 +665,7 @@ func run() error {
 		cancelOutbound()
 		if outboundErr != nil {
 			temporalClient.Close()
-			st.Close()
+			closeStores()
 			return fmt.Errorf("push effect recovery 飞书发送端 Gate: %w",
 				outboundErr)
 		}
@@ -650,7 +679,7 @@ func run() error {
 		)
 		if err != nil {
 			temporalClient.Close()
-			st.Close()
+			closeStores()
 			return fmt.Errorf("装配 push effect recovery coordinator: %w",
 				err)
 		}
@@ -665,12 +694,12 @@ func run() error {
 		)
 		if err != nil {
 			temporalClient.Close()
-			st.Close()
+			closeStores()
 			return fmt.Errorf("装配 push effect recovery lifecycle: %w", err)
 		}
 		if err := pushRecoveryRunner.RunStartup(ctx); err != nil {
 			temporalClient.Close()
-			st.Close()
+			closeStores()
 			return fmt.Errorf("push effect recovery 首轮恢复 Gate: %w", err)
 		}
 	}
@@ -695,35 +724,6 @@ func run() error {
 			return ctx.Err()
 		}
 	}
-	runMaintenance(func() {
-		executiveRecoveryRunner.Run(ctx)
-	})
-	runMaintenance(func() {
-		periodicCoordinator.Run(ctx)
-	})
-	runMaintenance(func() {
-		periodicRecoveryRunner.Run(ctx)
-	})
-
-	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
-	//
-	// 两种缺行都要靠它兜住，而且两种都是**静默的**：
-	//   · 建租户时 seed 失败——那条路径刻意只记日志（塞进事务会让一次 seed 失败
-	//     升级成整个注册失败），代价是用户注册"成功"却什么都用不了；
-	//   · 迁移漏回填——025 第一版就漏了存量租户，配合"缺行即拒绝"上线即锁死推送，
-	//     而下游把额度用尽当正常终态，Temporal 一片绿、零告警。
-	// 缺行的后果是"这个租户什么都用不了"，它不该靠谁记得手工补。
-	runMaintenance(func() {
-		n, err := st.ReconcileTenantQuota(ctx)
-		if err != nil {
-			slog.Error("配额 reconcile 整体失败（不影响启动）", "err", err)
-			return
-		}
-		if n > 0 {
-			slog.Info("配额 reconcile 完成", "seeded_tenants", n)
-		}
-	})
-
 	// agent loop（M4 契约 §9 装配序：store → llm → scheduler → tools → agent.New →
 	// manager 注入）：任务级立即运行依赖 scheduler，
 	// 故装配在 scheduler 之后；注入须在 manager.Start 之前，保证 WS 连接建立时
@@ -805,9 +805,73 @@ func run() error {
 		TaskDefinitionEdit: definitionEditController,
 	})
 	if err != nil {
+		closeServerStartupResources(temporalClient.Close, closeStores)
 		return fmt.Errorf("装配 Agent 工具注册表: %w", err)
 	}
 	manager.SetAgent(agentLoop)
+
+	// Build the A2A agent before any worker or recovery goroutine starts. A
+	// composition error is then an ordinary startup failure: no admitted work
+	// needs draining, and both Store boundaries can be closed immediately.
+	var a2aLoop *agent.Loop
+	if cfg.A2A.Enabled {
+		a2aTools, filterErr := agent.FilterAuthorizedTools(
+			tools, agent.AuthorizationA2AReadOnly,
+		)
+		if filterErr != nil {
+			closeServerStartupResources(temporalClient.Close, closeStores)
+			return fmt.Errorf("筛选 A2A Agent 工具: %w", filterErr)
+		}
+		var loopErr error
+		a2aLoop, loopErr = agent.NewChecked(agent.Deps{
+			Client:                agentLLMClient,
+			Recorder:              recorder,
+			Tools:                 a2aTools,
+			Model:                 cfg.LLM.AgentModel,
+			MaxTurns:              cfg.Agent.MaxTurns,
+			SystemPrompt:          a2a.ChatSystemPrompt,
+			IntentToolkitsEnabled: cfg.Agent.IntentToolkitsAllowAll,
+			IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
+				!cfg.Agent.IntentToolkitsAllowAll,
+			ToolCalls: agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
+		})
+		if loopErr != nil {
+			closeServerStartupResources(temporalClient.Close, closeStores)
+			return fmt.Errorf("装配 A2A Agent 工具注册表: %w", loopErr)
+		}
+	}
+
+	// Only launch background database users after every fallible Agent
+	// composition step has succeeded. Before this point startup failures can
+	// close Temporal and both Stores without racing an admitted goroutine.
+	runMaintenance(func() {
+		executiveRecoveryRunner.Run(ctx)
+	})
+	runMaintenance(func() {
+		periodicCoordinator.Run(ctx)
+	})
+	runMaintenance(func() {
+		periodicRecoveryRunner.Run(ctx)
+	})
+
+	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
+	//
+	// 两种缺行都要靠它兜住，而且两种都是**静默的**：
+	//   · 建租户时 seed 失败——那条路径刻意只记日志（塞进事务会让一次 seed 失败
+	//     升级成整个注册失败），代价是用户注册"成功"却什么都用不了；
+	//   · 迁移漏回填——025 第一版就漏了存量租户，配合"缺行即拒绝"上线即锁死推送，
+	//     而下游把额度用尽当正常终态，Temporal 一片绿、零告警。
+	// 缺行的后果是"这个租户什么都用不了"，它不该靠谁记得手工补。
+	runMaintenance(func() {
+		n, err := st.ReconcileTenantQuota(ctx)
+		if err != nil {
+			slog.Error("配额 reconcile 整体失败（不影响启动）", "err", err)
+			return
+		}
+		if n > 0 {
+			slog.Info("配额 reconcile 完成", "seeded_tenants", n)
+		}
+	})
 
 	// 反馈服务（M5 契约 §13）：装在 agent 之后。普通态度/原因由 056 耐久投影；
 	// 仅 deep_dive 成功送达后仍通过 Notifier=agentLoop 做 legacy best-effort 会话回调。
@@ -848,7 +912,7 @@ func run() error {
 			)
 		}
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("装配任务创建耐久回执: %w", err)
 	}
 	definitionEditReceiptDispatcher, err :=
@@ -871,7 +935,7 @@ func run() error {
 			)
 		}
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("装配任务定义编辑耐久回执: %w", err)
 	}
 	continuationDispatcher, err := agentcontinuation.New(
@@ -891,7 +955,7 @@ func run() error {
 			)
 		}
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("装配 Agent 耐久延续投影器: %w", err)
 	}
 	// Definition-edit recovery starts before any Feishu/HTTP ingress is admitted.
@@ -1065,7 +1129,7 @@ func run() error {
 			)
 		}
 		temporalClient.Close()
-		st.Close()
+		closeStores()
 		return fmt.Errorf("启动 Temporal worker: %w", err)
 	}
 
@@ -1105,7 +1169,13 @@ func run() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /readyz", handleReadyz(st))
+	readinessStores := []readyzStore{st}
+	if researchControlStore != nil {
+		// The control Store Ping covers both its vane_server_runtime control pool
+		// and the independently authenticated research executor pool.
+		readinessStores = append(readinessStores, researchControlStore)
+	}
+	mux.HandleFunc("GET /readyz", handleReadyz(readinessStores...))
 	// principal 解析器：全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 过渡期实现是「全局 owner 回退 + 租户恒为 1」，行为与收敛前逐字一致；
 	// 真实认证落地后只换这一处构造，api/a2a/gate 三处调用点零改动。
@@ -1147,32 +1217,6 @@ func run() error {
 			slog.Info("a2a: 已清理上次进程遗留的滞留任务", "count", n)
 		}
 
-		// assistant.chat 的 A2A 轨 agent 实例（契约 §12 P2）：与飞书轨完全隔离——
-		// 工具只由 agent 包的本地 authorization policy 筛选；main 不解释 effect，
-		// 更不读取远端 metadata。当前策略精确授权 list_schedules；
-		// system prompt 换 A2A 语境；Store/Profiles 不注入（RunOnce 不碰会话与画像，
-		// 误用 HandleMessage 会在 loadOrCreateSession 处 nil panic——响亮的装配错误）。
-		a2aTools, filterErr := agent.FilterAuthorizedTools(
-			tools, agent.AuthorizationA2AReadOnly,
-		)
-		if filterErr != nil {
-			return fmt.Errorf("筛选 A2A Agent 工具: %w", filterErr)
-		}
-		a2aLoop, loopErr := agent.NewChecked(agent.Deps{
-			Client:                agentLLMClient,
-			Recorder:              recorder,
-			Tools:                 a2aTools,
-			Model:                 cfg.LLM.AgentModel,
-			MaxTurns:              cfg.Agent.MaxTurns,
-			SystemPrompt:          a2a.ChatSystemPrompt,
-			IntentToolkitsEnabled: cfg.Agent.IntentToolkitsAllowAll,
-			IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
-				!cfg.Agent.IntentToolkitsAllowAll,
-			ToolCalls: agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
-		})
-		if loopErr != nil {
-			return fmt.Errorf("装配 A2A Agent 工具注册表: %w", loopErr)
-		}
 		a2aRuntime, err = a2a.Mount(mux, a2a.Deps{
 			Storage:   st,
 			Content:   st,
@@ -1216,7 +1260,7 @@ func run() error {
 			}
 			w.Stop()
 			temporalClient.Close()
-			st.Close()
+			closeStores()
 			return fmt.Errorf("挂载 A2A server: %w", err)
 		}
 	}
@@ -1355,7 +1399,7 @@ func run() error {
 		temporalClient.Close()
 		// pgxpool.Close 会等借出连接归还；到这里所有入口、SDK detached work、
 		// recovery、maintenance 与 Activity 都已确认退出。
-		st.Close()
+		closeStores()
 	}); err != nil {
 		unsafeErr := fmt.Errorf("优雅关停未能安全排空，共享依赖保持打开: %w", err)
 		if serveFailure != nil {
@@ -1394,12 +1438,29 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, `{"status":"ok"}`)
 }
 
-// handleReadyz 是就绪探针：DB Ping 通过返回 200，否则 503。
-func handleReadyz(st *store.Store) http.HandlerFunc {
+type readyzStore interface {
+	Ping(context.Context) error
+}
+
+// handleReadyz 是就绪探针：所有已启用 Store 的连接池 Ping 通过返回 200，否则 503。
+func handleReadyz(stores ...readyzStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
-		if err := st.Ping(ctx); err != nil {
+		results := make(chan error, len(stores))
+		for _, st := range stores {
+			go func() { results <- st.Ping(ctx) }()
+		}
+		var pingErrs []error
+		if len(stores) == 0 {
+			pingErrs = append(pingErrs, errors.New("readyz Store 未配置"))
+		}
+		for range stores {
+			if err := <-results; err != nil {
+				pingErrs = append(pingErrs, err)
+			}
+		}
+		if err := errors.Join(pingErrs...); err != nil {
 			slog.Warn("readyz 数据库探活失败", "err", err)
 			writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable"}`)
 			return
