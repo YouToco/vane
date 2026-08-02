@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pressly/goose/v3"
 )
@@ -150,6 +151,173 @@ func TestResearchShadowToolAdmissionUsesExactPreparedSidecarPostgres(t *testing.
 	}
 }
 
+func TestResearchShadowToolAdmissionSerializesRevocationWithoutDeadlockPostgres(t *testing.T) {
+	type mutation struct {
+		name      string
+		lockSQL   string
+		revokeSQL string
+		args      func(researchRunSpendFixtureV3) []any
+	}
+	mutations := []mutation{
+		{"membership", `SELECT 1 FROM memberships WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE`,
+			`UPDATE memberships SET role='member' WHERE tenant_id=$1 AND user_id=$2`,
+			func(f researchRunSpendFixtureV3) []any { return []any{f.tenantID, f.userID} }},
+		// status/deleted_at do not change a tenant key. Match PostgreSQL's
+		// real UPDATE lock strength so the test does not invent a conflict
+		// with child-row foreign-key KEY SHARE locks.
+		{"tenant", `SELECT 1 FROM tenants WHERE id=$1 FOR NO KEY UPDATE`,
+			`UPDATE tenants SET status='suspended' WHERE id=$1`,
+			func(f researchRunSpendFixtureV3) []any { return []any{f.tenantID} }},
+		{"schedule", `SELECT 1 FROM schedules WHERE id=$1 FOR UPDATE`,
+			`UPDATE schedules SET status='paused' WHERE id=$1`,
+			func(f researchRunSpendFixtureV3) []any { return []any{f.identity.TaskID} }},
+		{"prepared head", `SELECT 1 FROM research_v3_prepared_definition_heads
+			WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 FOR UPDATE`,
+			`DELETE FROM research_v3_prepared_definition_heads
+			WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+			func(f researchRunSpendFixtureV3) []any {
+				return []any{f.tenantID, f.userID, f.identity.TaskID}
+			}},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			f := newResearchShadowRunSpendFixtureV3(t, 1_000_000)
+			ctx := t.Context()
+			gate, err := f.store.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gate.Rollback(ctx)
+			budgetKey := "research-spend/v3:" + f.identity.TemporalRunID + ":budget"
+			if _, err := gate.Exec(ctx,
+				`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, budgetKey); err != nil {
+				t.Fatal(err)
+			}
+			var gatePID int
+			if err := gate.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&gatePID); err != nil {
+				t.Fatal(err)
+			}
+
+			revoke, err := f.store.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer revoke.Rollback(ctx)
+			var revokePID int
+			if err := revoke.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&revokePID); err != nil {
+				t.Fatal(err)
+			}
+			args := test.args(f)
+			var one int
+			if err := revoke.QueryRow(ctx, test.lockSQL, args...).Scan(&one); err != nil {
+				t.Fatal(err)
+			}
+
+			type beginResult struct {
+				execution ResearchRunStepExecutionV3
+				err       error
+			}
+			begun := make(chan beginResult, 1)
+			go func() {
+				execution, beginErr := f.store.BeginResearchRunStepV3(
+					ctx, f.identity, f.snapshotID, f.planRef, 0)
+				begun <- beginResult{execution: execution, err: beginErr}
+			}()
+			waitForResearchAdmissionLockV3(
+				t, f.store, f.identity.TemporalRunID, gatePID)
+
+			revoked := make(chan error, 1)
+			go func() {
+				_, revokeErr := revoke.Exec(ctx, test.revokeSQL, args...)
+				revoked <- revokeErr
+			}()
+			// Let the revocation reach migration 102's exact-task exclusive
+			// fence while admission owns the shared fence, then release the
+			// budget gate. A row-locking authorization SELECT deadlocks here.
+			waitForBackendAdvisoryLockV3(t, f.store, revokePID,
+				test.name+" revocation")
+			if err := gate.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case got := <-begun:
+				if got.err != nil || !got.execution.FirstWriter {
+					t.Fatalf("shadow admission during %s revocation=%+v err=%v",
+						test.name, got.execution, got.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("shadow admission deadlocked with %s revocation", test.name)
+			}
+			select {
+			case err := <-revoked:
+				if err != nil {
+					t.Fatalf("%s revocation deadlocked: %v", test.name, err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s revocation did not serialize", test.name)
+			}
+			if err := revoke.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if next, err := f.begin(t, 1); err == nil || next.StepID != 0 {
+				t.Fatalf("%s revocation admitted new ordinal=%+v err=%v",
+					test.name, next, err)
+			}
+			starts, reservations := f.spendCounts(t)
+			if starts != 1 || reservations != 1 || f.quotaTokens(t) != 9 {
+				t.Fatalf("%s revocation spend starts=%d reservations=%d quota=%v",
+					test.name, starts, reservations, f.quotaTokens(t))
+			}
+		})
+	}
+}
+
+func waitForResearchAdmissionLockV3(
+	t *testing.T, st *Store, temporalRunID string, blockerPID int,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := st.pool.QueryRow(t.Context(), `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			 WHERE datname=current_database()
+			   AND query LIKE '%admit_research_run_tool_step_cap_v1%'
+			   AND query NOT LIKE '%pg_stat_activity%'
+			   AND wait_event_type='Lock' AND wait_event='advisory'
+			   AND $1=ANY(pg_blocking_pids(pid))
+		)`, blockerPID).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("research admission for %s did not reach the budget lock", temporalRunID)
+}
+
+func waitForBackendAdvisoryLockV3(t *testing.T, st *Store, pid int, label string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := st.pool.QueryRow(t.Context(), `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			 WHERE datname=current_database() AND pid=$1
+			   AND wait_event_type='Lock' AND wait_event='advisory'
+		)`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s did not reach the exact-task advisory lock", label)
+}
+
 func TestMigration105SQLKeepsFormalAndShadowAuthorizationOrthogonal(t *testing.T) {
 	payload, err := fs.ReadFile(migrationsFS,
 		"migrations/105_research_shadow_tool_admission.sql")
@@ -172,5 +340,9 @@ func TestMigration105SQLKeepsFormalAndShadowAuthorizationOrthogonal(t *testing.T
 		if !strings.Contains(sqlText, required) {
 			t.Fatalf("105 migration omitted %q", required)
 		}
+	}
+	if strings.Contains(sqlText,
+		"FOR SHARE OF schedule,tenant,membership,head,operation,definition") {
+		t.Fatal("shadow authorization reintroduced advisory-to-row lock inversion")
 	}
 }

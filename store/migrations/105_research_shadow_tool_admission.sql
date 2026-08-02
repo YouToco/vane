@@ -306,8 +306,13 @@ BEGIN
                (schedule.execution_mode='discover_at_run' AND
                 schedule.approved_definition_version=head.definition_version AND
                 schedule.approved_definition_digest=head.definition_digest)
-           )
-         FOR SHARE OF schedule,tenant,membership,head,operation,definition;
+           );
+        -- The exact-task advisory fence above serializes every mutable
+        -- authorization writer.  Do not add row locks here: migration 102's
+        -- BEFORE triggers acquire the task lock after PostgreSQL has locked
+        -- the row being updated, so advisory-then-row would invert that order
+        -- and deadlock revocation.  A plain MVCC read linearizes before a
+        -- waiting revocation or observes its committed state.
     ELSE
         -- The formal V3 path is migration 095's original owner-action fence.
         SELECT true INTO admitted

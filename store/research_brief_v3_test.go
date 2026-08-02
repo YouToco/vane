@@ -27,6 +27,7 @@ type researchBriefFixtureV3 struct {
 	identity    types.RunIdentity
 	snapshotRef types.ResearchRunSnapshotRefV3
 	planRef     types.ResearchRunPlanRefV3
+	beginErr    error
 }
 
 func newResearchBriefFixtureV3(
@@ -66,6 +67,15 @@ func newResearchBriefFixtureWithWorkflowV3(
 	).Scan(&tenantID); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		if _, err := st.PurgeTenant(cleanupCtx, tenantID, false); err != nil {
+			t.Errorf("purge V3 research Brief fixture tenant: %v", err)
+			return
+		}
+		cleanupExec(cleanupCtx, t, st, `DELETE FROM users WHERE id=$1`, userID)
+	})
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO memberships (tenant_id,user_id,role) VALUES ($1,$2,'owner')`,
 		tenantID, userID); err != nil {
@@ -203,6 +213,12 @@ func newResearchBriefFixtureWithWorkflowV3(
 	planRef, _ := createResearchPlanFromReceiptV3(t, st, identity, snapshotRef, plan)
 	started, err := st.BeginResearchRunStepV3(ctx, identity, snapshotRef.SnapshotID, planRef, 0)
 	if err != nil {
+		if authorityToken != "" && strings.HasPrefix(workflowID, "research-v3-shadow-") {
+			return researchBriefFixtureV3{
+				st: st, tenantID: tenantID, userID: userID, taskID: taskID,
+				identity: identity, snapshotRef: snapshotRef, planRef: planRef, beginErr: err,
+			}
+		}
 		t.Fatal(err)
 	}
 	if completeEvidence {
@@ -223,15 +239,6 @@ func newResearchBriefFixtureWithWorkflowV3(
 	} else if started.StepID <= 0 {
 		t.Fatal("research step did not start")
 	}
-	t.Cleanup(func() {
-		cleanupCtx, cancel := cleanupContext()
-		defer cancel()
-		if _, err := st.PurgeTenant(cleanupCtx, tenantID, false); err != nil {
-			t.Errorf("purge V3 research Brief fixture tenant: %v", err)
-			return
-		}
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM users WHERE id=$1`, userID)
-	})
 	return researchBriefFixtureV3{
 		st: st, tenantID: tenantID, userID: userID, taskID: taskID,
 		identity: identity, snapshotRef: snapshotRef, planRef: planRef,
