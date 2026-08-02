@@ -246,6 +246,61 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		}
 	})
 
+	t.Run("quota readiness fails closed on live privilege drift", func(t *testing.T) {
+		for name, drift := range map[string]struct {
+			apply   string
+			restore string
+		}{
+			"resolver missing": {
+				apply: `ALTER FUNCTION resolve_research_quota_rule_v1(BIGINT,BIGINT,TEXT,TEXT)
+					RENAME TO resolve_research_quota_rule_v1_drifted`,
+				restore: `ALTER FUNCTION resolve_research_quota_rule_v1_drifted(BIGINT,BIGINT,TEXT,TEXT)
+					RENAME TO resolve_research_quota_rule_v1`,
+			},
+			"token column granted": {
+				apply:   `GRANT SELECT(tokens) ON tenant_quota TO vane_app`,
+				restore: `REVOKE SELECT(tokens) ON tenant_quota FROM vane_app`,
+			},
+			"runtime login token column granted": {
+				apply:   `GRANT SELECT(tokens) ON tenant_quota TO vane_server_runtime`,
+				restore: `REVOKE SELECT(tokens) ON tenant_quota FROM vane_server_runtime`,
+			},
+			"capability rate column granted": {
+				apply:   `GRANT SELECT(rate) ON tenant_quota TO vane_brief_reader`,
+				restore: `REVOKE SELECT(rate) ON tenant_quota FROM vane_brief_reader`,
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				runtimeStore, err := NewServerRuntime(t.Context(), runtimeURL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer runtimeStore.Close()
+				ownerCompat, err := New(t.Context(), scratchURL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer ownerCompat.Close()
+				if _, err := owner.ExecContext(t.Context(), drift.apply); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					ctx, cancel := cleanupContext()
+					defer cancel()
+					if _, err := owner.ExecContext(ctx, drift.restore); err != nil {
+						t.Errorf("restore quota readiness drift: %v", err)
+					}
+				}()
+				if err := runtimeStore.Ping(t.Context()); err == nil {
+					t.Fatal("restricted research control readiness accepted quota privilege drift")
+				}
+				if err := ownerCompat.Ping(t.Context()); err != nil {
+					t.Fatalf("owner-compatible primary readiness was coupled to V3 projection: %v", err)
+				}
+			})
+		}
+	})
+
 	t.Run("V3 shadow binds exact app tenant and user scope", func(t *testing.T) {
 		ownerStore, err := New(t.Context(), scratchURL)
 		if err != nil {
@@ -340,6 +395,10 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 			`SELECT rate,burst FROM tenant_quota LIMIT 1`); err == nil {
 			t.Fatal("vane_app read tenant_quota directly")
 		}
+		if _, err := runtimeStore.pool.Exec(t.Context(),
+			`SELECT tokens FROM tenant_quota LIMIT 1`); err == nil {
+			t.Fatal("vane_app read tenant_quota token balance directly")
+		}
 		unbound, err := runtimeStore.pool.Begin(t.Context())
 		if err != nil {
 			t.Fatal(err)
@@ -359,6 +418,73 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 			resolve_research_quota_rule_v1($1,$2,$3,$4)`, tenantID, user.ID,
 			taskID, string(QuotaLLMTokens)); err == nil {
 			t.Fatal("research executor invoked the control quota projection")
+		}
+		if _, err := executor.Exec(t.Context(),
+			`SELECT tokens FROM tenant_quota LIMIT 1`); err == nil {
+			t.Fatal("research executor read tenant_quota token balance directly")
+		}
+		var publicCanExecute bool
+		if err := owner.QueryRowContext(t.Context(), `
+			SELECT COALESCE(bool_or(acl.grantee=0 AND acl.privilege_type='EXECUTE'),false)
+			  FROM pg_catalog.pg_proc proc
+			 CROSS JOIN LATERAL aclexplode(COALESCE(proc.proacl,
+			       acldefault('f',proc.proowner))) acl
+			 WHERE proc.oid='public.resolve_research_quota_rule_v1(bigint,bigint,text,text)'::regprocedure`,
+		).Scan(&publicCanExecute); err != nil {
+			t.Fatal(err)
+		}
+		if publicCanExecute {
+			t.Fatal("PUBLIC can execute the research control quota projection")
+		}
+
+		for name, mutation := range map[string]struct {
+			apply   string
+			restore string
+		}{
+			"paused task": {
+				apply:   `UPDATE schedules SET status='paused' WHERE id=$1`,
+				restore: `UPDATE schedules SET status='active' WHERE id=$1`,
+			},
+			"suspended tenant": {
+				apply:   `UPDATE tenants SET status='suspended' WHERE id=$1`,
+				restore: `UPDATE tenants SET status='active' WHERE id=$1`,
+			},
+			"soft-deleted tenant": {
+				apply:   `UPDATE tenants SET deleted_at=now() WHERE id=$1`,
+				restore: `UPDATE tenants SET deleted_at=NULL WHERE id=$1`,
+			},
+			"missing membership": {
+				apply:   `DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+				restore: `INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'owner')`,
+			},
+			"non-owner membership": {
+				apply:   `UPDATE memberships SET role='member' WHERE tenant_id=$1 AND user_id=$2`,
+				restore: `UPDATE memberships SET role='owner' WHERE tenant_id=$1 AND user_id=$2`,
+			},
+		} {
+			t.Run("quota projection rejects "+name, func(t *testing.T) {
+				args := []any{tenantID, user.ID}
+				if name == "paused task" {
+					args = []any{taskID}
+				} else if name == "suspended tenant" || name == "soft-deleted tenant" {
+					args = []any{tenantID}
+				}
+				if _, err := owner.ExecContext(t.Context(), mutation.apply, args...); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					ctx, cancel := cleanupContext()
+					defer cancel()
+					if _, err := owner.ExecContext(ctx, mutation.restore, args...); err != nil {
+						t.Errorf("restore %s: %v", name, err)
+					}
+				}()
+				if _, err := runtimeStore.LoadResearchQuotaRuleV3(
+					t.Context(), identity, QuotaLLMTokens,
+				); !errors.Is(err, ErrQuotaExceeded) {
+					t.Fatalf("%s quota err=%v", name, err)
+				}
+			})
 		}
 		ref, err := runtimeStore.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
 			testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
