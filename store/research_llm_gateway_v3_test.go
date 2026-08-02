@@ -327,7 +327,8 @@ func TestResearchLLMProcessGatewayV2TerminalReplayAndRevocationPostgres(t *testi
 			}
 			if test.revoke {
 				if _, err := f.store.pool.Exec(t.Context(), `UPDATE research_run_capabilities
-					SET revoked_at=now() WHERE run_snapshot_id=$1`, f.snapshotID); err != nil {
+					SET revoked_at=GREATEST(clock_timestamp(),issued_at)
+				  WHERE run_snapshot_id=$1`, f.snapshotID); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -388,7 +389,8 @@ func TestResearchLLMProcessGatewayV2RecoversRevokedClaimPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := f.store.pool.Exec(t.Context(), `UPDATE research_run_capabilities
-		SET revoked_at=now() WHERE run_snapshot_id=$1`, f.snapshotID); err != nil {
+		SET revoked_at=GREATEST(clock_timestamp(),issued_at)
+	  WHERE run_snapshot_id=$1`, f.snapshotID); err != nil {
 		t.Fatal(err)
 	}
 	var settled bool
