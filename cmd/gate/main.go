@@ -8,7 +8,7 @@
 // （exit 2）都会把 deploy job 打红——服务此刻已在跑新代码（无自动回滚），流水线红
 // 是"部署已生效但体检不过"的强信号，与 probewatch 的飞书告警卡双通道。
 //
-// 为什么走 DB 直连（store.New）而不打 /api/admin/observability：
+// 为什么走 DB 直连（store.NewServerRuntime）而不打 /api/admin/observability：
 // post-deploy 在 VPS 上执行，本来就有库权限（与 vane.service 同宿主、同 VANE_DB_URL），
 // 走 HTTP 要额外带 Dashboard 密码、还要 Caddy 与 HTTP server 都已就绪——
 // 而"刚部署完服务还没起来"恰恰是探针最该说话的时刻，此时 HTTP 出口自己先挂了，
@@ -99,7 +99,11 @@ func run() int {
 
 	// 刻意不调 store.Migrate（cmd/server 启动时已跑过）：本工具是只读探针，
 	// 给"看指标"附带改 schema 的能力毫无收益——post-deploy 时 vane.service 早已迁移完毕。
-	st, err := store.New(ctx, cfg.DB.URL)
+	// Gate receives the same non-owner DSN as vane.service. Enter the exact
+	// default vane_app capability and validate the runtime shell; store.New
+	// would leave current_user at the inert NOINHERIT login and make every
+	// business-table probe fail before the old worker is drained.
+	st, err := store.NewServerRuntime(ctx, cfg.DB.URL)
 	if err != nil {
 		slog.Error("gate: 连接数据库失败", "err", err)
 		fmt.Fprintln(os.Stderr, "gate: 连接数据库失败——请确认 Postgres 可达且连接串正确")
