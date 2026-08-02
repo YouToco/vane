@@ -46,7 +46,8 @@ func TestResearchLLMProcessGatewayV2AtomicClaimPostgres(t *testing.T) {
 	}
 	seed := tenantTestStore(t)
 	ensureResearchLLMPriceV3(t, seed)
-	f := newResearchRunSpendFixtureWithToolBudgetV3(t, 1_000_000, 16, false)
+	f := newResearchRunSpendFixtureWithModelPolicyV3(t, 1_000_000, 16, false,
+		testProductionResearchModelPolicyStoreV3(t))
 	useOwnerResearchRuntimeForTest(f.store)
 	reservation, err := f.store.BeginResearchRunLLMSpendV3(t.Context(),
 		researchPlannerBeginV3(f, 1, "process gateway atomic claim"))

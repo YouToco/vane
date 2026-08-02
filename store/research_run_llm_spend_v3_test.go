@@ -16,7 +16,7 @@ func ensureResearchLLMPriceV3(t *testing.T, st *Store) {
 	if err := st.pool.QueryRow(t.Context(),
 		`SELECT EXISTS (
 		   SELECT 1 FROM provider_price_rules
-		    WHERE provider='deepseek' AND resource='deepseek-v4-pro'
+		    WHERE provider='deepseek' AND resource='strong-model'
 		      AND meter='llm_tokens' AND effective_to IS NULL
 		 )`).Scan(&exists); err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func ensureResearchLLMPriceV3(t *testing.T, st *Store) {
 		     provider,resource,meter,currency,input_cache_hit_per_million,
 		     input_cache_miss_per_million,output_per_million,effective_from,
 		     source_url,note,created_by,change_id,request_hash
-		 ) VALUES ('deepseek','deepseek-v4-pro','llm_tokens','USD',0.1,1.0,2.0,
+		 ) VALUES ('deepseek','strong-model','llm_tokens','USD',0.1,1.0,2.0,
 		           clock_timestamp(),'https://example.test/pricing',
 		           'V3 research model spend test',NULL,$1,$2)`,
 		"research-llm-v3-test-"+uuid.NewString(),

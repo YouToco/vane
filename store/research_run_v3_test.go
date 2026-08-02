@@ -644,17 +644,31 @@ func testResearchModelPolicyStoreV3(t *testing.T) runtimepolicy.ResearchModelPol
 			ID: runtimepolicy.CredentialIDLLMPrimaryV1, Generation: 1,
 		},
 		Planner: runtimepolicy.ResearchModelStageV3{
-			Stage: runtimepolicy.ResearchModelStagePlannerV3, Model: "deepseek-v4-pro",
+			Stage: runtimepolicy.ResearchModelStagePlannerV3, Model: "strong-model",
 			MaxTokens: 4096, SystemPrompt: "Plan from the trusted task manual.",
-			RendererVersion: "research-planner.render/v3", DisableThinking: true,
+			RendererVersion: "research-planner.render/v3",
 		},
 		Synthesis: runtimepolicy.ResearchModelStageV3{
-			Stage: runtimepolicy.ResearchModelStageSynthesisV3, Model: "deepseek-v4-pro",
+			Stage: runtimepolicy.ResearchModelStageSynthesisV3, Model: "strong-model",
 			MaxTokens: 8192, SystemPrompt: "Synthesize without Tools.",
-			RendererVersion: "research-synthesis.render/v3", DisableThinking: true,
+			RendererVersion: "research-synthesis.render/v3",
 		},
 		QuotaBucket: "llm_tokens",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
+}
+
+func testProductionResearchModelPolicyStoreV3(t *testing.T) runtimepolicy.ResearchModelPolicyV3 {
+	t.Helper()
+	policy := testResearchModelPolicyStoreV3(t)
+	policy.Planner.Model = "deepseek-v4-pro"
+	policy.Planner.DisableThinking = true
+	policy.Synthesis.Model = "deepseek-v4-pro"
+	policy.Synthesis.DisableThinking = true
+	policy, err := runtimepolicy.BuildResearchModelPolicyV3(policy)
 	if err != nil {
 		t.Fatal(err)
 	}
