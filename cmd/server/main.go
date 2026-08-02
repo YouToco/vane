@@ -80,6 +80,15 @@ func closeServerStores(primary, researchControl *store.Store) {
 	}
 }
 
+func closeServerStartupResources(closeTemporal, closeStores func()) {
+	if closeTemporal != nil {
+		closeTemporal()
+	}
+	if closeStores != nil {
+		closeStores()
+	}
+}
+
 func run() error {
 	// 顶层 ctx：SIGINT/SIGTERM 时取消，触发优雅关停。
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -715,35 +724,6 @@ func run() error {
 			return ctx.Err()
 		}
 	}
-	runMaintenance(func() {
-		executiveRecoveryRunner.Run(ctx)
-	})
-	runMaintenance(func() {
-		periodicCoordinator.Run(ctx)
-	})
-	runMaintenance(func() {
-		periodicRecoveryRunner.Run(ctx)
-	})
-
-	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
-	//
-	// 两种缺行都要靠它兜住，而且两种都是**静默的**：
-	//   · 建租户时 seed 失败——那条路径刻意只记日志（塞进事务会让一次 seed 失败
-	//     升级成整个注册失败），代价是用户注册"成功"却什么都用不了；
-	//   · 迁移漏回填——025 第一版就漏了存量租户，配合"缺行即拒绝"上线即锁死推送，
-	//     而下游把额度用尽当正常终态，Temporal 一片绿、零告警。
-	// 缺行的后果是"这个租户什么都用不了"，它不该靠谁记得手工补。
-	runMaintenance(func() {
-		n, err := st.ReconcileTenantQuota(ctx)
-		if err != nil {
-			slog.Error("配额 reconcile 整体失败（不影响启动）", "err", err)
-			return
-		}
-		if n > 0 {
-			slog.Info("配额 reconcile 完成", "seeded_tenants", n)
-		}
-	})
-
 	// agent loop（M4 契约 §9 装配序：store → llm → scheduler → tools → agent.New →
 	// manager 注入）：任务级立即运行依赖 scheduler，
 	// 故装配在 scheduler 之后；注入须在 manager.Start 之前，保证 WS 连接建立时
@@ -825,9 +805,73 @@ func run() error {
 		TaskDefinitionEdit: definitionEditController,
 	})
 	if err != nil {
+		closeServerStartupResources(temporalClient.Close, closeStores)
 		return fmt.Errorf("装配 Agent 工具注册表: %w", err)
 	}
 	manager.SetAgent(agentLoop)
+
+	// Build the A2A agent before any worker or recovery goroutine starts. A
+	// composition error is then an ordinary startup failure: no admitted work
+	// needs draining, and both Store boundaries can be closed immediately.
+	var a2aLoop *agent.Loop
+	if cfg.A2A.Enabled {
+		a2aTools, filterErr := agent.FilterAuthorizedTools(
+			tools, agent.AuthorizationA2AReadOnly,
+		)
+		if filterErr != nil {
+			closeServerStartupResources(temporalClient.Close, closeStores)
+			return fmt.Errorf("筛选 A2A Agent 工具: %w", filterErr)
+		}
+		var loopErr error
+		a2aLoop, loopErr = agent.NewChecked(agent.Deps{
+			Client:                agentLLMClient,
+			Recorder:              recorder,
+			Tools:                 a2aTools,
+			Model:                 cfg.LLM.AgentModel,
+			MaxTurns:              cfg.Agent.MaxTurns,
+			SystemPrompt:          a2a.ChatSystemPrompt,
+			IntentToolkitsEnabled: cfg.Agent.IntentToolkitsAllowAll,
+			IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
+				!cfg.Agent.IntentToolkitsAllowAll,
+			ToolCalls: agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
+		})
+		if loopErr != nil {
+			closeServerStartupResources(temporalClient.Close, closeStores)
+			return fmt.Errorf("装配 A2A Agent 工具注册表: %w", loopErr)
+		}
+	}
+
+	// Only launch background database users after every fallible Agent
+	// composition step has succeeded. Before this point startup failures can
+	// close Temporal and both Stores without racing an admitted goroutine.
+	runMaintenance(func() {
+		executiveRecoveryRunner.Run(ctx)
+	})
+	runMaintenance(func() {
+		periodicCoordinator.Run(ctx)
+	})
+	runMaintenance(func() {
+		periodicRecoveryRunner.Run(ctx)
+	})
+
+	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
+	//
+	// 两种缺行都要靠它兜住，而且两种都是**静默的**：
+	//   · 建租户时 seed 失败——那条路径刻意只记日志（塞进事务会让一次 seed 失败
+	//     升级成整个注册失败），代价是用户注册"成功"却什么都用不了；
+	//   · 迁移漏回填——025 第一版就漏了存量租户，配合"缺行即拒绝"上线即锁死推送，
+	//     而下游把额度用尽当正常终态，Temporal 一片绿、零告警。
+	// 缺行的后果是"这个租户什么都用不了"，它不该靠谁记得手工补。
+	runMaintenance(func() {
+		n, err := st.ReconcileTenantQuota(ctx)
+		if err != nil {
+			slog.Error("配额 reconcile 整体失败（不影响启动）", "err", err)
+			return
+		}
+		if n > 0 {
+			slog.Info("配额 reconcile 完成", "seeded_tenants", n)
+		}
+	})
 
 	// 反馈服务（M5 契约 §13）：装在 agent 之后。普通态度/原因由 056 耐久投影；
 	// 仅 deep_dive 成功送达后仍通过 Notifier=agentLoop 做 legacy best-effort 会话回调。
@@ -1173,32 +1217,6 @@ func run() error {
 			slog.Info("a2a: 已清理上次进程遗留的滞留任务", "count", n)
 		}
 
-		// assistant.chat 的 A2A 轨 agent 实例（契约 §12 P2）：与飞书轨完全隔离——
-		// 工具只由 agent 包的本地 authorization policy 筛选；main 不解释 effect，
-		// 更不读取远端 metadata。当前策略精确授权 list_schedules；
-		// system prompt 换 A2A 语境；Store/Profiles 不注入（RunOnce 不碰会话与画像，
-		// 误用 HandleMessage 会在 loadOrCreateSession 处 nil panic——响亮的装配错误）。
-		a2aTools, filterErr := agent.FilterAuthorizedTools(
-			tools, agent.AuthorizationA2AReadOnly,
-		)
-		if filterErr != nil {
-			return fmt.Errorf("筛选 A2A Agent 工具: %w", filterErr)
-		}
-		a2aLoop, loopErr := agent.NewChecked(agent.Deps{
-			Client:                agentLLMClient,
-			Recorder:              recorder,
-			Tools:                 a2aTools,
-			Model:                 cfg.LLM.AgentModel,
-			MaxTurns:              cfg.Agent.MaxTurns,
-			SystemPrompt:          a2a.ChatSystemPrompt,
-			IntentToolkitsEnabled: cfg.Agent.IntentToolkitsAllowAll,
-			IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
-				!cfg.Agent.IntentToolkitsAllowAll,
-			ToolCalls: agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
-		})
-		if loopErr != nil {
-			return fmt.Errorf("装配 A2A Agent 工具注册表: %w", loopErr)
-		}
 		a2aRuntime, err = a2a.Mount(mux, a2a.Deps{
 			Storage:   st,
 			Content:   st,
