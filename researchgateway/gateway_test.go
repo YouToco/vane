@@ -3,6 +3,7 @@ package researchgateway
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/runtimepolicy"
 )
@@ -261,6 +263,62 @@ func TestLLMProviderV1MissingFrozenGenerationFailsBeforeSend(t *testing.T) {
 	})
 	if err == nil || measured.Attempted {
 		t.Fatalf("missing frozen route measured=%+v err=%v", measured, err)
+	}
+}
+
+func TestLLMProviderV1ForwardsFrozenDisableThinkingToUpstream(t *testing.T) {
+	var requestBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"model":"deepseek-v4-pro",
+			"choices":[{"message":{"role":"assistant","content":"{\"steps\":[]}"}}],
+			"usage":{"prompt_tokens":10,"completion_tokens":5,
+			"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":6}
+		}`)
+	}))
+	defer upstream.Close()
+
+	client := llm.New(config.LLMConfig{
+		Provider: "deepseek", BaseURL: upstream.URL, APIKey: "test-key",
+		Model: "deepseek-v4-flash", MaxConcurrent: 1,
+	})
+	endpoint := runtimepolicy.EndpointRefV1{
+		ID: runtimepolicy.EndpointIDDeepSeekCompatiblePrimaryV1, Generation: 3,
+	}
+	credential := runtimepolicy.CredentialRefV1{
+		ID: runtimepolicy.CredentialIDLLMPrimaryV1, Generation: 4,
+	}
+	resolver, err := llm.NewRuntimeModelResolverV1(llm.RuntimeModelRouteV1{
+		Provider: runtimepolicy.ModelProviderDeepSeekV1, Endpoint: endpoint,
+		CredentialRef: credential, Client: client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	measured, err := (LLMProviderV1{Resolver: resolver}).Complete(t.Context(), FrozenRequestV1{
+		RunSnapshotID: 17, TenantID: 23, UserID: 29, TraceID: "trace-v3",
+		Stage: "planner", SystemPrompt: "system", UserPrompt: "user",
+		Provider: runtimepolicy.ModelProviderDeepSeekV1, Endpoint: endpoint,
+		CredentialRef: credential, Model: "deepseek-v4-pro", MaxTokens: 4096,
+		DisableThinking: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !measured.Attempted || !measured.DisableThinking || measured.Response == nil ||
+		measured.Response.Content == "" {
+		t.Fatalf("measured=%+v", measured)
+	}
+	if requestBody["model"] != "deepseek-v4-pro" {
+		t.Fatalf("upstream model=%v", requestBody["model"])
+	}
+	thinking, ok := requestBody["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "disabled" {
+		t.Fatalf("upstream thinking=%v", requestBody["thinking"])
 	}
 }
 

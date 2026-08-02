@@ -644,14 +644,14 @@ func testResearchModelPolicyStoreV3(t *testing.T) runtimepolicy.ResearchModelPol
 			ID: runtimepolicy.CredentialIDLLMPrimaryV1, Generation: 1,
 		},
 		Planner: runtimepolicy.ResearchModelStageV3{
-			Stage: runtimepolicy.ResearchModelStagePlannerV3, Model: "strong-model",
+			Stage: runtimepolicy.ResearchModelStagePlannerV3, Model: "deepseek-v4-pro",
 			MaxTokens: 4096, SystemPrompt: "Plan from the trusted task manual.",
-			RendererVersion: "research-planner.render/v3",
+			RendererVersion: "research-planner.render/v3", DisableThinking: true,
 		},
 		Synthesis: runtimepolicy.ResearchModelStageV3{
-			Stage: runtimepolicy.ResearchModelStageSynthesisV3, Model: "strong-model",
+			Stage: runtimepolicy.ResearchModelStageSynthesisV3, Model: "deepseek-v4-pro",
 			MaxTokens: 8192, SystemPrompt: "Synthesize without Tools.",
-			RendererVersion: "research-synthesis.render/v3",
+			RendererVersion: "research-synthesis.render/v3", DisableThinking: true,
 		},
 		QuotaBucket: "llm_tokens",
 	})

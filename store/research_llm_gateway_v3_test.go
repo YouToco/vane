@@ -53,13 +53,22 @@ func TestResearchLLMProcessGatewayV2AtomicClaimPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if reservation.Model != "deepseek-v4-pro" || !reservation.DisableThinking {
+		t.Fatalf("reservation model=%q disable_thinking=%v",
+			reservation.Model, reservation.DisableThinking)
+	}
 	capability, err := f.store.resolveResearchRunCapabilityV1(t.Context(), f.snapshotRef)
 	if err != nil {
 		t.Fatal(err)
 	}
 	bearer := hex.EncodeToString(capability.raw[:])
 	start := make(chan struct{})
-	results := make(chan bool, 16)
+	type claimResult struct {
+		first           bool
+		model           string
+		disableThinking bool
+	}
+	results := make(chan claimResult, 16)
 	errs := make(chan error, 16)
 	var wg sync.WaitGroup
 	for range 16 {
@@ -77,14 +86,15 @@ func TestResearchLLMProcessGatewayV2AtomicClaimPostgres(t *testing.T) {
 				errs <- claimErr
 				return
 			}
-			var first bool
-			claimErr = tx.QueryRow(t.Context(), `SELECT out_first_writer
+			var result claimResult
+			claimErr = tx.QueryRow(t.Context(), `SELECT out_first_writer,out_model,out_disable_thinking
 				FROM claim_research_llm_gateway_request_v2($1,$2,$3)`,
-				reservation.ReservationID, reservation.RequestDigest, bearer).Scan(&first)
+				reservation.ReservationID, reservation.RequestDigest, bearer).
+				Scan(&result.first, &result.model, &result.disableThinking)
 			if claimErr == nil {
 				claimErr = tx.Commit(t.Context())
 			}
-			results <- first
+			results <- result
 			errs <- claimErr
 		}()
 	}
@@ -98,8 +108,11 @@ func TestResearchLLMProcessGatewayV2AtomicClaimPostgres(t *testing.T) {
 		}
 	}
 	winners := 0
-	for first := range results {
-		if first {
+	for result := range results {
+		if result.model != "deepseek-v4-pro" || !result.disableThinking {
+			t.Fatalf("gateway claim model=%q disable_thinking=%v", result.model, result.disableThinking)
+		}
+		if result.first {
 			winners++
 		}
 	}
