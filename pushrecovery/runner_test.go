@@ -30,19 +30,14 @@ func (s *fakeDiscoveryStore) ReadPushEffectRecoveryCutoff(
 	return s.cutoff, nil
 }
 
-func (s *fakeDiscoveryStore) ListRecoverablePushEffectTenantIDs(
+func (s *fakeDiscoveryStore) ListRecoveryTenantCatalogPage(
 	_ context.Context,
-	taskID string,
-	cutoff time.Time,
 	afterTenantID int64,
 	limit int,
 ) ([]int64, error) {
-	if taskID != "task-one" || limit <= 0 {
+	if limit <= 0 {
 		return nil, errors.New("invalid discovery scope")
 	}
-	s.mu.Lock()
-	s.seenCutoffs = append(s.seenCutoffs, cutoff)
-	s.mu.Unlock()
 	if afterTenantID >= 1 || len(s.effects) == 0 {
 		return nil, nil
 	}

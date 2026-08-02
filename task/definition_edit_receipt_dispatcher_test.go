@@ -55,8 +55,8 @@ func newDefinitionEditReceiptFakeStore(
 	return &definitionEditReceiptFakeStore{r: r}
 }
 
-func (s *definitionEditReceiptFakeStore) ListDueTaskDefinitionEditReceiptTenantIDs(
-	_ context.Context, _ time.Time, afterTenantID int64, _ int,
+func (s *definitionEditReceiptFakeStore) ListRecoveryTenantCatalogPage(
+	_ context.Context, afterTenantID int64, _ int,
 ) ([]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

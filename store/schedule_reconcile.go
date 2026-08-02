@@ -24,14 +24,15 @@ const (
 // because this transaction owns no database mutation.
 func (s *Store) AcquireScheduleReconcile(
 	ctx context.Context,
+	tenantID int64,
 	id string,
 ) (*types.Schedule, func(context.Context) error, error) {
-	if strings.TrimSpace(id) == "" || strings.TrimSpace(id) != id || len(id) > 255 {
+	if tenantID <= 0 || strings.TrimSpace(id) == "" || strings.TrimSpace(id) != id || len(id) > 255 {
 		return nil, nil, types.NewAppError(
 			types.CodeValidation, "调度 reconcile 标识无效", types.ErrValidation,
 		)
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := s.beginRecoveryTenantRead(ctx, tenantID, "vane_edit_coordinator")
 	if err != nil {
 		return nil, nil, types.NewAppError(
 			types.CodeDatabase, fmt.Sprintf("开始调度 reconcile（id=%s）", id), err,
@@ -59,20 +60,21 @@ func (s *Store) AcquireScheduleReconcile(
 	err = scanSchedule(tx.QueryRow(ctx,
 		`SELECT `+scheduleColumns+`
 		   FROM schedules s
-		  WHERE s.id=$1 AND s.status=$2
+		  WHERE s.tenant_id=$1 AND s.id=$2 AND s.status=$3
 		    AND s.definition_edit_operation_id IS NULL
 		    AND s.definition_edit_fence IS NULL
 		    AND NOT EXISTS (
 		      SELECT 1
 		        FROM task_definition_edit_operations o
-		       WHERE o.target_tenant_id=s.tenant_id
+		       WHERE o.tenant_id=$1
+		         AND o.target_tenant_id=s.tenant_id
 		         AND o.target_user_id=s.user_id
 		         AND o.task_id=s.id
-		         AND o.status IN ($3,$4)
+		         AND o.status IN ($4,$5)
 		         AND o.tombstoned_at IS NULL
 		    )
 		    AND `+matureSchedulePredicate,
-		id, types.ScheduleStatusActive,
+		tenantID, id, types.ScheduleStatusActive,
 		types.TaskDefinitionEditOperationStatusPending,
 		types.TaskDefinitionEditOperationStatusExecuting,
 	), &sc)

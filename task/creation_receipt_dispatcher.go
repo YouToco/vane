@@ -56,8 +56,8 @@ func validAgentAutoReceiptTarget(provider, target, actionID string) bool {
 // is fenced by the receipt lease; a process may die after any method and a
 // later owner can safely continue from the persisted checkpoint.
 type CreationReceiptStore interface {
-	ListDueTaskCreationReceiptTenantIDs(
-		ctx context.Context, before time.Time, afterTenantID int64, limit int,
+	ListRecoveryTenantCatalogPage(
+		ctx context.Context, afterTenantID int64, limit int,
 	) ([]int64, error)
 	ListDueTaskCreationReceipts(
 		ctx context.Context, tenantID int64, before time.Time, limit int,
@@ -164,15 +164,15 @@ func (d *CreationReceiptDispatcher) DispatchOnce(ctx context.Context) error {
 	// Store clamps this future boundary to clock_timestamp(). Passing a future
 	// value prevents a slow process clock from hiding already-due database work.
 	boundary := time.Now().Add(24 * time.Hour)
-	tenantIDs, err := d.store.ListDueTaskCreationReceiptTenantIDs(
-		ctx, boundary, d.cursor, creationReceiptTenantLimit,
+	tenantIDs, err := d.store.ListRecoveryTenantCatalogPage(
+		ctx, d.cursor, creationReceiptTenantLimit,
 	)
 	if err != nil {
 		return fmt.Errorf("list receipt tenant shards: %w", err)
 	}
 	if len(tenantIDs) == 0 && d.cursor > 0 {
-		tenantIDs, err = d.store.ListDueTaskCreationReceiptTenantIDs(
-			ctx, boundary, 0, creationReceiptTenantLimit,
+		tenantIDs, err = d.store.ListRecoveryTenantCatalogPage(
+			ctx, 0, creationReceiptTenantLimit,
 		)
 		if err != nil {
 			return fmt.Errorf("wrap receipt tenant shards: %w", err)

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -112,14 +113,16 @@ type ScheduleSpec struct {
 // 把回滚是否真的发生钉死在单测里。*store.Store 隐式满足本接口，装配处零改动。
 type scheduleStore interface {
 	ResolveActiveTenantForUser(ctx context.Context, userID int64) (int64, error)
+	ListRecoveryTenantCatalogPage(ctx context.Context, afterTenantID int64, limit int) ([]int64, error)
 	ListSchedulesByUser(ctx context.Context, userID int64) ([]types.Schedule, error)
-	ListActiveSchedules(ctx context.Context) ([]types.Schedule, error)
+	ListActiveSchedules(ctx context.Context, tenantID int64) ([]types.Schedule, error)
 	InsertSchedule(ctx context.Context, sc *types.Schedule) error
 	UpdateScheduleSpec(ctx context.Context, id string, spec json.RawMessage, nlDesc *string) error
 	DeleteSchedule(ctx context.Context, id string, userID int64) error
 	GetSchedule(ctx context.Context, id string, userID int64) (*types.Schedule, error)
 	AcquireScheduleReconcile(
 		ctx context.Context,
+		tenantID int64,
 		id string,
 	) (*types.Schedule, func(context.Context) error, error)
 }
@@ -165,9 +168,14 @@ type scheduleCommandStore interface {
 	)
 	ListPendingScheduleCommands(
 		ctx context.Context,
-		afterTenantID int64,
+		tenantID int64,
 		afterID string,
 	) ([]types.ScheduleCommand, error)
+}
+
+type scheduleCommandRecoveryCursorStore interface {
+	LoadScheduleCommandRecoveryCursor(context.Context) (int64, string, error)
+	SaveScheduleCommandRecoveryCursor(context.Context, int64, string) error
 }
 
 type toolRuntimeCapabilityStore interface {
@@ -198,6 +206,8 @@ type Scheduler struct {
 	executiveBrief          rolloutScopeV1
 	researchV3              researchV3Rollout
 	commandAttempt          time.Duration
+	commandRecoveryMu       sync.Mutex
+	commandRecoveryCursor   scheduleCommandRecoveryCursor
 }
 
 // New 构造 Scheduler。client 由 cmd/server 用 client.Dial 建好后注入；
@@ -401,39 +411,57 @@ func (s *Scheduler) reconcileActions(ctx context.Context, budget time.Duration) 
 	passCtx, cancelPass := context.WithTimeout(ctx, budget)
 	defer cancelPass()
 
-	schedules, err := s.st.ListActiveSchedules(passCtx)
-	if err != nil {
-		return err
-	}
-	var updated, skipped, failed int
+	const tenantPageSize = 100
+	var updated, skipped, failed, total, processed int
 	var reconcileErrors []error
-	for index, sc := range schedules {
-		if err := passCtx.Err(); err != nil {
-			reconcileErrors = append(reconcileErrors, fmt.Errorf(
-				"scheduler: reconcile 全局启动预算耗尽（processed=%d remaining=%d）: %w",
-				index, len(schedules)-index, err,
-			))
+	var afterTenantID int64
+	for {
+		tenantIDs, err := s.st.ListRecoveryTenantCatalogPage(
+			passCtx, afterTenantID, tenantPageSize)
+		if err != nil {
+			return errors.Join(append(reconcileErrors, err)...)
+		}
+		for _, tenantID := range tenantIDs {
+			schedules, listErr := s.st.ListActiveSchedules(passCtx, tenantID)
+			if listErr != nil {
+				reconcileErrors = append(reconcileErrors, fmt.Errorf(
+					"list active schedules for tenant %d: %w", tenantID, listErr))
+				continue
+			}
+			total += len(schedules)
+			for _, sc := range schedules {
+				if err := passCtx.Err(); err != nil {
+					reconcileErrors = append(reconcileErrors, fmt.Errorf(
+						"scheduler: reconcile 全局启动预算耗尽（processed=%d）: %w",
+						processed, err))
+					goto done
+				}
+				processed++
+				didUpdate, rerr := s.reconcileOne(passCtx, sc)
+				switch {
+				case rerr != nil:
+					failed++
+					reconcileErrors = append(reconcileErrors, fmt.Errorf(
+						"reconcile schedule %s: %w", sc.ID, rerr))
+					slog.Error("scheduler: reconcile 调度 Action 失败（fail-closed）",
+						"schedule_id", sc.ID, "err", rerr)
+				case didUpdate:
+					updated++
+					slog.Info("scheduler: 已修正存量调度 Action 入参（下次触发生效）",
+						"schedule_id", sc.ID)
+				default:
+					skipped++
+				}
+			}
+		}
+		if len(tenantIDs) < tenantPageSize {
 			break
 		}
-		didUpdate, rerr := s.reconcileOne(passCtx, sc)
-		switch {
-		case rerr != nil:
-			failed++
-			reconcileErrors = append(reconcileErrors, fmt.Errorf(
-				"reconcile schedule %s: %w", sc.ID, rerr,
-			))
-			slog.Error("scheduler: reconcile 调度 Action 失败（fail-closed）",
-				"schedule_id", sc.ID, "err", rerr)
-		case didUpdate:
-			updated++
-			slog.Info("scheduler: 已修正存量调度 Action 入参（下次触发生效）",
-				"schedule_id", sc.ID)
-		default:
-			skipped++
-		}
+		afterTenantID = tenantIDs[len(tenantIDs)-1]
 	}
+done:
 	slog.Info("scheduler: 存量调度 Action reconcile 完成",
-		"total", len(schedules), "updated", updated, "skipped", skipped, "failed", failed)
+		"total", total, "updated", updated, "skipped", skipped, "failed", failed)
 	return errors.Join(reconcileErrors...)
 }
 
@@ -456,7 +484,8 @@ func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (up
 	// QuiesceTaskDefinitionEdit takes the same lock before installing its
 	// marker. A nil schedule means the task is no longer active or an edit now
 	// owns it, both normal skip outcomes.
-	sc, releaseDatabaseGate, err := s.st.AcquireScheduleReconcile(attemptCtx, listed.ID)
+	sc, releaseDatabaseGate, err := s.st.AcquireScheduleReconcile(
+		attemptCtx, listed.TenantID, listed.ID)
 	if err != nil {
 		return false, err
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -888,8 +889,40 @@ type fakeScheduleStore struct {
 }
 
 // ListActiveSchedules 供 ReconcileActions 用例注入存量调度集合。
-func (f *fakeScheduleStore) ListActiveSchedules(_ context.Context) ([]types.Schedule, error) {
-	active := append([]types.Schedule(nil), f.active...)
+func (f *fakeScheduleStore) ListRecoveryTenantCatalogPage(
+	_ context.Context, after int64, limit int,
+) ([]int64, error) {
+	seen := make(map[int64]struct{})
+	for _, schedule := range f.active {
+		tenantID := schedule.TenantID
+		if tenantID <= 0 {
+			tenantID = 1
+		}
+		if tenantID > after {
+			seen[tenantID] = struct{}{}
+		}
+	}
+	ids := make([]int64, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+	return ids, nil
+}
+
+func (f *fakeScheduleStore) ListActiveSchedules(
+	_ context.Context, tenantID int64,
+) ([]types.Schedule, error) {
+	active := make([]types.Schedule, 0, len(f.active))
+	for _, schedule := range f.active {
+		if schedule.TenantID == tenantID ||
+			(schedule.TenantID <= 0 && tenantID == 1) {
+			active = append(active, schedule)
+		}
+	}
 	for i := range active {
 		if active[i].ExecutionMode == "" {
 			active[i].ExecutionMode = types.ExecutionModeCompiled
@@ -900,6 +933,7 @@ func (f *fakeScheduleStore) ListActiveSchedules(_ context.Context) ([]types.Sche
 
 func (f *fakeScheduleStore) AcquireScheduleReconcile(
 	_ context.Context,
+	_ int64,
 	id string,
 ) (*types.Schedule, func(context.Context) error, error) {
 	f.reconcileAcquireCalls = append(f.reconcileAcquireCalls, id)

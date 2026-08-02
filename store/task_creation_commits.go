@@ -74,7 +74,7 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 		return taskCreationValidation("definition scope differs from operation lease")
 	}
 
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, p.Lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin definition commit", err)
 	}
@@ -224,7 +224,7 @@ func (s *Store) BeginTaskCreationActivation(
 		return false, err
 	}
 
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return false, taskCreationDatabaseError("begin activation authorization", err)
 	}
@@ -307,7 +307,7 @@ func (s *Store) CommitTaskCreationActivation(
 	if err := validateTaskCreationTaskID(taskID); err != nil {
 		return err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin activation commit", err)
 	}
@@ -407,7 +407,7 @@ func (s *Store) BlockTaskCreationOperationAfterSideEffect(
 	if err := validateTaskCreationErrorMetadata(errorCode, errorMessage); err != nil {
 		return err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin side-effect quarantine", err)
 	}
@@ -544,7 +544,7 @@ func (s *Store) BeginTaskCreationCleanup(
 	if err := validateTaskCreationErrorMetadata(errorCode, errorMessage); err != nil {
 		return false, err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return false, taskCreationDatabaseError("begin cleanup checkpoint", err)
 	}
@@ -656,7 +656,7 @@ func (s *Store) FinishTaskCreationCleanup(
 	if err != nil {
 		return err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin cleanup finish", err)
 	}

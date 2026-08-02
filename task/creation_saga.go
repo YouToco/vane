@@ -112,7 +112,7 @@ type CreationSagaStore interface {
 	FinishTaskCreationCleanup(ctx context.Context, lease types.TaskCreationLease, taskID string, terminalStatus types.TaskOperationStatus) error
 	BlockTaskCreationOperationAfterSideEffect(ctx context.Context, lease types.TaskCreationLease, taskID, errorCode, errorMessage string) error
 	CompleteTaskCreationOperation(ctx context.Context, lease types.TaskCreationLease, taskID string, result json.RawMessage) error
-	ListStaleTaskCreationTenantIDs(ctx context.Context, before time.Time, afterTenantID int64, limit int) ([]int64, error)
+	ListRecoveryTenantCatalogPage(ctx context.Context, afterTenantID int64, limit int) ([]int64, error)
 	ListStaleTaskCreationOperations(ctx context.Context, tenantID int64, before time.Time, limit int) ([]types.TaskCreationOperation, error)
 }
 
@@ -906,9 +906,8 @@ func (c *CreationCoordinator) RecoverStaleOnce(ctx context.Context) error {
 	defer c.recoveryMu.Unlock()
 	passCtx, cancelPass := context.WithTimeout(ctx, creationRecoveryPassTimeout)
 	defer cancelPass()
-	boundary := time.Now()
-	tenantIDs, err := c.store.ListStaleTaskCreationTenantIDs(
-		passCtx, boundary, c.recoveryCursor, creationRecoveryTenantLimit,
+	tenantIDs, err := c.store.ListRecoveryTenantCatalogPage(
+		passCtx, c.recoveryCursor, creationRecoveryTenantLimit,
 	)
 	if err != nil {
 		return fmt.Errorf("list stale task creation tenant shards: %w", err)
@@ -918,13 +917,23 @@ func (c *CreationCoordinator) RecoverStaleOnce(ctx context.Context) error {
 	// page, wrap once to the beginning; failures in tenants 1..100 can therefore
 	// never hide tenant 101 forever.
 	if c.recoveryCursor > 0 && len(tenantIDs) < creationRecoveryTenantLimit {
-		wrapped, wrapErr := c.store.ListStaleTaskCreationTenantIDs(
-			passCtx, boundary, 0, creationRecoveryTenantLimit-len(tenantIDs),
+		wrapped, wrapErr := c.store.ListRecoveryTenantCatalogPage(
+			passCtx, 0, creationRecoveryTenantLimit-len(tenantIDs),
 		)
 		if wrapErr != nil {
 			return fmt.Errorf("wrap stale task creation tenant shards: %w", wrapErr)
 		}
-		tenantIDs = append(tenantIDs, wrapped...)
+		seen := make(map[int64]struct{}, len(tenantIDs)+len(wrapped))
+		for _, tenantID := range tenantIDs {
+			seen[tenantID] = struct{}{}
+		}
+		for _, tenantID := range wrapped {
+			if _, duplicate := seen[tenantID]; duplicate {
+				continue
+			}
+			seen[tenantID] = struct{}{}
+			tenantIDs = append(tenantIDs, tenantID)
+		}
 	}
 	operations := make([]types.TaskCreationOperation, 0, creationRecoveryPassLimit)
 	var scanErrors []error

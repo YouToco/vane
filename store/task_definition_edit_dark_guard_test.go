@@ -175,7 +175,7 @@ func taskDefinitionEditReceiptDispatcherStoreCalls(
 	file *ast.File,
 ) (map[token.Pos]struct{}, error) {
 	expectations := []taskDefinitionEditStoreCallExpectation{
-		{"ListDueTaskDefinitionEditReceiptTenantIDs", "DispatchOnce", 2},
+		{"ListRecoveryTenantCatalogPage", "DispatchOnce", 2},
 		{"ListDueTaskDefinitionEditReceipts", "DispatchOnce", 1},
 		{"AcquireTaskDefinitionEditReceipt", "dispatchReceipt", 1},
 		{"CheckpointTaskDefinitionEditReceiptPayload", "loadOrCheckpointPayload", 1},
@@ -554,9 +554,9 @@ func taskDefinitionEditCoordinatorStoreCalls(file *ast.File) (map[token.Pos]stru
 		{"BlockTaskDefinitionEditOperation", "blockTaskDefinitionEditCheckpoint", 1},
 		{"LoadTaskDefinitionEditOperation", "reloadTaskDefinitionEditProgress", 1},
 		{"LoadTaskDefinitionEditOperation", "loadTaskDefinitionEditConvergent", 1},
-		{"ListStaleTaskDefinitionEditTenantIDs", "RecoverStaleOnce", 2},
+		{"ListRecoveryTenantCatalogPage", "RecoverStaleOnce", 2},
 		{"ListStaleTaskDefinitionEditOperations", "RecoverStaleOnce", 1},
-		{"ListNonterminalTaskDefinitionEditTenantIDs", "ValidateRuntimeEnvironment", 1},
+		{"ListRecoveryTenantCatalogPage", "ValidateRuntimeEnvironment", 1},
 		{"ListNonterminalTaskDefinitionEditOperations", "ValidateRuntimeEnvironment", 1},
 	}
 	type expectationKey struct{ method, function string }
@@ -1059,7 +1059,6 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"terminateAcquiredTaskDefinitionEditAssessment",
 			"takeOverTaskDefinitionEdit",
 			"RenewTaskDefinitionEditLease",
-			"ListStaleTaskDefinitionEditTenantIDs",
 			"ListStaleTaskDefinitionEditOperations",
 			"QuiesceTaskDefinitionEdit",
 			"AuthorizeTaskDefinitionEditRemotePhase",
@@ -1087,7 +1086,6 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"scanTaskDefinitionEditReceipt",
 			"taskDefinitionEditReceiptSelect",
 			"LoadTaskDefinitionEditReceiptByOperation",
-			"ListDueTaskDefinitionEditReceiptTenantIDs",
 			"ListDueTaskDefinitionEditReceipts",
 			"AcquireTaskDefinitionEditReceipt",
 			"CheckpointTaskDefinitionEditReceiptPayload",
@@ -1114,7 +1112,6 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"taskDefinitionEditReceiptLeaseLost",
 		}),
 		filepath.Clean(filepath.Join(storeDir, "task_definition_edit_preflight.go")): taskDefinitionEditStoreMethodSet([]string{
-			"ListNonterminalTaskDefinitionEditTenantIDs",
 			"ListNonterminalTaskDefinitionEditOperations",
 		}),
 		filepath.Clean(filepath.Join(storeDir, "task_definition_edit_tx.go")): taskDefinitionEditStoreMethodSet([]string{
@@ -1293,9 +1290,7 @@ func taskDefinitionEditOperationStoreMethods() map[string]struct{} {
 		"ExpireTaskDefinitionEditOperation",
 		"AcquireTaskDefinitionEditOperation",
 		"RenewTaskDefinitionEditLease",
-		"ListStaleTaskDefinitionEditTenantIDs",
 		"ListStaleTaskDefinitionEditOperations",
-		"ListNonterminalTaskDefinitionEditTenantIDs",
 		"ListNonterminalTaskDefinitionEditOperations",
 		"ValidateTaskDefinitionEditRuntimeRoles",
 		"QuiesceTaskDefinitionEdit",
@@ -1313,7 +1308,6 @@ func taskDefinitionEditOperationStoreMethods() map[string]struct{} {
 func taskDefinitionEditReceiptStoreMethods() map[string]struct{} {
 	return taskDefinitionEditStoreMethodSet([]string{
 		"LoadTaskDefinitionEditReceiptByOperation",
-		"ListDueTaskDefinitionEditReceiptTenantIDs",
 		"ListDueTaskDefinitionEditReceipts",
 		"AcquireTaskDefinitionEditReceipt",
 		"CheckpointTaskDefinitionEditReceiptPayload",

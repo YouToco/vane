@@ -3,70 +3,10 @@ package store
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/YouToco/vane/types"
 )
 
 const maxTaskDefinitionEditPreflightOperationIDBytes = 512
-
-// ListNonterminalTaskDefinitionEditTenantIDs is the bounded owner read-only
-// discovery exception used only by the startup namespace preflight. It returns
-// tenant identities, never operation payloads; all payload reads re-enter the
-// tenant-scoped restricted coordinator role.
-func (s *Store) ListNonterminalTaskDefinitionEditTenantIDs(
-	ctx context.Context,
-	afterTenantID int64,
-	limit int,
-) ([]int64, error) {
-	if afterTenantID < 0 || limit <= 0 || limit > 1000 {
-		return nil, taskDefinitionEditValidation(
-			"nonterminal operation tenant query is invalid")
-	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, taskDefinitionEditDatabaseError(
-			"begin nonterminal operation tenant scan", err)
-	}
-	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	rows, err := tx.Query(ctx, `
-		SELECT DISTINCT tenant_id
-		  FROM task_definition_edit_operations
-		 WHERE tenant_id > $1
-		   AND status IN ($2,$3)
-		   AND tombstoned_at IS NULL
-		 ORDER BY tenant_id
-		 LIMIT $4`,
-		afterTenantID,
-		types.TaskDefinitionEditOperationStatusPending,
-		types.TaskDefinitionEditOperationStatusExecuting,
-		limit,
-	)
-	if err != nil {
-		return nil, taskDefinitionEditDatabaseError(
-			"list nonterminal operation tenant shards", err)
-	}
-	defer rows.Close()
-	tenantIDs := make([]int64, 0)
-	for rows.Next() {
-		var tenantID int64
-		if err := rows.Scan(&tenantID); err != nil {
-			return nil, taskDefinitionEditDatabaseError(
-				"scan nonterminal operation tenant shard", err)
-		}
-		tenantIDs = append(tenantIDs, tenantID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, taskDefinitionEditDatabaseError(
-			"iterate nonterminal operation tenant shards", err)
-	}
-	rows.Close()
-	if err := tx.Commit(ctx); err != nil {
-		return nil, taskDefinitionEditDatabaseError(
-			"commit nonterminal operation tenant scan", err)
-	}
-	return tenantIDs, nil
-}
 
 func (s *Store) ListNonterminalTaskDefinitionEditOperations(
 	ctx context.Context,

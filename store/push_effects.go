@@ -195,67 +195,6 @@ func (s *Store) LoadPushEffect(
 	return effect, nil
 }
 
-// ListRecoverablePushEffectTenantIDs is the only cross-tenant discovery
-// exception. It is owner/admin READ ONLY and returns tenant IDs only; every
-// subsequent row read or mutation re-enters the tenant-scoped coordinator role.
-func (s *Store) ListRecoverablePushEffectTenantIDs(
-	ctx context.Context,
-	expectedTaskID string,
-	before time.Time,
-	afterTenantID int64,
-	limit int,
-) ([]int64, error) {
-	if !validTaskRunTaskID(expectedTaskID) || before.IsZero() ||
-		afterTenantID < 0 ||
-		limit <= 0 || limit > 1000 {
-		return nil, pushEffectValidation(
-			"recoverable push effect tenant query is invalid")
-	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, pushEffectDatabaseError(
-			"begin recoverable tenant discovery", err)
-	}
-	defer rollbackPushEffectTx(ctx, tx)
-	rows, err := tx.Query(ctx, `
-		SELECT DISTINCT tenant_id
-		  FROM push_effects
-		 WHERE task_id=$1 AND tenant_id>$3 AND (
-		       (status IN ('prepared','definite_failed') AND
-		        next_attempt_at<=LEAST($2,clock_timestamp())) OR
-		       (status='sending' AND takeover_not_before IS NOT NULL AND
-		        takeover_not_before<=LEAST($2,clock_timestamp())) OR
-		       (status='ambiguous' AND
-		        next_attempt_at<=LEAST($2,clock_timestamp()))
-		   )
-		 ORDER BY tenant_id LIMIT $4`,
-		expectedTaskID, before, afterTenantID, limit)
-	if err != nil {
-		return nil, pushEffectDatabaseError(
-			"list recoverable tenant shards", err)
-	}
-	defer rows.Close()
-	tenantIDs := make([]int64, 0)
-	for rows.Next() {
-		var tenantID int64
-		if err := rows.Scan(&tenantID); err != nil {
-			return nil, pushEffectDatabaseError(
-				"scan recoverable tenant shard", err)
-		}
-		tenantIDs = append(tenantIDs, tenantID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, pushEffectDatabaseError(
-			"iterate recoverable tenant shards", err)
-	}
-	rows.Close()
-	if err := tx.Commit(ctx); err != nil {
-		return nil, pushEffectDatabaseError(
-			"commit recoverable tenant discovery", err)
-	}
-	return tenantIDs, nil
-}
-
 // ReadPushEffectRecoveryCutoff captures the database protocol clock once for a
 // complete paged recovery pass. Host clock skew must not delay UUID-window
 // reconciliation or make pages disagree about what was due at pass start.
