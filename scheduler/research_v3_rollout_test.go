@@ -4,24 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
-func TestResearchRuntimeV3AuthorityCanary_IsHardDisabled(t *testing.T) {
+func TestResearchRuntimeV3AuthorityCanaryCannotRewriteNormalActions(t *testing.T) {
 	legacy := makePushParams(
 		7, 42, "task-v3", workflow.PushScope{SourceIDs: []int64{11}, TopN: 3},
 		"Kimi availability",
 	)
 
 	for name, configure := range map[string]func(*Scheduler){
-		"default hard dark": nil,
-		"empty hard dark": func(s *Scheduler) {
+		"default": nil,
+		"empty": func(s *Scheduler) {
 			WithResearchRuntimeV3AuthorityCanary("")(s)
 		},
 		"blank direct option fails closed": func(s *Scheduler) {
@@ -30,7 +32,7 @@ func TestResearchRuntimeV3AuthorityCanary_IsHardDisabled(t *testing.T) {
 		"different task remains legacy": func(s *Scheduler) {
 			WithResearchRuntimeV3AuthorityCanary("task-other")(s)
 		},
-		"matching task still remains legacy": func(s *Scheduler) {
+		"matching task requires explicit saga": func(s *Scheduler) {
 			WithResearchRuntimeV3AuthorityCanary("task-v3")(s)
 		},
 	} {
@@ -44,6 +46,29 @@ func TestResearchRuntimeV3AuthorityCanary_IsHardDisabled(t *testing.T) {
 				t.Fatalf("unselected Action changed:\nwant=%+v\n got=%+v", legacy, got)
 			}
 		})
+	}
+}
+
+func TestResearchV3CutoverPublicControlPlaneIsExactTaskOnly(t *testing.T) {
+	s := New(nil, "", nil, WithResearchRuntimeV3AuthorityCanary("task-v3"))
+	if _, err := s.CutoverResearchV3(
+		t.Context(), "task-other", 42, "gate-1"); types.CodeOf(err) != types.CodeNotFound {
+		t.Fatalf("cross-task cutover error=%v", err)
+	}
+	if _, err := s.RollbackResearchV3(
+		t.Context(), "task-other", 42, "gate-1"); types.CodeOf(err) != types.CodeNotFound {
+		t.Fatalf("cross-task rollback error=%v", err)
+	}
+	if _, err := s.CutoverResearchV3(
+		t.Context(), "task-v3", 42, "gate-1"); types.CodeOf(err) != types.CodeInternal {
+		t.Fatalf("exact task bypassed dependency readiness: %v", err)
+	}
+
+	invalid := New(nil, "", nil,
+		WithResearchRuntimeV3AuthorityCanary("task-v3\nother"))
+	if _, err := invalid.CutoverResearchV3(
+		t.Context(), "task-v3\nother", 42, "gate-1"); types.CodeOf(err) != types.CodeNotFound {
+		t.Fatalf("control-character task was admitted: %v", err)
 	}
 }
 
@@ -87,6 +112,119 @@ func TestResearchRuntimeV3AuthorityCannotRewriteMondayNineSchedule(t *testing.T)
 	assertMondayNineSpec(t, h)
 }
 
+func TestReconcileActions_RejectsTamperedFormalV3Token(t *testing.T) {
+	const taskID = "task-v3-tampered"
+	durableToken := strings.Repeat("d", 64)
+	h := &fakeScheduleHandle{current: formalResearchV3Schedule(
+		t, taskID, strings.Repeat("e", 64))}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	st := &fakeScheduleStore{
+		researchV3AuthorizationToken: durableToken,
+		researchV3AuthorityEnabled:   true,
+		active: []types.Schedule{{
+			ID: taskID, TenantID: 7, UserID: 42,
+			Status:        types.ScheduleStatusActive,
+			ExecutionMode: types.ExecutionModeDiscoverAtRun,
+		}},
+	}
+	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
+
+	if err := s.ReconcileActions(t.Context()); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("tampered formal V3 token error=%v", err)
+	}
+	if st.researchV3AuthorityCalls != 1 || len(h.history) != 0 {
+		t.Fatalf("tampered token checks=%d updates=%d",
+			st.researchV3AuthorityCalls, len(h.history))
+	}
+	assertMondayNineSpec(t, h)
+}
+
+func TestReconcileActions_RejectsRevokedFormalV3Authority(t *testing.T) {
+	const taskID = "task-v3-revoked"
+	token := strings.Repeat("f", 64)
+	h := &fakeScheduleHandle{current: formalResearchV3Schedule(t, taskID, token)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	st := &fakeScheduleStore{
+		researchV3AuthorizationToken: token,
+		researchV3AuthorityEnabled:   false,
+		active: []types.Schedule{{
+			ID: taskID, TenantID: 7, UserID: 42,
+			Status:        types.ScheduleStatusActive,
+			ExecutionMode: types.ExecutionModeDiscoverAtRun,
+		}},
+	}
+	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
+
+	if err := s.ReconcileActions(t.Context()); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("revoked formal V3 authority error=%v", err)
+	}
+	if st.researchV3AuthorityCalls != 1 || len(h.history) != 0 {
+		t.Fatalf("revoked authority checks=%d updates=%d",
+			st.researchV3AuthorityCalls, len(h.history))
+	}
+	assertMondayNineSpec(t, h)
+}
+
+func formalResearchV3Schedule(t *testing.T, taskID, token string) client.Schedule {
+	t.Helper()
+	payload, err := converter.GetDefaultDataConverter().ToPayload(
+		workflow.ResearchScheduledInputV3{
+			TenantID: 7, UserID: 42, TaskID: taskID,
+			ActionAuthorizationToken: token,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedule := reconcileSchedule("wf-"+taskID, []interface{}{payload})
+	action := schedule.Action.(*client.ScheduleWorkflowAction)
+	action.Workflow = workflow.ResearchScheduledWorkflowV3Name
+	schedule.Spec.CronExpressions = []string{"0 9 * * 1"}
+	schedule.Spec.TimeZoneName = "Asia/Shanghai"
+	return schedule
+}
+
+func TestReconcileActions_PreservesFormalV3EnvelopeAfterRestart(t *testing.T) {
+	const taskID = "task-v3-restart"
+	token := strings.Repeat("a", 64)
+	h := &fakeScheduleHandle{current: formalResearchV3Schedule(t, taskID, token)}
+	before := h.current.Action.(*client.ScheduleWorkflowAction).Args[0]
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	st := &fakeScheduleStore{researchV3AuthorizationToken: token,
+		researchV3AuthorityEnabled: true, active: []types.Schedule{{
+			ID: taskID, TenantID: 7, UserID: 42,
+			NLDescription: "每周一九点 Kimi 情报", ScopeJSON: json.RawMessage(`{}`),
+			Status: types.ScheduleStatusActive, ExecutionMode: types.ExecutionModeDiscoverAtRun,
+		}}}
+	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
+
+	if err := s.ReconcileActions(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.history) != 0 {
+		t.Fatalf("restart reconciliation rewrote formal V3 Action %d times", len(h.history))
+	}
+	if st.researchV3AuthorityCalls != 1 {
+		t.Fatalf("restart reconciliation authority checks=%d", st.researchV3AuthorityCalls)
+	}
+	action := h.current.Action.(*client.ScheduleWorkflowAction)
+	if action.Workflow != workflow.ResearchScheduledWorkflowV3Name ||
+		!reflect.DeepEqual(action.Args[0], before) {
+		t.Fatalf("formal V3 envelope changed: workflow=%v args=%#v", action.Workflow, action.Args)
+	}
+	decoded, found, err := decodeResearchScheduledActionV3(h.current.Action)
+	if err != nil || !found || decoded.ActionAuthorizationToken != token {
+		t.Fatalf("retained V3 token: found=%v input=%+v err=%v", found, decoded, err)
+	}
+	assertMondayNineSpec(t, h)
+}
+
 func assertMondayNineSpec(t *testing.T, h *fakeScheduleHandle) {
 	t.Helper()
 	if h.current.Spec == nil ||
@@ -117,6 +255,60 @@ func TestResearchRuntimeV3AuthorityCannotRewriteRename(t *testing.T) {
 	if got.RuntimeVersion != "" || got.ExecutionMode != types.ExecutionModeCompiled ||
 		got.NLDesc != "new name" {
 		t.Fatalf("authority rewrote renamed Action: %+v", got)
+	}
+}
+
+func TestUpdatePush_FormalV3RenameFailsClosedWithoutMutation(t *testing.T) {
+	const taskID = "task-v3-formal-rename"
+	token := strings.Repeat("b", 64)
+	h := &fakeScheduleHandle{current: formalResearchV3Schedule(t, taskID, token)}
+	beforeAction := h.current.Action
+	beforeSpec := h.current.Spec
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{}
+	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
+	name := "new name"
+	err := s.UpdatePush(t.Context(), taskID, 42,
+		ScheduleSpec{Cron: "30 10 * * 1", TZ: "Asia/Shanghai"}, &name)
+	if types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("formal V3 rename error=%v", err)
+	}
+	if len(h.history) != 0 || st.updateCall != 0 ||
+		!reflect.DeepEqual(h.current.Action, beforeAction) ||
+		!reflect.DeepEqual(h.current.Spec, beforeSpec) {
+		t.Fatalf("failed rename mutated V3 schedule: history=%d mirror=%d schedule=%+v",
+			len(h.history), st.updateCall, h.current)
+	}
+	decoded, found, decodeErr := decodeResearchScheduledActionV3(h.current.Action)
+	if decodeErr != nil || !found || decoded.ActionAuthorizationToken != token {
+		t.Fatalf("failed rename changed token: found=%v input=%+v err=%v", found, decoded, decodeErr)
+	}
+}
+
+func TestUpdatePush_FormalV3SpecOnlyPreservesEnvelope(t *testing.T) {
+	const taskID = "task-v3-formal-spec"
+	token := strings.Repeat("c", 64)
+	h := &fakeScheduleHandle{current: formalResearchV3Schedule(t, taskID, token)}
+	beforeAction := h.current.Action
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{}
+	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
+
+	if err := s.UpdatePush(t.Context(), taskID, 42,
+		ScheduleSpec{Cron: "30 10 * * 1", TZ: "Asia/Shanghai"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.history) != 1 || st.updateCall != 1 ||
+		!reflect.DeepEqual(h.current.Action, beforeAction) {
+		t.Fatalf("spec-only update changed V3 envelope: history=%d mirror=%d action=%#v",
+			len(h.history), st.updateCall, h.current.Action)
+	}
+	if got := h.current.Spec.CronExpressions; !reflect.DeepEqual(got, []string{"30 10 * * 1"}) {
+		t.Fatalf("spec-only update cron=%v", got)
+	}
+	decoded, found, err := decodeResearchScheduledActionV3(h.current.Action)
+	if err != nil || !found || decoded.ActionAuthorizationToken != token {
+		t.Fatalf("spec-only update changed token: found=%v input=%+v err=%v", found, decoded, err)
 	}
 }
 

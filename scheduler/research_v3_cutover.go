@@ -25,6 +25,9 @@ type researchV3CutoverJournal interface {
 	LoadCurrentResearchApprovedDefinitionV3Head(
 		context.Context, int64, int64, string,
 	) (types.ResearchV3DefinitionHead, error)
+	RequireSuccessfulResearchV3ShadowPreflight(
+		context.Context, int64, int64, string, types.ResearchV3DefinitionHead,
+	) error
 	BeginResearchV3Cutover(
 		context.Context, types.BeginResearchV3CutoverParams,
 	) (types.ResearchV3CutoverOperation, error)
@@ -53,9 +56,8 @@ type researchV3ScheduleRemote interface {
 
 type researchV3ParamsEncoder func(any) (*commonpb.Payload, error)
 
-// researchV3CutoverCoordinator is intentionally not reachable from config,
-// server startup, HTTP, or the Agent tool surface.  It is the dark, exact-task
-// core that will be wired only after the delivery Gate is independently green.
+// researchV3CutoverCoordinator is reachable only through the exact-task
+// operator methods below. It is not exposed to HTTP or the Agent tool surface.
 type researchV3CutoverCoordinator struct {
 	exactTaskID string
 	journal     researchV3CutoverJournal
@@ -85,14 +87,15 @@ func newResearchV3CutoverCoordinator(
 	}, nil
 }
 
-// newDarkResearchV3CutoverCore is deliberately unused by production wiring.
-// Keeping the adapter here makes the future Gate a small composition change,
-// while the hard-disabled authority option remains the current authority.
-func (s *Scheduler) newDarkResearchV3CutoverCore(
+func (s *Scheduler) newResearchV3CutoverCore(
 	exactTaskID string,
 ) (*researchV3CutoverCoordinator, error) {
+	if s == nil || s.c == nil || s.st == nil || s.taskScheduleEnv.namespace == "" {
+		return nil, types.NewAppError(types.CodeInternal,
+			"research V3 cutover dependencies are unavailable", nil)
+	}
 	journal, ok := s.st.(researchV3CutoverJournal)
-	if !ok || s == nil || s.c == nil || s.taskScheduleEnv.namespace == "" {
+	if !ok {
 		return nil, types.NewAppError(types.CodeInternal,
 			"research V3 cutover dependencies are unavailable", nil)
 	}
@@ -102,6 +105,53 @@ func (s *Scheduler) newDarkResearchV3CutoverCore(
 		func(params any) (*commonpb.Payload, error) {
 			return dc.ToPayload(params)
 		})
+}
+
+// CutoverResearchV3 replaces one already-shadowed task's Schedule Action via
+// the durable pause/CAS/restore saga. Config alone never changes an Action.
+func (s *Scheduler) CutoverResearchV3(
+	ctx context.Context, taskID string, userID int64, idempotencyKey string,
+) (types.ResearchV3CutoverOperation, error) {
+	if s == nil || s.researchV3.authorityID == "" ||
+		taskID != s.researchV3.authorityID {
+		return types.ResearchV3CutoverOperation{}, types.NewAppError(
+			types.CodeNotFound, "research V3 cutover task is not configured", types.ErrNotFound)
+	}
+	core, err := s.newResearchV3CutoverCore(taskID)
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	return core.Cutover(ctx, researchV3CutoverRequest{
+		TaskID: taskID, UserID: userID, IdempotencyKey: idempotencyKey,
+	})
+}
+
+// RollbackResearchV3 revokes delivery authority before restoring the frozen
+// Action. It derives tenant scope from the exact task/user mirror.
+func (s *Scheduler) RollbackResearchV3(
+	ctx context.Context, taskID string, userID int64, idempotencyKey string,
+) (types.ResearchV3CutoverOperation, error) {
+	if s == nil || s.researchV3.authorityID == "" ||
+		taskID != s.researchV3.authorityID {
+		return types.ResearchV3CutoverOperation{}, types.NewAppError(
+			types.CodeNotFound, "research V3 rollback task is not configured", types.ErrNotFound)
+	}
+	core, err := s.newResearchV3CutoverCore(taskID)
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	mirror, err := core.journal.GetSchedule(ctx, taskID, userID)
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	if mirror == nil || mirror.ID != taskID || mirror.UserID != userID ||
+		mirror.TenantID <= 0 {
+		return types.ResearchV3CutoverOperation{}, types.NewAppError(
+			types.CodeNotFound, "research V3 rollback task is unavailable", types.ErrNotFound)
+	}
+	return core.Rollback(ctx, mirror.TenantID, researchV3CutoverRequest{
+		TaskID: taskID, UserID: userID, IdempotencyKey: idempotencyKey,
+	})
 }
 
 func (c *researchV3CutoverCoordinator) Cutover(
@@ -129,6 +179,10 @@ func (c *researchV3CutoverCoordinator) Cutover(
 	head, err := c.journal.LoadCurrentResearchApprovedDefinitionV3Head(
 		ctx, mirror.TenantID, req.UserID, req.TaskID)
 	if err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	if err := c.journal.RequireSuccessfulResearchV3ShadowPreflight(
+		ctx, mirror.TenantID, req.UserID, req.TaskID, head); err != nil {
 		return types.ResearchV3CutoverOperation{}, err
 	}
 	desc, err := c.remote.Describe(ctx, req.TaskID)

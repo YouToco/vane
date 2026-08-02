@@ -26,7 +26,9 @@ func TestResearchV3RolloutWiring(t *testing.T) {
 		if ok {
 			name := selectorPath(call.Fun)
 			if name == "scheduler.WithResearchRuntimeV3ShadowCanary" ||
-				name == "scheduler.WithResearchRuntimeV3AuthorityCanary" {
+				name == "scheduler.WithResearchRuntimeV3AuthorityCanary" ||
+				name == "workflow.NewReceiptBackedResearchDeliveryV3" ||
+				name == "workflow.WithResearchDeliveryV3" {
 				options[name] = append(options[name], call)
 			}
 		}
@@ -40,6 +42,14 @@ func TestResearchV3RolloutWiring(t *testing.T) {
 		if len(calls) != 1 || len(calls[0].Args) != 1 ||
 			selectorPath(calls[0].Args[0]) != configField {
 			t.Fatalf("%s is not wired exactly once to %s", option, configField)
+		}
+	}
+	for _, constructor := range []string{
+		"workflow.NewReceiptBackedResearchDeliveryV3",
+		"workflow.WithResearchDeliveryV3",
+	} {
+		if len(options[constructor]) != 1 {
+			t.Fatalf("%s must be wired exactly once", constructor)
 		}
 	}
 }

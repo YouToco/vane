@@ -23,19 +23,67 @@ func readyResearchV3ShadowConfig() Config {
 	}
 }
 
-func TestResearchV3AuthorityIsRejectedUntilDeliveryIsReceiptBacked(t *testing.T) {
-	for _, authority := range []string{"task-v3", "task-other", " task-v3 "} {
-		cfg := readyResearchV3ShadowConfig()
-		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = authority
-		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "receipt-backed") {
-			t.Fatalf("authority %q returned %v, want explicit hard-dark rejection", authority, err)
-		}
-	}
+func TestResearchV3AuthorityRequiresExactShadowedTask(t *testing.T) {
 	cfg := readyResearchV3ShadowConfig()
+	cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = " task-v3 "
+	cfg.Pipeline.PushEffectRecoveryCanaryScheduleID = " task-v3 "
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "task-v3" {
+		t.Fatalf("trimmed authority=%q", cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID)
+	}
+
+	cfg = readyResearchV3ShadowConfig()
+	cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = "task-other"
+	cfg.Pipeline.PushEffectRecoveryCanaryScheduleID = "task-other"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "同一任务") {
+		t.Fatalf("different authority returned %v", err)
+	}
+
+	cfg = readyResearchV3ShadowConfig()
 	cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = "   "
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("whitespace-only authority was accepted")
 	}
+	for name, authorityID := range map[string]string{
+		"oversize": strings.Repeat("x", 256),
+		"control":  "task-v3\nother",
+		"format":   "task-v3\u200bother",
+	} {
+		t.Run(name+" authority rejected", func(t *testing.T) {
+			cfg := readyResearchV3ShadowConfig()
+			cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = authorityID
+			cfg.Pipeline.PushEffectRecoveryCanaryScheduleID = authorityID
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("invalid authority ID %q was accepted", authorityID)
+			}
+		})
+	}
+
+	t.Run("authority requires same-task durable recovery", func(t *testing.T) {
+		cfg := readyResearchV3ShadowConfig()
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = "task-v3"
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "push effect recovery") {
+			t.Fatalf("authority without recovery returned %v", err)
+		}
+
+		cfg = readyResearchV3ShadowConfig()
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = "task-v3"
+		cfg.Pipeline.PushEffectRecoveryCanaryScheduleID = "task-other"
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "同一任务") {
+			t.Fatalf("authority with cross-task recovery returned %v", err)
+		}
+	})
+
+	t.Run("V3 recovery does not require legacy compiled rollout", func(t *testing.T) {
+		cfg := readyResearchV3ShadowConfig()
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = "task-v3"
+		cfg.Pipeline.PushEffectRecoveryCanaryScheduleID = "task-v3"
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestResearchV3ShadowRequiresCompleteRuntime(t *testing.T) {
@@ -120,5 +168,29 @@ func TestEnvOnlyResearchV3ShadowCanary(t *testing.T) {
 		t.Fatalf("env-only Research V3 shadow/authority=%q/%q",
 			cfg.Pipeline.ResearchV3ShadowCanaryScheduleID,
 			cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID)
+	}
+}
+
+func TestEnvOnlyResearchV3AuthorityRequiresSameShadow(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://owner")
+	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://runtime")
+	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "active-v3")
+	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
+	t.Setenv("VANE_FETCH_EXA_API_KEY", "exa-test")
+	t.Setenv("VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID", "task-v3")
+	t.Setenv("VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID", "task-v3")
+	t.Setenv("VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID", "task-v3")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "task-v3" ||
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "task-v3" {
+		t.Fatalf("env authority/shadow=%q/%q",
+			cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID,
+			cfg.Pipeline.ResearchV3ShadowCanaryScheduleID)
 	}
 }

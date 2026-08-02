@@ -158,8 +158,8 @@ type PipelineConfig struct {
 	ToolRuntimeCanaryScheduleID string `mapstructure:"tool_runtime_canary_schedule_id"`
 	// ResearchV3ShadowCanaryScheduleID permits one exact no-delivery shadow run.
 	ResearchV3ShadowCanaryScheduleID string `mapstructure:"research_v3_shadow_canary_schedule_id"`
-	// ResearchV3AuthorityCanaryScheduleID is reserved for the future receipt-
-	// backed delivery cutover. Validate rejects every non-empty value today.
+	// ResearchV3AuthorityCanaryScheduleID permits the receipt-backed cutover
+	// control plane for exactly the already-shadowed task. There is no allow-all.
 	ResearchV3AuthorityCanaryScheduleID string `mapstructure:"research_v3_authority_canary_schedule_id"`
 	// RunOutcome* is the independent P1-B lifecycle rollout. It may select only
 	// Actions already selected by the compiled runtime rollout.
@@ -214,8 +214,9 @@ type PipelineConfig struct {
 	// PushEffectCanaryScheduleID enables durable external push effects for
 	// exactly one compiled task. Empty is fully dark; broad rollout has no key.
 	PushEffectCanaryScheduleID string `mapstructure:"push_effect_canary_schedule_id"`
-	// PushEffectRecoveryCanaryScheduleID enables recovery for one compiled
-	// task. It is independent of the fresh-send canary for separate rollback.
+	// PushEffectRecoveryCanaryScheduleID enables recovery for one exact task.
+	// Legacy compiled tasks retain their rollout dependency; Research V3
+	// authority must select this same task before delivery can be enabled.
 	PushEffectRecoveryCanaryScheduleID string `mapstructure:"push_effect_recovery_canary_schedule_id"`
 }
 
@@ -554,10 +555,14 @@ func (c *Config) Validate() error {
 		return errors.New(
 			"config: pipeline.research_v3_authority_canary_schedule_id 不能仅含空白")
 	}
-	c.Pipeline.ResearchV3AuthorityCanaryScheduleID = researchV3AuthorityID
-	if researchV3AuthorityID != "" {
+	if researchV3AuthorityID != "" && !validSnapshotShadowCanaryID(researchV3AuthorityID) {
 		return errors.New(
-			"config: Research V3 authority canary 尚未启用 receipt-backed delivery，当前仅允许 shadow")
+			"config: pipeline.research_v3_authority_canary_schedule_id 必须是 1-255 字节的有效任务 ID，且不能包含控制字符")
+	}
+	c.Pipeline.ResearchV3AuthorityCanaryScheduleID = researchV3AuthorityID
+	if researchV3AuthorityID != "" && researchV3AuthorityID != researchV3ShadowID {
+		return errors.New(
+			"config: Research V3 authority canary 必须与已配置的 shadow canary 是同一任务")
 	}
 	rawRunOutcomeCanaryID := c.Pipeline.RunOutcomeCanaryScheduleID
 	runOutcomeCanaryID := strings.TrimSpace(rawRunOutcomeCanaryID)
@@ -890,17 +895,22 @@ func (c *Config) Validate() error {
 		return errors.New(
 			"config: pipeline.push_effect_recovery_canary_schedule_id 无效")
 	}
-	if pushRecoveryCanaryID != "" && !c.Pipeline.CompiledRuntimeEnabled {
+	if pushRecoveryCanaryID != "" && researchV3AuthorityID == "" &&
+		!c.Pipeline.CompiledRuntimeEnabled {
 		return errors.New(
 			"config: push effect recovery canary 要求 compiled runtime 已启用")
 	}
-	if pushRecoveryCanaryID != "" &&
+	if pushRecoveryCanaryID != "" && researchV3AuthorityID == "" &&
 		!c.Pipeline.CompiledRuntimeAllowAll &&
 		compiledCanaryID != pushRecoveryCanaryID {
 		return errors.New(
 			"config: push effect recovery canary 必须位于 compiled runtime rollout")
 	}
 	c.Pipeline.PushEffectRecoveryCanaryScheduleID = pushRecoveryCanaryID
+	if researchV3AuthorityID != "" && pushRecoveryCanaryID != researchV3AuthorityID {
+		return errors.New(
+			"config: Research V3 authority canary 必须启用同一任务的 push effect recovery")
+	}
 	if c.Pipeline.CanonicalBriefEnabled {
 		if c.Pipeline.CanonicalBriefAllowAll ||
 			canonicalBriefCanaryID == "" {
@@ -1020,24 +1030,25 @@ func (c *Config) Validate() error {
 		c.Fetch.CompiledTikHubCredentialGeneration < 0 {
 		return errors.New("config: fetch compiled credential generation 必须为正数")
 	}
-	if c.Pipeline.ResearchV3ShadowCanaryScheduleID != "" {
+	if c.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
+		c.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
 		if strings.TrimSpace(c.DB.ResearchRuntimeURL) == "" {
-			return errors.New("config: Research V3 shadow 要求 db.research_runtime_url")
+			return errors.New("config: Research V3 runtime 要求 db.research_runtime_url")
 		}
 		if c.DB.ResearchCapabilityKeyID == "" ||
 			len(c.DB.ResearchCapabilityKeyHex) != 64 {
-			return errors.New("config: Research V3 shadow 要求 active research capability key")
+			return errors.New("config: Research V3 runtime 要求 active research capability key")
 		}
 		if _, err := hex.DecodeString(c.DB.ResearchCapabilityKeyHex); err != nil {
-			return errors.New("config: Research V3 shadow capability key hex 无效")
+			return errors.New("config: Research V3 runtime capability key hex 无效")
 		}
 		if c.LLM.CompiledEndpointGeneration <= 0 ||
 			c.LLM.CompiledCredentialGeneration <= 0 ||
 			c.Fetch.CompiledExaCredentialGeneration <= 0 {
-			return errors.New("config: Research V3 shadow 要求可用的 LLM/Exa retained generations")
+			return errors.New("config: Research V3 runtime 要求可用的 LLM/Exa retained generations")
 		}
 		if strings.TrimSpace(c.Fetch.ExaAPIKey) == "" {
-			return errors.New("config: Research V3 shadow 要求 fetch.exa_api_key")
+			return errors.New("config: Research V3 runtime 要求 fetch.exa_api_key")
 		}
 	}
 	return nil

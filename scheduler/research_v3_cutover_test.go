@@ -23,6 +23,7 @@ type researchV3CutoverJournalFake struct {
 	head             types.ResearchV3DefinitionHead
 	op               types.ResearchV3CutoverOperation
 	recheckErr       error
+	preflightErr     error
 	revoked          bool
 	advanceLostPhase types.ResearchV3CutoverPhase
 	advanceLost      bool
@@ -45,6 +46,13 @@ func (f *researchV3CutoverJournalFake) LoadCurrentResearchApprovedDefinitionV3He
 	context.Context, int64, int64, string,
 ) (types.ResearchV3DefinitionHead, error) {
 	return f.head, nil
+}
+
+func (f *researchV3CutoverJournalFake) RequireSuccessfulResearchV3ShadowPreflight(
+	context.Context, int64, int64, string, types.ResearchV3DefinitionHead,
+) error {
+	f.events = append(f.events, "shadow-preflight")
+	return f.preflightErr
 }
 
 func (f *researchV3CutoverJournalFake) BeginResearchV3Cutover(
@@ -136,11 +144,13 @@ type researchV3ScheduleRemoteFake struct {
 	lostAfterApply map[int]bool
 	requireRevoked *bool
 	requestReceipt map[string]bool
+	describeCalls  int
 }
 
 func (f *researchV3ScheduleRemoteFake) Describe(
 	context.Context, string,
 ) (*workflowservice.DescribeScheduleResponse, error) {
+	f.describeCalls++
 	return &workflowservice.DescribeScheduleResponse{
 		Schedule:      proto.Clone(f.schedule).(*schedulepb.Schedule),
 		ConflictToken: []byte{byte(f.token)},
@@ -309,6 +319,22 @@ func TestResearchV3CutoverRejectsNonExactTaskWithoutEffects(t *testing.T) {
 	})
 	if types.CodeOf(err) != types.CodeNotFound || journal.op.ID != 0 || len(remote.updates) != 0 {
 		t.Fatalf("err=%v operation=%d updates=%d", err, journal.op.ID, len(remote.updates))
+	}
+}
+
+func TestResearchV3CutoverRequiresDurableSuccessfulShadowBeforeRemoteRead(t *testing.T) {
+	journal := researchV3CutoverJournalForTest()
+	journal.preflightErr = types.NewAppError(
+		types.CodeConflict, "successful V3 shadow is unavailable", types.ErrConflict)
+	remote := &researchV3ScheduleRemoteFake{schedule: researchV3MondaySchedule(t)}
+	coordinator := researchV3CutoverCoordinatorForTest(t, journal, remote)
+	_, err := coordinator.Cutover(t.Context(), researchV3CutoverRequest{
+		TaskID: "task-kimi", UserID: 42, IdempotencyKey: "no-shadow",
+	})
+	if types.CodeOf(err) != types.CodeConflict || journal.op.ID != 0 ||
+		remote.describeCalls != 0 || len(remote.updates) != 0 {
+		t.Fatalf("err=%v operation=%d describes=%d updates=%d", err,
+			journal.op.ID, remote.describeCalls, len(remote.updates))
 	}
 }
 

@@ -6,21 +6,26 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
+	"runtime"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
-// researchV3Rollout holds two deliberately independent exact-task controls.
-// Shadow never mutates the durable Schedule Action; authority alone selects
-// that Action for V3 authority. The current coordinator remains delivery-dark;
-// enabling user-visible delivery is a separate reviewed Gate. Neither control
-// has an allow-all state.
+// researchV3Rollout holds two exact-task controls. Shadow never mutates the
+// durable Schedule Action. Authority only admits the explicit cutover saga;
+// normal create/edit/reconcile paths never interpret it as an Action selector.
+// Neither control has an allow-all state.
 type researchV3Rollout struct {
 	shadowID    string
 	authorityID string
@@ -39,21 +44,88 @@ func WithResearchRuntimeV3ShadowCanary(scheduleID string) SchedulerOption {
 	}
 }
 
-// WithResearchRuntimeV3AuthorityCanary reserves the future delivery-capable
-// durable V3 selector. It is hard-disabled until receipt-backed delivery and
-// its canonical-definition preflight are implemented.
+// WithResearchRuntimeV3AuthorityCanary admits only the explicit receipt-backed
+// cutover control plane for one exact task. It does not rewrite normal Actions.
 func WithResearchRuntimeV3AuthorityCanary(scheduleID string) SchedulerOption {
 	return func(s *Scheduler) {
-		// Delivery is not receipt-backed yet. Keep the future API surface but
-		// hard-disable every direct option so tests or alternate composition roots
-		// cannot silently rewrite a production Action into a no-delivery runtime.
-		_ = scheduleID
-		s.researchV3.authorityID = ""
+		trimmed := strings.TrimSpace(scheduleID)
+		if !validResearchV3RolloutID(trimmed) {
+			s.researchV3.authorityID = ""
+			return
+		}
+		s.researchV3.authorityID = trimmed
 	}
 }
 
-func (r researchV3Rollout) authoritySelected(taskID string) bool {
-	return r.authorityID != "" && taskID == r.authorityID
+func validResearchV3RolloutID(value string) bool {
+	if value == "" || len(value) > 255 || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeResearchScheduledActionV3(
+	action client.ScheduleAction,
+) (workflow.ResearchScheduledInputV3, bool, error) {
+	wf, ok := action.(*client.ScheduleWorkflowAction)
+	if !ok || scheduleActionWorkflowNameV3(wf) != workflow.ResearchScheduledWorkflowV3Name {
+		return workflow.ResearchScheduledInputV3{}, false, nil
+	}
+	if len(wf.Args) != 1 {
+		return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
+			types.CodeConflict, "research V3 Schedule Action envelope is malformed", types.ErrConflict)
+	}
+	var input workflow.ResearchScheduledInputV3
+	switch first := wf.Args[0].(type) {
+	case workflow.ResearchScheduledInputV3:
+		input = first
+	case *commonpb.Payload:
+		if err := converter.GetDefaultDataConverter().FromPayload(first, &input); err != nil {
+			return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
+				types.CodeConflict, "decode research V3 Schedule Action envelope", err)
+		}
+	default:
+		return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
+			types.CodeConflict, "research V3 Schedule Action envelope type is invalid", types.ErrConflict)
+	}
+	if input.TenantID <= 0 || input.UserID <= 0 || !validResearchV3RolloutID(input.TaskID) ||
+		len(input.ActionAuthorizationToken) != 64 ||
+		input.ActionAuthorizationToken != strings.ToLower(input.ActionAuthorizationToken) {
+		return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
+			types.CodeConflict, "research V3 Schedule Action envelope is invalid", types.ErrConflict)
+	}
+	if _, err := hex.DecodeString(input.ActionAuthorizationToken); err != nil {
+		return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
+			types.CodeConflict, "research V3 Schedule Action authorization is invalid", types.ErrConflict)
+	}
+	return input, true, nil
+}
+
+func scheduleActionWorkflowNameV3(action *client.ScheduleWorkflowAction) string {
+	if action == nil {
+		return ""
+	}
+	if name, ok := action.Workflow.(string); ok {
+		return name
+	}
+	value := reflect.ValueOf(action.Workflow)
+	if !value.IsValid() || value.Kind() != reflect.Func || value.IsNil() {
+		return ""
+	}
+	function := runtime.FuncForPC(value.Pointer())
+	if function == nil {
+		return ""
+	}
+	name := function.Name()
+	if index := strings.LastIndexByte(name, '.'); index >= 0 {
+		name = name[index+1:]
+	}
+	return name
 }
 
 // actionParamsFor applies all runtime selectors to one newly constructed
@@ -61,16 +133,6 @@ func (r researchV3Rollout) authoritySelected(taskID string) bool {
 // than decorating it, so no retained Source scope, display prompt, or run
 // snapshot can leak into the discover-at-run protocol.
 func (s *Scheduler) actionParamsFor(params workflow.PushParams) workflow.PushParams {
-	if s.researchV3.authoritySelected(params.ScheduleID) {
-		return workflow.PushParams{
-			TenantID:       params.TenantID,
-			UserID:         params.UserID,
-			RunKind:        workflow.PushRunKindScheduled,
-			ExecutionMode:  types.ExecutionModeDiscoverAtRun,
-			RuntimeVersion: workflow.ResearchRuntimeV3,
-			ScheduleID:     params.ScheduleID,
-		}
-	}
 	params.RuntimeVersion = s.runtimeVersionFor(
 		params.ScheduleID, params.ExecutionMode)
 	return params

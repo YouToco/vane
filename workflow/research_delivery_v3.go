@@ -30,7 +30,21 @@ type ResearchDeliveryTargetV3 struct {
 }
 
 type ResearchDeliveryTargetProviderV3 interface {
-	ResearchDeliveryTargetV3() ResearchDeliveryTargetV3
+	ResearchDeliveryTargetV3(context.Context, types.RunIdentity) (ResearchDeliveryTargetV3, error)
+}
+
+type ResearchDeliveryTargetResolverV3 func(
+	context.Context, types.RunIdentity,
+) (ResearchDeliveryTargetV3, error)
+
+func (f ResearchDeliveryTargetResolverV3) ResearchDeliveryTargetV3(
+	ctx context.Context, identity types.RunIdentity,
+) (ResearchDeliveryTargetV3, error) {
+	if f == nil {
+		return ResearchDeliveryTargetV3{}, researchCoordinatorValidationV3(
+			"research V3 delivery target resolver is unavailable")
+	}
+	return f(ctx, identity)
 }
 
 type ResearchDeliveryRendererV3 func(types.ResearchBriefPayloadV3) ([]byte, error)
@@ -101,7 +115,15 @@ func (d *ReceiptBackedResearchDeliveryV3) Deliver(
 		return ResearchDeliveryReceiptV3{}, researchCoordinatorValidationV3(
 			"research V3 delivery rendering failed")
 	}
-	target := d.targets.ResearchDeliveryTargetV3()
+	target, err := d.targets.ResearchDeliveryTargetV3(ctx, identity)
+	if err != nil {
+		return ResearchDeliveryReceiptV3{}, err
+	}
+	if target.Provider != "feishu" || target.AppIdentity == "" ||
+		target.ProviderChatID == "" || target.Target == "" {
+		return ResearchDeliveryReceiptV3{}, researchCoordinatorValidationV3(
+			"research V3 delivery target is invalid")
+	}
 	prepared, effect, err := d.store.PrepareOrGetResearchBriefDeliveryV3(ctx,
 		storepkg.PrepareResearchBriefDeliveryV3Params{
 			Identity: identity, SnapshotRef: snapshot, PlanRef: plan, BriefRef: brief,

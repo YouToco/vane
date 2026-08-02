@@ -59,8 +59,9 @@ pipeline:
   # Source-free Tool runtime is deliberately single-task only. To roll back:
   # pause the task first, then clear this ID (V2 definitions cannot run on V1).
   tool_runtime_canary_schedule_id: ""
-  # Research V3 is exact-task only. Shadow never delivers; authority remains
-  # empty until receipt-backed delivery ships in a later build.
+  # Research V3 is exact-task only. Shadow never delivers. Authority may only
+  # equal a successfully shadowed task and also requires the same task in
+  # push_effect_recovery_canary_schedule_id.
   research_v3_shadow_canary_schedule_id: ""
   research_v3_authority_canary_schedule_id: ""
   # P1-B exact-run lifecycle is independent and remains dark by default.
@@ -101,7 +102,8 @@ pipeline:
   observation_authority_canary_schedule_id: ""
   # Durable provider effect: exact one-task compiled canary only.
   push_effect_canary_schedule_id: ""
-  # Independent exact-task recovery canary. Empty keeps recovery fully dark.
+  # Independent exact-task recovery canary. Research V3 authority must bind
+  # this to the same task so startup recovery precedes worker/Feishu ingress.
   push_effect_recovery_canary_schedule_id: ""
 
 agent:

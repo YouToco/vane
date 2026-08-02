@@ -21,7 +21,7 @@ func TestMigration101KeepsExactCutoverAuthorityDarkAndTransitionGuarded(t *testi
 	sql := string(payload)
 	required := []string{
 		"vane_research_v3_cutover_operator NOLOGIN NOSUPERUSER",
-		"GRANT SELECT ON research_v3_delivery_authorities,\n                research_v3_cutover_operations TO vane_app",
+		"definition_digest,target_action_digest,action_authorization_digest,status\n) ON research_v3_delivery_authorities TO vane_app",
 		"GRANT UPDATE (status,enabled_at,revoked_at)",
 		"GRANT UPDATE (phase,rollback_conflict_token,rollback_token_digest)",
 		"ALTER ROLE vane_research_v3_cutover_operator NOLOGIN NOSUPERUSER",
@@ -49,8 +49,10 @@ func TestMigration101KeepsExactCutoverAuthorityDarkAndTransitionGuarded(t *testi
 		}
 	}
 	forbidden := []string{
+		"GRANT SELECT ON research_v3_delivery_authorities TO vane_app",
 		"GRANT SELECT,INSERT,UPDATE ON research_v3_delivery_authorities TO vane_app",
 		"GRANT SELECT,INSERT,UPDATE ON research_v3_cutover_operations TO vane_app",
+		"research_v3_cutover_operations TO vane_app",
 		"GRANT vane_research_v3_cutover_operator TO vane_server_runtime",
 		"REFERENCES schedules (tenant_id,user_id,id) ON DELETE RESTRICT",
 		"RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER\nSET search_path=pg_catalog,public,pg_temp",
@@ -60,6 +62,58 @@ func TestMigration101KeepsExactCutoverAuthorityDarkAndTransitionGuarded(t *testi
 		if strings.Contains(sql, fragment) {
 			t.Fatalf("migration 101 exposes forbidden authority: %q", fragment)
 		}
+	}
+}
+
+func TestMigration101CutoverJournalACLPostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	if err := Migrate(t.Context(), os.Getenv("DATABASE_URL")); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var (
+		appCanReadWholeAuthority, appCanReadAuthorityScope      bool
+		appCanReadAuthorityDigest, appCanReadAuthorityTimestamp bool
+		appCanReadJournal, appCanReadTarget, appCanReadConflict bool
+		operatorCanReadJournal, serverIsOperator                bool
+	)
+	if err := st.pool.QueryRow(t.Context(), `
+		SELECT
+		 has_table_privilege('vane_app','public.research_v3_delivery_authorities','SELECT'),
+		 has_column_privilege('vane_app','public.research_v3_delivery_authorities','task_id','SELECT'),
+		 has_column_privilege('vane_app','public.research_v3_delivery_authorities','action_authorization_digest','SELECT'),
+		 has_column_privilege('vane_app','public.research_v3_delivery_authorities','enabled_at','SELECT'),
+		 has_table_privilege('vane_app','public.research_v3_cutover_operations','SELECT'),
+		 has_column_privilege('vane_app','public.research_v3_cutover_operations','target_action','SELECT'),
+		 has_column_privilege('vane_app','public.research_v3_cutover_operations','frozen_conflict_token','SELECT'),
+		 has_table_privilege('vane_research_v3_cutover_operator',
+		                     'public.research_v3_cutover_operations','SELECT'),
+		 COALESCE(pg_has_role(to_regrole('vane_server_runtime'),
+		                      to_regrole('vane_research_v3_cutover_operator'),
+		                      'MEMBER'),false)
+	`).Scan(&appCanReadWholeAuthority, &appCanReadAuthorityScope,
+		&appCanReadAuthorityDigest, &appCanReadAuthorityTimestamp,
+		&appCanReadJournal, &appCanReadTarget, &appCanReadConflict,
+		&operatorCanReadJournal, &serverIsOperator); err != nil {
+		t.Fatal(err)
+	}
+	if appCanReadWholeAuthority || !appCanReadAuthorityScope ||
+		!appCanReadAuthorityDigest || appCanReadAuthorityTimestamp ||
+		appCanReadJournal || appCanReadTarget || appCanReadConflict ||
+		!operatorCanReadJournal || serverIsOperator {
+		t.Fatalf("unsafe migration 101 ACL: app_whole_authority=%t "+
+			"app_authority_scope=%t app_authority_digest=%t app_authority_timestamp=%t "+
+			"app_journal=%t app_target=%t app_conflict=%t operator_journal=%t "+
+			"server_operator=%t", appCanReadWholeAuthority, appCanReadAuthorityScope,
+			appCanReadAuthorityDigest, appCanReadAuthorityTimestamp,
+			appCanReadJournal, appCanReadTarget, appCanReadConflict,
+			operatorCanReadJournal, serverIsOperator)
 	}
 }
 

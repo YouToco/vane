@@ -118,11 +118,13 @@ func (f *researchDeliverySenderFakeV3) PushWithUUID(
 
 type researchDeliveryTargetFakeV3 struct{}
 
-func (researchDeliveryTargetFakeV3) ResearchDeliveryTargetV3() ResearchDeliveryTargetV3 {
+func (researchDeliveryTargetFakeV3) ResearchDeliveryTargetV3(
+	context.Context, types.RunIdentity,
+) (ResearchDeliveryTargetV3, error) {
 	return ResearchDeliveryTargetV3{
 		Provider: "feishu", AppIdentity: "cli_a:gen_1",
 		ProviderChatID: "oc_owner", Target: "ou_owner",
-	}
+	}, nil
 }
 
 func researchDeliveryFixtureV3(t *testing.T) (

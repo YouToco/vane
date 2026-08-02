@@ -123,8 +123,14 @@ BEGIN
 END $$;
 -- +goose StatementEnd
 
-GRANT SELECT ON research_v3_delivery_authorities,
-                research_v3_cutover_operations TO vane_app;
+-- Ordinary application and delivery code needs only the live authority row.
+-- The cutover journal contains frozen Schedule bytes, conflict tokens and the
+-- formal Action bearer token, so it remains visible only to the one-shot
+-- migration-owner/operator capability below.
+GRANT SELECT (
+    tenant_id,user_id,task_id,generation,definition_version,
+    definition_digest,target_action_digest,action_authorization_digest,status
+) ON research_v3_delivery_authorities TO vane_app;
 GRANT SELECT ON research_v3_delivery_authorities
     TO vane_push_effect_coordinator;
 GRANT SELECT (

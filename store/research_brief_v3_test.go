@@ -47,6 +47,14 @@ func newResearchBriefFixtureWithAuthorityV3(
 	t *testing.T, threshold taskstate.NotificationThresholdV3, completeEvidence bool,
 	evidenceResult []byte, authorityToken string,
 ) researchBriefFixtureV3 {
+	return newResearchBriefFixtureWithWorkflowV3(
+		t, threshold, completeEvidence, evidenceResult, authorityToken, "")
+}
+
+func newResearchBriefFixtureWithWorkflowV3(
+	t *testing.T, threshold taskstate.NotificationThresholdV3, completeEvidence bool,
+	evidenceResult []byte, authorityToken, workflowID string,
+) researchBriefFixtureV3 {
 	t.Helper()
 	st := tenantTestStore(t)
 	useOwnerResearchRuntimeForTest(st)
@@ -128,8 +136,11 @@ func newResearchBriefFixtureWithAuthorityV3(
 		}
 	}
 
+	if workflowID == "" {
+		workflowID = "workflow-" + taskID
+	}
 	identity := types.RunIdentity{
-		TemporalWorkflowID: "workflow-" + taskID, TemporalRunID: "run-" + uuid.NewString(),
+		TemporalWorkflowID: workflowID, TemporalRunID: "run-" + uuid.NewString(),
 		RunKind: types.RunSnapshotKindScheduled, TenantID: tenantID, UserID: userID, TaskID: taskID,
 	}
 	researchTools := researchBriefToolPolicyV3(t)

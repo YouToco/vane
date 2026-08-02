@@ -92,6 +92,7 @@ func run() error {
 		return fmt.Errorf("初始化 research gateway client: %w", err)
 	}
 	var researchRuntimeOption workflow.ActivitiesOption
+	var researchDeliveryOption workflow.ActivitiesOption
 	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
 		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
 		researchExecutor, executorErr := fetcher.NewResearchExecutorV3(cfg.Fetch)
@@ -198,6 +199,18 @@ func run() error {
 	score := scorer.New(llmClient, recorder, st, hints)
 	cards := cardgen.New(llmClient, recorder, hints)
 	push := pusher.New(manager)
+	if cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+		delivery, deliveryErr := workflow.NewReceiptBackedResearchDeliveryV3(
+			st, push, newResearchV3DeliveryTargetResolver(st, manager),
+			renderResearchBriefCardV3,
+		)
+		if deliveryErr != nil {
+			temporalClient.Close()
+			st.Close()
+			return fmt.Errorf("初始化 research V3 receipt-backed delivery: %w", deliveryErr)
+		}
+		researchDeliveryOption = workflow.WithResearchDeliveryV3(delivery)
+	}
 	// 构卡函数注入而非 workflow 直接 import feishu：feishu→agent→workflow 依赖链
 	// 已存在，直接调用会成环（M5 契约 §8.2）。
 	ev := evolver.New(llmClient, recorder, st)
@@ -337,7 +350,8 @@ func run() error {
 			cfg.Pipeline.ObservationAuthorityCanaryScheduleID),
 		workflow.WithPushEffectCanary(
 			st, cfg.Pipeline.PushEffectCanaryScheduleID),
-		researchRuntimeOption)
+		researchRuntimeOption,
+		researchDeliveryOption)
 	periodicActivities, err := periodicbrief.NewActivities(
 		st, compiledModelResolver, recorder,
 		manager, cfg.Dashboard.Origin,

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -24,6 +25,129 @@ func (s *Store) LoadCurrentResearchApprovedDefinitionV3Head(
 	}
 	return loadCanonicalResearchV3HeadTx(
 		ctx, s.pool, tenantID, userID, taskID, false)
+}
+
+// VerifyEnabledResearchV3ActionAuthorization makes startup reconciliation a
+// live check against the durable exact-task authority. A syntactically valid
+// but stale or tampered Schedule bearer token must stop startup rather than
+// leave the next scheduled run to fail silently.
+func (s *Store) VerifyEnabledResearchV3ActionAuthorization(
+	ctx context.Context, tenantID, userID int64, taskID, token string,
+) error {
+	if err := validateTaskStateScope(tenantID, userID, taskID); err != nil {
+		return err
+	}
+	if len(token) != 64 || token != strings.ToLower(token) {
+		return types.NewAppError(types.CodeConflict,
+			"research V3 Schedule Action authorization is invalid", types.ErrConflict)
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return types.NewAppError(types.CodeConflict,
+			"research V3 Schedule Action authorization is invalid", types.ErrConflict)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return taskStateDatabaseError("begin research V3 Action authority verification", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true)`,
+		strconv.FormatInt(tenantID, 10), strconv.FormatInt(userID, 10)); err != nil {
+		return taskStateDatabaseError("bind research V3 Action authority scope", err)
+	}
+	var expected string
+	err = tx.QueryRow(ctx,
+		`SELECT action_authorization_digest
+		   FROM research_v3_delivery_authorities
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND status='enabled'`,
+		tenantID, userID, taskID).Scan(&expected)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.NewAppError(types.CodeConflict,
+			"enabled research V3 Action authority is unavailable", types.ErrConflict)
+	}
+	if err != nil {
+		return taskStateDatabaseError("load research V3 Action authority", err)
+	}
+	digest := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(digest[:])), []byte(expected)) != 1 {
+		return types.NewAppError(types.CodeConflict,
+			"research V3 Schedule Action authorization does not match durable authority",
+			types.ErrConflict)
+	}
+	return nil
+}
+
+// RequireSuccessfulResearchV3ShadowPreflight proves that the exact current
+// definition has already completed synthesis through the delivery-dark shadow
+// workflow. The proof is rebuilt from immutable snapshot and Brief rows; a
+// Temporal start receipt or an in-memory success flag is never sufficient.
+func (s *Store) RequireSuccessfulResearchV3ShadowPreflight(
+	ctx context.Context, tenantID, userID int64, taskID string,
+	head types.ResearchV3DefinitionHead,
+) error {
+	if err := validateTaskStateScope(tenantID, userID, taskID); err != nil {
+		return err
+	}
+	if head.Version <= 0 || !validDigestSyntaxV3(head.Digest) {
+		return types.NewAppError(types.CodeValidation,
+			"research V3 shadow preflight head is invalid", types.ErrValidation)
+	}
+	row, err := scanTaskRunSnapshot(s.pool.QueryRow(ctx,
+		`SELECT `+taskRunSnapshotColumns+`
+		   FROM task_run_snapshots
+		  WHERE id=(
+		        SELECT synthesis.run_snapshot_id
+		          FROM research_brief_syntheses synthesis
+		          JOIN task_run_snapshots candidate
+		            ON candidate.id=synthesis.run_snapshot_id
+		           AND candidate.tenant_id=synthesis.tenant_id
+		           AND candidate.user_id=synthesis.user_id
+		           AND candidate.task_id=synthesis.task_id
+		           AND candidate.temporal_workflow_id=synthesis.temporal_workflow_id
+		           AND candidate.temporal_run_id=synthesis.temporal_run_id
+		         WHERE synthesis.tenant_id=$1 AND synthesis.user_id=$2
+		           AND synthesis.task_id=$3 AND synthesis.definition_digest=$4
+		           AND synthesis.status='finalized' AND synthesis.finalized_at IS NOT NULL
+		           AND candidate.reference_schema_version=$5
+		           AND candidate.definition_digest=$4
+		           AND candidate.temporal_workflow_id LIKE 'research-v3-shadow-%'
+		           AND NOT EXISTS (
+		               SELECT 1 FROM research_brief_deliveries delivery
+		                WHERE delivery.tenant_id=synthesis.tenant_id
+		                  AND delivery.user_id=synthesis.user_id
+		                  AND delivery.task_id=synthesis.task_id
+		                  AND delivery.brief_id=synthesis.id)
+		         ORDER BY synthesis.finalized_at DESC,synthesis.id DESC
+		         LIMIT 1)`,
+		tenantID, userID, taskID, head.Digest, types.ResearchRunSnapshotRefSchemaV3))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.NewAppError(types.CodeConflict,
+			"successful delivery-dark research V3 shadow is unavailable", types.ErrConflict)
+	}
+	if err != nil {
+		return taskStateDatabaseError("load research V3 shadow preflight", err)
+	}
+	identity := types.RunIdentity{
+		TemporalWorkflowID: row.TemporalWorkflowID,
+		TemporalRunID:      row.TemporalRunID,
+		RunKind:            row.RunKind,
+		TenantID:           row.TenantID,
+		UserID:             row.UserID,
+		TaskID:             row.TaskID,
+	}
+	ref, err := validateStoredResearchRunSnapshotV3(identity, row)
+	if err != nil {
+		return err
+	}
+	shadowSuffix := strings.TrimPrefix(ref.TemporalWorkflowID, "research-v3-shadow-")
+	if shadowSuffix == ref.TemporalWorkflowID || !validDigestSyntaxV3(shadowSuffix) ||
+		ref.DefinitionVersion != head.Version || ref.DefinitionDigest != head.Digest ||
+		ref.AuthorityGeneration != 0 || ref.TargetActionDigest != "" ||
+		ref.ActionAuthorizationDigest != "" {
+		return types.NewAppError(types.CodeConflict,
+			"research V3 shadow preflight evidence is not eligible", types.ErrConflict)
+	}
+	return nil
 }
 
 // BeginResearchV3Cutover stages a new exact-task authority and its immutable
