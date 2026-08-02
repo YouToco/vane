@@ -16,6 +16,9 @@ Research V3 shadow 是正式切流前的独立技术验证路径。它读取 del
   snapshot、owner/active 租户与任务、当前 prepared head 及其 prepare journal 必须完全一致；
   正式 Schedule 可保持 `compiled`。撤销 sidecar 后只允许已有 ordinal 的幂等恢复，禁止任何
   新 Tool effect。正式运行仍逐字沿用 `discover_at_run`/manual-run authority 原规则。
+- Shadow snapshot 创建与 Tool first-writer 都只在 exact-task advisory fence 下读取 owner、
+  tenant、Schedule 和 prepared head；撤权写入使用同一独占 fence。读取不再叠加授权行锁，
+  避免与 row-then-advisory 的撤权触发器形成死锁；正式 snapshot 分支保持原行锁规则。
 - 即使 coordinator 错误返回 `delivery_allowed=true`，Shadow Workflow 仍跳过投递。
 
 ## 执行
