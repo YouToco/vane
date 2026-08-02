@@ -9,6 +9,7 @@ import (
 	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/researchgateway"
 	"github.com/YouToco/vane/runcontext"
+	"github.com/YouToco/vane/runtimeconfig"
 	"github.com/YouToco/vane/runtimepolicy"
 	storepkg "github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -100,6 +101,46 @@ func TestProductionResearchRuntimeV3IsDeliveryHardDark(t *testing.T) {
 	if _, err := runtime.Deliver(t.Context(), identity, snapshot, plan,
 		types.ResearchBriefRefV3{}, "trace"); types.CodeOf(err) != types.CodeValidation || types.IsRetryable(err) {
 		t.Fatalf("Deliver error=%v, want non-retryable hard-dark rejection", err)
+	}
+}
+
+func TestProductionResearchRuntimeV3FreezesDedicatedNonThinkingModelPolicy(t *testing.T) {
+	identity, snapshot, _, _ := researchBridgeFixtureV3(t)
+	current, err := runtimeconfig.BuildResearchRuntimeV3(
+		runtimeconfig.CurrentCompiledV1Input{
+			Model: "cheap-pipeline-model", ResearchModel: "strong-research-model",
+			ModelEndpointGeneration: 1, ModelCredentialGeneration: 1,
+			ExaCredentialGeneration: 1, TikHubCredentialGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &coordinatorStoreFakeV3{createSnapshot: func(
+		_ context.Context, gotIdentity types.RunIdentity, _ runtimepolicy.BundleV1,
+		_ runtimepolicy.ResearchToolPolicyV3, model runtimepolicy.ResearchModelPolicyV3,
+		_ string,
+	) (types.ResearchRunSnapshotRefV3, error) {
+		if gotIdentity != identity || model.Planner.Model != "strong-research-model" ||
+			model.Synthesis.Model != "strong-research-model" ||
+			!model.Planner.DisableThinking || !model.Synthesis.DisableThinking {
+			t.Fatalf("unsafe V3 model policy crossed the Store boundary: %+v", model)
+		}
+		return snapshot, nil
+	}}
+	runtime, err := NewProductionResearchRuntimeV3(
+		store, coordinatorGatewayFakeV3{}, &coordinatorExecutorFakeV3{},
+		func(context.Context, types.RunIdentity) (
+			runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
+			runtimepolicy.ResearchModelPolicyV3, error,
+		) {
+			return current.Bundle, current.Tools, current.Model, nil
+		}, func(got types.RunIdentity) bool { return got == identity })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, authorized, delivery, err := runtime.Prepare(
+		t.Context(), identity, ""); err != nil || !authorized || delivery {
+		t.Fatalf("Prepare authorized=%v delivery=%v err=%v", authorized, delivery, err)
 	}
 }
 

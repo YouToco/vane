@@ -104,7 +104,11 @@ type LLMConfig struct {
 	// AgentModel 是 agent loop（function calling）使用的模型，与 Model
 	//（摘要/评分等高频便宜档）分离：FC 多轮决策的质量依赖高档模型
 	//（v4-pro 实测 60/60 全过，M4 事实基准），成本按调用面分账。
-	AgentModel    string `mapstructure:"agent_model"`
+	AgentModel string `mapstructure:"agent_model"`
+	// ResearchModel is the dedicated strong model for V3 planner/synthesis.
+	// It deliberately does not inherit AgentModel: the paid research ledger
+	// must have a retained price rule for this exact model generation.
+	ResearchModel string `mapstructure:"research_model"`
 	MaxConcurrent int    `mapstructure:"max_concurrent"`
 	// CompiledEndpointGeneration and CompiledCredentialGeneration are opaque
 	// route generations for immutable task-run snapshots. Any endpoint or key
@@ -369,6 +373,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("llm.agent_provider", "")
 	v.SetDefault("llm.agent_base_url", "")
 	v.SetDefault("llm.agent_model", "deepseek-v4-pro")
+	v.SetDefault("llm.research_model", "deepseek-v4-pro")
 	// max_concurrent 32：真实 API 受控实验定的值（2026-07-18），不是拍脑袋。
 	// 45 条批次（生产实测批次规模）在并发 5 下 5.7 秒、并发 32 下 1.25 秒，零错误零 429。
 	// 上限侧余量极大——打分/出卡走 deepseek-v4-flash，官方并发限额 2500；
@@ -478,6 +483,10 @@ func readConfigFile(v *viper.Viper, path string) error {
 // Validate 校验必填项并补齐零值默认值。
 // 允许在 Unmarshal 后单独调用（如配置热更新场景）。
 func (c *Config) Validate() error {
+	c.LLM.ResearchModel = strings.TrimSpace(c.LLM.ResearchModel)
+	if c.LLM.ResearchModel == "" {
+		c.LLM.ResearchModel = "deepseek-v4-pro"
+	}
 	c.DB.ResearchCapabilityKeyID = strings.TrimSpace(c.DB.ResearchCapabilityKeyID)
 	c.DB.ResearchCapabilityKeyHex = strings.TrimSpace(c.DB.ResearchCapabilityKeyHex)
 	c.DB.ResearchCapabilityRetiredKeys = strings.TrimSpace(

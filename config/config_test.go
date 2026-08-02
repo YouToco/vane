@@ -1085,6 +1085,7 @@ llm:
   agent_base_url: "https://api.moonshot.cn/v1"
   agent_api_key: "yaml-agent-key"
   agent_model: "kimi-k2.6"
+  research_model: "deepseek-v4-pro"
   max_concurrent: 9
   compiled_endpoint_generation: 2
   compiled_credential_generation: 6
@@ -1127,6 +1128,7 @@ log:
 		{"llm.agent_base_url", cfg.LLM.AgentBaseURL, "https://api.moonshot.cn/v1"},
 		{"llm.agent_api_key", cfg.LLM.AgentAPIKey, "yaml-agent-key"},
 		{"llm.agent_model", cfg.LLM.AgentModel, "kimi-k2.6"},
+		{"llm.research_model", cfg.LLM.ResearchModel, "deepseek-v4-pro"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 9},
 		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(2)},
 		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(6)},
@@ -1172,6 +1174,7 @@ log:
 	t.Setenv("VANE_LLM_AGENT_BASE_URL", "https://api.moonshot.cn/v1")
 	t.Setenv("VANE_LLM_AGENT_API_KEY", "env-agent-key")
 	t.Setenv("VANE_LLM_AGENT_MODEL", "kimi-k2.6")
+	t.Setenv("VANE_LLM_RESEARCH_MODEL", "deepseek-v4-pro")
 	t.Setenv("VANE_LLM_COMPILED_ENDPOINT_GENERATION", "11")
 	t.Setenv("VANE_LLM_COMPILED_CREDENTIAL_GENERATION", "13")
 	t.Setenv("VANE_FETCH_TIKHUB_API_KEY", "env-tikhub-key")
@@ -1198,6 +1201,7 @@ log:
 		{"llm.agent_base_url", cfg.LLM.AgentBaseURL, "https://api.moonshot.cn/v1"},
 		{"llm.agent_api_key", cfg.LLM.AgentAPIKey, "env-agent-key"},
 		{"llm.agent_model", cfg.LLM.AgentModel, "kimi-k2.6"},
+		{"llm.research_model", cfg.LLM.ResearchModel, "deepseek-v4-pro"},
 		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(11)},
 		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(13)},
 		{"fetch.tikhub_api_key", cfg.Fetch.TikhubAPIKey, "env-tikhub-key"},
@@ -1419,6 +1423,7 @@ func TestDefaults(t *testing.T) {
 		{"llm.agent_provider", cfg.LLM.AgentProvider, ""},
 		{"llm.agent_base_url", cfg.LLM.AgentBaseURL, ""},
 		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-pro"},
+		{"llm.research_model", cfg.LLM.ResearchModel, "deepseek-v4-pro"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 32},
 		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(1)},
 		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(1)},

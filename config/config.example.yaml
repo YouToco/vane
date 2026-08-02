@@ -32,6 +32,8 @@ llm:
   agent_base_url: ""
   agent_api_key: "" # VANE_LLM_AGENT_API_KEY
   agent_model: "deepseek-v4-pro"   # Agent/DeepDive/A2A 质量档
+  # V3 planner/synthesis 专用强模型；必须有有效的 provider_price_rules 价格规则。
+  research_model: "deepseek-v4-pro"
   max_concurrent: 32            # 实测定值：45 条批次 5 并发 5.7s → 32 并发 1.25s（v4-flash 官方限额 2500）
   # endpoint/key 任一变更时必须分别递增；旧代未保留则旧 run 安全失败，禁止复用代号。
   compiled_endpoint_generation: 1
