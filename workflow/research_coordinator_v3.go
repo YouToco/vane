@@ -590,15 +590,16 @@ type researchPlannerPromptV3 struct {
 // model-visible. A schema-version label alone is not enough information for a
 // remote model to infer the required field names.
 type researchPlannerResponseContractV3 struct {
-	SchemaVersionLiteral   string   `json:"schema_version_literal"`
-	RequiredTopLevelFields []string `json:"required_top_level_fields"`
-	RequiredStepFields     []string `json:"required_step_fields"`
-	MinSteps               int      `json:"min_steps"`
-	MaxSteps               int      `json:"max_steps"`
-	ToolNameRule           string   `json:"tool_name_rule"`
-	ArgumentsRule          string   `json:"arguments_rule"`
-	AdditionalProperties   bool     `json:"additional_properties"`
-	SingleJSONObject       bool     `json:"single_json_object"`
+	SchemaVersionLiteral       string   `json:"schema_version_literal"`
+	RequiredTopLevelFields     []string `json:"required_top_level_fields"`
+	RequiredStepFields         []string `json:"required_step_fields"`
+	MinSteps                   int      `json:"min_steps"`
+	MaxSteps                   int      `json:"max_steps"`
+	ToolNameRule               string   `json:"tool_name_rule"`
+	ArgumentsRule              string   `json:"arguments_rule"`
+	ExtraTopLevelFieldsAllowed bool     `json:"extra_top_level_fields_allowed"`
+	ExtraStepFieldsAllowed     bool     `json:"extra_step_fields_allowed"`
+	SingleJSONObject           bool     `json:"single_json_object"`
 }
 
 type researchPlannerCorrectionPromptV3 struct {
@@ -623,15 +624,16 @@ func buildResearchPlannerPromptV3(seal runcontext.ResearchSnapshotSealV3) (strin
 		MaxToolCalls:      seal.Payload.PlannerBudget.MaxToolCalls,
 		AllowedTools:      tools,
 		ResponseContract: researchPlannerResponseContractV3{
-			SchemaVersionLiteral:   researchPlannerOutputSchemaV3,
-			RequiredTopLevelFields: []string{"schema_version", "steps"},
-			RequiredStepFields:     []string{"invocation_id", "tool_name", "arguments"},
-			MinSteps:               1,
-			MaxSteps:               seal.Payload.PlannerBudget.MaxToolCalls,
-			ToolNameRule:           "must exactly equal one allowed_tools[].name",
-			ArgumentsRule:          "must be an object matching that allowed tool's parameters schema",
-			AdditionalProperties:   false,
-			SingleJSONObject:       true,
+			SchemaVersionLiteral:       researchPlannerOutputSchemaV3,
+			RequiredTopLevelFields:     []string{"schema_version", "steps"},
+			RequiredStepFields:         []string{"invocation_id", "tool_name", "arguments"},
+			MinSteps:                   1,
+			MaxSteps:                   seal.Payload.PlannerBudget.MaxToolCalls,
+			ToolNameRule:               "must exactly equal one allowed_tools[].name",
+			ArgumentsRule:              "must be an object matching that allowed tool's parameters schema",
+			ExtraTopLevelFieldsAllowed: false,
+			ExtraStepFieldsAllowed:     false,
+			SingleJSONObject:           true,
 		},
 	})
 	if err != nil || len(payload) < 2 || len(payload) > 2<<20 {

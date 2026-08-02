@@ -415,7 +415,8 @@ func TestResearchPlannerPromptContainsOnlyFrozenInternalInputs(t *testing.T) {
 	if contract.SchemaVersionLiteral != researchPlannerOutputSchemaV3 ||
 		!reflect.DeepEqual(contract.RequiredTopLevelFields, []string{"schema_version", "steps"}) ||
 		!reflect.DeepEqual(contract.RequiredStepFields, []string{"invocation_id", "tool_name", "arguments"}) ||
-		contract.MinSteps != 1 || contract.MaxSteps != 4 || contract.AdditionalProperties ||
+		contract.MinSteps != 1 || contract.MaxSteps != 4 || contract.ExtraTopLevelFieldsAllowed ||
+		contract.ExtraStepFieldsAllowed ||
 		!contract.SingleJSONObject || !strings.Contains(contract.ToolNameRule, "allowed_tools") ||
 		!strings.Contains(contract.ArgumentsRule, "parameters") {
 		t.Fatalf("planner response contract is incomplete: %+v", contract)
