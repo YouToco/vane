@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,17 @@ func tenantTestStore(t *testing.T) *Store {
 	st, err := New(ctx, dbURL)
 	if err != nil {
 		t.Fatalf("New() 失败: %v", err)
+	}
+	// Most Store integration tests provision one ephemeral owner URL. V3
+	// production code never falls back to it; dedicated runtime-login tests
+	// below exercise NewWithResearchRuntime and its authority probe separately.
+	st.beginResearchTx = st.pool.BeginTx
+	if err := st.configureResearchRunCapabilityV1(ResearchRunCapabilityConfigV1{
+		ActiveKeyID:  "store-tests-active",
+		ActiveKeyHex: strings.Repeat("42", 32),
+		RetiredKeys:  "store-tests-retired=" + strings.Repeat("24", 32),
+	}); err != nil {
+		t.Fatalf("configure V3 test capability: %v", err)
 	}
 	t.Cleanup(st.Close)
 	return st

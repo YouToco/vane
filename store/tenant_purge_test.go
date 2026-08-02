@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/agentledger"
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
 
@@ -91,6 +92,187 @@ func TestInvariant_PurgeListNeverTouchesSharedFacts(t *testing.T) {
 			t.Errorf("**红线 I-A3 被破坏**：%s 是跨租户客观事实（同一篇内容被多个租户的信源指向），"+
 				"出现在 purgeOrder 里意味着删一个租户会删掉别的租户还在用的数据——不可逆", shared)
 		}
+	}
+}
+
+func TestInvariant_ResearchBriefSynthesisPurgesBeforeResearchParents(t *testing.T) {
+	positions := map[string]int{}
+	for index, step := range purgeOrder {
+		positions[step.table] = index
+	}
+	child, ok := positions["research_brief_syntheses"]
+	if !ok {
+		t.Fatal("research_brief_syntheses missing from purgeOrder")
+	}
+	for _, parent := range []string{
+		"research_run_evidence", "research_run_step_spend_reservations",
+		"research_run_steps", "research_run_plans",
+		"task_run_snapshots",
+	} {
+		parentPosition, exists := positions[parent]
+		if !exists || child >= parentPosition {
+			t.Fatalf("research_brief_syntheses position=%d must precede %s position=%d",
+				child, parent, parentPosition)
+		}
+	}
+}
+
+func TestInvariant_ResearchSpendPurgesInForeignKeyOrder(t *testing.T) {
+	positions := map[string]int{}
+	for index, step := range purgeOrder {
+		positions[step.table] = index
+	}
+	wantOrder := []string{
+		"research_run_step_spend_settlements",
+		"tool_calls",
+		"research_run_evidence",
+		"research_run_step_spend_reservations",
+		"research_run_steps",
+	}
+	for index, table := range wantOrder {
+		position, exists := positions[table]
+		if !exists {
+			t.Fatalf("%s missing from purgeOrder", table)
+		}
+		if index == 0 {
+			continue
+		}
+		previous := wantOrder[index-1]
+		if positions[previous] >= position {
+			t.Fatalf("%s position=%d must precede %s position=%d",
+				previous, positions[previous], table, position)
+		}
+	}
+}
+
+func TestPurgeTenant_RemovesResearchBriefSynthesis(t *testing.T) {
+	f := newResearchBriefFixtureV3(t, taskstate.NotificationThresholdMajorV3, true)
+	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(t.Context(),
+		researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatalf("prepare research Brief synthesis fixture: %v", err)
+	}
+	if prepared.Synthesis.ID <= 0 {
+		t.Fatal("research Brief synthesis fixture was not persisted")
+	}
+
+	dryRun, err := f.st.PurgeTenant(t.Context(), f.tenantID, true)
+	if err != nil {
+		t.Fatalf("dry-run tenant purge: %v", err)
+	}
+	if got := dryRun.Rows["research_brief_syntheses"]; got != 1 {
+		t.Fatalf("dry-run research Brief synthesis rows=%d, want 1", got)
+	}
+	var retained int
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM research_brief_syntheses WHERE id=$1`,
+		prepared.Synthesis.ID).Scan(&retained); err != nil || retained != 1 {
+		t.Fatalf("dry-run did not roll back synthesis delete: count=%d err=%v", retained, err)
+	}
+
+	report, err := f.st.PurgeTenant(t.Context(), f.tenantID, false)
+	if err != nil {
+		t.Fatalf("real tenant purge: %v", err)
+	}
+	if got := report.Rows["research_brief_syntheses"]; got != 1 {
+		t.Fatalf("real purge research Brief synthesis rows=%d, want 1", got)
+	}
+	var remaining int
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM research_brief_syntheses WHERE id=$1`,
+		prepared.Synthesis.ID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("research Brief synthesis survived purge: count=%d err=%v", remaining, err)
+	}
+}
+
+func TestPurgeTenant_RemovesCompleteResearchSpendLedgerPostgres(t *testing.T) {
+	f := newResearchRunSpendFixtureV3(t, 1_000_000)
+	ctx := t.Context()
+
+	started, err := f.begin(t, 0)
+	if err != nil {
+		t.Fatalf("begin V3 paid research step: %v", err)
+	}
+	if !started.FirstWriter || started.StepID <= 0 ||
+		started.SpendReservationID <= 0 || len(started.Arguments) == 0 {
+		t.Fatalf("V3 paid research step did not seal execution authority: %+v", started)
+	}
+	visibleResult := []byte(`{"status":"available","source":"official"}`)
+	receipt, err := f.store.CommitResearchRunStepEvidenceV3(
+		ctx,
+		CommitResearchRunStepEvidenceV3Params{
+			Identity: f.identity, RunSnapshotID: f.snapshotID,
+			PlanRef: f.planRef, Ordinal: 0,
+			Result: visibleResult, OriginalSize: len(visibleResult),
+			TrustType: "external", CostMicroUSD: 37,
+			ProviderCall: researchProviderCallV3ForTest(
+				researchExecutionTraceV3ForTest(t, f.identity, f.snapshotID,
+					f.planRef, 0, started.InvocationID), 37,
+			),
+		},
+	)
+	if err != nil {
+		t.Fatalf("commit complete V3 paid research evidence: %v", err)
+	}
+	if receipt.StepID <= 0 || receipt.EvidenceID <= 0 ||
+		receipt.Phase != ResearchRunStepCompletedV3 {
+		t.Fatalf("complete V3 paid research receipt is invalid: %+v", receipt)
+	}
+
+	var toolCallID, settlementID int64
+	if err := f.store.pool.QueryRow(ctx, `
+		SELECT call.id, settlement.id
+		  FROM research_run_step_spend_reservations reservation
+		  JOIN tool_calls call
+		    ON call.research_run_step_spend_reservation_id=reservation.id
+		  JOIN research_run_step_spend_settlements settlement
+		    ON settlement.reservation_id=reservation.id
+		   AND settlement.tool_call_id=call.id
+		 WHERE reservation.id=$1
+		   AND reservation.tenant_id=$2`,
+		started.SpendReservationID, f.tenantID,
+	).Scan(&toolCallID, &settlementID); err != nil {
+		t.Fatalf("load complete V3 spend chain before purge: %v", err)
+	}
+
+	report, err := f.store.PurgeTenant(ctx, f.tenantID, false)
+	if err != nil {
+		t.Fatalf("purge tenant with complete V3 spend chain: %v", err)
+	}
+	wantRows := map[string]int64{
+		"research_run_step_spend_settlements":  1,
+		"tool_calls":                           1,
+		"research_run_evidence":                1,
+		"research_run_step_spend_reservations": 1,
+		"research_run_steps":                   2,
+	}
+	for table, want := range wantRows {
+		if got := report.Rows[table]; got != want {
+			t.Errorf("purge report %s rows=%d, want %d", table, got, want)
+		}
+	}
+
+	var settlements, toolCalls, evidence, reservations, steps, tenants int
+	if err := f.store.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM research_run_step_spend_settlements WHERE id=$1),
+			(SELECT count(*) FROM tool_calls WHERE id=$2),
+			(SELECT count(*) FROM research_run_evidence WHERE id=$3),
+			(SELECT count(*) FROM research_run_step_spend_reservations WHERE id=$4),
+			(SELECT count(*) FROM research_run_steps WHERE id IN ($5,$6)),
+			(SELECT count(*) FROM tenants WHERE id=$7)`,
+		settlementID, toolCallID, receipt.EvidenceID,
+		started.SpendReservationID, started.StepID, receipt.StepID, f.tenantID,
+	).Scan(&settlements, &toolCalls, &evidence, &reservations, &steps, &tenants); err != nil {
+		t.Fatalf("check complete V3 spend purge residue: %v", err)
+	}
+	if settlements != 0 || toolCalls != 0 || evidence != 0 ||
+		reservations != 0 || steps != 0 || tenants != 0 {
+		t.Fatalf(
+			"complete V3 spend purge residue settlements=%d tool_calls=%d "+
+				"evidence=%d reservations=%d steps=%d tenants=%d",
+			settlements, toolCalls, evidence, reservations, steps, tenants,
+		)
 	}
 }
 

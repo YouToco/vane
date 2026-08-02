@@ -81,6 +81,10 @@ var purgeOrder = []purgeStep{
 	// tombstones survive normal task deletion. Tenant hard-delete explicitly
 	// removes it before the tenant/user parents.
 	{"schedule_commands", "tenant_id = $1"},
+	// Cutover journal is the authority child; both retain rollback evidence
+	// during ordinary task life and are removed only by explicit tenant purge.
+	{"research_v3_cutover_operations", "tenant_id = $1"},
+	{"research_v3_delivery_authorities", "tenant_id = $1"},
 	// 无 tenant_id、经 schedules 反查的两张（正因为没有 tenant_id，
 	// 「按 tenant_id 列对账」的守卫看不见它们，必须靠外键可达性那条守卫兜住）。
 	{"schedule_playbooks", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
@@ -95,6 +99,13 @@ var purgeOrder = []purgeStep{
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"task_creation_operations", "tenant_id = $1"},
+	// Agent-first query audits and exact model-visible evidence are children of
+	// the session/tool ledgers. They are retained for normal task/session life
+	// and removed only by this explicit tenant erasure path.
+	{"agent_intelligence_access_denials", "presented_tenant_id = $1"},
+	{"agent_intelligence_query_audits", "tenant_id = $1"},
+	{"agent_turn_records", "tenant_id = $1"},
+	{"agent_tool_evidence", "tenant_id = $1"},
 	{"agent_turn_context_snapshots", "tenant_id = $1"},
 	{"agent_session_fact_outbox", "tenant_id = $1"},
 	// Projection authority and semantic events reference agent_sessions by the
@@ -103,6 +114,9 @@ var purgeOrder = []purgeStep{
 	// by writers, but purge already pre-locks session roots before child deletes.
 	{"agent_session_projection_authority_events", "tenant_id = $1"},
 	{"agent_events", "tenant_id = $1"},
+	// V3 delivery anchors reference the effect and projections, so they are the
+	// first child in the durable delivery chain.
+	{"research_brief_deliveries", "tenant_id = $1"},
 	// External effect checkpoints bind exact delivery, batch, and immutable run
 	// identities, so they must be removed before all three parent aggregates.
 	{"push_effects", "tenant_id = $1"},
@@ -136,8 +150,30 @@ var purgeOrder = []purgeStep{
 	{"task_run_content_provenance", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	// Exact model/tool receipts reference immutable run snapshots from 082.
+	// A research spend settlement is the child of both its provider Tool call
+	// and immutable reservation, while a reservation binds its started step.
+	// Preserve the complete 090 child-first chain even while those two tables
+	// remain optional across a reversible migration rollout.
+	{"research_run_llm_spend_settlements", "tenant_id = $1"},
 	{"llm_calls", "tenant_id = $1"},
+	{"research_run_llm_spend_reservations", "tenant_id = $1"},
+	{"research_run_step_spend_settlements", "tenant_id = $1"},
+	// V3-bound Tool evidence is immutable under direct DELETE. Count it here
+	// for the purge report, then let the final tenants delete remove it through
+	// fk_tool_calls_tenant. This is the only structural delete authority.
 	{"tool_calls", "tenant_id = $1"},
+	// V3 research evidence binds its immutable started step; steps bind the
+	// per-run plan; plans bind the frozen run snapshot. Keep this exact
+	// child-first order so explicit tenant erasure leaves no research history.
+	// Syntheses bind both the plan and snapshot, so they must lead the chain.
+	{"research_brief_syntheses", "tenant_id = $1"},
+	{"research_run_evidence", "tenant_id = $1"},
+	{"research_run_step_spend_reservations", "tenant_id = $1"},
+	{"research_run_steps", "tenant_id = $1"},
+	{"research_run_plans", "tenant_id = $1"},
+	// Capability hashes are children of the exact immutable snapshot. They are
+	// never directly visible or deletable by the runtime executor.
+	{"research_run_capabilities", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration
 	// 031, so batches must be gone before either the marked parent or its
 	// sidecar. A marked run also points at its immutable cutover event; parents
@@ -172,6 +208,26 @@ var purgeOrder = []purgeStep{
 	{"tenant_quota", "tenant_id = $1"},
 	{"memberships", "tenant_id = $1"},
 	{"invites", "consumed_by_tenant = $1"},
+}
+
+// Some immutable children are deliberately not directly deletable. They stay
+// in purgeOrder so schema coverage and reporting remain complete, but the
+// tenant root FK cascade is their sole delete authority.
+var tenantCascadePurgeTables = map[string]struct{}{
+	"llm_calls":                            {},
+	"research_run_llm_spend_settlements":   {},
+	"research_run_llm_spend_reservations":  {},
+	"tool_calls":                           {},
+	"research_run_step_spend_reservations": {},
+	"research_run_steps":                   {},
+	"research_run_plans":                   {},
+	"research_run_capabilities":            {},
+	"task_run_snapshots":                   {},
+	// A cutover event is referenced by immutable snapshots that are themselves
+	// deleted only by the tenant root cascade. Count both parents for the purge
+	// report, then let the same root delete remove them atomically; deleting the
+	// event directly first would violate the snapshot's exact-event fence.
+	"task_run_snapshot_v2_cutover_events": {},
 }
 
 // purgeSharedTables 是**绝不能出现在 purgeOrder 里**的跨租户客观事实表（红线 I-A3）。
@@ -228,20 +284,30 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
 	}
 	var (
-		canonicalBriefStagesAvailable bool
-		profileEpochsAvailable        bool
-		profileEpochFencesAvailable   bool
-		profileCheckpointsAvailable   bool
-		profileEpochEventsAvailable   bool
-		profileEpochReceiptsAvailable bool
-		profileActivitiesAvailable    bool
-		executiveReceiptsAvailable    bool
-		executiveArtifactsAvailable   bool
-		reportSettingsAvailable       bool
-		periodicIntentsAvailable      bool
-		periodicReceiptsAvailable     bool
-		periodicReportsAvailable      bool
-		periodicDeliveriesAvailable   bool
+		canonicalBriefStagesAvailable      bool
+		profileEpochsAvailable             bool
+		profileEpochFencesAvailable        bool
+		profileCheckpointsAvailable        bool
+		profileEpochEventsAvailable        bool
+		profileEpochReceiptsAvailable      bool
+		profileActivitiesAvailable         bool
+		executiveReceiptsAvailable         bool
+		executiveArtifactsAvailable        bool
+		reportSettingsAvailable            bool
+		periodicIntentsAvailable           bool
+		periodicReceiptsAvailable          bool
+		periodicReportsAvailable           bool
+		periodicDeliveriesAvailable        bool
+		researchBriefsAvailable            bool
+		researchEvidenceAvailable          bool
+		researchLLMSettlementsAvailable    bool
+		researchLLMReservationsAvailable   bool
+		researchSpendSettlementsAvailable  bool
+		researchSpendReservationsAvailable bool
+		researchRunCapabilitiesAvailable   bool
+		researchBriefDeliveriesAvailable   bool
+		researchV3AuthoritiesAvailable     bool
+		researchV3CutoversAvailable        bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -257,7 +323,17 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.periodic_brief_intents') IS NOT NULL,
 		        to_regclass('public.periodic_synthesis_receipts') IS NOT NULL,
 		        to_regclass('public.periodic_brief_reports') IS NOT NULL,
-		        to_regclass('public.periodic_report_deliveries') IS NOT NULL`,
+		        to_regclass('public.periodic_report_deliveries') IS NOT NULL,
+		        to_regclass('public.research_brief_syntheses') IS NOT NULL,
+		        to_regclass('public.research_run_evidence') IS NOT NULL,
+		        to_regclass('public.research_run_llm_spend_settlements') IS NOT NULL,
+		        to_regclass('public.research_run_llm_spend_reservations') IS NOT NULL,
+		        to_regclass('public.research_run_step_spend_settlements') IS NOT NULL,
+		        to_regclass('public.research_run_step_spend_reservations') IS NOT NULL,
+		        to_regclass('public.research_run_capabilities') IS NOT NULL,
+		        to_regclass('public.research_brief_deliveries') IS NOT NULL,
+		        to_regclass('public.research_v3_delivery_authorities') IS NOT NULL,
+		        to_regclass('public.research_v3_cutover_operations') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -273,29 +349,48 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&periodicReceiptsAvailable,
 		&periodicReportsAvailable,
 		&periodicDeliveriesAvailable,
+		&researchBriefsAvailable,
+		&researchEvidenceAvailable,
+		&researchLLMSettlementsAvailable,
+		&researchLLMReservationsAvailable,
+		&researchSpendSettlementsAvailable,
+		&researchSpendReservationsAvailable,
+		&researchRunCapabilitiesAvailable,
+		&researchBriefDeliveriesAvailable,
+		&researchV3AuthoritiesAvailable,
+		&researchV3CutoversAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
 	}
 	optionalPurgeTables := map[string]bool{
-		"canonical_brief_stages":             canonicalBriefStagesAvailable,
-		"profile_epochs":                     profileEpochsAvailable,
-		"profile_feedback_epoch_fences":      profileEpochFencesAvailable,
-		"profile_epoch_checkpoints":          profileCheckpointsAvailable,
-		"profile_epoch_events":               profileEpochEventsAvailable,
-		"profile_epoch_receipts":             profileEpochReceiptsAvailable,
-		"profile_epoch_activities":           profileActivitiesAvailable,
-		"executive_brief_synthesis_receipts": executiveReceiptsAvailable,
-		"executive_brief_artifacts":          executiveArtifactsAvailable,
-		"brief_report_settings":              reportSettingsAvailable,
-		"periodic_brief_intents":             periodicIntentsAvailable,
-		"periodic_synthesis_receipts":        periodicReceiptsAvailable,
-		"periodic_brief_reports":             periodicReportsAvailable,
-		"periodic_report_deliveries":         periodicDeliveriesAvailable,
+		"canonical_brief_stages":               canonicalBriefStagesAvailable,
+		"profile_epochs":                       profileEpochsAvailable,
+		"profile_feedback_epoch_fences":        profileEpochFencesAvailable,
+		"profile_epoch_checkpoints":            profileCheckpointsAvailable,
+		"profile_epoch_events":                 profileEpochEventsAvailable,
+		"profile_epoch_receipts":               profileEpochReceiptsAvailable,
+		"profile_epoch_activities":             profileActivitiesAvailable,
+		"executive_brief_synthesis_receipts":   executiveReceiptsAvailable,
+		"executive_brief_artifacts":            executiveArtifactsAvailable,
+		"brief_report_settings":                reportSettingsAvailable,
+		"periodic_brief_intents":               periodicIntentsAvailable,
+		"periodic_synthesis_receipts":          periodicReceiptsAvailable,
+		"periodic_brief_reports":               periodicReportsAvailable,
+		"periodic_report_deliveries":           periodicDeliveriesAvailable,
+		"research_brief_syntheses":             researchBriefsAvailable,
+		"research_run_evidence":                researchEvidenceAvailable,
+		"research_run_llm_spend_settlements":   researchLLMSettlementsAvailable,
+		"research_run_llm_spend_reservations":  researchLLMReservationsAvailable,
+		"research_run_step_spend_settlements":  researchSpendSettlementsAvailable,
+		"research_run_step_spend_reservations": researchSpendReservationsAvailable,
+		"research_run_capabilities":            researchRunCapabilitiesAvailable,
+		"research_brief_deliveries":            researchBriefDeliveriesAvailable,
+		"research_v3_delivery_authorities":     researchV3AuthoritiesAvailable,
+		"research_v3_cutover_operations":       researchV3CutoversAvailable,
 	}
 	if _, err := tx.Exec(ctx,
-		`SELECT set_config('app.tenant_id', $1, true),
-		        set_config('app.tenant_purge', 'on', true)`,
+		`SELECT set_config('app.tenant_id', $1, true)`,
 		fmt.Sprintf("%d", tenantID)); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "设置租户清理上下文", err)
@@ -337,9 +432,34 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	// child-first DELETE sequence, whose statement order need not equal lock
 	// order once every conflicting row is already fenced.
 	purgeLocks := []struct {
-		name  string
-		query string
+		name     string
+		query    string
+		optional bool
 	}{
+		{
+			name: "research_v3_cutover_operations",
+			query: `SELECT id FROM research_v3_cutover_operations
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge V3 cutover journal lock order */`,
+			optional: true,
+		},
+		{
+			name: "research_v3_delivery_authorities",
+			query: `SELECT generation FROM research_v3_delivery_authorities
+			         WHERE tenant_id = $1
+			         ORDER BY user_id,task_id,generation
+			         FOR UPDATE /* tenant purge V3 authority lock order */`,
+			optional: true,
+		},
+		{
+			name: "research_brief_deliveries",
+			query: `SELECT id FROM research_brief_deliveries
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge research delivery lock order */`,
+			optional: true,
+		},
 		{
 			name: "push_batches",
 			query: `SELECT id FROM push_batches
@@ -425,7 +545,41 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			         FOR UPDATE /* tenant purge agent-session lock order */`,
 		},
 	}
+	if researchSpendReservationsAvailable {
+		// Provider settlement locks its immutable reservation before appending
+		// the settlement and Tool-call children. Drain that exact parent in the
+		// same schedule -> reservation order used by effect admission, after the
+		// tenant admission root has fenced new reservations. The conditional
+		// append keeps the current binary safe on either side of migration 090.
+		purgeLocks = append(purgeLocks, struct {
+			name     string
+			query    string
+			optional bool
+		}{
+			name: "research_run_step_spend_reservations",
+			query: `SELECT id FROM research_run_step_spend_reservations
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge research spend lock order */`,
+		})
+	}
+	if researchLLMReservationsAvailable {
+		purgeLocks = append(purgeLocks, struct {
+			name     string
+			query    string
+			optional bool
+		}{
+			name: "research_run_llm_spend_reservations",
+			query: `SELECT id FROM research_run_llm_spend_reservations
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge research llm spend lock order */`,
+		})
+	}
 	for _, lock := range purgeLocks {
+		if lock.optional && !optionalPurgeTables[lock.name] {
+			continue
+		}
 		rows, lockErr := tx.Query(ctx, lock.query, tenantID)
 		if lockErr != nil {
 			return nil, types.NewAppError(types.CodeDatabase,
@@ -447,6 +601,32 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			// Current binaries may finish an already-admitted tenant purge
 			// while a safely reversible migration has rolled back the
 			// corresponding optional table.
+			continue
+		}
+		_, cascadeOnly := tenantCascadePurgeTables[st.table]
+		// Migration 091 upgrades llm_calls -> tenants to ON DELETE CASCADE so
+		// bound immutable evidence can be removed only by the tenant root. Its
+		// reversible Down restores the legacy non-cascading FK. A current binary
+		// can therefore run against schema 090 and must directly remove legacy,
+		// unbound calls before deleting the tenant instead of merely counting
+		// them and then failing at the parent FK.
+		if st.table == "llm_calls" && !researchLLMReservationsAvailable {
+			cascadeOnly = false
+		}
+		if cascadeOnly {
+			// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；
+			// tenant_id 走参数化的 $1。真正删除由下方租户根 FK cascade 完成。
+			var count int64
+			if err := tx.QueryRow(ctx,
+				fmt.Sprintf("SELECT count(*) FROM %s WHERE %s", st.table, st.where),
+				tenantID).Scan(&count); err != nil {
+				return nil, types.NewAppError(types.CodeDatabase,
+					fmt.Sprintf("统计租户 %d 的 %s", tenantID, st.table), err)
+			}
+			if count > 0 {
+				rep.Rows[st.table] = count
+				rep.Total += count
+			}
 			continue
 		}
 		// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；

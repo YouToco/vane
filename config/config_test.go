@@ -1449,6 +1449,8 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.executive_brief_web_projection_allow_all", cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll, false},
 		{"pipeline.executive_brief_renderer_canary_schedule_id", cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
+		{"agent.agent_first_owner_canary", cfg.Agent.AgentFirstOwnerCanary, false},
+		{"agent.agent_first_canary_user_id", cfg.Agent.AgentFirstCanaryUserID, int64(0)},
 		{"agent.intent_toolkits_shadow_enabled", cfg.Agent.IntentToolkitsShadowEnabled, true},
 		{"agent.intent_toolkits_owner_canary", cfg.Agent.IntentToolkitsOwnerCanary, false},
 		{"agent.intent_toolkits_allow_all", cfg.Agent.IntentToolkitsAllowAll, false},
@@ -1463,6 +1465,22 @@ func TestDefaults(t *testing.T) {
 }
 
 func TestLoadIntentToolkitsRollout(t *testing.T) {
+	t.Run("agent first owner canary from environment", func(t *testing.T) {
+		clearVaneEnv(t)
+		t.Setenv("VANE_AGENT_AGENT_FIRST_OWNER_CANARY", "true")
+		t.Setenv("VANE_AGENT_AGENT_FIRST_CANARY_USER_ID", "42")
+		cfg, err := Load(writeTempConfig(t, `
+db:
+  url: "postgres://test"
+`))
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.Agent.AgentFirstOwnerCanary || cfg.Agent.AgentFirstCanaryUserID != 42 {
+			t.Fatalf("agent-first rollout config = %+v", cfg.Agent)
+		}
+	})
+
 	t.Run("owner canary from environment", func(t *testing.T) {
 		clearVaneEnv(t)
 		t.Setenv("VANE_AGENT_INTENT_TOOLKITS_SHADOW_ENABLED", "false")
@@ -1478,6 +1496,19 @@ db:
 			!cfg.Agent.IntentToolkitsOwnerCanary ||
 			cfg.Agent.IntentToolkitsAllowAll {
 			t.Fatalf("rollout config = %+v", cfg.Agent)
+		}
+	})
+
+	t.Run("agent first canary requires exact user", func(t *testing.T) {
+		clearVaneEnv(t)
+		_, err := Load(writeTempConfig(t, `
+db:
+  url: "postgres://test"
+agent:
+  agent_first_owner_canary: true
+`))
+		if err == nil || !strings.Contains(err.Error(), "精确 canary user_id") {
+			t.Fatalf("Load() error = %v", err)
 		}
 	})
 
@@ -1625,6 +1656,71 @@ func TestValidateCompiledRouteGenerations(t *testing.T) {
 }
 
 // TestMissingDBURL 验证缺少 db.url 时 Load 报错。
+func TestResearchRuntimeURLFromEnvironment(t *testing.T) {
+	t.Setenv("VANE_DB_URL", "postgres://owner")
+	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://vane_research_runtime:secret@db/vane")
+	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "research-cap-2026-08")
+	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.DB.ResearchRuntimeURL,
+		"postgres://vane_research_runtime:secret@db/vane"; got != want {
+		t.Fatalf("db.research_runtime_url=%q, want %q", got, want)
+	}
+	if cfg.DB.ResearchCapabilityKeyID != "research-cap-2026-08" ||
+		cfg.DB.ResearchCapabilityKeyHex != strings.Repeat("42", 32) {
+		t.Fatal("research capability key was not loaded from environment")
+	}
+}
+
+func TestResearchGatewaySocketUsesIsolatedUnixDefault(t *testing.T) {
+	t.Setenv("VANE_DB_URL", "postgres://runtime")
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.ResearchGateway.SocketPath,
+		"/run/vane-research-gateway/gateway.sock"; got != want {
+		t.Fatalf("research gateway socket = %q, want %q", got, want)
+	}
+}
+
+func TestResearchGatewaySocketRejectsRelativeOrUncleanPath(t *testing.T) {
+	for _, value := range []string{"gateway.sock", "/run/vane/../gateway.sock", "   "} {
+		t.Run(strings.ReplaceAll(value, "/", "_"), func(t *testing.T) {
+			t.Setenv("VANE_DB_URL", "postgres://runtime")
+			t.Setenv("VANE_RESEARCH_GATEWAY_SOCKET_PATH", value)
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(configPath); err == nil {
+				t.Fatalf("accepted unsafe research gateway socket %q", value)
+			}
+		})
+	}
+}
+
+func TestResearchRuntimeRequiresCapabilityKey(t *testing.T) {
+	cfg := Config{DB: DBConfig{
+		URL: "postgres://owner", ResearchRuntimeURL: "postgres://runtime",
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "capability") {
+		t.Fatalf("missing research capability key returned %v", err)
+	}
+	cfg.DB.ResearchCapabilityKeyID = "active"
+	cfg.DB.ResearchCapabilityKeyHex = strings.Repeat("ab", 32)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid research capability key was rejected: %v", err)
+	}
+}
+
 func TestMissingDBURL(t *testing.T) {
 	clearVaneEnv(t)
 	skipIfSystemConfigExists(t)

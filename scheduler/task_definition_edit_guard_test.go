@@ -800,6 +800,18 @@ func taskDefinitionEditRawTransportExpectations(
 ) []taskDefinitionEditRawTransportExpectation {
 	return []taskDefinitionEditRawTransportExpectation{
 		{
+			filepath.Clean(filepath.Join(schedulerDir, "research_v3_cutover.go")),
+			"describeResearchV3CutoverSchedule",
+			"DescribeSchedule",
+			1,
+		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "research_v3_cutover.go")),
+			"compareAndSwapResearchV3CutoverSchedule",
+			"UpdateSchedule",
+			1,
+		},
+		{
 			filepath.Clean(filepath.Join(schedulerDir, "task_definition_edit.go")),
 			"transitionTaskDefinitionEdit",
 			"UpdateSchedule",

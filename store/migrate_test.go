@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 84
+const latestMigrationVersion int64 = 101
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -83,6 +83,32 @@ var wantTables = []string{
 	"schedule_commands",
 	// 055 immutable Agent context shadow candidates with seal-time watermarks.
 	"agent_turn_context_snapshots",
+	// 085 exact model-visible evidence, complete user-facing Agent turns and
+	// metadata-only semantic query audit.
+	"agent_tool_evidence",
+	"agent_turn_records",
+	"agent_intelligence_query_audits",
+	"agent_intelligence_access_denials",
+	"agent_intelligence_cursor_keys",
+	// 086 immutable V3 per-run research plan and Tool step receipts.
+	"research_run_plans",
+	"research_run_steps",
+	"research_run_evidence",
+	// 090 immutable first-writer spend authority and append-only settlement.
+	"research_run_step_spend_reservations",
+	"research_run_step_spend_settlements",
+	"research_run_llm_spend_reservations",
+	"research_run_llm_spend_settlements",
+	"research_run_capabilities",
+	"research_llm_gateway_verifier_keys",
+	"research_llm_gateway_attempts",
+	"research_llm_gateway_frozen_requests",
+	"research_llm_process_gateway_settlements",
+	// 088 V3 synthesis spend state and immutable terminal Brief artifact.
+	"research_brief_syntheses",
+	"research_brief_deliveries",
+	"research_v3_delivery_authorities",
+	"research_v3_cutover_operations",
 	// 056 durable business-fact to exact Agent-session continuation.
 	"agent_session_fact_outbox",
 	// 058/059/070 are retired by 074 together with the account-source product.

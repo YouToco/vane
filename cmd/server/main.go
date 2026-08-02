@@ -1,4 +1,4 @@
-// vane server 入口：加载配置 → 初始化日志 → 自动迁移 → 建库连接 →
+// vane server 入口：加载配置 → 初始化日志 → 建库连接 →
 // LLM 客户端/记账 → 飞书 Manager → HTTP 服务（healthz/readyz + Dashboard API）→ 优雅关停。
 package main
 
@@ -37,6 +37,7 @@ import (
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/pusher"
 	"github.com/YouToco/vane/pushrecovery"
+	"github.com/YouToco/vane/researchgateway"
 	"github.com/YouToco/vane/runoutcome"
 	"github.com/YouToco/vane/runtimeconfig"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -45,6 +46,7 @@ import (
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/tikhubinvoke"
+	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
@@ -72,19 +74,76 @@ func run() error {
 
 	initLogger(cfg.Log.Level)
 
-	// MVP 决策：启动时自动执行数据库迁移，失败则拒绝启动。
-	// 60s 上限覆盖"VPS 开机时 Postgres 容器尚未就绪"的等待窗口；SIGTERM 可提前中断。
-	migrateCtx, cancelMigrate := context.WithTimeout(ctx, 60*time.Second)
-	if err := store.Migrate(migrateCtx, cfg.DB.URL); err != nil {
-		cancelMigrate()
-		return fmt.Errorf("数据库迁移: %w", err)
-	}
-	cancelMigrate()
-	slog.Info("数据库迁移完成")
-
-	st, err := store.New(ctx, cfg.DB.URL)
+	st, err := store.NewServerRuntimeWithResearchRuntimeCapability(
+		ctx, cfg.DB.URL, cfg.DB.ResearchRuntimeURL,
+		store.ResearchRunCapabilityConfigV1{
+			ActiveKeyID:  cfg.DB.ResearchCapabilityKeyID,
+			ActiveKeyHex: cfg.DB.ResearchCapabilityKeyHex,
+			RetiredKeys:  cfg.DB.ResearchCapabilityRetiredKeys,
+			TTL:          time.Duration(cfg.DB.ResearchCapabilityTTLDays) * 24 * time.Hour,
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("初始化数据库连接池: %w", err)
+	}
+	gatewayClient, err := researchgateway.NewUnixClientV1(cfg.ResearchGateway.SocketPath)
+	if err != nil {
+		st.Close()
+		return fmt.Errorf("初始化 research gateway client: %w", err)
+	}
+	var researchRuntimeOption workflow.ActivitiesOption
+	var researchDeliveryOption workflow.ActivitiesOption
+	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+		researchExecutor, executorErr := fetcher.NewResearchExecutorV3(cfg.Fetch)
+		if executorErr != nil {
+			st.Close()
+			return fmt.Errorf("初始化 research V3 executor: %w", executorErr)
+		}
+		researchRuntime, runtimeErr := workflow.NewProductionResearchRuntimeV3(
+			st, gatewayClient, researchExecutor,
+			func(ctx context.Context, identity types.RunIdentity) (
+				runtimepolicy.BundleV1,
+				runtimepolicy.ResearchToolPolicyV3,
+				runtimepolicy.ResearchModelPolicyV3,
+				error,
+			) {
+				for _, bucket := range []store.QuotaBucket{
+					store.QuotaLLMTokens, store.QuotaExaCalls,
+				} {
+					if _, err := st.LoadQuotaRule(ctx, identity.TenantID, bucket); err != nil {
+						return runtimepolicy.BundleV1{},
+							runtimepolicy.ResearchToolPolicyV3{},
+							runtimepolicy.ResearchModelPolicyV3{}, err
+					}
+				}
+				current, err := runtimeconfig.BuildResearchRuntimeV3(
+					runtimeconfig.CurrentCompiledV1Input{
+						Model:                      cfg.LLM.Model,
+						TaskInstructionEnabled:     true,
+						ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
+						ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
+						ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
+						TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
+					})
+				if err != nil {
+					return runtimepolicy.BundleV1{},
+						runtimepolicy.ResearchToolPolicyV3{},
+						runtimepolicy.ResearchModelPolicyV3{}, err
+				}
+				return current.Bundle, current.Tools, current.Model, nil
+			},
+			func(identity types.RunIdentity) bool {
+				return identity.TaskID != "" &&
+					(identity.TaskID == cfg.Pipeline.ResearchV3ShadowCanaryScheduleID ||
+						identity.TaskID == cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID)
+			},
+		)
+		if runtimeErr != nil {
+			st.Close()
+			return fmt.Errorf("初始化 research V3 coordinator: %w", runtimeErr)
+		}
+		researchRuntimeOption = workflow.WithResearchRuntimeV3(researchRuntime)
 	}
 
 	// LLM 客户端 + 调用记账（写库失败只记日志，不影响主流程）。
@@ -140,6 +199,18 @@ func run() error {
 	score := scorer.New(llmClient, recorder, st, hints)
 	cards := cardgen.New(llmClient, recorder, hints)
 	push := pusher.New(manager)
+	if cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+		delivery, deliveryErr := workflow.NewReceiptBackedResearchDeliveryV3(
+			st, push, newResearchV3DeliveryTargetResolver(st, manager),
+			renderResearchBriefCardV3,
+		)
+		if deliveryErr != nil {
+			temporalClient.Close()
+			st.Close()
+			return fmt.Errorf("初始化 research V3 receipt-backed delivery: %w", deliveryErr)
+		}
+		researchDeliveryOption = workflow.WithResearchDeliveryV3(delivery)
+	}
 	// 构卡函数注入而非 workflow 直接 import feishu：feishu→agent→workflow 依赖链
 	// 已存在，直接调用会成环（M5 契约 §8.2）。
 	ev := evolver.New(llmClient, recorder, st)
@@ -278,7 +349,9 @@ func run() error {
 			cfg.Pipeline.ObservationShadowCanaryScheduleID,
 			cfg.Pipeline.ObservationAuthorityCanaryScheduleID),
 		workflow.WithPushEffectCanary(
-			st, cfg.Pipeline.PushEffectCanaryScheduleID))
+			st, cfg.Pipeline.PushEffectCanaryScheduleID),
+		researchRuntimeOption,
+		researchDeliveryOption)
 	periodicActivities, err := periodicbrief.NewActivities(
 		st, compiledModelResolver, recorder,
 		manager, cfg.Dashboard.Origin,
@@ -302,6 +375,8 @@ func run() error {
 	// 保证 Stop 不会采用 SDK 的 0 秒默认值、在 Activity 仍收尾时就释放 DB/Temporal。
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, temporalWorkerOptions())
 	w.RegisterWorkflow(workflow.PushPipelineWorkflow)
+	w.RegisterWorkflow(workflow.ResearchShadowWorkflowV3)
+	w.RegisterWorkflow(workflow.ResearchScheduledWorkflowV3)
 	w.RegisterWorkflow(periodicbrief.WorkflowV1)
 	// 逐个注册（非整体 Register）：漏注册不会启动失败，而是每批推送在该活动上
 	// 重试到超时——EvolveProfile 的错误被 workflow 刻意吞掉，漏注册只会表现为
@@ -326,6 +401,11 @@ func run() error {
 	w.RegisterActivity(activities.CardGenToolCandidatesV2)
 	w.RegisterActivity(activities.PushToolCardsV2)
 	w.RegisterActivity(activities.RecordEmptyToolRunV2)
+	w.RegisterActivity(activities.PrepareResearchRunV3)
+	w.RegisterActivity(activities.PlanResearchRunV3)
+	w.RegisterActivity(activities.ExecuteResearchStepV3)
+	w.RegisterActivity(activities.SynthesizeResearchBriefV3)
+	w.RegisterActivity(activities.DeliverResearchBriefV3)
 	w.RegisterActivity(activities.BeginRunOutcomeV1)
 	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
 	w.RegisterActivity(activities.BeginToolRunOutcomeV2)
@@ -361,6 +441,12 @@ func run() error {
 		),
 		scheduler.WithCompiledToolRuntimeCanary(
 			cfg.Pipeline.ToolRuntimeCanaryScheduleID,
+		),
+		scheduler.WithResearchRuntimeV3ShadowCanary(
+			cfg.Pipeline.ResearchV3ShadowCanaryScheduleID,
+		),
+		scheduler.WithResearchRuntimeV3AuthorityCanary(
+			cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID,
 		),
 		scheduler.WithRunOutcomeRollout(
 			cfg.Pipeline.RunOutcomeEnabled,
@@ -657,6 +743,26 @@ func run() error {
 		st, sched, sched, endpoints, exaTools,
 		definitionEditToolController,
 	)
+	if cfg.Agent.AgentFirstOwnerCanary {
+		authorizer := agent.NewModelOwnerActionAuthorizer(
+			agentLLMClient, recorder, cfg.LLM.AgentModel,
+		)
+		withoutLegacyProfileWriter := tools[:0]
+		for _, tool := range tools {
+			if tool.Name() != "update_profile" {
+				withoutLegacyProfileWriter = append(withoutLegacyProfileWriter, tool)
+			}
+		}
+		tools = withoutLegacyProfileWriter
+		tools = append(tools,
+			agent.NewQueryMyIntelligenceTool(st),
+			agent.NewAuthorizedUpdateProfileTool(st, authorizer),
+			agent.NewManageTasksTool(agent.ManageTasksDeps{
+				Queries: st, Runner: sched, Deleter: sched,
+				Edits:      definitionEditController,
+				Authorizer: authorizer,
+			}))
+	}
 	agentLoop, err := agent.NewChecked(agent.Deps{
 		Client:     agentLLMClient,
 		Recorder:   recorder,
@@ -671,9 +777,12 @@ func run() error {
 		IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
 			!cfg.Agent.IntentToolkitsOwnerCanary &&
 			!cfg.Agent.IntentToolkitsAllowAll,
-		Endpoints:    endpoints,
-		ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
-		TaskCreation: creationCoordinator,
+		AgentFirstEnabled:      cfg.Agent.AgentFirstOwnerCanary,
+		AgentFirstCanaryUserID: cfg.Agent.AgentFirstCanaryUserID,
+		Endpoints:              endpoints,
+		ToolCalls:              agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
+		Evidence:               st,
+		TaskCreation:           creationCoordinator,
 		// The current controller serves direct durable execution only.
 		TaskDefinitionEdit: definitionEditController,
 	})

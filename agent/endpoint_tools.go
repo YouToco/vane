@@ -27,6 +27,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/tikhubcatalog"
 	"github.com/YouToco/vane/tikhubinvoke"
 	"github.com/YouToco/vane/types"
@@ -87,19 +88,24 @@ type toolRunState struct {
 	// while returning the legacy registry unchanged.
 	intentToolkitsEnabled        bool
 	intentToolkitsShadow         bool
+	agentFirstEnabled            bool
 	intentToolkitsShadowSeen     bool
 	intentToolkitsLegacyCount    int
 	intentToolkitsCandidateCount int
 	intentToolkitsRemoved        []string
 	// Unified loop breaker state. Provider-specific message caps are not used
 	// for planning; this hidden ceiling only stops repeated or runaway calls.
-	toolExecutions     int
-	successfulCalls    map[string]struct{}
-	failedCalls        map[string]int
-	loopBreakReason    string
-	clarificationCount int
-	candidateSearches  int
-	candidateHits      int
+	toolExecutions      int
+	successfulCalls     map[string]struct{}
+	failedCalls         map[string]int
+	toolEvidence        []store.AgentToolEvidenceV1
+	actionReceipts      []json.RawMessage
+	internalReferences  map[string]struct{}
+	deferEvidenceCommit bool
+	loopBreakReason     string
+	clarificationCount  int
+	candidateSearches   int
+	candidateHits       int
 	// sideEffectConstrainedTurn is set for every semantically routed task
 	// action except a uniquely bound definition edit. Only the side-effecting
 	// tool named by allowedSideEffectTool may survive; one-off research instead

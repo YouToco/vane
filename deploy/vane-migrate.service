@@ -1,0 +1,27 @@
+[Unit]
+Description=Vane database migration (one-shot schema owner)
+After=network-online.target docker.service
+Wants=network-online.target
+Before=vane.service vane-research-gateway.service
+
+[Service]
+Type=oneshot
+User=vane-migrate
+Group=vane-migrate
+WorkingDirectory=/opt/vane
+LoadCredential=migration_db_url:/etc/vane/credentials/migration_db_url
+ExecStart=/opt/vane/bin/vane-migrate
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TimeoutStartSec=6min
+
+[Install]
+WantedBy=multi-user.target

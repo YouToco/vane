@@ -44,6 +44,19 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 	// 路由到 worker 注册的真实实例，nil 接收者不会被解引用（标准用法）。
 	var a *Activities
 
+	// Research V3 is selected only by its new durable Action label. Existing
+	// histories have immutable non-V3 args and therefore never acquire this
+	// command sequence during replay; no legacy GetVersion branch is changed.
+	if IsResearchRuntimeV3(p.RuntimeVersion) {
+		if !validResearchV3PushParams(p) {
+			return types.NewAppError(types.CodeValidation,
+				"research V3 scheduled run envelope is invalid", nil)
+		}
+		return runResearchPipelineV3(ctx, ResearchScheduledInputV3{
+			TenantID: p.TenantID, UserID: p.UserID, TaskID: p.ScheduleID,
+		}, traceID, a, false)
+	}
+
 	// counts 是漏斗快照，每步拿到结果后立刻累加（纯计算，确定性无碍）。
 	// 它让"抓到 20 条但全被去重掉"与"压根没抓到新内容"在库里可区分——两者此前
 	// 都只是"没有行"。未跑到的阶段保持 nil，不是 0（见 types.PipelineCounts：

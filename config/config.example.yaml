@@ -7,8 +7,13 @@ server:
   # 确需对外监听改 "0.0.0.0:8080" 或用 VANE_SERVER_ADDR 覆盖（记得同时收好防火墙）。
   addr: "127.0.0.1:8080"
 
+research_gateway:
+  socket_path: "/run/vane-research-gateway/gateway.sock"
+
 db:
   url: "" # VANE_DB_URL
+  # V3 专用非 owner LOGIN；留空会安全禁用 V3，不影响旧任务。
+  research_runtime_url: "" # VANE_DB_RESEARCH_RUNTIME_URL
 
 temporal:
   host: "127.0.0.1:7233"
@@ -54,6 +59,11 @@ pipeline:
   # Source-free Tool runtime is deliberately single-task only. To roll back:
   # pause the task first, then clear this ID (V2 definitions cannot run on V1).
   tool_runtime_canary_schedule_id: ""
+  # Research V3 is exact-task only. Shadow never delivers. Authority may only
+  # equal a successfully shadowed task and also requires the same task in
+  # push_effect_recovery_canary_schedule_id.
+  research_v3_shadow_canary_schedule_id: ""
+  research_v3_authority_canary_schedule_id: ""
   # P1-B exact-run lifecycle is independent and remains dark by default.
   run_outcome_enabled: false
   run_outcome_canary_schedule_id: ""
@@ -92,10 +102,15 @@ pipeline:
   observation_authority_canary_schedule_id: ""
   # Durable provider effect: exact one-task compiled canary only.
   push_effect_canary_schedule_id: ""
-  # Independent exact-task recovery canary. Empty keeps recovery fully dark.
+  # Independent exact-task recovery canary. Research V3 authority must bind
+  # this to the same task so startup recovery precedes worker/Feishu ingress.
   push_effect_recovery_canary_schedule_id: ""
 
 agent:
+  # Owner-only Agent-first canary. Keeps dedicated Web and A2A compatibility
+  # lanes unchanged while general chat uses query_my_intelligence/manage_tasks.
+  agent_first_owner_canary: false
+  agent_first_canary_user_id: 0
   max_turns: 20
   # 意图工具包发布顺序：默认只记录旧/新曝光差异；owner_canary 仅启用飞书 Owner；
   # 验收后关闭 canary 并显式打开 allow_all。owner_canary 与 allow_all 不可同时开启。

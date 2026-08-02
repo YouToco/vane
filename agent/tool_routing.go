@@ -2,6 +2,21 @@ package agent
 
 import "strings"
 
+func legacyGeneralChatTool(name string) bool {
+	switch name {
+	case "list_schedules", "view_task_playbook", "view_task_latest_run",
+		"view_profile", "create_schedule", "edit_task_definition",
+		"run_task_now", "remove_schedule":
+		return true
+	default:
+		return false
+	}
+}
+
+func agentFirstOnlyTool(name string) bool {
+	return name == "query_my_intelligence" || name == "manage_tasks"
+}
+
 // classifyOwnerIntents is deliberately deterministic and only consumes the
 // authenticated current-user request. It narrows the first-turn schema set; it
 // is not an authorization decision, and missing a tag can only hide a tool.

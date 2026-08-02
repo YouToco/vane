@@ -43,6 +43,7 @@ type TaskRunTrigger interface {
 }
 
 type toolInvocationIDKey struct{}
+type providerToolCallIDKey struct{}
 
 func withToolInvocationID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, toolInvocationIDKey{}, id)
@@ -51,6 +52,15 @@ func withToolInvocationID(ctx context.Context, id string) context.Context {
 func toolInvocationIDFrom(ctx context.Context) (string, bool) {
 	id, ok := ctx.Value(toolInvocationIDKey{}).(string)
 	return id, ok && strings.TrimSpace(id) != ""
+}
+
+func withProviderToolCallID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, providerToolCallIDKey{}, id)
+}
+
+func providerToolCallIDFrom(ctx context.Context) (string, bool) {
+	id, ok := ctx.Value(providerToolCallIDKey{}).(string)
+	return id, ok && strings.TrimSpace(id) == id && id != ""
 }
 
 func scopedToolInvocationID(ctx context.Context, providerCallID string) string {
@@ -99,6 +109,14 @@ type taskRunEvidenceStore interface {
 		userID int64,
 		taskID string,
 	) (*store.TaskLatestRunEvidenceV1, error)
+}
+
+type intelligenceQueryStore interface {
+	QueryMyIntelligence(
+		ctx context.Context,
+		scope store.IntelligenceScope,
+		query store.IntelligenceQuery,
+	) (*store.IntelligenceQueryResult, error)
 }
 
 // BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单的静态部分（契约 §10）：
@@ -150,6 +168,129 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, runner TaskRunTrigg
 		tools = append(tools, exa.SearchTool(), exa.ReadPageTool())
 	}
 	return tools
+}
+
+func NewQueryMyIntelligenceTool(st intelligenceQueryStore) ToolSpec {
+	return newToolSpec(&queryMyIntelligenceTool{st: st}, withToolSurface(
+		ownerPolicy(Effects(EffectInternalRead), BudgetNone),
+		ExposureAlways, knownToolIntents, ResultTrustLocal, false))
+}
+
+const queryMyIntelligenceSchema = `{
+  "type": "object",
+  "properties": {
+    "dataset": {
+      "type": "string",
+      "enum": ["tasks","runs","observations","briefs","agent_turns","tool_calls","profile"],
+      "description": "一次只查询一个用户情报数据集"
+    },
+    "select": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {"type":"string"},
+      "description": "要返回的目录字段；省略使用该数据集的专业默认列"
+    },
+    "filters": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "properties": {
+          "field": {"type":"string"},
+          "op": {"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","in","within"]},
+          "value": {"description":"与字段类型匹配的 JSON 值；within 使用 today、yesterday 或 last_7_days"}
+        },
+        "required": ["field","op","value"],
+        "additionalProperties": false
+      }
+    },
+    "group_by": {"type":"array","maxItems":8,"items":{"type":"string"}},
+    "metrics": {
+      "type":"array","maxItems":8,
+      "items": {
+        "type":"object",
+        "properties": {
+          "function":{"type":"string","enum":["count","sum","avg","min","max"]},
+          "field":{"type":"string"},
+          "as":{"type":"string"}
+        },
+        "required":["function","as"],
+        "additionalProperties":false
+      }
+    },
+    "order_by": {
+      "type":"array","maxItems":8,
+      "items": {
+        "type":"object",
+        "properties": {
+          "field":{"type":"string"},
+          "direction":{"type":"string","enum":["asc","desc"]}
+        },
+        "required":["field"],
+        "additionalProperties":false
+      }
+    },
+    "limit":{"type":"integer","minimum":1,"maximum":100},
+    "cursor":{"type":"string","description":"上一页返回的 next_cursor；只能原样继续同一查询"}
+  },
+  "required":["dataset"],
+  "additionalProperties":false
+}`
+
+type queryMyIntelligenceTool struct {
+	st intelligenceQueryStore
+}
+
+func (*queryMyIntelligenceTool) Name() string { return "query_my_intelligence" }
+func (*queryMyIntelligenceTool) Description() string {
+	return "查询当前用户自己的任务、历史运行、Observation、Brief、历史 Agent 回答、模型实际看到的工具证据或画像。按名称、主题、用途和自然时间定位，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
+}
+func (*queryMyIntelligenceTool) Parameters() json.RawMessage {
+	return json.RawMessage(queryMyIntelligenceSchema)
+}
+func (t *queryMyIntelligenceTool) Execute(
+	ctx context.Context,
+	userID int64,
+	raw json.RawMessage,
+) (string, error) {
+	if t.st == nil {
+		return "", types.NewAppError(types.CodeInternal,
+			"用户情报查询未装配", nil)
+	}
+	var query store.IntelligenceQuery
+	if err := strictjson.DecodeExact(raw, &query); err != nil {
+		return "query_my_intelligence 参数不是合法关系查询，或包含未知字段", nil
+	}
+	meta, ok := ctx.Value(chatMetaKey{}).(chatMeta)
+	if !ok || meta.scope.TenantID <= 0 || meta.scope.UserID != userID ||
+		meta.scope.SessionID <= 0 {
+		return "", types.NewAppError(types.CodeValidation,
+			"用户情报查询缺少认证会话范围", types.ErrValidation)
+	}
+	sessionID := meta.scope.SessionID
+	result, err := t.st.QueryMyIntelligence(ctx, store.IntelligenceScope{
+		TenantID: meta.scope.TenantID, UserID: userID, SessionID: &sessionID,
+	}, query)
+	if err != nil {
+		if errors.Is(err, types.ErrValidation) {
+			return "query_my_intelligence 查询被拒绝：" + err.Error(), nil
+		}
+		return "", err
+	}
+	rememberIntelligenceResultReferences(ctx, result)
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return "", types.NewAppError(types.CodeInternal,
+			"编码用户情报查询结果", err)
+	}
+	return string(encoded), nil
+}
+func (*queryMyIntelligenceTool) Summarize(args json.RawMessage) string {
+	var query store.IntelligenceQuery
+	if err := json.Unmarshal(args, &query); err != nil {
+		return summarizeFallback("查询我的历史情报", args)
+	}
+	return "查询我的 " + string(query.Dataset) + " 情报"
 }
 
 // edit_task_definition is a schema-only model tool. Loop delegates it directly
@@ -955,7 +1096,14 @@ type updateProfileArgs struct {
 }
 
 type updateProfileTool struct {
-	st profileStore
+	st         profileStore
+	authorizer OwnerActionAuthorizer
+}
+
+func NewAuthorizedUpdateProfileTool(st profileStore, authorizer OwnerActionAuthorizer) ToolSpec {
+	return newToolSpec(&updateProfileTool{st: st, authorizer: authorizer}, withToolSurface(ownerPolicy(
+		Effects(EffectStateWrite, EffectDirectOwnerWrite), BudgetNone),
+		ExposureIntent, IntentProfile, ResultTrustLocal, true))
 }
 
 func (t *updateProfileTool) Name() string { return "update_profile" }
@@ -975,6 +1123,28 @@ func (t *updateProfileTool) Execute(ctx context.Context, userID int64, args json
 	}
 	if a.Industry == nil && a.Occupation == nil && a.Tags == nil {
 		return "没有提供任何要修改的字段，请至少提供 industry、occupation、tags 之一", nil
+	}
+	if state := runStateFrom(ctx); state != nil && state.agentFirstEnabled {
+		if t.authorizer == nil {
+			return "画像写入授权能力未装配，本次未执行。", nil
+		}
+		decision, err := t.authorizer.AuthorizeOwnerAction(ctx, OwnerActionAuthorization{
+			OwnerRequest: state.ownerRequest, Action: "update_profile",
+			Changes: append(json.RawMessage(nil), args...),
+			Targets: []OwnerActionTarget{{Name: "当前用户画像", Status: "current"}},
+		})
+		if err != nil {
+			return "", err
+		}
+		switch decision {
+		case OwnerActionAuthorized:
+		case OwnerActionAmbiguous:
+			return "画像写入要求仍有歧义，本次未执行；请自然追问一次。", nil
+		case OwnerActionDenied:
+			return "当前原话没有授权画像写入，本次未执行。", nil
+		default:
+			return "", errors.New("agent: profile authorizer returned an invalid decision")
+		}
 	}
 	p, err := t.st.UpsertProfileFields(ctx, userID, a.Industry, a.Occupation, capProfileTags(a.Tags))
 	if err != nil {

@@ -5,12 +5,14 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -26,17 +28,22 @@ var defaultConfigPaths = []string{
 
 // Config 是 Vane 的全量配置，结构与 config.example.yaml 一一对应。
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	DB       DBConfig       `mapstructure:"db"`
-	Temporal TemporalConfig `mapstructure:"temporal"`
-	LLM      LLMConfig      `mapstructure:"llm"`
-	Fetch    FetchConfig    `mapstructure:"fetch"`
-	Pipeline PipelineConfig `mapstructure:"pipeline"`
-	Agent    AgentConfig    `mapstructure:"agent"`
-	Log      LogConfig      `mapstructure:"log"`
+	Server          ServerConfig          `mapstructure:"server"`
+	DB              DBConfig              `mapstructure:"db"`
+	Temporal        TemporalConfig        `mapstructure:"temporal"`
+	LLM             LLMConfig             `mapstructure:"llm"`
+	Fetch           FetchConfig           `mapstructure:"fetch"`
+	Pipeline        PipelineConfig        `mapstructure:"pipeline"`
+	Agent           AgentConfig           `mapstructure:"agent"`
+	Log             LogConfig             `mapstructure:"log"`
+	ResearchGateway ResearchGatewayConfig `mapstructure:"research_gateway"`
 
 	Dashboard DashboardConfig `mapstructure:"dashboard"`
 	A2A       A2AConfig       `mapstructure:"a2a"`
+}
+
+type ResearchGatewayConfig struct {
+	SocketPath string `mapstructure:"socket_path"`
 }
 
 // ServerConfig 是 HTTP 服务配置。
@@ -53,6 +60,21 @@ type ServerConfig struct {
 type DBConfig struct {
 	// URL 是 Postgres 连接串（必填），环境变量 VANE_DB_URL。
 	URL string `mapstructure:"url"`
+	// ResearchRuntimeURL 是 V3 情报运行专用的非 owner LOGIN 连接串。
+	// 留空时旧运行路径保持可用，但所有 V3 Store 入口 fail-closed。
+	ResearchRuntimeURL string `mapstructure:"research_runtime_url"`
+	// ResearchCapabilityKeyID identifies the active HMAC key. Retired keys must
+	// be retained for at least the longest V3 workflow/retry window.
+	ResearchCapabilityKeyID string `mapstructure:"research_capability_key_id"`
+	// ResearchCapabilityKeyHex is exactly 32 random bytes encoded as lowercase
+	// hex. It is control-plane authority and must only be supplied by secret env.
+	ResearchCapabilityKeyHex string `mapstructure:"research_capability_key_hex"`
+	// ResearchCapabilityRetiredKeys retains derivation-only keys as
+	// "kid=64hex,kid2=64hex" for workflows issued before rotation.
+	ResearchCapabilityRetiredKeys string `mapstructure:"research_capability_retired_keys"`
+	// ResearchCapabilityTTLDays must cover the maximum workflow, retry and
+	// Temporal retention window. Default 90 days.
+	ResearchCapabilityTTLDays int `mapstructure:"research_capability_ttl_days"`
 }
 
 // TemporalConfig 是 Temporal 集群与任务队列配置。
@@ -134,6 +156,11 @@ type PipelineConfig struct {
 	// is pause-task first, then clear this ID; V2 deliberately has no allow-all
 	// switch and cannot be relabeled as the incompatible retained V1 runtime.
 	ToolRuntimeCanaryScheduleID string `mapstructure:"tool_runtime_canary_schedule_id"`
+	// ResearchV3ShadowCanaryScheduleID permits one exact no-delivery shadow run.
+	ResearchV3ShadowCanaryScheduleID string `mapstructure:"research_v3_shadow_canary_schedule_id"`
+	// ResearchV3AuthorityCanaryScheduleID permits the receipt-backed cutover
+	// control plane for exactly the already-shadowed task. There is no allow-all.
+	ResearchV3AuthorityCanaryScheduleID string `mapstructure:"research_v3_authority_canary_schedule_id"`
 	// RunOutcome* is the independent P1-B lifecycle rollout. It may select only
 	// Actions already selected by the compiled runtime rollout.
 	RunOutcomeEnabled          bool   `mapstructure:"run_outcome_enabled"`
@@ -187,14 +214,22 @@ type PipelineConfig struct {
 	// PushEffectCanaryScheduleID enables durable external push effects for
 	// exactly one compiled task. Empty is fully dark; broad rollout has no key.
 	PushEffectCanaryScheduleID string `mapstructure:"push_effect_canary_schedule_id"`
-	// PushEffectRecoveryCanaryScheduleID enables recovery for one compiled
-	// task. It is independent of the fresh-send canary for separate rollback.
+	// PushEffectRecoveryCanaryScheduleID enables recovery for one exact task.
+	// Legacy compiled tasks retain their rollout dependency; Research V3
+	// authority must select this same task before delivery can be enabled.
 	PushEffectRecoveryCanaryScheduleID string `mapstructure:"push_effect_recovery_canary_schedule_id"`
 }
 
 // AgentConfig 是 agent loop 运行约束配置。
 type AgentConfig struct {
 	MaxTurns int `mapstructure:"max_turns"`
+	// AgentFirstOwnerCanary replaces the production owner chat surface with the
+	// small orthogonal query/manage/profile/research toolset. Dedicated Web
+	// create/edit lanes and A2A remain on their compatibility surfaces.
+	AgentFirstOwnerCanary bool `mapstructure:"agent_first_owner_canary"`
+	// AgentFirstCanaryUserID makes the owner canary an exact authenticated user
+	// rather than a process-wide switch. It is required when the canary is on.
+	AgentFirstCanaryUserID int64 `mapstructure:"agent_first_canary_user_id"`
 	// IntentToolkitsShadowEnabled computes the intent-routed first-request
 	// toolset without changing model-visible tools and records only aggregate
 	// old/new exposure differences. It is the default rollout stage.
@@ -257,6 +292,10 @@ type A2AConfig struct {
 // （有默认值或出现在配置文件中）生效，纯环境变量运行时嵌套敏感键会漏读。
 var sensitiveKeys = []string{
 	"db.url",
+	"db.research_runtime_url",
+	"db.research_capability_key_id",
+	"db.research_capability_key_hex",
+	"db.research_capability_retired_keys",
 	"llm.api_key",
 	"llm.agent_api_key",
 	"fetch.tikhub_api_key",
@@ -308,6 +347,7 @@ func setDefaults(v *viper.Viper) {
 	// 默认只绑 loopback：生产走 Caddy(host 网络)反代 127.0.0.1:8080，8080 不该对公网可达。
 	// 需对外监听时用 VANE_SERVER_ADDR / 配置文件显式覆盖（见 ServerConfig.Addr）。
 	v.SetDefault("server.addr", "127.0.0.1:8080")
+	v.SetDefault("research_gateway.socket_path", "/run/vane-research-gateway/gateway.sock")
 	// Dashboard 前端生产源。设默认值兼有两个作用：生产零配置即放行正确源；
 	// 让 dashboard.origin 成为 Viper 的"已知键"，VANE_DASHBOARD_ORIGIN 可覆盖（见 sensitiveKeys 注释）。
 	v.SetDefault("dashboard.origin", "https://vane.zhuoqidev.com")
@@ -315,6 +355,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("temporal.host", "127.0.0.1:7233")
 	v.SetDefault("temporal.namespace", "default")
 	v.SetDefault("temporal.task_queue", "vane-push")
+	v.SetDefault("db.research_capability_ttl_days", 90)
 
 	v.SetDefault("llm.provider", "deepseek")
 	v.SetDefault("llm.base_url", "https://api.deepseek.com")
@@ -353,6 +394,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_canary_schedule_id", "")
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
 	v.SetDefault("pipeline.tool_runtime_canary_schedule_id", "")
+	v.SetDefault("pipeline.research_v3_shadow_canary_schedule_id", "")
+	v.SetDefault("pipeline.research_v3_authority_canary_schedule_id", "")
 	v.SetDefault("pipeline.run_outcome_enabled", false)
 	v.SetDefault("pipeline.run_outcome_canary_schedule_id", "")
 	v.SetDefault("pipeline.run_outcome_allow_all", false)
@@ -387,6 +430,8 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.intent_toolkits_shadow_enabled", true)
+	v.SetDefault("agent.agent_first_owner_canary", false)
+	v.SetDefault("agent.agent_first_canary_user_id", int64(0))
 	v.SetDefault("agent.intent_toolkits_owner_canary", false)
 	v.SetDefault("agent.intent_toolkits_allow_all", false)
 	v.SetDefault("agent.definition_edit_enabled", false)
@@ -428,6 +473,25 @@ func readConfigFile(v *viper.Viper, path string) error {
 // Validate 校验必填项并补齐零值默认值。
 // 允许在 Unmarshal 后单独调用（如配置热更新场景）。
 func (c *Config) Validate() error {
+	c.DB.ResearchCapabilityKeyID = strings.TrimSpace(c.DB.ResearchCapabilityKeyID)
+	c.DB.ResearchCapabilityKeyHex = strings.TrimSpace(c.DB.ResearchCapabilityKeyHex)
+	c.DB.ResearchCapabilityRetiredKeys = strings.TrimSpace(
+		c.DB.ResearchCapabilityRetiredKeys)
+	if c.DB.ResearchCapabilityTTLDays == 0 {
+		c.DB.ResearchCapabilityTTLDays = 90
+	}
+	if c.DB.ResearchCapabilityTTLDays < 7 || c.DB.ResearchCapabilityTTLDays > 400 {
+		return errors.New("config: db.research_capability_ttl_days 必须在 7–400 天")
+	}
+	if strings.TrimSpace(c.DB.ResearchRuntimeURL) != "" {
+		if c.DB.ResearchCapabilityKeyID == "" || c.DB.ResearchCapabilityKeyHex == "" {
+			return errors.New("config: V3 research runtime 要求 research capability key")
+		}
+		if len(c.DB.ResearchCapabilityKeyHex) != 64 ||
+			strings.ToLower(c.DB.ResearchCapabilityKeyHex) != c.DB.ResearchCapabilityKeyHex {
+			return errors.New("config: db.research_capability_key_hex 必须是 32-byte lowercase hex")
+		}
+	}
 	rawCanaryID := c.Pipeline.PlaybookPromptCanaryScheduleID
 	canaryID := strings.TrimSpace(rawCanaryID)
 	if c.Pipeline.PlaybookPromptsEnabled && rawCanaryID != "" && canaryID == "" {
@@ -473,6 +537,32 @@ func (c *Config) Validate() error {
 			return errors.New(
 				"config: Tool runtime canary 必须位于 compiled runtime rollout")
 		}
+	}
+	rawResearchV3ShadowID := c.Pipeline.ResearchV3ShadowCanaryScheduleID
+	researchV3ShadowID := strings.TrimSpace(rawResearchV3ShadowID)
+	if rawResearchV3ShadowID != "" && researchV3ShadowID == "" {
+		return errors.New(
+			"config: pipeline.research_v3_shadow_canary_schedule_id 不能仅含空白")
+	}
+	if researchV3ShadowID != "" && !validSnapshotShadowCanaryID(researchV3ShadowID) {
+		return errors.New(
+			"config: pipeline.research_v3_shadow_canary_schedule_id 必须是 1-255 字节的有效任务 ID，且不能包含控制字符")
+	}
+	c.Pipeline.ResearchV3ShadowCanaryScheduleID = researchV3ShadowID
+	rawResearchV3AuthorityID := c.Pipeline.ResearchV3AuthorityCanaryScheduleID
+	researchV3AuthorityID := strings.TrimSpace(rawResearchV3AuthorityID)
+	if rawResearchV3AuthorityID != "" && researchV3AuthorityID == "" {
+		return errors.New(
+			"config: pipeline.research_v3_authority_canary_schedule_id 不能仅含空白")
+	}
+	if researchV3AuthorityID != "" && !validSnapshotShadowCanaryID(researchV3AuthorityID) {
+		return errors.New(
+			"config: pipeline.research_v3_authority_canary_schedule_id 必须是 1-255 字节的有效任务 ID，且不能包含控制字符")
+	}
+	c.Pipeline.ResearchV3AuthorityCanaryScheduleID = researchV3AuthorityID
+	if researchV3AuthorityID != "" && researchV3AuthorityID != researchV3ShadowID {
+		return errors.New(
+			"config: Research V3 authority canary 必须与已配置的 shadow canary 是同一任务")
 	}
 	rawRunOutcomeCanaryID := c.Pipeline.RunOutcomeCanaryScheduleID
 	runOutcomeCanaryID := strings.TrimSpace(rawRunOutcomeCanaryID)
@@ -805,17 +895,22 @@ func (c *Config) Validate() error {
 		return errors.New(
 			"config: pipeline.push_effect_recovery_canary_schedule_id 无效")
 	}
-	if pushRecoveryCanaryID != "" && !c.Pipeline.CompiledRuntimeEnabled {
+	if pushRecoveryCanaryID != "" && researchV3AuthorityID == "" &&
+		!c.Pipeline.CompiledRuntimeEnabled {
 		return errors.New(
 			"config: push effect recovery canary 要求 compiled runtime 已启用")
 	}
-	if pushRecoveryCanaryID != "" &&
+	if pushRecoveryCanaryID != "" && researchV3AuthorityID == "" &&
 		!c.Pipeline.CompiledRuntimeAllowAll &&
 		compiledCanaryID != pushRecoveryCanaryID {
 		return errors.New(
 			"config: push effect recovery canary 必须位于 compiled runtime rollout")
 	}
 	c.Pipeline.PushEffectRecoveryCanaryScheduleID = pushRecoveryCanaryID
+	if researchV3AuthorityID != "" && pushRecoveryCanaryID != researchV3AuthorityID {
+		return errors.New(
+			"config: Research V3 authority canary 必须启用同一任务的 push effect recovery")
+	}
 	if c.Pipeline.CanonicalBriefEnabled {
 		if c.Pipeline.CanonicalBriefAllowAll ||
 			canonicalBriefCanaryID == "" {
@@ -890,6 +985,20 @@ func (c *Config) Validate() error {
 	if c.DB.URL == "" {
 		return errors.New("config: db.url 必填（可通过环境变量 VANE_DB_URL 设置）")
 	}
+	rawGatewaySocket := c.ResearchGateway.SocketPath
+	gatewaySocket := strings.TrimSpace(rawGatewaySocket)
+	// Validate is also called on directly constructed Config values. Preserve
+	// the same isolated default as Load, while still rejecting an explicitly
+	// supplied whitespace-only path.
+	if rawGatewaySocket == "" {
+		gatewaySocket = "/run/vane-research-gateway/gateway.sock"
+	}
+	if gatewaySocket == "" || len(gatewaySocket) > 255 ||
+		!strings.HasPrefix(gatewaySocket, "/") || path.Clean(gatewaySocket) != gatewaySocket ||
+		strings.ContainsRune(gatewaySocket, 0) {
+		return errors.New("config: research_gateway.socket_path 必须是规范的绝对 Unix socket 路径")
+	}
+	c.ResearchGateway.SocketPath = gatewaySocket
 	if _, err := c.LLM.AgentClientConfig(); err != nil {
 		return err
 	}
@@ -898,6 +1007,9 @@ func (c *Config) Validate() error {
 		return errors.New(
 			"config: agent intent toolkits owner canary 与 allow_all 不能同时启用",
 		)
+	}
+	if c.Agent.AgentFirstOwnerCanary && c.Agent.AgentFirstCanaryUserID <= 0 {
+		return errors.New("config: agent-first owner canary 必须指定精确 canary user_id")
 	}
 	if c.LLM.CompiledEndpointGeneration == 0 {
 		c.LLM.CompiledEndpointGeneration = 1
@@ -917,6 +1029,27 @@ func (c *Config) Validate() error {
 	if c.Fetch.CompiledExaCredentialGeneration < 0 ||
 		c.Fetch.CompiledTikHubCredentialGeneration < 0 {
 		return errors.New("config: fetch compiled credential generation 必须为正数")
+	}
+	if c.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
+		c.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+		if strings.TrimSpace(c.DB.ResearchRuntimeURL) == "" {
+			return errors.New("config: Research V3 runtime 要求 db.research_runtime_url")
+		}
+		if c.DB.ResearchCapabilityKeyID == "" ||
+			len(c.DB.ResearchCapabilityKeyHex) != 64 {
+			return errors.New("config: Research V3 runtime 要求 active research capability key")
+		}
+		if _, err := hex.DecodeString(c.DB.ResearchCapabilityKeyHex); err != nil {
+			return errors.New("config: Research V3 runtime capability key hex 无效")
+		}
+		if c.LLM.CompiledEndpointGeneration <= 0 ||
+			c.LLM.CompiledCredentialGeneration <= 0 ||
+			c.Fetch.CompiledExaCredentialGeneration <= 0 {
+			return errors.New("config: Research V3 runtime 要求可用的 LLM/Exa retained generations")
+		}
+		if strings.TrimSpace(c.Fetch.ExaAPIKey) == "" {
+			return errors.New("config: Research V3 runtime 要求 fetch.exa_api_key")
+		}
 	}
 	return nil
 }

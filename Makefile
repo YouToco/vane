@@ -2,6 +2,8 @@
 
 build:
 	go build -o bin/vane ./cmd/server
+	go build -o bin/vane-migrate ./cmd/migrate
+	go build -o bin/vane-research-gateway ./cmd/researchgateway
 
 test:
 	go test -race -coverprofile=coverage.txt ./...

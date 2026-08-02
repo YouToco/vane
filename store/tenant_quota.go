@@ -74,8 +74,10 @@ func (b QuotaBucket) IsFinancial() bool { return financialBuckets[b] }
 // ListQuota 查得到数字、看起来一切就绪，于是没人会再去想"Exa 到底受不受限"。
 // 把未接线写成代码里的显式空串，比写在 PR 描述里可靠：PR 会沉底，代码不会。
 //
-// 未接线的三个各自卡在什么地方（2026-07-19）：
-//   - exa_calls / tikhub_calls：Fetcher.Fetch(ctx, src) 拿不到 user_id——
+// 当前接线状态：
+//   - exa_calls：V3 research step 在 Store 内把配额扣减、started step 和
+//     不可变 spend reservation 原子提交；重放不会再次放行供应商请求。
+//   - tikhub_calls：Fetcher.Fetch(ctx, src) 拿不到 user_id——
 //     source 是跨租户共享的，"谁触发了这次抓取"这个信息在抓取层根本不存在。
 //     要接线得先让抓取携带触发者身份，那是接缝②的活。
 //   - push / fetch：DoS 面，不花钱，优先级低于财务面。
@@ -86,7 +88,7 @@ var enforcedBuckets = map[QuotaBucket]string{
 	// 而测试全绿（2026-07-19 审查实测）。自证式的守卫比没有守卫更糟，
 	// 因为它让人以为这件事有人在看。
 	QuotaLLMTokens:   "llm",
-	QuotaExaCalls:    "",
+	QuotaExaCalls:    "store",
 	QuotaTikHubCalls: "",
 	QuotaPush:        "",
 	QuotaFetch:       "",

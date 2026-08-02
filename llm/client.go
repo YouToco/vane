@@ -96,7 +96,10 @@ type Request struct {
 // actually returned the corresponding breakdown instead of collapsing
 // "unknown" into a real zero.
 type Response struct {
-	Content                 string
+	Content string
+	// UsageReported distinguishes a real zero from an HTTP 200 response that
+	// omitted its usage object. Paid callers must treat omission as unknown.
+	UsageReported           bool
 	PromptTokens            int
 	CompletionTokens        int
 	CacheHitTokens          int
@@ -129,6 +132,19 @@ type thinkingConfig struct {
 	Type string `json:"type"` // "disabled" | "enabled"
 }
 
+type chatUsage struct {
+	PromptTokens          *int `json:"prompt_tokens"`
+	CompletionTokens      *int `json:"completion_tokens"`
+	PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens"`
+	PromptTokensDetails   struct {
+		CachedTokens *int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails struct {
+		ReasoningTokens *int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+}
+
 type chatResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
@@ -137,18 +153,7 @@ type chatResponse struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens          int  `json:"prompt_tokens"`
-		CompletionTokens      int  `json:"completion_tokens"`
-		PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens"`
-		PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens"`
-		PromptTokensDetails   struct {
-			CachedTokens *int `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-		CompletionTokensDetails struct {
-			ReasoningTokens *int `json:"reasoning_tokens"`
-		} `json:"completion_tokens_details"`
-	} `json:"usage"`
+	Usage *chatUsage `json:"usage"`
 }
 
 func usageCacheBreakdown(prompt int, topHit, topMiss, nestedHit *int) (hit, miss int, reported bool) {
@@ -262,19 +267,31 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	if model == "" {
 		model = requestModel
 	}
+	usage := chatUsage{}
+	if cr.Usage != nil {
+		usage = *cr.Usage
+	}
+	usageReported := usage.PromptTokens != nil && usage.CompletionTokens != nil &&
+		*usage.PromptTokens >= 0 && *usage.CompletionTokens >= 0 &&
+		*usage.PromptTokens+*usage.CompletionTokens > 0
+	promptTokens, completionTokens := 0, 0
+	if usageReported {
+		promptTokens, completionTokens = *usage.PromptTokens, *usage.CompletionTokens
+	}
 	hit, miss, cacheReported := usageCacheBreakdown(
-		cr.Usage.PromptTokens,
-		cr.Usage.PromptCacheHitTokens,
-		cr.Usage.PromptCacheMissTokens,
-		cr.Usage.PromptTokensDetails.CachedTokens,
+		promptTokens,
+		usage.PromptCacheHitTokens,
+		usage.PromptCacheMissTokens,
+		usage.PromptTokensDetails.CachedTokens,
 	)
 	reasoning, reasoningReported := usageReasoningBreakdown(
-		cr.Usage.CompletionTokens,
-		cr.Usage.CompletionTokensDetails.ReasoningTokens,
+		completionTokens,
+		usage.CompletionTokensDetails.ReasoningTokens,
 	)
 	resp := &Response{
-		PromptTokens:            cr.Usage.PromptTokens,
-		CompletionTokens:        cr.Usage.CompletionTokens,
+		UsageReported:           usageReported,
+		PromptTokens:            promptTokens,
+		CompletionTokens:        completionTokens,
 		CacheHitTokens:          hit,
 		CacheMissTokens:         miss,
 		CacheTokensReported:     cacheReported,
@@ -284,13 +301,20 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 		LatencyMs:               int(time.Since(start).Milliseconds()),
 	}
 	if len(cr.Choices) == 0 {
-		// HTTP 200 已经携带 token 回执时，即使业务响应缺少 choices 也必须把
-		// 用量交给 Do 落账；返回 metadata-only response，与 Chat 的协议失败
-		// 路径保持一致，调用方仍只收到原始错误。
+		// Even malformed business responses must return metadata to the caller so
+		// any provider-reported usage can be durably accounted.
 		return resp, types.NewAppError(types.CodeLLMUnavailable, "llm: 响应缺少 choices", nil)
 	}
 
 	resp.Content = cr.Choices[0].Message.Content
+	if !usageReported {
+		// A successful HTTP status without complete token metadata is not a
+		// settleable success. Return metadata only and force the durable V3 path
+		// to retain its conservative reservation as an indeterminate attempt.
+		resp.Content = ""
+		return resp, types.NewAppError(types.CodeLLMUnavailable,
+			"llm: 响应用量元数据缺失或无效", nil)
+	}
 	// content 空是隐性故障信号（如思维链吃光 max_tokens 预算导致 finish_reason=length
 	// 且 content=""），静默返回会让上层用兜底值掩盖问题——2026-07-14 打分全回退中位分
 	// 三个批次才被发现。这里不报错（语义留给调用方），但必须留下可检索的告警。
@@ -298,7 +322,7 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 		slog.Warn("llm: 上游返回空 content",
 			"model", model,
 			"finish_reason", cr.Choices[0].FinishReason,
-			"completion_tokens", cr.Usage.CompletionTokens)
+			"completion_tokens", completionTokens)
 	}
 	return resp, nil
 }

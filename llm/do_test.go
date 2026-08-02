@@ -23,6 +23,12 @@ type capturingRecorderStore struct {
 	onTryConsume      func()
 }
 
+type doTestRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f doTestRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func (s *capturingRecorderStore) InsertLLMCall(_ context.Context, call *types.LLMCall) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -268,6 +274,98 @@ func TestDo_CompiledQuotaUsesPostSemaphoreGateAndExactTenantSettlement(t *testin
 	}
 	if wantDelta := wantEstimate - 15; st.frozenAdjustDelta != wantDelta {
 		t.Errorf("reconcile delta = %v, want %v", st.frozenAdjustDelta, wantDelta)
+	}
+}
+
+func TestDo_CompiledUnknownUsageFailureRetainsConservativeReservation(t *testing.T) {
+	tests := []struct {
+		name       string
+		makeClient func(*testing.T) (*Client, context.Context, context.CancelFunc)
+	}{
+		{
+			name: "upstream unavailable",
+			makeClient: func(t *testing.T) (*Client, context.Context, context.CancelFunc) {
+				t.Helper()
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, "upstream failed after accepting request", http.StatusBadGateway)
+				}))
+				t.Cleanup(srv.Close)
+				return newTestClient(srv.URL, 1), t.Context(), func() {}
+			},
+		},
+		{
+			name: "request timeout",
+			makeClient: func(t *testing.T) (*Client, context.Context, context.CancelFunc) {
+				t.Helper()
+				client := newTestClient("http://llm.test", 1)
+				client.httpClient = &http.Client{Transport: doTestRoundTripFunc(func(
+					req *http.Request,
+				) (*http.Response, error) {
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				})}
+				ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+				return client, ctx, cancel
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, ctx, cancel := test.makeClient(t)
+			defer cancel()
+			st := &routingRecorderStore{}
+			userID, tenantID := int64(41), int64(9)
+			rule := validFrozenLLMQuotaRule()
+			var reservations atomic.Int64
+			_, err := Do(ctx, client, &Recorder{st: st}, CallMeta{
+				TraceID: "compiled-unknown-usage", SpanName: "score",
+				TenantID: &tenantID, UserID: &userID, QuotaRule: &rule,
+				BeforeSpend: func(context.Context, float64) error {
+					reservations.Add(1)
+					return nil
+				},
+			}, Request{System: "s", User: "u"})
+			if types.CodeOf(err) != types.CodeLLMUnavailable {
+				t.Fatalf("error code = %s, want %s", types.CodeOf(err), types.CodeLLMUnavailable)
+			}
+			if reservations.Load() != 1 {
+				t.Fatalf("quota reservations = %d, want 1", reservations.Load())
+			}
+			if st.frozenAdjustCalls != 0 {
+				t.Fatalf("unknown usage settlements = %d, want 0", st.frozenAdjustCalls)
+			}
+			if st.insertCalls != 1 {
+				t.Fatalf("ledger calls = %d, want 1", st.insertCalls)
+			}
+		})
+	}
+}
+
+func TestDo_LegacyUnknownUsageFailureRetainsConservativeReservation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream failed after accepting request", http.StatusBadGateway)
+	}))
+	t.Cleanup(srv.Close)
+
+	userID := int64(42)
+	st := &capturingRecorderStore{}
+	_, err := Do(t.Context(), newTestClient(srv.URL, 1), &Recorder{st: st},
+		CallMeta{TraceID: "legacy-unknown-usage", SpanName: "score", UserID: &userID},
+		Request{System: "s", User: "u"})
+	if types.CodeOf(err) != types.CodeLLMUnavailable {
+		t.Fatalf("error code = %s, want %s", types.CodeOf(err), types.CodeLLMUnavailable)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.legacyTryCalls != 1 {
+		t.Fatalf("quota reservations = %d, want 1", st.legacyTryCalls)
+	}
+	if st.legacyAdjustCalls != 0 {
+		t.Fatalf("unknown usage refunds = %d, want 0", st.legacyAdjustCalls)
+	}
+	if len(st.calls) != 1 || st.calls[0].Error == "" {
+		t.Fatalf("ledger calls = %#v, want one explicit error row", st.calls)
 	}
 }
 

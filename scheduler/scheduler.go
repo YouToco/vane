@@ -176,6 +176,12 @@ type toolRuntimeCapabilityStore interface {
 	) (bool, error)
 }
 
+type researchV3ActionAuthorityStore interface {
+	VerifyEnabledResearchV3ActionAuthorization(
+		context.Context, int64, int64, string, string,
+	) error
+}
+
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
 type Scheduler struct {
 	c                       client.Client
@@ -190,6 +196,7 @@ type Scheduler struct {
 	structuredInsight       structuredInsightRollout
 	structuredEventEvidence rolloutScopeV1
 	executiveBrief          rolloutScopeV1
+	researchV3              researchV3Rollout
 	commandAttempt          time.Duration
 }
 
@@ -298,8 +305,7 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 	// one active membership before creating Temporal state. A tenant-less fresh
 	// scheduled run is fail-closed and must never be created for later repair.
 	params := makePushParams(tenantID, userID, schedID, scope, nlDesc)
-	params.RuntimeVersion = s.runtimeVersionFor(
-		schedID, types.ExecutionModeCompiled)
+	params = s.actionParamsFor(params)
 
 	_, err = s.c.ScheduleClient().Create(ctx, client.ScheduleOptions{
 		ID:   schedID,
@@ -484,12 +490,38 @@ func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (up
 	// task to compiled merely because makePushParams is also used by legacy
 	// compiled creation paths.
 	want.ExecutionMode = sc.ExecutionMode
-	want.RuntimeVersion = s.runtimeVersionFor(sc.ID, sc.ExecutionMode)
+	want = s.actionParamsFor(want)
 
 	h := s.c.ScheduleClient().GetHandle(attemptCtx, sc.ID)
 	desc, err := h.Describe(attemptCtx)
 	if err != nil {
 		return false, err
+	}
+	formalV3, isFormalV3, err := decodeResearchScheduledActionV3(
+		desc.Schedule.Action)
+	if err != nil {
+		return false, err
+	}
+	if isFormalV3 {
+		if s.researchV3.authorityID != sc.ID || formalV3.TenantID != sc.TenantID ||
+			formalV3.UserID != sc.UserID || formalV3.TaskID != sc.ID {
+			return false, types.NewAppError(types.CodeConflict,
+				"research V3 Schedule Action is outside the exact authority scope", types.ErrConflict)
+		}
+		verifier, ok := s.st.(researchV3ActionAuthorityStore)
+		if !ok {
+			return false, types.NewAppError(types.CodeInternal,
+				"research V3 Action authority verifier is unavailable", types.ErrInternal)
+		}
+		if err := verifier.VerifyEnabledResearchV3ActionAuthorization(
+			ctx, sc.TenantID, sc.UserID, sc.ID,
+			formalV3.ActionAuthorizationToken,
+		); err != nil {
+			return false, err
+		}
+		// Only the cutover/rollback saga may replace this envelope. In
+		// particular, startup reconciliation must preserve its capability token.
+		return false, nil
 	}
 	current, found, err := decodeScheduleActionPushParams(
 		desc.Schedule.Action)
@@ -1433,6 +1465,8 @@ func (s *Scheduler) NextRun(
 // 会让聚合卡 header 永久显示旧任务名。入参整体按 makePushParams 重建（与 CreatePush/
 // ReconcileActions 同一构造器，scope 取镜像当前值），顺带给 b1 之前缺 schedule_id 的
 // 老调度在改名那一刻即时补齐，不必等下次重启 reconcile（reconcile 是改名之外的兜底）。
+// 正式 Research V3 Action 是 capability envelope，不能用 PushParams 重建；其改名请求
+// 必须 fail-closed 并交给 V3 definition editor，频率-only 更新仍原样保留 envelope。
 //
 // 原子性（CreatePush 那条铁律的 update 版）：先 Temporal Update 成功、再更新 Postgres
 // 镜像；镜像失败则把 Temporal 补偿回旧 Spec，使二者不漂移，并把镜像错误上抛（调用方
@@ -1469,8 +1503,7 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 		if sc.ExecutionMode != "" {
 			params.ExecutionMode = sc.ExecutionMode
 		}
-		params.RuntimeVersion = s.runtimeVersionFor(
-			schedID, params.ExecutionMode)
+		params = s.actionParamsFor(params)
 		if workflow.IsCompiledToolRuntimeV2(params.RuntimeVersion) {
 			if err := requireToolRuntimeDefinition(
 				ctx, s.st,
@@ -1492,6 +1525,20 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 			oldSpec = sch.Spec
 			sch.Spec = &sdkSpec
 			if wantArgs != nil {
+				formalV3, isFormalV3, decodeV3Err := decodeResearchScheduledActionV3(sch.Action)
+				if decodeV3Err != nil {
+					return nil, decodeV3Err
+				}
+				if isFormalV3 {
+					if s.researchV3.authorityID != schedID ||
+						formalV3.TenantID != sc.TenantID || formalV3.UserID != userID ||
+						formalV3.TaskID != schedID {
+						return nil, types.NewAppError(types.CodeConflict,
+							"research V3 Schedule Action is outside the exact authority scope", types.ErrConflict)
+					}
+					return nil, types.NewAppError(types.CodeConflict,
+						"research V3 task name must be changed through the V3 definition editor", types.ErrConflict)
+				}
 				wf, ok := sch.Action.(*client.ScheduleWorkflowAction)
 				if !ok {
 					return nil, fmt.Errorf("调度 %s 的 Action 非 workflow 类型，无法回写任务名", schedID)
@@ -1520,6 +1567,10 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 		},
 	})
 	if err != nil {
+		var appErr *types.AppError
+		if errors.As(err, &appErr) {
+			return appErr
+		}
 		var nf *serviceerror.NotFound
 		if errors.As(err, &nf) {
 			return types.NewAppError(types.CodeNotFound,

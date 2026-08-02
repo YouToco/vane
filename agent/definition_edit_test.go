@@ -177,7 +177,7 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Reply != "已修改定时推送任务（id=task-edit-1）。" {
+	if out.Reply != "已修改定时推送任务。" {
 		t.Fatalf("Reply=%q", out.Reply)
 	}
 	if len(chat.requests) != 6 {
@@ -380,7 +380,7 @@ func TestNaturalTaskDefinitionEditSupportsPoliteShortName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Reply != "已修改定时推送任务（id=task-brief）。" {
+	if out.Reply != "已修改定时推送任务。" {
 		t.Fatalf("Reply=%q", out.Reply)
 	}
 	if len(list.calls) != 1 || list.calls[0].args != `{"query":"早报"}` {
@@ -499,7 +499,7 @@ func TestNaturalTaskDefinitionEditAmbiguityExposesNoWriteTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if followup.Reply != "已修改定时推送任务（id=task-ai-weekly）。" {
+	if followup.Reply != "已修改定时推送任务。" {
 		t.Fatalf("followup Reply=%q", followup.Reply)
 	}
 	if len(list.calls) != 2 {

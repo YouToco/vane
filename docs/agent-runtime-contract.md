@@ -5,6 +5,10 @@
 > 写入口，但 Agent 以 server-owned receipt 自动授权推进，不再发行新确认卡。
 > 2026-07-29 起 Agent 只从任务手册选择版本化 Tool。旧 target projection
 > 仅作为可恢复 v1 Run 与历史内容证据的迁移兼容根。
+> 2026-08-01 起交互 Agent 的用户历史读取统一迁移到
+> [Agent-first 用户情报与证据契约](agent-first-intelligence-contract.md)。该契约不改变
+> V1/V2 replay。`vane.task-approved-definition/v3` 是新任务的目标协议；V3 切流前，
+> 本文件中的 compiled/discover_at_run 旧实现仍只描述历史运行面。
 
 ## 1. 产品语义
 
@@ -249,7 +253,28 @@ schema version 分派到固定 reader；不得先调用 current DTO validator，
 
 `discover_at_run` 的空计划永远不得进入 legacy“抓全部订阅源”分支。
 
-### 3.2 C0/C1 的主体边界
+### 3.2 V3 研究运行冻结点
+
+`vane.task-approved-definition/v3` 只保存任务名称、完整任务手册、Schedule spec、通知门槛、
+输出偏好、planner budget 和投递策略。V3 定义禁止出现 `ToolCalls`、Source、subscription、
+fetch target 或创建时推测的长期抓取计划；`Schedule.Spec` 在迁移和影子运行期间保持不变。
+
+每次 V3 run 在数据库时钟确定的 `history_through_utc` 冻结：当前 V3 definition head、
+capability catalog、Tool/prompt/model/quota policy，以及 planner budget。Temporal history 只接收
+`vane.research-run-snapshot-ref/v3` 安全引用，不接收任务手册、prompt、Tool schema 或凭证。
+V1/V2 snapshot reader 与 admission function 不修改；migration 只按 reference schema 把 V3
+写入路由到独立准入围栏。
+
+Planner 输出的 canonical plan 先写入 append-only `research_run_plans`，Workflow 只接收
+`vane.research-run-plan-ref/v3`。每个外部 Tool 调用必须先在 `research_run_steps` 写入唯一
+`started` receipt，之后才能 I/O；completed/failed/indeterminate 终态必须绑定同一 plan、ordinal、
+invocation、Tool 和 request digest。应用角色对这两张账本没有 UPDATE/DELETE 权限。
+
+V3 历史读取以 snapshot 的数据库 cutoff 为上界，禁止把当前时间或模型猜测当成“昨天”的边界。
+首个真实任务切流前，V3 writer、workflow dispatch 和投递仍保持 dark；旧 V1/V2 run 继续按原 reader
+恢复与回放。
+
+### 3.3 C0/C1 的主体边界
 
 C0/C1 只为有持久 TaskID 的 scheduled/manual task run 建快照。账户级 ad-hoc run 已删除；
 不得用空 TaskID、`discover_at_run` 或 legacy scope 绕过，也不得借用其他任务的记忆、

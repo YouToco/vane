@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -36,6 +37,17 @@ func (s *Store) claimAuthorizedPushEffect(
 	params pusheffect.AuthorizedClaimParams,
 	reconciliation bool,
 ) (*pusheffect.Effect, pusheffect.AuthorizedClaimDecision, error) {
+	return s.claimAuthorizedPushEffectWithGate(ctx, params, reconciliation, nil)
+}
+
+type pushEffectClaimGate func(context.Context, pgx.Tx, *pusheffect.Effect) error
+
+func (s *Store) claimAuthorizedPushEffectWithGate(
+	ctx context.Context,
+	params pusheffect.AuthorizedClaimParams,
+	reconciliation bool,
+	gate pushEffectClaimGate,
+) (*pusheffect.Effect, pusheffect.AuthorizedClaimDecision, error) {
 	if err := validatePushEffectClaim(params.ClaimParams); err != nil {
 		return nil, "", err
 	}
@@ -69,8 +81,23 @@ func (s *Store) claimAuthorizedPushEffect(
 		return nil, "", pushEffectConflict(
 			"push effect is outside the enabled recovery task")
 	}
-	if err := validatePushEffectRunSnapshotForClaim(ctx, tx, effect); err != nil {
+	v3Identity, v3Snapshot, err := validatePushEffectRunSnapshotForClaim(ctx, tx, effect)
+	if err != nil {
 		return nil, "", err
+	}
+	// Generic fresh recovery and ambiguous reconciliation are V3 delivery
+	// entry points too. They must cross the same exact cutover fence as the
+	// workflow-owned first claim. Sent-receipt settlement never enters claim.
+	if v3Identity != nil && v3Snapshot != nil {
+		if _, err := RequireResearchV3DeliveryAuthorityForClaimTx(
+			ctx, tx, *v3Identity, *v3Snapshot); err != nil {
+			return nil, "", err
+		}
+	}
+	if gate != nil {
+		if err := gate(ctx, tx, effect); err != nil {
+			return nil, "", err
+		}
 	}
 	admitted, err := canonicalBriefPushRecoveryAdmittedV1(
 		ctx, tx, effect)
@@ -198,6 +225,64 @@ func canonicalBriefPushRecoveryAdmittedV1(
 		// frozen by Tool provenance plus the durable effect itself.
 		return true, nil
 	}
+	if referenceSchema == types.ResearchRunSnapshotRefSchemaV3 {
+		var briefID, planID int64
+		var anchorReferenceDigest, anchorBriefDigest string
+		err := tx.QueryRow(ctx, `
+			SELECT brief_id,plan_id,brief_reference_digest,brief_digest
+			  FROM research_brief_deliveries
+			 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
+			   AND run_snapshot_id=$4 AND batch_id=$5 AND effect_id=$6
+			   AND status='prepared'`,
+			effect.TenantID, effect.UserID, effect.TaskID,
+			effect.RunSnapshotID, effect.BatchID, effect.ID).Scan(
+			&briefID, &planID, &anchorReferenceDigest, &anchorBriefDigest)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, pushEffectDatabaseError(
+				"load research Brief push recovery anchor", err)
+		}
+		var briefRow ResearchBriefSynthesisV3
+		var briefStatus string
+		err = tx.QueryRow(ctx, `
+			SELECT id,tenant_id,user_id,task_id,run_snapshot_id,plan_id,
+			       temporal_workflow_id,temporal_run_id,definition_digest,plan_digest,
+			       notification_threshold,request_digest,evidence_digest,history_digest,
+			       status,significance,decision,delivery_required,brief_digest,finalized_at
+			  FROM research_brief_syntheses
+			  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4
+			    AND run_snapshot_id=$5 AND plan_id=$6
+			    AND temporal_run_id=$7 AND status='finalized'
+			    AND delivery_required=true`,
+			briefID, effect.TenantID, effect.UserID, effect.TaskID,
+			effect.RunSnapshotID, planID, effect.RunID).Scan(
+			&briefRow.ID, &briefRow.TenantID, &briefRow.UserID, &briefRow.TaskID,
+			&briefRow.RunSnapshotID, &briefRow.PlanID, &briefRow.TemporalWorkflowID,
+			&briefRow.TemporalRunID, &briefRow.DefinitionDigest, &briefRow.PlanDigest,
+			&briefRow.NotificationThreshold, &briefRow.RequestDigest,
+			&briefRow.EvidenceDigest, &briefRow.HistoryDigest, &briefStatus,
+			&briefRow.Significance, &briefRow.Decision, &briefRow.DeliveryRequired,
+			&briefRow.BriefDigest, &briefRow.FinalizedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, pushEffectDatabaseError(
+				"load finalized research Brief push recovery evidence", err)
+		}
+		briefRow.Status = ResearchBriefSynthesisStatusV3(briefStatus)
+		briefRef, err := researchBriefRefFromSynthesisV3(briefRow)
+		if err != nil {
+			return false, err
+		}
+		return briefRef.BriefID == briefID && briefRef.PlanID == planID &&
+			briefRef.RunSnapshotID == effect.RunSnapshotID &&
+			briefRef.BriefDigest == anchorBriefDigest &&
+			subtle.ConstantTimeCompare([]byte(briefRef.ReferenceDigest),
+				[]byte(anchorReferenceDigest)) == 1, nil
+	}
 	var available bool
 	if err := tx.QueryRow(ctx, `
 		SELECT to_regprocedure(
@@ -228,7 +313,7 @@ func validatePushEffectRunSnapshotForClaim(
 	ctx context.Context,
 	tx pgx.Tx,
 	effect *pusheffect.Effect,
-) error {
+) (*types.RunIdentity, *types.ResearchRunSnapshotRefV3, error) {
 	var snapshot taskRunSnapshot
 	var rawMode string
 	err := tx.QueryRow(ctx, `
@@ -246,18 +331,18 @@ func validatePushEffectRunSnapshotForClaim(
 		&snapshot.QuotaPolicyDigest, &snapshot.DefinitionDigest,
 		&snapshot.PlanDigest, &snapshot.PayloadDigest,
 		&snapshot.ReferenceDigest, &snapshot.ReferenceSchemaVersion,
-		&snapshot.BudgetJSON,
+		&snapshot.Payload, &snapshot.BudgetJSON, &snapshot.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return pushEffectIntegrity()
+		return nil, nil, pushEffectIntegrity()
 	}
 	if err != nil {
-		return pushEffectDatabaseError(
+		return nil, nil, pushEffectDatabaseError(
 			"load authorized claim run snapshot", err)
 	}
 	mode, err := types.ParseExecutionMode(rawMode)
 	if err != nil {
-		return pushEffectIntegrity()
+		return nil, nil, pushEffectIntegrity()
 	}
 	snapshot.Mode = mode
 	var temporalWorkflowID string
@@ -270,9 +355,36 @@ func validatePushEffectRunSnapshotForClaim(
 			ref.UserID != effect.UserID ||
 			ref.TaskID != effect.TaskID ||
 			ref.TemporalRunID != effect.RunID {
-			return pushEffectIntegrity()
+			return nil, nil, pushEffectIntegrity()
 		}
 		temporalWorkflowID = ref.TemporalWorkflowID
+	case types.ResearchRunSnapshotRefSchemaV3:
+		identity := types.RunIdentity{
+			TemporalWorkflowID: snapshot.TemporalWorkflowID,
+			TemporalRunID:      snapshot.TemporalRunID,
+			RunKind:            snapshot.RunKind,
+			TenantID:           snapshot.TenantID,
+			UserID:             snapshot.UserID,
+			TaskID:             snapshot.TaskID,
+		}
+		fullSnapshot, found, err := loadResearchRunSnapshotRowV3(ctx, tx,
+			CreateOrGetTaskRunSnapshotParams{
+				TenantID: identity.TenantID, UserID: identity.UserID,
+				TaskID: identity.TaskID, TemporalWorkflowID: identity.TemporalWorkflowID,
+				TemporalRunID: identity.TemporalRunID,
+			})
+		if err != nil {
+			return nil, nil, err
+		}
+		ref, err := validateStoredResearchRunSnapshotV3(identity, fullSnapshot)
+		if !found || err != nil || ref.SnapshotID != effect.RunSnapshotID ||
+			ref.TenantID != effect.TenantID || ref.UserID != effect.UserID ||
+			ref.TaskID != effect.TaskID || ref.TemporalRunID != effect.RunID {
+			return nil, nil, pushEffectIntegrity()
+		}
+		// V3 Workflow IDs are independently sealed by the research capability
+		// and do not use the legacy scheduled/manual naming grammar.
+		return &identity, &ref, nil
 	default:
 		ref, err := snapshot.safeRef()
 		if err != nil ||
@@ -281,22 +393,22 @@ func validatePushEffectRunSnapshotForClaim(
 			ref.UserID != effect.UserID ||
 			ref.TaskID != effect.TaskID ||
 			ref.TemporalRunID != effect.RunID {
-			return pushEffectIntegrity()
+			return nil, nil, pushEffectIntegrity()
 		}
 		temporalWorkflowID = ref.TemporalWorkflowID
 	}
 	if temporalWorkflowID == scheduledTaskWorkflowID(effect.TaskID) {
-		return nil
+		return nil, nil, nil
 	}
 	if !validTaskRunWorkflowExecutionIDV1(
 		effect.TaskID, temporalWorkflowID,
 	) {
-		return pushEffectIntegrity()
+		return nil, nil, pushEffectIntegrity()
 	}
 	// Temporal Schedule appends the nominal UTC time to ordinary executions.
 	// The sealed snapshot and exact effect coordinates provide the authority;
 	// no separate repair-era workflow allowlist is needed.
-	return nil
+	return nil, nil, nil
 }
 
 const pushEffectRunSnapshotReferenceColumns = `id, tenant_id, user_id, task_id,
@@ -304,7 +416,7 @@ const pushEffectRunSnapshotReferenceColumns = `id, tenant_id, user_id, task_id,
 	adaptive_version, capability_catalog_digest, tool_policy_digest,
 	prompt_policy_digest, model_policy_digest, quota_policy_digest,
 	definition_digest, plan_digest, payload_digest, reference_digest,
-	reference_schema_version, budget`
+	reference_schema_version, payload, budget, created_at`
 
 func loadAuthorizedPushEffectClaimReplay(
 	ctx context.Context,

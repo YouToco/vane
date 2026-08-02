@@ -639,7 +639,8 @@ func taskDefinitionEditStartupStoreCalls(
 			}
 			receiver, receiverOK := taskDefinitionEditStoreUnparen(selector.X).(*ast.Ident)
 			return receiverOK && receiver.Name == "store" &&
-				selector.Sel.Name == "New"
+				(selector.Sel.Name == "New" || selector.Sel.Name == "NewWithResearchRuntime" ||
+					selector.Sel.Name == "NewServerRuntimeWithResearchRuntimeCapability")
 		})
 		if !constructsStore {
 			continue
@@ -652,7 +653,7 @@ func taskDefinitionEditStartupStoreCalls(
 		}
 	}
 	if storeObject == nil {
-		return nil, fmt.Errorf("cmd/server run must bind store.New result to st")
+		return nil, fmt.Errorf("cmd/server run must bind a Store constructor result to st")
 	}
 
 	totalCalls := 0

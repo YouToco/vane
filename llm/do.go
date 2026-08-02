@@ -186,10 +186,28 @@ func do(
 
 	// 失败路径的 ctx 往往已经超时/取消；记账与配额对账共享一个有硬上限的
 	// detached tail。调用已完成，不该漏账，也不能让 DB stall 无限拖住 Activity。
-	// 若 HTTP 200 的业务形态不合法但上游已返回 usage，metadata-only resp 仍会
-	// 把真实 token 落账；只有完全拿不到 usage 时才维持既有保守对账语义。
+	// HTTP 429/4xx 是上游明确拒绝，actual=0 可安全退还；但 timeout、5xx、
+	// 读取/解析响应失败都可能发生在供应商已生成并计费之后。用量未知时保留
+	// 事前预扣，与 DoChat 保持相同的保守语义。若 HTTP 200 业务形态不合法
+	// 但上游已返回 usage，metadata-only resp 仍会按真实 token 对账。
+	actualTokens := call.PromptTokens + call.CompletionTokens
+	if resp != nil && !resp.UsageReported {
+		reconcileQuota = false
+		slog.Warn("llm: response omitted usage, retaining conservative precharge",
+			"trace_id", meta.TraceID,
+			"model", c.requestModel(req.Model),
+			"reserved_tokens", reserved)
+	}
+	if err != nil && resp == nil && types.CodeOf(err) == types.CodeLLMUnavailable {
+		reconcileQuota = false
+		slog.Warn("llm: 响应用量未知，保留单轮调用的保守预扣",
+			"trace_id", meta.TraceID,
+			"model", c.requestModel(req.Model),
+			"reserved_tokens", reserved,
+			"error_code", types.CodeOf(err))
+	}
 	rec.finishCallAccountingWithReservation(ctx, call, meta.TenantID, meta.UserID, reserved,
-		call.PromptTokens+call.CompletionTokens, meta.QuotaRule, reconcileQuota)
+		actualTokens, meta.QuotaRule, reconcileQuota)
 	if err != nil {
 		// metadata-only response 只用于内部记账，不能让业务调用方误用不完整结果。
 		return nil, err
