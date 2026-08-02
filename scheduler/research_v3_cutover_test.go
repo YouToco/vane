@@ -94,6 +94,28 @@ func (f *researchV3CutoverJournalFake) RecheckResearchV3CutoverDefinition(
 	return f.recheckErr
 }
 
+func (f *researchV3CutoverJournalFake) PromoteResearchV3PreparedDefinition(
+	_ context.Context, op types.ResearchV3CutoverOperation,
+) (types.ResearchV3CutoverOperation, error) {
+	if f.op.ID != op.ID || f.op.Phase != types.ResearchV3CutoverPaused {
+		return types.ResearchV3CutoverOperation{}, types.ErrConflict
+	}
+	f.op.Phase = types.ResearchV3CutoverDefinitionPromoted
+	f.events = append(f.events, "phase:"+string(f.op.Phase))
+	return f.op, nil
+}
+
+func (f *researchV3CutoverJournalFake) RestoreResearchV3OriginalDefinition(
+	_ context.Context, op types.ResearchV3CutoverOperation,
+) (types.ResearchV3CutoverOperation, error) {
+	if f.op.ID != op.ID || f.op.Phase != types.ResearchV3CutoverRollbackPaused {
+		return types.ResearchV3CutoverOperation{}, types.ErrConflict
+	}
+	f.op.Phase = types.ResearchV3CutoverDefinitionRestored
+	f.events = append(f.events, "phase:"+string(f.op.Phase))
+	return f.op, nil
+}
+
 func (f *researchV3CutoverJournalFake) BeginResearchV3RollbackPause(
 	_ context.Context, op types.ResearchV3CutoverOperation, token []byte, digest string,
 ) (types.ResearchV3CutoverOperation, error) {

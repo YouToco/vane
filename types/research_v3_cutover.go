@@ -11,10 +11,12 @@ const (
 	ResearchV3CutoverPrepared               ResearchV3CutoverPhase = "prepared"
 	ResearchV3CutoverPauseRequested         ResearchV3CutoverPhase = "pause_requested"
 	ResearchV3CutoverPaused                 ResearchV3CutoverPhase = "paused"
+	ResearchV3CutoverDefinitionPromoted     ResearchV3CutoverPhase = "definition_promoted"
 	ResearchV3CutoverActionSwapped          ResearchV3CutoverPhase = "action_swapped"
 	ResearchV3CutoverActive                 ResearchV3CutoverPhase = "active"
 	ResearchV3CutoverRollbackPauseRequested ResearchV3CutoverPhase = "rollback_pause_requested"
 	ResearchV3CutoverRollbackPaused         ResearchV3CutoverPhase = "rollback_paused"
+	ResearchV3CutoverDefinitionRestored     ResearchV3CutoverPhase = "definition_restored"
 	ResearchV3CutoverRolledBack             ResearchV3CutoverPhase = "rolled_back"
 	ResearchV3CutoverAborted                ResearchV3CutoverPhase = "aborted"
 	ResearchV3CutoverManualIntervention     ResearchV3CutoverPhase = "manual_intervention"
@@ -37,6 +39,8 @@ type ResearchV3CutoverOperation struct {
 	IdempotencyKey            string
 	Generation                int64
 	Definition                ResearchV3DefinitionHead
+	OriginalExecutionMode     ExecutionMode
+	OriginalDefinition        *ResearchV3DefinitionHead
 	FrozenSchedule            []byte
 	FrozenScheduleDigest      string
 	FrozenConflictToken       []byte

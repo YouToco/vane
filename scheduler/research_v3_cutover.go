@@ -16,6 +16,7 @@ import (
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
@@ -37,6 +38,12 @@ type researchV3CutoverJournal interface {
 	RecheckResearchV3CutoverDefinition(
 		context.Context, types.ResearchV3CutoverOperation,
 	) error
+	PromoteResearchV3PreparedDefinition(
+		context.Context, types.ResearchV3CutoverOperation,
+	) (types.ResearchV3CutoverOperation, error)
+	RestoreResearchV3OriginalDefinition(
+		context.Context, types.ResearchV3CutoverOperation,
+	) (types.ResearchV3CutoverOperation, error)
 	BeginResearchV3RollbackPause(
 		context.Context, types.ResearchV3CutoverOperation, []byte, string,
 	) (types.ResearchV3CutoverOperation, error)
@@ -52,6 +59,16 @@ type researchV3CutoverJournal interface {
 type researchV3ScheduleRemote interface {
 	Describe(context.Context, string) (*workflowservice.DescribeScheduleResponse, error)
 	CompareAndSwap(context.Context, string, *schedulepb.Schedule, []byte, string) error
+}
+
+type researchV3DefinitionPrepareStore interface {
+	GetSchedule(context.Context, string, int64) (*types.Schedule, error)
+	PrepareResearchV3Definition(
+		context.Context, taskstate.ResearchV3DefinitionPrepareParams,
+	) (types.ResearchV3DefinitionPrepareOperation, error)
+	RollbackResearchV3DefinitionPrepare(
+		context.Context, int64, int64, string, string,
+	) (types.ResearchV3DefinitionPrepareOperation, error)
 }
 
 type researchV3ParamsEncoder func(any) (*commonpb.Payload, error)
@@ -72,6 +89,54 @@ type researchV3CutoverRequest struct {
 }
 
 const researchV3CutoverConflictRollbackTimeout = 30 * time.Second
+
+// PrepareResearchV3Definition creates only a delivery-dark sidecar head for
+// the exact configured shadow task. Tenant scope is resolved from the owner
+// mirror rather than accepted from an operator argument.
+func (s *Scheduler) PrepareResearchV3Definition(
+	ctx context.Context, p taskstate.ResearchV3DefinitionPrepareParams,
+) (types.ResearchV3DefinitionPrepareOperation, error) {
+	if s == nil || !s.researchV3.shadowIDMatch(p.TaskID) || p.TenantID != 0 ||
+		p.UserID <= 0 {
+		return types.ResearchV3DefinitionPrepareOperation{}, types.NewAppError(
+			types.CodeNotFound, "research V3 prepare task is not configured", types.ErrNotFound)
+	}
+	preparer, ok := s.st.(researchV3DefinitionPrepareStore)
+	if !ok {
+		return types.ResearchV3DefinitionPrepareOperation{}, types.NewAppError(
+			types.CodeInternal, "research V3 prepare dependencies are unavailable", nil)
+	}
+	mirror, err := preparer.GetSchedule(ctx, p.TaskID, p.UserID)
+	if err != nil {
+		return types.ResearchV3DefinitionPrepareOperation{}, err
+	}
+	if mirror == nil || mirror.ID != p.TaskID || mirror.UserID != p.UserID || mirror.TenantID <= 0 {
+		return types.ResearchV3DefinitionPrepareOperation{}, types.ErrNotFound
+	}
+	p.TenantID = mirror.TenantID
+	return preparer.PrepareResearchV3Definition(ctx, p)
+}
+
+func (s *Scheduler) RollbackResearchV3DefinitionPrepare(
+	ctx context.Context, taskID string, userID int64, idempotencyKey string,
+) (types.ResearchV3DefinitionPrepareOperation, error) {
+	if s == nil || !s.researchV3.shadowIDMatch(taskID) || userID <= 0 {
+		return types.ResearchV3DefinitionPrepareOperation{}, types.ErrNotFound
+	}
+	preparer, ok := s.st.(researchV3DefinitionPrepareStore)
+	if !ok {
+		return types.ResearchV3DefinitionPrepareOperation{}, types.ErrInternal
+	}
+	mirror, err := preparer.GetSchedule(ctx, taskID, userID)
+	if err != nil {
+		return types.ResearchV3DefinitionPrepareOperation{}, err
+	}
+	if mirror == nil || mirror.TenantID <= 0 || mirror.ID != taskID || mirror.UserID != userID {
+		return types.ResearchV3DefinitionPrepareOperation{}, types.ErrNotFound
+	}
+	return preparer.RollbackResearchV3DefinitionPrepare(
+		ctx, mirror.TenantID, userID, taskID, idempotencyKey)
+}
 
 func newResearchV3CutoverCoordinator(
 	exactTaskID string, journal researchV3CutoverJournal,
@@ -321,20 +386,25 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 			}
 		case types.ResearchV3CutoverPaused:
 			if observed.target {
-				current := op
-				var advanced types.ResearchV3CutoverOperation
-				advanced, err = c.advance(ctx, current, types.ResearchV3CutoverPaused, types.ResearchV3CutoverActionSwapped)
-				if err != nil && types.CodeOf(err) == types.CodeConflict {
-					return types.ResearchV3CutoverOperation{}, c.rollbackCutoverConflict(ctx, current, err)
-				}
-				if err == nil {
-					op = advanced
-				} else {
-					op = current
-				}
+				return types.ResearchV3CutoverOperation{}, c.rollbackCutoverConflict(ctx, op,
+					types.NewAppError(types.CodeConflict, "research V3 target Action appeared before definition promotion", types.ErrConflict))
 			} else if !observed.paused {
 				err = types.NewAppError(types.CodeConflict,
 					"research V3 cutover lost its paused fence", types.ErrConflict)
+			} else {
+				op, err = c.journal.PromoteResearchV3PreparedDefinition(ctx, op)
+			}
+		case types.ResearchV3CutoverDefinitionPromoted:
+			if !observed.paused {
+				err = types.NewAppError(types.CodeConflict,
+					"research V3 cutover lost its paused fence after definition promotion", types.ErrConflict)
+			} else if observed.target {
+				current := op
+				op, err = c.advance(ctx, current, types.ResearchV3CutoverDefinitionPromoted,
+					types.ResearchV3CutoverActionSwapped)
+				if err != nil && types.CodeOf(err) == types.CodeConflict {
+					return types.ResearchV3CutoverOperation{}, c.rollbackCutoverConflict(ctx, current, err)
+				}
 			} else if err = c.journal.RecheckResearchV3CutoverDefinition(ctx, op); err == nil {
 				err = c.casAction(ctx, op, desc, frozen, target, "swap-action")
 			} else if types.CodeOf(err) == types.CodeConflict {
@@ -369,7 +439,7 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 		case types.ResearchV3CutoverAborted:
 			return types.ResearchV3CutoverOperation{}, types.NewAppError(
 				types.CodeConflict, "research V3 cutover was aborted without Schedule ownership", types.ErrConflict)
-		case types.ResearchV3CutoverRollbackPaused, types.ResearchV3CutoverRolledBack:
+		case types.ResearchV3CutoverRollbackPaused, types.ResearchV3CutoverDefinitionRestored, types.ResearchV3CutoverRolledBack:
 			return types.ResearchV3CutoverOperation{}, types.NewAppError(
 				types.CodeConflict, "research V3 cutover is rolling back", types.ErrConflict)
 		default:
@@ -527,6 +597,25 @@ func (c *researchV3CutoverCoordinator) Rollback(
 			}
 			return op, nil
 		}
+		if op.Phase == types.ResearchV3CutoverDefinitionRestored {
+			if observed.target {
+				return types.ResearchV3CutoverOperation{}, types.NewAppError(
+					types.CodeConflict, "research V3 Action remained after definition restore", types.ErrConflict)
+			}
+			if observed.paused != op.OriginalPaused {
+				err = c.casState(ctx, op, desc, frozen, true, op.OriginalPaused, "rollback-state")
+				if err != nil && ctx.Err() != nil {
+					return types.ResearchV3CutoverOperation{}, err
+				}
+				continue
+			}
+			op, err = c.advance(ctx, op, types.ResearchV3CutoverDefinitionRestored,
+				types.ResearchV3CutoverRolledBack)
+			if err == nil {
+				return op, nil
+			}
+			continue
+		}
 		if op.Phase != types.ResearchV3CutoverRollbackPaused {
 			switch op.Phase {
 			case types.ResearchV3CutoverActive:
@@ -569,7 +658,7 @@ func (c *researchV3CutoverCoordinator) Rollback(
 						ctx, op, "research V3 rollback cannot prove pause ownership")
 				}
 				op, err = c.advance(ctx, op, op.Phase, types.ResearchV3CutoverRollbackPaused)
-			case types.ResearchV3CutoverActionSwapped:
+			case types.ResearchV3CutoverActionSwapped, types.ResearchV3CutoverDefinitionPromoted:
 				if !observed.paused {
 					token := append([]byte(nil), desc.GetConflictToken()...)
 					digest := sha256.Sum256(token)
@@ -604,16 +693,9 @@ func (c *researchV3CutoverCoordinator) Rollback(
 			}
 			continue
 		}
-		if observed.paused != op.OriginalPaused {
-			err = c.casState(ctx, op, desc, frozen, true, op.OriginalPaused, "rollback-state")
-			if err != nil && ctx.Err() != nil {
-				return types.ResearchV3CutoverOperation{}, err
-			}
-			continue
-		}
-		op, err = c.advance(ctx, op, types.ResearchV3CutoverRollbackPaused, types.ResearchV3CutoverRolledBack)
+		op, err = c.journal.RestoreResearchV3OriginalDefinition(ctx, op)
 		if err == nil {
-			return op, nil
+			continue
 		}
 		if latest, found, loadErr := c.journal.LoadResearchV3Cutover(
 			ctx, op.TenantID, op.UserID, op.TaskID, op.IdempotencyKey,

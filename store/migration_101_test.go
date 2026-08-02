@@ -18,7 +18,7 @@ func TestMigration101KeepsExactCutoverAuthorityDarkAndTransitionGuarded(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	sql := string(payload)
+	sql := strings.ReplaceAll(string(payload), "\r\n", "\n")
 	required := []string{
 		"vane_research_v3_cutover_operator NOLOGIN NOSUPERUSER",
 		"definition_digest,target_action_digest,action_authorization_digest,status\n) ON research_v3_delivery_authorities TO vane_app",

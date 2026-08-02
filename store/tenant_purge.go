@@ -83,8 +83,10 @@ var purgeOrder = []purgeStep{
 	{"schedule_commands", "tenant_id = $1"},
 	// Cutover journal is the authority child; both retain rollback evidence
 	// during ordinary task life and are removed only by explicit tenant purge.
+	{"research_v3_prepared_definition_heads", "tenant_id = $1"},
 	{"research_v3_cutover_operations", "tenant_id = $1"},
 	{"research_v3_delivery_authorities", "tenant_id = $1"},
+	{"research_v3_definition_prepare_operations", "tenant_id = $1"},
 	// 无 tenant_id、经 schedules 反查的两张（正因为没有 tenant_id，
 	// 「按 tenant_id 列对账」的守卫看不见它们，必须靠外键可达性那条守卫兜住）。
 	{"schedule_playbooks", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
@@ -436,6 +438,16 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		query    string
 		optional bool
 	}{
+		{
+			name: "research_v3_prepared_definition_heads",
+			query: `SELECT task_id FROM research_v3_prepared_definition_heads
+			         WHERE tenant_id = $1 ORDER BY user_id,task_id FOR UPDATE`,
+		},
+		{
+			name: "research_v3_definition_prepare_operations",
+			query: `SELECT id FROM research_v3_definition_prepare_operations
+			         WHERE tenant_id = $1 ORDER BY id FOR UPDATE`,
+		},
 		{
 			name: "research_v3_cutover_operations",
 			query: `SELECT id FROM research_v3_cutover_operations

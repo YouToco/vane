@@ -122,6 +122,26 @@ func newResearchBriefFixtureWithWorkflowV3(
 		taskID, definitionDigest); err != nil {
 		t.Fatal(err)
 	}
+	// Every V3 shadow now binds an explicit delivery-dark prepared sidecar;
+	// formal workflows continue to use the production head. Keep both equal in
+	// this general fixture so preflight tests can choose either workflow kind.
+	var prepareOperationID int64
+	if err := st.pool.QueryRow(ctx,
+		`INSERT INTO research_v3_definition_prepare_operations
+		 (tenant_id,user_id,task_id,idempotency_key,target_definition_version,
+		  target_definition_digest,original_execution_mode,
+		  original_definition_version,original_definition_digest)
+		 VALUES($1,$2,$3,$4,1,$5,'discover_at_run',1,$5) RETURNING id`,
+		tenantID, userID, taskID, "fixture-"+uuid.NewString(), definitionDigest,
+	).Scan(&prepareOperationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO research_v3_prepared_definition_heads
+		 (tenant_id,user_id,task_id,definition_version,definition_digest,prepare_operation_id)
+		 VALUES($1,$2,$3,1,$4,$5)`, tenantID, userID, taskID, definitionDigest, prepareOperationID); err != nil {
+		t.Fatal(err)
+	}
 	if authorityToken != "" {
 		authoritySum := sha256.Sum256([]byte(authorityToken))
 		if _, err := st.pool.Exec(ctx, `
