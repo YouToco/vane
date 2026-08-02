@@ -1067,16 +1067,17 @@ func (s *Scheduler) buildPreparedTaskSchedule(req TaskScheduleRequest) (Prepared
 		scope.SourceIDs = slices.Clone(req.Scope.SourceIDs)
 	}
 	params := makePushParams(req.TenantID, req.UserID, taskID, scope, name)
-	runtimeVersion := s.runtimeVersionFor(taskID, types.ExecutionModeCompiled)
+	params = s.actionParamsFor(params)
+	runtimeVersion := params.RuntimeVersion
 	fingerprintVersion := taskScheduleFingerprintVersionV1
 	if workflow.IsCompiledRuntimeV1(runtimeVersion) ||
-		workflow.IsCompiledToolRuntimeV2(runtimeVersion) {
+		workflow.IsCompiledToolRuntimeV2(runtimeVersion) ||
+		workflow.IsResearchRuntimeV3(runtimeVersion) {
 		// A v2 checkpoint is written only for an explicitly selected C1b
 		// canary/all-task rollout. This keeps dark deployment expansion-safe:
 		// an older binary can still resume every checkpoint written before C1b
 		// is deliberately activated.
 		fingerprintVersion = taskScheduleFingerprintVersion
-		params.RuntimeVersion = runtimeVersion
 	} else {
 		// Preserve the exact semantic v1 Action envelope. buildTaskScheduleExpected
 		// upgrades it deterministically before Temporal I/O, while the durable
@@ -1236,8 +1237,17 @@ func ValidatePreparedTaskScheduleRequest(
 	}
 	params := prepared.Action.Params
 	if params.UserID != req.UserID || params.RunKind != workflow.PushRunKindScheduled ||
-		params.ScheduleID != taskID ||
-		params.NLDesc != strings.TrimSpace(req.NLDescription) ||
+		params.ScheduleID != taskID {
+		return errors.New("prepared workflow parameters differ from the request")
+	}
+	if workflow.IsResearchRuntimeV3(params.RuntimeVersion) {
+		if params.TenantID != req.TenantID ||
+			params.ExecutionMode != types.ExecutionModeDiscoverAtRun ||
+			params.NLDesc != "" || params.Scope.TopN != 0 ||
+			len(params.Scope.SourceIDs) != 0 || params.Snapshot != nil {
+			return errors.New("prepared research V3 workflow parameters differ from the request")
+		}
+	} else if params.NLDesc != strings.TrimSpace(req.NLDescription) ||
 		params.Scope.TopN != req.Scope.TopN ||
 		!slices.Equal(params.Scope.SourceIDs, req.Scope.SourceIDs) {
 		return errors.New("prepared workflow parameters differ from the request")
@@ -1306,7 +1316,6 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 		{"workflow_type", prepared.Action.WorkflowType},
 		{"action_id", prepared.Action.ActionID},
 		{"activation_note", prepared.Action.ActivationNote},
-		{"nl_description", prepared.Action.Params.NLDesc},
 		{"creation.note", prepared.Creation.Note},
 	} {
 		if err := validateTaskScheduleString(field.name, field.value, true); err != nil {
@@ -1348,6 +1357,13 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 			params.RuntimeVersion != "" {
 			return errors.New("v1 workflow params are not in the retained legacy shape")
 		}
+	} else if workflow.IsResearchRuntimeV3(params.RuntimeVersion) {
+		if params.TenantID != prepared.TenantID ||
+			params.ExecutionMode != types.ExecutionModeDiscoverAtRun ||
+			params.NLDesc != "" || params.Scope.TopN != 0 ||
+			len(params.Scope.SourceIDs) != 0 {
+			return errors.New("v2 research V3 workflow params are not an exact discover-at-run envelope")
+		}
 	} else {
 		if params.TenantID != prepared.TenantID || params.ExecutionMode != types.ExecutionModeCompiled {
 			return errors.New("v2 workflow params do not match the prepared tenant and compiled mode")
@@ -1356,6 +1372,11 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 			!workflow.IsCompiledRuntimeV1(params.RuntimeVersion) &&
 			!workflow.IsCompiledToolRuntimeV2(params.RuntimeVersion) {
 			return errors.New("prepared Schedule Action runtime version is unsupported")
+		}
+	}
+	if !workflow.IsResearchRuntimeV3(params.RuntimeVersion) {
+		if err := validateTaskScheduleString("nl_description", params.NLDesc, true); err != nil {
+			return err
 		}
 	}
 	if params.Scope.TopN < 0 {

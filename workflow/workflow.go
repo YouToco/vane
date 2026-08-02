@@ -52,7 +52,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 			return types.NewAppError(types.CodeValidation,
 				"research V3 scheduled run envelope is invalid", nil)
 		}
-		return runResearchPipelineV3(ctx, p, traceID, a)
+		return runResearchPipelineV3(ctx, p, traceID, a, true)
 	}
 
 	// counts 是漏斗快照，每步拿到结果后立刻累加（纯计算，确定性无碍）。

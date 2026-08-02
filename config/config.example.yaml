@@ -59,6 +59,10 @@ pipeline:
   # Source-free Tool runtime is deliberately single-task only. To roll back:
   # pause the task first, then clear this ID (V2 definitions cannot run on V1).
   tool_runtime_canary_schedule_id: ""
+  # Research V3 is exact-task only. Shadow never delivers; authority remains
+  # empty until receipt-backed delivery ships in a later build.
+  research_v3_shadow_canary_schedule_id: ""
+  research_v3_authority_canary_schedule_id: ""
   # P1-B exact-run lifecycle is independent and remains dark by default.
   run_outcome_enabled: false
   run_outcome_canary_schedule_id: ""

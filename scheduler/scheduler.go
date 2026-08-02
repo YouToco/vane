@@ -190,6 +190,7 @@ type Scheduler struct {
 	structuredInsight       structuredInsightRollout
 	structuredEventEvidence rolloutScopeV1
 	executiveBrief          rolloutScopeV1
+	researchV3              researchV3Rollout
 	commandAttempt          time.Duration
 }
 
@@ -298,8 +299,7 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 	// one active membership before creating Temporal state. A tenant-less fresh
 	// scheduled run is fail-closed and must never be created for later repair.
 	params := makePushParams(tenantID, userID, schedID, scope, nlDesc)
-	params.RuntimeVersion = s.runtimeVersionFor(
-		schedID, types.ExecutionModeCompiled)
+	params = s.actionParamsFor(params)
 
 	_, err = s.c.ScheduleClient().Create(ctx, client.ScheduleOptions{
 		ID:   schedID,
@@ -484,7 +484,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (up
 	// task to compiled merely because makePushParams is also used by legacy
 	// compiled creation paths.
 	want.ExecutionMode = sc.ExecutionMode
-	want.RuntimeVersion = s.runtimeVersionFor(sc.ID, sc.ExecutionMode)
+	want = s.actionParamsFor(want)
 
 	h := s.c.ScheduleClient().GetHandle(attemptCtx, sc.ID)
 	desc, err := h.Describe(attemptCtx)
@@ -1469,8 +1469,7 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 		if sc.ExecutionMode != "" {
 			params.ExecutionMode = sc.ExecutionMode
 		}
-		params.RuntimeVersion = s.runtimeVersionFor(
-			schedID, params.ExecutionMode)
+		params = s.actionParamsFor(params)
 		if workflow.IsCompiledToolRuntimeV2(params.RuntimeVersion) {
 			if err := requireToolRuntimeDefinition(
 				ctx, s.st,

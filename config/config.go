@@ -5,6 +5,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -155,6 +156,11 @@ type PipelineConfig struct {
 	// is pause-task first, then clear this ID; V2 deliberately has no allow-all
 	// switch and cannot be relabeled as the incompatible retained V1 runtime.
 	ToolRuntimeCanaryScheduleID string `mapstructure:"tool_runtime_canary_schedule_id"`
+	// ResearchV3ShadowCanaryScheduleID permits one exact no-delivery shadow run.
+	ResearchV3ShadowCanaryScheduleID string `mapstructure:"research_v3_shadow_canary_schedule_id"`
+	// ResearchV3AuthorityCanaryScheduleID is reserved for the future receipt-
+	// backed delivery cutover. Validate rejects every non-empty value today.
+	ResearchV3AuthorityCanaryScheduleID string `mapstructure:"research_v3_authority_canary_schedule_id"`
 	// RunOutcome* is the independent P1-B lifecycle rollout. It may select only
 	// Actions already selected by the compiled runtime rollout.
 	RunOutcomeEnabled          bool   `mapstructure:"run_outcome_enabled"`
@@ -387,6 +393,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_canary_schedule_id", "")
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
 	v.SetDefault("pipeline.tool_runtime_canary_schedule_id", "")
+	v.SetDefault("pipeline.research_v3_shadow_canary_schedule_id", "")
+	v.SetDefault("pipeline.research_v3_authority_canary_schedule_id", "")
 	v.SetDefault("pipeline.run_outcome_enabled", false)
 	v.SetDefault("pipeline.run_outcome_canary_schedule_id", "")
 	v.SetDefault("pipeline.run_outcome_allow_all", false)
@@ -528,6 +536,28 @@ func (c *Config) Validate() error {
 			return errors.New(
 				"config: Tool runtime canary 必须位于 compiled runtime rollout")
 		}
+	}
+	rawResearchV3ShadowID := c.Pipeline.ResearchV3ShadowCanaryScheduleID
+	researchV3ShadowID := strings.TrimSpace(rawResearchV3ShadowID)
+	if rawResearchV3ShadowID != "" && researchV3ShadowID == "" {
+		return errors.New(
+			"config: pipeline.research_v3_shadow_canary_schedule_id 不能仅含空白")
+	}
+	if researchV3ShadowID != "" && !validSnapshotShadowCanaryID(researchV3ShadowID) {
+		return errors.New(
+			"config: pipeline.research_v3_shadow_canary_schedule_id 必须是 1-255 字节的有效任务 ID，且不能包含控制字符")
+	}
+	c.Pipeline.ResearchV3ShadowCanaryScheduleID = researchV3ShadowID
+	rawResearchV3AuthorityID := c.Pipeline.ResearchV3AuthorityCanaryScheduleID
+	researchV3AuthorityID := strings.TrimSpace(rawResearchV3AuthorityID)
+	if rawResearchV3AuthorityID != "" && researchV3AuthorityID == "" {
+		return errors.New(
+			"config: pipeline.research_v3_authority_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.ResearchV3AuthorityCanaryScheduleID = researchV3AuthorityID
+	if researchV3AuthorityID != "" {
+		return errors.New(
+			"config: Research V3 authority canary 尚未启用 receipt-backed delivery，当前仅允许 shadow")
 	}
 	rawRunOutcomeCanaryID := c.Pipeline.RunOutcomeCanaryScheduleID
 	runOutcomeCanaryID := strings.TrimSpace(rawRunOutcomeCanaryID)
@@ -989,6 +1019,26 @@ func (c *Config) Validate() error {
 	if c.Fetch.CompiledExaCredentialGeneration < 0 ||
 		c.Fetch.CompiledTikHubCredentialGeneration < 0 {
 		return errors.New("config: fetch compiled credential generation 必须为正数")
+	}
+	if c.Pipeline.ResearchV3ShadowCanaryScheduleID != "" {
+		if strings.TrimSpace(c.DB.ResearchRuntimeURL) == "" {
+			return errors.New("config: Research V3 shadow 要求 db.research_runtime_url")
+		}
+		if c.DB.ResearchCapabilityKeyID == "" ||
+			len(c.DB.ResearchCapabilityKeyHex) != 64 {
+			return errors.New("config: Research V3 shadow 要求 active research capability key")
+		}
+		if _, err := hex.DecodeString(c.DB.ResearchCapabilityKeyHex); err != nil {
+			return errors.New("config: Research V3 shadow capability key hex 无效")
+		}
+		if c.LLM.CompiledEndpointGeneration <= 0 ||
+			c.LLM.CompiledCredentialGeneration <= 0 ||
+			c.Fetch.CompiledExaCredentialGeneration <= 0 {
+			return errors.New("config: Research V3 shadow 要求可用的 LLM/Exa retained generations")
+		}
+		if strings.TrimSpace(c.Fetch.ExaAPIKey) == "" {
+			return errors.New("config: Research V3 shadow 要求 fetch.exa_api_key")
+		}
 	}
 	return nil
 }

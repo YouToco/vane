@@ -49,10 +49,20 @@ var serverRuntimeForbiddenRoles = []string{
 
 var serverRuntimeProtectedRelations = []string{
 	"public.research_llm_gateway_attempts",
+	"public.research_llm_gateway_frozen_requests",
 	"public.research_llm_gateway_verifier_keys",
 	"public.research_run_capabilities",
+	"public.research_run_llm_spend_reservations",
 	"public.research_run_llm_spend_settlements",
 	"public.research_run_step_spend_settlements",
+}
+
+// Vane_app historically reads the LLM spend reservation/settlement ledger for
+// user-facing accounting. Capability and frozen-request bytes are a stricter
+// subset: no long-lived server capability may read them directly.
+var serverRuntimeForbiddenReadRelations = []string{
+	"public.research_llm_gateway_frozen_requests",
+	"public.research_run_capabilities",
 }
 
 // ProvisionServerRuntime installs the cluster-global runtime shell only after
@@ -60,8 +70,12 @@ var serverRuntimeProtectedRelations = []string{
 // directly as the migration/schema owner; migration 098 rejects SET ROLE and
 // delegated callers.
 func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
+	if err := callServerRuntimeProvisioner(
+		ctx, dbURL, "provision_vane_server_runtime_v1"); err != nil {
+		return err
+	}
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_v1")
+		ctx, dbURL, "provision_vane_server_runtime_research_binder_v1")
 }
 
 // DeprovisionServerRuntime removes only migration 098's exact memberships and
@@ -69,6 +83,10 @@ func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 // dependency error is intentional evidence of drift and is never papered over
 // with DROP OWNED.
 func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
+	if err := callServerRuntimeProvisioner(
+		ctx, dbURL, "deprovision_vane_server_runtime_research_binder_v1"); err != nil {
+		return err
+	}
 	return callServerRuntimeProvisioner(
 		ctx, dbURL, "deprovision_vane_server_runtime_v1")
 }
@@ -259,7 +277,7 @@ func validateServerRuntimeAuthorityRole(
 			ownsDatabase, ownsObject, canCreatePublic)
 	}
 
-	var protectedMutation, readsGatewaySecret bool
+	var protectedMutation, protectedRead, readsGatewaySecret bool
 	if err := tx.QueryRow(ctx, `
 		SELECT
 		  COALESCE(bool_or(
@@ -268,31 +286,44 @@ func validateServerRuntimeAuthorityRole(
 		    has_table_privilege($1,relation_name,'DELETE') OR
 		    has_table_privilege($1,relation_name,'TRUNCATE')
 		  ),false),
+		  COALESCE((SELECT bool_or(
+		    has_table_privilege($1,relation_name,'SELECT') OR
+		    has_any_column_privilege($1,relation_name,'SELECT')
+		  ) FROM unnest($3::text[]) AS forbidden_read(relation_name)),false),
 		  has_column_privilege($1,
 		    'public.research_llm_gateway_verifier_keys','secret','SELECT')
 		FROM unnest($2::text[]) AS relation_name`,
-		role, serverRuntimeProtectedRelations,
-	).Scan(&protectedMutation, &readsGatewaySecret); err != nil {
+		role, serverRuntimeProtectedRelations, serverRuntimeForbiddenReadRelations,
+	).Scan(&protectedMutation, &protectedRead, &readsGatewaySecret); err != nil {
 		return fmt.Errorf("inspect protected privileges for %s: %w", role, err)
 	}
-	if protectedMutation || readsGatewaySecret {
+	if protectedMutation || protectedRead || readsGatewaySecret {
 		return fmt.Errorf("server authority role %s has direct protected data privileges", role)
 	}
 
-	var gatewayFunctionCount int
+	var gatewayFunctionCount, binderFunctionCount int
 	if err := tx.QueryRow(ctx, `
-		SELECT count(*)
+		SELECT count(*),count(*) FILTER (WHERE
+		       proc.proname='bind_research_llm_process_gateway_v1' AND
+		       pg_catalog.pg_get_function_identity_arguments(proc.oid)=
+		       'requested_tenant_id bigint, requested_user_id bigint, requested_task_id text, requested_workflow_id text, requested_temporal_run_id text, requested_snapshot_id bigint, requested_reference_digest text, requested_reservation_id bigint')
 		  FROM pg_catalog.pg_proc proc
 		  JOIN pg_catalog.pg_namespace ns ON ns.oid=proc.pronamespace
 		 WHERE ns.nspname='public'
 		   AND (proc.proname LIKE '%research_llm_gateway%'
+		        OR proc.proname LIKE '%research_llm_process_gateway%'
 		        OR proc.proname LIKE 'settle_signed_research_run_llm_spend%'
 		        OR proc.proname LIKE 'sign_research_llm_gateway%')
 		   AND has_function_privilege($1,proc.oid,'EXECUTE')`, role,
-	).Scan(&gatewayFunctionCount); err != nil {
+	).Scan(&gatewayFunctionCount, &binderFunctionCount); err != nil {
 		return fmt.Errorf("inspect gateway function privileges for %s: %w", role, err)
 	}
-	if gatewayFunctionCount != 0 {
+	wantGatewayFunctions := 0
+	if role == serverRuntimeLoginRole {
+		wantGatewayFunctions = 1
+	}
+	if gatewayFunctionCount != wantGatewayFunctions ||
+		binderFunctionCount != wantGatewayFunctions {
 		return fmt.Errorf("server authority role %s can execute %d provider gateway functions",
 			role, gatewayFunctionCount)
 	}

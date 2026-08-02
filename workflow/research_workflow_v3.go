@@ -12,6 +12,7 @@ import (
 // Temporal history receives only immutable references and digests.
 func runResearchPipelineV3(
 	ctx workflow.Context, p PushParams, traceID string, a *Activities,
+	deliveryAuthority bool,
 ) error {
 	prepareCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
 	var prepared PrepareResearchRunV3Result
@@ -70,7 +71,7 @@ func runResearchPipelineV3(
 	if err := brief.ValidateFor(identity, prepared.Snapshot.SnapshotID, planned.Plan.PlanID); err != nil {
 		return err
 	}
-	if !prepared.DeliveryAllowed || !brief.DeliveryRequired {
+	if !deliveryAuthority || !prepared.DeliveryAllowed || !brief.DeliveryRequired {
 		return nil
 	}
 	deliveryCtx := workflow.WithActivityOptions(ctx, researchV3DeliveryOptions())

@@ -242,6 +242,30 @@ func TestResearchWorkflowV3HardNoDeliveryOverridesMajorBrief(t *testing.T) {
 	}
 }
 
+func TestResearchShadowWorkflowV3NeverDeliversEvenIfCoordinatorAllows(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "wf-research-v3-shadow"})
+	stubs := &researchWorkflowV3Stubs{
+		significance:    types.ResearchBriefSignificanceMajorV3,
+		deliveryAllowed: true,
+	}
+	stubs.register(env)
+	env.ExecuteWorkflow(ResearchShadowWorkflowV3, ResearchShadowInputV3{
+		TenantID: 7, UserID: 42, TaskID: "task-v3",
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	stubs.mu.Lock()
+	got := append([]string(nil), stubs.calls...)
+	stubs.mu.Unlock()
+	want := []string{"prepare", "plan", "step:0", "step:1", "synthesize"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("shadow calls=%v want=%v", got, want)
+	}
+}
+
 func TestResearchWorkflowV3InvalidEnvelopeHasNoActivity(t *testing.T) {
 	for _, mutate := range []func(*PushParams){
 		func(p *PushParams) { p.ExecutionMode = types.ExecutionModeCompiled },

@@ -46,6 +46,7 @@ import (
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/tikhubinvoke"
+	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
@@ -90,7 +91,59 @@ func run() error {
 		st.Close()
 		return fmt.Errorf("初始化 research gateway client: %w", err)
 	}
-	_ = gatewayClient // V3 LLM activity wiring lands with the process rollout.
+	var researchRuntimeOption workflow.ActivitiesOption
+	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+		researchExecutor, executorErr := fetcher.NewResearchExecutorV3(cfg.Fetch)
+		if executorErr != nil {
+			st.Close()
+			return fmt.Errorf("初始化 research V3 executor: %w", executorErr)
+		}
+		researchRuntime, runtimeErr := workflow.NewProductionResearchRuntimeV3(
+			st, gatewayClient, researchExecutor,
+			func(ctx context.Context, identity types.RunIdentity) (
+				runtimepolicy.BundleV1,
+				runtimepolicy.ResearchToolPolicyV3,
+				runtimepolicy.ResearchModelPolicyV3,
+				error,
+			) {
+				for _, bucket := range []store.QuotaBucket{
+					store.QuotaLLMTokens, store.QuotaExaCalls,
+				} {
+					if _, err := st.LoadQuotaRule(ctx, identity.TenantID, bucket); err != nil {
+						return runtimepolicy.BundleV1{},
+							runtimepolicy.ResearchToolPolicyV3{},
+							runtimepolicy.ResearchModelPolicyV3{}, err
+					}
+				}
+				current, err := runtimeconfig.BuildResearchRuntimeV3(
+					runtimeconfig.CurrentCompiledV1Input{
+						Model:                      cfg.LLM.Model,
+						TaskInstructionEnabled:     true,
+						ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
+						ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
+						ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
+						TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
+					})
+				if err != nil {
+					return runtimepolicy.BundleV1{},
+						runtimepolicy.ResearchToolPolicyV3{},
+						runtimepolicy.ResearchModelPolicyV3{}, err
+				}
+				return current.Bundle, current.Tools, current.Model, nil
+			},
+			func(identity types.RunIdentity) bool {
+				return identity.TaskID != "" &&
+					(identity.TaskID == cfg.Pipeline.ResearchV3ShadowCanaryScheduleID ||
+						identity.TaskID == cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID)
+			},
+		)
+		if runtimeErr != nil {
+			st.Close()
+			return fmt.Errorf("初始化 research V3 coordinator: %w", runtimeErr)
+		}
+		researchRuntimeOption = workflow.WithResearchRuntimeV3(researchRuntime)
+	}
 
 	// LLM 客户端 + 调用记账（写库失败只记日志，不影响主流程）。
 	llmClient := llm.New(cfg.LLM)
@@ -283,7 +336,8 @@ func run() error {
 			cfg.Pipeline.ObservationShadowCanaryScheduleID,
 			cfg.Pipeline.ObservationAuthorityCanaryScheduleID),
 		workflow.WithPushEffectCanary(
-			st, cfg.Pipeline.PushEffectCanaryScheduleID))
+			st, cfg.Pipeline.PushEffectCanaryScheduleID),
+		researchRuntimeOption)
 	periodicActivities, err := periodicbrief.NewActivities(
 		st, compiledModelResolver, recorder,
 		manager, cfg.Dashboard.Origin,
@@ -307,6 +361,7 @@ func run() error {
 	// 保证 Stop 不会采用 SDK 的 0 秒默认值、在 Activity 仍收尾时就释放 DB/Temporal。
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, temporalWorkerOptions())
 	w.RegisterWorkflow(workflow.PushPipelineWorkflow)
+	w.RegisterWorkflow(workflow.ResearchShadowWorkflowV3)
 	w.RegisterWorkflow(periodicbrief.WorkflowV1)
 	// 逐个注册（非整体 Register）：漏注册不会启动失败，而是每批推送在该活动上
 	// 重试到超时——EvolveProfile 的错误被 workflow 刻意吞掉，漏注册只会表现为
@@ -371,6 +426,12 @@ func run() error {
 		),
 		scheduler.WithCompiledToolRuntimeCanary(
 			cfg.Pipeline.ToolRuntimeCanaryScheduleID,
+		),
+		scheduler.WithResearchRuntimeV3ShadowCanary(
+			cfg.Pipeline.ResearchV3ShadowCanaryScheduleID,
+		),
+		scheduler.WithResearchRuntimeV3AuthorityCanary(
+			cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID,
 		),
 		scheduler.WithRunOutcomeRollout(
 			cfg.Pipeline.RunOutcomeEnabled,
