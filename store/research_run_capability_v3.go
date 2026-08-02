@@ -164,6 +164,9 @@ func (s *Store) resolveResearchRunCapabilityV1(
 			"begin research capability registration", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3AppScopeTx(ctx, tx, ref.TenantID, ref.UserID); err != nil {
+		return ResearchRunCapabilityV1{}, err
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
 		fmt.Sprintf("research-capability/v1:%d", ref.SnapshotID)); err != nil {
@@ -174,7 +177,7 @@ func (s *Store) resolveResearchRunCapabilityV1(
 		return ResearchRunCapabilityV1{}, err
 	}
 
-	registration, found, err := loadResearchRunCapabilityRegistrationV1(ctx, tx, ref.SnapshotID)
+	registration, found, err := loadResearchRunCapabilityRegistrationV1(ctx, tx, ref)
 	if err != nil {
 		return ResearchRunCapabilityV1{}, err
 	}
@@ -190,9 +193,12 @@ func (s *Store) resolveResearchRunCapabilityV1(
 			registration.TaskID != ref.TaskID ||
 			registration.WorkflowID != ref.TemporalWorkflowID ||
 			registration.TemporalRunID != ref.TemporalRunID ||
-			registration.ReferenceDigest != ref.ReferenceDigest ||
-			subtle.ConstantTimeCompare(registration.CapabilityDigest[:], digest[:]) != 1 {
-			return ResearchRunCapabilityV1{}, researchRunConflictError()
+			registration.ReferenceDigest != ref.ReferenceDigest {
+			return ResearchRunCapabilityV1{}, researchRunIntegrityError()
+		}
+		if subtle.ConstantTimeCompare(registration.CapabilityDigest[:], digest[:]) != 1 {
+			return ResearchRunCapabilityV1{}, types.NewAppError(types.CodeConflict,
+				"research run capability digest does not match the retained key", types.ErrConflict)
 		}
 		if !registration.NotAfter.After(time.Now()) {
 			return ResearchRunCapabilityV1{}, researchRunValidationError(
@@ -222,18 +228,15 @@ func (s *Store) resolveResearchRunCapabilityV1(
 			return ResearchRunCapabilityV1{}, researchRunValidationError(
 				"research run capability issuance window expired")
 		}
-		_, err = tx.Exec(ctx,
-			`INSERT INTO research_run_capabilities (
-			     run_snapshot_id,tenant_id,user_id,task_id,temporal_workflow_id,
-			     temporal_run_id,reference_digest,key_id,generation,
-			     capability_hash,not_after
-			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$10)`,
-			ref.SnapshotID, ref.TenantID, ref.UserID, ref.TaskID,
-			ref.TemporalWorkflowID, ref.TemporalRunID, ref.ReferenceDigest,
-			s.researchCapabilityActiveKey, digest[:], notAfter)
-		if err != nil {
-			return ResearchRunCapabilityV1{}, researchRunDatabaseError(
-				"register research run capability", err)
+		registration, err = registerResearchRunCapabilityRegistrationV1(ctx, tx,
+			ref, s.researchCapabilityActiveKey, digest[:], notAfter)
+		if err != nil || registration.KeyID != s.researchCapabilityActiveKey ||
+			subtle.ConstantTimeCompare(registration.CapabilityDigest[:], digest[:]) != 1 {
+			if err != nil {
+				return ResearchRunCapabilityV1{}, err
+			}
+			return ResearchRunCapabilityV1{}, types.NewAppError(types.CodeConflict,
+				"new research capability registration does not match active key", types.ErrConflict)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -273,8 +276,7 @@ func (s *Store) registerResearchRunCapabilityInControlTxV1(
 	if err := validateControlResearchRunSnapshotRefV3(ctx, tx, ref); err != nil {
 		return err
 	}
-	registration, found, err := loadResearchRunCapabilityRegistrationV1(
-		ctx, tx, ref.SnapshotID)
+	registration, found, err := loadResearchRunCapabilityRegistrationV1(ctx, tx, ref)
 	if err != nil {
 		return err
 	}
@@ -292,7 +294,8 @@ func (s *Store) registerResearchRunCapabilityInControlTxV1(
 			registration.TemporalRunID != ref.TemporalRunID ||
 			registration.ReferenceDigest != ref.ReferenceDigest ||
 			subtle.ConstantTimeCompare(registration.CapabilityDigest[:], digest[:]) != 1 {
-			return researchRunConflictError()
+			return types.NewAppError(types.CodeConflict,
+				"existing research capability registration does not match snapshot", types.ErrConflict)
 		}
 		return nil
 	}
@@ -309,16 +312,15 @@ func (s *Store) registerResearchRunCapabilityInControlTxV1(
 		return researchRunValidationError(
 			"research run capability issuance window expired")
 	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO research_run_capabilities (
-		     run_snapshot_id,tenant_id,user_id,task_id,temporal_workflow_id,
-		     temporal_run_id,reference_digest,key_id,generation,
-		     capability_hash,not_after
-		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$10)`,
-		ref.SnapshotID, ref.TenantID, ref.UserID, ref.TaskID,
-		ref.TemporalWorkflowID, ref.TemporalRunID, ref.ReferenceDigest,
-		s.researchCapabilityActiveKey, digest[:], notAfter); err != nil {
-		return researchRunDatabaseError("register research run capability", err)
+	registration, err = registerResearchRunCapabilityRegistrationV1(ctx, tx,
+		ref, s.researchCapabilityActiveKey, digest[:], notAfter)
+	if err != nil {
+		return err
+	}
+	if registration.KeyID != s.researchCapabilityActiveKey ||
+		subtle.ConstantTimeCompare(registration.CapabilityDigest[:], digest[:]) != 1 {
+		return types.NewAppError(types.CodeConflict,
+			"atomic research capability registration does not match active key", types.ErrConflict)
 	}
 	return nil
 }
@@ -334,17 +336,17 @@ func deriveResearchRunCapabilityV1(
 }
 
 func loadResearchRunCapabilityRegistrationV1(
-	ctx context.Context, tx pgx.Tx, snapshotID int64,
+	ctx context.Context, tx pgx.Tx, ref types.ResearchRunSnapshotRefV3,
 ) (researchRunCapabilityRegistrationV1, bool, error) {
 	var registration researchRunCapabilityRegistrationV1
 	var capabilityHash []byte
 	err := tx.QueryRow(ctx,
-		`SELECT id,run_snapshot_id,tenant_id,user_id,task_id,
-		        temporal_workflow_id,temporal_run_id,reference_digest,key_id,
-		        generation,capability_hash,not_after
-		   FROM research_run_capabilities
-		  WHERE run_snapshot_id=$1 AND revoked_at IS NULL
-		  ORDER BY generation DESC LIMIT 1`, snapshotID,
+		`SELECT out_id,out_run_snapshot_id,out_tenant_id,out_user_id,out_task_id,
+		        out_workflow_id,out_temporal_run_id,out_reference_digest,out_key_id,
+		        out_generation,out_capability_hash,out_not_after
+		   FROM resolve_research_run_capability_registration_v1($1,$2,$3,$4,$5,$6,$7)`,
+		ref.SnapshotID, ref.TenantID, ref.UserID, ref.TaskID,
+		ref.TemporalWorkflowID, ref.TemporalRunID, ref.ReferenceDigest,
 	).Scan(&registration.ID, &registration.RunSnapshotID,
 		&registration.TenantID, &registration.UserID, &registration.TaskID,
 		&registration.WorkflowID, &registration.TemporalRunID,
@@ -362,6 +364,34 @@ func loadResearchRunCapabilityRegistrationV1(
 	}
 	copy(registration.CapabilityDigest[:], capabilityHash)
 	return registration, true, nil
+}
+
+func registerResearchRunCapabilityRegistrationV1(ctx context.Context, tx pgx.Tx,
+	ref types.ResearchRunSnapshotRefV3, keyID string, capabilityHash []byte,
+	notAfter time.Time,
+) (researchRunCapabilityRegistrationV1, error) {
+	var registration researchRunCapabilityRegistrationV1
+	var storedHash []byte
+	err := tx.QueryRow(ctx, `SELECT out_id,out_run_snapshot_id,out_tenant_id,
+		out_user_id,out_task_id,out_workflow_id,out_temporal_run_id,
+		out_reference_digest,out_key_id,out_generation,out_capability_hash,out_not_after
+		FROM register_research_run_capability_registration_v1(
+		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, ref.SnapshotID, ref.TenantID,
+		ref.UserID, ref.TaskID, ref.TemporalWorkflowID, ref.TemporalRunID,
+		ref.ReferenceDigest, keyID, capabilityHash, notAfter).Scan(
+		&registration.ID, &registration.RunSnapshotID, &registration.TenantID,
+		&registration.UserID, &registration.TaskID, &registration.WorkflowID,
+		&registration.TemporalRunID, &registration.ReferenceDigest,
+		&registration.KeyID, &registration.Generation, &storedHash,
+		&registration.NotAfter)
+	if err != nil {
+		return registration, researchRunDatabaseError("register research run capability", err)
+	}
+	if len(storedHash) != sha256.Size {
+		return researchRunCapabilityRegistrationV1{}, researchRunIntegrityError()
+	}
+	copy(registration.CapabilityDigest[:], storedHash)
+	return registration, nil
 }
 
 func validateControlResearchRunSnapshotRefV3(
@@ -396,6 +426,9 @@ func (s *Store) loadControlResearchRunSnapshotRefV3(
 			"begin control snapshot read", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3AppScopeTx(ctx, tx, identity.TenantID, identity.UserID); err != nil {
+		return types.ResearchRunSnapshotRefV3{}, err
+	}
 	row, found, err := loadResearchRunSnapshotRowV3(ctx, tx,
 		CreateOrGetTaskRunSnapshotParams{
 			TenantID: identity.TenantID, UserID: identity.UserID,

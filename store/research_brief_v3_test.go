@@ -83,6 +83,11 @@ func newResearchBriefFixtureWithWorkflowV3(
 		taskID, tenantID, userID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.pool.Exec(ctx, `INSERT INTO schedule_playbooks
+		(schedule_id,content,fetch_plan) VALUES($1,$2,'{}')`, taskID,
+		"检查 Kimi 官方套餐；没有达到门槛不推送。"); err != nil {
+		t.Fatal(err)
+	}
 	definition, err := taskstate.BuildApprovedDefinitionV3(taskstate.ApprovedDefinitionInputV3{
 		TenantID: tenantID, UserID: userID, TaskID: taskID,
 		TaskName: "Kimi pricing", TaskManual: "检查 Kimi 官方套餐；没有达到门槛不推送。",
@@ -107,6 +112,12 @@ func newResearchBriefFixtureWithWorkflowV3(
 	}
 	definitionPayload, _ := taskstate.EncodeApprovedDefinitionV3(definition)
 	definitionDigest, _ := taskstate.DigestApprovedDefinitionV3(definition)
+	baseHead := &types.ResearchV3DefinitionHead{Version: 1, Digest: definitionDigest}
+	baselineDigest, err := sealResearchV3SourceBaseline(
+		definition, types.StrictnessStrict, types.ExecutionModeDiscoverAtRun, baseHead)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO task_approved_definition_versions (
 		     tenant_id,user_id,task_id,version,schema_version,execution_mode,
@@ -120,6 +131,28 @@ func newResearchBriefFixtureWithWorkflowV3(
 		`UPDATE schedules SET execution_mode='discover_at_run',
 		     approved_definition_version=1,approved_definition_digest=$2 WHERE id=$1`,
 		taskID, definitionDigest); err != nil {
+		t.Fatal(err)
+	}
+	// Every V3 shadow now binds an explicit delivery-dark prepared sidecar;
+	// formal workflows continue to use the production head. Keep both equal in
+	// this general fixture so preflight tests can choose either workflow kind.
+	var prepareOperationID int64
+	if err := st.pool.QueryRow(ctx,
+		`INSERT INTO research_v3_definition_prepare_operations
+		 (tenant_id,user_id,task_id,idempotency_key,target_definition_version,
+		  target_definition_digest,source_baseline_digest,original_execution_mode,
+		  original_definition_version,original_definition_digest)
+		 VALUES($1,$2,$3,$4,1,$5,$6,'discover_at_run',1,$5) RETURNING id`,
+		tenantID, userID, taskID, "fixture-"+uuid.NewString(), definitionDigest, baselineDigest,
+	).Scan(&prepareOperationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO research_v3_prepared_definition_heads
+		 (tenant_id,user_id,task_id,definition_version,definition_digest,prepare_operation_id,
+		  base_execution_mode,base_definition_version,base_definition_digest,source_baseline_digest)
+		 VALUES($1,$2,$3,1,$4,$5,'discover_at_run',1,$4,$6)`, tenantID, userID,
+		taskID, definitionDigest, prepareOperationID, baselineDigest); err != nil {
 		t.Fatal(err)
 	}
 	if authorityToken != "" {

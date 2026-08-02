@@ -1,6 +1,6 @@
 # Research V3 shadow runbook
 
-Research V3 shadow 是正式切流前的独立技术验证路径。它读取同一个已批准的 V3 任务定义，生成真实的 Planner、工具证据与 Brief，但在 Workflow 层强制不调用投递 Activity。
+Research V3 shadow 是正式切流前的独立技术验证路径。它读取 delivery-dark prepared sidecar 中的 V3 任务定义，生成真实的 Planner、工具证据与 Brief，但在 Workflow 层强制不调用投递 Activity。Prepare 不改变正式 Schedule 的 head、mode、Action 或 next run。
 
 ## 安全边界
 
@@ -10,13 +10,33 @@ Research V3 shadow 是正式切流前的独立技术验证路径。它读取同�
 - Authority 配置本身不会修改任何 Action。普通创建、编辑、reconcile 也永远不读取它来切 V3；只有 `researchcutover` 的持久化 saga 可以替换 exact-task Action。
 - 切流后的每次启动 reconcile 都会在 tenant/user RLS 事务中把正式 Action token 的哈希与同任务 `enabled` authority 实时比对；token 被替换或 authority 已撤销时启动 fail-closed，不能把故障拖到下一次周一运行。
 - Shadow 使用独立 Workflow ID，不读取、不更新、不触发原 Schedule；原 cron、时区、Overlap、Action 和下次周一 09:00 执行时间均保持不变。
-- Scheduler 再核验任务 owner、active 状态与 current canonical `vane.task-approved-definition/v3`。
+- Scheduler 再核验任务 owner、active 状态与 exact prepared `vane.task-approved-definition/v3` sidecar；不会回退读取正式 head。
 - Coordinator 在任何 Store、模型或网络副作用前再次核验精确任务授权。
 - 即使 coordinator 错误返回 `delivery_allowed=true`，Shadow Workflow 仍跳过投递。
 
 ## 执行
 
 先部署 migration、gateway、server 和 worker，并只配置 shadow ID。不要配置 authority ID。
+
+用显式 policy JSON 准备 sidecar；任务名称、完整手册与调度 spec 由 Store 从当前 owner 投影读取，policy 文件不能覆盖它们：
+
+```json
+{
+  "notification": {"minimum_significance": "major_updates_only", "suppress_empty": true},
+  "output": {"language": "zh-CN", "format": "executive_brief", "instructions": "", "include_evidence_links": true},
+  "planner_budget": {"max_planner_rounds": 8, "max_tool_calls": 16, "max_tokens": 32768, "max_cost_micro_usd": 1000000, "duration_ms": 300000}
+}
+```
+
+```powershell
+$env:VANE_MIGRATION_DB_URL = "<one-shot migration owner DSN>"
+/opt/vane/bin/vane-research-prepare -operation prepare -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <stable-prepare-key> -policy-file <policy.json>
+```
+
+Prepare 重试必须复用同一个 key。相同 key 但 task projection/policy 不同会 fail-closed；旧 immutable definition 不会覆盖或删除。
+`vane-research-prepare rollback` 只允许在尚未创建切流 journal 时执行；一旦
+cutover 进入 prepared、pause 或后续恢复阶段，sidecar 会被硬围栏保留，必须先由
+`vane-research-cutover rollback` 收敛到 `rolled_back`，避免调度已暂停但定义被删除。
 
 ```powershell
 go run ./cmd/researchshadow -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <stable-key>
@@ -47,7 +67,7 @@ go run ./cmd/researchcutover -operation cutover -task-id <schedule-id> -user-id 
 
 `researchcutover` 是一次性 operator 控制面，只接受 migration owner credential（也支持 systemd `CREDENTIALS_DIRECTORY/migration_db_url`）；长期运行的 `vane_server_runtime` 永远不获得 cutover operator 身份。
 
-该 saga 按“冻结完整 Schedule → CAS 暂停 → 重验 V3 definition → 仅替换 Action → 恢复原暂停状态”执行；cron、时区、Overlap、Workflow ID、Task Queue 与其他策略必须逐字保持。命令重试必须复用同一个 key。
+该 saga 按“冻结完整 Schedule 与原 DB head/mode → CAS 暂停 → 原子 promote prepared head/mode → 仅替换 Action → 恢复原暂停状态”执行；cron、时区、Overlap、Workflow ID、Task Queue 与其他策略必须逐字保持。命令重试必须复用同一个 key。
 
 切流后只验收一次临时真实运行：官方原文交叉核验、历史对比、专业卡片，以及无重大更新时零 delivery/零飞书消息。正式周一 09:00 不做临时改期。
 
@@ -59,4 +79,10 @@ go run ./cmd/researchcutover -operation cutover -task-id <schedule-id> -user-id 
 go run ./cmd/researchcutover -operation rollback -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <same-stable-cutover-key>
 ```
 
-Rollback 首先撤销数据库投递 authority，然后暂停并恢复冻结的旧 Action，最后恢复原暂停状态。若发现外部紧急暂停且无法证明由 saga 持有，状态进入 `manual_intervention`，不会擅自恢复调度。只有输出 phase=`rolled_back` 后才能清除 authority ID；shadow ID 可保留用于无投递复测。
+Rollback 首先撤销数据库投递 authority，然后暂停、恢复冻结的旧 Action，并在仍暂停时原子恢复旧 DB head/mode，最后恢复原暂停状态。若发现外部紧急暂停且无法证明由 saga 持有，状态进入 `manual_intervention`，不会擅自恢复调度。只有输出 phase=`rolled_back` 后才能清除 authority ID；shadow ID 可保留用于无投递复测。
+
+若只需撤销尚未切流的 prepared sidecar：
+
+```powershell
+/opt/vane/bin/vane-research-prepare -operation rollback -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <same-stable-prepare-key>
+```

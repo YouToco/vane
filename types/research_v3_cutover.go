@@ -1,6 +1,14 @@
 package types
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// ErrResearchV3CutoverDrift distinguishes a verified definition/baseline
+// change from an optimistic phase conflict. Coordinators may compensate the
+// former, but must reload and resume after the latter.
+var ErrResearchV3CutoverDrift = errors.New("vane: research V3 cutover definition drift")
 
 // ResearchV3CutoverPhase is the durable checkpoint of the exact-task
 // Schedule Action replacement saga.  The remote Schedule is always described
@@ -11,10 +19,12 @@ const (
 	ResearchV3CutoverPrepared               ResearchV3CutoverPhase = "prepared"
 	ResearchV3CutoverPauseRequested         ResearchV3CutoverPhase = "pause_requested"
 	ResearchV3CutoverPaused                 ResearchV3CutoverPhase = "paused"
+	ResearchV3CutoverDefinitionPromoted     ResearchV3CutoverPhase = "definition_promoted"
 	ResearchV3CutoverActionSwapped          ResearchV3CutoverPhase = "action_swapped"
 	ResearchV3CutoverActive                 ResearchV3CutoverPhase = "active"
 	ResearchV3CutoverRollbackPauseRequested ResearchV3CutoverPhase = "rollback_pause_requested"
 	ResearchV3CutoverRollbackPaused         ResearchV3CutoverPhase = "rollback_paused"
+	ResearchV3CutoverDefinitionRestored     ResearchV3CutoverPhase = "definition_restored"
 	ResearchV3CutoverRolledBack             ResearchV3CutoverPhase = "rolled_back"
 	ResearchV3CutoverAborted                ResearchV3CutoverPhase = "aborted"
 	ResearchV3CutoverManualIntervention     ResearchV3CutoverPhase = "manual_intervention"
@@ -37,6 +47,9 @@ type ResearchV3CutoverOperation struct {
 	IdempotencyKey            string
 	Generation                int64
 	Definition                ResearchV3DefinitionHead
+	SourceBaselineDigest      string
+	OriginalExecutionMode     ExecutionMode
+	OriginalDefinition        *ResearchV3DefinitionHead
 	FrozenSchedule            []byte
 	FrozenScheduleDigest      string
 	FrozenConflictToken       []byte

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/url"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
 
@@ -87,6 +89,9 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 	})
 	researchURL := roleTestURL(t, scratchURL, researchRuntimeLoginRole,
 		researchPassword)
+	if _, err := provider.UpTo(t.Context(), 102); err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("valid runtime supports default and explicit Store capabilities", func(t *testing.T) {
 		st, err := NewServerRuntime(t.Context(), runtimeURL)
@@ -238,6 +243,118 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		}
 		if sessionUser != researchRuntimeLoginRole || currentUser != researchRuntimeLoginRole {
 			t.Fatalf("research identity=%s/%s", sessionUser, currentUser)
+		}
+	})
+
+	t.Run("V3 shadow binds exact app tenant and user scope", func(t *testing.T) {
+		ownerStore, err := New(t.Context(), scratchURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ownerStore.Close()
+		user, err := ownerStore.UpsertUserByOpenID(t.Context(),
+			"ou-v3-runtime-"+uuid.NewString(), "V3 runtime owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var tenantID int64
+		if err := owner.QueryRowContext(t.Context(),
+			`INSERT INTO tenants(status,plan) VALUES('active','free') RETURNING id`).Scan(&tenantID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'owner')`,
+			tenantID, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		taskID := "v3-runtime-" + uuid.NewString()
+		if _, err := owner.ExecContext(t.Context(), `INSERT INTO schedules
+			(id,tenant_id,user_id,nl_description,spec_json,scope_json,status,push_strictness)
+			VALUES($1,$2,$3,'runtime V3','{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}',
+			'{}','active','strict')`, taskID, tenantID, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(), `INSERT INTO schedule_playbooks
+			(schedule_id,content,fetch_plan) VALUES($1,'runtime RLS shadow test','{}')`,
+			taskID); err != nil {
+			t.Fatal(err)
+		}
+		p := researchV3PreparePolicyForTest()
+		p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey = tenantID, user.ID, taskID, "runtime-prepare"
+		if _, err := ownerStore.PrepareResearchV3Definition(t.Context(), p); err != nil {
+			t.Fatal(err)
+		}
+		runtimeStore, err := NewServerRuntimeWithResearchRuntimeCapability(
+			t.Context(), runtimeURL, researchURL, ResearchRunCapabilityConfigV1{
+				ActiveKeyID:  "server-runtime-v3-shadow",
+				ActiveKeyHex: strings.Repeat("53", 32),
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer runtimeStore.Close()
+		mirror, err := runtimeStore.GetSchedule(t.Context(), taskID, user.ID)
+		if err != nil || mirror.TenantID != tenantID {
+			t.Fatalf("runtime GetSchedule=%+v err=%v", mirror, err)
+		}
+		if _, err := runtimeStore.GetSchedule(t.Context(), taskID, user.ID+1); types.CodeOf(err) != types.CodeNotFound {
+			t.Fatalf("runtime cross-user GetSchedule err=%v", err)
+		}
+		available, err := runtimeStore.HasCurrentResearchApprovedDefinitionV3(
+			t.Context(), tenantID, user.ID, taskID)
+		if err != nil || !available {
+			t.Fatalf("runtime V3 preflight=%t err=%v", available, err)
+		}
+		foreign, err := runtimeStore.HasCurrentResearchApprovedDefinitionV3(
+			t.Context(), tenantID+1, user.ID, taskID)
+		if err != nil || foreign {
+			t.Fatalf("runtime cross-tenant V3 preflight=%t err=%v", foreign, err)
+		}
+		identity := types.RunIdentity{TemporalWorkflowID: "research-v3-shadow-" + strings.Repeat("2", 64),
+			TemporalRunID: "runtime-run-" + uuid.NewString(), RunKind: types.RunSnapshotKindScheduled,
+			TenantID: tenantID, UserID: user.ID, TaskID: taskID}
+		ref, err := runtimeStore.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
+			testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
+			testResearchModelPolicyStoreV3(t))
+		if err != nil {
+			t.Fatalf("runtime V3 snapshot: %v", err)
+		}
+		loaded, err := runtimeStore.loadControlResearchRunSnapshotRefV3(
+			t.Context(), identity, ref.SnapshotID)
+		if err != nil || loaded != ref {
+			t.Fatalf("runtime control snapshot=%+v err=%v", loaded, err)
+		}
+		tx, err := runtimeStore.pool.Begin(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(t.Context()) }()
+		if _, err := tx.Exec(t.Context(), `SELECT set_config('app.tenant_id',$1,true),
+			set_config('app.user_id',$2,true)`, fmt.Sprint(tenantID+1), fmt.Sprint(user.ID)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(t.Context(), `SELECT * FROM
+			resolve_research_run_capability_registration_v1($1,$2,$3,$4,$5,$6,$7)`,
+			ref.SnapshotID, tenantID, user.ID, taskID, ref.TemporalWorkflowID,
+			ref.TemporalRunID, ref.ReferenceDigest); err == nil {
+			t.Fatal("cross-tenant capability resolver bypassed bound app scope")
+		}
+		_ = tx.Rollback(t.Context())
+		tx2, err := runtimeStore.pool.Begin(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx2.Rollback(t.Context()) }()
+		if _, err := tx2.Exec(t.Context(), `SELECT set_config('app.tenant_id',$1,true),
+			set_config('app.user_id',$2,true)`, fmt.Sprint(tenantID+1), fmt.Sprint(user.ID)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx2.Exec(t.Context(), `SELECT * FROM
+			register_research_run_capability_registration_v1(
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, ref.SnapshotID, tenantID, user.ID,
+			taskID, ref.TemporalWorkflowID, ref.TemporalRunID, ref.ReferenceDigest,
+			"poison-key", make([]byte, 32), time.Now().Add(24*time.Hour)); err == nil {
+			t.Fatal("cross-tenant capability registrar bypassed bound app scope")
 		}
 	})
 

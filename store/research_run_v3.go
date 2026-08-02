@@ -69,6 +69,15 @@ func (s *Store) CreateOrGetResearchRunSnapshotWithAuthorityV3(
 		return types.ResearchRunSnapshotRefV3{}, researchRunDatabaseError("begin research snapshot transaction", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3AppScopeTx(
+		ctx, tx, identity.TenantID, identity.UserID); err != nil {
+		return types.ResearchRunSnapshotRefV3{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,101))`,
+		fmt.Sprintf("%d/%d/%s", identity.TenantID, identity.UserID, identity.TaskID)); err != nil {
+		return types.ResearchRunSnapshotRefV3{}, researchRunDatabaseError(
+			"lock research V3 task baseline", err)
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1,$2))`,
 		identity.TemporalRunID, taskRunSnapshotLockSeed); err != nil {
@@ -285,10 +294,19 @@ func loadResearchRunSnapshotRowV3(
 func loadCurrentResearchDefinitionV3(
 	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
 ) (int64, string, taskstate.ApprovedDefinitionV3, error) {
+	if isExactResearchV3ShadowWorkflowID(identity.TemporalWorkflowID) {
+		binding, err := loadPreparedResearchV3BindingTx(
+			ctx, tx, identity.TenantID, identity.UserID, identity.TaskID, true,
+			researchV3ExpectBaseOrTargetHead)
+		if err != nil {
+			return 0, "", taskstate.ApprovedDefinitionV3{}, err
+		}
+		return binding.Target.Version, binding.Target.Digest, binding.Definition, nil
+	}
 	var version int64
 	var digest, schemaVersion string
 	var payload, scheduleSpec []byte
-	err := tx.QueryRow(ctx,
+	query :=
 		`SELECT schedule.approved_definition_version,
 		        schedule.approved_definition_digest,definition.schema_version,
 		        definition.payload,schedule.spec_json
@@ -307,9 +325,10 @@ func loadCurrentResearchDefinitionV3(
 		            schedule.tenant_id,schedule.user_id,schedule.id,$4
 		        )
 		    )) AND schedule.execution_mode='discover_at_run'
-		  FOR SHARE OF schedule`,
-		identity.TaskID, identity.TenantID, identity.UserID, identity.TemporalWorkflowID,
-	).Scan(&version, &digest, &schemaVersion, &payload, &scheduleSpec)
+		  FOR SHARE OF schedule`
+	args := []any{identity.TaskID, identity.TenantID, identity.UserID, identity.TemporalWorkflowID}
+	err := tx.QueryRow(ctx, query, args...).Scan(
+		&version, &digest, &schemaVersion, &payload, &scheduleSpec)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, "", taskstate.ApprovedDefinitionV3{}, researchRunValidationError("research task is not active")
 	}
@@ -329,6 +348,19 @@ func loadCurrentResearchDefinitionV3(
 		return 0, "", taskstate.ApprovedDefinitionV3{}, researchRunIntegrityError()
 	}
 	return version, digest, definition, nil
+}
+
+func isExactResearchV3ShadowWorkflowID(value string) bool {
+	const prefix = "research-v3-shadow-"
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+64 {
+		return false
+	}
+	for _, r := range value[len(prefix):] {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validateStoredResearchRunSnapshotV3(

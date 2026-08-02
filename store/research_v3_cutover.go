@@ -23,8 +23,18 @@ func (s *Store) LoadCurrentResearchApprovedDefinitionV3Head(
 	if err := validateTaskStateScope(tenantID, userID, taskID); err != nil {
 		return types.ResearchV3DefinitionHead{}, err
 	}
-	return loadCanonicalResearchV3HeadTx(
-		ctx, s.pool, tenantID, userID, taskID, false)
+	return s.LoadPreparedResearchV3DefinitionHead(ctx, tenantID, userID, taskID)
+}
+
+// LoadPreparedResearchApprovedDefinitionV3Head returns the delivery-dark
+// sidecar selected by prepare. It never falls back to the production head.
+func (s *Store) LoadPreparedResearchApprovedDefinitionV3Head(
+	ctx context.Context, tenantID, userID int64, taskID string,
+) (types.ResearchV3DefinitionHead, error) {
+	if err := validateTaskStateScope(tenantID, userID, taskID); err != nil {
+		return types.ResearchV3DefinitionHead{}, err
+	}
+	return s.LoadPreparedResearchV3DefinitionHead(ctx, tenantID, userID, taskID)
 }
 
 // VerifyEnabledResearchV3ActionAuthorization makes startup reconciliation a
@@ -45,7 +55,7 @@ func (s *Store) VerifyEnabledResearchV3ActionAuthorization(
 		return types.NewAppError(types.CodeConflict,
 			"research V3 Schedule Action authorization is invalid", types.ErrConflict)
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return taskStateDatabaseError("begin research V3 Action authority verification", err)
 	}
@@ -181,13 +191,31 @@ func (s *Store) BeginResearchV3Cutover(
 			return types.ResearchV3CutoverOperation{}, types.NewAppError(
 				types.CodeConflict, "research V3 cutover key has different immutable input", types.ErrConflict)
 		}
+		if existing.Phase == types.ResearchV3CutoverPrepared ||
+			existing.Phase == types.ResearchV3CutoverPauseRequested ||
+			existing.Phase == types.ResearchV3CutoverPaused {
+			binding, bindErr := loadPreparedResearchV3BindingTx(
+				ctx, tx, p.TenantID, p.UserID, p.TaskID, true,
+				researchV3ExpectBaseHead)
+			if bindErr != nil {
+				return types.ResearchV3CutoverOperation{}, bindErr
+			}
+			if binding.Target != existing.Definition ||
+				binding.SourceBaselineDigest != existing.SourceBaselineDigest ||
+				binding.BaseMode != existing.OriginalExecutionMode ||
+				!researchV3HeadsEqual(binding.BaseHead, existing.OriginalDefinition) {
+				return types.ResearchV3CutoverOperation{}, types.NewAppError(
+					types.CodeConflict, "research V3 task changed after cutover began", types.ErrConflict)
+			}
+		}
 		return existing, nil
 	}
-	head, err := loadCanonicalResearchV3HeadTx(ctx, tx, p.TenantID, p.UserID, p.TaskID, true)
+	binding, err := loadPreparedResearchV3BindingTx(ctx, tx, p.TenantID, p.UserID,
+		p.TaskID, true, researchV3ExpectBaseHead)
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, err
 	}
-	if head != p.Definition {
+	if binding.Target != p.Definition {
 		return types.ResearchV3CutoverOperation{}, types.NewAppError(
 			types.CodeConflict, "research V3 definition changed before cutover", types.ErrConflict)
 	}
@@ -208,24 +236,35 @@ func (s *Store) BeginResearchV3Cutover(
 		p.Definition.Digest, p.TargetActionDigest, p.ActionAuthorizationDigest); err != nil {
 		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("stage V3 delivery authority", err)
 	}
+	originalMode := string(binding.BaseMode)
+	var originalVersion *int64
+	var originalDigest *string
+	if binding.BaseHead != nil {
+		originalVersion, originalDigest = &binding.BaseHead.Version, &binding.BaseHead.Digest
+	}
 	var op types.ResearchV3CutoverOperation
-	err = tx.QueryRow(ctx,
+	op, err = scanResearchV3Cutover(tx.QueryRow(ctx,
 		`INSERT INTO research_v3_cutover_operations
 		 (tenant_id,user_id,task_id,idempotency_key,generation,
 		  definition_version,definition_digest,frozen_schedule,
 		  frozen_schedule_digest,frozen_conflict_token,conflict_token_digest,
-		  target_action,target_action_digest,action_authorization_digest,original_paused,phase)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'prepared')
+		  target_action,target_action_digest,action_authorization_digest,original_paused,phase,
+		  original_execution_mode,original_definition_version,original_definition_digest,
+		  source_baseline_digest)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'prepared',$16,$17,$18,$19)
 		 RETURNING id,tenant_id,user_id,task_id,idempotency_key,generation,
 		  definition_version,definition_digest,frozen_schedule,
 		  frozen_schedule_digest,frozen_conflict_token,conflict_token_digest,
+		  rollback_conflict_token,rollback_token_digest,
 		  target_action,target_action_digest,action_authorization_digest,
-		  original_paused,phase,created_at,updated_at`,
+		  original_paused,original_execution_mode,original_definition_version,
+		  original_definition_digest,source_baseline_digest,phase,created_at,updated_at`,
 		p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey, generation,
 		p.Definition.Version, p.Definition.Digest, p.FrozenSchedule,
 		p.FrozenScheduleDigest, p.FrozenConflictToken, p.ConflictTokenDigest,
 		p.TargetAction, p.TargetActionDigest, p.ActionAuthorizationDigest,
-		p.OriginalPaused).Scan(researchV3CutoverScanTargets(&op)...)
+		p.OriginalPaused, originalMode, originalVersion, originalDigest,
+		binding.SourceBaselineDigest))
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("insert V3 cutover journal", err)
 	}
@@ -245,15 +284,219 @@ func (s *Store) LoadResearchV3Cutover(
 func (s *Store) RecheckResearchV3CutoverDefinition(
 	ctx context.Context, op types.ResearchV3CutoverOperation,
 ) error {
-	head, err := loadCanonicalResearchV3HeadTx(ctx, s.pool, op.TenantID, op.UserID, op.TaskID, false)
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
 	}
-	if head != op.Definition {
-		return types.NewAppError(types.CodeConflict,
-			"research V3 definition changed during cutover", types.ErrConflict)
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3CutoverOperatorTx(ctx, tx, op.TenantID, op.UserID); err != nil {
+		return err
+	}
+	expectation := researchV3ExpectBaseHead
+	if op.Phase == types.ResearchV3CutoverDefinitionPromoted ||
+		op.Phase == types.ResearchV3CutoverActionSwapped ||
+		op.Phase == types.ResearchV3CutoverActive {
+		expectation = researchV3ExpectTargetHead
+	}
+	binding, err := loadPreparedResearchV3BindingTx(ctx, tx, op.TenantID, op.UserID,
+		op.TaskID, true, expectation)
+	if err != nil {
+		if types.CodeOf(err) == types.CodeDatabase || types.CodeOf(err) == types.CodeInternal {
+			return err
+		}
+		return researchV3CutoverDrift("research V3 definition is no longer admissible")
+	}
+	if binding.Target != op.Definition || binding.SourceBaselineDigest != op.SourceBaselineDigest ||
+		binding.BaseMode != op.OriginalExecutionMode || !researchV3HeadsEqual(binding.BaseHead, op.OriginalDefinition) {
+		return researchV3CutoverDrift("research V3 definition changed during cutover")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return taskStateDatabaseError("commit research V3 definition recheck", err)
 	}
 	return nil
+}
+
+// PromoteResearchV3PreparedDefinition performs the production DB-head switch
+// and its durable checkpoint in one transaction. The coordinator calls this
+// only after it has proved that Temporal is paused.
+func (s *Store) PromoteResearchV3PreparedDefinition(
+	ctx context.Context, op types.ResearchV3CutoverOperation,
+) (types.ResearchV3CutoverOperation, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("begin V3 definition promotion", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3CutoverOperatorTx(ctx, tx, op.TenantID, op.UserID); err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,101))`,
+		fmt.Sprintf("%d/%d/%s", op.TenantID, op.UserID, op.TaskID)); err != nil {
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("lock V3 definition promotion", err)
+	}
+	binding, err := loadPreparedResearchV3BindingTx(ctx, tx, op.TenantID, op.UserID,
+		op.TaskID, true, researchV3ExpectBaseHead)
+	if err != nil || binding.Target != op.Definition ||
+		binding.SourceBaselineDigest != op.SourceBaselineDigest ||
+		binding.BaseMode != op.OriginalExecutionMode ||
+		!researchV3HeadsEqual(binding.BaseHead, op.OriginalDefinition) {
+		if err != nil {
+			if types.CodeOf(err) == types.CodeDatabase || types.CodeOf(err) == types.CodeInternal {
+				return types.ResearchV3CutoverOperation{}, err
+			}
+			return types.ResearchV3CutoverOperation{}, researchV3CutoverDrift(
+				"prepared V3 definition is no longer admissible")
+		}
+		return types.ResearchV3CutoverOperation{}, researchV3CutoverDrift(
+			"prepared V3 definition changed before promotion")
+	}
+	if err := requireResearchV3ProductionHeadTx(ctx, tx, op, false); err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	command, err := tx.Exec(ctx,
+		`UPDATE schedules SET execution_mode='discover_at_run',
+		 approved_definition_version=$1,approved_definition_digest=$2
+		 WHERE tenant_id=$3 AND user_id=$4 AND id=$5 AND execution_mode=$6
+		 AND approved_definition_version IS NOT DISTINCT FROM $7
+		 AND approved_definition_digest IS NOT DISTINCT FROM $8`,
+		op.Definition.Version, op.Definition.Digest, op.TenantID, op.UserID, op.TaskID,
+		op.OriginalExecutionMode, nullableDefinitionVersion(op.OriginalDefinition),
+		nullableDefinitionDigest(op.OriginalDefinition))
+	if err != nil || command.RowsAffected() != 1 {
+		if err == nil {
+			return types.ResearchV3CutoverOperation{}, researchV3CutoverDrift(
+				"production definition changed before V3 promotion")
+		}
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("promote V3 production definition", err)
+	}
+	command, err = tx.Exec(ctx,
+		`UPDATE research_v3_cutover_operations SET phase='definition_promoted'
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4
+		 AND generation=$5 AND phase='paused'`,
+		op.ID, op.TenantID, op.UserID, op.TaskID, op.Generation)
+	if err != nil || command.RowsAffected() != 1 {
+		if err == nil {
+			err = types.ErrConflict
+		}
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("checkpoint V3 definition promotion", err)
+	}
+	updated, found, err := loadResearchV3CutoverTx(ctx, tx, op.TenantID, op.UserID, op.TaskID, op.IdempotencyKey)
+	if err != nil || !found {
+		if err == nil {
+			err = types.ErrNotFound
+		}
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("commit V3 definition promotion", err)
+	}
+	return updated, nil
+}
+
+// RestoreResearchV3OriginalDefinition restores the exact pre-cutover DB head
+// while Temporal remains paused. It also handles rollback before promotion.
+func (s *Store) RestoreResearchV3OriginalDefinition(
+	ctx context.Context, op types.ResearchV3CutoverOperation,
+) (types.ResearchV3CutoverOperation, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("begin V3 definition restore", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3CutoverOperatorTx(ctx, tx, op.TenantID, op.UserID); err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,101))`, fmt.Sprintf("%d/%d/%s", op.TenantID, op.UserID, op.TaskID)); err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	var mode string
+	var version *int64
+	var digest *string
+	if err := tx.QueryRow(ctx, `SELECT execution_mode,approved_definition_version,approved_definition_digest FROM schedules WHERE tenant_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE`, op.TenantID, op.UserID, op.TaskID).Scan(&mode, &version, &digest); err != nil {
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("lock V3 production definition restore", err)
+	}
+	isTarget := mode == string(types.ExecutionModeDiscoverAtRun) && version != nil && digest != nil && *version == op.Definition.Version && *digest == op.Definition.Digest
+	isOriginal := mode == string(op.OriginalExecutionMode) && nullableHeadEqual(version, digest, op.OriginalDefinition)
+	if !isTarget && !isOriginal {
+		return types.ResearchV3CutoverOperation{}, types.NewAppError(types.CodeConflict, "production definition changed before V3 restore", types.ErrConflict)
+	}
+	if isTarget {
+		command, execErr := tx.Exec(ctx, `UPDATE schedules SET execution_mode=$1,approved_definition_version=$2,approved_definition_digest=$3 WHERE tenant_id=$4 AND user_id=$5 AND id=$6 AND execution_mode='discover_at_run' AND approved_definition_version=$7 AND approved_definition_digest=$8`, op.OriginalExecutionMode, nullableDefinitionVersion(op.OriginalDefinition), nullableDefinitionDigest(op.OriginalDefinition), op.TenantID, op.UserID, op.TaskID, op.Definition.Version, op.Definition.Digest)
+		if execErr != nil || command.RowsAffected() != 1 {
+			if execErr == nil {
+				execErr = types.ErrConflict
+			}
+			return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("restore V3 production definition", execErr)
+		}
+	}
+	command, err := tx.Exec(ctx, `UPDATE research_v3_cutover_operations SET phase='definition_restored' WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4 AND generation=$5 AND phase='rollback_paused'`, op.ID, op.TenantID, op.UserID, op.TaskID, op.Generation)
+	if err != nil || command.RowsAffected() != 1 {
+		if err == nil {
+			err = types.ErrConflict
+		}
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("checkpoint V3 definition restore", err)
+	}
+	updated, found, err := loadResearchV3CutoverTx(ctx, tx, op.TenantID, op.UserID, op.TaskID, op.IdempotencyKey)
+	if err != nil || !found {
+		if err == nil {
+			err = types.ErrNotFound
+		}
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("commit V3 definition restore", err)
+	}
+	return updated, nil
+}
+
+func requireResearchV3ProductionHeadTx(ctx context.Context, tx pgx.Tx, op types.ResearchV3CutoverOperation, promoted bool) error {
+	var mode string
+	var version *int64
+	var digest *string
+	if err := tx.QueryRow(ctx, `SELECT execution_mode,approved_definition_version,approved_definition_digest FROM schedules WHERE tenant_id=$1 AND user_id=$2 AND id=$3 FOR SHARE`, op.TenantID, op.UserID, op.TaskID).Scan(&mode, &version, &digest); err != nil {
+		return taskStateDatabaseError("load V3 production definition head", err)
+	}
+	if promoted {
+		if mode != string(types.ExecutionModeDiscoverAtRun) || version == nil || digest == nil || *version != op.Definition.Version || *digest != op.Definition.Digest {
+			return researchV3CutoverDrift("promoted V3 definition changed")
+		}
+		return nil
+	}
+	if mode != string(op.OriginalExecutionMode) || !nullableHeadEqual(version, digest, op.OriginalDefinition) {
+		return researchV3CutoverDrift("production definition changed before V3 promotion")
+	}
+	return nil
+}
+
+func researchV3CutoverDrift(message string) error {
+	return types.NewAppError(types.CodeConflict, message, types.ErrResearchV3CutoverDrift)
+}
+
+func nullableDefinitionVersion(head *types.ResearchV3DefinitionHead) any {
+	if head == nil {
+		return nil
+	}
+	return head.Version
+}
+func nullableDefinitionDigest(head *types.ResearchV3DefinitionHead) any {
+	if head == nil {
+		return nil
+	}
+	return head.Digest
+}
+func nullableHeadEqual(version *int64, digest *string, head *types.ResearchV3DefinitionHead) bool {
+	if head == nil {
+		return version == nil && digest == nil
+	}
+	return version != nil && digest != nil && *version == head.Version && *digest == head.Digest
+}
+
+func researchV3HeadsEqual(left, right *types.ResearchV3DefinitionHead) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Version == right.Version && subtle.ConstantTimeCompare(
+		[]byte(left.Digest), []byte(right.Digest)) == 1
 }
 
 func (s *Store) AdvanceResearchV3Cutover(
@@ -270,13 +513,44 @@ func (s *Store) AdvanceResearchV3Cutover(
 	}
 	if next == types.ResearchV3CutoverPauseRequested || next == types.ResearchV3CutoverPaused || next == types.ResearchV3CutoverActionSwapped ||
 		next == types.ResearchV3CutoverActive {
-		head, headErr := loadCanonicalResearchV3HeadTx(ctx, tx, op.TenantID, op.UserID, op.TaskID, true)
-		if headErr != nil {
-			return types.ResearchV3CutoverOperation{}, headErr
+		promoted := next == types.ResearchV3CutoverActionSwapped || next == types.ResearchV3CutoverActive
+		if !promoted {
+			binding, headErr := loadPreparedResearchV3BindingTx(
+				ctx, tx, op.TenantID, op.UserID, op.TaskID, true,
+				researchV3ExpectBaseHead)
+			if headErr != nil || binding.Target != op.Definition ||
+				binding.SourceBaselineDigest != op.SourceBaselineDigest ||
+				binding.BaseMode != op.OriginalExecutionMode ||
+				!researchV3HeadsEqual(binding.BaseHead, op.OriginalDefinition) {
+				if headErr != nil {
+					if types.CodeOf(headErr) == types.CodeDatabase || types.CodeOf(headErr) == types.CodeInternal {
+						return types.ResearchV3CutoverOperation{}, headErr
+					}
+					return types.ResearchV3CutoverOperation{}, researchV3CutoverDrift(
+						"prepared V3 definition is no longer admissible")
+				}
+				return types.ResearchV3CutoverOperation{}, researchV3CutoverDrift(
+					"prepared V3 definition changed during cutover")
+			}
+		} else {
+			binding, headErr := loadPreparedResearchV3BindingTx(
+				ctx, tx, op.TenantID, op.UserID, op.TaskID, true,
+				researchV3ExpectTargetHead)
+			if headErr != nil || binding.Target != op.Definition ||
+				binding.SourceBaselineDigest != op.SourceBaselineDigest {
+				if headErr != nil {
+					if types.CodeOf(headErr) == types.CodeDatabase || types.CodeOf(headErr) == types.CodeInternal {
+						return types.ResearchV3CutoverOperation{}, headErr
+					}
+					return types.ResearchV3CutoverOperation{}, researchV3CutoverDrift(
+						"prepared V3 baseline is no longer admissible")
+				}
+				return types.ResearchV3CutoverOperation{}, researchV3CutoverDrift(
+					"prepared V3 baseline changed after promotion")
+			}
 		}
-		if head != op.Definition {
-			return types.ResearchV3CutoverOperation{}, types.NewAppError(
-				types.CodeConflict, "research V3 definition changed during cutover", types.ErrConflict)
+		if headErr := requireResearchV3ProductionHeadTx(ctx, tx, op, promoted); headErr != nil {
+			return types.ResearchV3CutoverOperation{}, headErr
 		}
 	}
 	command, err := tx.Exec(ctx,
@@ -590,17 +864,17 @@ func loadResearchV3CutoverTx(
 		QueryRow(context.Context, string, ...any) pgx.Row
 	}, tenantID, userID int64, taskID, key string,
 ) (types.ResearchV3CutoverOperation, bool, error) {
-	var op types.ResearchV3CutoverOperation
-	err := q.QueryRow(ctx,
+	op, err := scanResearchV3Cutover(q.QueryRow(ctx,
 		`SELECT id,tenant_id,user_id,task_id,idempotency_key,generation,
 		        definition_version,definition_digest,frozen_schedule,
 		        frozen_schedule_digest,frozen_conflict_token,conflict_token_digest,
 		        rollback_conflict_token,rollback_token_digest,
 		        target_action,target_action_digest,action_authorization_digest,
-		        original_paused,phase,created_at,updated_at
+		        original_paused,original_execution_mode,original_definition_version,
+		        original_definition_digest,source_baseline_digest,phase,created_at,updated_at
 		   FROM research_v3_cutover_operations
 		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND idempotency_key=$4`,
-		tenantID, userID, taskID, key).Scan(researchV3CutoverScanTargets(&op)...)
+		tenantID, userID, taskID, key))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return types.ResearchV3CutoverOperation{}, false, nil
 	}
@@ -610,14 +884,35 @@ func loadResearchV3CutoverTx(
 	return op, true, nil
 }
 
-func researchV3CutoverScanTargets(op *types.ResearchV3CutoverOperation) []any {
-	return []any{&op.ID, &op.TenantID, &op.UserID, &op.TaskID,
+func scanResearchV3Cutover(row pgx.Row) (types.ResearchV3CutoverOperation, error) {
+	var op types.ResearchV3CutoverOperation
+	var rollbackDigest *string
+	var originalVersion *int64
+	var originalDigest *string
+	err := row.Scan(&op.ID, &op.TenantID, &op.UserID, &op.TaskID,
 		&op.IdempotencyKey, &op.Generation, &op.Definition.Version,
 		&op.Definition.Digest, &op.FrozenSchedule, &op.FrozenScheduleDigest,
 		&op.FrozenConflictToken, &op.ConflictTokenDigest,
-		&op.RollbackConflictToken, &op.RollbackTokenDigest,
-		&op.TargetAction, &op.TargetActionDigest, &op.ActionAuthorizationDigest, &op.OriginalPaused,
-		&op.Phase, &op.CreatedAt, &op.UpdatedAt}
+		&op.RollbackConflictToken, &rollbackDigest,
+		&op.TargetAction, &op.TargetActionDigest, &op.ActionAuthorizationDigest,
+		&op.OriginalPaused, &op.OriginalExecutionMode, &originalVersion, &originalDigest,
+		&op.SourceBaselineDigest, &op.Phase, &op.CreatedAt, &op.UpdatedAt)
+	if err != nil {
+		return op, err
+	}
+	if (originalVersion == nil) != (originalDigest == nil) ||
+		!validDigestSyntaxV3(op.SourceBaselineDigest) {
+		return op, taskStateIntegrity()
+	}
+	if rollbackDigest != nil {
+		op.RollbackTokenDigest = *rollbackDigest
+	}
+	if originalVersion != nil {
+		op.OriginalDefinition = &types.ResearchV3DefinitionHead{
+			Version: *originalVersion, Digest: *originalDigest,
+		}
+	}
+	return op, nil
 }
 
 func validateResearchV3CutoverBegin(p types.BeginResearchV3CutoverParams) error {

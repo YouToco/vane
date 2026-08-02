@@ -274,9 +274,28 @@ func (s *Store) DeleteSchedule(ctx context.Context, id string, userID int64) err
 // GetSchedule 按 id 读取单个调度镜像；不存在时返回 CodeNotFound 的 AppError，
 // 调用方可用 errors.Is(err, types.ErrNotFound) 命中。
 func (s *Store) GetSchedule(ctx context.Context, id string, userID int64) (*types.Schedule, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("开始查询调度（id=%s）", id), err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var tenantID *int64
+	if err := tx.QueryRow(ctx,
+		`SELECT resolve_owned_schedule_tenant_v1($1,$2)`, id, userID).Scan(&tenantID); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("解析调度租户（id=%s）", id), err)
+	}
+	if tenantID == nil {
+		return nil, types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("调度 id=%s 不存在", id), pgx.ErrNoRows)
+	}
+	if err := bindResearchV3AppScopeTx(ctx, tx, *tenantID, userID); err != nil {
+		return nil, err
+	}
 	var sc types.Schedule
-	err := scanSchedule(
-		s.pool.QueryRow(ctx,
+	err = scanSchedule(
+		tx.QueryRow(ctx,
 			`SELECT `+scheduleColumns+`
 			   FROM schedules s
 			  WHERE s.id = $1 AND s.user_id = $2
@@ -290,6 +309,10 @@ func (s *Store) GetSchedule(ctx context.Context, id string, userID int64) (*type
 		}
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("查询调度（id=%s）", id), err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("提交调度查询（id=%s）", id), err)
 	}
 	return &sc, nil
 }

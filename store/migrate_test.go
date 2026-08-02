@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 101
+const latestMigrationVersion int64 = 102
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -109,6 +109,8 @@ var wantTables = []string{
 	"research_brief_deliveries",
 	"research_v3_delivery_authorities",
 	"research_v3_cutover_operations",
+	"research_v3_definition_prepare_operations",
+	"research_v3_prepared_definition_heads",
 	// 056 durable business-fact to exact Agent-session continuation.
 	"agent_session_fact_outbox",
 	// 058/059/070 are retired by 074 together with the account-source product.
