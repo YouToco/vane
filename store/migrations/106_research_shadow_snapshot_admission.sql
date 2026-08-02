@@ -89,7 +89,7 @@ BEGIN
        NEW.definition_digest IS DISTINCT FROM selected_definition_digest OR
        approved_schema_version IS DISTINCT FROM 'vane.task-approved-definition/v3' OR
        approved_execution_mode IS DISTINCT FROM 'discover_at_run' THEN
-        RAISE EXCEPTION '106: research snapshot admission fence rejected task state'
+        RAISE EXCEPTION '102: research snapshot admission fence rejected task state'
             USING ERRCODE='23514';
     END IF;
     RETURN NEW;

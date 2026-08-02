@@ -278,24 +278,24 @@ func TestMigration106SQLKeepsFormalAndShadowSnapshotAuthorizationOrthogonal(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	formalStart := "        SELECT schedule.status,schedule.execution_mode," +
+	formalSelectStart := "        SELECT schedule.status,schedule.execution_mode," +
 		"schedule.approved_definition_digest,"
-	formalEnd := "         FOR SHARE OF schedule,tenant,membership,definition;"
+	formalEnd := "    RETURN NEW;"
 	extractFormal := func(label, payload string) string {
 		t.Helper()
-		start := strings.Index(payload, formalStart)
+		start := strings.Index(payload, formalSelectStart)
 		if start < 0 {
 			t.Fatalf("%s lost formal snapshot SELECT", label)
 		}
 		end := strings.Index(payload[start:], formalEnd)
 		if end < 0 {
-			t.Fatalf("%s lost formal snapshot row lock", label)
+			t.Fatalf("%s lost formal snapshot admission tail", label)
 		}
 		return strings.ReplaceAll(
 			payload[start:start+end+len(formalEnd)], "\r\n", "\n")
 	}
 	if oldFormal, newFormal := extractFormal("102", string(legacyPayload)),
 		extractFormal("106", sqlText); oldFormal != newFormal {
-		t.Fatal("106 changed migration 102's formal snapshot authorization branch")
+		t.Fatal("106 changed migration 102's formal snapshot authorization or error branch")
 	}
 }
