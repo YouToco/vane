@@ -660,3 +660,17 @@ func testResearchModelPolicyStoreV3(t *testing.T) runtimepolicy.ResearchModelPol
 	}
 	return policy
 }
+
+func testProductionResearchModelPolicyStoreV3(t *testing.T) runtimepolicy.ResearchModelPolicyV3 {
+	t.Helper()
+	policy := testResearchModelPolicyStoreV3(t)
+	policy.Planner.Model = "deepseek-v4-pro"
+	policy.Planner.DisableThinking = true
+	policy.Synthesis.Model = "deepseek-v4-pro"
+	policy.Synthesis.DisableThinking = true
+	policy, err := runtimepolicy.BuildResearchModelPolicyV3(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
+}

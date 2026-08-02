@@ -36,18 +36,28 @@ func researchModelPolicyForTest(t *testing.T) ResearchModelPolicyV3 {
 }
 
 func TestResearchModelPolicyV3CanonicalRoundTrip(t *testing.T) {
-	policy := researchModelPolicyForTest(t)
-	payload, err := EncodeResearchModelPolicyV3(policy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := DecodeResearchModelPolicyV3(payload)
-	if err != nil || decoded != policy {
-		t.Fatalf("decoded=%+v err=%v", decoded, err)
-	}
-	digest, err := DigestResearchModelPolicyV3(decoded)
-	if err != nil || len(digest) != 64 {
-		t.Fatalf("digest=%q err=%v", digest, err)
+	for _, disableThinking := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy-enabled", true: "v3-disabled"}[disableThinking], func(t *testing.T) {
+			policy := researchModelPolicyForTest(t)
+			policy.Planner.DisableThinking = disableThinking
+			policy.Synthesis.DisableThinking = disableThinking
+			payload, err := EncodeResearchModelPolicyV3(policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := DecodeResearchModelPolicyV3(payload)
+			if err != nil || decoded != policy {
+				t.Fatalf("decoded=%+v err=%v", decoded, err)
+			}
+			if decoded.Planner.DisableThinking != disableThinking ||
+				decoded.Synthesis.DisableThinking != disableThinking {
+				t.Fatalf("disable_thinking changed during round trip: %+v", decoded)
+			}
+			digest, err := DigestResearchModelPolicyV3(decoded)
+			if err != nil || len(digest) != 64 {
+				t.Fatalf("digest=%q err=%v", digest, err)
+			}
+		})
 	}
 }
 

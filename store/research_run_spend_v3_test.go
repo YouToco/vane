@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -37,6 +38,15 @@ func newResearchRunSpendFixtureV3(t *testing.T, maxRunCostMicroUSD int64) resear
 
 func newResearchRunSpendFixtureWithToolBudgetV3(
 	t *testing.T, maxRunCostMicroUSD int64, maxToolCalls int, createPlan bool,
+) researchRunSpendFixtureV3 {
+	t.Helper()
+	return newResearchRunSpendFixtureWithModelPolicyV3(t, maxRunCostMicroUSD,
+		maxToolCalls, createPlan, testResearchModelPolicyStoreV3(t))
+}
+
+func newResearchRunSpendFixtureWithModelPolicyV3(
+	t *testing.T, maxRunCostMicroUSD int64, maxToolCalls int, createPlan bool,
+	modelPolicy runtimepolicy.ResearchModelPolicyV3,
 ) researchRunSpendFixtureV3 {
 	t.Helper()
 	if os.Getenv("DATABASE_URL") == "" {
@@ -139,7 +149,7 @@ func newResearchRunSpendFixtureWithToolBudgetV3(
 	}
 	snapshotRef, err := st.CreateOrGetResearchRunSnapshotV3(
 		ctx, identity, testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
-		testResearchModelPolicyStoreV3(t))
+		modelPolicy)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -21,6 +21,7 @@ import (
 // composing the current production compiled policy.
 type CurrentCompiledV1Input struct {
 	Model                      string
+	ResearchModel              string
 	TaskInstructionEnabled     bool
 	ModelEndpointGeneration    int64
 	ModelCredentialGeneration  int64

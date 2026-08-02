@@ -166,6 +166,7 @@ func run() error {
 				current, err := runtimeconfig.BuildResearchRuntimeV3(
 					runtimeconfig.CurrentCompiledV1Input{
 						Model:                      cfg.LLM.Model,
+						ResearchModel:              cfg.LLM.ResearchModel,
 						TaskInstructionEnabled:     true,
 						ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
 						ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
