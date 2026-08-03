@@ -82,6 +82,10 @@ func (s *Store) CommitApprovedDefinitionEdit(
 	if !errors.Is(err, types.ErrNotFound) {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
+	if s.legacyAdmissionIsClosed() {
+		return ApprovedDefinitionVersionRecord{},
+			legacyAdmissionClosed("approved definition edit v1/v2")
+	}
 
 	record, err := appendApprovedDefinitionEditTx(ctx, tx, head, command)
 	if err != nil {
