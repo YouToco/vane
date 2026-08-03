@@ -355,6 +355,17 @@ func TestCreationCoordinator_NativeV3PostgreSQLTemporalLifecycle(t *testing.T) {
 		t.Fatalf("native V3 terminal receipt: %v", err)
 	}
 	eventCount := len(schedules.events)
+	replayInput := input
+	replayInput.ExpiresAt = time.Now().Add(24 * time.Hour)
+	replayedProposal, err := coordinator.PrepareResearchV3(t.Context(), replayInput)
+	if err != nil || replayedProposal.ID != input.ActionID ||
+		replayedProposal.Summary != input.TaskName {
+		t.Fatalf("native V3 whole-tool prepare replay=%+v err=%v", replayedProposal, err)
+	}
+	if len(schedules.events) != eventCount {
+		t.Fatalf("native V3 prepare replay touched Temporal: before=%d after=%d",
+			eventCount, len(schedules.events))
+	}
 	replayed, err := coordinator.ExecuteResearchV3(
 		t.Context(), userID, input.ActionID, testCreationReceiptTarget)
 	if err != nil || !replayed.Replayed || replayed.TaskID != result.TaskID {
