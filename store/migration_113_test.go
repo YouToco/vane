@@ -96,12 +96,19 @@ func TestMigration113FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		).Scan(&batchID); err != nil {
 			t.Fatal(err)
 		}
-		var deliveryID int64
+		var supersededDeliveryID, explicitDeliveryID int64
 		if err := db.QueryRowContext(t.Context(), `
 			INSERT INTO deliveries(tenant_id,user_id,batch_id,status,body_md)
 			VALUES($1,$2,$3,'sent','当时推送：Kimi 套餐尚不可购买') RETURNING id`,
 			tenantID, userID, batchID,
-		).Scan(&deliveryID); err != nil {
+		).Scan(&supersededDeliveryID); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRowContext(t.Context(), `
+			INSERT INTO deliveries(tenant_id,user_id,batch_id,status,body_md)
+			VALUES($1,$2,$3,'sent','另一条推送：明确不感兴趣') RETURNING id`,
+			tenantID, userID, batchID,
+		).Scan(&explicitDeliveryID); err != nil {
 			t.Fatal(err)
 		}
 		at := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
@@ -112,8 +119,8 @@ func TestMigration113FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 			    ($1,$2,$3,'interested',NULL,'',$4),
 			    ($1,$2,$3,'not_interested',NULL,'',$4),
 			    ($1,$2,$3,'misjudged','factually_wrong','官方原文相反',$4-interval '1 hour'),
-			    ($1,$2,$3,'not_interested',NULL,'明确不感兴趣',$4)`,
-			tenantID, userID, deliveryID, at,
+			    ($1,$2,$5,'not_interested',NULL,'明确不感兴趣',$4)`,
+			tenantID, userID, supersededDeliveryID, at, explicitDeliveryID,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -163,11 +170,15 @@ func TestMigration113FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		result.Rows[3]["is_effective_attitude"] != true {
 		t.Fatalf("effective attitude rows=%+v", result.Rows)
 	}
-	for _, row := range result.Rows {
+	for index, row := range result.Rows {
 		if row["task_ref"] != "feedback-task-a-113" {
 			t.Fatalf("cross-subject feedback row=%+v", row)
 		}
-		if row["delivered_summary"] != "当时推送：Kimi 套餐尚不可购买" {
+		wantSummary := "当时推送：Kimi 套餐尚不可购买"
+		if index == 3 {
+			wantSummary = "另一条推送：明确不感兴趣"
+		}
+		if row["delivered_summary"] != wantSummary {
 			t.Fatalf("feedback lost delivered summary row=%+v", row)
 		}
 	}

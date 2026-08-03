@@ -46,6 +46,10 @@ var observationProjectionRequiredColumns = []string{
 	"observation_digest", "content_count", "created_at",
 }
 
+var feedbackProjectionRequiredColumns = []string{
+	"record_id", "delivered_summary", "created_at",
+}
+
 const compartmentedPublicSummarySystemNote = `
 
 [隔离公开证据摘要阶段]
@@ -201,6 +205,33 @@ func prepareIntelligenceObservationQuery(
 			"历史 Observation 原文只能按逐行 provenance 查询，不能聚合", types.ErrValidation)
 	}
 	for _, required := range observationProjectionRequiredColumns {
+		if !slices.Contains(query.Select, required) {
+			query.Select = append(query.Select, required)
+		}
+	}
+	return query, nil
+}
+
+// prepareIntelligenceFeedbackQuery makes the immutable feedback identity
+// available to the projection layer whenever a caller asks for the historical
+// delivery summary. The summary is mixed-trust presentation data and must
+// never reach the main Agent as part of a locally trusted tool result.
+func prepareIntelligenceFeedbackQuery(
+	query store.IntelligenceQuery,
+) (store.IntelligenceQuery, error) {
+	if query.Dataset != store.IntelligenceFeedbacks {
+		return query, nil
+	}
+	wantsSummary := len(query.Select) == 0 ||
+		slices.Contains(query.Select, "delivered_summary")
+	if !wantsSummary {
+		return query, nil
+	}
+	if len(query.GroupBy) > 0 || len(query.Metrics) > 0 {
+		return store.IntelligenceQuery{}, types.NewAppError(types.CodeValidation,
+			"历史投递摘要只能按逐行 provenance 查询，不能聚合", types.ErrValidation)
+	}
+	for _, required := range feedbackProjectionRequiredColumns {
 		if !slices.Contains(query.Select, required) {
 			query.Select = append(query.Select, required)
 		}
@@ -412,6 +443,82 @@ func projectObservationResultForAgent(
 			store.IntelligenceColumn{Name: "public_evidence_status", Type: "text"})
 	}
 	state.historicalPublicPending = true
+	return nil
+}
+
+// projectFeedbackResultForAgent splits one mixed-trust feedback row at the
+// harness boundary. Canonical feedback metadata remains locally trusted, while
+// the exact text previously delivered to the user is moved to the existing
+// historical-public sidecar. The main Agent receives only an opaque ref; this
+// mixed-coverage presentation snapshot can therefore be summarized only in the
+// Tools:nil compartment and can never influence another internal query or
+// owner write.
+func projectFeedbackResultForAgent(
+	ctx context.Context,
+	result *store.IntelligenceQueryResult,
+) error {
+	if result == nil || result.Dataset != store.IntelligenceFeedbacks {
+		return nil
+	}
+	state := runStateFrom(ctx)
+	meta, ok := ctx.Value(chatMetaKey{}).(chatMeta)
+	if state == nil || !ok || meta.scope.TenantID <= 0 ||
+		meta.scope.UserID <= 0 || meta.scope.SessionID <= 0 {
+		return types.NewAppError(types.CodeValidation,
+			"历史投递摘要缺少认证会话范围", types.ErrValidation)
+	}
+	projected := false
+	handled := false
+	for _, row := range result.Rows {
+		summaryValue, exists := row["delivered_summary"]
+		if !exists {
+			continue
+		}
+		handled = true
+		delete(row, "delivered_summary")
+		summary, validSummary := summaryValue.(string)
+		if !validSummary || !utf8.ValidString(summary) {
+			return types.NewAppError(types.CodeValidation,
+				"历史投递摘要不是有效文本", types.ErrValidation)
+		}
+		recordID, recordOK := row["record_id"].(string)
+		if !recordOK || strings.TrimSpace(recordID) == "" ||
+			strings.TrimSpace(recordID) != recordID {
+			return types.NewAppError(types.CodeValidation,
+				"历史投递摘要缺少不可变反馈身份", types.ErrValidation)
+		}
+		delete(row, "record_id")
+		if strings.TrimSpace(summary) == "" {
+			row["public_evidence_status"] = "legacy_unavailable"
+			continue
+		}
+		arguments := `{"field":"delivered_summary"}`
+		record := newPublicEvidenceRecord(
+			meta.scope.TenantID, meta.scope.UserID, "historical",
+			"feedback", recordID, "feedback_delivered_summary", arguments,
+			summary, "mixed", int64(len(summary)), false, nil,
+		)
+		if err := rememberPublicEvidenceRecord(state, record); err != nil {
+			return err
+		}
+		row["public_evidence_ref"] = record.Ref
+		row["public_evidence_status"] = "isolated"
+		projected = true
+	}
+	if !handled {
+		return nil
+	}
+	if !intelligenceColumnsContain(result.Columns, "public_evidence_ref") {
+		result.Columns = append(result.Columns,
+			store.IntelligenceColumn{Name: "public_evidence_ref", Type: "text"})
+	}
+	if !intelligenceColumnsContain(result.Columns, "public_evidence_status") {
+		result.Columns = append(result.Columns,
+			store.IntelligenceColumn{Name: "public_evidence_status", Type: "text"})
+	}
+	if projected {
+		state.historicalPublicPending = true
+	}
 	return nil
 }
 
