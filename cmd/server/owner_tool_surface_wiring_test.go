@@ -68,6 +68,65 @@ func TestOwnerToolSurfaceIsACompositionInvariant(t *testing.T) {
 	}
 }
 
+// TestOwnerRuntimeGatePrecedesAllDurableAssembly proves the process cannot
+// expose unconditional manage_tasks create while its Research V3 worker is
+// dark. The Gate must run before the first Store is opened, and the owner
+// catalog itself must remain unconditional rather than falling back to a
+// canary or a hidden create tool.
+func TestOwnerRuntimeGatePrecedesAllDurableAssembly(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate owner runtime Gate wiring test")
+	}
+	file, err := parser.ParseFile(token.NewFileSet(),
+		filepath.Join(filepath.Dir(testFile), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gatePos, ownerBuilderPos token.Pos
+	var firstStorePos token.Pos
+	var conditionals []*ast.IfStmt
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch current := node.(type) {
+		case *ast.IfStmt:
+			conditionals = append(conditionals, current)
+		case *ast.CallExpr:
+			switch {
+			case isIdentCall(current.Fun, "requireOwnerAgentResearchV3Runtime"):
+				if gatePos != token.NoPos {
+					t.Fatal("owner runtime Gate is called more than once")
+				}
+				gatePos = current.Pos()
+			case isPackageSelector(current.Fun, "store", "New"),
+				isPackageSelector(current.Fun, "store", "NewServerRuntimeWithResearchRuntimeCapabilityAndEditRecovery"):
+				if firstStorePos == token.NoPos || current.Pos() < firstStorePos {
+					firstStorePos = current.Pos()
+				}
+			case isPackageSelector(current.Fun, "agent", "BuildOwnerTools"):
+				ownerBuilderPos = current.Pos()
+			}
+		}
+		return true
+	})
+	if gatePos == token.NoPos || firstStorePos == token.NoPos ||
+		ownerBuilderPos == token.NoPos || gatePos >= firstStorePos ||
+		gatePos >= ownerBuilderPos {
+		t.Fatalf("unsafe startup order: gate=%d firstStore=%d ownerBuilder=%d",
+			gatePos, firstStorePos, ownerBuilderPos)
+	}
+	for _, conditional := range conditionals {
+		if conditional.Pos() < ownerBuilderPos && ownerBuilderPos < conditional.End() {
+			t.Fatalf("owner BuildOwnerTools is conditional at %d; runtime Gate must guard startup instead",
+				conditional.Pos())
+		}
+	}
+}
+
+func isIdentCall(expr ast.Expr, name string) bool {
+	ident, ok := expr.(*ast.Ident)
+	return ok && ident.Name == name
+}
+
 // TestSessionAdmissionIsSharedOnlyBySessionBearingLoops pins the composition
 // boundary behind owner chat and Web Dashboard concurrency. They use separate
 // Loop/catalog instances but mutate one active session per user, so both must

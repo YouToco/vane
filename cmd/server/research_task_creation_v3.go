@@ -9,6 +9,20 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+// requireOwnerAgentResearchV3Runtime is the process-level startup gate for the
+// unconditional owner Agent surface. manage_tasks always exposes native V3
+// create, so the server must never admit Feishu/HTTP work while the durable V3
+// worker capability is dark. run calls this before opening any Store.
+func requireOwnerAgentResearchV3Runtime(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("owner Agent startup requires configuration")
+	}
+	if !cfg.Pipeline.ResearchV3RuntimeEnabled {
+		return errors.New("owner Agent manage_tasks create requires pipeline.research_v3_runtime_enabled=true; refusing startup before Store, worker, or ingress")
+	}
+	return nil
+}
+
 // nativeResearchV3CreationPolicy is trusted deployment policy, never model
 // input. These bounded defaults match the V3 workflow's production-tested
 // envelope; tenant quota remains the independent spend authority.
@@ -25,14 +39,12 @@ func nativeResearchV3CreationPolicy() task.CreationV3ServerPolicy {
 func shouldInitializeResearchV3Runtime(cfg *config.Config) bool {
 	return cfg != nil && (cfg.Pipeline.ResearchV3RuntimeEnabled ||
 		cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
-		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" ||
-		cfg.Agent.AgentFirstOwnerCanary)
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "")
 }
 
 func shouldEnableResearchV3Delivery(cfg *config.Config) bool {
 	return cfg != nil && (cfg.Pipeline.ResearchV3RuntimeEnabled ||
-		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" ||
-		cfg.Agent.AgentFirstOwnerCanary)
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "")
 }
 
 type researchV3ActionAuthorityVerifier interface {

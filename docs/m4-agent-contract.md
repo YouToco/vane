@@ -32,10 +32,9 @@
   网络超时/429/5xx 最多自动重试两次，同一错误签名连续两次终止该分支并基于已有证据回答。
 - 会话：同一 owner 30 分钟内的消息共享一个 agent 会话（多轮上下文），超时新开。
 
-意图工具包采用三阶段发布：默认只记录 legacy/candidate 曝光数量及候选会隐藏的工具名，
-模型仍看到 legacy 工具面；`agent.intent_toolkits_owner_canary=true` 仅启用飞书 Owner；
-验收后关闭 canary 并显式设置 `agent.intent_toolkits_allow_all=true`。canary 与 allow-all
-互斥，shadow 日志不记录用户原文或工具参数。
+意图工具包三阶段发布已退役。生产 Owner 工具面现在由 composition root 固定为小型正交
+Agent-first catalog，不再通过 shadow、owner canary 或 allow-all 配置切换；A2A 与 Web
+兼容入口各自显式装配，不能回退到 Owner catalog。
 
 ## 1. migration `store/migrations/005_agent.sql`
 

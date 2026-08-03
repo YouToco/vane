@@ -530,7 +530,7 @@ func TestManageTasksPartialFailureKeepsReceiptAndStableTurnKeys(t *testing.T) {
 	}
 }
 
-func TestManageTasksCreateUsesOnlyNativeV3ExecutorInput(t *testing.T) {
+func TestOwnerManageTasksCreateRunsThroughNativeV3WithoutCanary(t *testing.T) {
 	queries := &fakeManageTaskQuery{err: errors.New("create must not query")}
 	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
 	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
@@ -795,7 +795,7 @@ func TestOwnerGeneralChatInventoryHidesLegacyTaskTools(t *testing.T) {
 	}
 }
 
-func TestAgentFirstCanaryDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
+func TestOwnerAgentDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
 	fs := newFakeStore()
 	fs.profiles[42] = &types.Profile{UserID: 42, Industry: "SECRET-INDUSTRY"}
 	writer := &fakeAgentEvidenceWriter{}

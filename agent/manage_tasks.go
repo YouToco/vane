@@ -141,7 +141,7 @@ type ManageTasksDeps struct {
 }
 
 // NewManageTasksTool builds the single task mutation surface. It is separate
-// from BuildTools while the owner canary coexists with legacy direct Web lanes.
+// from BuildTools while the fixed owner lane coexists with legacy direct Web lanes.
 func NewManageTasksTool(deps ManageTasksDeps) ToolSpec {
 	return newToolSpec(&manageTasksTool{deps: deps}, withToolSurface(ownerPolicy(
 		Effects(EffectDurableProposal, EffectStateWrite, EffectDelivery,

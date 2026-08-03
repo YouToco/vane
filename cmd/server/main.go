@@ -99,6 +99,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("加载配置: %w", err)
 	}
+	// The owner surface always contains manage_tasks create. Fail before the
+	// first Store connection (and therefore before workers or ingress) instead
+	// of advertising a durable action whose V3 runtime is dark.
+	if err := requireOwnerAgentResearchV3Runtime(cfg); err != nil {
+		return fmt.Errorf("Owner Agent 启动 Gate: %w", err)
+	}
 
 	initLogger(cfg.Log.Level)
 

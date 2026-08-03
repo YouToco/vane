@@ -62,6 +62,7 @@
 ## 7. Agent-first owner 工具面
 
 - 生产飞书 owner chat 由 composition root 显式选择 `OwnerAgent` lane；它不是配置开关、灰度比例或用户 ID canary，不能因环境变量缺失回退旧工具。
+- 因 Owner catalog 无条件提供原生 V3 `manage_tasks create`，server 启动必须显式设置 `pipeline.research_v3_runtime_enabled=true`；该 Gate 在首个 Store、worker 或 ingress 之前失败。此开关只保证运行能力持续在线，不授予任何任务执行权；正式运行仍逐任务校验数据库 authority token，shadow/cutover 仍保持 exact-task 语义。
 - owner 普通聊天只装配 `query_my_intelligence`、`manage_tasks`、经统一裁决的 `update_profile` 与已配置的公开研究工具。构造时缺少 exact evidence writer、任一必需工具或混入八个旧任务工具都会拒绝启动。
 - `list_schedules`、`view_task_playbook`、`view_task_latest_run`、`view_profile`、`create_schedule`、`edit_task_definition`、`run_task_now`、`remove_schedule` 不再进入 owner 或 A2A catalog。其 Go handler 暂只服务显式 Web create/edit 兼容入口与历史测试；待 Web 迁到 `manage_tasks` 后物理删除。
 - 旧 `intent_toolkits_shadow/owner_canary/allow_all` 配置、关键词首轮分类和 shadow diff 已删除。强模型始终看到完整的小型正交工具面；授权仍在工具边界执行。

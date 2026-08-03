@@ -414,7 +414,7 @@ type Loop struct {
 	taskCreation       CreationController
 	taskDefinitionEdit DefinitionEditController
 	sys                string // system prompt（含端点检索能力说明段，装配时定型）
-	agentFirstSys      string // 精确 owner canary：不含旧任务工具/冻结抓取计划指引
+	agentFirstSys      string // 固定 owner lane：不含旧任务工具/冻结抓取计划指引
 	renderProfile      bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
 	model              string
 	maxTurns           int

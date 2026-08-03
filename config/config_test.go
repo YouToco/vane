@@ -1454,8 +1454,6 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.executive_brief_web_projection_allow_all", cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll, false},
 		{"pipeline.executive_brief_renderer_canary_schedule_id", cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
-		{"agent.agent_first_owner_canary", cfg.Agent.AgentFirstOwnerCanary, false},
-		{"agent.agent_first_canary_user_id", cfg.Agent.AgentFirstCanaryUserID, int64(0)},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},
 		{"log.level", cfg.Log.Level, "info"},
 	}
@@ -1464,44 +1462,6 @@ func TestDefaults(t *testing.T) {
 			t.Errorf("%s = %v, 期望默认值 %v", c.name, c.got, c.want)
 		}
 	}
-}
-
-func TestLoadResearchV3OwnerAdmissionRollout(t *testing.T) {
-	t.Run("agent first owner canary from environment", func(t *testing.T) {
-		clearVaneEnv(t)
-		t.Setenv("VANE_AGENT_AGENT_FIRST_OWNER_CANARY", "true")
-		t.Setenv("VANE_AGENT_AGENT_FIRST_CANARY_USER_ID", "42")
-		t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://runtime")
-		t.Setenv("VANE_DB_RESEARCH_CONTROL_URL", "postgres://control")
-		t.Setenv("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL", "postgres://edit-recovery")
-		t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "active-v3")
-		t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
-		t.Setenv("VANE_FETCH_EXA_API_KEY", "exa-test")
-		cfg, err := Load(writeTempConfig(t, `
-db:
-  url: "postgres://test"
-`))
-		if err != nil {
-			t.Fatalf("Load() error = %v", err)
-		}
-		if !cfg.Agent.AgentFirstOwnerCanary || cfg.Agent.AgentFirstCanaryUserID != 42 {
-			t.Fatalf("agent-first rollout config = %+v", cfg.Agent)
-		}
-	})
-
-	t.Run("agent first canary requires exact user", func(t *testing.T) {
-		clearVaneEnv(t)
-		_, err := Load(writeTempConfig(t, `
-db:
-  url: "postgres://test"
-agent:
-  agent_first_owner_canary: true
-`))
-		if err == nil || !strings.Contains(err.Error(), "精确 canary user_id") {
-			t.Fatalf("Load() error = %v", err)
-		}
-	})
-
 }
 
 func TestLLMConfigAgentClientConfig(t *testing.T) {
