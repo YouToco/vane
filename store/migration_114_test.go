@@ -26,6 +26,17 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		_, _ = db.ExecContext(context.Background(),
 			`SELECT deprovision_vane_server_runtime_v2()`)
 	})
+	if _, err := db.ExecContext(t.Context(),
+		`ALTER ROLE vane_server_runtime REPLICATION`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 114); err == nil {
+		t.Fatal("migration 114 accepted replication-capable server runtime")
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`ALTER ROLE vane_server_runtime NOREPLICATION`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := provider.UpTo(t.Context(), 114); err != nil {
 		t.Fatal(err)
 	}
@@ -87,8 +98,8 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		}
 		var deliveryID int64
 		if err := db.QueryRowContext(t.Context(), `
-			INSERT INTO deliveries(tenant_id,user_id,batch_id,status)
-			VALUES($1,$2,$3,'sent') RETURNING id`,
+			INSERT INTO deliveries(tenant_id,user_id,batch_id,status,body_md)
+			VALUES($1,$2,$3,'sent','当时推送：Kimi 套餐尚不可购买') RETURNING id`,
 			tenantID, userID, batchID,
 		).Scan(&deliveryID); err != nil {
 			t.Fatal(err)
@@ -100,7 +111,7 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 			) VALUES
 			    ($1,$2,$3,'interested',NULL,'',$4),
 			    ($1,$2,$3,'not_interested',NULL,'',$4),
-			    ($1,$2,$3,'misjudged','factually_wrong','官方原文相反',$4),
+			    ($1,$2,$3,'misjudged','factually_wrong','官方原文相反',$4-interval '1 hour'),
 			    ($1,$2,$3,'not_interested',NULL,'明确不感兴趣',$4)`,
 			tenantID, userID, deliveryID, at,
 		); err != nil {
@@ -119,7 +130,7 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 	query := IntelligenceQuery{
 		Dataset: IntelligenceFeedbacks,
 		Select: []string{
-			"task_ref", "action", "reason_code", "detail",
+			"task_ref", "delivered_summary", "action", "reason_code", "detail",
 			"is_effective_attitude", "created_at",
 		},
 		OrderBy: []IntelligenceOrder{
@@ -138,14 +149,15 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		result.Dataset != IntelligenceFeedbacks || len(result.Rows) != 4 {
 		t.Fatalf("feedback result=%+v", result)
 	}
-	if result.Rows[0]["action"] != "interested" ||
-		result.Rows[0]["is_effective_attitude"] != false ||
-		result.Rows[1]["action"] != "not_interested" ||
+	if result.Rows[0]["action"] != "misjudged" ||
+		result.Rows[0]["reason_code"] != "factually_wrong" ||
+		result.Rows[0]["detail"] != "官方原文相反" ||
+		result.Rows[0]["is_effective_attitude"] != nil ||
+		result.Rows[1]["action"] != "interested" ||
 		result.Rows[1]["is_effective_attitude"] != false ||
-		result.Rows[2]["action"] != "misjudged" ||
-		result.Rows[2]["reason_code"] != "factually_wrong" ||
-		result.Rows[2]["detail"] != "官方原文相反" ||
-		result.Rows[2]["is_effective_attitude"] != nil ||
+		result.Rows[2]["action"] != "not_interested" ||
+		result.Rows[2]["detail"] != "" ||
+		result.Rows[2]["is_effective_attitude"] != false ||
 		result.Rows[3]["action"] != "not_interested" ||
 		result.Rows[3]["detail"] != "明确不感兴趣" ||
 		result.Rows[3]["is_effective_attitude"] != true {
@@ -154,6 +166,9 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 	for _, row := range result.Rows {
 		if row["task_ref"] != "feedback-task-a-114" {
 			t.Fatalf("cross-subject feedback row=%+v", row)
+		}
+		if row["delivered_summary"] != "当时推送：Kimi 套餐尚不可购买" {
+			t.Fatalf("feedback lost delivered summary row=%+v", row)
 		}
 	}
 
@@ -198,21 +213,22 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		t.Fatalf("feedback audit count=%d, want 3", audits)
 	}
 
-	var tableSelect, cardJSONSelect, policyCount bool
+	var tableSelect, bodyMDSelect, cardJSONSelect, policyCount bool
 	if err := db.QueryRowContext(t.Context(), `
 		SELECT
 		  has_table_privilege('vane_intelligence_reader','feedbacks','SELECT'),
+		  has_column_privilege('vane_intelligence_reader','deliveries','body_md','SELECT'),
 		  has_column_privilege('vane_intelligence_reader','deliveries','card_json','SELECT'),
 		  (SELECT count(*)=5 FROM pg_policies
 		    WHERE policyname='intelligence_feedback_identity'
 		      AND tablename IN (
 		        'feedbacks','deliveries','push_batches','profiles','profile_claim_states'
 		      ))`,
-	).Scan(&tableSelect, &cardJSONSelect, &policyCount); err != nil {
+	).Scan(&tableSelect, &bodyMDSelect, &cardJSONSelect, &policyCount); err != nil {
 		t.Fatal(err)
 	}
-	if tableSelect || cardJSONSelect || !policyCount {
-		t.Fatalf("feedback reader capability table=%v card_json=%v policies=%v",
-			tableSelect, cardJSONSelect, policyCount)
+	if tableSelect || !bodyMDSelect || cardJSONSelect || !policyCount {
+		t.Fatalf("feedback reader capability table=%v body_md=%v card_json=%v policies=%v",
+			tableSelect, bodyMDSelect, cardJSONSelect, policyCount)
 	}
 }

@@ -13,6 +13,7 @@ BEGIN
          WHERE rolname='vane_intelligence_reader'
            AND NOT rolcanlogin AND NOT rolsuper AND NOT rolbypassrls
            AND NOT rolinherit AND NOT rolcreaterole AND NOT rolcreatedb
+           AND NOT rolreplication
     ) THEN
         RAISE EXCEPTION '114: intelligence reader attributes are unsafe';
     END IF;
@@ -43,7 +44,7 @@ BEGIN
            AND runtime_role.rolname='vane_server_runtime'
            AND (runtime_role.rolsuper OR runtime_role.rolbypassrls
                 OR runtime_role.rolinherit OR runtime_role.rolcreaterole
-                OR runtime_role.rolcreatedb)
+                OR runtime_role.rolcreatedb OR runtime_role.rolreplication)
     ) THEN
         RAISE EXCEPTION '114: server runtime reader member is unsafe';
     END IF;
@@ -68,7 +69,7 @@ GRANT SELECT (
     id,tenant_id,user_id,delivery_id,action,reason_code,detail,
     profile_epoch,created_at
 ) ON feedbacks TO vane_intelligence_reader;
-GRANT SELECT (id,tenant_id,user_id,batch_id)
+GRANT SELECT (id,tenant_id,user_id,batch_id,body_md)
     ON deliveries TO vane_intelligence_reader;
 GRANT SELECT (id,tenant_id,user_id,schedule_id,run_snapshot_id)
     ON push_batches TO vane_intelligence_reader;

@@ -255,7 +255,8 @@ var intelligenceCatalog = map[IntelligenceDataset]intelligenceDatasetSpec{
 	},
 	IntelligenceFeedbacks: {
 		base: `SELECT f.tenant_id,f.user_id,f.id::text AS record_id,
-		              s.id AS task_ref,rs.id::text AS run_snapshot_id,f.action,
+		              s.id AS task_ref,rs.id::text AS run_snapshot_id,
+		              COALESCE(left(d.body_md,2000),'') AS delivered_summary,f.action,
 		              COALESCE(f.reason_code,'') AS reason_code,f.detail,
 		              CASE
 		                WHEN f.action NOT IN ('interested','not_interested')
@@ -272,15 +273,18 @@ var intelligenceCatalog = map[IntelligenceDataset]intelligenceDatasetSpec{
 		                     AND newer.delivery_id=f.delivery_id
 		                     AND newer.profile_epoch=f.profile_epoch
 		                     AND (
-		                       newer.action IN ('interested','not_interested')
+		                       (
+		                         newer.action IN ('interested','not_interested')
+		                         AND (newer.created_at,newer.id)>(f.created_at,f.id)
+		                       )
 		                       OR (
 		                         f.action='not_interested'
 		                         AND btrim(f.detail)=''
 		                         AND newer.action='misjudged'
 		                         AND newer.reason_code IS NOT NULL
+		                         AND newer.id>f.id
 		                       )
 		                     )
-		                     AND (newer.created_at,newer.id)>(f.created_at,f.id)
 		                )
 		              END AS is_effective_attitude,
 		              f.created_at
@@ -302,11 +306,11 @@ var intelligenceCatalog = map[IntelligenceDataset]intelligenceDatasetSpec{
 		         LEFT JOIN profile_claim_states pcs
 		           ON pcs.tenant_id=f.tenant_id AND pcs.user_id=f.user_id`,
 		columns: intelligenceColumns(
-			"record_id:text", "task_ref:text", "run_snapshot_id:text",
+			"record_id:text", "task_ref:text", "run_snapshot_id:text", "delivered_summary:text",
 			"action:text", "reason_code:text", "detail:text",
 			"is_effective_attitude:boolean", "created_at:time"),
 		defaults: []string{
-			"task_ref", "run_snapshot_id", "action", "reason_code",
+			"task_ref", "run_snapshot_id", "delivered_summary", "action", "reason_code",
 			"detail", "is_effective_attitude", "created_at",
 		},
 		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
