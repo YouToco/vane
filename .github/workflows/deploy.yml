@@ -209,7 +209,12 @@ jobs:
             "$RUNNER_TEMP/vane-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
           [[ ! -e "$BUILD_ROOT" ]]
           install -d -m 0700 "$BUILD_ROOT"
+          [[ -n "$GITHUB_WORKSPACE" && "$GITHUB_WORKSPACE" == /* ]]
+          HANDOFF_ROOT="$GITHUB_WORKSPACE/release-handoff"
+          rm -rf -- "$HANDOFF_ROOT"
+          install -d -m 0700 "$HANDOFF_ROOT"
           echo "BUILD_ROOT=$BUILD_ROOT" >>"$GITHUB_ENV"
+          echo "HANDOFF_ROOT=$HANDOFF_ROOT" >>"$GITHUB_ENV"
 
       - name: Checkout deployment control plane
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -314,26 +319,40 @@ jobs:
             'vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1' ]]
           echo "value=$contract" >>"$GITHUB_OUTPUT"
 
-      - name: Package backend artifact
+      - name: Package backend release handoff
         if: needs.plan.outputs.backend_changed == 'true'
         run: |
+          [[ ! -e "$HANDOFF_ROOT/backend" && ! -L "$HANDOFF_ROOT/backend" ]]
           "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" pack \
             --component backend \
             --sha "${{ needs.plan.outputs.backend_sha }}" \
             --source "$BUILD_ROOT/source/vane-release" \
             --server-release-contract \
               "${{ steps.server_contract.outputs.value }}" \
-            --output "$BUILD_ROOT/artifacts/backend"
+            --output "$HANDOFF_ROOT/backend"
 
-      - name: Upload backend artifact
+      # GitHub Artifact storage is billing-coupled. An exact same-run cache
+      # preserves the untrusted-build/trusted-deploy job boundary without
+      # making a production release depend on Artifact quota. The deploy job
+      # still verifies the manifest, every digest and the exact source SHA.
+      - name: Save backend release handoff
         if: needs.plan.outputs.backend_changed == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: ${{ github.run_id }}-${{ github.run_attempt }}-backend-${{ needs.plan.outputs.backend_sha }}
-          path: ${{ runner.temp }}/vane-build-${{ github.run_id }}-${{ github.run_attempt }}/artifacts/backend/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
+          key: vane-release-v1-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
+          path: release-handoff/backend
+
+      # cache/save deliberately treats several remote save failures as
+      # warnings. Probe the exact immutable key before the build job can be
+      # considered successful, otherwise deploy would discover the miss late.
+      - name: Verify backend release handoff is remotely visible
+        if: needs.plan.outputs.backend_changed == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: vane-release-v1-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
+          path: release-handoff/backend
+          lookup-only: true
+          fail-on-cache-miss: true
 
       - name: Checkout frontend gate source at exact SHA
         if: needs.plan.outputs.frontend_changed == 'true'
@@ -381,24 +400,31 @@ jobs:
           npm run build
           [[ -z $(git status --porcelain --untracked-files=all) ]]
 
-      - name: Package frontend artifact
+      - name: Package frontend release handoff
         if: needs.plan.outputs.frontend_changed == 'true'
         run: |
+          [[ ! -e "$HANDOFF_ROOT/frontend" && ! -L "$HANDOFF_ROOT/frontend" ]]
           "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" pack \
             --component frontend \
             --sha "${{ needs.plan.outputs.frontend_sha }}" \
             --source "$BUILD_ROOT/source/vane-web-release" \
-            --output "$BUILD_ROOT/artifacts/frontend"
+            --output "$HANDOFF_ROOT/frontend"
 
-      - name: Upload frontend artifact
+      - name: Save frontend release handoff
         if: needs.plan.outputs.frontend_changed == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: ${{ github.run_id }}-${{ github.run_attempt }}-frontend-${{ needs.plan.outputs.frontend_sha }}
-          path: ${{ runner.temp }}/vane-build-${{ github.run_id }}-${{ github.run_attempt }}/artifacts/frontend/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
+          key: vane-release-v1-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
+          path: release-handoff/frontend
+
+      - name: Verify frontend release handoff is remotely visible
+        if: needs.plan.outputs.frontend_changed == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: vane-release-v1-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
+          path: release-handoff/frontend
+          lookup-only: true
+          fail-on-cache-miss: true
 
       - name: Remove per-attempt build root
         if: always()
@@ -406,9 +432,12 @@ jobs:
           set -euo pipefail
           [[ "$BUILD_ROOT" == \
             "$RUNNER_TEMP/vane-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+          [[ "$HANDOFF_ROOT" == "$GITHUB_WORKSPACE/release-handoff" ]]
           rm -rf -- "$BUILD_ROOT"
+          rm -rf -- "$HANDOFF_ROOT"
 
-  # This job receives only control-plane code and same-run artifacts. It never
+  # This job receives only control-plane code and exact same-run release
+  # handoffs. It never
   # downloads or executes source trees or Go build/test commands. Frontend
   # deploys materialize the lock-pinned Wrangler tree before any secret-bearing
   # provider step, so runner images carry no hidden tool dependency.
@@ -431,7 +460,12 @@ jobs:
             "$RUNNER_TEMP/vane-deploy-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
           [[ ! -e "$DEPLOY_ROOT" ]]
           install -d -m 0700 "$DEPLOY_ROOT"
+          [[ -n "$GITHUB_WORKSPACE" && "$GITHUB_WORKSPACE" == /* ]]
+          HANDOFF_ROOT="$GITHUB_WORKSPACE/release-handoff"
+          rm -rf -- "$HANDOFF_ROOT"
+          install -d -m 0700 "$HANDOFF_ROOT"
           echo "DEPLOY_ROOT=$DEPLOY_ROOT" >>"$GITHUB_ENV"
+          echo "HANDOFF_ROOT=$HANDOFF_ROOT" >>"$GITHUB_ENV"
 
       - name: Checkout deployment control plane
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -446,19 +480,23 @@ jobs:
         with:
           node-version: 22.23.1
 
-      - name: Download backend artifact from this run
+      - name: Restore backend release handoff from this run
+        id: restore-backend-handoff
         if: needs.plan.outputs.backend_changed == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: ${{ github.run_id }}-${{ github.run_attempt }}-backend-${{ needs.plan.outputs.backend_sha }}
-          path: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/incoming/backend
+          key: vane-release-v1-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
+          path: release-handoff/backend
+          fail-on-cache-miss: true
 
-      - name: Download frontend artifact from this run
+      - name: Restore frontend release handoff from this run
+        id: restore-frontend-handoff
         if: needs.plan.outputs.frontend_changed == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: ${{ github.run_id }}-${{ github.run_attempt }}-frontend-${{ needs.plan.outputs.frontend_sha }}
-          path: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/incoming/frontend
+          key: vane-release-v1-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
+          path: release-handoff/frontend
+          fail-on-cache-miss: true
 
       - name: Strictly validate backend artifact
         if: needs.plan.outputs.backend_changed == 'true'
@@ -466,7 +504,7 @@ jobs:
           "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" validate \
             --component backend \
             --sha "${{ needs.plan.outputs.backend_sha }}" \
-            --input "$DEPLOY_ROOT/incoming/backend" \
+            --input "$HANDOFF_ROOT/backend" \
             --output "$DEPLOY_ROOT/verified/backend"
 
       - name: Strictly validate frontend artifact
@@ -475,7 +513,7 @@ jobs:
           "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" validate \
             --component frontend \
             --sha "${{ needs.plan.outputs.frontend_sha }}" \
-            --input "$DEPLOY_ROOT/incoming/frontend" \
+            --input "$HANDOFF_ROOT/frontend" \
             --output "$DEPLOY_ROOT/verified/frontend"
 
       - name: Install pinned Aliyun tools
@@ -547,4 +585,6 @@ jobs:
           set -euo pipefail
           [[ "$DEPLOY_ROOT" == \
             "$RUNNER_TEMP/vane-deploy-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+          [[ "$HANDOFF_ROOT" == "$GITHUB_WORKSPACE/release-handoff" ]]
           rm -rf -- "$DEPLOY_ROOT"
+          rm -rf -- "$HANDOFF_ROOT"

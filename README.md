@@ -33,11 +33,19 @@ contain no production workflow, runner label, or production credential.
   clean tree. PostgreSQL uses a GitHub-assigned ephemeral host port so stale or
   concurrent runner workloads cannot collide on a fixed host port before the
   Gate starts.
-- `deploy` runs on `vane-deploy`. It downloads only artifacts named with the
-  current run ID, attempt, component, and source SHA. It never downloads source
-  trees and runs no source build, npm install, or Go build/test command.
+- `deploy` runs on `vane-deploy`. It restores only release handoffs cached under
+  an exact key containing the current run ID, component, and source SHA. No
+  prefix fallback is allowed and a miss fails closed. Omitting the attempt is
+  intentional: a failed deploy job can reuse the already gated immutable
+  handoff when only failed jobs are retried. This keeps the
+  build/deploy trust boundary while avoiding a production dependency on the
+  account's separately billed GitHub Artifact quota. GitHub documents exact
+  run-ID caches and cross-job save/restore as supported short-lived
+  handoff patterns. The deploy job never restores source trees and runs no
+  source build, npm install, or Go build/test command.
 
-Each component artifact is a tarball plus SHA256 sidecar and JSON manifest. The
+Each component release handoff is a tarball plus SHA256 sidecar and JSON
+manifest. The
 manifest binds source SHA, archive SHA256/size, and the complete file allowlist
 with per-file SHA256, size, and mode. Before any production secret is exposed,
 the deploy job rejects extra inputs, duplicate JSON keys, traversal, symlinks,
@@ -138,7 +146,8 @@ stale-SHA, and cross-repository completions cannot enter `plan`. There is no
 `workflow_dispatch` or `repository_dispatch` production entry. The certificate
 workflow remains schedule-only. A failed production run is retried with
 GitHub's run-rerun operation using **Re-run all jobs** so `plan`, the exact-SHA
-Gates, artifacts, and deployment all share the new run attempt. GitHub
+Gates, release handoffs, and deployment remain bound to one workflow run.
+GitHub
 Environment approval is intentionally not used as a security boundary on this
 Free private repository.
 
