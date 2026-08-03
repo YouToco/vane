@@ -89,7 +89,7 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 	})
 	researchURL := roleTestURL(t, scratchURL, researchRuntimeLoginRole,
 		researchPassword)
-	if _, err := provider.UpTo(t.Context(), 103); err != nil {
+	if _, err := provider.UpTo(t.Context(), 108); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,6 +243,35 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		}
 		if sessionUser != researchRuntimeLoginRole || currentUser != researchRuntimeLoginRole {
 			t.Fatalf("research identity=%s/%s", sessionUser, currentUser)
+		}
+	})
+
+	t.Run("constructor rejects missing synthesis admission capability", func(t *testing.T) {
+		if _, err := owner.ExecContext(t.Context(),
+			`REVOKE EXECUTE ON FUNCTION authorize_research_run_effect_cap_v1(BIGINT)
+			 FROM vane_research_v3_executor`); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			ctx, cancel := cleanupContext()
+			defer cancel()
+			if _, err := owner.ExecContext(ctx,
+				`GRANT EXECUTE ON FUNCTION authorize_research_run_effect_cap_v1(BIGINT)
+				 TO vane_research_v3_executor`); err != nil {
+				t.Errorf("restore synthesis admission capability: %v", err)
+			}
+		}()
+
+		st, err := NewServerRuntimeWithResearchRuntimeCapability(
+			t.Context(), runtimeURL, researchURL, ResearchRunCapabilityConfigV1{
+				ActiveKeyID:  "server-runtime-missing-synthesis-admission",
+				ActiveKeyHex: strings.Repeat("52", 32),
+			})
+		if st != nil {
+			st.Close()
+		}
+		if err == nil || !strings.Contains(err.Error(), "destructive privileges") {
+			t.Fatalf("constructor accepted missing synthesis admission capability: %v", err)
 		}
 	})
 

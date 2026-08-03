@@ -397,6 +397,10 @@ func (s *Store) ClaimResearchBriefSynthesisV3(
 		return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError("begin research Brief claim", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
+		return ClaimResearchBriefSynthesisV3Result{}, researchRunDatabaseError(
+			"lock research Brief schema", err)
+	}
 	if scopedRef != params.SnapshotRef {
 		return ClaimResearchBriefSynthesisV3Result{}, researchRunIntegrityError()
 	}
@@ -440,7 +444,9 @@ func (s *Store) ClaimResearchBriefSynthesisV3(
 			Synthesis: row, ReceiptState: state, LLMCallID: callID,
 		}, nil
 	}
-	if err := authorizeResearchRunEffectV3(ctx, tx, params.Identity); err != nil {
+	if err := authorizeResearchRunEffectV3(
+		ctx, tx, params.Identity, params.SnapshotRef.SnapshotID,
+	); err != nil {
 		return ClaimResearchBriefSynthesisV3Result{}, err
 	}
 	row, err = scanResearchBriefSynthesisV3(tx.QueryRow(ctx,
