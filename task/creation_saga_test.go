@@ -178,7 +178,7 @@ func (s *creationSagaFakeStore) CreateResearchTaskCreationOperationV3(
 	}
 	s.op = types.TaskCreationOperation{
 		ID: p.ID, TenantID: p.TenantID, UserID: p.UserID, SessionID: p.SessionID,
-		ToolName: "create_schedule", Args: bytes.Clone(p.Args), Summary: p.Summary,
+		ToolName: "manage_tasks", Args: bytes.Clone(p.Args), Summary: p.Summary,
 		Status: types.TaskOperationStatusPending, ExpiresAt: p.ExpiresAt,
 		ExecutionVersion: types.TaskCreationExecutionVersionV2,
 	}

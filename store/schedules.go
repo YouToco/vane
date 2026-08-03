@@ -16,17 +16,26 @@ import (
 const scheduleColumns = `id, tenant_id, user_id, nl_description, spec_json, scope_json, status, execution_mode, created_at, updated_at`
 
 // matureSchedulePredicate requires the outer schedules table to use alias s.
-// A v1 aggregate is user-manageable only after its operation is both
-// executed/completed; v0/legacy schedules have no matching versioned row and
+// A versioned aggregate is user-manageable only after its operation is both
+// executed/completed. V1 is permanently bound to create_schedule and native
+// V2 to manage_tasks; v0/legacy schedules have no matching versioned row and
 // therefore remain visible.
 const matureSchedulePredicate = `NOT EXISTS (
 	SELECT 1
 	  FROM task_creation_operations p
 	 WHERE p.task_id = s.id
 	   AND p.tenant_id = s.tenant_id AND p.user_id = s.user_id
-	   AND p.tool_name = 'create_schedule' AND p.execution_version = 1
+	   AND ((p.tool_name = 'create_schedule' AND p.execution_version = 1) OR
+	        (p.tool_name = 'manage_tasks' AND p.execution_version = 2))
 	   AND NOT (p.status = 'executed' AND p.phase = 'completed')
 )`
+
+// Research execution and delivery queries use the descriptive schedule alias.
+// Keep one predicate definition so creation-protocol additions cannot diverge
+// between management and money/network effect gates.
+var matureSchedulePredicateForResearch = strings.ReplaceAll(
+	matureSchedulePredicate, "s.", "schedule.",
+)
 
 // scanSchedule 把一行 schedules 扫进 types.Schedule（复用于单行与多行）。
 func scanSchedule(row pgx.Row, sc *types.Schedule) error {

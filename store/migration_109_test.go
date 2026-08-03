@@ -2,11 +2,14 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"io/fs"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pressly/goose/v3"
 )
 
@@ -40,20 +43,24 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 		"begin_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,smallint)",
 		"commit_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,smallint)",
 	} {
-		var publicExecute, appExecute, securityDefiner, safePath bool
+		var publicExecute, appExecute, coordinatorExecute, securityDefiner, safePath bool
 		var owner string
 		if err := db.QueryRowContext(t.Context(), `
 			SELECT has_function_privilege('public',p.oid,'EXECUTE'),
 			       has_function_privilege('vane_app',p.oid,'EXECUTE'),
+			       has_function_privilege('vane_native_v3_creation_coordinator',p.oid,'EXECUTE'),
 			       p.prosecdef,p.proowner::regrole::text,
 			       p.proconfig=ARRAY['search_path=pg_catalog, public, pg_temp']::text[]
 			  FROM pg_proc p WHERE p.oid=$1::regprocedure`, signature).Scan(
-			&publicExecute, &appExecute, &securityDefiner, &owner, &safePath); err != nil {
+			&publicExecute, &appExecute, &coordinatorExecute,
+			&securityDefiner, &owner, &safePath); err != nil {
 			t.Fatal(err)
 		}
-		if publicExecute || !appExecute || !securityDefiner || owner == "vane_app" || !safePath {
-			t.Fatalf("unsafe native V3 function %s public=%v app=%v definer=%v owner=%q path=%v",
-				signature, publicExecute, appExecute, securityDefiner, owner, safePath)
+		if publicExecute || appExecute || !coordinatorExecute || !securityDefiner ||
+			owner == "vane_app" || !safePath {
+			t.Fatalf("unsafe native V3 function %s public=%v app=%v coordinator=%v definer=%v owner=%q path=%v",
+				signature, publicExecute, appExecute, coordinatorExecute,
+				securityDefiner, owner, safePath)
 		}
 	}
 
@@ -69,6 +76,135 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 		t.Fatalf("migration 109 did not retain only V1/V2 creation protocols: %s",
 			constraintDefinition)
 	}
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT pg_get_constraintdef(oid)
+		  FROM pg_constraint
+		 WHERE conname='task_creation_operations_protocol_tool_binding'`,
+	).Scan(&constraintDefinition); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(constraintDefinition, "execution_version = 1") ||
+		!strings.Contains(constraintDefinition, "tool_name = 'create_schedule'") ||
+		!strings.Contains(constraintDefinition, "execution_version = 2") ||
+		!strings.Contains(constraintDefinition, "tool_name = 'manage_tasks'") {
+		t.Fatalf("migration 109 protocol/tool binding differs: %s", constraintDefinition)
+	}
+
+	var appAuthorityInsert, appAuthorityUpdate bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT has_table_privilege('vane_app','research_v3_delivery_authorities','INSERT'),
+		       has_table_privilege('vane_app','research_v3_delivery_authorities','UPDATE')`,
+	).Scan(&appAuthorityInsert, &appAuthorityUpdate); err != nil {
+		t.Fatal(err)
+	}
+	if appAuthorityInsert || appAuthorityUpdate {
+		t.Fatalf("vane_app received direct authority mutation insert=%v update=%v",
+			appAuthorityInsert, appAuthorityUpdate)
+	}
+	roleTx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roleTx.ExecContext(t.Context(), `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	_, directErr := roleTx.ExecContext(t.Context(), `
+		INSERT INTO research_v3_delivery_authorities
+		 (tenant_id,user_id,task_id,generation,definition_version,definition_digest,
+		  target_action_digest,action_authorization_digest,status)
+		 VALUES (1,1,'forbidden',1,1,repeat('0',64),repeat('0',64),repeat('0',64),'staged')`)
+	if directErr == nil || !postgresCodeIs(directErr, "42501") {
+		t.Fatalf("vane_app direct authority insert err=%v", directErr)
+	}
+	if err := roleTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	roleTx, err = db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roleTx.ExecContext(t.Context(), `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	_, executeErr := roleTx.ExecContext(t.Context(), `
+		SELECT begin_native_research_task_activation_v3_v1(
+		 NULL::text,NULL::bigint,NULL::bigint,NULL::text,NULL::bigint,
+		 NULL::text,2::smallint)`)
+	if executeErr == nil || !postgresCodeIs(executeErr, "42501") {
+		t.Fatalf("vane_app reached native V3 write function: %v", executeErr)
+	}
+	_ = roleTx.Rollback()
+	roleTx, err = db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roleTx.ExecContext(t.Context(),
+		`SET LOCAL ROLE vane_native_v3_creation_coordinator`); err != nil {
+		t.Fatal(err)
+	}
+	_, directErr = roleTx.ExecContext(t.Context(), `
+		INSERT INTO research_v3_delivery_authorities
+		 (tenant_id,user_id,task_id,generation,definition_version,definition_digest,
+		  target_action_digest,action_authorization_digest,status)
+		 VALUES (1,1,'forbidden',1,1,repeat('0',64),repeat('0',64),repeat('0',64),'staged')`)
+	if directErr == nil || !postgresCodeIs(directErr, "42501") {
+		t.Fatalf("coordinator gained direct authority insert: %v", directErr)
+	}
+	_ = roleTx.Rollback()
+	roleTx, err = db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roleTx.ExecContext(t.Context(),
+		`SET LOCAL ROLE vane_native_v3_creation_coordinator`); err != nil {
+		t.Fatal(err)
+	}
+	_, executeErr = roleTx.ExecContext(t.Context(), `
+		SELECT begin_native_research_task_activation_v3_v1(
+		 NULL::text,NULL::bigint,NULL::bigint,NULL::text,NULL::bigint,
+		 NULL::text,2::smallint)`)
+	if executeErr == nil || postgresCodeIs(executeErr, "42501") {
+		t.Fatalf("coordinator did not reach guarded function body: %v", executeErr)
+	}
+	_ = roleTx.Rollback()
+
+	var appMember, serverMember, coordinatorLogin, coordinatorInherit, coordinatorBypass bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT pg_has_role('vane_app','vane_native_v3_creation_coordinator','MEMBER'),
+		       EXISTS (
+		         SELECT 1 FROM pg_roles runtime,pg_roles coordinator
+		          WHERE runtime.rolname='vane_server_runtime'
+		            AND coordinator.rolname='vane_native_v3_creation_coordinator'
+		            AND pg_has_role(runtime.oid,coordinator.oid,'MEMBER')
+		       ),
+		       rolcanlogin,rolinherit,rolbypassrls
+		  FROM pg_roles WHERE rolname='vane_native_v3_creation_coordinator'`).Scan(
+		&appMember, &serverMember, &coordinatorLogin, &coordinatorInherit,
+		&coordinatorBypass); err != nil {
+		t.Fatal(err)
+	}
+	if appMember || serverMember || coordinatorLogin || coordinatorInherit || coordinatorBypass {
+		t.Fatalf("unsafe coordinator role app_member=%v server_member=%v login=%v inherit=%v bypass=%v",
+			appMember, serverMember, coordinatorLogin, coordinatorInherit, coordinatorBypass)
+	}
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatalf("provision exact server runtime V2: %v", err)
+	}
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatalf("replay exact server runtime V2 provision: %v", err)
+	}
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT EXISTS (
+		  SELECT 1 FROM pg_roles runtime,pg_roles coordinator
+		   WHERE runtime.rolname='vane_server_runtime'
+		     AND coordinator.rolname='vane_native_v3_creation_coordinator'
+		     AND pg_has_role(runtime.oid,coordinator.oid,'MEMBER'))`,
+	).Scan(&serverMember); err != nil {
+		t.Fatal(err)
+	}
+	if !serverMember {
+		t.Fatal("provisioned server runtime cannot enter native V3 coordinator")
+	}
 
 	migration, err := fs.ReadFile(dir, "109_native_research_task_creation.sql")
 	if err != nil {
@@ -80,8 +216,102 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 			t.Fatalf("native V3 creation migration references retired execution state %q", forbidden)
 		}
 	}
+	for _, signature := range []string{
+		"commit_native_research_task_creation_v3_v1(text,bigint,bigint,text,bigint,text,text,bytea,bytea,bytea,bytea,text,text,smallint)",
+		"begin_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,smallint)",
+		"commit_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,smallint)",
+	} {
+		var definition string
+		if err := db.QueryRowContext(t.Context(),
+			`SELECT pg_get_functiondef($1::regprocedure)`, signature).Scan(&definition); err != nil {
+			t.Fatal(err)
+		}
+		advisory := strings.Index(definition, "pg_advisory_xact_lock(hashtextextended")
+		rowLock := firstPositiveIndex(definition, "FOR UPDATE", "FOR SHARE")
+		if advisory < 0 || rowLock < 0 || advisory >= rowLock {
+			t.Fatalf("native V3 lock order differs for %s advisory=%d row=%d",
+				signature, advisory, rowLock)
+		}
+	}
+
+	var userID, tenantID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users(feishu_open_id,name) VALUES ('migration-109-owner','owner') RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO tenants(status,plan) VALUES ('active','free') RETURNING id`,
+	).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'owner')`,
+		tenantID, userID); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []struct {
+		id      string
+		tool    string
+		version int
+	}{
+		{"migration-109-invalid-v1", "manage_tasks", 1},
+		{"migration-109-invalid-v2", "create_schedule", 2},
+	} {
+		_, err := db.ExecContext(t.Context(), `
+			INSERT INTO task_creation_operations
+			 (id,tenant_id,user_id,tool_name,args,summary,status,expires_at,execution_version)
+			 VALUES ($1,$2,$3,$4,'{}','invalid','pending',$5,$6)`,
+			invalid.id, tenantID, userID, invalid.tool, time.Now().Add(time.Hour), invalid.version)
+		if err == nil || !postgresCodeIs(err, "23514") {
+			t.Fatalf("invalid protocol/tool binding %+v err=%v", invalid, err)
+		}
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO task_creation_operations
+		 (id,tenant_id,user_id,tool_name,args,summary,status,expires_at,execution_version)
+		 VALUES ('migration-109-v1',$1,$2,'create_schedule','{}','v1','pending',$3,1)`,
+		tenantID, userID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("V1/create_schedule binding rejected: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`DELETE FROM task_creation_operations WHERE id='migration-109-v1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO task_creation_operations
+		 (id,tenant_id,user_id,tool_name,args,summary,status,expires_at,execution_version)
+		 VALUES ('migration-109-v2',$1,$2,'manage_tasks','{}','v3','pending',$3,2)`,
+		tenantID, userID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(t.Context(), 108); err == nil {
+		t.Fatal("migration 109 downgraded with a native V2 operation")
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`DELETE FROM task_creation_operations WHERE id='migration-109-v2'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatalf("deprovision exact server runtime V2: %v", err)
+	}
 
 	if _, err := provider.DownTo(t.Context(), 108); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func postgresCodeIs(err error, code string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == code
+}
+
+func firstPositiveIndex(value string, candidates ...string) int {
+	best := -1
+	for _, candidate := range candidates {
+		if index := strings.Index(value, candidate); index >= 0 && (best < 0 || index < best) {
+			best = index
+		}
+	}
+	return best
 }

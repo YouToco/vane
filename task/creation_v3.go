@@ -115,7 +115,8 @@ func (c *CreationCoordinator) PrepareResearchV3(
 	}
 	if op == nil || op.ExecutionVersion != types.TaskCreationExecutionVersionV2 ||
 		op.ID != params.ID || op.TenantID != params.TenantID || op.UserID != params.UserID ||
-		op.Summary != params.Summary || !researchV3CreationDefinitionsEqual(op.Args, params.Args) {
+		op.ToolName != "manage_tasks" || op.Summary != params.Summary ||
+		!researchV3CreationDefinitionsEqual(op.Args, params.Args) {
 		return CreationProposal{}, types.NewAppError(
 			types.CodeConflict, "V3 任务创建操作与已保存内容冲突", types.ErrConflict)
 	}
