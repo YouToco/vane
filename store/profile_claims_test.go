@@ -1,12 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1463,9 +1464,22 @@ func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(firstAction, replay) {
+	firstPayload, err := json.Marshal(firstAction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayPayload, err := json.Marshal(replay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Receipt replay is a wire-level exactness contract. time.Time values
+	// scanned by pgx and decoded from the stored JSON can carry different
+	// internal *time.Location pointers while encoding to identical RFC3339
+	// bytes. reflect.DeepEqual therefore makes this test runner-timezone
+	// dependent even though the API response is unchanged.
+	if !bytes.Equal(firstPayload, replayPayload) {
 		t.Fatalf("bounded action receipt replay drifted:\n%+v\n%+v",
-			firstAction, replay)
+			string(firstPayload), string(replayPayload))
 	}
 }
 
