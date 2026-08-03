@@ -1149,6 +1149,16 @@ func (l *Loop) handleMessage(
 		// 给出了信任标签，未来包装文案改名也不能让原文漏进持久化历史。
 		externalTurn := redactLatestExternalInput(msgs)
 		msgs = truncateMessages(append(history, externalTurn...))
+	} else if state.compartmentedResearch != nil &&
+		state.compartmentedResearch.visibleTurn {
+		// Compartmented synthesis deliberately returns only the safe visible
+		// user/assistant pair. Preserve prior scrubbed history while ensuring the
+		// raw public tool protocol and page body never enter agent_sessions.
+		visible := []llm.ChatMessage{
+			{Role: "user", Content: text},
+			{Role: "assistant", Content: outcome.Reply},
+		}
+		msgs = truncateMessages(append(history, visible...))
 	} else if directProposal {
 		// converse 只处理 current-user-only 视图；持久化时把本轮安全交换追加
 		// 回原有已清洗历史，既不泄漏旧画像给模型，也不抹掉用户会话。
@@ -1330,7 +1340,21 @@ func (l *Loop) converse(
 			// 只把 taint 后含工具协议的出站视图投影为纯 user 数据消息。
 			// 继续研究时也使用同一投影，确保第二个公开查询永远看不到
 			// 画像或此前会话，只看到当前 owner request 与公开结果。
-			requestMessages = untrustedContinuationMessages(msgs)
+			if state.compartmentedResearch != nil {
+				var bundleErr error
+				requestMessages, bundleErr = publicEvidenceBundleMessages(state)
+				if bundleErr != nil {
+					reply := replyExternalFollowupUngrounded
+					state.compartmentedResearch.visibleTurn = true
+					msgs = []llm.ChatMessage{
+						{Role: "user", Content: state.ownerRequest},
+						{Role: "assistant", Content: reply},
+					}
+					return Outcome{Reply: reply}, msgs, turns, nil
+				}
+			} else {
+				requestMessages = untrustedContinuationMessages(msgs)
+			}
 		}
 		system := l.sys
 		if state.agentFirstEnabled {
@@ -1396,6 +1420,9 @@ func (l *Loop) converse(
 			if state.externalFollowupGroundingFailures > 0 {
 				system += externalFollowupGroundingRetrySystemNote
 			}
+		}
+		if state.compartmentedResearch != nil && state.untrustedExternalResult {
+			system += compartmentedPublicSummarySystemNote
 		}
 		if state.webSearchSucceeded &&
 			!state.webPageReadSucceeded &&
@@ -1534,6 +1561,32 @@ func (l *Loop) converse(
 					Reply: replyTaskDefinitionEditNotCreated,
 				}, msgs, turns, nil
 			}
+			if state.historicalPublicPending &&
+				state.compartmentedResearch == nil {
+				if err := freezeCompartmentedInternalEvidence(
+					ctx, state, true,
+				); err != nil {
+					return Outcome{}, nil, 0, err
+				}
+				state.untrustedExternalResult = true
+				reply, extraTurns, finishErr := l.finishCompartmentedResearch(
+					// The main Agent has seen only the safe projection, never the
+					// sidecar bytes. Do not accept even schema-shaped main output as
+					// a public summary; force the isolated Tools:nil summary request.
+					ctx, state, "",
+					turns+state.contextStepOffset+1,
+				)
+				turns += extraTurns
+				if finishErr != nil {
+					return Outcome{}, nil, 0, finishErr
+				}
+				state.compartmentedResearch.visibleTurn = true
+				msgs = []llm.ChatMessage{
+					{Role: "user", Content: state.ownerRequest},
+					{Role: "assistant", Content: reply},
+				}
+				return Outcome{Reply: reply}, msgs, turns, nil
+			}
 			reply := rejectRetiredConfirmationClaim(resp.Content)
 			if state != nil && (strings.Contains(reply, "？") ||
 				strings.HasSuffix(strings.TrimSpace(reply), "?")) {
@@ -1548,6 +1601,22 @@ func (l *Loop) converse(
 					Role: "assistant", Content: replyGroundedPageNotRead,
 				})
 				return Outcome{Reply: replyGroundedPageNotRead}, msgs, turns, nil
+			}
+			if state.compartmentedResearch != nil && state.untrustedExternalResult {
+				reply, extraTurns, finishErr := l.finishCompartmentedResearch(
+					ctx, state, resp.Content,
+					turns+state.contextStepOffset+1,
+				)
+				turns += extraTurns
+				if finishErr != nil {
+					return Outcome{}, nil, 0, finishErr
+				}
+				state.compartmentedResearch.visibleTurn = true
+				msgs = []llm.ChatMessage{
+					{Role: "user", Content: state.ownerRequest},
+					{Role: "assistant", Content: reply},
+				}
+				return Outcome{Reply: reply}, msgs, turns, nil
 			}
 			if state.webResearchSucceeded &&
 				!externalFollowupReplyGrounded(
@@ -2047,12 +2116,12 @@ func isSafeAfterUntrusted(spec ToolSpec) bool {
 		effects.Has(EffectStateWrite) ||
 		effects.Has(EffectDelivery) ||
 		effects.Has(EffectDurableProposal) ||
-		effects.Has(EffectDirectOwnerWrite) {
+		effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite) {
 		return false
 	}
 	return effects.Has(EffectLocalHandleRead) ||
-		effects.Has(EffectNetworkRead) ||
-		effects.Has(EffectActivationWrite)
+		effects.Has(EffectNetworkRead)
 }
 
 func canDeclareAfterUntrusted(state *toolRunState, spec ToolSpec) bool {
@@ -2362,6 +2431,9 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 					))) {
 			out = append(out, toolMsg(tc.ID, toolMsgExplicitIntent))
 			continue
+		}
+		if err := beginCompartmentedResearch(ctx, state, spec); err != nil {
+			return out, err
 		}
 		// 外部结果之后仍允许只读公开研究，但内部读取和写入保持确定性关闭。
 		// 此时出站历史已被 isolateExternalResultTurn 缩到当前用户请求与公开
@@ -3696,6 +3768,12 @@ func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64,
 	ctx = context.WithValue(ctx, toolCallRecKey{}, rec)
 
 	start := time.Now()
+	if spec.Name() == "web_search" {
+		// A provider call ID may be reused by a malformed model response. Clear
+		// any prior invocation-local display metadata before this execution so a
+		// failed retry cannot inherit links from an earlier successful search.
+		resetInvocationPublicEvidenceURLs(ctx)
+	}
 	result, err := spec.Execute(ctx, userID, args)
 	rec.DurationMs = int(time.Since(start).Milliseconds())
 	if isUntrustedResultTool(spec) {
@@ -3766,7 +3844,7 @@ func (l *Loop) captureExactToolEvidence(
 	if spec.Policy.ResultTrust == ResultTrustExternal {
 		trust = "external"
 	}
-	state.toolEvidence = append(state.toolEvidence, store.AgentToolEvidenceV1{
+	evidence := store.AgentToolEvidenceV1{
 		InvocationID: invocationID,
 		ToolCall:     *rec,
 		ToolName:     spec.Name(),
@@ -3774,7 +3852,11 @@ func (l *Loop) captureExactToolEvidence(
 		Result:       append([]byte(nil), result...),
 		OriginalSize: rec.ResultSize,
 		TrustType:    trust,
-	})
+	}
+	if err := rememberCurrentPublicEvidence(ctx, state, spec, evidence); err != nil {
+		return false
+	}
+	state.toolEvidence = append(state.toolEvidence, evidence)
 	return true
 }
 

@@ -268,13 +268,27 @@ func (t *queryMyIntelligenceTool) Execute(
 			"用户情报查询缺少认证会话范围", types.ErrValidation)
 	}
 	sessionID := meta.scope.SessionID
+	storeQuery, projectionErr := prepareIntelligenceToolCallQuery(query)
+	if projectionErr != nil {
+		return "query_my_intelligence 查询被拒绝：" + projectionErr.Error(), nil
+	}
+	storeQuery, projectionErr = prepareIntelligenceObservationQuery(storeQuery)
+	if projectionErr != nil {
+		return "query_my_intelligence 查询被拒绝：" + projectionErr.Error(), nil
+	}
 	result, err := t.st.QueryMyIntelligence(ctx, store.IntelligenceScope{
 		TenantID: meta.scope.TenantID, UserID: userID, SessionID: &sessionID,
-	}, query)
+	}, storeQuery)
 	if err != nil {
 		if errors.Is(err, types.ErrValidation) {
 			return "query_my_intelligence 查询被拒绝：" + err.Error(), nil
 		}
+		return "", err
+	}
+	if err := projectIntelligenceResultForAgent(ctx, result); err != nil {
+		return "", err
+	}
+	if err := projectObservationResultForAgent(ctx, result); err != nil {
 		return "", err
 	}
 	rememberIntelligenceResultReferences(ctx, result)

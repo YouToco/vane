@@ -68,6 +68,51 @@
 - `run`/`delete` 强制使用每个任务的耐久幂等命令。批量部分失败仍继续处理其他目标，并把 completed/failed 写入动作回执；用户只看到可读名称。
 - 开启 exact evidence 后，任何 provider call identity、scope 或 session 不变量不匹配都会中止回复，不能回退到 legacy preview。presentation guard 和内部引用脱敏都发生在最终 turn 提交之前。
 
+### 7.1 内部历史与当前公开证据隔离综合
+
+Agent-first 同一轮需要比较历史与当前网页时，必须先完成
+`query_my_intelligence`，并在首个公开读取执行前冻结模型实际看到的 exact
+内部证据、认证 scope 与集合摘要。公开正文进入后，内部查询和全部写工具继续由
+Harness 确定性关闭；外部正文只能在隔离上下文中继续公开研究，不能改写已经冻结的
+内部查询。`EffectActivationWrite` 同样关闭：动态端点只能在首个外部结果前完成发现，
+不能由外部正文触发新的持久化 activation。
+
+`tool_calls` 数据集必须逐行携带 `trust_type` provenance。`local` 行可以留在受信主
+Agent；`external`、未知或缺失 provenance 的 `model_visible_result` 在工具返回前移出，
+其 arguments、raw trace 与 raw invocation 同样不得留在主投影，只留下严格系统元数据
+与 tenant/user/trace/invocation/arguments/result/coverage 共同派生的不可变
+`public_evidence_ref`。arguments/trace/invocation 任一敏感字段的查询都必须自动补齐逐行
+provenance 后再投影。历史记录、当前网页、动态 API、社媒及
+`read_endpoint_result` 统一使用这一引用；URL 只是由已知 Tool 参数或结构化结果产生的
+可选展示元数据，不参与证据身份。缺失 trace 的 legacy 行明确标记 `unbound_trace` 并
+移除原文与原始标识；非 exact 的 local legacy 行同样 fail-closed。历史
+`query_my_intelligence` 的 exact local wrapper 可保留本地参数，但其 result 可能嵌套旧
+external 原文，因无法递归证明 provenance 而丢弃，不得冻结为受信内部证据。展示 URL
+必须绑定到产生该 ref 的单次 invocation，不得从本轮累计搜索结果串入其他 ref。
+
+`observations` 数据集虽然属于用户自己的历史记录，其中的 URL、标题、作者与正文仍是
+外部公开证据，不因进入数据库而升级为受信指令。查询原始 Observation 时，Harness
+必须把完整行移入既有 public evidence sidecar，主 Agent 只见严格元数据与
+`public_evidence_ref/status`，并设置仅限本轮的 historical-public pending 状态。这个状态
+不能依赖关键词判断：若主 Agent 下一步调用当前公开工具，Harness 在调用前冻结安全投影
+并进入正常隔离研究；若主 Agent 直接文字收敛，Harness 丢弃该文字并转入历史公开证据的
+隔离摘要与无工具综合出口。exact local、`legacy_local_unavailable`、`unbound_trace` 与
+`unavailable` 不得设置 pending；状态保持到本轮可见 final，下一用户 turn 自然清零。
+tasks/profile/runs、严格 Brief 与 AgentTurn 结论仍按受信内部证据处理。
+
+公开研究结束后，模型先在隔离上下文输出严格的
+`vane.public-evidence-summary/v1`。送入摘要器的 bundle 为每个既有 ref 携带完整、未静默
+截断的 arguments JSON 与模型可见 result；arguments 必须是有效 UTF-8/JSON 且不超过
+64 KiB，arguments 与 result 合计受本轮 512 KiB 预算约束。ref 身份继续绑定完整
+arguments、可见 result、original size、truncation 与 provenance。摘要只接受固定字段、受限长度与结构化工具结果中
+真实存在的 `public_evidence_ref`；Markdown 包装、未知字段、伪造 ref、正文 URL 或无效
+`as_of` 均拒绝。最终综合
+请求固定 `Tools:nil`，只包含当前用户原话、冻结的内部 exact evidence 与公开摘要。
+原始网页正文和原生 Tool 协议不得进入最终综合请求或 `agent_sessions` 后续历史；完整
+模型可见工具结果仍按 `AgentToolEvidenceV1` 独立留存。最终 turn 在返回前继续原子封存
+内部与公开工具证据，且不得向用户暴露内部引用或证据摘要。最终模型不得自由输出 URL；
+Harness 只根据摘要已采纳 ref 的可选规范化展示 URL 渲染链接。
+
 ## 8. V3 运行权限与付费调用回执
 
 `app.tenant_id` / `app.user_id` 只用于兼容过滤，不能作为 V3 的授权根。每个 V3
