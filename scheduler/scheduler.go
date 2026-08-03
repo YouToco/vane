@@ -621,10 +621,38 @@ func (s *Scheduler) decodeRawScheduleActionPushParams(
 	response *workflowservice.DescribeScheduleResponse,
 	taskID string,
 ) (workflow.PushParams, bool, error) {
+	var params workflow.PushParams
+	found, err := s.decodeRawScheduleActionInput(
+		response, taskID, &params,
+	)
+	return params, found, err
+}
+
+func (s *Scheduler) decodeRawScheduleActionResearchV3Input(
+	response *workflowservice.DescribeScheduleResponse,
+	taskID string,
+) (workflow.ResearchScheduledInputV3, bool, error) {
+	var input workflow.ResearchScheduledInputV3
+	found, err := s.decodeRawScheduleActionInput(
+		response, taskID, &input,
+	)
+	return input, found, err
+}
+
+// decodeRawScheduleActionInput decodes the one immutable argument from a
+// persisted Schedule Action with the converter identity sealed in its memo.
+// It deliberately accepts an output pointer instead of selecting a workflow
+// protocol: durable manual runs must preserve both the frozen PushParams wire
+// and the independent ResearchScheduledInputV3 cutover wire.
+func (s *Scheduler) decodeRawScheduleActionInput(
+	response *workflowservice.DescribeScheduleResponse,
+	taskID string,
+	output any,
+) (bool, error) {
 	start := response.GetSchedule().GetAction().GetStartWorkflow()
 	if start == nil || start.GetInput() == nil ||
 		len(start.GetInput().GetPayloads()) != 1 {
-		return workflow.PushParams{}, false, nil
+		return false, nil
 	}
 	s.taskScheduleEnv.mu.Lock()
 	namespace := s.taskScheduleEnv.namespace
@@ -636,12 +664,9 @@ func (s *Scheduler) decodeRawScheduleActionPushParams(
 		candidates = append(candidates, dc)
 	}
 	s.taskScheduleEnv.mu.Unlock()
-	decode := func(dc converter.DataConverter) (
-		workflow.PushParams, error,
-	) {
+	decode := func(dc converter.DataConverter) error {
 		if dc == nil {
-			return workflow.PushParams{},
-				errors.New("task schedule decoder is unavailable")
+			return errors.New("task schedule decoder is unavailable")
 		}
 		prepared := PreparedTaskSchedule{
 			Namespace: namespace,
@@ -651,24 +676,23 @@ func (s *Scheduler) decodeRawScheduleActionPushParams(
 		}
 		actionDC, err := taskScheduleActionDataConverter(prepared, dc)
 		if err != nil {
-			return workflow.PushParams{}, err
+			return err
 		}
-		var params workflow.PushParams
 		if err := actionDC.FromPayloads(
-			start.GetInput(), &params); err != nil {
-			return workflow.PushParams{}, err
+			start.GetInput(), output); err != nil {
+			return err
 		}
-		return params, nil
+		return nil
 	}
 
 	memoPayload := start.GetMemo().GetFields()[taskScheduleMemoKey]
 	if memoPayload == nil {
-		params, err := decode(converter.GetDefaultDataConverter())
+		err := decode(converter.GetDefaultDataConverter())
 		if err != nil {
-			return workflow.PushParams{}, false,
+			return false,
 				fmt.Errorf("解码旧调度 Action 入参: %w", err)
 		}
-		return params, true, nil
+		return true, nil
 	}
 
 	for _, candidate := range candidates {
@@ -693,15 +717,14 @@ func (s *Scheduler) decodeRawScheduleActionPushParams(
 			fingerprint.ConverterID == "" {
 			continue
 		}
-		params, err := decode(
-			s.taskScheduleDecoder(fingerprint.ConverterID))
+		err = decode(s.taskScheduleDecoder(fingerprint.ConverterID))
 		if err != nil {
-			return workflow.PushParams{}, false,
+			return false,
 				fmt.Errorf("解码版本化调度 Action 入参: %w", err)
 		}
-		return params, true, nil
+		return true, nil
 	}
-	return workflow.PushParams{}, false,
+	return false,
 		errors.New("恢复任务无法解析版本化 Temporal Action")
 }
 
@@ -1236,6 +1259,60 @@ func (s *Scheduler) applyScheduleCommandRemote(
 			},
 		)
 		if err != nil {
+			return err
+		}
+		start := description.GetSchedule().GetAction().GetStartWorkflow()
+		if start != nil && start.GetWorkflowType().GetName() ==
+			workflow.ResearchScheduledWorkflowV3Name {
+			input, found, err := s.decodeRawScheduleActionResearchV3Input(
+				description, command.TaskID,
+			)
+			if err != nil {
+				return err
+			}
+			if !found || s.researchV3.authorityID != command.TaskID ||
+				input.TenantID != command.TenantID ||
+				input.UserID != command.UserID || input.TaskID != command.TaskID ||
+				validateResearchScheduledInputV3(input) != nil ||
+				strings.TrimSpace(start.GetTaskQueue().GetName()) == "" {
+				return types.NewAppError(
+					types.CodeConflict,
+					"立即运行的 Research V3 执行定义与耐久命令不一致",
+					types.ErrConflict,
+				)
+			}
+			verifier, ok := s.st.(researchV3ActionAuthorityStore)
+			if !ok {
+				return types.NewAppError(
+					types.CodeInternal,
+					"Research V3 立即运行授权校验器未配置",
+					types.ErrInternal,
+				)
+			}
+			if err := verifier.VerifyEnabledResearchV3ActionAuthorization(
+				ctx, command.TenantID, command.UserID, command.TaskID,
+				input.ActionAuthorizationToken,
+			); err != nil {
+				return err
+			}
+			_, err = s.c.ExecuteWorkflow(
+				ctx,
+				client.StartWorkflowOptions{
+					ID: manualTaskWorkflowID(
+						command.ID, command.CreatedAt,
+					),
+					TaskQueue: start.GetTaskQueue().GetName(),
+					WorkflowIDReusePolicy: enums.
+						WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+					WorkflowExecutionErrorWhenAlreadyStarted: true,
+				},
+				workflow.ResearchScheduledWorkflowV3,
+				input,
+			)
+			var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+			if errors.As(err, &alreadyStarted) {
+				return nil
+			}
 			return err
 		}
 		params, found, err := s.decodeRawScheduleActionPushParams(
