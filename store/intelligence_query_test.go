@@ -55,11 +55,11 @@ func TestFeedbackIntelligenceCatalogV2UsesCanonicalScopedProjection(t *testing.T
 		IntelligenceQuery{
 			Dataset: IntelligenceFeedbacks,
 			Select: []string{
-				"task_ref", "delivery_ref", "action", "reason_code",
+				"task_ref", "action", "reason_code",
 				"detail", "is_effective_attitude", "created_at",
 			},
 			Filters: []IntelligenceFilter{{
-				Field: "action", Op: "eq", Value: json.RawMessage(`"misjudged"`),
+				Field: "action", Op: "eq", Value: json.RawMessage(`"deep_dive"`),
 			}},
 			Limit: 25,
 		}, spec,
@@ -73,13 +73,15 @@ func TestFeedbackIntelligenceCatalogV2UsesCanonicalScopedProjection(t *testing.T
 		"rs.user_id=b.user_id AND rs.task_id=s.id",
 		"LEFT JOIN profile_claim_states pcs", "newer.profile_epoch=f.profile_epoch",
 		"(newer.created_at,newer.id)>(f.created_at,f.id)",
+		"f.action='not_interested'", "btrim(f.detail)=''",
+		"newer.action='misjudged'", "newer.reason_code IS NOT NULL",
 		"tenant_id=$1", "user_id=$2", "task_ref=$3",
 	} {
 		if !strings.Contains(compiled.sql, required) {
 			t.Fatalf("feedback projection is missing %q:\n%s", required, compiled.sql)
 		}
 	}
-	if strings.Contains(compiled.sql, "'misjudged'") {
+	if strings.Contains(compiled.sql, "'deep_dive'") {
 		t.Fatalf("model filter value reached SQL text: %s", compiled.sql)
 	}
 	if got := compiled.args[2]; got != "task-kimi" {
@@ -87,7 +89,7 @@ func TestFeedbackIntelligenceCatalogV2UsesCanonicalScopedProjection(t *testing.T
 	}
 	foundAction := false
 	for _, arg := range compiled.args {
-		if arg == "misjudged" {
+		if arg == "deep_dive" {
 			foundAction = true
 			break
 		}

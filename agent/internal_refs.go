@@ -11,7 +11,7 @@ import (
 )
 
 var internalReferenceFields = map[string]struct{}{
-	"record_id": {}, "task_ref": {}, "run_snapshot_id": {}, "delivery_ref": {},
+	"record_id": {}, "task_ref": {}, "run_snapshot_id": {},
 	"task_id": {}, "task_refs": {}, "completed_task_refs": {}, "failed_task_refs": {},
 	"schedule_id": {}, "schedule_ids": {}, "tool_invocation_ids": {},
 	"temporal_workflow_id": {}, "temporal_run_id": {},

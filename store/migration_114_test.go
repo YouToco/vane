@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -9,6 +10,22 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 	dbURL, db, provider := openMigration066Database(
 		t, "vane_feedback_intelligence_114",
 	)
+	if _, err := provider.UpTo(t.Context(), 111); err != nil {
+		t.Fatal(err)
+	}
+	// Production provisions vane_server_runtime as the intentional NOINHERIT
+	// member of vane_intelligence_reader. Migration 114 must accept that exact
+	// role graph while rejecting every additional reader member.
+	if _, err := db.ExecContext(t.Context(),
+		`SELECT provision_vane_server_runtime_v2()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(),
+			`ALTER ROLE vane_server_runtime NOLOGIN`)
+		_, _ = db.ExecContext(context.Background(),
+			`SELECT deprovision_vane_server_runtime_v2()`)
+	})
 	if _, err := provider.UpTo(t.Context(), 114); err != nil {
 		t.Fatal(err)
 	}
@@ -34,9 +51,9 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		}
 		return
 	}
-	userA, sessionA := createUser("feedback-intelligence-a-113", 1)
+	userA, sessionA := createUser("feedback-intelligence-a-114", 1)
 	userSameTenant, sessionSameTenant := createUser(
-		"feedback-intelligence-b-113", 1,
+		"feedback-intelligence-b-114", 1,
 	)
 	var tenantB int64
 	if err := db.QueryRowContext(t.Context(), `
@@ -45,7 +62,7 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		t.Fatal(err)
 	}
 	userOtherTenant, sessionOtherTenant := createUser(
-		"feedback-intelligence-c-113", tenantB,
+		"feedback-intelligence-c-114", tenantB,
 	)
 
 	createFeedbacks := func(
@@ -83,15 +100,16 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 			) VALUES
 			    ($1,$2,$3,'interested',NULL,'',$4),
 			    ($1,$2,$3,'not_interested',NULL,'',$4),
-			    ($1,$2,$3,'misjudged','factually_wrong','官方原文相反',$4)`,
+			    ($1,$2,$3,'misjudged','factually_wrong','官方原文相反',$4),
+			    ($1,$2,$3,'not_interested',NULL,'明确不感兴趣',$4)`,
 			tenantID, userID, deliveryID, at,
 		); err != nil {
 			t.Fatal(err)
 		}
 	}
-	createFeedbacks(1, userA, "feedback-task-a-113")
-	createFeedbacks(1, userSameTenant, "feedback-task-b-113")
-	createFeedbacks(tenantB, userOtherTenant, "feedback-task-c-113")
+	createFeedbacks(1, userA, "feedback-task-a-114")
+	createFeedbacks(1, userSameTenant, "feedback-task-b-114")
+	createFeedbacks(tenantB, userOtherTenant, "feedback-task-c-114")
 
 	st, err := New(t.Context(), dbURL)
 	if err != nil {
@@ -101,7 +119,7 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 	query := IntelligenceQuery{
 		Dataset: IntelligenceFeedbacks,
 		Select: []string{
-			"task_ref", "delivery_ref", "action", "reason_code", "detail",
+			"task_ref", "action", "reason_code", "detail",
 			"is_effective_attitude", "created_at",
 		},
 		OrderBy: []IntelligenceOrder{
@@ -117,38 +135,41 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		t.Fatal(err)
 	}
 	if result.CatalogVersion != IntelligenceCatalogVersion ||
-		result.Dataset != IntelligenceFeedbacks || len(result.Rows) != 3 {
+		result.Dataset != IntelligenceFeedbacks || len(result.Rows) != 4 {
 		t.Fatalf("feedback result=%+v", result)
 	}
 	if result.Rows[0]["action"] != "interested" ||
 		result.Rows[0]["is_effective_attitude"] != false ||
 		result.Rows[1]["action"] != "not_interested" ||
-		result.Rows[1]["is_effective_attitude"] != true ||
+		result.Rows[1]["is_effective_attitude"] != false ||
 		result.Rows[2]["action"] != "misjudged" ||
 		result.Rows[2]["reason_code"] != "factually_wrong" ||
 		result.Rows[2]["detail"] != "官方原文相反" ||
-		result.Rows[2]["is_effective_attitude"] != nil {
+		result.Rows[2]["is_effective_attitude"] != nil ||
+		result.Rows[3]["action"] != "not_interested" ||
+		result.Rows[3]["detail"] != "明确不感兴趣" ||
+		result.Rows[3]["is_effective_attitude"] != true {
 		t.Fatalf("effective attitude rows=%+v", result.Rows)
 	}
 	for _, row := range result.Rows {
-		if row["task_ref"] != "feedback-task-a-113" {
+		if row["task_ref"] != "feedback-task-a-114" {
 			t.Fatalf("cross-subject feedback row=%+v", row)
 		}
 	}
 
 	taskScoped, err := st.QueryMyIntelligence(t.Context(), IntelligenceScope{
 		TenantID: 1, UserID: userA, SessionID: &sessionA,
-		TaskID: "feedback-task-a-113",
+		TaskID: "feedback-task-a-114",
 	}, IntelligenceQuery{
 		Dataset: IntelligenceFeedbacks,
 		Select:  []string{"task_ref", "action", "created_at"}, Limit: 10,
 	})
-	if err != nil || len(taskScoped.Rows) != 3 {
+	if err != nil || len(taskScoped.Rows) != 4 {
 		t.Fatalf("exact-task feedback rows=%+v err=%v", taskScoped, err)
 	}
 	crossTask, err := st.QueryMyIntelligence(t.Context(), IntelligenceScope{
 		TenantID: 1, UserID: userA, SessionID: &sessionA,
-		TaskID: "feedback-task-b-113",
+		TaskID: "feedback-task-b-114",
 	}, IntelligenceQuery{Dataset: IntelligenceFeedbacks, Limit: 10})
 	if err != nil || len(crossTask.Rows) != 0 {
 		t.Fatalf("cross-task feedback rows=%+v err=%v", crossTask, err)
@@ -160,7 +181,7 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 	} {
 		owned, err := st.QueryMyIntelligence(t.Context(), scope,
 			IntelligenceQuery{Dataset: IntelligenceFeedbacks, Limit: 10})
-		if err != nil || len(owned.Rows) != 3 {
+		if err != nil || len(owned.Rows) != 4 {
 			t.Fatalf("owned feedback scope=%+v rows=%+v err=%v", scope, owned, err)
 		}
 	}

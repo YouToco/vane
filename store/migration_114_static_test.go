@@ -14,6 +14,9 @@ func TestMigration114FeedbackCatalogCapabilityIsColumnScoped(t *testing.T) {
 	sql := string(raw)
 	for _, required := range []string{
 		"'feedbacks','invalid'",
+		"member_role.rolname NOT IN (CURRENT_USER,'vane_server_runtime')",
+		"runtime_role.rolname='vane_server_runtime'",
+		"runtime_role.rolsuper OR runtime_role.rolbypassrls",
 		"GRANT SELECT (\n    id,tenant_id,user_id,delivery_id,action,reason_code,detail,",
 		"GRANT SELECT (id,tenant_id,user_id,batch_id)",
 		"GRANT SELECT (id,tenant_id,user_id,schedule_id,run_snapshot_id)",
