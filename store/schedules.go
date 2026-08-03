@@ -71,6 +71,15 @@ func nativeResearchScheduleMaturityClause(
 		return "", fmt.Errorf("native research creation schema boundary is incomplete")
 	}
 	if !schemaActive {
+		// Before migration 108 the restricted executor can only replay a
+		// capability-bound snapshot that was already admitted through the
+		// schema-owner definition fence. It never had direct SELECT on the V1
+		// creation ledger; adding that predicate here would break frozen replay.
+		// Control-plane snapshot and delivery transactions still retain the V1
+		// fence, including on schema 108 where effects use their own definer.
+		if activeRole == researchRuntimeCapabilityRole {
+			return "", nil
+		}
 		return " AND " + strings.ReplaceAll(matureSchedulePredicate, "s.", "schedule."), nil
 	}
 	if activeRole == researchRuntimeCapabilityRole {
