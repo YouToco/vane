@@ -88,8 +88,9 @@ type ResearchBriefSynthesisV3 struct {
 }
 
 type PrepareResearchBriefSynthesisV3Result struct {
-	Synthesis   ResearchBriefSynthesisV3
-	FirstWriter bool
+	Synthesis       ResearchBriefSynthesisV3
+	FirstWriter     bool
+	PartialCoverage bool
 }
 
 type ClaimResearchBriefSynthesisV3Params struct {
@@ -311,7 +312,9 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 		if err := tx.Commit(ctx); err != nil {
 			return PrepareResearchBriefSynthesisV3Result{}, researchRunDatabaseError("commit research Brief synthesis replay", err)
 		}
-		return PrepareResearchBriefSynthesisV3Result{Synthesis: existing}, nil
+		return PrepareResearchBriefSynthesisV3Result{
+			Synthesis: existing, PartialCoverage: researchBriefSynthesisPartialCoverageV31(existing),
+		}, nil
 	}
 	evidencePayload, evidenceContext, toolFailures, err :=
 		buildResearchEvidenceManifestV3(ctx, tx, params.Identity, params.PlanRef)
@@ -373,7 +376,9 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 	if err := tx.Commit(ctx); err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, researchRunDatabaseError("commit research Brief synthesis", err)
 	}
-	return PrepareResearchBriefSynthesisV3Result{Synthesis: row, FirstWriter: true}, nil
+	return PrepareResearchBriefSynthesisV3Result{
+		Synthesis: row, FirstWriter: true, PartialCoverage: len(toolFailures) > 0,
+	}, nil
 }
 
 func (s *Store) ClaimResearchBriefSynthesisV3(
@@ -1335,6 +1340,16 @@ func researchBriefSynthesisFrozenPayloadsValidV3(row ResearchBriefSynthesisV3) b
 func validResearchSynthesisContextVersionV3(version string, failures int) bool {
 	return (version == researchSynthesisContextSchemaV3 && failures == 0) ||
 		(version == researchSynthesisContextSchemaV31 && failures > 0)
+}
+
+func researchBriefSynthesisPartialCoverageV31(
+	row ResearchBriefSynthesisV3,
+) bool {
+	var contextPayload struct {
+		SchemaVersion string `json:"schema_version"`
+	}
+	return json.Unmarshal(row.ContextPayload, &contextPayload) == nil &&
+		contextPayload.SchemaVersion == researchSynthesisContextSchemaV31
 }
 
 func validResearchEvidenceManifestVersionV3(version string, failures int) bool {

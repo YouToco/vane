@@ -36,6 +36,7 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		got.Model.Planner.Model != "strong-research-model" ||
 		got.Model.Synthesis.Model != "strong-research-model" ||
 		got.Model.Planner.RendererVersion != runtimepolicy.ResearchPlannerRendererVersionV32 ||
+		got.Model.Synthesis.RendererVersion != runtimepolicy.ResearchSynthesisRendererVersionV31 ||
 		!got.Model.Planner.DisableThinking || !got.Model.Synthesis.DisableThinking ||
 		!strings.Contains(got.Model.Planner.SystemPrompt, "至少两条互补证据路径") ||
 		!strings.Contains(got.Model.Planner.SystemPrompt, "公开搜索 fallback") ||

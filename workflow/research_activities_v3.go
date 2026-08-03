@@ -89,6 +89,14 @@ func (r ResearchStepReceiptV3) Validate(ordinal int) error {
 			"research step receipt is invalid", nil)
 	}
 	switch r.Phase {
+	case "":
+		// Activity results written before the terminal-outcome union had no
+		// phase field. Only the old exact success shape is replay-compatible;
+		// an empty phase can never authorize a failed/indeterminate receipt.
+		if r.EvidenceID <= 0 || !researchV3Digest(r.ResultDigest) || r.ErrorCode != "" {
+			return types.NewAppError(types.CodeValidation,
+				"legacy research completed step receipt is invalid", nil)
+		}
 	case string(storepkg.ResearchRunStepCompletedV3):
 		if r.EvidenceID <= 0 || !researchV3Digest(r.ResultDigest) || r.ErrorCode != "" {
 			return types.NewAppError(types.CodeValidation,

@@ -58,6 +58,15 @@ func newResearchBriefFixtureWithWorkflowV3(
 ) researchBriefFixtureV3 {
 	t.Helper()
 	st := tenantTestStore(t)
+	return newResearchBriefFixtureWithStoreAndWorkflowV3(
+		t, st, threshold, completeEvidence, evidenceResult, authorityToken, workflowID)
+}
+
+func newResearchBriefFixtureWithStoreAndWorkflowV3(
+	t *testing.T, st *Store, threshold taskstate.NotificationThresholdV3,
+	completeEvidence bool, evidenceResult []byte, authorityToken, workflowID string,
+) researchBriefFixtureV3 {
+	t.Helper()
 	useOwnerResearchRuntimeForTest(st)
 	ctx := t.Context()
 	userID := testUser(t, st)

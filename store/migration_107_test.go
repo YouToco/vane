@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"io/fs"
@@ -11,8 +12,178 @@ import (
 
 	"github.com/pressly/goose/v3"
 
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
+
+func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	db, err := sql.Open("pgx", scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir,
+		goose.WithAllowOutofOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 106); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.configureResearchRunCapabilityV1(ResearchRunCapabilityConfigV1{
+		ActiveKeyID:  "migration-107-active",
+		ActiveKeyHex: strings.Repeat("42", 32),
+		RetiredKeys:  "migration-107-retired=" + strings.Repeat("24", 32),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	preparedFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true, nil, "", "")
+	prepared, err := st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(preparedFixture))
+	if err != nil || !prepared.FirstWriter ||
+		prepared.Synthesis.Status != ResearchBriefSynthesisPreparedV3 {
+		t.Fatalf("legacy prepared=%+v err=%v", prepared, err)
+	}
+
+	spendingFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true, nil, "", "")
+	spendingPrepared, err := st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(spendingFixture))
+	if err != nil || !spendingPrepared.FirstWriter {
+		t.Fatalf("legacy spending prepare=%+v err=%v", spendingPrepared, err)
+	}
+	spendingHandle, spendingReservation := claimResearchBriefWithPendingReceiptV3(
+		t, spendingFixture, spendingPrepared.Synthesis)
+	spendingBefore, err := st.LoadResearchBriefSynthesisV3(t.Context(),
+		spendingFixture.identity, spendingFixture.snapshotRef, spendingFixture.planRef)
+	if err != nil || spendingBefore.Status != ResearchBriefSynthesisSpendingV3 {
+		t.Fatalf("legacy spending=%+v err=%v", spendingBefore, err)
+	}
+
+	type frozenLegacyV3 struct {
+		requestDigest, contextDigest, evidenceDigest, historyDigest string
+		context, evidence, history                                  []byte
+	}
+	freeze := func(row ResearchBriefSynthesisV3) frozenLegacyV3 {
+		t.Helper()
+		var context researchSynthesisContextV3
+		var evidence researchEvidenceManifestV3
+		if err := json.Unmarshal(row.ContextPayload, &context); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(row.EvidenceManifest, &evidence); err != nil {
+			t.Fatal(err)
+		}
+		if context.SchemaVersion != researchSynthesisContextSchemaV3 ||
+			evidence.SchemaVersion != researchEvidenceManifestSchemaV3 ||
+			len(context.ToolFailures) != 0 || len(evidence.ToolFailures) != 0 {
+			t.Fatalf("pre-107 artifact is not retained complete-coverage v3: context=%+v evidence=%+v",
+				context, evidence)
+		}
+		return frozenLegacyV3{
+			requestDigest: row.RequestDigest, contextDigest: row.ContextDigest,
+			evidenceDigest: row.EvidenceDigest, historyDigest: row.HistoryDigest,
+			context:  append([]byte(nil), row.ContextPayload...),
+			evidence: append([]byte(nil), row.EvidenceManifest...),
+			history:  append([]byte(nil), row.HistoryManifest...),
+		}
+	}
+	assertFrozen := func(want frozenLegacyV3, got ResearchBriefSynthesisV3) {
+		t.Helper()
+		if got.RequestDigest != want.requestDigest ||
+			got.ContextDigest != want.contextDigest ||
+			got.EvidenceDigest != want.evidenceDigest ||
+			got.HistoryDigest != want.historyDigest ||
+			!bytes.Equal(got.ContextPayload, want.context) ||
+			!bytes.Equal(got.EvidenceManifest, want.evidence) ||
+			!bytes.Equal(got.HistoryManifest, want.history) {
+			t.Fatalf("legacy v3 frozen bytes drifted after migration: got=%+v", got)
+		}
+	}
+	preparedFrozen := freeze(prepared.Synthesis)
+	spendingFrozen := freeze(spendingBefore)
+
+	if _, err := provider.UpTo(t.Context(), 107); err != nil {
+		t.Fatal(err)
+	}
+
+	preparedReplay, err := st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(preparedFixture))
+	if err != nil || preparedReplay.FirstWriter ||
+		preparedReplay.Synthesis.Status != ResearchBriefSynthesisPreparedV3 {
+		t.Fatalf("post-107 prepared replay=%+v err=%v", preparedReplay, err)
+	}
+	assertFrozen(preparedFrozen, preparedReplay.Synthesis)
+	spendingReplay, err := st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(spendingFixture))
+	if err != nil || spendingReplay.FirstWriter ||
+		spendingReplay.Synthesis.Status != ResearchBriefSynthesisSpendingV3 {
+		t.Fatalf("post-107 spending replay=%+v err=%v", spendingReplay, err)
+	}
+	assertFrozen(spendingFrozen, spendingReplay.Synthesis)
+
+	spendingClaimReplay, err := st.ClaimResearchBriefSynthesisV3(
+		t.Context(), spendingHandle)
+	if err != nil || spendingClaimReplay.Claimed ||
+		spendingClaimReplay.ReceiptState != ResearchBriefLLMReceiptPendingV3 {
+		t.Fatalf("post-107 spending claim replay=%+v err=%v",
+			spendingClaimReplay, err)
+	}
+	preparedHandle, preparedReservation := claimResearchBriefWithPendingReceiptV3(
+		t, preparedFixture, preparedReplay.Synthesis)
+
+	finalizeAndReplay := func(
+		fixture researchBriefFixtureV3, synthesis ResearchBriefSynthesisV3,
+		handle ClaimResearchBriefSynthesisV3Params,
+		reservation ResearchRunLLMSpendReservationV3, summary string,
+	) {
+		t.Helper()
+		payload := researchBriefPayloadV3(t, synthesis,
+			types.ResearchBriefSignificanceNoneV3, summary)
+		settleResearchBriefReceiptV3(t, fixture, reservation, synthesis, payload)
+		params := FinalizeResearchBriefSynthesisV3Params{
+			ClaimResearchBriefSynthesisV3Params: handle,
+			BriefPayload:                        payload,
+		}
+		ref, err := st.FinalizeResearchBriefSynthesisV3(t.Context(), params)
+		if err != nil || ref.Decision != types.ResearchBriefDecisionQuietV3 ||
+			ref.DeliveryRequired {
+			t.Fatalf("post-107 legacy finalization ref=%+v err=%v", ref, err)
+		}
+		replay, err := st.FinalizeResearchBriefSynthesisV3(t.Context(), params)
+		if err != nil || replay != ref {
+			t.Fatalf("post-107 legacy finalization replay=%+v want=%+v err=%v",
+				replay, ref, err)
+		}
+		finalized, err := st.LoadResearchBriefSynthesisV3(t.Context(),
+			fixture.identity, fixture.snapshotRef, fixture.planRef)
+		if err != nil || finalized.Status != ResearchBriefSynthesisFinalizedV3 {
+			t.Fatalf("post-107 legacy finalized=%+v err=%v", finalized, err)
+		}
+	}
+	finalizeAndReplay(preparedFixture, preparedReplay.Synthesis,
+		preparedHandle, preparedReservation, "prepared v3 completed after migration 107")
+	finalizeAndReplay(spendingFixture, spendingReplay.Synthesis,
+		spendingHandle, spendingReservation, "spending v3 completed after migration 107")
+}
 
 func TestMigration107ACLTriggerRoutingAndIrreversibleDowngradePostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")

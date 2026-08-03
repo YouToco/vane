@@ -249,7 +249,8 @@ func researchPlanFromCompletionV3(
 	seal runcontext.ResearchSnapshotSealV3, completion []byte,
 ) (runcontext.ResearchExecutionPlanV3, error) {
 	steps, err := decodeResearchPlannerCompletionV3(
-		completion, seal.ResearchModel.Planner.RendererVersion)
+		completion, seal.ResearchModel.Planner.RendererVersion,
+		snapshot.PlannerBudget.MaxToolCalls)
 	if err != nil {
 		return runcontext.ResearchExecutionPlanV3{}, err
 	}
@@ -364,6 +365,13 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 	}
 	if err := validateResearchSnapshotSealForCoordinatorV3(seal, snapshot); err != nil {
 		return ResearchBriefRefV3{}, err
+	}
+	if prepared.PartialCoverage &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV31 {
+		return ResearchBriefRefV3{}, types.NewAppError(types.CodeConflict,
+			"frozen research synthesis renderer cannot express partial coverage",
+			types.ErrConflict)
 	}
 	userPrompt := string(prepared.Synthesis.ContextPayload)
 	reservation, err := r.store.BeginResearchRunLLMSpendV3(ctx,
@@ -558,7 +566,7 @@ type researchPlannerOutputV3 struct {
 }
 
 func decodeResearchPlannerCompletionV3(
-	raw []byte, rendererVersion string,
+	raw []byte, rendererVersion string, maxToolCalls int,
 ) ([]runcontext.ResearchPlanStepV3, error) {
 	if len(raw) < 2 || len(raw) > 256<<10 {
 		return nil, researchCoordinatorValidationV3("research planner output is invalid")
@@ -566,7 +574,8 @@ func decodeResearchPlannerCompletionV3(
 	var output researchPlannerOutputV3
 	if err := strictjson.DecodeExact(raw, &output); err != nil ||
 		output.SchemaVersion != researchPlannerOutputSchemaV3 ||
-		len(output.Steps) == 0 || len(output.Steps) > 16 {
+		len(output.Steps) < minimumResearchPlannerStepsV3(rendererVersion, maxToolCalls) ||
+		len(output.Steps) > maxToolCalls || maxToolCalls <= 0 || maxToolCalls > 16 {
 		return nil, researchCoordinatorValidationV3("research planner output is invalid")
 	}
 	switch rendererVersion {
@@ -588,6 +597,14 @@ func decodeResearchPlannerCompletionV3(
 	steps := make([]runcontext.ResearchPlanStepV3, len(output.Steps))
 	copy(steps, output.Steps)
 	return steps, nil
+}
+
+func minimumResearchPlannerStepsV3(rendererVersion string, maxToolCalls int) int {
+	if rendererVersion == runtimepolicy.ResearchPlannerRendererVersionV32 &&
+		maxToolCalls >= 2 {
+		return 2
+	}
+	return 1
 }
 
 type researchPlannerPromptToolV3 struct {
@@ -693,10 +710,12 @@ func buildResearchPlannerPromptV31(
 		MaxToolCalls:      seal.Payload.PlannerBudget.MaxToolCalls,
 		AllowedTools:      researchPlannerPromptToolsV3(seal),
 		ResponseContract: researchPlannerResponseContractV3{
-			SchemaVersionLiteral:       researchPlannerOutputSchemaV3,
-			RequiredTopLevelFields:     []string{"schema_version", "steps"},
-			RequiredStepFields:         []string{"invocation_id", "tool_name", "arguments"},
-			MinSteps:                   1,
+			SchemaVersionLiteral:   researchPlannerOutputSchemaV3,
+			RequiredTopLevelFields: []string{"schema_version", "steps"},
+			RequiredStepFields:     []string{"invocation_id", "tool_name", "arguments"},
+			MinSteps: minimumResearchPlannerStepsV3(
+				seal.ResearchModel.Planner.RendererVersion,
+				seal.Payload.PlannerBudget.MaxToolCalls),
 			MaxSteps:                   seal.Payload.PlannerBudget.MaxToolCalls,
 			ToolNameRule:               "must exactly equal one allowed_tools[].name",
 			ArgumentsRule:              "must be an object matching that allowed tool's parameters schema",
