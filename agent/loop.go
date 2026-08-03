@@ -1561,6 +1561,32 @@ func (l *Loop) converse(
 					Reply: replyTaskDefinitionEditNotCreated,
 				}, msgs, turns, nil
 			}
+			if state.historicalPublicPending &&
+				state.compartmentedResearch == nil {
+				if err := freezeCompartmentedInternalEvidence(
+					ctx, state, true,
+				); err != nil {
+					return Outcome{}, nil, 0, err
+				}
+				state.untrustedExternalResult = true
+				reply, extraTurns, finishErr := l.finishCompartmentedResearch(
+					// The main Agent has seen only the safe projection, never the
+					// sidecar bytes. Do not accept even schema-shaped main output as
+					// a public summary; force the isolated Tools:nil summary request.
+					ctx, state, "",
+					turns+state.contextStepOffset+1,
+				)
+				turns += extraTurns
+				if finishErr != nil {
+					return Outcome{}, nil, 0, finishErr
+				}
+				state.compartmentedResearch.visibleTurn = true
+				msgs = []llm.ChatMessage{
+					{Role: "user", Content: state.ownerRequest},
+					{Role: "assistant", Content: reply},
+				}
+				return Outcome{Reply: reply}, msgs, turns, nil
+			}
 			reply := rejectRetiredConfirmationClaim(resp.Content)
 			if state != nil && (strings.Contains(reply, "？") ||
 				strings.HasSuffix(strings.TrimSpace(reply), "?")) {

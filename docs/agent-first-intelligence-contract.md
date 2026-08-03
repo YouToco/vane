@@ -93,12 +93,18 @@ external 原文，因无法递归证明 provenance 而丢弃，不得冻结为�
 `observations` 数据集虽然属于用户自己的历史记录，其中的 URL、标题、作者与正文仍是
 外部公开证据，不因进入数据库而升级为受信指令。查询原始 Observation 时，Harness
 必须把完整行移入既有 public evidence sidecar，主 Agent 只见严格元数据与
-`public_evidence_ref/status`；即使本轮没有新网页调用，也直接进入历史公开证据的隔离
-摘要与无工具综合出口。tasks/profile/runs、严格 Brief 与 AgentTurn 结论仍按受信内部
-证据处理。
+`public_evidence_ref/status`，并设置仅限本轮的 historical-public pending 状态。这个状态
+不能依赖关键词判断：若主 Agent 下一步调用当前公开工具，Harness 在调用前冻结安全投影
+并进入正常隔离研究；若主 Agent 直接文字收敛，Harness 丢弃该文字并转入历史公开证据的
+隔离摘要与无工具综合出口。exact local、`legacy_local_unavailable`、`unbound_trace` 与
+`unavailable` 不得设置 pending；状态保持到本轮可见 final，下一用户 turn 自然清零。
+tasks/profile/runs、严格 Brief 与 AgentTurn 结论仍按受信内部证据处理。
 
 公开研究结束后，模型先在隔离上下文输出严格的
-`vane.public-evidence-summary/v1`。摘要只接受固定字段、受限长度与结构化工具结果中
+`vane.public-evidence-summary/v1`。送入摘要器的 bundle 为每个既有 ref 携带完整、未静默
+截断的 arguments JSON 与模型可见 result；arguments 必须是有效 UTF-8/JSON 且不超过
+64 KiB，arguments 与 result 合计受本轮 512 KiB 预算约束。ref 身份继续绑定完整
+arguments、可见 result、original size、truncation 与 provenance。摘要只接受固定字段、受限长度与结构化工具结果中
 真实存在的 `public_evidence_ref`；Markdown 包装、未知字段、伪造 ref、正文 URL 或无效
 `as_of` 均拒绝。最终综合
 请求固定 `Tools:nil`，只包含当前用户原话、冻结的内部 exact evidence 与公开摘要。

@@ -112,6 +112,11 @@ type toolRunState struct {
 	// materialized by the compartmented public-evidence stage.
 	publicEvidence      map[string]publicEvidenceRecord
 	publicEvidenceOrder []string
+	// historicalPublicPending records that this turn projected authenticated
+	// historical public bytes into the sidecar. The next current public read
+	// consumes it through the normal compartment, while direct text convergence
+	// is intercepted and summarized without tools.
+	historicalPublicPending bool
 	// publicEvidenceDisplayURLs is keyed by the provider tool-call ID and is
 	// overwritten by that exact web_search invocation. It must never reuse the
 	// turn-wide accumulated grounding list, because refs are invocation-local.
