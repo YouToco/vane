@@ -4,8 +4,12 @@ package scheduler
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,9 +17,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	commonpb "go.temporal.io/api/common/v1"
+	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/testsuite"
 	"google.golang.org/grpc"
 
@@ -90,6 +96,7 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 		defer cleanupPool.Close()
 		for _, query := range []string{
 			`DELETE FROM schedule_commands WHERE user_id=$1`,
+			`DELETE FROM research_v3_delivery_authorities WHERE user_id=$1`,
 			`DELETE FROM schedules WHERE user_id=$1`,
 			`DELETE FROM memberships WHERE user_id=$1`,
 			`DELETE FROM users WHERE id=$1`,
@@ -290,6 +297,130 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 	assertScheduleCommandState(
 		t, ctx, st, server.Client(), taskID, user.ID, resumeCrashKey, false,
 	)
+
+	// Replace only the stored Action with the formal V3 envelope, as the
+	// cutover saga does. A durable one-off run must start that exact protocol,
+	// survive response loss under the same schedule_commands row, and leave the
+	// recurring spec/action-count untouched.
+	handle := server.Client().ScheduleClient().GetHandle(ctx, taskID)
+	beforeV3, err := handle.Describe(ctx)
+	if err != nil {
+		t.Fatalf("describe before V3 manual run: %v", err)
+	}
+	v3Input := workflow.ResearchScheduledInputV3{
+		TenantID: 1, UserID: user.ID, TaskID: taskID,
+		ActionAuthorizationToken: strings.Repeat("c", 64),
+	}
+	authorityDigest := sha256.Sum256([]byte(v3Input.ActionAuthorizationToken))
+	authorityPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("open V3 authority fixture pool: %v", err)
+	}
+	if _, err := authorityPool.Exec(ctx, `
+		INSERT INTO research_v3_delivery_authorities (
+		    tenant_id,user_id,task_id,generation,definition_version,
+		    definition_digest,target_action_digest,action_authorization_digest,
+		    status,enabled_at
+		) VALUES ($1,$2,$3,1,1,$4,$5,$6,'enabled',clock_timestamp())`,
+		1, user.ID, taskID, strings.Repeat("d", 64),
+		strings.Repeat("e", 64), fmt.Sprintf("%x", authorityDigest),
+	); err != nil {
+		authorityPool.Close()
+		t.Fatalf("install V3 authority fixture: %v", err)
+	}
+	authorityPool.Close()
+	if err := handle.Update(ctx, client.ScheduleUpdateOptions{
+		DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
+			schedule := in.Description.Schedule
+			action, ok := schedule.Action.(*client.ScheduleWorkflowAction)
+			if !ok || action == nil {
+				return nil, errors.New("integration schedule Action is not a workflow")
+			}
+			updated := *action
+			updated.Workflow = workflow.ResearchScheduledWorkflowV3Name
+			updated.Args = []interface{}{v3Input}
+			schedule.Action = &updated
+			return &client.ScheduleUpdate{Schedule: &schedule}, nil
+		},
+	}); err != nil {
+		t.Fatalf("install formal V3 Action fixture: %v", err)
+	}
+	v3FaultScheduler := New(
+		faultClient, taskQueue, st,
+		WithTaskScheduleNamespace(namespace),
+		WithResearchRuntimeV3AuthorityCanary(taskID),
+	)
+	v3RecoveryScheduler := New(
+		faultClient, taskQueue, st,
+		WithTaskScheduleNamespace(namespace),
+		WithResearchRuntimeV3AuthorityCanary(taskID),
+	)
+	faults.arm("trigger")
+	const v3RunKey = "integration-v3-trigger-response-loss"
+	if err := v3FaultScheduler.TriggerScheduleNowIdempotent(
+		ctx, taskID, user.ID, v3RunKey,
+	); err == nil {
+		t.Fatal("V3 trigger response loss unexpectedly reported success")
+	}
+	v3Run := mustScheduleCommand(t, st, ctx, 1, user.ID, v3RunKey)
+	if v3Run.Status != types.ScheduleCommandPending {
+		t.Fatalf("V3 run after response loss=%+v", v3Run)
+	}
+	if err := v3RecoveryScheduler.RecoverScheduleCommandsOnce(ctx); err != nil {
+		t.Fatalf("recover V3 trigger response loss: %v", err)
+	}
+	v3Run = mustScheduleCommand(t, st, ctx, 1, user.ID, v3RunKey)
+	if v3Run.Status != types.ScheduleCommandCompleted {
+		t.Fatalf("V3 run checkpoint=%+v", v3Run)
+	}
+	v3WorkflowID := manualTaskWorkflowID(v3Run.ID, v3Run.CreatedAt)
+	if got := faults.requestCount(v3WorkflowID); got != 2 {
+		t.Fatalf("V3 manual workflow attempts=%d, want response-loss retry 2", got)
+	}
+	v3Execution, err := server.Client().WorkflowService().DescribeWorkflowExecution(
+		ctx, &workflowservice.DescribeWorkflowExecutionRequest{
+			Namespace: namespace,
+			Execution: &commonpb.WorkflowExecution{WorkflowId: v3WorkflowID},
+		},
+	)
+	if err != nil {
+		t.Fatalf("describe V3 command-bound manual workflow: %v", err)
+	}
+	if got := v3Execution.GetWorkflowExecutionInfo().GetType().GetName(); got != workflow.ResearchScheduledWorkflowV3Name {
+		t.Fatalf("V3 manual workflow type=%q", got)
+	}
+	history := server.Client().GetWorkflowHistory(
+		ctx, v3WorkflowID, "", false,
+		enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT,
+	)
+	started, err := history.Next()
+	if err != nil {
+		t.Fatalf("read V3 manual workflow start event: %v", err)
+	}
+	var startedInput workflow.ResearchScheduledInputV3
+	if attrs := started.GetWorkflowExecutionStartedEventAttributes(); attrs == nil {
+		t.Fatalf("first V3 history event is not WorkflowExecutionStarted: %v", started.GetEventType())
+	} else if err := converter.GetDefaultDataConverter().FromPayloads(
+		attrs.GetInput(), &startedInput,
+	); err != nil {
+		t.Fatalf("decode V3 manual workflow input: %v", err)
+	}
+	if startedInput != v3Input {
+		t.Fatalf("V3 manual workflow input=%+v, want %+v", startedInput, v3Input)
+	}
+	afterV3, err := handle.Describe(ctx)
+	if err != nil {
+		t.Fatalf("describe after V3 manual run: %v", err)
+	}
+	if !reflect.DeepEqual(beforeV3.Schedule.Spec, afterV3.Schedule.Spec) {
+		t.Fatalf("V3 manual run changed recurring spec: before=%+v after=%+v",
+			beforeV3.Schedule.Spec, afterV3.Schedule.Spec)
+	}
+	if action, ok := afterV3.Schedule.Action.(*client.ScheduleWorkflowAction); !ok ||
+		fmt.Sprint(action.Workflow) != workflow.ResearchScheduledWorkflowV3Name {
+		t.Fatalf("V3 manual run changed formal Action: %#v", afterV3.Schedule.Action)
+	}
+	assertScheduleActionCount(t, ctx, server.Client(), taskID, 0)
 
 	// Delete is also an intent/checkpoint command. If the process exits after
 	// Temporal deletion, recovery adopts NotFound, deletes the mirror, and

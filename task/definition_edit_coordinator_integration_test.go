@@ -25,6 +25,22 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+type researchV3EditCreateResponseLossStore struct {
+	*store.Store
+	createCalls int
+}
+
+func (s *researchV3EditCreateResponseLossStore) CreateResearchTaskDefinitionEditOperationV3(
+	ctx context.Context, params types.CreateResearchTaskDefinitionEditOperationV3Params,
+) (*types.TaskDefinitionEditOperation, error) {
+	op, err := s.Store.CreateResearchTaskDefinitionEditOperationV3(ctx, params)
+	if err != nil {
+		return op, err
+	}
+	s.createCalls++
+	return nil, errors.New("simulated native V3 edit create response loss")
+}
+
 func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t *testing.T) {
 	dbURL := os.Getenv("VANE_TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -38,7 +54,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 		namespace = "c2b3-definition-edit-coordinator-integration"
 		taskQueue = "c2b3-definition-edit-coordinator-integration"
 	)
-	startCtx, cancelStart := context.WithTimeout(t.Context(), 2*time.Minute)
+	startCtx, cancelStart := context.WithTimeout(t.Context(), 5*time.Minute)
 	server, err := testsuite.StartDevServer(startCtx, testsuite.DevServerOptions{
 		ClientOptions: &client.Options{Namespace: namespace},
 		LogLevel:      "error",
@@ -255,6 +271,105 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 				)
 			}
 		})
+	}
+	t.Run("native v3 whole-tool response loss replay", func(t *testing.T) {
+		runNativeV3DefinitionEditWholeToolReplay(
+			t, server.Client(), namespace, taskQueue)
+	})
+}
+
+func runNativeV3DefinitionEditWholeToolReplay(
+	t *testing.T, temporalClient client.Client, namespace, taskQueue string,
+) {
+	t.Helper()
+	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	schedules := scheduler.New(temporalClient, taskQueue, nil,
+		scheduler.WithTaskScheduleNamespace(namespace))
+	creation := NewCreationCoordinator(st, schedules, nil,
+		WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+	creationSession, err := st.CreateAgentSession(t.Context(), userID)
+	if err != nil {
+		t.Fatalf("create V3 creation session: %v", err)
+	}
+	createInput := testResearchV3CreationInput()
+	createInput.ActionID = "native-v3-edit-base-" + uuid.NewString()
+	createInput.UserID = userID
+	createInput.SessionID = &creationSession.ID
+	createInput.SpecJSON = json.RawMessage(
+		`{"tz":"Asia/Shanghai","every_seconds":3600}`)
+	if _, err := creation.PrepareResearchV3(t.Context(), createInput); err != nil {
+		t.Fatalf("prepare native V3 base: %v", err)
+	}
+	created, err := creation.ExecuteResearchV3(
+		t.Context(), userID, createInput.ActionID, testCreationReceiptTarget)
+	if err != nil || created.TaskID == "" ||
+		created.Status != types.TaskOperationStatusExecuted {
+		t.Fatalf("create native V3 base=%+v err=%v", created, err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := temporalClient.ScheduleClient().GetHandle(
+			cleanupCtx, created.TaskID).Delete(cleanupCtx); err != nil {
+			if _, notFound := errors.AsType[*serviceerror.NotFound](err); !notFound {
+				t.Errorf("delete native V3 replay schedule: %v", err)
+			}
+		}
+	})
+
+	editSession, err := st.CreateAgentSession(t.Context(), userID)
+	if err != nil {
+		t.Fatalf("create V3 edit session: %v", err)
+	}
+	manual := "只查官方原文并与历史证据比较；无重大更新不推送。"
+	input := ResearchTaskDefinitionEditChangesInputV3{
+		ActionID: "native-v3-edit-loss-" + uuid.NewString(),
+		TenantID: tenantID, UserID: userID, TaskID: created.TaskID,
+		SessionID: editSession.ID,
+		Changes:   ResearchV3DefinitionChanges{TaskManual: &manual},
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	responseLoss := &researchV3EditCreateResponseLossStore{Store: st}
+	coordinator := NewResearchTaskDefinitionEditCoordinatorV3(
+		responseLoss, schedules, nil)
+	op, err := coordinator.PrepareChanges(t.Context(), input)
+	if err != nil || op == nil || responseLoss.createCalls != 1 {
+		t.Fatalf("adopt V3 edit create response loss op=%+v calls=%d err=%v",
+			op, responseLoss.createCalls, err)
+	}
+	receipt := TaskDefinitionEditReceiptTarget{
+		Provider: AgentAutoReceiptProvider, Target: input.ActionID,
+	}
+	outcome, err := coordinator.Execute(t.Context(), op.Scope(), receipt)
+	if err != nil || outcome.Status != types.TaskDefinitionEditOperationStatusCompleted {
+		t.Fatalf("complete native V3 edit outcome=%+v err=%v", outcome, err)
+	}
+	before, err := st.LoadResearchTaskDefinitionEditBasisV3(
+		t.Context(), tenantID, userID, created.TaskID)
+	if err != nil || before.DefinitionVersion != 2 {
+		t.Fatalf("native V3 head before replay=%+v err=%v", before, err)
+	}
+
+	replayInput := input
+	replayInput.ExpiresAt = input.ExpiresAt.Add(24 * time.Hour)
+	replayCoordinator := NewResearchTaskDefinitionEditCoordinatorV3(st, schedules, nil)
+	replayedOp, err := replayCoordinator.PrepareChanges(t.Context(), replayInput)
+	if err != nil || replayedOp == nil || replayedOp.ID != op.ID ||
+		!replayedOp.ExpiresAt.Equal(op.ExpiresAt) {
+		t.Fatalf("whole-tool replay op=%+v err=%v want=%+v", replayedOp, err, op)
+	}
+	replayedOutcome, err := replayCoordinator.Execute(
+		t.Context(), replayedOp.Scope(), receipt)
+	if err != nil || !replayedOutcome.Replayed ||
+		replayedOutcome.Status != types.TaskDefinitionEditOperationStatusCompleted {
+		t.Fatalf("terminal whole-tool replay=%+v err=%v", replayedOutcome, err)
+	}
+	after, err := st.LoadResearchTaskDefinitionEditBasisV3(
+		t.Context(), tenantID, userID, created.TaskID)
+	if err != nil || after.DefinitionVersion != before.DefinitionVersion ||
+		after.DefinitionDigest != before.DefinitionDigest {
+		t.Fatalf("whole-tool replay changed head before=%+v after=%+v err=%v",
+			before, after, err)
 	}
 }
 

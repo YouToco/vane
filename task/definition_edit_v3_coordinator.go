@@ -23,6 +23,43 @@ type ResearchTaskDefinitionEditProposalInputV3 struct {
 	ExpiresAt time.Time
 }
 
+type ResearchTaskDefinitionEditChangesInputV3 struct {
+	ActionID  string
+	TenantID  int64
+	UserID    int64
+	TaskID    string
+	Changes   ResearchV3DefinitionChanges
+	SessionID int64
+	ExpiresAt time.Time
+}
+
+// ErrResearchTaskDefinitionEditNotExecuted marks a failure before the durable
+// operation was sealed. Callers may safely report that no edit was admitted;
+// they must not promise background recovery for this class of error.
+var ErrResearchTaskDefinitionEditNotExecuted = errors.New(
+	"task: native V3 definition edit was not executed")
+
+type researchTaskDefinitionEditNotExecutedError struct{ cause error }
+
+func (e *researchTaskDefinitionEditNotExecutedError) Error() string {
+	return ErrResearchTaskDefinitionEditNotExecuted.Error() + ": " + e.cause.Error()
+}
+
+func (e *researchTaskDefinitionEditNotExecutedError) Unwrap() error {
+	return e.cause
+}
+
+func (*researchTaskDefinitionEditNotExecutedError) Is(target error) bool {
+	return target == ErrResearchTaskDefinitionEditNotExecuted
+}
+
+func researchTaskDefinitionEditNotExecuted(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &researchTaskDefinitionEditNotExecutedError{cause: err}
+}
+
 type ResearchTaskDefinitionEditStoreV3 interface {
 	LoadResearchTaskDefinitionEditBasisV3(context.Context, int64, int64, string) (*types.ResearchTaskDefinitionEditBasisV3, error)
 	CreateResearchTaskDefinitionEditOperationV3(context.Context, types.CreateResearchTaskDefinitionEditOperationV3Params) (*types.TaskDefinitionEditOperation, error)
@@ -72,60 +109,165 @@ func (c *ResearchTaskDefinitionEditCoordinatorV3) Prepare(
 	ctx context.Context, in ResearchTaskDefinitionEditProposalInputV3,
 ) (*types.TaskDefinitionEditOperation, error) {
 	if c == nil || c.store == nil || c.scheduler == nil {
-		return nil, errors.New("task: native V3 edit is not configured")
+		return nil, researchTaskDefinitionEditNotExecuted(
+			errors.New("task: native V3 edit is not configured"))
 	}
 	if !validResearchV3CreationOperationID(in.ActionID) || in.TenantID <= 0 ||
 		in.UserID <= 0 || in.TaskID == "" || in.SessionID <= 0 || in.ExpiresAt.IsZero() {
-		return nil, creationValidation("V3 任务编辑请求不完整", nil)
+		return nil, researchTaskDefinitionEditNotExecuted(
+			creationValidation("V3 任务编辑请求不完整", nil))
 	}
 	basis, err := c.store.LoadResearchTaskDefinitionEditBasisV3(
 		ctx, in.TenantID, in.UserID, in.TaskID)
 	if err != nil {
-		return nil, err
+		return nil, researchTaskDefinitionEditNotExecuted(err)
 	}
 	base, err := taskstate.DecodeApprovedDefinitionV3(basis.DefinitionPayload)
 	if err != nil {
-		return nil, fmt.Errorf("task: native V3 base definition: %w", err)
+		return nil, researchTaskDefinitionEditNotExecuted(fmt.Errorf(
+			"task: native V3 base definition: %w", err))
 	}
 	target, err := BuildResearchV3DefinitionEditTarget(base, in.ResearchV3DefinitionEditInput)
 	if err != nil {
-		return nil, err
+		return nil, researchTaskDefinitionEditNotExecuted(err)
+	}
+	return c.prepareTarget(ctx, in.ActionID, in.TenantID, in.UserID,
+		in.TaskID, in.SessionID, in.ExpiresAt, basis, base, target)
+}
+
+// PrepareChanges loads one exact current V3 head and applies only the fields
+// explicitly authorized by the owner. It never asks the Agent to echo
+// unchanged policy and never performs a separate model-visible read.
+func (c *ResearchTaskDefinitionEditCoordinatorV3) PrepareChanges(
+	ctx context.Context, in ResearchTaskDefinitionEditChangesInputV3,
+) (*types.TaskDefinitionEditOperation, error) {
+	if c == nil || c.store == nil || c.scheduler == nil {
+		return nil, researchTaskDefinitionEditNotExecuted(
+			errors.New("task: native V3 edit is not configured"))
+	}
+	if !validResearchV3CreationOperationID(in.ActionID) || in.TenantID <= 0 ||
+		in.UserID <= 0 || in.TaskID == "" || in.SessionID <= 0 || in.ExpiresAt.IsZero() {
+		return nil, researchTaskDefinitionEditNotExecuted(
+			creationValidation("V3 任务编辑请求不完整", nil))
+	}
+	scope := researchTaskDefinitionEditScopeV3(
+		in.ActionID, in.TenantID, in.UserID, in.TaskID)
+	existing, existingErr := c.store.LoadResearchTaskDefinitionEditOperationV3(
+		ctx, scope)
+	if existingErr == nil {
+		if researchTaskDefinitionEditChangesReplayMatchesV3(existing, in) {
+			return existing, nil
+		}
+		return nil, researchTaskDefinitionEditNotExecuted(types.NewAppError(
+			types.CodeConflict, "V3 任务编辑操作与已保存内容冲突", types.ErrConflict))
+	}
+	if !errors.Is(existingErr, types.ErrNotFound) {
+		// A prior attempt with this action ID may already be sealed while its
+		// read is temporarily unavailable. Never claim the task is unchanged on
+		// an infrastructure read failure.
+		return nil, existingErr
+	}
+	basis, err := c.store.LoadResearchTaskDefinitionEditBasisV3(
+		ctx, in.TenantID, in.UserID, in.TaskID)
+	if err != nil {
+		return nil, researchTaskDefinitionEditNotExecuted(err)
+	}
+	base, err := taskstate.DecodeApprovedDefinitionV3(basis.DefinitionPayload)
+	if err != nil {
+		return nil, researchTaskDefinitionEditNotExecuted(fmt.Errorf(
+			"task: native V3 base definition: %w", err))
+	}
+	target, err := ApplyResearchV3DefinitionChanges(base, in.Changes)
+	if err != nil {
+		return nil, researchTaskDefinitionEditNotExecuted(err)
+	}
+	return c.prepareTarget(ctx, in.ActionID, in.TenantID, in.UserID,
+		in.TaskID, in.SessionID, in.ExpiresAt, basis, base, target)
+}
+
+func researchTaskDefinitionEditChangesReplayMatchesV3(
+	op *types.TaskDefinitionEditOperation,
+	in ResearchTaskDefinitionEditChangesInputV3,
+) bool {
+	if op == nil || op.Protocol != types.TaskDefinitionEditProtocolResearchV3 ||
+		op.ID != in.ActionID || op.TenantID != in.TenantID ||
+		op.UserID != in.UserID || op.TargetTenantID != in.TenantID ||
+		op.TargetUserID != in.UserID || op.TaskID != in.TaskID ||
+		op.SessionID != in.SessionID {
+		return false
+	}
+	switch op.Status {
+	case types.TaskDefinitionEditOperationStatusPending,
+		types.TaskDefinitionEditOperationStatusExecuting,
+		types.TaskDefinitionEditOperationStatusCompleted,
+		types.TaskDefinitionEditOperationStatusBlocked,
+		types.TaskDefinitionEditOperationStatusSuperseded:
+	default:
+		return false
+	}
+	base, err := taskstate.DecodeApprovedDefinitionV3(op.BaseDefinition)
+	if err != nil {
+		return false
+	}
+	target, err := ApplyResearchV3DefinitionChanges(base, in.Changes)
+	if err != nil {
+		return false
+	}
+	targetPayload, err := taskstate.EncodeApprovedDefinitionV3(target)
+	return err == nil && bytes.Equal(targetPayload, op.TargetDefinition)
+}
+
+func (c *ResearchTaskDefinitionEditCoordinatorV3) prepareTarget(
+	ctx context.Context, actionID string, tenantID, userID int64,
+	taskID string, sessionID int64, expiresAt time.Time,
+	basis *types.ResearchTaskDefinitionEditBasisV3,
+	base, target taskstate.ApprovedDefinitionV3,
+) (*types.TaskDefinitionEditOperation, error) {
+	if basis == nil || basis.TenantID != tenantID || basis.UserID != userID ||
+		basis.TaskID != taskID || base.TenantID != tenantID ||
+		base.UserID != userID || base.TaskID != taskID ||
+		target.TenantID != tenantID || target.UserID != userID ||
+		target.TaskID != taskID {
+		return nil, researchTaskDefinitionEditNotExecuted(
+			errors.New("task: native V3 edit basis identity differs"))
 	}
 	basePayload, err := taskstate.EncodeApprovedDefinitionV3(base)
 	if err != nil {
-		return nil, err
+		return nil, researchTaskDefinitionEditNotExecuted(err)
 	}
 	targetPayload, err := taskstate.EncodeApprovedDefinitionV3(target)
 	if err != nil {
-		return nil, err
+		return nil, researchTaskDefinitionEditNotExecuted(err)
 	}
 	if bytes.Equal(basePayload, targetPayload) {
-		return nil, creationValidation("V3 任务编辑没有产生任何变化", nil)
+		return nil, researchTaskDefinitionEditNotExecuted(
+			creationValidation("V3 任务编辑没有产生任何变化", nil))
 	}
 	basePrepared, err := scheduler.DecodePreparedResearchTaskScheduleV3(
 		basis.PreparedSchedule)
 	if err != nil {
-		return nil, fmt.Errorf("task: native V3 prepared Schedule: %w", err)
+		return nil, researchTaskDefinitionEditNotExecuted(fmt.Errorf(
+			"task: native V3 prepared Schedule: %w", err))
 	}
 	prepared, baseSnapshot, err := c.scheduler.PrepareResearchDefinitionEditV3(
-		ctx, in.ActionID, basePrepared, basis.DefinitionVersion,
+		ctx, actionID, basePrepared, basis.DefinitionVersion,
 		basis.DefinitionDigest, basis.DefinitionVersion+1, target)
 	if err != nil {
-		return nil, err
+		return nil, researchTaskDefinitionEditNotExecuted(err)
 	}
 	preparedBytes, err := scheduler.EncodePreparedResearchTaskDefinitionEditV3(prepared)
 	if err != nil {
-		return nil, err
+		return nil, researchTaskDefinitionEditNotExecuted(err)
 	}
 	snapshotBytes, err := scheduler.EncodeResearchTaskDefinitionEditSnapshotV3(
 		prepared, baseSnapshot)
 	if err != nil {
-		return nil, err
+		return nil, researchTaskDefinitionEditNotExecuted(err)
 	}
 	params := types.CreateResearchTaskDefinitionEditOperationV3Params{
-		ID: in.ActionID, TenantID: in.TenantID, UserID: in.UserID,
-		TaskID: in.TaskID, SessionID: in.SessionID,
-		ExpiresAt:   in.ExpiresAt.UTC().Truncate(time.Microsecond),
+		ID: actionID, TenantID: tenantID, UserID: userID,
+		TaskID: taskID, SessionID: sessionID,
+		ExpiresAt:   expiresAt.UTC().Truncate(time.Microsecond),
 		BaseVersion: basis.DefinitionVersion, BaseDefinition: basePayload,
 		TargetVersion: basis.DefinitionVersion + 1, TargetDefinition: targetPayload,
 		PreparedEdit: preparedBytes, BaseSnapshot: snapshotBytes,
@@ -140,10 +282,28 @@ func (c *ResearchTaskDefinitionEditCoordinatorV3) Prepare(
 	loaded, loadErr := c.store.LoadResearchTaskDefinitionEditOperationV3(
 		readCtx, researchTaskDefinitionEditScopeV3(params.ID, params.TenantID,
 			params.UserID, params.TaskID))
-	if loadErr == nil && researchTaskDefinitionEditProposalMatchesV3(loaded, params) {
-		return loaded, nil
+	if loadErr == nil {
+		if researchTaskDefinitionEditProposalMatchesV3(loaded, params) {
+			return loaded, nil
+		}
+		return nil, researchTaskDefinitionEditNotExecuted(types.NewAppError(
+			types.CodeConflict, "V3 任务编辑操作与已保存内容冲突", types.ErrConflict))
+	}
+	if errors.Is(loadErr, types.ErrNotFound) {
+		if researchTaskDefinitionEditSealDefinitelyRejected(createErr) {
+			return nil, researchTaskDefinitionEditNotExecuted(createErr)
+		}
+		// The insert may still commit after its response is lost; one read that
+		// raced that commit cannot prove the operation was not admitted.
+		return nil, errors.Join(createErr, loadErr)
 	}
 	return nil, errors.Join(createErr, loadErr)
+}
+
+func researchTaskDefinitionEditSealDefinitelyRejected(err error) bool {
+	return errors.Is(err, types.ErrValidation) ||
+		errors.Is(err, types.ErrConflict) ||
+		errors.Is(err, types.ErrNotFound)
 }
 
 func researchTaskDefinitionEditProposalMatchesV3(
@@ -152,6 +312,7 @@ func researchTaskDefinitionEditProposalMatchesV3(
 ) bool {
 	return op != nil && op.Protocol == types.TaskDefinitionEditProtocolResearchV3 &&
 		op.ID == p.ID && op.TenantID == p.TenantID && op.UserID == p.UserID &&
+		op.TargetTenantID == p.TenantID && op.TargetUserID == p.UserID &&
 		op.TaskID == p.TaskID && op.SessionID == p.SessionID &&
 		(op.Status == types.TaskDefinitionEditOperationStatusPending ||
 			op.Status == types.TaskDefinitionEditOperationStatusExecuting ||
@@ -161,8 +322,7 @@ func researchTaskDefinitionEditProposalMatchesV3(
 		bytes.Equal(op.BaseDefinition, p.BaseDefinition) &&
 		bytes.Equal(op.TargetDefinition, p.TargetDefinition) &&
 		bytes.Equal(op.PreparedEdit, p.PreparedEdit) &&
-		bytes.Equal(op.BaseSnapshot, p.BaseSnapshot) &&
-		op.ExpiresAt.Equal(p.ExpiresAt)
+		bytes.Equal(op.BaseSnapshot, p.BaseSnapshot)
 }
 
 func (c *ResearchTaskDefinitionEditCoordinatorV3) Execute(

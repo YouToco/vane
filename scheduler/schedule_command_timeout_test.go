@@ -3,6 +3,8 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,7 +22,12 @@ import (
 
 type scheduleCommandTimeoutClient struct {
 	client.Client
-	service workflowservice.WorkflowServiceClient
+	service      workflowservice.WorkflowServiceClient
+	mu           sync.Mutex
+	options      client.StartWorkflowOptions
+	workflowType interface{}
+	args         []interface{}
+	executeCalls int
 }
 
 func (c *scheduleCommandTimeoutClient) WorkflowService() workflowservice.WorkflowServiceClient {
@@ -28,11 +35,17 @@ func (c *scheduleCommandTimeoutClient) WorkflowService() workflowservice.Workflo
 }
 
 func (c *scheduleCommandTimeoutClient) ExecuteWorkflow(
-	context.Context,
-	client.StartWorkflowOptions,
-	interface{},
-	...interface{},
+	_ context.Context,
+	options client.StartWorkflowOptions,
+	workflowType interface{},
+	args ...interface{},
 ) (client.WorkflowRun, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.options = options
+	c.workflowType = workflowType
+	c.args = append([]interface{}(nil), args...)
+	c.executeCalls++
 	return nil, nil
 }
 
@@ -137,6 +150,92 @@ func rawResumeScheduleAction(
 	)
 }
 
+func rawResearchV3ScheduleAction(
+	taskID string,
+	input workflow.ResearchScheduledInputV3,
+) *schedulepb.ScheduleAction {
+	return rawScheduleActionFromClient(
+		&client.ScheduleWorkflowAction{
+			ID: "wf-" + taskID, Workflow: workflow.ResearchScheduledWorkflowV3Name,
+			TaskQueue: "sealed-v3-tq", Args: []interface{}{input},
+		},
+		converter.GetDefaultDataConverter(),
+	)
+}
+
+func TestDurableRunStartsFormalResearchV3Envelope(t *testing.T) {
+	const taskID = "task-v3-manual-run"
+	input := workflow.ResearchScheduledInputV3{
+		TenantID: 1, UserID: 7, TaskID: taskID,
+		ActionAuthorizationToken: strings.Repeat("a", 64),
+	}
+	remote := &scheduleCommandStaticDescribe{
+		action: rawResearchV3ScheduleAction(taskID, input),
+	}
+	client := &scheduleCommandTimeoutClient{service: remote}
+	st := &scheduleCommandTimeoutStore{
+		researchV3AuthorityEnabled: true,
+		researchV3AuthorityToken:   input.ActionAuthorizationToken,
+	}
+	s := New(client, "vane-tq", st,
+		WithTaskScheduleNamespace("test"),
+		WithResearchRuntimeV3AuthorityCanary(taskID),
+	)
+	command := &types.ScheduleCommand{
+		ID:       "01900000-0000-7000-8000-000000000001",
+		TenantID: 1, UserID: 7, TaskID: taskID,
+		Kind: types.ScheduleCommandRun, CreatedAt: time.Date(
+			2026, time.August, 3, 12, 34, 56, 0, time.UTC,
+		),
+	}
+
+	if err := s.applyScheduleCommandRemote(t.Context(), command); err != nil {
+		t.Fatalf("run formal Research V3 Action: %v", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.executeCalls != 1 || client.options.ID != manualTaskWorkflowID(
+		command.ID, command.CreatedAt,
+	) || client.options.TaskQueue != "sealed-v3-tq" || len(client.args) != 1 {
+		t.Fatalf("V3 manual execution=%d options=%+v args=%#v",
+			client.executeCalls, client.options, client.args)
+	}
+	if reflect.ValueOf(client.workflowType).Pointer() !=
+		reflect.ValueOf(workflow.ResearchScheduledWorkflowV3).Pointer() {
+		t.Fatalf("manual workflow type=%T, want ResearchScheduledWorkflowV3",
+			client.workflowType)
+	}
+	if got, ok := client.args[0].(workflow.ResearchScheduledInputV3); !ok || got != input {
+		t.Fatalf("manual V3 input=%#v, want %#v", client.args[0], input)
+	}
+}
+
+func TestDurableRunRejectsFormalResearchV3OutsideExactAuthority(t *testing.T) {
+	const taskID = "task-v3-manual-run-no-authority"
+	input := workflow.ResearchScheduledInputV3{
+		TenantID: 1, UserID: 7, TaskID: taskID,
+		ActionAuthorizationToken: strings.Repeat("b", 64),
+	}
+	client := &scheduleCommandTimeoutClient{service: &scheduleCommandStaticDescribe{
+		action: rawResearchV3ScheduleAction(taskID, input),
+	}}
+	s := New(client, "vane-tq", &scheduleCommandTimeoutStore{},
+		WithTaskScheduleNamespace("test"))
+	err := s.applyScheduleCommandRemote(t.Context(), &types.ScheduleCommand{
+		ID:       "01900000-0000-7000-8000-000000000002",
+		TenantID: 1, UserID: 7, TaskID: taskID,
+		Kind: types.ScheduleCommandRun, CreatedAt: time.Now().UTC(),
+	})
+	if types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("manual V3 without exact authority error=%v", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.executeCalls != 0 {
+		t.Fatalf("unauthorized V3 manual executions=%d", client.executeCalls)
+	}
+}
+
 func (s *scheduleCommandFirstRPCBlackhole) PatchSchedule(
 	ctx context.Context,
 	request *workflowservice.PatchScheduleRequest,
@@ -190,11 +289,27 @@ func (s *scheduleCommandFirstRPCBlackhole) DeleteSchedule(
 
 type scheduleCommandTimeoutStore struct {
 	scheduleStore
-	mu             sync.Mutex
-	command        *types.ScheduleCommand
-	locked         bool
-	toolDefinition bool
-	schedule       types.Schedule
+	mu                         sync.Mutex
+	command                    *types.ScheduleCommand
+	locked                     bool
+	toolDefinition             bool
+	schedule                   types.Schedule
+	researchV3AuthorityEnabled bool
+	researchV3AuthorityToken   string
+}
+
+func (s *scheduleCommandTimeoutStore) VerifyEnabledResearchV3ActionAuthorization(
+	_ context.Context,
+	_, _ int64,
+	_ string,
+	token string,
+) error {
+	if !s.researchV3AuthorityEnabled || token != s.researchV3AuthorityToken {
+		return types.NewAppError(
+			types.CodeConflict, "Research V3 authority unavailable", types.ErrConflict,
+		)
+	}
+	return nil
 }
 
 func (s *scheduleCommandTimeoutStore) ResolveActiveTenantForUser(

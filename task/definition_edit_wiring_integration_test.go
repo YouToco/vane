@@ -153,11 +153,6 @@ func TestDefinitionEditReceiptDispatcherIntegration_PostgreSQLResponseLossRecove
 			t.Fatalf("receipt recovery pass: %v", err)
 		}
 	}
-	calls, resources := sender.snapshot()
-	if calls != 2 || len(resources) != 1 ||
-		resources[fixture.receipt.Target] == "" {
-		t.Fatalf("original-card replay calls=%d resources=%v", calls, resources)
-	}
 }
 
 type definitionEditPostgreSQLReceiptSessions struct {

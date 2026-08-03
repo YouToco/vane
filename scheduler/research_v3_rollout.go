@@ -93,17 +93,23 @@ func decodeResearchScheduledActionV3(
 		return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
 			types.CodeConflict, "research V3 Schedule Action envelope type is invalid", types.ErrConflict)
 	}
+	if err := validateResearchScheduledInputV3(input); err != nil {
+		return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
+			types.CodeConflict, "research V3 Schedule Action envelope is invalid", err)
+	}
+	return input, true, nil
+}
+
+func validateResearchScheduledInputV3(input workflow.ResearchScheduledInputV3) error {
 	if input.TenantID <= 0 || input.UserID <= 0 || !validResearchV3RolloutID(input.TaskID) ||
 		len(input.ActionAuthorizationToken) != 64 ||
 		input.ActionAuthorizationToken != strings.ToLower(input.ActionAuthorizationToken) {
-		return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
-			types.CodeConflict, "research V3 Schedule Action envelope is invalid", types.ErrConflict)
+		return types.ErrConflict
 	}
 	if _, err := hex.DecodeString(input.ActionAuthorizationToken); err != nil {
-		return workflow.ResearchScheduledInputV3{}, true, types.NewAppError(
-			types.CodeConflict, "research V3 Schedule Action authorization is invalid", types.ErrConflict)
+		return errors.Join(types.ErrConflict, err)
 	}
-	return input, true, nil
+	return nil
 }
 
 func scheduleActionWorkflowNameV3(action *client.ScheduleWorkflowAction) string {

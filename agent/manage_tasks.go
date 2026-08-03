@@ -96,6 +96,37 @@ type ResearchTaskCreationV3Executor interface {
 	) (ResearchTaskCreationV3Outcome, error)
 }
 
+type ResearchTaskDefinitionEditV3Changes struct {
+	Name         *string
+	Manual       *string
+	Schedule     json.RawMessage
+	Notification *ResearchTaskNotificationV3Input
+	Output       *ResearchTaskOutputV3Input
+}
+
+type ResearchTaskDefinitionEditV3Input struct {
+	ActionID  string
+	TenantID  int64
+	UserID    int64
+	SessionID int64
+	TaskRef   string
+	Changes   ResearchTaskDefinitionEditV3Changes
+}
+
+type ResearchTaskDefinitionEditV3Outcome struct {
+	OperationID string
+	TaskRef     string
+	TaskName    string
+	Status      string
+}
+
+type ResearchTaskDefinitionEditV3Executor interface {
+	ExecuteResearchTaskDefinitionEditV3(
+		context.Context,
+		ResearchTaskDefinitionEditV3Input,
+	) (ResearchTaskDefinitionEditV3Outcome, error)
+}
+
 // ManageTasksDeps keeps the model-visible write tool behind narrow, already
 // authenticated control-plane interfaces. A nil Creator fails closed; only the
 // complete V3 lifecycle may implement it, so this shell cannot fall back to a
@@ -103,6 +134,7 @@ type ResearchTaskCreationV3Executor interface {
 type ManageTasksDeps struct {
 	Queries    intelligenceQueryStore
 	Creator    ResearchTaskCreationV3Executor
+	Editor     ResearchTaskDefinitionEditV3Executor
 	Runner     TaskRunTrigger
 	Deleter    idempotentScheduleDeleter
 	Authorizer OwnerActionAuthorizer
@@ -120,7 +152,7 @@ func NewManageTasksTool(deps ManageTasksDeps) ToolSpec {
 const manageTasksSchema = `{
   "type":"object",
   "properties":{
-    "action":{"type":"string","enum":["create","run","delete"]},
+    "action":{"type":"string","enum":["create","edit","run","delete"]},
     "name":{"type":"string","minLength":1,"maxLength":16384,"description":"create 的可读任务名称"},
     "manual":{"type":"string","minLength":1,"maxLength":262144,"description":"create 的完整任务手册：监控什么、何时检查、怎样呈现"},
     "schedule":{
@@ -155,7 +187,32 @@ const manageTasksSchema = `{
       "required":["language","format","include_evidence_links"],
       "additionalProperties":false
     },
-    "task_refs":{"type":"array","minItems":1,"maxItems":20,"uniqueItems":true,"items":{"type":"string"},"description":"run/delete 的内部任务引用；用户无需知道或提供"}
+    "changes":{
+      "type":"object",
+      "properties":{
+        "name":{"type":"string","minLength":1,"maxLength":16384},
+        "manual":{"type":"string","minLength":1,"maxLength":262144},
+        "schedule":{
+          "type":"object",
+          "properties":{"cron":{"type":"string"},"every_seconds":{"type":"integer","minimum":3600},"anchor_at":{"type":"string"},"tz":{"type":"string","minLength":1}},
+          "required":["tz"],"additionalProperties":false
+        },
+        "notification":{
+          "type":"object",
+          "properties":{"minimum_significance":{"type":"string","enum":["major_updates_only","all_qualified_updates"]},"suppress_empty":{"type":"boolean","enum":[true]}},
+          "required":["minimum_significance","suppress_empty"],"additionalProperties":false
+        },
+        "output":{
+          "type":"object",
+          "properties":{"language":{"type":"string","enum":["auto","zh-CN","en"]},"format":{"type":"string","enum":["executive_brief","concise_brief"]},"instructions":{"type":"string","maxLength":16384},"include_evidence_links":{"type":"boolean"}},
+          "required":["language","format","include_evidence_links"],"additionalProperties":false
+        }
+      },
+      "minProperties":1,
+      "additionalProperties":false,
+      "description":"edit 中用户明确要求改变的完整字段；未提供字段由服务端从最新不可变定义保留"
+    },
+    "task_refs":{"type":"array","minItems":1,"maxItems":20,"uniqueItems":true,"items":{"type":"string"},"description":"edit/run/delete 的内部任务引用；用户无需知道或提供；edit 必须恰好一个"}
   },
   "required":["action"],
   "additionalProperties":false
@@ -168,7 +225,16 @@ type manageTasksArgs struct {
 	Schedule     *manageTaskScheduleArgs     `json:"schedule,omitempty"`
 	Notification *manageTaskNotificationArgs `json:"notification,omitempty"`
 	Output       *manageTaskOutputArgs       `json:"output,omitempty"`
+	Changes      *manageTaskEditChanges      `json:"changes,omitempty"`
 	TaskRefs     []string                    `json:"task_refs,omitempty"`
+}
+
+type manageTaskEditChanges struct {
+	Name         *string                     `json:"name,omitempty"`
+	Manual       *string                     `json:"manual,omitempty"`
+	Schedule     *manageTaskScheduleArgs     `json:"schedule,omitempty"`
+	Notification *manageTaskNotificationArgs `json:"notification,omitempty"`
+	Output       *manageTaskOutputArgs       `json:"output,omitempty"`
 }
 
 type manageTaskScheduleArgs struct {
@@ -194,7 +260,7 @@ type manageTasksTool struct{ deps ManageTasksDeps }
 
 func (*manageTasksTool) Name() string { return manageTasksName }
 func (*manageTasksTool) Description() string {
-	return "创建、立即运行或批量删除当前用户的情报任务。创建只提交任务名称、完整任务手册、调度、通知门槛和输出偏好；运行/删除先用 query_my_intelligence 按自然名称、主题、用途或时间定位。不要向用户展示或索要内部引用。明确指令直接执行，真正含糊时自然追问一次，全程没有确认卡。"
+	return "创建、编辑、立即运行或批量删除当前用户的情报任务。编辑只提交用户明确要求改变的字段，未改变字段由服务端从最新定义安全保留；编辑/运行/删除先用 query_my_intelligence 按自然名称、主题、用途或时间定位。不要向用户展示或索要内部引用。明确指令直接执行，真正含糊时自然追问一次，全程没有确认卡。"
 }
 func (*manageTasksTool) Parameters() json.RawMessage { return json.RawMessage(manageTasksSchema) }
 func (*manageTasksTool) Summarize(raw json.RawMessage) string {
@@ -227,6 +293,9 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 		}
 		targets = []OwnerActionTarget{{Name: args.Name, Status: "proposed"}}
 	} else {
+		if args.Action == "edit" && t.deps.Editor == nil {
+			return "任务编辑能力当前未装配，本次未执行。", nil
+		}
 		if t.deps.Queries == nil {
 			return "任务查询能力当前未完整装配，本次未执行。", nil
 		}
@@ -283,6 +352,8 @@ func deterministicManageTasksResult(
 	}
 	if len(receipt) > 0 && json.Unmarshal(receipt, &decoded) == nil {
 		switch decoded.Status {
+		case "not_executed":
+			return "任务修改未执行，原任务保持不变；请修正变更内容后重试。"
 		case "execution_indeterminate":
 			return "任务操作结果暂时无法确认；系统会按同一请求安全恢复，本次不能声称已经完成。"
 		case "invalid_outcome":
@@ -337,7 +408,8 @@ func manageTasksClarifiedOwnerRequest(
 				Action string `json:"action"`
 			}
 			if json.Unmarshal([]byte(call.Arguments), &envelope) != nil ||
-				(envelope.Action != "create" && envelope.Action != "run" && envelope.Action != "delete") {
+				(envelope.Action != "create" && envelope.Action != "edit" &&
+					envelope.Action != "run" && envelope.Action != "delete") {
 				return "", "", false
 			}
 			action = envelope.Action
@@ -406,12 +478,22 @@ func decodeManageTasksArgs(raw json.RawMessage) (manageTasksArgs, []string, stri
 	}
 	switch args.Action {
 	case "create":
-		if len(args.TaskRefs) != 0 || !validManageTaskCreateArgs(args) {
+		if args.Changes != nil || len(args.TaskRefs) != 0 || !validManageTaskCreateArgs(args) {
 			return args, nil, "create 必须完整提供 name、manual、schedule、notification 和 output，且不能提供任务引用"
 		}
 		return args, nil, ""
+	case "edit":
+		if hasManageTaskCreateFields(args) || !validManageTaskEditChanges(args.Changes) {
+			return args, nil, "edit 只能提供一个 task_refs 引用和至少一项合法 changes"
+		}
+		refs, errText, _ := normalizeTaskRefs(args.TaskRefs)
+		if errText != "" || len(refs) != 1 {
+			return args, nil, "edit 必须恰好提供一个内部任务引用"
+		}
+		args.TaskRefs = refs
+		return args, refs, ""
 	case "run", "delete":
-		if hasManageTaskCreateFields(args) {
+		if hasManageTaskCreateFields(args) || args.Changes != nil {
 			return args, nil, args.Action + " 只能提供 task_refs"
 		}
 		refs, errText, _ := normalizeTaskRefs(args.TaskRefs)
@@ -421,7 +503,7 @@ func decodeManageTasksArgs(raw json.RawMessage) (manageTasksArgs, []string, stri
 		args.TaskRefs = refs
 		return args, refs, ""
 	default:
-		return args, nil, "action 必须是 create、run 或 delete"
+		return args, nil, "action 必须是 create、edit、run 或 delete"
 	}
 }
 
@@ -466,7 +548,54 @@ func validManageTaskCreateArgs(args manageTasksArgs) bool {
 	return true
 }
 
+func validManageTaskEditChanges(changes *manageTaskEditChanges) bool {
+	if changes == nil || (changes.Name == nil && changes.Manual == nil &&
+		changes.Schedule == nil && changes.Notification == nil && changes.Output == nil) {
+		return false
+	}
+	if changes.Name != nil && (*changes.Name == "" ||
+		strings.TrimSpace(*changes.Name) != *changes.Name ||
+		!utf8.ValidString(*changes.Name) || len(*changes.Name) > 16<<10) {
+		return false
+	}
+	if changes.Manual != nil && (strings.TrimSpace(*changes.Manual) == "" ||
+		!utf8.ValidString(*changes.Manual) || len(*changes.Manual) > 256<<10) {
+		return false
+	}
+	probe := manageTasksArgs{Name: "edit", Manual: "edit", Schedule: changes.Schedule,
+		Notification: changes.Notification, Output: changes.Output}
+	if changes.Schedule != nil {
+		probe.Notification = &manageTaskNotificationArgs{MinimumSignificance: "major_updates_only", SuppressEmpty: boolPointer(true)}
+		probe.Output = &manageTaskOutputArgs{Language: "auto", Format: "concise_brief", IncludeEvidenceLinks: boolPointer(true)}
+		if !validManageTaskCreateArgs(probe) {
+			return false
+		}
+	}
+	if changes.Notification != nil {
+		n := changes.Notification
+		if n.SuppressEmpty == nil || !*n.SuppressEmpty ||
+			(n.MinimumSignificance != "major_updates_only" && n.MinimumSignificance != "all_qualified_updates") {
+			return false
+		}
+	}
+	if changes.Output != nil {
+		o := changes.Output
+		if o.IncludeEvidenceLinks == nil || !utf8.ValidString(o.Instructions) ||
+			len(o.Instructions) > 16<<10 ||
+			(o.Language != "auto" && o.Language != "zh-CN" && o.Language != "en") ||
+			(o.Format != "executive_brief" && o.Format != "concise_brief") {
+			return false
+		}
+	}
+	return true
+}
+
+func boolPointer(value bool) *bool { return &value }
+
 func (args manageTasksArgs) authorizationChanges() (json.RawMessage, error) {
+	if args.Action == "edit" {
+		return json.Marshal(args.Changes)
+	}
 	if args.Action != "create" {
 		return nil, nil
 	}
@@ -621,6 +750,73 @@ func (t *manageTasksTool) executeAuthorized(ctx context.Context, meta chatMeta, 
 			return "任务创建已安全停止，本次没有启用新任务。", receipt, nil
 		default:
 			return "", receipt, errors.New("agent: unreachable native V3 creation status")
+		}
+	case "edit":
+		if t.deps.Editor == nil || len(targets) != 1 {
+			return "", nil, errors.New("agent: manage_tasks edit controller is unavailable")
+		}
+		target := targets[0]
+		actionID := manageTaskIdempotencyKey(meta, args.Action, target.Ref)
+		input := ResearchTaskDefinitionEditV3Input{
+			ActionID: actionID, TenantID: meta.scope.TenantID,
+			UserID: meta.scope.UserID, SessionID: meta.scope.SessionID,
+			TaskRef: target.Ref,
+			Changes: ResearchTaskDefinitionEditV3Changes{
+				Name: args.Changes.Name, Manual: args.Changes.Manual,
+			},
+		}
+		if args.Changes.Schedule != nil {
+			input.Changes.Schedule, _ = json.Marshal(args.Changes.Schedule)
+		}
+		if args.Changes.Notification != nil {
+			input.Changes.Notification = &ResearchTaskNotificationV3Input{
+				MinimumSignificance: args.Changes.Notification.MinimumSignificance,
+				SuppressEmpty:       *args.Changes.Notification.SuppressEmpty,
+			}
+		}
+		if args.Changes.Output != nil {
+			input.Changes.Output = &ResearchTaskOutputV3Input{
+				Language:             args.Changes.Output.Language,
+				Format:               args.Changes.Output.Format,
+				Instructions:         args.Changes.Output.Instructions,
+				IncludeEvidenceLinks: *args.Changes.Output.IncludeEvidenceLinks,
+			}
+		}
+		outcome, err := t.deps.Editor.ExecuteResearchTaskDefinitionEditV3(ctx, input)
+		if err != nil {
+			if errors.Is(err, errResearchTaskDefinitionEditNotExecuted) {
+				return "", taskActionReceipt(args.Action, []string{target.Ref},
+					"not_executed", actionID), err
+			}
+			return "", taskActionReceipt(args.Action, []string{target.Ref},
+				"execution_indeterminate", actionID), err
+		}
+		outcome.OperationID = strings.TrimSpace(outcome.OperationID)
+		outcome.TaskRef = strings.TrimSpace(outcome.TaskRef)
+		outcome.TaskName = strings.TrimSpace(outcome.TaskName)
+		outcome.Status = strings.TrimSpace(outcome.Status)
+		if outcome.OperationID != actionID || outcome.TaskRef != target.Ref ||
+			outcome.TaskName == "" || (args.Changes.Name != nil &&
+			outcome.TaskName != *args.Changes.Name) ||
+			(outcome.Status != "completed" && outcome.Status != "executing" &&
+				outcome.Status != "blocked" && outcome.Status != "superseded") {
+			return "", taskActionReceipt(args.Action, []string{target.Ref},
+					"invalid_outcome", actionID),
+				errors.New("agent: native V3 edit returned an invalid outcome")
+		}
+		receipt := taskActionReceipt(args.Action, []string{target.Ref},
+			outcome.Status, actionID)
+		switch outcome.Status {
+		case "completed":
+			return "已修改任务：" + outcome.TaskName + "。", receipt, nil
+		case "executing":
+			return "任务修改已受理，系统会自动继续处理：" + outcome.TaskName + "。", receipt, nil
+		case "blocked":
+			return "任务修改已安全停止，原任务未被不完整覆盖：" + outcome.TaskName + "。", receipt, nil
+		case "superseded":
+			return "任务定义在编辑期间已更新，本次没有覆盖新版本；请按任务名称重新描述要修改的内容。", receipt, nil
+		default:
+			return "", receipt, errors.New("agent: unreachable native V3 edit status")
 		}
 	case "run":
 		if t.deps.Runner == nil {
