@@ -369,11 +369,11 @@ func TestContextShadowCandidateMessagesExactlyMirrorProfileRequest(t *testing.T)
 			snapshots[0].CandidateMessages, want,
 		)
 	}
-	if !strings.Contains(
+	if strings.Contains(
 		snapshots[0].CandidateMessages[0].Content,
 		"AI SaaS",
 	) {
-		t.Fatal("profile system content missing from candidate")
+		t.Fatal("owner profile must be queried through query_my_intelligence, not injected")
 	}
 }
 

@@ -1,8 +1,8 @@
 // assistant.chat executor（契约 §12 P2 / PR-4）：LLM 轨——把入站自然语言交给
-// A2A 轨 agent.Loop（RunOnce，只读工具白名单），按 contextId 重建多轮历史。
+// A2A 轨 agent.Loop（RunOnce，零工具公开对话面），按 contextId 重建多轮历史。
 //
 // 与 content.query 的分工：query 是确定性检索（零 LLM、结果可复现），chat 是
-// 对话式问答（订阅/计划的只读查询 + 中文组织）。卡片 description 引导对端
+// 对话式问答（仅依赖当前请求与同 context 历史）。卡片 description 引导对端
 // 各取所长（检索找 query、对话找 chat）。
 package a2a
 
@@ -94,7 +94,7 @@ func chatFailText() string { return "对话处理失败，请稍后重试" }
 //
 // 逻辑本体已收敛到 auth 包（企业级契约 §1.1，不变量 I-A1）；本函数只剩两层适配：
 // ① 加 dbQueryTimeout（A2A 特有的预算，auth 包不该替调用方决定超时）；
-// ② 收窄成 userID——A2A 轨以 owner 身份执行只读工具（数据边界拍板 §13.2）。
+// ② 收窄成 userID——A2A 轨仅用该身份建立对话范围，不暴露 owner 工具目录。
 // 错误的对外文案仍由 ownerErrText 按错误码收窄（B-F1），内层 Message 永不外露。
 func (e *executor) resolveOwner(ctx context.Context) (int64, error) {
 	octx, cancel := context.WithTimeout(ctx, dbQueryTimeout)

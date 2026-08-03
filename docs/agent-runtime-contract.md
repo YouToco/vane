@@ -81,15 +81,14 @@ C2b3-2 继续按故障域拆成四个不可跳级的子列车：
   reconcile 不得持有 active 快照跨过 quiesce/recovery 后再写回 Temporal；须等待首次恢复完成，或在每次写前
   以 operation marker/status/fence 重新授权，并以并发真 Temporal Gate 证明旧 Action 不会覆盖已完成编辑。
 
-当前 2d 第 2 步接入默认关闭的 `agent.definition_edit_enabled`：开启时唯一
-`edit_task_definition` 工具可修改完整 intent/手册、调度、列表描述与门槛，Agent 的
-Propose/Confirm/Cancel 分别只委托 definition-edit controller，且仅精确的
-`ErrDefinitionEditOperationNotFound` 可继续兼容路由。确认/取消已经绑定原卡 App fingerprint +
-message ID。第 3 步现已接通独立 terminal outbox dispatcher：只消费
+当前任务编辑统一通过 owner Agent 的 `manage_tasks` 进入 V3
+definition-edit coordinator；无 feature flag，也不再对模型暴露
+`edit_task_definition`。历史确认/取消仍绑定原卡 App fingerprint +
+message ID。独立 terminal outbox dispatcher 只消费
 `task_definition_edit_receipts` 的 lease/fence API，从冻结 operation/result 生成不可变 card payload
 与固定 session 事实，先原子 checkpoint session、再 Patch 原卡、最后 checkpoint sent；响应丢失只会
-以相同 target+bytes 精确 replay，不会新发卡或重复 session 消息。dispatcher 无论 feature flag 状态均在
-所有 ingress 前启动，用于收敛历史 outbox；生产和普通用户行为仍因 flag 默认关闭而不暴露编辑工具。
+以相同 target+bytes 精确 replay，不会新发卡或重复 session 消息。dispatcher 在
+所有 ingress 前启动，仅用于收敛历史 outbox。
 
 7.10-B5 起，新 Agent 编辑请求不再发行确认卡：模型给出的 exact edit command 仍先经
 `Propose` 冻结 base/target 与审计身份，随后由 Agent 用 server-owned

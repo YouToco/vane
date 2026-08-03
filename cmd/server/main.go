@@ -1200,13 +1200,12 @@ func run() error {
 	principals := auth.NewOwnerResolver(st, feishu.SettingKeyOwner)
 
 	api.Mount(mux, api.Deps{
-		Store:                 st,
-		Auth:                  st,
-		Manager:               manager,
-		Scheduler:             sched,
-		TaskAgent:             agentLoop,
-		BriefFeedback:         fbSvc,
-		DefinitionEditEnabled: cfg.Agent.DefinitionEditEnabled,
+		Store:         st,
+		Auth:          st,
+		Manager:       manager,
+		Scheduler:     sched,
+		TaskAgent:     agentLoop,
+		BriefFeedback: fbSvc,
 		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
 			ExecutiveBriefWebCanaryScheduleID,
 		ExecutiveBriefWebProjectionAllowAll: cfg.Pipeline.

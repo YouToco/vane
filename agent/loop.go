@@ -640,8 +640,8 @@ func (l *Loop) handleGroundedMessage(
 func (l *Loop) handleMessage(
 	ctx context.Context,
 	userID int64,
-	directActionID string,
-	directDefinitionEditTaskID string,
+	webActionID string,
+	webSelectedTaskRef string,
 	text string,
 	externalInput bool,
 ) (Outcome, error) {
@@ -660,17 +660,13 @@ func (l *Loop) handleMessage(
 		return Outcome{}, err
 	}
 
-	// Decode and scrub before routing so a targeted clarification can resume
-	// the immediately preceding isolated edit turn without persisting an
-	// internal task ID. Only the original command and the readable assistant
-	// question are reused; task candidates are resolved again under the current
-	// owner on the follow-up turn.
+	// Web and Feishu owner turns share the same scrubbed session history.
 	history := l.scrubUntrustedHistory(decodeMessages(sess))
 	// 同一条消息内的所有模型调用（含只读意图裁决）共享 trace_id。
 	turnID := uuid.NewString()
-	webAgentFirst := l.ownerAgent && directActionID != ""
+	webAgentFirst := l.ownerAgent && webActionID != ""
 	if webAgentFirst {
-		turnID = directActionID
+		turnID = webActionID
 		replay, replayErr := l.turnReplay.FindAgentTurnReplayV1(
 			ctx, sess.TenantID, userID, turnID,
 		)
@@ -733,9 +729,9 @@ func (l *Loop) handleMessage(
 		failedCalls:             make(map[string]int),
 		untrustedExternalResult: externalInput,
 	}
-	if webAgentFirst && directDefinitionEditTaskID != "" {
-		rememberInternalReference(state, directDefinitionEditTaskID)
-		state.webSelectedTaskRef = directDefinitionEditTaskID
+	if webAgentFirst && webSelectedTaskRef != "" {
+		rememberInternalReference(state, webSelectedTaskRef)
+		state.webSelectedTaskRef = webSelectedTaskRef
 	}
 	if externalInput {
 		if request, _, ok := splitExternalInput(text); ok {

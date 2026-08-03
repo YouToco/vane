@@ -110,8 +110,8 @@ func TestRunOnce_外部只读结果使用无协议续写(t *testing.T) {
 // 非零 → 原文生效。默认轨行为已被 M5 §12.2 的画像注入用例钉死，这里只验非零覆盖。
 func TestNew_SystemPrompt(t *testing.T) {
 	l := New(Deps{Model: "m", MaxTurns: 1, SessionTTL: time.Minute})
-	if l.sys != systemPrompt || !l.renderProfile {
-		t.Error("零值 SystemPrompt 应回落默认常量且 renderProfile=true")
+	if l.sys != systemPrompt || l.renderProfile {
+		t.Error("零值 SystemPrompt 应回落 Agent-first 常量且不直接注入画像")
 	}
 	l2 := New(Deps{Model: "m", MaxTurns: 1, SessionTTL: time.Minute, SystemPrompt: "自定义"})
 	if l2.sys != "自定义" || l2.renderProfile {

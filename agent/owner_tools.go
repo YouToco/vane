@@ -262,8 +262,8 @@ func (*updateProfileTool) Description() string {
 func (*updateProfileTool) Parameters() json.RawMessage { return json.RawMessage(updateProfileSchema) }
 func (t *updateProfileTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	var a updateProfileArgs
-	if err := strictjson.DecodeExact(args, &a); err != nil {
-		return "参数不是合法 JSON，或包含未知字段，请修正后重试", nil
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "参数不是合法 JSON，请修正后重试", nil
 	}
 	if a.Industry == nil && a.Occupation == nil && a.Tags == nil {
 		return "没有提供任何要修改的字段，请至少提供 industry、occupation、tags 之一", nil

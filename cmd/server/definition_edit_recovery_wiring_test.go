@@ -10,10 +10,9 @@ import (
 	"testing"
 )
 
-// TestTaskDefinitionEditWiringRetainsWebCompatibilityController pins the
-// recovery/Web boundary. The controller remains for the explicit Web action
-// endpoint, but it is not registered in the owner model catalog.
-func TestTaskDefinitionEditWiringRetainsWebCompatibilityController(t *testing.T) {
+// TestTaskDefinitionEditWiringRetainsLegacyRecoveryOnly pins the historical
+// recovery boundary. New Web edits use manage_tasks and the V3 coordinator.
+func TestTaskDefinitionEditWiringRetainsLegacyRecoveryOnly(t *testing.T) {
 	t.Helper()
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -45,8 +44,6 @@ func TestTaskDefinitionEditWiringRetainsWebCompatibilityController(t *testing.T)
 		managerStartPos       token.Pos
 		coordinatorIdentCount int
 		stopCalls             int
-		controllerCalls       int
-		controllerPos         token.Pos
 	)
 
 	ast.Inspect(parsed, func(node ast.Node) bool {
@@ -110,14 +107,6 @@ func TestTaskDefinitionEditWiringRetainsWebCompatibilityController(t *testing.T)
 			if isReceiverSelector(value.Fun, "w", "Start") {
 				workerStartPos = value.Pos()
 			}
-			if isPackageSelector(value.Fun, "task", "NewDefinitionEditController") &&
-				len(value.Args) == 2 {
-				if coordinator, ok := value.Args[1].(*ast.Ident); ok &&
-					coordinator.Name == coordinatorName {
-					controllerCalls++
-					controllerPos = value.Pos()
-				}
-			}
 			if ident, ok := value.Fun.(*ast.Ident); ok && ident.Name == "stopDefinitionEditRecovery" {
 				stopCalls++
 			}
@@ -133,9 +122,9 @@ func TestTaskDefinitionEditWiringRetainsWebCompatibilityController(t *testing.T)
 		return true
 	})
 
-	if coordinatorIdentCount != 5 || controllerCalls != 1 {
-		t.Fatalf("%s production references/controller edges = %d/%d, want assignment plus three recovery/Gate receivers and one narrow controller edge",
-			coordinatorName, coordinatorIdentCount, controllerCalls)
+	if coordinatorIdentCount != 4 {
+		t.Fatalf("%s production references = %d, want assignment plus three recovery/Gate receivers",
+			coordinatorName, coordinatorIdentCount)
 	}
 	if roleGateCalls != 1 || environmentGateCalls != 1 ||
 		firstRecoveryCalls != 1 || reconcileCalls != 1 {
@@ -155,10 +144,6 @@ func TestTaskDefinitionEditWiringRetainsWebCompatibilityController(t *testing.T)
 		t.Fatalf("startup order must be constructor→role Gate→environment Gate→first recovery→reconcile→periodic recovery→worker ingress→manager ingress: constructor=%d role=%d environment=%d first=%d reconcile=%d worker.Start=%d periodic=%d manager.Start=%d",
 			constructorPos, roleGatePos, environmentGatePos, firstRecoveryPos,
 			reconcilePos, workerStartPos, runRecoveryPos, managerStartPos)
-	}
-	if controllerPos == token.NoPos || controllerPos >= managerStartPos {
-		t.Fatalf("flagged definition-edit controller must be constructed before manager ingress: controller=%d manager=%d",
-			controllerPos, managerStartPos)
 	}
 	if stopCalls != 3 {
 		t.Fatalf("stopDefinitionEditRecovery calls = %d, want worker/A2A startup-failure and normal-shutdown drains",

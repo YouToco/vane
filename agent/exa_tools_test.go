@@ -378,7 +378,7 @@ func TestBuildPublicResearchTools_Exa装配(t *testing.T) {
 // 真装配时出现——缺 key 环境 prompt 不得广告白名单里不存在的工具（否则模型按
 // prompt 调用被白名单拒绝，浪费一轮还向用户食言）。
 func TestSystemPrompt_ExaNote条件注入(t *testing.T) {
-	const marker = "一次性需求"
+	const marker = "使用 web_search/read_page"
 	with := New(Deps{Tools: []ToolSpec{newToolSpec(
 		&webSearchTool{et: newTestExaTools(nil, nil)},
 		ownerPolicy(Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),

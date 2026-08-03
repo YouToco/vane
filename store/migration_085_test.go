@@ -114,6 +114,28 @@ func TestMigration085AgentIntelligenceEvidenceAndIsolation(t *testing.T) {
 	if err := st.CommitAgentTurnRecordV1(t.Context(), 1, userA, record); err != nil {
 		t.Fatalf("exact replay: %v", err)
 	}
+	replay, err := st.FindAgentTurnReplayV1(
+		t.Context(), 1, userA, record.TraceID,
+	)
+	if err != nil || replay.UserMessage != record.UserMessage ||
+		replay.AssistantMessage != record.AssistantMessage {
+		t.Fatalf("durable turn replay=%+v err=%v", replay, err)
+	}
+	if _, err := st.FindAgentTurnReplayV1(
+		t.Context(), 1, userSameTenant, record.TraceID,
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("cross-user replay err=%v, want not found", err)
+	}
+	if _, err := st.FindAgentTurnReplayV1(
+		t.Context(), tenantB, userB, record.TraceID,
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("cross-tenant replay err=%v, want not found", err)
+	}
+	if _, err := st.FindAgentTurnReplayV1(
+		t.Context(), 1, userA, "",
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("invalid replay trace err=%v, want validation", err)
+	}
 	concurrent := record
 	concurrent.TurnID = "turn-concurrent-085"
 	concurrent.TraceID = "trace-concurrent-085"

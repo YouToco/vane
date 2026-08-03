@@ -10,6 +10,7 @@ import (
 	"github.com/YouToco/vane/agentcontext"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/types"
 )
 
 type evidenceTestTool struct{ result string }
@@ -29,6 +30,80 @@ type fakeAgentEvidenceWriter struct {
 	userID   int64
 	record   store.AgentTurnRecordV1
 	err      error
+}
+
+type fakeAgentTurnReplayReader struct {
+	replay store.AgentTurnReplayV1
+	err    error
+	calls  int
+}
+
+func (f *fakeAgentTurnReplayReader) FindAgentTurnReplayV1(
+	context.Context, int64, int64, string,
+) (store.AgentTurnReplayV1, error) {
+	f.calls++
+	return f.replay, f.err
+}
+
+func TestWebTaskActionReplaysCompletedTurnWithoutModelCall(t *testing.T) {
+	reader := &fakeAgentTurnReplayReader{replay: store.AgentTurnReplayV1{
+		UserMessage: "创建 Kimi 套餐监控", AssistantMessage: "任务已创建。",
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(), Profiles: newFakeStore(),
+		Tools: ownerTestTools(), Evidence: &fakeAgentEvidenceWriter{},
+		TurnReplay: reader, OwnerAgent: true,
+	})
+	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+		t.Fatal("durable replay must not call the model")
+		return nil, nil
+	}
+	out, err := loop.HandleWebTaskActionMessage(
+		t.Context(), 7, "a58d8934-3b23-420c-b58a-93c0208e186d", "",
+		"创建 Kimi 套餐监控",
+	)
+	if err != nil || out.Reply != "任务已创建。" || reader.calls != 1 {
+		t.Fatalf("out=%+v calls=%d err=%v", out, reader.calls, err)
+	}
+}
+
+func TestWebTaskActionRejectsRequestIDReusedWithDifferentMessage(t *testing.T) {
+	reader := &fakeAgentTurnReplayReader{replay: store.AgentTurnReplayV1{
+		UserMessage: "创建 A", AssistantMessage: "已创建 A。",
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(), Profiles: newFakeStore(),
+		Tools: ownerTestTools(), Evidence: &fakeAgentEvidenceWriter{},
+		TurnReplay: reader, OwnerAgent: true,
+	})
+	_, err := loop.HandleWebTaskActionMessage(
+		t.Context(), 7, "d364eb61-a52c-4ddb-8efa-b47fb8c23dc7", "", "创建 B",
+	)
+	if !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("err=%v, want conflict", err)
+	}
+}
+
+func TestWebTaskActionUsesStableActionIDAsEvidenceTrace(t *testing.T) {
+	const actionID = "58ed32df-4bbd-4e06-b9fe-fae2a954c460"
+	reader := &fakeAgentTurnReplayReader{err: types.NewAppError(
+		types.CodeNotFound, "missing", types.ErrNotFound,
+	)}
+	writer := &fakeAgentEvidenceWriter{}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs, Tools: ownerTestTools(), Evidence: writer,
+		TurnReplay: reader, OwnerAgent: true, MaxTurns: 1,
+	})
+	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+		return &llm.ChatResponse{Content: "请补充监控频率？"}, nil
+	}
+	out, err := loop.HandleWebTaskActionMessage(
+		t.Context(), 7, actionID, "", "创建 Kimi 套餐监控",
+	)
+	if err != nil || out.Reply == "" || writer.record.TurnID != actionID {
+		t.Fatalf("out=%+v trace=%q err=%v", out, writer.record.TurnID, err)
+	}
 }
 
 func (f *fakeAgentEvidenceWriter) CommitAgentTurnRecordV1(

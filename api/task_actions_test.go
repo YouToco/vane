@@ -59,8 +59,7 @@ func (f *fakeTaskActionAgent) result() (agent.Outcome, error) {
 func TestWebTaskActionExecutesNaturalLanguageDirectly(t *testing.T) {
 	taskAgent := &fakeTaskActionAgent{}
 	deps, cookie := authedDeps(t, Deps{
-		TaskAgent:             taskAgent,
-		DefinitionEditEnabled: true,
+		TaskAgent: taskAgent,
 	})
 	mux := http.NewServeMux()
 	Mount(mux, deps)

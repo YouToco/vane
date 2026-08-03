@@ -84,7 +84,7 @@ func (s *server) handleListTaskBriefs(w http.ResponseWriter, r *http.Request) {
 		page.LatestCheck,
 		cost,
 		role,
-		s.deps.DefinitionEditEnabled,
+		true,
 	)
 	response.Health = &health
 	writeJSON(w, http.StatusOK, response)

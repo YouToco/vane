@@ -131,10 +131,6 @@ type Deps struct {
 	// Principal 是全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 生产由 main.go 注入 auth.NewOwnerResolver；单测可注入假实现。
 	Principal auth.PrincipalResolver
-	// DefinitionEditEnabled is the live process capability. The Web must not
-	// advertise or enter the definition-edit proposal path while the Agent
-	// feature flag is disabled, even though historical cards remain routable.
-	DefinitionEditEnabled bool
 	// P2-D Web exposure is independent from dark synthesis and Feishu render.
 	// Projection allow-all exposes only durable GET projections. Paid follow-up
 	// and settings/feedback writes remain exact-canary capabilities.

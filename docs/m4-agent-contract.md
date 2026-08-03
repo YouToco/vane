@@ -1,5 +1,10 @@
 # M4 契约：最小 Agent Loop + 工具化（并行实现的对接基准）
 
+> **历史文档：** Owner Agent 和 Web 写入的现行契约已转移到
+> `agent-first-intelligence-contract.md`。本文保留用于旧 Temporal/卡片回放与事故背景；
+> 不得从本文恢复 `BuildTools`、八个窄任务工具、关键词意图路由、确认卡或
+> direct create/edit 状态机。
+
 > **现行覆盖声明（2026-07-29）：** 本文中的 `list/add/remove/enable_source`、
 > `push_now`、账户订阅、来源确认卡、通用 pending action 与 callback 执行入口
 > 已由 `task-playbook-fetch-target-cutover.md` 取代，只作为冻结 v1 数据和事故背景
