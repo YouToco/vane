@@ -42,6 +42,25 @@ class DeployStateOwnerTests(unittest.TestCase):
 
         self.assertEqual(runner_labels(job_block(workflow, "renew")), EXPECTED_LABELS)
 
+    def test_build_uses_a_fresh_hosted_vm(self) -> None:
+        workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        build = job_block(workflow, "build")
+
+        self.assertIn("    runs-on: ubuntu-24.04\n", build)
+        self.assertNotIn("self-hosted", build)
+        self.assertNotIn("runs-on: [self-hosted, Linux, vane-build]", build)
+
+    def test_control_plane_pr_and_main_trust_domains_are_separate(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('["self-hosted","Linux","vane-test"]', workflow)
+        self.assertIn("'\"ubuntu-24.04\"'", workflow)
+        self.assertNotIn('["self-hosted","Linux","vane-build"]', workflow)
+        self.assertIn("  hosted-runner-smoke:\n", workflow)
+        self.assertIn("    runs-on: ubuntu-24.04\n", workflow)
+
     def test_actionlint_knows_the_primary_runner_label(self) -> None:
         config = ACTIONLINT_CONFIG.read_text(encoding="utf-8")
 

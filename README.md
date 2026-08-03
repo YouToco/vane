@@ -8,9 +8,10 @@ contain no production workflow, runner label, or production credential.
 
 1. `vane-test` runs ordinary source-repository pull-request and main CI. It has
    no production access and its result is not trusted as a deployment gate.
-2. `vane-build` independently checks and builds the exact 40-character source
-   SHAs selected by this repository. It has two read-only source deploy keys,
-   but no production secrets.
+2. A fresh GitHub-hosted `ubuntu-24.04` VM independently checks and builds the
+   exact 40-character source SHAs selected by this repository. It has two
+   read-only source deploy keys for the duration of one job, but no production
+   secrets or persistent state.
 3. `vane-deploy` owns durable deployed-SHA and certificate state and is the only
    runner that receives production credentials. Its dedicated
    `vane-deploy-runner` Unix user has no local `sudo` or Docker-group access.
@@ -20,7 +21,8 @@ contain no production workflow, runner label, or production credential.
 - `plan` runs on `vane-deploy`. It uses native `git ls-remote` with the two
   read-only deploy keys to resolve each source `main`, then compares those exact
   SHAs with the VM's durable state. It neither checks out nor executes source.
-- `build` runs on `vane-build` only when a component changed. Backend Gate is
+- `build` runs on a fresh GitHub-hosted x64 VM only when a component changed.
+  Backend Gate is
   `go mod download`, `go vet ./...`, and the complete uncached race test suite
   against PostgreSQL 18. It deliberately matches source CI test ordering:
   Store integration tests share one database, so random start-order changes
@@ -175,13 +177,12 @@ All runner registrations are repository-scoped and implement three roles:
   is intentionally not part of this trust role, so an isolated ARM64 VM or an
   isolated X64 WSL runner may execute it. PR-controlled checks never enter a
   trusted build VM.
-- control-plane exact-`main` push and schedule CI:
-  `[self-hosted, Linux, vane-build]`; only trusted default-branch workflow code
-  reaches this runner, avoiding a `vane-test` outage becoming a
-  production-control-plane single point of failure. The label deliberately
-  permits both X64 and ARM64 Linux hosts.
-- build VM: `[self-hosted, Linux, vane-build]`; Docker is available for the
+- control-plane exact-`main` push and schedule CI: GitHub-hosted
+  `ubuntu-24.04`; each run starts clean and cannot inherit PR-runner state.
+- build VM: GitHub-hosted `ubuntu-24.04`; Docker is available for the
   PostgreSQL service, and the pinned setup actions provide Go 1.26 and Node 22.
+  The VM is x64, ephemeral, receives only read-only source keys, and is
+  destroyed after the job.
 - primary deploy VM: `[self-hosted, Linux, vps-primary, vane-deploy]`. `plan`,
   `deploy`, and certificate renewal are deliberately pinned to this one
   durable-state owner; a broad-label fallback must not split a single DAG or
@@ -207,7 +208,9 @@ even when a workflow request omits that second label: a later trusted job could
 inherit files, processes, tool shims, or daemon state left by the PR. The same
 physical/VM trust-zone rule applies to fallback capacity.
 
-The current Windows WSL2 runner is `vane-test`-only. An optional Windows X64
+The current Windows WSL2 runner is `vane-test`-only. The former Mac Mini
+`vane-build` runner is no longer on the normal release path; it may be retained
+offline only as audited break-glass capacity. Any self-hosted X64
 `vane-build` fallback must be a separate, clean build-only VM/host with no
 `vane-test` registration. Its systemd service must use a dedicated `HOME` under
 the runner directory, a Linux-only `PATH`, and make Windows mounts such as
