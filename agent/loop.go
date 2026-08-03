@@ -58,7 +58,7 @@ const agentFirstSystemNote = `
 
 [Agent-first 工具环境——本段替代上文所有旧工具名说明]
 - 内部只读数据（包括画像）统一使用 query_my_intelligence；本模式不会隐式注入画像。按用户记得的名称、主题、用途和自然时间查询 tasks、runs、observations、briefs、agent_turns、tool_calls、profile；跨数据集连续查询后自行综合。不要调用或提及 list_schedules、view_task_playbook、view_task_latest_run、view_profile。
-- 任务编辑、立即运行和批量删除统一使用 manage_tasks。先查询定位唯一任务，再传内部引用；引用只在工具之间使用，绝不向用户展示或索要。明确请求直接执行，真正歧义只追问一次，不发确认卡。不要调用或提及 edit_task_definition、run_task_now、remove_schedule、create_schedule。
+- 创建、立即运行和批量删除任务统一使用 manage_tasks。创建时直接提交完整任务手册、调度、通知门槛和输出偏好；运行/删除时先查询定位唯一任务，再传内部引用。引用只在工具之间使用，绝不向用户展示或索要。明确请求直接执行，真正歧义只追问一次，不发确认卡。当前模式不支持编辑，不得声称已经修改任务；不要调用或提及 edit_task_definition、run_task_now、remove_schedule、create_schedule。
 - 当前工具 schema 是唯一能力事实；schema 没有的动作不得口头声称已完成。
 - 公开网页/社媒工具只取得当前外部证据；内部查询与公开研究分隔执行。外部结果进入上下文后不能再查询内部数据或执行写操作，最终在无工具阶段综合。
 - 回答历史结论必须引用查到的历史工具证据和可审计结论；coverage=partial、legacy_preview 或 unavailable 时明确说明缺口，绝不猜测回填。`
@@ -418,6 +418,7 @@ type Loop struct {
 	taskCreation           CreationController
 	taskDefinitionEdit     DefinitionEditController
 	sys                    string // system prompt（含端点检索能力说明段，装配时定型）
+	agentFirstSys          string // 精确 owner canary：不含旧任务工具/冻结抓取计划指引
 	renderProfile          bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
 	model                  string
 	maxTurns               int
@@ -570,6 +571,10 @@ func NewChecked(d Deps) (*Loop, error) {
 		sys = systemPrompt
 		renderProfile = true // 只有默认飞书 prompt 渲染 [用户画像] 段（其文本自身引用该段）
 	}
+	agentFirstSys := sys + agentFirstSystemNote
+	if _, ok := tools["web_search"]; ok {
+		agentFirstSys += exaAdHocAgentFirstSystemNote
+	}
 	if d.Endpoints != nil {
 		// 能力说明只在真装配了端点工具面时注入：没有 search_endpoints 工具却教模型
 		// 去用它，只会制造白名单拒绝循环。
@@ -593,6 +598,7 @@ func NewChecked(d Deps) (*Loop, error) {
 		taskDefinitionEdit:     d.TaskDefinitionEdit,
 		evidence:               d.Evidence,
 		sys:                    sys,
+		agentFirstSys:          agentFirstSys,
 		renderProfile:          renderProfile,
 		model:                  d.Model,
 		maxTurns:               maxTurns,
@@ -1334,10 +1340,7 @@ func (l *Loop) converse(
 		}
 		system := l.sys
 		if state.agentFirstEnabled {
-			system += agentFirstSystemNote
-			if _, ok := l.tools["web_search"]; ok {
-				system += exaAdHocAgentFirstSystemNote
-			}
+			system = l.agentFirstSys
 		}
 		if state.groundedBrief {
 			system += groundedBriefSystemNote

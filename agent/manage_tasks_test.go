@@ -10,7 +10,6 @@ import (
 	"github.com/YouToco/vane/agentcontext"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
@@ -73,19 +72,17 @@ func (f *fakeManageTaskDeleter) DeletePushIdempotent(_ context.Context, ref stri
 	return nil
 }
 
-type fakeManageTaskEditor struct {
-	prepared task.DefinitionEditProposalInput
-	outcome  task.TaskDefinitionEditOutcome
-	calls    int
+type fakeManageTaskCreatorV3 struct {
+	input   ResearchTaskCreationV3Input
+	outcome ResearchTaskCreationV3Outcome
+	err     error
+	calls   int
 }
 
-func (f *fakeManageTaskEditor) Prepare(_ context.Context, in task.DefinitionEditProposalInput) (task.DefinitionEditProposal, error) {
-	f.prepared = in
-	return task.DefinitionEditProposal{ID: in.ActionID, Summary: "edit"}, nil
-}
-func (f *fakeManageTaskEditor) Execute(_ context.Context, _ int64, _ string, _ task.TaskDefinitionEditReceiptTarget) (task.TaskDefinitionEditOutcome, error) {
+func (f *fakeManageTaskCreatorV3) ExecuteResearchTaskCreationV3(_ context.Context, in ResearchTaskCreationV3Input) (ResearchTaskCreationV3Outcome, error) {
 	f.calls++
-	return f.outcome, nil
+	f.input = in
+	return f.outcome, f.err
 }
 
 func manageTasksTestContext(owner string) (context.Context, *toolRunState) {
@@ -175,27 +172,99 @@ func TestManageTasksPartialFailureKeepsReceiptAndStableTurnKeys(t *testing.T) {
 	}
 }
 
-func TestManageTasksEditBuildsControllerCommandWithoutUserIDArgument(t *testing.T) {
-	queries := &fakeManageTaskQuery{rows: manageTaskRows("kimi")}
+func TestManageTasksCreateUsesOnlyNativeV3ExecutorInput(t *testing.T) {
+	queries := &fakeManageTaskQuery{err: errors.New("create must not query")}
 	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
-	editor := &fakeManageTaskEditor{outcome: task.TaskDefinitionEditOutcome{
-		Status: types.TaskDefinitionEditOperationStatusCompleted, TaskID: "kimi",
+	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
+		TaskRef: "task-internal-kimi", TaskName: "Kimi 套餐监控", Status: "completed",
 	}}
-	spec := NewManageTasksTool(ManageTasksDeps{Queries: queries, Edits: editor, Authorizer: authorizer})
-	ctx, state := manageTasksTestContext("把 Kimi 任务改成每周一九点，手册改为只看官方套餐页")
-	result, err := spec.Execute(ctx, 42, json.RawMessage(`{"action":"edit","task_ref":"kimi","changes":{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},"intent":"只看官方套餐页"}}`))
-	if err != nil || !strings.Contains(result, "已修改") {
-		t.Fatalf("edit result=%q err=%v", result, err)
+	spec := NewManageTasksTool(ManageTasksDeps{Queries: queries, Creator: creator, Authorizer: authorizer})
+	ctx, state := manageTasksTestContext("创建 Kimi 套餐监控，每周一九点查官方是否开放购买；无重大更新不推送")
+	result, err := spec.Execute(ctx, 42, json.RawMessage(`{
+		"action":"create","name":"Kimi 套餐监控",
+		"manual":"检查 Kimi 官方套餐页是否开放购买，并与历史证据交叉核验。",
+		"schedule":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},
+		"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},
+		"output":{"language":"zh-CN","format":"executive_brief","instructions":"给老板看","include_evidence_links":true}
+	}`))
+	if err != nil || result != "已创建任务：Kimi 套餐监控。" {
+		t.Fatalf("create result=%q err=%v", result, err)
 	}
-	var command map[string]json.RawMessage
-	if err := json.Unmarshal(editor.prepared.RawArgs, &command); err != nil {
-		t.Fatal(err)
+	if queries.query.Dataset != "" {
+		t.Fatalf("create queried existing tasks: %+v", queries.query)
 	}
-	if string(command["task_id"]) != `"kimi"` || command["user_id"] != nil || editor.prepared.UserID != 42 || editor.prepared.SessionID == nil || *editor.prepared.SessionID != 9 {
-		t.Fatalf("controller command/scope mismatch: command=%s prepared=%+v", editor.prepared.RawArgs, editor.prepared)
+	if creator.calls != 1 || creator.input.UserID != 42 ||
+		creator.input.SessionID == nil || *creator.input.SessionID != 9 ||
+		creator.input.Name != "Kimi 套餐监控" ||
+		creator.input.Manual == "" || string(creator.input.Schedule) != `{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}` ||
+		creator.input.Notification.MinimumSignificance != "major_updates_only" ||
+		!creator.input.Notification.SuppressEmpty ||
+		creator.input.Output.Format != "executive_brief" ||
+		!creator.input.Output.IncludeEvidenceLinks {
+		t.Fatalf("native V3 input mismatch: %+v", creator.input)
 	}
-	if editor.calls != 1 || len(state.actionReceipts) != 1 {
-		t.Fatalf("edit calls/receipts=%d/%d", editor.calls, len(state.actionReceipts))
+	if authorizer.calls != 1 || authorizer.input.Action != "create" ||
+		len(authorizer.input.Targets) != 1 ||
+		authorizer.input.Targets[0].Name != "Kimi 套餐监控" ||
+		len(state.actionReceipts) != 1 ||
+		!strings.Contains(string(state.actionReceipts[0]), "task-internal-kimi") {
+		t.Fatalf("create auth/receipt mismatch: auth=%+v receipts=%s", authorizer.input, state.actionReceipts)
+	}
+}
+
+func TestManageTasksCreateWithoutV3ExecutorFailsClosedBeforeAuthorization(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	spec := NewManageTasksTool(ManageTasksDeps{Authorizer: authorizer})
+	ctx, state := manageTasksTestContext("创建任务")
+	result, err := spec.Execute(ctx, 42, json.RawMessage(`{
+		"action":"create","name":"测试","manual":"检查官方更新。",
+		"schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},
+		"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},
+		"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}
+	}`))
+	if err != nil || !strings.Contains(result, "未装配") ||
+		authorizer.calls != 0 || len(state.actionReceipts) != 0 {
+		t.Fatalf("unwired create escaped: result=%q err=%v auth=%d receipts=%s",
+			result, err, authorizer.calls, state.actionReceipts)
+	}
+}
+
+func TestManageTasksCreateExecutingDoesNotClaimCompletion(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
+		TaskRef: "task-pending", TaskName: "测试", Status: "executing",
+	}}
+	spec := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
+	ctx, _ := manageTasksTestContext("创建测试任务")
+	result, err := spec.Execute(ctx, 42, json.RawMessage(`{
+		"action":"create","name":"测试","manual":"检查官方更新。",
+		"schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},
+		"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},
+		"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}
+	}`))
+	if err != nil || !strings.Contains(result, "已受理") || strings.Contains(result, "已创建任务") {
+		t.Fatalf("executing create overclaimed: result=%q err=%v", result, err)
+	}
+}
+
+func TestManageTasksCreateCannotCrossExternalTaintBoundary(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
+		TaskRef: "must-not-exist", TaskName: "测试", Status: "completed",
+	}}
+	spec := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
+	ctx, state := manageTasksTestContext("根据刚查到的网页创建任务")
+	state.untrustedExternalResult = true
+	result, err := spec.Execute(ctx, 42, json.RawMessage(`{
+		"action":"create","name":"测试","manual":"检查官方更新。",
+		"schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},
+		"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},
+		"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}
+	}`))
+	if err != nil || !strings.Contains(result, "认证上下文") ||
+		creator.calls != 0 || authorizer.calls != 0 || len(state.actionReceipts) != 0 {
+		t.Fatalf("tainted create escaped: result=%q err=%v creator=%d auth=%d receipts=%s",
+			result, err, creator.calls, authorizer.calls, state.actionReceipts)
 	}
 }
 
@@ -227,6 +296,7 @@ func TestManageTasksRejectsMalformedUnionBeforeQuery(t *testing.T) {
 		`{"action":"run","task_ref":"a"}`,
 		`{"action":"delete","task_refs":[" a"]}`,
 		`{"action":"create","task_refs":["a"]}`,
+		`{"action":"create","name":"x","manual":"m","schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},"notification":{"minimum_significance":"major_updates_only","suppress_empty":false},"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}}`,
 		`{"action":"run","task_refs":["a"],"tenant_id":7}`,
 	}
 	for _, raw := range cases {
@@ -236,6 +306,42 @@ func TestManageTasksRejectsMalformedUnionBeforeQuery(t *testing.T) {
 	}
 	if queries.query.Dataset != "" {
 		t.Fatalf("malformed input reached query: %+v", queries.query)
+	}
+}
+
+func TestManageTasksSchemaIsAgentFirstV3Only(t *testing.T) {
+	spec := NewManageTasksTool(ManageTasksDeps{})
+	if err := spec.validate(); err != nil {
+		t.Fatalf("manage_tasks schema invalid: %v", err)
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(spec.Parameters(), &schema); err != nil {
+		t.Fatal(err)
+	}
+	var action struct {
+		Enum []string `json:"enum"`
+	}
+	if err := json.Unmarshal(schema.Properties["action"], &action); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(action.Enum, ",") != "create,run,delete" {
+		t.Fatalf("manage_tasks actions=%v", action.Enum)
+	}
+	for _, required := range []string{"name", "manual", "schedule", "notification", "output", "task_refs"} {
+		if schema.Properties[required] == nil {
+			t.Errorf("manage_tasks schema missing %s", required)
+		}
+	}
+	visible := strings.ToLower(spec.Description() + "\n" + string(spec.Parameters()))
+	for _, retired := range []string{
+		"\"edit\"", "changes", "tool_calls", "source", "fetch",
+		"budget", "delivery_policy", "create_schedule",
+	} {
+		if strings.Contains(visible, retired) {
+			t.Errorf("manage_tasks V3 surface retained %q: %s", retired, visible)
+		}
 	}
 }
 
@@ -272,9 +378,16 @@ func TestAgentFirstGeneralChatInventoryHidesLegacyTaskTools(t *testing.T) {
 	legacyDefs := loop.requestTools(&toolRunState{
 		agentFirstEnabled: false, intents: knownToolIntents,
 	})
+	legacyNames := make(map[string]bool, len(legacyDefs))
 	for _, def := range legacyDefs {
+		legacyNames[def.Name] = true
 		if agentFirstOnlyTool(def.Name) {
 			t.Fatalf("non-canary inventory exposed %s", def.Name)
+		}
+	}
+	for _, retained := range []string{"list_schedules", "create_schedule", "run_task_now", "remove_schedule"} {
+		if !legacyNames[retained] {
+			t.Fatalf("non-canary lost legacy tool %s: %v", retained, legacyNames)
 		}
 	}
 	if !strings.Contains(agentFirstSystemNote, "Agent-first 工具环境") ||
@@ -306,6 +419,35 @@ func TestAgentFirstCanaryDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
 	if strings.Contains(string(encoded), "SECRET-INDUSTRY") ||
 		!strings.Contains(string(encoded), "Agent-first 工具环境") {
 		t.Fatalf("Agent-first request leaked implicit profile or missed environment: %s", encoded)
+	}
+	for _, retiredGuidance := range []string{
+		"统一使用 create_schedule 创建", "create_schedule 必须带完整 intent",
+		"系统会冻结本任务的 Tool 调用", "改用 create_schedule",
+	} {
+		if strings.Contains(string(encoded), retiredGuidance) {
+			t.Fatalf("Agent-first prompt retained legacy create guidance %q: %s",
+				retiredGuidance, encoded)
+		}
+	}
+	if !strings.Contains(string(encoded), "创建、立即运行和批量删除任务统一使用 manage_tasks") {
+		t.Fatalf("Agent-first prompt missed V3 create guidance: %s", encoded)
+	}
+}
+
+func TestAgentFirstPromptSplitPreservesLegacyNonCanaryGuidance(t *testing.T) {
+	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
+	loop := New(Deps{
+		Tools:             BuildTools(nil, nil, nil, nil, exa),
+		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42,
+		Evidence: &fakeAgentEvidenceWriter{},
+	})
+	if !strings.Contains(loop.sys, "统一使用 create_schedule 创建") {
+		t.Fatalf("non-canary prompt lost retained legacy guidance: %q", loop.sys)
+	}
+	if strings.Contains(loop.agentFirstSys, "统一使用 create_schedule 创建") ||
+		strings.Contains(loop.agentFirstSys, "create_schedule 必须带完整 intent") ||
+		!strings.Contains(loop.agentFirstSys, "创建、立即运行和批量删除任务统一使用 manage_tasks") {
+		t.Fatalf("Agent-first prompt split is not clean: %q", loop.agentFirstSys)
 	}
 }
 
