@@ -152,6 +152,20 @@ func TestResearchV3ShadowRequiresCompleteRuntime(t *testing.T) {
 	}
 }
 
+func TestResearchV3PersistentRuntimeRequiresCompleteRuntimeWithoutCanary(t *testing.T) {
+	cfg := readyResearchV3ShadowConfig()
+	cfg.Pipeline.ResearchV3ShadowCanaryScheduleID = ""
+	cfg.Pipeline.ResearchV3RuntimeEnabled = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("complete persistent runtime rejected: %v", err)
+	}
+
+	cfg.DB.ResearchControlURL = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("persistent runtime accepted missing control Store")
+	}
+}
+
 func TestAgentFirstOwnerCanaryRequiresCompleteResearchV3Runtime(t *testing.T) {
 	ready := readyResearchV3ShadowConfig()
 	ready.Pipeline.ResearchV3ShadowCanaryScheduleID = ""
@@ -203,6 +217,29 @@ func TestEnvOnlyResearchV3ShadowCanary(t *testing.T) {
 		t.Fatalf("env-only Research V3 shadow/authority=%q/%q",
 			cfg.Pipeline.ResearchV3ShadowCanaryScheduleID,
 			cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID)
+	}
+}
+
+func TestEnvOnlyResearchV3PersistentRuntime(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://owner")
+	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://runtime")
+	t.Setenv("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL", "postgres://edit-recovery")
+	t.Setenv("VANE_DB_RESEARCH_CONTROL_URL", "postgres://control")
+	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "active-v3")
+	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
+	t.Setenv("VANE_FETCH_EXA_API_KEY", "exa-test")
+	t.Setenv("VANE_PIPELINE_RESEARCH_V3_RUNTIME_ENABLED", "true")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Pipeline.ResearchV3RuntimeEnabled ||
+		cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+		t.Fatalf("env-only persistent runtime did not stay independent: %+v", cfg.Pipeline)
 	}
 }
 

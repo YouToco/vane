@@ -28,10 +28,13 @@ type ResearchRuntimePolicyBuilderV3 func(
 ) (runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
 	runtimepolicy.ResearchModelPolicyV3, error)
 
-// ResearchRuntimeAuthorizerV3 is the hard pre-effect cutover boundary. It must
-// be backed by an exact task allow-set; a broad "all tasks" authorizer is not
-// part of this coordinator's API.
-type ResearchRuntimeAuthorizerV3 func(types.RunIdentity) bool
+// ResearchRuntimeAuthorizerV3 is the hard pre-effect admission boundary. The
+// formal path verifies the Action's tenant/user/task-bound authority token;
+// the shadow path remains an exact-task deployment canary. It runs before
+// policy construction or any mutable Store/provider effect.
+type ResearchRuntimeAuthorizerV3 func(
+	context.Context, types.RunIdentity, string,
+) (bool, error)
 
 type researchRuntimeStoreV3 interface {
 	CreateOrGetResearchRunSnapshotWithAuthorityV3(context.Context, types.RunIdentity,
@@ -126,7 +129,11 @@ func (r *ProductionResearchRuntimeV3) Prepare(
 		return types.ResearchRunSnapshotRefV3{}, false, false,
 			researchCoordinatorValidationV3("research V3 preparation is invalid")
 	}
-	if !r.authorize(identity) {
+	authorized, err := r.authorize(ctx, identity, authorityToken)
+	if err != nil {
+		return types.ResearchRunSnapshotRefV3{}, false, false, err
+	}
+	if !authorized {
 		return types.ResearchRunSnapshotRefV3{}, false, false, nil
 	}
 	policy, tools, model, err := r.policyBuilder(ctx, identity)

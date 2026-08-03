@@ -345,15 +345,19 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("install formal V3 Action fixture: %v", err)
 	}
+	formalBeforeV3, err := handle.Describe(ctx)
+	if err != nil {
+		t.Fatalf("describe installed formal V3 Action: %v", err)
+	}
 	v3FaultScheduler := New(
 		faultClient, taskQueue, st,
 		WithTaskScheduleNamespace(namespace),
-		WithResearchRuntimeV3AuthorityCanary(taskID),
+		WithResearchRuntimeV3AuthorityCanary("task-next-cutover"),
 	)
 	v3RecoveryScheduler := New(
 		faultClient, taskQueue, st,
 		WithTaskScheduleNamespace(namespace),
-		WithResearchRuntimeV3AuthorityCanary(taskID),
+		WithResearchRuntimeV3AuthorityCanary("task-next-cutover"),
 	)
 	faults.arm("trigger")
 	const v3RunKey = "integration-v3-trigger-response-loss"
@@ -412,9 +416,11 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 	if err != nil {
 		t.Fatalf("describe after V3 manual run: %v", err)
 	}
-	if !reflect.DeepEqual(beforeV3.Schedule.Spec, afterV3.Schedule.Spec) {
-		t.Fatalf("V3 manual run changed recurring spec: before=%+v after=%+v",
-			beforeV3.Schedule.Spec, afterV3.Schedule.Spec)
+	if !reflect.DeepEqual(beforeV3.Schedule.Spec, afterV3.Schedule.Spec) ||
+		!reflect.DeepEqual(formalBeforeV3.Schedule.State, afterV3.Schedule.State) ||
+		!reflect.DeepEqual(formalBeforeV3.Schedule.Action, afterV3.Schedule.Action) {
+		t.Fatalf("V3 manual run changed schedule: before=%+v after=%+v",
+			formalBeforeV3.Schedule, afterV3.Schedule)
 	}
 	if action, ok := afterV3.Schedule.Action.(*client.ScheduleWorkflowAction); !ok ||
 		fmt.Sprint(action.Workflow) != workflow.ResearchScheduledWorkflowV3Name {

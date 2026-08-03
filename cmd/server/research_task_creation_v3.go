@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"errors"
+
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
@@ -20,31 +23,48 @@ func nativeResearchV3CreationPolicy() task.CreationV3ServerPolicy {
 }
 
 func shouldInitializeResearchV3Runtime(cfg *config.Config) bool {
-	return cfg != nil && (cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
+	return cfg != nil && (cfg.Pipeline.ResearchV3RuntimeEnabled ||
+		cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
 		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" ||
 		cfg.Agent.AgentFirstOwnerCanary)
 }
 
 func shouldEnableResearchV3Delivery(cfg *config.Config) bool {
-	return cfg != nil && (cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" ||
+	return cfg != nil && (cfg.Pipeline.ResearchV3RuntimeEnabled ||
+		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" ||
 		cfg.Agent.AgentFirstOwnerCanary)
 }
 
-// researchV3RuntimeAdmissionAllowed preserves both existing exact-task
-// canaries and admits only tasks owned by the exact Agent-first canary user.
-// Identity is the Store-sealed run identity; model arguments cannot select it.
-func researchV3RuntimeAdmissionAllowed(
+type researchV3ActionAuthorityVerifier interface {
+	VerifyEnabledResearchV3ActionAuthorization(
+		context.Context, int64, int64, string, string,
+	) error
+}
+
+// authorizeResearchV3Runtime preserves the exact-task, tokenless shadow lane.
+// Every formal Action is admitted only by its own enabled database authority;
+// a process-wide runtime flag or the currently selected cutover task is never
+// task authority.
+func authorizeResearchV3Runtime(
+	ctx context.Context,
 	cfg *config.Config,
+	verifier researchV3ActionAuthorityVerifier,
 	identity types.RunIdentity,
-) bool {
+	authorityToken string,
+) (bool, error) {
 	if cfg == nil || identity.TaskID == "" {
-		return false
+		return false, nil
 	}
-	if identity.TaskID == cfg.Pipeline.ResearchV3ShadowCanaryScheduleID ||
-		identity.TaskID == cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID {
-		return true
+	if authorityToken == "" {
+		return identity.TaskID == cfg.Pipeline.ResearchV3ShadowCanaryScheduleID, nil
 	}
-	return cfg.Agent.AgentFirstOwnerCanary &&
-		cfg.Agent.AgentFirstCanaryUserID > 0 &&
-		identity.UserID == cfg.Agent.AgentFirstCanaryUserID
+	if verifier == nil {
+		return false, errors.New("research V3 authority verifier is unavailable")
+	}
+	if err := verifier.VerifyEnabledResearchV3ActionAuthorization(
+		ctx, identity.TenantID, identity.UserID, identity.TaskID, authorityToken,
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }

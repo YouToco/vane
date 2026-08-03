@@ -503,10 +503,10 @@ func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (up
 		return false, err
 	}
 	if isFormalV3 {
-		if s.researchV3.authorityID != sc.ID || formalV3.TenantID != sc.TenantID ||
+		if formalV3.TenantID != sc.TenantID ||
 			formalV3.UserID != sc.UserID || formalV3.TaskID != sc.ID {
 			return false, types.NewAppError(types.CodeConflict,
-				"research V3 Schedule Action is outside the exact authority scope", types.ErrConflict)
+				"research V3 Schedule Action identity does not match the task scope", types.ErrConflict)
 		}
 		verifier, ok := s.st.(researchV3ActionAuthorityStore)
 		if !ok {
@@ -1270,7 +1270,7 @@ func (s *Scheduler) applyScheduleCommandRemote(
 			if err != nil {
 				return err
 			}
-			if !found || s.researchV3.authorityID != command.TaskID ||
+			if !found ||
 				input.TenantID != command.TenantID ||
 				input.UserID != command.UserID || input.TaskID != command.TaskID ||
 				validateResearchScheduledInputV3(input) != nil ||
@@ -1607,11 +1607,10 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 					return nil, decodeV3Err
 				}
 				if isFormalV3 {
-					if s.researchV3.authorityID != schedID ||
-						formalV3.TenantID != sc.TenantID || formalV3.UserID != userID ||
+					if formalV3.TenantID != sc.TenantID || formalV3.UserID != userID ||
 						formalV3.TaskID != schedID {
 						return nil, types.NewAppError(types.CodeConflict,
-							"research V3 Schedule Action is outside the exact authority scope", types.ErrConflict)
+							"research V3 Schedule Action identity does not match the task scope", types.ErrConflict)
 					}
 					return nil, types.NewAppError(types.CodeConflict,
 						"research V3 task name must be changed through the V3 definition editor", types.ErrConflict)

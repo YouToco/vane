@@ -135,14 +135,15 @@ ss -ltnp | grep ':8080'
 - 091–098 是 forward-only 安全迁移。已出现 reservation、attempt、receipt 或 quota-floor
   记录后，Down 会 fail-closed；运维不得删除证据或手工恢复旧 ACL 来强行降级。
 - 第一个 V3 Boss Gate 前，新 binary、migration、socket 和 gateway 只以 hard-dark 方式部署
-  并完成探针，不改任何 Temporal schedule。当前 checkpoint 尚未注入 V3 coordinator，因此
-  没有可误开的 V3 开关；现有 `TOOL_RUNTIME_CANARY` 属于旧 compiled runtime，不能拿来切 V3。
+  并完成探针，不改任何 Temporal schedule。`VANE_PIPELINE_RESEARCH_V3_RUNTIME_ENABLED` 此时保持
+  `false`；现有 `TOOL_RUNTIME_CANARY` 属于旧 compiled runtime，不能拿来切 V3。
 - 新服务启动失败时，保留数据库版本和全部不可变记录，停止切流并修复后向前发布。只有在
   预先保存的上一版 binary/unit 仍在运行且尚未产生任何 V3 effect 时，才可恢复上一制品；
   不运行 migration Down。旧版若要求 owner 常驻，视为短时事故模式，必须立即回到本边界。
-- 后续 coordinator PR 必须新增独立的 V3 exact-task canary 守卫后才可进入老板 Gate；回滚只清空
-  该独立守卫并重启主服务。网关和 retained route generation 继续保留以完成在途结算。
-  禁止暂停/改写周一 9:00 正式 schedule 作为回滚手段。
+- Shadow、cutover 与 rollback 始终使用 exact-task canary；正式 V3 运行只认 Action 身份及数据库
+  enabled authority token。首个切流时开启持久 runtime；只要仍有 enabled V3 task 就不得关闭。
+  回滚不删除网关和 retained route generation，保留它们完成在途结算。禁止暂停/改写周一 9:00
+  正式 schedule 作为配置回滚手段。
 - endpoint/key 轮换只追加 route generation 和对应 systemd credential。旧 generation 在
   Temporal retention、run capability TTL 和所有在途 run 全部结束前不得移除。
 

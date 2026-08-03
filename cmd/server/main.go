@@ -180,8 +180,10 @@ func run() error {
 				}
 				return current.Bundle, current.Tools, current.Model, nil
 			},
-			func(identity types.RunIdentity) bool {
-				return researchV3RuntimeAdmissionAllowed(cfg, identity)
+			func(ctx context.Context, identity types.RunIdentity, authorityToken string) (bool, error) {
+				return authorizeResearchV3Runtime(
+					ctx, cfg, researchControlStore, identity, authorityToken,
+				)
 			},
 		)
 		if runtimeErr != nil {
