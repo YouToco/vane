@@ -990,17 +990,6 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 		ctx, p, types.TaskDefinitionEditProtocolLegacyV1V2)
 }
 
-// AcquireResearchTaskDefinitionEditOperationV3 is the native V3 lease lane.
-// It shares fencing mechanics with legacy edits but never invokes their wire
-// decoder or Compiled schedule assessment.
-func (s *Store) AcquireResearchTaskDefinitionEditOperationV3(
-	ctx context.Context,
-	p types.AcquireTaskDefinitionEditOperationParams,
-) (*types.TaskDefinitionEditOperation, error) {
-	return s.acquireTaskDefinitionEditOperationProtocol(
-		ctx, p, types.TaskDefinitionEditProtocolResearchV3)
-}
-
 func (s *Store) acquireTaskDefinitionEditOperationProtocol(
 	ctx context.Context,
 	p types.AcquireTaskDefinitionEditOperationParams,
@@ -1009,8 +998,7 @@ func (s *Store) acquireTaskDefinitionEditOperationProtocol(
 	if err := validateTaskDefinitionEditAcquire(p); err != nil {
 		return nil, err
 	}
-	if protocol != types.TaskDefinitionEditProtocolLegacyV1V2 &&
-		protocol != types.TaskDefinitionEditProtocolResearchV3 {
+	if protocol != types.TaskDefinitionEditProtocolLegacyV1V2 {
 		return nil, taskDefinitionEditIntegrity()
 	}
 	tx, err := s.beginTaskDefinitionEditTx(ctx, p.Scope.TenantID)
@@ -1039,14 +1027,8 @@ func (s *Store) acquireTaskDefinitionEditOperationProtocol(
 
 	switch op.Status {
 	case types.TaskDefinitionEditOperationStatusPending:
-		var actorErr error
-		if protocol == types.TaskDefinitionEditProtocolResearchV3 {
-			actorErr = validateResearchTaskDefinitionEditActiveOwnerV3(
-				ctx, tx, op.TenantID, op.UserID)
-		} else {
-			actorErr = validateTaskDefinitionEditActiveActor(
-				ctx, tx, op.TenantID, op.UserID)
-		}
+		actorErr := validateTaskDefinitionEditActiveActor(
+			ctx, tx, op.TenantID, op.UserID)
 		if actorErr != nil {
 			return nil, actorErr
 		}
