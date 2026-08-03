@@ -632,8 +632,7 @@ func taskDefinitionEditV3CoordinatorStoreCalls(file *ast.File) (map[token.Pos]st
 		{"BlockResearchTaskDefinitionEditOperationV3", "runRemote", 1},
 		{"BlockResearchTaskDefinitionEditOperationV3", "quarantine", 1},
 		{"LoadResearchTaskDefinitionEditOperationV3", "load", 1},
-		{"ListStaleResearchTaskDefinitionEditTenantIDsV3", "RecoverStaleOnceV3", 2},
-		{"ListStaleResearchTaskDefinitionEditOperationsV3", "RecoverStaleOnceV3", 1},
+		{"ClaimStaleResearchTaskDefinitionEditOperationV3", "RecoverStaleOnceV3", 1},
 	}
 	type key struct{ method, function string }
 	want := make(map[key]int, len(expectations))
@@ -1183,8 +1182,7 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"CommitResearchTaskDefinitionEditDefinitionV3",
 			"CompleteResearchTaskDefinitionEditOperationV3",
 			"BlockResearchTaskDefinitionEditOperationV3",
-			"ListStaleResearchTaskDefinitionEditTenantIDsV3",
-			"ListStaleResearchTaskDefinitionEditOperationsV3",
+			"ClaimStaleResearchTaskDefinitionEditOperationV3",
 		}),
 		filepath.Clean(filepath.Join(storeDir, "task_definition_edit_receipts.go")): taskDefinitionEditStoreMethodSet([]string{
 			"scanTaskDefinitionEditReceipt",
@@ -1403,8 +1401,7 @@ func taskDefinitionEditOperationStoreMethods() map[string]struct{} {
 		"CheckpointResearchTaskDefinitionEditTargetRestoredV3",
 		"CompleteResearchTaskDefinitionEditOperationV3",
 		"BlockResearchTaskDefinitionEditOperationV3",
-		"ListStaleResearchTaskDefinitionEditTenantIDsV3",
-		"ListStaleResearchTaskDefinitionEditOperationsV3",
+		"ClaimStaleResearchTaskDefinitionEditOperationV3",
 		"CreateTaskDefinitionEditOperation",
 		"LoadTaskDefinitionEditOperation",
 		"ExpireTaskDefinitionEditOperation",

@@ -30,6 +30,28 @@ CREATE POLICY legacy_definition_edit_protocol_isolation
 -- later migration can safely maintain/drop the owned functions.
 -- +goose StatementBegin
 DO $$ BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_roles
+	                WHERE rolname='vane_native_v3_edit_recovery') THEN
+	    BEGIN
+	        CREATE ROLE vane_native_v3_edit_recovery
+	            NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+	            NOREPLICATION NOBYPASSRLS;
+	    EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
+	    END;
+	END IF;
+	ALTER ROLE vane_native_v3_edit_recovery
+	    NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+	    NOREPLICATION NOBYPASSRLS;
+	IF EXISTS (
+	    SELECT 1 FROM pg_auth_members edge
+	    JOIN pg_roles granted ON granted.oid=edge.roleid
+	    JOIN pg_roles member ON member.oid=edge.member
+	    WHERE (granted.rolname='vane_native_v3_edit_recovery'
+	           AND member.rolname<>'vane_native_v3_edit_recovery_runtime')
+	       OR member.rolname='vane_native_v3_edit_recovery'
+	) THEN
+	    RAISE EXCEPTION '110: unsafe native V3 edit recovery capability membership';
+	END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles
                     WHERE rolname='vane_native_v3_edit_coordinator') THEN
         BEGIN
@@ -93,6 +115,51 @@ CREATE POLICY native_v3_edit_authority_user_isolation
            NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint)
     WITH CHECK (user_id IS NOT DISTINCT FROM
            NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint);
+
+-- Recovery is intentionally absent from vane_app. A separate non-login,
+-- least-privilege definer may bypass tenant RLS only inside one fixed global
+-- claim function. Only the separately provisioned recovery login can assume
+-- the opaque capability role; neither server nor paid research runtime can.
+-- +goose StatementBegin
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles
+                    WHERE rolname='vane_native_v3_edit_recovery_coordinator') THEN
+        BEGIN
+            CREATE ROLE vane_native_v3_edit_recovery_coordinator
+                NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+                NOREPLICATION BYPASSRLS;
+        EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
+        END;
+    END IF;
+    ALTER ROLE vane_native_v3_edit_recovery_coordinator
+        NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+        NOREPLICATION BYPASSRLS;
+    IF EXISTS (
+        SELECT 1 FROM pg_auth_members edge
+        JOIN pg_roles granted ON granted.oid=edge.roleid
+        JOIN pg_roles member ON member.oid=edge.member
+        WHERE granted.rolname='vane_native_v3_edit_recovery_coordinator'
+          AND member.rolname<>current_user
+    ) OR EXISTS (
+        SELECT 1 FROM pg_auth_members edge
+        JOIN pg_roles member ON member.oid=edge.member
+        WHERE member.rolname='vane_native_v3_edit_recovery_coordinator'
+    ) THEN
+        RAISE EXCEPTION '110: unsafe native V3 recovery role membership';
+    END IF;
+    EXECUTE format('GRANT vane_native_v3_edit_recovery_coordinator TO %I',current_user);
+END $$;
+-- +goose StatementEnd
+
+GRANT USAGE ON SCHEMA public TO vane_native_v3_edit_recovery_coordinator;
+GRANT SELECT ON task_definition_edit_operations
+    TO vane_native_v3_edit_recovery_coordinator;
+GRANT UPDATE (lease_owner,lease_until,takeover_not_before,fence,attempt,updated_at)
+    ON task_definition_edit_operations TO vane_native_v3_edit_recovery_coordinator;
+GRANT SELECT (tenant_id,user_id,id,status,definition_edit_operation_id,
+    definition_edit_fence) ON schedules TO vane_native_v3_edit_recovery_coordinator;
+GRANT UPDATE (definition_edit_fence,updated_at) ON schedules
+    TO vane_native_v3_edit_recovery_coordinator;
 
 -- +goose StatementBegin
 CREATE FUNCTION native_research_v3_edit_assert_scope_v1(
@@ -241,52 +308,85 @@ ALTER FUNCTION load_native_research_v3_edit_basis_v1(bigint,bigint,text)
 GRANT EXECUTE ON FUNCTION load_native_research_v3_edit_basis_v1(bigint,bigint,text)
     TO vane_app;
 
--- Cross-tenant recovery discovery is the one deliberate owner-definer reader.
--- It exposes only bounded tenant IDs for expired protocol-3 leases.
 -- +goose StatementBegin
-CREATE FUNCTION list_stale_native_research_v3_edit_tenants_v1(
-    requested_before TIMESTAMPTZ,requested_after_tenant_id BIGINT,requested_limit INTEGER
-) RETURNS SETOF BIGINT LANGUAGE sql SECURITY DEFINER
+CREATE FUNCTION claim_stale_native_research_v3_edit_v1(
+    requested_before TIMESTAMPTZ,requested_lease_owner TEXT,
+    requested_lease_us BIGINT
+) RETURNS TABLE(operation_id TEXT,tenant_id BIGINT,user_id BIGINT,task_id TEXT,
+                lease_owner TEXT,fence BIGINT)
+LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp AS $$
-    SELECT DISTINCT operation.tenant_id
-      FROM public.task_definition_edit_operations operation
-     WHERE operation.operation_protocol=3 AND operation.status='executing'
-       AND operation.tombstoned_at IS NULL
-       AND operation.tenant_id>requested_after_tenant_id
-       AND operation.lease_owner<>'' AND operation.fence>0 AND operation.attempt>0
-       AND operation.lease_until IS NOT NULL AND operation.takeover_not_before IS NOT NULL
-       AND operation.lease_until<=clock_timestamp()
-       AND operation.takeover_not_before<=LEAST(requested_before,clock_timestamp())
-     ORDER BY operation.tenant_id LIMIT LEAST(GREATEST(requested_limit,0),100);
+DECLARE candidate RECORD; operation public.task_definition_edit_operations%ROWTYPE;
+        now_at TIMESTAMPTZ; old_fence BIGINT;
+BEGIN
+    IF requested_before IS NULL OR requested_lease_owner IS NULL OR
+       requested_lease_owner='' OR btrim(requested_lease_owner)<>requested_lease_owner OR
+       requested_lease_us NOT BETWEEN 1 AND 86400000000 THEN
+        RAISE EXCEPTION '110: native V3 recovery claim is invalid' USING ERRCODE='23514';
+    END IF;
+    now_at:=clock_timestamp();
+    SELECT candidate_operation.id,candidate_operation.tenant_id,
+           candidate_operation.user_id,candidate_operation.task_id
+      INTO candidate
+      FROM public.task_definition_edit_operations candidate_operation
+     WHERE candidate_operation.operation_protocol=3
+       AND candidate_operation.status='executing'
+       AND candidate_operation.tombstoned_at IS NULL
+       AND candidate_operation.lease_owner<>''
+       AND candidate_operation.fence>0 AND candidate_operation.attempt>0
+       AND candidate_operation.lease_until IS NOT NULL
+       AND candidate_operation.takeover_not_before IS NOT NULL
+       AND candidate_operation.lease_until<=now_at
+       AND candidate_operation.takeover_not_before<=LEAST(requested_before,now_at)
+     ORDER BY candidate_operation.takeover_not_before,candidate_operation.id
+     LIMIT 1 FOR UPDATE OF candidate_operation SKIP LOCKED;
+    IF NOT FOUND THEN RETURN; END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        candidate.tenant_id::text||'/'||candidate.user_id::text||'/'||candidate.task_id,101));
+    SELECT * INTO operation
+      FROM public.task_definition_edit_operations claimed
+     WHERE claimed.id=candidate.id AND claimed.operation_protocol=3
+       AND claimed.tenant_id=candidate.tenant_id AND claimed.user_id=candidate.user_id
+       AND claimed.task_id=candidate.task_id AND claimed.status='executing'
+       AND claimed.tombstoned_at IS NULL AND claimed.lease_until<=clock_timestamp()
+       AND claimed.takeover_not_before<=LEAST(requested_before,clock_timestamp())
+     FOR UPDATE;
+    IF NOT FOUND THEN RETURN; END IF;
+    old_fence:=operation.fence;
+    UPDATE public.task_definition_edit_operations target SET
+        lease_owner=requested_lease_owner,
+        lease_until=clock_timestamp()+(requested_lease_us*interval '1 microsecond'),
+        takeover_not_before=clock_timestamp()+((requested_lease_us+30000000)*interval '1 microsecond'),
+        fence=target.fence+1,attempt=target.attempt+1,updated_at=clock_timestamp()
+     WHERE target.id=operation.id AND target.operation_protocol=3
+       AND target.status='executing' AND target.tombstoned_at IS NULL
+       AND target.fence=old_fence AND target.takeover_not_before<=clock_timestamp()
+     RETURNING target.* INTO operation;
+    IF NOT FOUND THEN RETURN; END IF;
+    IF operation.phase<>'proposal_sealed' THEN
+        UPDATE public.schedules target SET definition_edit_fence=operation.fence,
+            updated_at=clock_timestamp()
+         WHERE target.tenant_id=operation.tenant_id
+           AND target.user_id=operation.user_id AND target.id=operation.task_id
+           AND target.status='paused'
+           AND target.definition_edit_operation_id=operation.id
+           AND target.definition_edit_fence=old_fence;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION '110: native V3 recovery marker differs' USING ERRCODE='40001';
+        END IF;
+    END IF;
+    RETURN QUERY SELECT operation.id,operation.tenant_id,operation.user_id,
+        operation.task_id,operation.lease_owner,operation.fence;
+END
 $$;
 -- +goose StatementEnd
-REVOKE ALL ON FUNCTION list_stale_native_research_v3_edit_tenants_v1(timestamptz,bigint,integer)
+REVOKE ALL ON FUNCTION claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)
     FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION list_stale_native_research_v3_edit_tenants_v1(timestamptz,bigint,integer)
-    TO vane_app;
-
--- +goose StatementBegin
-CREATE FUNCTION list_stale_native_research_v3_edit_operations_v1(
-    requested_tenant_id BIGINT,requested_before TIMESTAMPTZ,requested_limit INTEGER
-) RETURNS SETOF task_definition_edit_operations
-LANGUAGE sql SECURITY DEFINER
-SET search_path=pg_catalog,public,pg_temp AS $$
-    SELECT operation.* FROM public.task_definition_edit_operations operation
-     WHERE operation.operation_protocol=3
-       AND operation.tenant_id=requested_tenant_id
-       AND operation.status='executing' AND operation.tombstoned_at IS NULL
-       AND operation.lease_owner<>'' AND operation.fence>0 AND operation.attempt>0
-       AND operation.lease_until IS NOT NULL AND operation.takeover_not_before IS NOT NULL
-       AND operation.lease_until<=clock_timestamp()
-       AND operation.takeover_not_before<=LEAST(requested_before,clock_timestamp())
-     ORDER BY operation.takeover_not_before,operation.id
-     LIMIT LEAST(GREATEST(requested_limit,0),4);
-$$;
--- +goose StatementEnd
-REVOKE ALL ON FUNCTION list_stale_native_research_v3_edit_operations_v1(bigint,timestamptz,integer)
-    FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION list_stale_native_research_v3_edit_operations_v1(bigint,timestamptz,integer)
-    TO vane_app;
+ALTER FUNCTION claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)
+    OWNER TO vane_native_v3_edit_recovery_coordinator;
+GRANT EXECUTE ON FUNCTION claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)
+    TO vane_native_v3_edit_recovery;
+GRANT USAGE ON SCHEMA public TO vane_native_v3_edit_recovery;
 
 -- +goose StatementBegin
 CREATE FUNCTION seal_native_research_v3_edit_v1(
@@ -1043,8 +1143,9 @@ DO $$ BEGIN
 END $$;
 -- +goose StatementEnd
 
-DROP FUNCTION list_stale_native_research_v3_edit_tenants_v1(timestamptz,bigint,integer);
-DROP FUNCTION list_stale_native_research_v3_edit_operations_v1(bigint,timestamptz,integer);
+SET LOCAL ROLE vane_native_v3_edit_recovery_coordinator;
+DROP FUNCTION claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint);
+RESET ROLE;
 
 SET LOCAL ROLE vane_native_v3_edit_coordinator;
 DROP FUNCTION finish_native_research_v3_edit_v1(text,text,bigint,bigint,text,text,bigint,text,text,jsonb,text,text);
@@ -1081,6 +1182,12 @@ REVOKE SELECT ON agent_sessions FROM vane_native_v3_edit_coordinator;
 REVOKE SELECT ON memberships FROM vane_native_v3_edit_coordinator;
 REVOKE SELECT ON tenants FROM vane_native_v3_edit_coordinator;
 REVOKE USAGE ON SCHEMA public FROM vane_native_v3_edit_coordinator;
+
+REVOKE ALL ON schedules FROM vane_native_v3_edit_recovery_coordinator;
+REVOKE ALL ON task_definition_edit_operations
+    FROM vane_native_v3_edit_recovery_coordinator;
+REVOKE USAGE ON SCHEMA public FROM vane_native_v3_edit_recovery_coordinator;
+REVOKE USAGE ON SCHEMA public FROM vane_native_v3_edit_recovery;
 
 DROP INDEX idx_task_definition_edit_operations_protocol_recovery;
 ALTER TABLE task_definition_edit_operations

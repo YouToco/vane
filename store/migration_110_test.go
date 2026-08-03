@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
 
 	"github.com/YouToco/vane/taskstate"
@@ -97,6 +99,59 @@ func TestMigration110ProtocolIsolationAndACLPostgres(t *testing.T) {
 		t.Fatalf("unsafe native role login=%v inherit=%v bypass=%v runtime_member=%v app_exec=%v",
 			canLogin, inherits, bypasses, runtimeMember, appExec)
 	}
+	var recoveryLogin, recoveryInherits, recoveryBypasses, serverMember,
+		appClaim, researchClaim, capabilityClaim, researchDirectRead, retiredDiscovery bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT role.rolcanlogin,role.rolinherit,role.rolbypassrls,
+		       EXISTS (SELECT 1 FROM pg_auth_members edge
+		         JOIN pg_roles granted ON granted.oid=edge.roleid
+		         JOIN pg_roles member ON member.oid=edge.member
+		        WHERE granted.rolname='vane_native_v3_edit_recovery_coordinator'
+		          AND member.rolname='vane_server_runtime'),
+		       has_function_privilege('vane_app',
+		         'claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)','EXECUTE'),
+		       has_function_privilege('vane_research_runtime',
+		         'claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)','EXECUTE'),
+		       has_function_privilege('vane_native_v3_edit_recovery',
+		         'claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)','EXECUTE'),
+		       has_table_privilege('vane_research_runtime',
+		         'task_definition_edit_operations','SELECT'),
+		       to_regprocedure('list_stale_native_research_v3_edit_operations_v1(bigint,timestamptz,integer)') IS NOT NULL
+		  FROM pg_roles role
+		 WHERE role.rolname='vane_native_v3_edit_recovery_coordinator'`).Scan(
+		&recoveryLogin, &recoveryInherits, &recoveryBypasses, &serverMember,
+		&appClaim, &researchClaim, &capabilityClaim, &researchDirectRead,
+		&retiredDiscovery); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryLogin || recoveryInherits || !recoveryBypasses || serverMember ||
+		appClaim || researchClaim || !capabilityClaim || researchDirectRead || retiredDiscovery {
+		t.Fatalf("unsafe recovery role login=%v inherit=%v bypass=%v server_member=%v app_claim=%v research_claim=%v capability_claim=%v research_read=%v retired=%v",
+			recoveryLogin, recoveryInherits, recoveryBypasses, serverMember,
+			appClaim, researchClaim, capabilityClaim, researchDirectRead, retiredDiscovery)
+	}
+	var capabilityLogin, capabilityInherits, capabilityBypasses bool
+	if err := db.QueryRowContext(t.Context(), `SELECT rolcanlogin,rolinherit,rolbypassrls
+		FROM pg_roles WHERE rolname='vane_native_v3_edit_recovery'`).Scan(
+		&capabilityLogin, &capabilityInherits, &capabilityBypasses); err != nil {
+		t.Fatal(err)
+	}
+	if capabilityLogin || capabilityInherits || capabilityBypasses {
+		t.Fatalf("unsafe recovery capability login=%v inherit=%v bypass=%v",
+			capabilityLogin, capabilityInherits, capabilityBypasses)
+	}
+	var claimOwner string
+	var claimDefiner bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT pg_get_userbyid(proc.proowner),proc.prosecdef
+		  FROM pg_proc proc
+		 WHERE proc.oid='claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)'::regprocedure`).Scan(
+		&claimOwner, &claimDefiner); err != nil {
+		t.Fatal(err)
+	}
+	if claimOwner != "vane_native_v3_edit_recovery_coordinator" || !claimDefiner {
+		t.Fatalf("unsafe claim owner=%q security_definer=%v", claimOwner, claimDefiner)
+	}
 	if _, err := provider.DownTo(t.Context(), 109); err != nil {
 		t.Fatal(err)
 	}
@@ -119,10 +174,21 @@ func TestMigration110ContainsNoRetiredExecutionState(t *testing.T) {
 		t.Fatal(err)
 	}
 	sqlText := strings.ToLower(string(raw))
+	for _, forbidden := range []string{
+		"list_stale_native_research_v3_edit_tenants_v1",
+		"list_stale_native_research_v3_edit_operations_v1",
+		"create role vane_native_v3_edit_recovery_runtime",
+		"grant execute on function claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)\n    to vane_app",
+	} {
+		if strings.Contains(sqlText, forbidden) {
+			t.Fatalf("migration 110 exposes retired recovery surface %q", forbidden)
+		}
+	}
 	for _, required := range []string{
 		"operation_protocol", "check (operation_protocol in (1,3))",
 		"refusing downgrade while native v3 edits exist",
 		"key in ('tool_calls','sources','fetch_targets','source_catalog')",
+		"claim_stale_native_research_v3_edit_v1",
 	} {
 		if !strings.Contains(sqlText, required) {
 			t.Fatalf("migration 110 is missing %q", required)
@@ -264,6 +330,100 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(runtime.Close)
+	if _, err := runtime.ClaimStaleResearchTaskDefinitionEditOperationV3(
+		t.Context(), time.Now(), "missing-recovery-credential", time.Minute); !errors.Is(
+		err, errNativeV3EditRecoveryRuntimeUnavailable) {
+		t.Fatalf("missing recovery credential err=%v", err)
+	}
+	if err := ProvisionNativeV3EditRecoveryRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := DeprovisionNativeV3EditRecoveryRuntime(ctx, scratchURL); err != nil {
+			t.Errorf("deprovision native V3 edit recovery runtime: %v", err)
+		}
+	})
+	const recoveryPassword = "native-v3-edit-recovery-password"
+	if _, err := owner.pool.Exec(t.Context(),
+		`ALTER ROLE vane_native_v3_edit_recovery_runtime LOGIN PASSWORD '`+recoveryPassword+`'`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = owner.pool.Exec(context.Background(),
+			`ALTER ROLE vane_native_v3_edit_recovery_runtime NOLOGIN PASSWORD NULL`)
+	})
+	recoveryPool, err := newStorePool(t.Context(),
+		roleTestURL(t, scratchURL, nativeV3EditRecoveryRuntimeLoginRole, recoveryPassword),
+		initializeNativeV3EditRecoveryRuntimeConnection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(recoveryPool.Close)
+	runtime.editRecoveryPool = recoveryPool
+	runtime.beginEditRecoveryTx = recoveryPool.BeginTx
+	if _, err := owner.pool.Exec(t.Context(),
+		`GRANT SELECT ON tenants TO vane_native_v3_edit_recovery_runtime`); err != nil {
+		t.Fatal(err)
+	}
+	if driftPool, err := newStorePool(t.Context(),
+		roleTestURL(t, scratchURL, nativeV3EditRecoveryRuntimeLoginRole, recoveryPassword),
+		initializeNativeV3EditRecoveryRuntimeConnection); err == nil {
+		driftPool.Close()
+		t.Fatal("recovery runtime accepted a direct table grant")
+	}
+	if _, err := owner.pool.Exec(t.Context(),
+		`REVOKE SELECT ON tenants FROM vane_native_v3_edit_recovery_runtime`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.pool.Exec(t.Context(),
+		`GRANT SELECT ON tenants TO vane_native_v3_edit_recovery`); err != nil {
+		t.Fatal(err)
+	}
+	if driftPool, err := newStorePool(t.Context(),
+		roleTestURL(t, scratchURL, nativeV3EditRecoveryRuntimeLoginRole, recoveryPassword),
+		initializeNativeV3EditRecoveryRuntimeConnection); err == nil {
+		driftPool.Close()
+		t.Fatal("recovery capability accepted an extra table grant")
+	}
+	if _, err := owner.pool.Exec(t.Context(),
+		`REVOKE SELECT ON tenants FROM vane_native_v3_edit_recovery`); err != nil {
+		t.Fatal(err)
+	}
+	const researchAttackPassword = "native-v3-edit-research-attacker"
+	if _, err := owner.pool.Exec(t.Context(),
+		`ALTER ROLE vane_research_runtime LOGIN PASSWORD '`+researchAttackPassword+`'`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = owner.pool.Exec(context.Background(),
+			`ALTER ROLE vane_research_runtime NOLOGIN PASSWORD NULL`)
+	})
+	researchAttacker, err := pgx.Connect(t.Context(),
+		roleTestURL(t, scratchURL, researchRuntimeLoginRole, researchAttackPassword))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := researchAttacker.Exec(t.Context(),
+		`SET ROLE vane_native_v3_edit_recovery`); err == nil {
+		t.Fatal("paid research runtime entered edit recovery capability")
+	}
+	if _, err := researchAttacker.Exec(t.Context(),
+		`SET ROLE vane_research_v3_executor`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := researchAttacker.Exec(t.Context(), `SELECT * FROM
+		claim_stale_native_research_v3_edit_v1(clock_timestamp(),'research-forged',60000000)`); err == nil {
+		t.Fatal("paid research runtime executed the global edit recovery claim")
+	}
+	if err := researchAttacker.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.pool.Exec(t.Context(),
+		`ALTER ROLE vane_research_runtime NOLOGIN PASSWORD NULL`); err != nil {
+		t.Fatal(err)
+	}
 
 	editID := "v3-edit-" + uuid.NewString()
 	prepared := preparedResearchTaskEditV3StoreView{WireVersion: preparedResearchTaskEditV3StoreWire,
@@ -300,47 +460,118 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaseOwner := "runtime-lifecycle"
+	leaseOwner := "runtime-lifecycle-lost-response"
 	op, err = runtime.AcquireResearchTaskDefinitionEditOperationV3(t.Context(),
 		types.AcquireTaskDefinitionEditOperationParams{Scope: op.Scope(), LeaseOwner: leaseOwner,
 			LeaseDuration: time.Hour, ReceiptProvider: "feishu", ReceiptTarget: "chat-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease := op.Lease()
+	if _, err := owner.pool.Exec(t.Context(), `UPDATE task_definition_edit_operations
+		SET lease_until=clock_timestamp()-interval '2 minutes',
+		    takeover_not_before=clock_timestamp()-interval '1 minute'
+		WHERE id=$1 AND operation_protocol=3 AND status='executing'`, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := runtime.ClaimStaleResearchTaskDefinitionEditOperationV3(
+		t.Context(), time.Now(), "runtime-recovery-after-restart", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.ID != op.ID || claimed.Fence != op.Fence+1 ||
+		claimed.Attempt != op.Attempt+1 || claimed.LeaseOwner != "runtime-recovery-after-restart" {
+		t.Fatalf("claimed=%+v original=%+v", claimed, op)
+	}
+	lease := claimed.Lease()
+	forceRecoveryRestart := func(current types.TaskDefinitionEditLease, label string) types.TaskDefinitionEditLease {
+		t.Helper()
+		if _, err := owner.pool.Exec(t.Context(), `UPDATE task_definition_edit_operations
+			SET lease_until=clock_timestamp()-interval '2 minutes',
+			    takeover_not_before=clock_timestamp()-interval '1 minute'
+			WHERE id=$1 AND operation_protocol=3 AND status='executing' AND fence=$2`,
+			current.ID, current.Fence); err != nil {
+			t.Fatal(err)
+		}
+		next, err := runtime.ClaimStaleResearchTaskDefinitionEditOperationV3(
+			t.Context(), time.Now(), "runtime-recovery-"+label, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next == nil || next.ID != current.ID || next.Fence != current.Fence+1 ||
+			next.LeaseOwner != "runtime-recovery-"+label {
+			t.Fatalf("%s claim=%+v current=%+v", label, next, current)
+		}
+		return next.Lease()
+	}
 	if err := runtime.QuiesceResearchTaskDefinitionEditV3(t.Context(), lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.QuiesceResearchTaskDefinitionEditV3(t.Context(), lease); err != nil {
+		t.Fatalf("quiesce response-loss replay: %v", err)
+	}
+	lease = forceRecoveryRestart(lease, "db-quiesced")
+	if _, err := runtime.AuthorizeResearchTaskDefinitionEditRemotePhaseV3(t.Context(), lease,
+		types.TaskDefinitionEditPhaseDBQuiesced); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.AuthorizeResearchTaskDefinitionEditRemotePhaseV3(t.Context(), lease,
 		types.TaskDefinitionEditPhaseDBQuiesced); err != nil {
-		t.Fatal(err)
+		t.Fatalf("pause authorization response-loss replay: %v", err)
 	}
 	basePaused := nativeV3Snapshot110(t, "base_paused", taskID, baseDigest, true)
 	if err := runtime.CheckpointResearchTaskDefinitionEditBasePausedV3(t.Context(), lease, basePaused); err != nil {
 		t.Fatal(err)
 	}
+	if err := runtime.CheckpointResearchTaskDefinitionEditBasePausedV3(t.Context(), lease, basePaused); err != nil {
+		t.Fatalf("base checkpoint response-loss replay: %v", err)
+	}
+	lease = forceRecoveryRestart(lease, "base-paused")
 	if err := runtime.CommitResearchTaskDefinitionEditDefinitionV3(t.Context(), lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.CommitResearchTaskDefinitionEditDefinitionV3(t.Context(), lease); err != nil {
+		t.Fatalf("definition commit response-loss replay: %v", err)
+	}
+	lease = forceRecoveryRestart(lease, "definition-committed")
+	if _, err := runtime.AuthorizeResearchTaskDefinitionEditRemotePhaseV3(t.Context(), lease,
+		types.TaskDefinitionEditPhaseDefinitionCommitted); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.AuthorizeResearchTaskDefinitionEditRemotePhaseV3(t.Context(), lease,
 		types.TaskDefinitionEditPhaseDefinitionCommitted); err != nil {
-		t.Fatal(err)
+		t.Fatalf("apply authorization response-loss replay: %v", err)
 	}
 	targetPaused := nativeV3Snapshot110(t, "target_paused", taskID, targetDigest, true)
 	if err := runtime.CheckpointResearchTaskDefinitionEditTargetAppliedV3(t.Context(), lease, targetPaused); err != nil {
 		t.Fatal(err)
 	}
+	if err := runtime.CheckpointResearchTaskDefinitionEditTargetAppliedV3(t.Context(), lease, targetPaused); err != nil {
+		t.Fatalf("apply checkpoint response-loss replay: %v", err)
+	}
+	lease = forceRecoveryRestart(lease, "target-applied")
 	if _, err := runtime.AuthorizeResearchTaskDefinitionEditRemotePhaseV3(t.Context(), lease,
 		types.TaskDefinitionEditPhaseTemporalTargetApplied); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := runtime.AuthorizeResearchTaskDefinitionEditRemotePhaseV3(t.Context(), lease,
+		types.TaskDefinitionEditPhaseTemporalTargetApplied); err != nil {
+		t.Fatalf("restore authorization response-loss replay: %v", err)
 	}
 	targetFinal := nativeV3Snapshot110(t, "target_final", taskID, targetDigest, false)
 	if err := runtime.CheckpointResearchTaskDefinitionEditTargetRestoredV3(t.Context(), lease, targetFinal); err != nil {
 		t.Fatal(err)
 	}
+	if err := runtime.CheckpointResearchTaskDefinitionEditTargetRestoredV3(t.Context(), lease, targetFinal); err != nil {
+		t.Fatalf("restore checkpoint response-loss replay: %v", err)
+	}
+	lease = forceRecoveryRestart(lease, "target-restored")
 	if err := runtime.CompleteResearchTaskDefinitionEditOperationV3(t.Context(), lease,
 		json.RawMessage(`{"ok":true}`)); err != nil {
 		t.Fatal(err)
+	}
+	if err := runtime.CompleteResearchTaskDefinitionEditOperationV3(t.Context(), lease,
+		json.RawMessage(`{"ok":true}`)); err != nil {
+		t.Fatalf("completion response-loss replay: %v", err)
 	}
 	completed, err := runtime.LoadResearchTaskDefinitionEditOperationV3(t.Context(), op.Scope())
 	if err != nil || completed.Status != types.TaskDefinitionEditOperationStatusCompleted {
@@ -354,6 +585,13 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 	defer conn.Release()
 	if _, err := conn.Exec(t.Context(), `RESET ROLE; SET ROLE vane_native_v3_edit_coordinator`); err == nil {
 		t.Fatal("server runtime entered native V3 coordinator role")
+	}
+	if _, err := conn.Exec(t.Context(), `RESET ROLE; SET ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(t.Context(), `SELECT * FROM claim_stale_native_research_v3_edit_v1(
+		clock_timestamp(),'forged-recovery',60000000)`); err == nil {
+		t.Fatal("vane_app executed the cross-tenant recovery claim")
 	}
 	if _, err := conn.Exec(t.Context(), `RESET ROLE; SET ROLE vane_edit_coordinator`); err != nil {
 		t.Fatal(err)

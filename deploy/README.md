@@ -73,23 +73,29 @@ cp /opt/vane/vane-migrate.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl start vane-migrate
 
-# 3b. 为三个长期非 owner 登录设置互不相同的密码。
+# 3b. 为四个长期非 owner 登录设置互不相同的密码。
 read -rsp 'V3 research DB password: ' VANE_RESEARCH_DB_PASSWORD; echo
+read -rsp 'V3 edit recovery DB password: ' VANE_EDIT_RECOVERY_DB_PASSWORD; echo
 read -rsp 'V3 LLM gateway DB password: ' VANE_GATEWAY_DB_PASSWORD; echo
 read -rsp 'Vane server DB password: ' VANE_SERVER_DB_PASSWORD; echo
 docker compose exec -T postgres psql -U vane -d vane \
   -v runtime_password="$VANE_RESEARCH_DB_PASSWORD" \
+  -v edit_recovery_password="$VANE_EDIT_RECOVERY_DB_PASSWORD" \
   -v gateway_password="$VANE_GATEWAY_DB_PASSWORD" \
   -v server_password="$VANE_SERVER_DB_PASSWORD" <<'SQL'
 ALTER ROLE vane_research_runtime LOGIN PASSWORD :'runtime_password';
+ALTER ROLE vane_native_v3_edit_recovery_runtime LOGIN PASSWORD :'edit_recovery_password';
 ALTER ROLE vane_research_llm_gateway_runtime LOGIN PASSWORD :'gateway_password';
 ALTER ROLE vane_server_runtime LOGIN PASSWORD :'server_password';
 SQL
-unset VANE_RESEARCH_DB_PASSWORD VANE_GATEWAY_DB_PASSWORD VANE_SERVER_DB_PASSWORD
+unset VANE_RESEARCH_DB_PASSWORD VANE_EDIT_RECOVERY_DB_PASSWORD VANE_GATEWAY_DB_PASSWORD VANE_SERVER_DB_PASSWORD
 # 将 server/runtime URL 写入 /opt/vane/env/server.env：
 # VANE_DB_URL=postgres://vane_server_runtime:<server-password>@127.0.0.1:5432/vane?sslmode=disable
 # VANE_DB_RESEARCH_CONTROL_URL=postgres://vane_server_runtime:<server-password>@127.0.0.1:5432/vane?sslmode=disable
 # VANE_DB_RESEARCH_RUNTIME_URL=postgres://vane_research_runtime:<url-encoded-password>@127.0.0.1:5432/vane?sslmode=disable
+# 将 recovery URL 写入以下 0400 credential，禁止放入 server.env：
+install -o vane -g vane -m 0400 /dev/null /etc/vane/credentials/native_v3_edit_recovery_db_url
+# 文件内容使用 vane_native_v3_edit_recovery_runtime，绝不能使用 server、research 或 owner 登录。
 # 将 gateway URL 与 Provider key 分别写入以下 0400 credential 文件：
 install -o vane-research-gateway -g vane-research-gateway -m 0400 /dev/null /etc/vane/credentials/gateway_db_url
 install -o vane-research-gateway -g vane-research-gateway -m 0400 /dev/null /etc/vane/credentials/research_llm_api_key_gen1
