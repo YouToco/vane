@@ -778,7 +778,6 @@ func run() error {
 			agent.NewAuthorizedUpdateProfileTool(st, authorizer),
 			agent.NewManageTasksTool(agent.ManageTasksDeps{
 				Queries: st, Runner: sched, Deleter: sched,
-				Edits:      definitionEditController,
 				Authorizer: authorizer,
 			}))
 	}
