@@ -499,9 +499,16 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		"read_research_history_content_cap_v3(bigint,bigint,text,bigint,text,text,integer,integer)":              true,
 		"admit_research_run_tool_step_cap_v1(bigint,bigint,integer)":                                             true,
 		"authorize_research_run_effect_cap_v1(bigint)":                                                           true,
-		"native_research_schedule_mature_v3_v1(bigint,bigint,text)":                                             true,
 		"freeze_research_llm_gateway_request_v2(bigint,text,text,text)":                                          true,
 		"load_research_run_bound_llm_call_v1(bigint,bigint)":                                                     true,
+	}
+	const nativeScheduleMaturitySignature = "native_research_schedule_mature_v3_v1(bigint,bigint,text)"
+	nativeScheduleMaturityRequired, err := nativeResearchCreationSchemaV3Active(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("inspect native research creation schema version: %w", err)
+	}
+	if nativeScheduleMaturityRequired {
+		allowedDefiners[nativeScheduleMaturitySignature] = true
 	}
 	definerRows, err := tx.Query(ctx,
 		`SELECT procedure.oid::regprocedure::text

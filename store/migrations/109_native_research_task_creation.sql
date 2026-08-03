@@ -95,8 +95,8 @@ BEGIN
          WHERE operation.tenant_id=expected_tenant_id
            AND operation.user_id=expected_user_id
            AND operation.task_id=expected_task_id
-           AND operation.execution_version=2
-           AND operation.tool_name='manage_tasks'
+           AND ((operation.execution_version=1 AND operation.tool_name='create_schedule') OR
+                (operation.execution_version=2 AND operation.tool_name='manage_tasks'))
            AND NOT (operation.status='executed' AND operation.phase='completed')
     );
 END

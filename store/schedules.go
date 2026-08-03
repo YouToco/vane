@@ -31,6 +31,21 @@ const matureSchedulePredicate = `NOT EXISTS (
 )`
 
 const nativeResearchScheduleMaturityFunctionV1 = "public.native_research_schedule_mature_v3_v1(bigint,bigint,text)"
+const nativeResearchCreationSchemaMarkerV3 = "task_creation_operations_protocol_tool_binding"
+
+func nativeResearchCreationSchemaV3Active(ctx context.Context, tx pgx.Tx) (bool, error) {
+	var active bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM pg_catalog.pg_constraint constraint_row
+			 WHERE constraint_row.conrelid='public.task_creation_operations'::regclass
+			   AND constraint_row.conname=$1
+		)`, nativeResearchCreationSchemaMarkerV3).Scan(&active); err != nil {
+		return false, err
+	}
+	return active, nil
+}
 
 // nativeResearchScheduleMaturityClause keeps pre-109 replay byte-compatible:
 // databases that cannot contain native V3 creation operations do not reference
@@ -41,6 +56,10 @@ const nativeResearchScheduleMaturityFunctionV1 = "public.native_research_schedul
 func nativeResearchScheduleMaturityClause(
 	ctx context.Context, tx pgx.Tx,
 ) (string, error) {
+	schemaActive, err := nativeResearchCreationSchemaV3Active(ctx, tx)
+	if err != nil {
+		return "", err
+	}
 	var activeRole string
 	var available bool
 	if err := tx.QueryRow(ctx,
@@ -49,7 +68,10 @@ func nativeResearchScheduleMaturityClause(
 	).Scan(&activeRole, &available); err != nil {
 		return "", err
 	}
-	if !available {
+	if schemaActive != available {
+		return "", fmt.Errorf("native research creation schema boundary is incomplete")
+	}
+	if !schemaActive {
 		return "", nil
 	}
 	if activeRole == researchRuntimeCapabilityRole {
@@ -61,8 +83,8 @@ func nativeResearchScheduleMaturityClause(
 		 WHERE operation.task_id=schedule.id
 		   AND operation.tenant_id=schedule.tenant_id
 		   AND operation.user_id=schedule.user_id
-		   AND operation.execution_version=2
-		   AND operation.tool_name='manage_tasks'
+		   AND ((operation.execution_version=1 AND operation.tool_name='create_schedule') OR
+		        (operation.execution_version=2 AND operation.tool_name='manage_tasks'))
 		   AND NOT (operation.status='executed' AND operation.phase='completed')
 	)`, nil
 }
