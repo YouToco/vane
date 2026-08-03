@@ -391,6 +391,55 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 		`REVOKE SELECT ON tenants FROM vane_native_v3_edit_recovery`); err != nil {
 		t.Fatal(err)
 	}
+	const indirectRole = "vane_native_v3_edit_recovery_indirect_test"
+	if _, err := owner.pool.Exec(t.Context(), `
+		REVOKE vane_native_v3_edit_recovery FROM vane_native_v3_edit_recovery_runtime;
+		CREATE ROLE `+indirectRole+` NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+			NOINHERIT NOREPLICATION NOBYPASSRLS;
+		GRANT vane_native_v3_edit_recovery TO `+indirectRole+`;
+		GRANT SELECT ON tenants TO `+indirectRole+`;
+		GRANT `+indirectRole+` TO vane_native_v3_edit_recovery_runtime`); err != nil {
+		t.Fatal(err)
+	}
+	restoreExactRecoveryMembership := func(ctx context.Context) {
+		_, _ = owner.pool.Exec(ctx, `
+			REVOKE `+indirectRole+` FROM vane_native_v3_edit_recovery_runtime;
+			REVOKE vane_native_v3_edit_recovery FROM `+indirectRole+`;
+			REVOKE SELECT ON tenants FROM `+indirectRole+`;
+			DROP ROLE IF EXISTS `+indirectRole+`;
+			GRANT vane_native_v3_edit_recovery TO vane_native_v3_edit_recovery_runtime
+				WITH ADMIN FALSE, SET TRUE, INHERIT FALSE`)
+	}
+	t.Cleanup(func() { restoreExactRecoveryMembership(context.Background()) })
+	if driftPool, err := newStorePool(t.Context(),
+		roleTestURL(t, scratchURL, nativeV3EditRecoveryRuntimeLoginRole, recoveryPassword),
+		initializeNativeV3EditRecoveryRuntimeConnection); err == nil {
+		driftPool.Close()
+		t.Fatal("recovery runtime accepted an indirect privileged membership")
+	}
+	restoreExactRecoveryMembership(t.Context())
+	if _, err := owner.pool.Exec(t.Context(), `
+		REVOKE vane_native_v3_edit_recovery FROM vane_native_v3_edit_recovery_runtime;
+		GRANT vane_native_v3_edit_recovery TO vane_native_v3_edit_recovery_runtime
+			WITH ADMIN TRUE, SET TRUE, INHERIT FALSE`); err != nil {
+		t.Fatal(err)
+	}
+	if driftPool, err := newStorePool(t.Context(),
+		roleTestURL(t, scratchURL, nativeV3EditRecoveryRuntimeLoginRole, recoveryPassword),
+		initializeNativeV3EditRecoveryRuntimeConnection); err == nil {
+		driftPool.Close()
+		t.Fatal("recovery runtime accepted ADMIN OPTION on its capability")
+	}
+	if err := ProvisionNativeV3EditRecoveryRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatalf("provisioner did not reset unsafe membership options: %v", err)
+	}
+	resetPool, err := newStorePool(t.Context(),
+		roleTestURL(t, scratchURL, nativeV3EditRecoveryRuntimeLoginRole, recoveryPassword),
+		initializeNativeV3EditRecoveryRuntimeConnection)
+	if err != nil {
+		t.Fatalf("recovery runtime rejected reset exact membership: %v", err)
+	}
+	resetPool.Close()
 	const researchAttackPassword = "native-v3-edit-research-attacker"
 	if _, err := owner.pool.Exec(t.Context(),
 		`ALTER ROLE vane_research_runtime LOGIN PASSWORD '`+researchAttackPassword+`'`); err != nil {
