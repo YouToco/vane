@@ -79,13 +79,23 @@ Harness 确定性关闭；外部正文只能在隔离上下文中继续公开研
 
 `tool_calls` 数据集必须逐行携带 `trust_type` provenance。`local` 行可以留在受信主
 Agent；`external`、未知或缺失 provenance 的 `model_visible_result` 在工具返回前移出，
-只留下受信元数据与 tenant/user/trace/invocation/arguments/result/coverage 共同派生的
-不可变 `public_evidence_ref`。历史记录、当前网页、动态 API、社媒及
+其 arguments、raw trace 与 raw invocation 同样不得留在主投影，只留下严格系统元数据
+与 tenant/user/trace/invocation/arguments/result/coverage 共同派生的不可变
+`public_evidence_ref`。arguments/trace/invocation 任一敏感字段的查询都必须自动补齐逐行
+provenance 后再投影。历史记录、当前网页、动态 API、社媒及
 `read_endpoint_result` 统一使用这一引用；URL 只是由已知 Tool 参数或结构化结果产生的
 可选展示元数据，不参与证据身份。缺失 trace 的 legacy 行明确标记 `unbound_trace` 并
-移除原文；历史 `query_my_intelligence` 的 local wrapper 可能嵌套旧 external 原文，因
-无法递归证明 provenance 而 fail-closed，不得冻结为受信内部证据。展示 URL 必须绑定到
-产生该 ref 的单次 invocation，不得从本轮累计搜索结果串入其他 ref。
+移除原文与原始标识；非 exact 的 local legacy 行同样 fail-closed。历史
+`query_my_intelligence` 的 exact local wrapper 可保留本地参数，但其 result 可能嵌套旧
+external 原文，因无法递归证明 provenance 而丢弃，不得冻结为受信内部证据。展示 URL
+必须绑定到产生该 ref 的单次 invocation，不得从本轮累计搜索结果串入其他 ref。
+
+`observations` 数据集虽然属于用户自己的历史记录，其中的 URL、标题、作者与正文仍是
+外部公开证据，不因进入数据库而升级为受信指令。查询原始 Observation 时，Harness
+必须把完整行移入既有 public evidence sidecar，主 Agent 只见严格元数据与
+`public_evidence_ref/status`；即使本轮没有新网页调用，也直接进入历史公开证据的隔离
+摘要与无工具综合出口。tasks/profile/runs、严格 Brief 与 AgentTurn 结论仍按受信内部
+证据处理。
 
 公开研究结束后，模型先在隔离上下文输出严格的
 `vane.public-evidence-summary/v1`。摘要只接受固定字段、受限长度与结构化工具结果中

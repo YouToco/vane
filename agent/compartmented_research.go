@@ -16,6 +16,7 @@ import (
 
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
@@ -37,6 +38,11 @@ var toolCallProjectionRequiredColumns = []string{
 	"trace_id", "invocation_id", "tool_name", "arguments",
 	"model_visible_result", "result_size", "truncated", "trust_type",
 	"evidence_coverage", "created_at",
+}
+
+var observationProjectionRequiredColumns = []string{
+	"task_ref", "run_snapshot_id", "invocation_digest", "observation",
+	"observation_digest", "content_count", "created_at",
 }
 
 const compartmentedPublicSummarySystemNote = `
@@ -160,9 +166,13 @@ func prepareIntelligenceToolCallQuery(
 	if query.Dataset != store.IntelligenceToolCalls {
 		return query, nil
 	}
-	wantsRaw := len(query.Select) == 0 ||
-		slices.Contains(query.Select, "model_visible_result")
-	if !wantsRaw {
+	wantsProjection := len(query.Select) == 0
+	for _, field := range []string{
+		"arguments", "model_visible_result", "invocation_id", "trace_id",
+	} {
+		wantsProjection = wantsProjection || slices.Contains(query.Select, field)
+	}
+	if !wantsProjection {
 		return query, nil
 	}
 	if len(query.GroupBy) > 0 || len(query.Metrics) > 0 {
@@ -173,9 +183,33 @@ func prepareIntelligenceToolCallQuery(
 	return query, nil
 }
 
-// projectIntelligenceResultForAgent removes external historical result bytes
-// before query_my_intelligence returns to the main Agent. The raw bytes move to
-// an in-memory, per-turn sidecar keyed by an immutable opaque ref. Unknown or
+func prepareIntelligenceObservationQuery(
+	query store.IntelligenceQuery,
+) (store.IntelligenceQuery, error) {
+	if query.Dataset != store.IntelligenceObservations {
+		return query, nil
+	}
+	wantsObservation := len(query.Select) == 0 ||
+		slices.Contains(query.Select, "observation")
+	if !wantsObservation {
+		return query, nil
+	}
+	if len(query.GroupBy) > 0 || len(query.Metrics) > 0 {
+		return store.IntelligenceQuery{}, types.NewAppError(types.CodeValidation,
+			"历史 Observation 原文只能按逐行 provenance 查询，不能聚合", types.ErrValidation)
+	}
+	for _, required := range observationProjectionRequiredColumns {
+		if !slices.Contains(query.Select, required) {
+			query.Select = append(query.Select, required)
+		}
+	}
+	return query, nil
+}
+
+// projectIntelligenceResultForAgent removes external historical arguments,
+// result bytes and raw trace/invocation identifiers before
+// query_my_intelligence returns to the main Agent. Those fields only contribute
+// to an in-memory, per-turn sidecar and its immutable opaque ref. Unknown or
 // missing trust provenance is treated as external.
 func projectIntelligenceResultForAgent(
 	ctx context.Context,
@@ -196,14 +230,20 @@ func projectIntelligenceResultForAgent(
 		traceID, traceOK := row["trace_id"].(string)
 		if !traceOK || strings.TrimSpace(traceID) == "" ||
 			strings.TrimSpace(traceID) != traceID {
-			delete(row, "model_visible_result")
+			stripHistoricalRawProvenance(row)
 			row["public_evidence_status"] = "unbound_trace"
 			continue
 		}
 		toolName, toolOK := row["tool_name"].(string)
 		if trust == "local" && (!toolOK || strings.TrimSpace(toolName) == "") {
-			delete(row, "model_visible_result")
+			stripHistoricalRawProvenance(row)
 			row["public_evidence_status"] = "unavailable_provenance"
+			continue
+		}
+		coverage, _ := row["evidence_coverage"].(string)
+		if trust == "local" && coverage != "exact" {
+			stripHistoricalRawProvenance(row)
+			row["public_evidence_status"] = "legacy_local_unavailable"
 			continue
 		}
 		if trust == "local" && toolName == "query_my_intelligence" {
@@ -221,8 +261,8 @@ func projectIntelligenceResultForAgent(
 			continue
 		}
 		raw, rawOK := row["model_visible_result"].(string)
-		delete(row, "model_visible_result")
 		if !rawOK || !utf8.ValidString(raw) {
+			stripHistoricalRawProvenance(row)
 			row["public_evidence_status"] = "unavailable"
 			continue
 		}
@@ -236,7 +276,6 @@ func projectIntelligenceResultForAgent(
 		if err != nil {
 			return err
 		}
-		coverage, _ := row["evidence_coverage"].(string)
 		if coverage == "" {
 			coverage = "unavailable"
 		}
@@ -255,6 +294,7 @@ func projectIntelligenceResultForAgent(
 		if err := rememberPublicEvidenceRecord(state, record); err != nil {
 			return err
 		}
+		stripHistoricalRawProvenance(row)
 		row["public_evidence_ref"] = record.Ref
 		row["public_evidence_status"] = "isolated"
 	}
@@ -268,6 +308,106 @@ func projectIntelligenceResultForAgent(
 			store.IntelligenceColumn{Name: "public_evidence_status", Type: "text"},
 		)
 	}
+	return nil
+}
+
+func stripHistoricalRawProvenance(row map[string]any) {
+	delete(row, "arguments")
+	delete(row, "invocation_id")
+	delete(row, "model_visible_result")
+	delete(row, "trace_id")
+}
+
+func projectObservationResultForAgent(
+	ctx context.Context,
+	result *store.IntelligenceQueryResult,
+) error {
+	if result == nil || result.Dataset != store.IntelligenceObservations {
+		return nil
+	}
+	state := runStateFrom(ctx)
+	meta, ok := ctx.Value(chatMetaKey{}).(chatMeta)
+	if state == nil || !ok || meta.scope.TenantID <= 0 ||
+		meta.scope.UserID <= 0 || meta.scope.SessionID <= 0 {
+		return types.NewAppError(types.CodeValidation,
+			"历史 Observation 缺少认证会话范围", types.ErrValidation)
+	}
+	projected := false
+	for _, row := range result.Rows {
+		observation, exists := row["observation"]
+		if !exists {
+			continue
+		}
+		raw, err := json.Marshal(observation)
+		if err != nil || !json.Valid(raw) || !utf8.Valid(raw) {
+			return types.NewAppError(types.CodeValidation,
+				"历史 Observation 原文无效", types.ErrValidation)
+		}
+		var decoded runcontext.ToolObservationSetV1
+		if strictjson.DecodeExact(raw, &decoded) != nil {
+			return types.NewAppError(types.CodeValidation,
+				"历史 Observation provenance 无效", types.ErrValidation)
+		}
+		canonical, err := json.Marshal(decoded)
+		if err != nil {
+			return fmt.Errorf("canonicalize historical Observation: %w", err)
+		}
+		set, items, digest, err := runcontext.DecodeToolObservationSetV1(canonical)
+		if err != nil {
+			return types.NewAppError(types.CodeValidation,
+				"历史 Observation provenance 无效", types.ErrValidation)
+		}
+		runSnapshotID, runOK := row["run_snapshot_id"].(string)
+		invocationDigest, invocationOK := row["invocation_digest"].(string)
+		observationDigest, digestOK := row["observation_digest"].(string)
+		if !runOK || !invocationOK || !digestOK ||
+			runSnapshotID != fmt.Sprintf("%d", set.RunSnapshotID) ||
+			invocationDigest != set.InvocationDigest || observationDigest != digest {
+			return types.NewAppError(types.CodeValidation,
+				"历史 Observation 身份不一致", types.ErrValidation)
+		}
+		arguments, err := json.Marshal(map[string]string{
+			"invocation_digest":  invocationDigest,
+			"observation_digest": observationDigest,
+			"run_snapshot_id":    runSnapshotID,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal historical Observation provenance: %w", err)
+		}
+		urls := make([]string, 0, len(items))
+		for _, item := range items {
+			urls = append(urls, item.URL)
+		}
+		record := newPublicEvidenceRecord(
+			meta.scope.TenantID, meta.scope.UserID, "historical",
+			runSnapshotID, invocationDigest, "observation", string(arguments),
+			string(canonical), "exact", int64(len(canonical)), false, urls,
+		)
+		if err := rememberPublicEvidenceRecord(state, record); err != nil {
+			return err
+		}
+		delete(row, "invocation_digest")
+		delete(row, "observation")
+		delete(row, "observation_digest")
+		row["public_evidence_ref"] = record.Ref
+		row["public_evidence_status"] = "isolated"
+		projected = true
+	}
+	if !projected {
+		return nil
+	}
+	if !intelligenceColumnsContain(result.Columns, "public_evidence_ref") {
+		result.Columns = append(result.Columns,
+			store.IntelligenceColumn{Name: "public_evidence_ref", Type: "text"})
+	}
+	if !intelligenceColumnsContain(result.Columns, "public_evidence_status") {
+		result.Columns = append(result.Columns,
+			store.IntelligenceColumn{Name: "public_evidence_status", Type: "text"})
+	}
+	if err := freezeCompartmentedInternalEvidence(ctx, state, true); err != nil {
+		return err
+	}
+	state.untrustedExternalResult = true
 	return nil
 }
 
@@ -424,6 +564,17 @@ func beginCompartmentedResearch(
 		!isUntrustedResultTool(spec) {
 		return nil
 	}
+	return freezeCompartmentedInternalEvidence(ctx, state, false)
+}
+
+func freezeCompartmentedInternalEvidence(
+	ctx context.Context,
+	state *toolRunState,
+	allowEmpty bool,
+) error {
+	if state == nil || !state.agentFirstEnabled || state.compartmentedResearch != nil {
+		return nil
+	}
 	meta, ok := ctx.Value(chatMetaKey{}).(chatMeta)
 	if !ok || meta.scope.TenantID <= 0 || meta.scope.UserID <= 0 ||
 		meta.scope.SessionID <= 0 || meta.scope.UserID != meta.userID || meta.traceID == "" {
@@ -437,7 +588,7 @@ func beginCompartmentedResearch(
 			selected = append(selected, evidence)
 		}
 	}
-	if len(selected) == 0 {
+	if len(selected) == 0 && !allowEmpty {
 		return nil
 	}
 	if len(selected) > maxFrozenInternalEvidenceCount {
