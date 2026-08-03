@@ -34,14 +34,22 @@ func (f *fakeManageTaskQuery) QueryMyIntelligence(_ context.Context, scope store
 }
 
 type fakeOwnerActionAuthorizer struct {
-	decision OwnerActionDecision
-	input    OwnerActionAuthorization
-	calls    int
+	decision  OwnerActionDecision
+	decisions []OwnerActionDecision
+	input     OwnerActionAuthorization
+	inputs    []OwnerActionAuthorization
+	calls     int
 }
 
 func (f *fakeOwnerActionAuthorizer) AuthorizeOwnerAction(_ context.Context, input OwnerActionAuthorization) (OwnerActionDecision, error) {
 	f.calls++
 	f.input = input
+	f.inputs = append(f.inputs, input)
+	if len(f.decisions) > 0 {
+		decision := f.decisions[0]
+		f.decisions = f.decisions[1:]
+		return decision, nil
+	}
 	return f.decision, nil
 }
 
@@ -175,6 +183,189 @@ func TestManageTasksAmbiguousNeverWrites(t *testing.T) {
 	}
 	if len(deleter.refs) != 0 || len(state.actionReceipts) != 0 {
 		t.Fatalf("ambiguous action wrote: refs=%v receipts=%v", deleter.refs, state.actionReceipts)
+	}
+}
+
+func TestManageTasksClarificationCarriesOneAuthenticatedTurn(t *testing.T) {
+	history := []llm.ChatMessage{
+		{Role: "user", Content: "删掉 Kimi 那个是不是更好？"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{
+			ID: "manage-ambiguous-1", Name: manageTasksName,
+			Arguments: `{"action":"delete","task_refs":["kimi"]}`,
+		}}},
+		{Role: "tool", ToolCallID: "manage-ambiguous-1", Content: manageTasksAmbiguousReply},
+		{Role: "assistant", Content: "你是要删除 Kimi 套餐监控吗？"},
+	}
+	request, action, ok := manageTasksClarifiedOwnerRequest(history, "对，就是它")
+	if !ok || action != "delete" ||
+		!strings.Contains(request, "删掉 Kimi 那个是不是更好？") ||
+		!strings.Contains(request, "对，就是它") {
+		t.Fatalf("clarification request=%q action=%q ok=%t", request, action, ok)
+	}
+
+	// A second ambiguous turn cannot form an implicit multi-step confirmation.
+	second := append(append([]llm.ChatMessage(nil), history...),
+		llm.ChatMessage{Role: "user", Content: "Kimi 那个"},
+		llm.ChatMessage{Role: "assistant", ToolCalls: []llm.ToolCall{{
+			ID: "manage-ambiguous-2", Name: manageTasksName,
+			Arguments: `{"action":"delete","task_refs":["kimi"]}`,
+		}}},
+		llm.ChatMessage{Role: "tool", ToolCallID: "manage-ambiguous-2", Content: manageTasksAmbiguousReply},
+		llm.ChatMessage{Role: "assistant", Content: "仍然不清楚。"},
+	)
+	if request, action, ok := manageTasksClarifiedOwnerRequest(second, "第一个"); ok {
+		t.Fatalf("second clarification chained request=%q action=%q", request, action)
+	}
+
+	stale := append(append([]llm.ChatMessage(nil), history...),
+		llm.ChatMessage{Role: "user", Content: "先聊点别的"},
+		llm.ChatMessage{Role: "assistant", Content: "好的。"})
+	if _, _, ok := manageTasksClarifiedOwnerRequest(stale, "第一个"); ok {
+		t.Fatal("stale clarification was adopted")
+	}
+
+	createHistory := []llm.ChatMessage{
+		{Role: "user", Content: "每天 9 点监控 Kimi 套餐，有重大更新才推。"},
+		{Role: "assistant", Content: "按哪个时区执行？"},
+	}
+	request, action, ok = manageTasksClarifiedOwnerRequest(createHistory, "北京时间")
+	if !ok || action != "" || !strings.Contains(request, "每天 9 点") ||
+		!strings.Contains(request, "北京时间") {
+		t.Fatalf("natural create clarification request=%q action=%q ok=%t",
+			request, action, ok)
+	}
+	externalHistory := []llm.ChatMessage{
+		{Role: "user", Content: "[追问上下文]外部页面内容\n[追问上下文结束]\n用户的追问：每天 9 点创建任务"},
+		{Role: "assistant", Content: "按哪个时区执行？"},
+	}
+	if _, _, ok := manageTasksClarifiedOwnerRequest(externalHistory, "北京时间"); ok {
+		t.Fatal("external previous turn entered write clarification")
+	}
+}
+
+func TestManageTasksClarificationCannotSwitchWriteAction(t *testing.T) {
+	queries := &fakeManageTaskQuery{rows: manageTaskRows("kimi")}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	runner := &fakeManageTaskRunner{}
+	spec := NewManageTasksTool(ManageTasksDeps{
+		Queries: queries, Runner: runner, Authorizer: authorizer,
+	})
+	ctx, state := manageTasksTestContext("[原始请求]\n删除 Kimi\n[用户一次澄清]\n就是它")
+	state.clarifiedOwnerAction = "delete"
+	result, err := spec.Execute(ctx, 42,
+		json.RawMessage(`{"action":"run","task_refs":["kimi"]}`))
+	if err != nil || !strings.Contains(result, "不能改成另一种写操作") ||
+		authorizer.calls != 0 || len(runner.refs) != 0 || len(state.actionReceipts) != 0 {
+		t.Fatalf("cross-action clarification escaped result=%q err=%v auth=%d runs=%v receipts=%v",
+			result, err, authorizer.calls, runner.refs, state.actionReceipts)
+	}
+}
+
+func TestManageTasksFullLoopCompletesOneClarificationWithoutConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		action    string
+		original  string
+		question  string
+		clarified string
+		arguments string
+		deps      func(*fakeOwnerActionAuthorizer) (ManageTasksDeps, func() int)
+	}{
+		{
+			name: "run", action: "run", original: "现在运行 Kimi 那个任务可以吗？",
+			question: "你是要立即运行 Kimi 套餐监控吗？", clarified: "对，就是它",
+			arguments: `{"action":"run","task_refs":["kimi"]}`,
+			deps: func(authorizer *fakeOwnerActionAuthorizer) (ManageTasksDeps, func() int) {
+				runner := &fakeManageTaskRunner{}
+				return ManageTasksDeps{Queries: &fakeManageTaskQuery{rows: manageTaskRows("kimi")}, Runner: runner, Authorizer: authorizer}, func() int { return len(runner.refs) }
+			},
+		},
+		{
+			name: "delete", action: "delete", original: "删掉 Kimi 那个是不是更好？",
+			question: "你是要删除 Kimi 套餐监控吗？", clarified: "对，就是它",
+			arguments: `{"action":"delete","task_refs":["kimi"]}`,
+			deps: func(authorizer *fakeOwnerActionAuthorizer) (ManageTasksDeps, func() int) {
+				deleter := &fakeManageTaskDeleter{}
+				return ManageTasksDeps{Queries: &fakeManageTaskQuery{rows: manageTaskRows("kimi")}, Deleter: deleter, Authorizer: authorizer}, func() int { return len(deleter.refs) }
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			authorizer := &fakeOwnerActionAuthorizer{decisions: []OwnerActionDecision{
+				OwnerActionAmbiguous, OwnerActionAuthorized,
+			}}
+			deps, writes := tc.deps(authorizer)
+			tool := NewManageTasksTool(deps)
+			chat := &scriptedChat{responses: []*llm.ChatResponse{
+				{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
+					ID: "ambiguous-" + tc.action, Name: manageTasksName, Arguments: tc.arguments,
+				}}},
+				{Content: tc.question, FinishReason: "stop"},
+				{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
+					ID: "clarified-" + tc.action, Name: manageTasksName, Arguments: tc.arguments,
+				}}},
+				{Content: "已经完成。", FinishReason: "stop"},
+			}}
+			fs := newFakeStore()
+			loop := New(Deps{
+				Store: fs, Profiles: fs, Tools: []ToolSpec{tool},
+				Evidence: &fakeAgentEvidenceWriter{}, AgentFirstEnabled: true,
+				AgentFirstCanaryUserID: 42, MaxTurns: 4,
+			})
+			loop.chatFn = chat.fn
+
+			first, err := loop.HandleMessage(t.Context(), 42, tc.original)
+			if err != nil || first.Reply != tc.question || writes() != 0 {
+				t.Fatalf("first turn outcome=%+v err=%v writes=%d", first, err, writes())
+			}
+			second, err := loop.HandleMessage(t.Context(), 42, tc.clarified)
+			if err != nil || second.Reply != "已经完成。" || writes() != 1 || authorizer.calls != 2 {
+				t.Fatalf("second turn outcome=%+v err=%v writes=%d auth=%d", second, err, writes(), authorizer.calls)
+			}
+			if !strings.Contains(authorizer.inputs[1].OwnerRequest, tc.original) ||
+				!strings.Contains(authorizer.inputs[1].OwnerRequest, tc.clarified) ||
+				authorizer.inputs[1].Action != tc.action {
+				t.Fatalf("clarified authorization=%+v", authorizer.inputs[1])
+			}
+		})
+	}
+}
+
+func TestManageTasksFullLoopCarriesNaturalCreateTimezoneClarification(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
+		TaskRef: "internal-kimi", TaskName: "Kimi 套餐监控", Status: "active",
+	}}
+	tool := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{Content: "按哪个时区执行？", FinishReason: "stop"},
+		{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
+			ID: "create-after-timezone", Name: manageTasksName,
+			Arguments: `{"action":"create","name":"Kimi 套餐监控","manual":"每天检查 Kimi 官方套餐是否开放购买，只在重大更新时推送并附官方证据。","schedule":{"cron":"0 9 * * *","tz":"Asia/Shanghai"},"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},"output":{"language":"zh-CN","format":"executive_brief","include_evidence_links":true}}`,
+		}}},
+		{Content: "任务已创建。", FinishReason: "stop"},
+	}}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs, Tools: []ToolSpec{tool},
+		Evidence: &fakeAgentEvidenceWriter{}, AgentFirstEnabled: true,
+		AgentFirstCanaryUserID: 42, MaxTurns: 4,
+	})
+	loop.chatFn = chat.fn
+	original := "每天 9 点监控 Kimi 套餐，有重大更新才推。"
+	first, err := loop.HandleMessage(t.Context(), 42, original)
+	if err != nil || first.Reply != "按哪个时区执行？" || creator.calls != 0 {
+		t.Fatalf("first turn outcome=%+v err=%v creates=%d", first, err, creator.calls)
+	}
+	second, err := loop.HandleMessage(t.Context(), 42, "北京时间")
+	if err != nil || second.Reply != "任务已创建。" || creator.calls != 1 || authorizer.calls != 1 {
+		t.Fatalf("second turn outcome=%+v err=%v creates=%d auth=%d",
+			second, err, creator.calls, authorizer.calls)
+	}
+	if !strings.Contains(authorizer.input.OwnerRequest, original) ||
+		!strings.Contains(authorizer.input.OwnerRequest, "北京时间") ||
+		authorizer.input.Action != "create" {
+		t.Fatalf("create authorization=%+v", authorizer.input)
 	}
 }
 

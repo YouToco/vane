@@ -1107,14 +1107,21 @@ func (l *Loop) handleMessage(
 	// 端点注册表契约 §4：激活集随会话持久化，本条消息的工具运行状态经 ctx 旁路
 	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
 	ownerRequest := text
+	clarifiedOwnerAction := ""
 	if externalInput {
 		if request, _, ok := splitExternalInput(text); ok {
 			ownerRequest = request
+		}
+	} else if agentFirst {
+		if clarified, action, ok := manageTasksClarifiedOwnerRequest(history, text); ok {
+			ownerRequest = clarified
+			clarifiedOwnerAction = action
 		}
 	}
 	state := &toolRunState{
 		activation:                 decodeActivation(sess.ActivatedTools),
 		ownerRequest:               ownerRequest,
+		clarifiedOwnerAction:       clarifiedOwnerAction,
 		intents:                    classifyOwnerIntents(ownerRequest),
 		intentToolkitsEnabled:      l.intentToolkitsEnabled,
 		intentToolkitsShadow:       l.intentToolkitsShadow,
@@ -4157,7 +4164,8 @@ func toolReplyForCall(turn []llm.ChatMessage, callID string) (string, bool) {
 func isFixedSafeToolReply(name, reply string) bool {
 	return reply == fmt.Sprintf("工具 %s 不存在", name) ||
 		reply == toolMsgUntrustedBoundary ||
-		reply == toolMsgExternalBatch
+		reply == toolMsgExternalBatch ||
+		(name == manageTasksName && reply == manageTasksAmbiguousReply)
 }
 
 // 仅这些工具的真实回执由本地受信数据构造；未知/下线/未来新增工具默认不可信。

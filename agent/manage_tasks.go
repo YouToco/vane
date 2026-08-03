@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	manageTasksName     = "manage_tasks"
-	manageTasksBatchMax = 20
+	manageTasksName           = "manage_tasks"
+	manageTasksBatchMax       = 20
+	manageTasksAmbiguousReply = "这条写指令仍有歧义，本次未执行。请只针对缺失信息自然追问一次，不要让用户提供内部 ID，也不要发送确认卡。"
 )
 
 // OwnerActionDecision is the result of the single write-boundary adjudication.
@@ -216,6 +217,9 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 	if t.deps.Authorizer == nil {
 		return "任务管理能力当前未完整装配，本次未执行。", nil
 	}
+	if state.clarifiedOwnerAction != "" && state.clarifiedOwnerAction != args.Action {
+		return "这次回答只用于澄清上一项任务操作，不能改成另一种写操作；本次未执行。", nil
+	}
 	var targets []OwnerActionTarget
 	if args.Action == "create" {
 		if t.deps.Creator == nil {
@@ -249,7 +253,7 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 	}
 	switch decision {
 	case OwnerActionAmbiguous:
-		return "这条写指令仍有歧义，本次未执行。请只针对缺失信息自然追问一次，不要让用户提供内部 ID，也不要发送确认卡。", nil
+		return manageTasksAmbiguousReply, nil
 	case OwnerActionDenied:
 		return "当前原话没有授权这项写操作，本次未执行。", nil
 	case OwnerActionAuthorized:
@@ -265,6 +269,113 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 		return "", err
 	}
 	return result, nil
+}
+
+// manageTasksClarifiedOwnerRequest reconstructs exactly one pending write
+// clarification from the immediately preceding authenticated conversation.
+// It consumes only two verbatim user messages and an exact Tool result emitted
+// by this binary; assistant prose, external content and arbitrary history never
+// become authorization input. A second ambiguous turn is not chainable.
+func manageTasksClarifiedOwnerRequest(
+	history []llm.ChatMessage, current string,
+) (string, string, bool) {
+	current = strings.TrimSpace(current)
+	if current == "" {
+		return "", "", false
+	}
+	toolIndex := -1
+	for i := len(history) - 1; i >= 0; i-- {
+		message := history[i]
+		if message.Role == "user" {
+			break
+		}
+		if message.Role == "tool" && message.Content == manageTasksAmbiguousReply &&
+			strings.TrimSpace(message.ToolCallID) != "" {
+			toolIndex = i
+			break
+		}
+	}
+	if toolIndex < 1 {
+		return naturalWriteClarifiedOwnerRequest(history, current)
+	}
+	callIndex := -1
+	action := ""
+	for i := toolIndex - 1; i >= 0; i-- {
+		message := history[i]
+		if message.Role == "user" {
+			break
+		}
+		if message.Role != "assistant" {
+			continue
+		}
+		for _, call := range message.ToolCalls {
+			if call.ID != history[toolIndex].ToolCallID || call.Name != manageTasksName {
+				continue
+			}
+			var envelope struct {
+				Action string `json:"action"`
+			}
+			if json.Unmarshal([]byte(call.Arguments), &envelope) != nil ||
+				(envelope.Action != "create" && envelope.Action != "run" && envelope.Action != "delete") {
+				return "", "", false
+			}
+			action = envelope.Action
+			callIndex = i
+			break
+		}
+		if callIndex >= 0 {
+			break
+		}
+	}
+	if callIndex < 1 {
+		return "", "", false
+	}
+	ownerIndex := -1
+	for i := callIndex - 1; i >= 0; i-- {
+		if history[i].Role == "user" {
+			ownerIndex = i
+			break
+		}
+	}
+	if ownerIndex < 0 || strings.TrimSpace(history[ownerIndex].Content) == "" {
+		return "", "", false
+	}
+	previousUser := -1
+	for i := ownerIndex - 1; i >= 0; i-- {
+		if history[i].Role == "user" {
+			previousUser = i
+			break
+		}
+	}
+	for i := previousUser + 1; i < ownerIndex; i++ {
+		if history[i].Role == "tool" && history[i].Content == manageTasksAmbiguousReply {
+			return "", "", false
+		}
+	}
+	return "[原始请求]\n" + strings.TrimSpace(history[ownerIndex].Content) +
+		"\n[用户一次澄清]\n" + current, action, true
+}
+
+func naturalWriteClarifiedOwnerRequest(
+	history []llm.ChatMessage, current string,
+) (string, string, bool) {
+	if len(history) < 2 {
+		return "", "", false
+	}
+	owner := history[len(history)-2]
+	assistant := history[len(history)-1]
+	ownerText := strings.TrimSpace(owner.Content)
+	assistantText := strings.TrimSpace(assistant.Content)
+	if owner.Role != "user" || assistant.Role != "assistant" ||
+		len(assistant.ToolCalls) != 0 || len([]rune(ownerText)) < 8 ||
+		(!strings.Contains(assistantText, "?") && !strings.Contains(assistantText, "？")) {
+		return "", "", false
+	}
+	if _, _, external := splitExternalInput(ownerText); external {
+		return "", "", false
+	}
+	return "[原始请求]\n" + ownerText +
+		"\n[用户一次澄清]\n" + current, "", true
 }
 
 func decodeManageTasksArgs(raw json.RawMessage) (manageTasksArgs, []string, string) {
