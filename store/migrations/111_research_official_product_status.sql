@@ -7,6 +7,7 @@
 -- +goose Up
 
 SELECT pg_advisory_xact_lock(6215335020355474248);
+LOCK TABLE tenants IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE research_run_steps,research_run_step_spend_reservations,
            research_run_step_spend_settlements,tool_calls,tenant_quota
     IN ACCESS EXCLUSIVE MODE;

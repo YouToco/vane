@@ -127,6 +127,13 @@ func TestResearchExecutorV3OfficialRouteAndURLInjectionFailBeforeEffect(t *testi
 
 	for _, args := range []json.RawMessage{
 		json.RawMessage(`{"page_url":"https://evil.example/pricing"}`),
+		json.RawMessage(`{"page_url":"https://www.kimi.com:443/membership/pricing"}`),
+		json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing?x=1"}`),
+		json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing#x"}`),
+		json.RawMessage(`{"page_url":"https://user@www.kimi.com/membership/pricing"}`),
+		json.RawMessage(`{"page_url":"https://www.kimi.com/membership/%70ricing"}`),
+		json.RawMessage(`{"page_url":"https://kimi.com/membership/pricing"}`),
+		json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing/"}`),
 		json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing","endpoint":"https://evil.example"}`),
 	} {
 		receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest("kimi-injection", tool, args))

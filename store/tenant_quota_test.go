@@ -663,6 +663,10 @@ func TestReconcileTenantQuota_SeedsMissingAndPreservesUsed(t *testing.T) {
 	// B：正常租户，但已经用掉一部分额度。
 	used := newQuotaTenant(t, st)
 	setBucket(t, st, used, QuotaLLMTokens, 42, 0, 2000000)
+	if _, err := st.pool.Exec(ctx, `DELETE FROM tenant_quota WHERE tenant_id=$1 AND bucket=$2`,
+		used, QuotaOfficialCalls); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := st.ReconcileTenantQuota(ctx); err != nil {
 		t.Fatalf("reconcile 失败: %v", err)
@@ -682,7 +686,11 @@ func TestReconcileTenantQuota_SeedsMissingAndPreservesUsed(t *testing.T) {
 	}
 
 	// B 的余额必须原样保留。
-	for _, q := range mustListQuota(t, st, used) {
+	usedQuotas := mustListQuota(t, st, used)
+	if len(usedQuotas) != len(defaultQuotas) {
+		t.Fatalf("partial missing bucket was not reconciled: got %d", len(usedQuotas))
+	}
+	for _, q := range usedQuotas {
 		if q.Bucket == QuotaLLMTokens && q.Tokens > 100 {
 			t.Errorf("reconcile 把已用掉的额度刷回了 %.0f（原为 42）—— "+
 				"那会让「重启服务」变成一条回满额度的免费通道，配额形同虚设", q.Tokens)

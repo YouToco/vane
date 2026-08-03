@@ -15,6 +15,7 @@ import (
 
 	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/researchtools"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
@@ -209,7 +210,8 @@ func (e *ResearchExecutorV3) ExecuteOnceV3(
 	}
 	canonical, err := acquisitiontool.CanonicalizeToolArgumentsV1(
 		req.Tool.Name, req.Arguments)
-	if err != nil || !bytes.Equal(canonical, req.Arguments) {
+	if err != nil || !bytes.Equal(canonical, req.Arguments) ||
+		researchtools.ValidateCanonicalArgumentsV3(req.Tool.Name, canonical) != nil {
 		return researchFailureReceiptV3(
 			ResearchExecutionDefiniteFailureV3, req.Tool.Provider, false,
 			ResearchExecutionInvalidRequestV3)

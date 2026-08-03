@@ -9,12 +9,81 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pressly/goose/v3"
 
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
 )
+
+func TestMigration111FencesConcurrentTenantRegistrationPostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	db, err := sql.Open("pgx", scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir, goose.WithAllowOutofOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 110); err != nil {
+		t.Fatal(err)
+	}
+
+	registration, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tenantID int64
+	if err := registration.QueryRowContext(t.Context(),
+		`INSERT INTO tenants(status,plan) VALUES('active','free') RETURNING id`).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	migrated := make(chan error, 1)
+	go func() { _, err := provider.UpTo(t.Context(), 111); migrated <- err }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		err := db.QueryRowContext(t.Context(), `SELECT EXISTS(
+			SELECT 1 FROM pg_locks lock JOIN pg_class rel ON rel.oid=lock.relation
+			 WHERE rel.relname='tenants' AND lock.mode='AccessExclusiveLock' AND NOT lock.granted)`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("migration did not fence concurrent tenant registration")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := registration.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-migrated; err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM tenant_quota
+		WHERE tenant_id=$1 AND bucket='official_calls'`, tenantID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("concurrent tenant missed official_calls backfill: %d", count)
+	}
+}
 
 func TestMigration111OfficialResearchRouteAndDowngradeGuardPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")

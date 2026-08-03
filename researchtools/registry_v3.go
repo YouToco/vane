@@ -115,7 +115,27 @@ func (r *RegistryV3) Canonicalize(
 	if err != nil {
 		return nil, runtimepolicy.ResearchToolDefinitionV3{}, err
 	}
+	if err := ValidateCanonicalArgumentsV3(toolName, canonical); err != nil {
+		return nil, runtimepolicy.ResearchToolDefinitionV3{}, err
+	}
 	return canonical, tool, nil
+}
+
+// ValidateCanonicalArgumentsV3 applies scheduled-only route constraints after
+// generic schema canonicalization. Legacy ProductStatusFetcher callers retain
+// their existing URL compatibility.
+func ValidateCanonicalArgumentsV3(toolName string, canonical json.RawMessage) error {
+	if toolName != "web_product_status" {
+		return nil
+	}
+	var args struct {
+		PageURL string `json:"page_url"`
+	}
+	if err := json.Unmarshal(canonical, &args); err != nil ||
+		args.PageURL != "https://www.kimi.com/membership/pricing" {
+		return errors.New("researchtools: official product-status route is not exact")
+	}
+	return nil
 }
 
 func findCapability(

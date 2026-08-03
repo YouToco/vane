@@ -349,11 +349,19 @@ func (s *Store) AdjustForUser(ctx context.Context, userID int64, bucket QuotaBuc
 // 失败方向失效——而它防的是"新增了桶却忘了 seed"变成静默的无限额度洞。
 // 启动时补齐是一次可观测的批量动作，懒加载是每次调用都可能悄悄放行。
 func (s *Store) ReconcileTenantQuota(ctx context.Context) (int, error) {
+	buckets := make([]string, 0, len(defaultQuotas))
+	for _, quota := range defaultQuotas {
+		buckets = append(buckets, string(quota.Bucket))
+	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT t.id FROM tenants t
 		  WHERE t.status <> 'deleting'
-		    AND NOT EXISTS (SELECT 1 FROM tenant_quota q WHERE q.tenant_id = t.id)
-		  ORDER BY t.id`)
+		    AND EXISTS (
+		      SELECT 1 FROM unnest($1::text[]) expected(bucket)
+		       WHERE NOT EXISTS (SELECT 1 FROM tenant_quota q
+		                          WHERE q.tenant_id=t.id AND q.bucket=expected.bucket)
+		    )
+		  ORDER BY t.id`, buckets)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "查询缺配额的租户", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/runtimepolicy"
 )
 
@@ -27,6 +28,46 @@ func exaCatalogForTest(t *testing.T) runtimepolicy.CapabilityCatalogV1 {
 				}, DependencyCredentialRefs: []runtimepolicy.CredentialRefV1{},
 			},
 		},
+	}
+}
+
+func TestRegistryV3RejectsNonExactOfficialProductStatusRoutes(t *testing.T) {
+	model, ok := acquisitiontool.LookupModelToolDefinitionV1("web_product_status")
+	if !ok {
+		t.Fatal("missing model tool")
+	}
+	policy, err := runtimepolicy.BuildResearchToolPolicyV3([]runtimepolicy.ResearchToolDefinitionV3{{
+		Name: "web_product_status", Description: model.Description, Parameters: model.ArgumentsSchema,
+		Implementation: runtimepolicy.ResearchToolKimiProductStatusV3, ImplementationGeneration: 1,
+		Provider: "kimi", Effects: []runtimepolicy.ResearchToolEffectV3{
+			runtimepolicy.ResearchToolEffectNetworkReadV3, runtimepolicy.ResearchToolEffectTrustTaintV3,
+		}, ResultTrust: runtimepolicy.ResearchToolTrustOfficialV3,
+		BudgetBucket: "official_calls", MaxCostMicroUSD: 1,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistryV3(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing"}`)
+	if _, _, err := registry.Canonicalize(registry.Digest(), "web_product_status", valid); err != nil {
+		t.Fatal(err)
+	}
+	for _, pageURL := range []string{
+		"https://www.kimi.com:443/membership/pricing",
+		"https://www.kimi.com/membership/pricing?x=1",
+		"https://www.kimi.com/membership/pricing#x",
+		"https://user@www.kimi.com/membership/pricing",
+		"https://www.kimi.com/membership/%70ricing",
+		"https://kimi.com/membership/pricing",
+		"https://www.kimi.com/membership/pricing/",
+	} {
+		raw, _ := json.Marshal(map[string]string{"page_url": pageURL})
+		if _, _, err := registry.Canonicalize(registry.Digest(), "web_product_status", raw); err == nil {
+			t.Fatalf("non-exact official route accepted: %s", pageURL)
+		}
 	}
 }
 
