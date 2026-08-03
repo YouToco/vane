@@ -29,6 +29,10 @@ WITH expired AS (
        AND error_code='' AND error_message=''
        AND ((receipt_provider='' AND receipt_target='') OR
             (receipt_provider='agent_auto/v1' AND receipt_target=id))
+       AND NOT EXISTS (
+           SELECT 1 FROM task_creation_receipts existing_receipt
+            WHERE existing_receipt.operation_id=task_creation_operations.id
+       )
        AND expires_at<=clock_timestamp()
     RETURNING id,tenant_id,user_id,session_id,receipt_provider,receipt_target
 )
@@ -65,6 +69,10 @@ BEGIN
            AND ((operation.receipt_provider='' AND operation.receipt_target='') OR
                 (operation.receipt_provider='agent_auto/v1' AND
                  operation.receipt_target=operation.id))
+           AND NOT EXISTS (
+               SELECT 1 FROM task_creation_receipts existing_receipt
+                WHERE existing_receipt.operation_id=operation.id
+           )
            AND operation.expires_at<=clock_timestamp()
            AND operation.tombstoned_at IS NULL
     ) THEN

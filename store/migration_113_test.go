@@ -63,6 +63,7 @@ func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *test
 		{id: "migration-111-expired", expires: "clock_timestamp()-interval '1 hour'"},
 		{id: "migration-111-live", expires: "clock_timestamp()+interval '1 hour'"},
 		{id: "migration-111-non-pristine", expires: "clock_timestamp()-interval '1 hour'", attempt: 1},
+		{id: "migration-113-pre-receipted", expires: "clock_timestamp()-interval '1 hour'"},
 		{id: "migration-113-normalized", expires: "clock_timestamp()-interval '1 hour'",
 			provider: "agent_auto/v1", target: "migration-113-normalized"},
 		{id: "migration-113-wrong-provider", expires: "clock_timestamp()-interval '1 hour'",
@@ -90,6 +91,17 @@ func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *test
 				t.Fatalf("set %s receipt shape: %v", fixture.id, err)
 			}
 		}
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO task_creation_receipts(
+		    operation_id,tenant_id,user_id,provider_key,status,
+		    provider_message_id,failure_class,sent_at
+		) VALUES(
+		    'migration-113-pre-receipted',$1,$2,
+		    md5('migration-113-pre-receipted')::uuid,'suppressed',
+		    'legacy-suppressed','preexisting_terminal_fact',clock_timestamp()
+		)`, tenantID, userID); err != nil {
+		t.Fatal(err)
 	}
 
 	if _, err := provider.UpTo(t.Context(), 113); err != nil {
@@ -121,13 +133,16 @@ func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *test
 		t.Fatalf("074-normalized tombstone=%q provider=%q target=%q",
 			status, normalizedProvider, normalizedTarget)
 	}
-	for _, id := range []string{"migration-113-wrong-provider", "migration-113-wrong-target"} {
+	for _, id := range []string{
+		"migration-113-wrong-provider", "migration-113-wrong-target",
+		"migration-113-pre-receipted",
+	} {
 		if err := db.QueryRowContext(t.Context(), `SELECT status,phase,tombstoned_at IS NOT NULL
 			FROM task_creation_operations WHERE id=$1`, id).Scan(&status, &phase, &tombstoned); err != nil {
 			t.Fatal(err)
 		}
 		if status != "pending" || phase != "" || tombstoned {
-			t.Fatalf("invalid receipt shape %s was tombstoned", id)
+			t.Fatalf("non-pristine legacy operation %s was tombstoned", id)
 		}
 	}
 	var receiptStatus, providerMessageID, failureClass string
@@ -190,7 +205,7 @@ func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *test
 		t.Fatalf("new V1 admission error=%v, want closed", err)
 	}
 
-	if _, err := provider.DownTo(t.Context(), 110); err != nil {
+	if _, err := provider.DownTo(t.Context(), 112); err != nil {
 		t.Fatal(err)
 	}
 	var operations, receipts int
