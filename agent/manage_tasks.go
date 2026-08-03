@@ -465,16 +465,20 @@ func (t *manageTasksTool) executeAuthorized(ctx context.Context, meta chatMeta, 
 		outcome.TaskRef = strings.TrimSpace(outcome.TaskRef)
 		outcome.TaskName = strings.TrimSpace(outcome.TaskName)
 		outcome.Status = strings.TrimSpace(outcome.Status)
-		if outcome.TaskRef == "" || outcome.TaskName == "" ||
-			outcome.TaskName != args.Name ||
+		if outcome.TaskName == "" || outcome.TaskName != args.Name ||
 			(outcome.Status != "completed" && outcome.Status != "executing" &&
-				outcome.Status != "blocked") {
+				outcome.Status != "blocked") ||
+			(outcome.Status == "completed" && outcome.TaskRef == "") {
 			return "", taskActionReceipt(args.Action, nil,
 					"invalid_outcome", actionID),
 				errors.New("agent: native V3 creation returned an invalid outcome")
 		}
-		rememberInternalReference(runStateFrom(ctx), outcome.TaskRef)
-		receipt := taskActionReceipt(args.Action, []string{outcome.TaskRef},
+		refs := []string(nil)
+		if outcome.TaskRef != "" {
+			rememberInternalReference(runStateFrom(ctx), outcome.TaskRef)
+			refs = []string{outcome.TaskRef}
+		}
+		receipt := taskActionReceipt(args.Action, refs,
 			outcome.Status, actionID)
 		switch outcome.Status {
 		case "completed":

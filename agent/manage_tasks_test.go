@@ -135,6 +135,34 @@ func TestManageTasksRunInjectsScopeAuthorizesAndRecordsReceipt(t *testing.T) {
 	}
 }
 
+func TestManageTasksBatchDeleteUsesResolvedNaturalNamesWithoutIDs(t *testing.T) {
+	queries := &fakeManageTaskQuery{rows: manageTaskRows("kimi", "claude")}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	deleter := &fakeManageTaskDeleter{}
+	spec := NewManageTasksTool(ManageTasksDeps{
+		Queries: queries, Deleter: deleter, Authorizer: authorizer,
+	})
+	ctx, state := manageTasksTestContext("删除 Kimi 套餐监控和 Claude 动态监控")
+	result, err := spec.Execute(ctx, 42,
+		json.RawMessage(`{"action":"delete","task_refs":["kimi","claude"]}`))
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if strings.Join(deleter.refs, ",") != "kimi,claude" || len(deleter.keys) != 2 ||
+		deleter.keys[0] == deleter.keys[1] {
+		t.Fatalf("batch delete calls mismatch: refs=%v keys=%v", deleter.refs, deleter.keys)
+	}
+	if authorizer.calls != 1 || authorizer.input.OwnerRequest !=
+		"删除 Kimi 套餐监控和 Claude 动态监控" || len(authorizer.input.Targets) != 2 {
+		t.Fatalf("batch delete authorization mismatch: %+v", authorizer.input)
+	}
+	if !strings.Contains(result, "已删除 2 个任务") || len(state.actionReceipts) != 1 ||
+		!strings.Contains(string(state.actionReceipts[0]), `"status":"completed"`) {
+		t.Fatalf("delete result/receipt mismatch: result=%q receipts=%s",
+			result, state.actionReceipts)
+	}
+}
+
 func TestManageTasksAmbiguousNeverWrites(t *testing.T) {
 	queries := &fakeManageTaskQuery{rows: manageTaskRows("kimi")}
 	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAmbiguous}
@@ -232,7 +260,7 @@ func TestManageTasksCreateWithoutV3ExecutorFailsClosedBeforeAuthorization(t *tes
 func TestManageTasksCreateExecutingDoesNotClaimCompletion(t *testing.T) {
 	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
 	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
-		TaskRef: "task-pending", TaskName: "测试", Status: "executing",
+		TaskName: "测试", Status: "executing",
 	}}
 	spec := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
 	ctx, _ := manageTasksTestContext("创建测试任务")

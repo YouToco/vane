@@ -123,8 +123,7 @@ func run() error {
 	}
 	var researchRuntimeOption workflow.ActivitiesOption
 	var researchDeliveryOption workflow.ActivitiesOption
-	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
-		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+	if shouldInitializeResearchV3Runtime(cfg) {
 		researchControlStore, err = store.NewServerRuntimeWithResearchRuntimeCapability(
 			ctx, cfg.DB.ResearchControlURL, cfg.DB.ResearchRuntimeURL,
 			store.ResearchRunCapabilityConfigV1{
@@ -181,9 +180,7 @@ func run() error {
 				return current.Bundle, current.Tools, current.Model, nil
 			},
 			func(identity types.RunIdentity) bool {
-				return identity.TaskID != "" &&
-					(identity.TaskID == cfg.Pipeline.ResearchV3ShadowCanaryScheduleID ||
-						identity.TaskID == cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID)
+				return researchV3RuntimeAdmissionAllowed(cfg, identity)
 			},
 		)
 		if runtimeErr != nil {
@@ -246,7 +243,7 @@ func run() error {
 	score := scorer.New(llmClient, recorder, st, hints)
 	cards := cardgen.New(llmClient, recorder, hints)
 	push := pusher.New(manager)
-	if cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+	if shouldEnableResearchV3Delivery(cfg) {
 		delivery, deliveryErr := workflow.NewReceiptBackedResearchDeliveryV3(
 			researchControlStore, push,
 			newResearchV3DeliveryTargetResolver(researchControlStore, manager),
@@ -545,7 +542,10 @@ func run() error {
 		closeStores()
 		return fmt.Errorf("装配周期 Brief recovery: %w", err)
 	}
-	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
+	creationCoordinator := task.NewCreationCoordinator(
+		st, sched, slog.Default(),
+		task.WithResearchV3CreationPolicy(nativeResearchV3CreationPolicy()),
+	)
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns
 	// recovery for durable operations left by a prior process. The coordinator is
 	// intentionally retained only in this composition root: it is not injected
@@ -777,7 +777,11 @@ func run() error {
 			agent.NewQueryMyIntelligenceTool(st),
 			agent.NewAuthorizedUpdateProfileTool(st, authorizer),
 			agent.NewManageTasksTool(agent.ManageTasksDeps{
-				Queries: st, Runner: sched, Deleter: sched,
+				Queries: st,
+				Creator: agent.NewResearchTaskCreationV3Executor(
+					creationCoordinator,
+				),
+				Runner: sched, Deleter: sched,
 				Authorizer: authorizer,
 			}))
 	}

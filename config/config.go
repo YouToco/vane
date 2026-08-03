@@ -1045,7 +1045,8 @@ func (c *Config) Validate() error {
 		return errors.New("config: fetch compiled credential generation 必须为正数")
 	}
 	if c.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
-		c.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
+		c.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" ||
+		c.Agent.AgentFirstOwnerCanary {
 		if strings.TrimSpace(c.DB.ResearchRuntimeURL) == "" {
 			return errors.New("config: Research V3 runtime 要求 db.research_runtime_url")
 		}

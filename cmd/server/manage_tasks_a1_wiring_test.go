@@ -10,9 +10,8 @@ import (
 )
 
 // TestAgentFirstManageTasksDoesNotReuseLegacyEditController pins the A1
-// composition boundary. Native V3 create is deliberately unwired in this
-// checkpoint; the server must not fill that gap with the V1 create or edit
-// coordinators, and edit must not re-enter manage_tasks as a hidden dependency.
+// composition boundary. Create must enter through the narrow native V3
+// adapter, never through V1 create_schedule or the definition-edit controller.
 func TestAgentFirstManageTasksDoesNotReuseLegacyEditController(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -41,6 +40,7 @@ func TestAgentFirstManageTasksDoesNotReuseLegacyEditController(t *testing.T) {
 		t.Fatalf("NewManageTasksTool production calls=%d, want 1", len(literals))
 	}
 	fields := make(map[string]bool)
+	creatorWired := false
 	for _, element := range literals[0].Elts {
 		pair, ok := element.(*ast.KeyValueExpr)
 		if !ok {
@@ -51,13 +51,62 @@ func TestAgentFirstManageTasksDoesNotReuseLegacyEditController(t *testing.T) {
 			t.Fatalf("ManageTasksDeps key=%T", pair.Key)
 		}
 		fields[key.Name] = true
-		if key.Name == "Creator" || key.Name == "Edits" {
-			t.Fatalf("A1 server wired forbidden/unready manage_tasks dependency %s", key.Name)
+		if key.Name == "Edits" {
+			t.Fatalf("A1 server wired retired manage_tasks dependency %s", key.Name)
+		}
+		if key.Name == "Creator" {
+			call, ok := pair.Value.(*ast.CallExpr)
+			if !ok || !isPackageSelector(call.Fun, "agent", "NewResearchTaskCreationV3Executor") ||
+				len(call.Args) != 1 {
+				t.Fatalf("Creator=%T, want native V3 adapter call", pair.Value)
+			}
+			controller, ok := call.Args[0].(*ast.Ident)
+			creatorWired = ok && controller.Name == "creationCoordinator"
 		}
 	}
-	for _, required := range []string{"Queries", "Runner", "Deleter", "Authorizer"} {
+	for _, required := range []string{"Queries", "Creator", "Runner", "Deleter", "Authorizer"} {
 		if !fields[required] {
 			t.Errorf("ManageTasksDeps missing %s: %v", required, fields)
 		}
+	}
+	if !creatorWired {
+		t.Fatal("manage_tasks Creator is not bound to creationCoordinator through the native V3 adapter")
+	}
+}
+
+func TestNativeV3CreationPolicyIsInjectedIntoProductionCoordinator(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate manage_tasks wiring test")
+	}
+	file, err := parser.ParseFile(token.NewFileSet(),
+		filepath.Join(filepath.Dir(testFile), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wired := false
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || !isPackageSelector(call.Fun, "task", "NewCreationCoordinator") {
+			return true
+		}
+		if len(call.Args) != 4 {
+			t.Fatalf("NewCreationCoordinator args=%d, want V3 policy option", len(call.Args))
+		}
+		option, ok := call.Args[3].(*ast.CallExpr)
+		if !ok || !isPackageSelector(option.Fun, "task", "WithResearchV3CreationPolicy") ||
+			len(option.Args) != 1 {
+			t.Fatalf("creation option=%T, want WithResearchV3CreationPolicy", call.Args[3])
+		}
+		policy, ok := option.Args[0].(*ast.CallExpr)
+		if !ok || len(policy.Args) != 0 {
+			t.Fatalf("V3 creation policy=%T, want zero-arg trusted server policy", option.Args[0])
+		}
+		name, ok := policy.Fun.(*ast.Ident)
+		wired = ok && name.Name == "nativeResearchV3CreationPolicy"
+		return true
+	})
+	if !wired {
+		t.Fatal("production CreationCoordinator lacks trusted native V3 creation policy")
 	}
 }

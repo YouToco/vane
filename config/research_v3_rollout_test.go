@@ -151,6 +151,36 @@ func TestResearchV3ShadowRequiresCompleteRuntime(t *testing.T) {
 	}
 }
 
+func TestAgentFirstOwnerCanaryRequiresCompleteResearchV3Runtime(t *testing.T) {
+	ready := readyResearchV3ShadowConfig()
+	ready.Pipeline.ResearchV3ShadowCanaryScheduleID = ""
+	ready.Agent.AgentFirstOwnerCanary = true
+	ready.Agent.AgentFirstCanaryUserID = 42
+	if err := ready.Validate(); err != nil {
+		t.Fatalf("ready Agent-first owner canary rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "runtime URL", mutate: func(c *Config) { c.DB.ResearchRuntimeURL = "" }},
+		{name: "control URL", mutate: func(c *Config) { c.DB.ResearchControlURL = "" }},
+		{name: "active key ID", mutate: func(c *Config) { c.DB.ResearchCapabilityKeyID = "" }},
+		{name: "active key hex", mutate: func(c *Config) { c.DB.ResearchCapabilityKeyHex = "" }},
+		{name: "Exa key", mutate: func(c *Config) { c.Fetch.ExaAPIKey = " " }},
+	}
+	for _, tc := range tests {
+		t.Run("missing "+tc.name, func(t *testing.T) {
+			cfg := ready
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("Agent-first owner canary accepted missing %s", tc.name)
+			}
+		})
+	}
+}
+
 func TestEnvOnlyResearchV3ShadowCanary(t *testing.T) {
 	clearVaneEnv(t)
 	skipIfSystemConfigExists(t)
