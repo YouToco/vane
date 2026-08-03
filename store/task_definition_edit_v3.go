@@ -247,10 +247,6 @@ func (s *Store) beginResearchTaskDefinitionEditTxV3(
 			return nil, taskDefinitionEditDatabaseError("set native V3 edit scope", err)
 		}
 	}
-	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_edit_coordinator`); err != nil {
-		rollbackTaskDefinitionEditTx(ctx, tx)
-		return nil, taskDefinitionEditDatabaseError("enter native V3 edit role", err)
-	}
 	return tx, nil
 }
 
@@ -292,14 +288,7 @@ func loadResearchTaskDefinitionEditBasisV3Tx(
 	taskID string,
 	lock bool,
 ) (*types.ResearchTaskDefinitionEditBasisV3, error) {
-	if err := validateResearchTaskDefinitionEditActiveOwnerV3(
-		ctx, tx, tenantID, userID); err != nil {
-		return nil, err
-	}
-	lockClause := ""
-	if lock {
-		lockClause = " FOR UPDATE OF schedule FOR SHARE OF definition,playbook,authority"
-	}
+	_ = lock
 	var status string
 	var version, generation int64
 	var digest, targetActionDigest, authorizationDigest string
@@ -307,39 +296,14 @@ func loadResearchTaskDefinitionEditBasisV3Tx(
 	var scheduleName string
 	var scheduleSpec []byte
 	var manual string
+	var provenanceKind string
+	var provenance []byte
 	err := tx.QueryRow(ctx, `
-		SELECT schedule.status,schedule.approved_definition_version,
-		       schedule.approved_definition_digest,definition.payload,
-		       schedule.nl_description,schedule.spec_json::text::bytea,
-		       playbook.content,authority.generation,
-		       authority.target_action_digest,
-		       authority.action_authorization_digest
-		  FROM schedules schedule
-		  JOIN schedule_playbooks playbook ON playbook.schedule_id=schedule.id
-		  JOIN task_approved_definition_versions definition
-		    ON definition.tenant_id=schedule.tenant_id
-		   AND definition.user_id=schedule.user_id
-		   AND definition.task_id=schedule.id
-		   AND definition.version=schedule.approved_definition_version
-		   AND definition.definition_digest=schedule.approved_definition_digest
-		  JOIN research_v3_delivery_authorities authority
-		    ON authority.tenant_id=schedule.tenant_id
-		   AND authority.user_id=schedule.user_id
-		   AND authority.task_id=schedule.id
-		   AND authority.definition_version=schedule.approved_definition_version
-		   AND authority.definition_digest=schedule.approved_definition_digest
-		   AND authority.status='enabled'
-		 WHERE schedule.tenant_id=$1 AND schedule.user_id=$2 AND schedule.id=$3
-		   AND schedule.execution_mode='discover_at_run'
-		   AND schedule.status IN ('active','paused')
-		   AND schedule.scope_json='{}'::jsonb
-		   AND playbook.fetch_plan='{}'::jsonb
-		   AND schedule.definition_edit_operation_id IS NULL
-		   AND schedule.definition_edit_fence IS NULL
-		   AND definition.schema_version='vane.task-approved-definition/v3'`+lockClause,
+		SELECT * FROM load_native_research_v3_edit_basis_v1($1,$2,$3)`,
 		tenantID, userID, taskID).Scan(
 		&status, &version, &digest, &payload, &scheduleName, &scheduleSpec,
-		&manual, &generation, &targetActionDigest, &authorizationDigest)
+		&manual, &generation, &targetActionDigest, &authorizationDigest,
+		&provenanceKind, &provenance)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, taskDefinitionEditNotFound()
 	}
@@ -361,10 +325,17 @@ func loadResearchTaskDefinitionEditBasisV3Tx(
 	if err != nil || wantDigest != digest {
 		return nil, taskDefinitionEditIntegrity()
 	}
-	preparedBytes, err := loadCurrentResearchPreparedScheduleV3Tx(
-		ctx, tx, tenantID, userID, taskID, version, digest)
-	if err != nil {
-		return nil, err
+	preparedBytes := bytes.Clone(provenance)
+	if provenanceKind == "edit" {
+		preparedEdit, _, _, _, _, decodeErr :=
+			decodePreparedResearchTaskEditV3Store(provenance)
+		if decodeErr != nil || preparedEdit.TargetDefinitionVersion != version ||
+			preparedEdit.TargetDefinitionDigest != digest {
+			return nil, taskDefinitionEditIntegrity()
+		}
+		preparedBytes = bytes.Clone(preparedEdit.Target)
+	} else if provenanceKind != "creation" || version != 1 {
+		return nil, taskDefinitionEditIntegrity()
 	}
 	prepared, preparedIdentity, err := decodePreparedResearchTaskScheduleV3Store(
 		preparedBytes)
@@ -383,62 +354,6 @@ func loadResearchTaskDefinitionEditBasisV3Tx(
 		AuthorityGeneration: generation, TargetActionDigest: targetActionDigest,
 		ActionAuthorizationDigest: authorizationDigest,
 	}, nil
-}
-
-func loadCurrentResearchPreparedScheduleV3Tx(
-	ctx context.Context,
-	tx pgx.Tx,
-	tenantID, userID int64,
-	taskID string,
-	version int64,
-	digest string,
-) ([]byte, error) {
-	var preparedEdit []byte
-	err := tx.QueryRow(ctx, `
-		SELECT prepared_edit
-		  FROM task_definition_edit_operations
-		 WHERE operation_protocol=$1 AND tenant_id=$2 AND user_id=$3
-		   AND task_id=$4 AND target_definition_version=$5
-		   AND target_definition_digest=$6 AND status='completed'
-		   AND phase='temporal_target_restored' AND tombstoned_at IS NOT NULL
-		 ORDER BY created_at DESC,id DESC LIMIT 1`,
-		types.TaskDefinitionEditProtocolResearchV3, tenantID, userID,
-		taskID, version, digest).Scan(&preparedEdit)
-	if err == nil {
-		prepared, _, _, _, _, decodeErr := decodePreparedResearchTaskEditV3Store(
-			preparedEdit)
-		if decodeErr != nil || prepared.TargetDefinitionVersion != version ||
-			prepared.TargetDefinitionDigest != digest {
-			return nil, taskDefinitionEditIntegrity()
-		}
-		return bytes.Clone(prepared.Target), nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, taskDefinitionEditDatabaseError("load completed native V3 edit provenance", err)
-	}
-	var preparedSchedule []byte
-	err = tx.QueryRow(ctx, `
-		SELECT prepared_schedule
-		  FROM task_creation_operations
-		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
-		   AND execution_version=$4 AND tool_name='manage_tasks'
-		   AND status='executed' AND phase='completed'
-		   AND tombstoned_at IS NOT NULL AND compiled_digest=$5
-		 ORDER BY created_at DESC,id DESC LIMIT 1`, tenantID, userID, taskID,
-		types.TaskCreationExecutionVersionV2, digest).Scan(&preparedSchedule)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, taskDefinitionEditConflict(
-			"native V3 prepared Schedule provenance is unavailable")
-	}
-	if err != nil {
-		return nil, taskDefinitionEditDatabaseError("load native V3 creation provenance", err)
-	}
-	_, preparedIdentity, err := decodePreparedResearchTaskScheduleV3Store(
-		preparedSchedule)
-	if err != nil || version != 1 || preparedIdentity.PreparedDigest != digest {
-		return nil, taskDefinitionEditIntegrity()
-	}
-	return bytes.Clone(preparedSchedule), nil
 }
 
 func jsonBytesSemanticEqual(left, right []byte) bool {
@@ -538,34 +453,19 @@ func (s *Store) CreateResearchTaskDefinitionEditOperationV3(
 		basis.ActionAuthorizationDigest != preparedBase.ActionAuthorizationDigest {
 		return nil, taskDefinitionEditConflict("native V3 edit base changed")
 	}
-	var sessionActive bool
-	if err := tx.QueryRow(ctx, `
-		SELECT true FROM agent_sessions
-		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND status='active'
-		 FOR SHARE`, p.SessionID, p.TenantID, p.UserID).Scan(&sessionActive); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, taskDefinitionEditValidation("native V3 edit session is inactive")
-		}
-		return nil, taskDefinitionEditDatabaseError("validate native V3 edit session", err)
-	}
 	expiresAt := p.ExpiresAt.UTC().Truncate(time.Microsecond)
 	var op types.TaskDefinitionEditOperation
 	err = scanTaskDefinitionEditOperation(tx.QueryRow(ctx, `
-		INSERT INTO task_definition_edit_operations (
-		 id,operation_protocol,tenant_id,user_id,target_tenant_id,target_user_id,
-		 task_id,session_id,operation_ref,expires_at,original_status,
-		 base_definition_version,base_definition_digest,base_definition,
-		 target_definition_version,target_definition_digest,target_definition,
-		 canonical_proposal,proposal_digest,prepared_edit,prepared_edit_digest,
-		 base_snapshot,base_snapshot_digest)
-		VALUES ($1,$2,$3,$4,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-		        $16,$17,$18,$19,$20,$21)
-		RETURNING `+taskDefinitionEditOperationColumns,
-		p.ID, types.TaskDefinitionEditProtocolResearchV3, p.TenantID, p.UserID,
-		p.TaskID, p.SessionID, "agent_auto/v3:"+p.ID, expiresAt, originalStatus,
-		p.BaseVersion, baseDigest, p.BaseDefinition, p.TargetVersion, targetDigest,
-		p.TargetDefinition, proposalBytes, proposalDigest, p.PreparedEdit,
-		preparedDigest, p.BaseSnapshot, snapshotDigest), &op)
+		SELECT `+taskDefinitionEditOperationColumns+`
+		  FROM seal_native_research_v3_edit_v1(
+		   $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+		   $19,$20,$21,$22)`,
+		p.ID, p.TenantID, p.UserID, p.TaskID, p.SessionID, expiresAt,
+		originalStatus, p.BaseVersion, baseDigest, p.BaseDefinition,
+		p.TargetVersion, targetDigest, p.TargetDefinition, proposalBytes,
+		proposalDigest, p.PreparedEdit, preparedDigest, p.BaseSnapshot,
+		snapshotDigest, basePrepared, preparedBase.TargetActionDigest,
+		preparedBase.ActionAuthorizationDigest), &op)
 	if err != nil {
 		return nil, taskDefinitionEditDatabaseError("create native V3 edit operation", err)
 	}
@@ -590,6 +490,13 @@ func (s *Store) LoadResearchTaskDefinitionEditOperationV3(
 	ctx context.Context,
 	scope types.TaskDefinitionEditScope,
 ) (*types.TaskDefinitionEditOperation, error) {
+	return s.loadResearchTaskDefinitionEditOperationV3(ctx, scope)
+}
+
+func (s *Store) loadResearchTaskDefinitionEditOperationV3(
+	ctx context.Context,
+	scope types.TaskDefinitionEditScope,
+) (*types.TaskDefinitionEditOperation, error) {
 	if !validTaskDefinitionEditScope(scope) {
 		return nil, taskDefinitionEditValidation("native V3 edit scope is invalid")
 	}
@@ -602,11 +509,8 @@ func (s *Store) LoadResearchTaskDefinitionEditOperationV3(
 	var op types.TaskDefinitionEditOperation
 	err = scanTaskDefinitionEditOperation(tx.QueryRow(ctx, `SELECT `+
 		taskDefinitionEditOperationColumns+`
-		 FROM task_definition_edit_operations
-		 WHERE id=$1 AND operation_protocol=$2 AND tenant_id=$3 AND user_id=$4
-		   AND target_tenant_id=$3 AND target_user_id=$4 AND task_id=$5`,
-		scope.ID, types.TaskDefinitionEditProtocolResearchV3,
-		scope.TenantID, scope.UserID, scope.TaskID), &op)
+		 FROM load_native_research_v3_edit_operation_v1($1,$2,$3,$4)`,
+		scope.ID, scope.TenantID, scope.UserID, scope.TaskID), &op)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, taskDefinitionEditNotFound()
 	}
@@ -617,6 +521,54 @@ func (s *Store) LoadResearchTaskDefinitionEditOperationV3(
 		return nil, taskDefinitionEditDatabaseError("commit native V3 edit load", err)
 	}
 	return cloneTaskDefinitionEditOperation(&op), nil
+}
+
+// AcquireResearchTaskDefinitionEditOperationV3 starts or takes over the exact
+// native V3 operation through the protocol-specific capability boundary.
+func (s *Store) AcquireResearchTaskDefinitionEditOperationV3(
+	ctx context.Context,
+	p types.AcquireTaskDefinitionEditOperationParams,
+) (*types.TaskDefinitionEditOperation, error) {
+	if err := validateTaskDefinitionEditAcquire(p); err != nil {
+		return nil, err
+	}
+	if p.Scope.TargetTenantID != p.Scope.TenantID ||
+		p.Scope.TargetUserID != p.Scope.UserID {
+		return nil, taskDefinitionEditValidation("native V3 edit target scope differs")
+	}
+	tx, err := s.beginResearchTaskDefinitionEditTxV3(
+		ctx, p.Scope.TenantID, p.Scope.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rollbackTaskDefinitionEditTx(ctx, tx)
+	var op types.TaskDefinitionEditOperation
+	err = scanTaskDefinitionEditOperation(tx.QueryRow(ctx, `SELECT `+
+		taskDefinitionEditOperationColumns+`
+		 FROM acquire_native_research_v3_edit_v1($1,$2,$3,$4,$5,$6,$7,$8)`,
+		p.Scope.ID, p.Scope.TenantID, p.Scope.UserID, p.Scope.TaskID,
+		p.LeaseOwner, p.LeaseDuration.Microseconds(), p.ReceiptProvider,
+		p.ReceiptTarget), &op)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, taskDefinitionEditNotFound()
+	}
+	if err != nil {
+		return nil, taskDefinitionEditDatabaseError("acquire native V3 edit", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskDefinitionEditDatabaseError("commit native V3 edit acquisition", err)
+	}
+	copy := cloneTaskDefinitionEditOperation(&op)
+	if taskDefinitionEditOperationIsTerminal(op.Status) || op.TombstonedAt != nil {
+		return copy, taskDefinitionEditTerminal()
+	}
+	if op.Status != types.TaskDefinitionEditOperationStatusExecuting {
+		return copy, taskDefinitionEditIntegrity()
+	}
+	if op.LeaseOwner != p.LeaseOwner {
+		return copy, taskDefinitionEditBusy()
+	}
+	return copy, nil
 }
 
 func decodeResearchTaskDefinitionEditOperationV3(
@@ -651,22 +603,10 @@ func (s *Store) QuiesceResearchTaskDefinitionEditV3(
 	if err := validateTaskDefinitionEditLease(lease); err != nil {
 		return err
 	}
-	tx, err := s.beginResearchTaskDefinitionEditTxV3(
-		ctx, lease.TenantID, lease.UserID)
-	if err != nil {
-		return err
-	}
-	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	if err := lockTaskScheduleMutation(ctx, tx, lease.TaskID); err != nil {
-		return err
-	}
-	schedule, err := lockTaskDefinitionEditScheduleForUpdate(
-		ctx, tx, lease.TargetTenantID, lease.TargetUserID, lease.TaskID)
-	if err != nil {
-		return err
-	}
-	op, _, err := loadLeasedTaskDefinitionEditOperationProtocol(
-		ctx, tx, lease, types.TaskDefinitionEditProtocolResearchV3)
+	op, err := s.loadResearchTaskDefinitionEditOperationV3(ctx,
+		types.TaskDefinitionEditScope{ID: lease.ID, TenantID: lease.TenantID,
+			UserID: lease.UserID, TargetTenantID: lease.TargetTenantID,
+			TargetUserID: lease.TargetUserID, TaskID: lease.TaskID})
 	if err != nil {
 		return err
 	}
@@ -674,97 +614,21 @@ func (s *Store) QuiesceResearchTaskDefinitionEditV3(
 	if err != nil {
 		return err
 	}
-	if op.Phase == types.TaskDefinitionEditPhaseDBQuiesced {
-		if assessTaskDefinitionEditScheduleProtocol(op, schedule,
-			types.TaskDefinitionEditProtocolResearchV3) != taskDefinitionEditScheduleExact {
-			return taskDefinitionEditConflict("native V3 quiesce replay differs")
-		}
-		return verifyResearchTaskDefinitionEditAuthorityV3(
-			ctx, tx, op, op.BaseDefinitionVersion, op.BaseDefinitionDigest,
-			base.TargetActionDigest, base.ActionAuthorizationDigest, "revoked")
-	}
-	if op.Phase != types.TaskDefinitionEditPhaseProposalSealed ||
-		assessTaskDefinitionEditScheduleProtocol(op, schedule,
-			types.TaskDefinitionEditProtocolResearchV3) != taskDefinitionEditScheduleExact {
-		return taskDefinitionEditConflict("native V3 edit is not quiesce-ready")
-	}
-	if err := validateResearchTaskDefinitionEditActiveOwnerV3(
-		ctx, tx, op.TenantID, op.UserID); err != nil {
+	tx, err := s.beginResearchTaskDefinitionEditTxV3(
+		ctx, lease.TenantID, lease.UserID)
+	if err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `
-		UPDATE research_v3_delivery_authorities
-		   SET status='revoked',revoked_at=clock_timestamp()
-		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
-		   AND definition_version=$4 AND definition_digest=$5
-		   AND target_action_digest=$6 AND action_authorization_digest=$7
-		   AND status='enabled' AND enabled_at IS NOT NULL AND revoked_at IS NULL`,
-		op.TenantID, op.UserID, op.TaskID, op.BaseDefinitionVersion,
-		op.BaseDefinitionDigest, base.TargetActionDigest,
+	defer rollbackTaskDefinitionEditTx(ctx, tx)
+	_, err = tx.Exec(ctx, `SELECT quiesce_native_research_v3_edit_v1(
+		$1,$2,$3,$4,$5,$6,$7,$8)`, lease.ID, lease.TenantID, lease.UserID,
+		lease.TaskID, lease.LeaseOwner, lease.Fence, base.TargetActionDigest,
 		base.ActionAuthorizationDigest)
 	if err != nil {
-		return taskDefinitionEditDatabaseError("revoke native V3 edit authority", err)
-	}
-	if tag.RowsAffected() != 1 {
-		return taskDefinitionEditConflict("native V3 base authority changed")
-	}
-	tag, err = tx.Exec(ctx, `
-		UPDATE schedules
-		   SET status=$7,definition_edit_operation_id=$8,
-		       definition_edit_fence=$9,updated_at=clock_timestamp()
-		 WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND status=$4
-		   AND execution_mode=$5 AND approved_definition_version=$6
-		   AND approved_definition_digest=$10
-		   AND definition_edit_operation_id IS NULL AND definition_edit_fence IS NULL`,
-		op.TenantID, op.UserID, op.TaskID, op.OriginalStatus,
-		types.ExecutionModeDiscoverAtRun, op.BaseDefinitionVersion,
-		types.ScheduleStatusPaused, op.ID, op.Fence, op.BaseDefinitionDigest)
-	if err != nil || tag.RowsAffected() != 1 {
-		if err == nil {
-			return taskDefinitionEditConflict("native V3 schedule changed during quiesce")
-		}
-		return taskDefinitionEditDatabaseError("quiesce native V3 schedule", err)
-	}
-	tag, err = tx.Exec(ctx, `
-		UPDATE task_definition_edit_operations SET phase=$7,updated_at=clock_timestamp()
-		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-		   AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
-		   AND operation_protocol=$8 AND status=$9 AND phase=$10
-		   AND tombstoned_at IS NULL AND lease_owner=$11 AND fence=$12
-		   AND lease_until>clock_timestamp()`, op.ID, op.TenantID, op.UserID,
-		op.TargetTenantID, op.TargetUserID, op.TaskID,
-		types.TaskDefinitionEditPhaseDBQuiesced,
-		types.TaskDefinitionEditProtocolResearchV3,
-		types.TaskDefinitionEditOperationStatusExecuting,
-		types.TaskDefinitionEditPhaseProposalSealed, lease.LeaseOwner, lease.Fence)
-	if err != nil || tag.RowsAffected() != 1 {
-		if err == nil {
-			return taskDefinitionEditLeaseLost()
-		}
-		return taskDefinitionEditDatabaseError("checkpoint native V3 quiesce", err)
+		return taskDefinitionEditDatabaseError("quiesce native V3 edit", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskDefinitionEditDatabaseError("commit native V3 quiesce", err)
-	}
-	return nil
-}
-
-func verifyResearchTaskDefinitionEditAuthorityV3(
-	ctx context.Context, tx pgx.Tx, op *types.TaskDefinitionEditOperation,
-	version int64, digest, targetActionDigest, authorizationDigest, status string,
-) error {
-	var count int
-	if err := tx.QueryRow(ctx, `
-		SELECT count(*) FROM research_v3_delivery_authorities
-		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
-		   AND definition_version=$4 AND definition_digest=$5
-		   AND target_action_digest=$6 AND action_authorization_digest=$7
-		   AND status=$8`, op.TenantID, op.UserID, op.TaskID, version, digest,
-		targetActionDigest, authorizationDigest, status).Scan(&count); err != nil {
-		return taskDefinitionEditDatabaseError("verify native V3 edit authority", err)
-	}
-	if count != 1 {
-		return taskDefinitionEditConflict("native V3 edit authority differs")
 	}
 	return nil
 }
@@ -780,39 +644,41 @@ func (s *Store) AuthorizeResearchTaskDefinitionEditRemotePhaseV3(
 	default:
 		return nil, taskDefinitionEditValidation("native V3 remote phase is invalid")
 	}
+	op, err := s.loadResearchTaskDefinitionEditOperationV3(ctx,
+		types.TaskDefinitionEditScope{ID: lease.ID, TenantID: lease.TenantID,
+			UserID: lease.UserID, TargetTenantID: lease.TargetTenantID,
+			TargetUserID: lease.TargetUserID, TaskID: lease.TaskID})
+	if err != nil {
+		return nil, err
+	}
+	_, _, target, err := decodeResearchTaskDefinitionEditOperationV3(op)
+	if err != nil {
+		return nil, err
+	}
 	tx, err := s.beginResearchTaskDefinitionEditTxV3(
 		ctx, lease.TenantID, lease.UserID)
 	if err != nil {
 		return nil, err
 	}
 	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	schedule, err := lockTaskDefinitionEditScheduleForUpdate(
-		ctx, tx, lease.TargetTenantID, lease.TargetUserID, lease.TaskID)
+	var authorized types.TaskDefinitionEditOperation
+	err = scanTaskDefinitionEditOperation(tx.QueryRow(ctx, `SELECT `+
+		taskDefinitionEditOperationColumns+`
+		 FROM authorize_native_research_v3_edit_remote_v1(
+		 $1,$2,$3,$4,$5,$6,$7,$8,$9)`, lease.ID, lease.TenantID,
+		lease.UserID, lease.TaskID, lease.LeaseOwner, lease.Fence,
+		expectedPhase, target.TargetActionDigest,
+		target.ActionAuthorizationDigest), &authorized)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, taskDefinitionEditLeaseLost()
+	}
 	if err != nil {
-		return nil, err
-	}
-	op, _, err := loadLeasedTaskDefinitionEditOperationProtocol(
-		ctx, tx, lease, types.TaskDefinitionEditProtocolResearchV3)
-	if err != nil {
-		return nil, err
-	}
-	_, _, target, err := decodeResearchTaskDefinitionEditOperationV3(op)
-	if err != nil || op.Phase != expectedPhase ||
-		assessTaskDefinitionEditScheduleProtocol(op, schedule,
-			types.TaskDefinitionEditProtocolResearchV3) != taskDefinitionEditScheduleExact {
-		return nil, taskDefinitionEditConflict("native V3 remote authority changed")
-	}
-	if expectedPhase != types.TaskDefinitionEditPhaseDBQuiesced {
-		if err := verifyResearchTaskDefinitionEditAuthorityV3(ctx, tx, op,
-			op.TargetDefinitionVersion, op.TargetDefinitionDigest,
-			target.TargetActionDigest, target.ActionAuthorizationDigest, "staged"); err != nil {
-			return nil, err
-		}
+		return nil, taskDefinitionEditDatabaseError("authorize native V3 remote phase", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, taskDefinitionEditDatabaseError("commit native V3 remote authority", err)
 	}
-	return cloneTaskDefinitionEditOperation(op), nil
+	return cloneTaskDefinitionEditOperation(&authorized), nil
 }
 
 type researchTaskDefinitionEditCheckpointV3 struct {
@@ -871,59 +737,32 @@ func (s *Store) checkpointResearchTaskDefinitionEditV3(
 	if len(snapshot) == 0 {
 		return taskDefinitionEditValidation("native V3 checkpoint is empty")
 	}
+	op, err := s.loadResearchTaskDefinitionEditOperationV3(ctx,
+		types.TaskDefinitionEditScope{ID: lease.ID, TenantID: lease.TenantID,
+			UserID: lease.UserID, TargetTenantID: lease.TargetTenantID,
+			TargetUserID: lease.TargetUserID, TaskID: lease.TaskID})
+	if err != nil {
+		return err
+	}
+	prepared, _, _, err := decodeResearchTaskDefinitionEditOperationV3(op)
+	if err != nil {
+		return err
+	}
+	decoded, decodeErr := decodeResearchTaskEditSnapshotV3Store(snapshot, prepared, op.TaskID)
+	if decodeErr != nil || decoded.Phase != cp.expectedPhase {
+		return taskDefinitionEditValidation("native V3 checkpoint evidence differs")
+	}
+	digest := sha256HexTaskDefinitionEdit(snapshot)
 	tx, err := s.beginResearchTaskDefinitionEditTxV3(ctx, lease.TenantID, lease.UserID)
 	if err != nil {
 		return err
 	}
 	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	schedule, err := lockTaskDefinitionEditScheduleForUpdate(
-		ctx, tx, lease.TargetTenantID, lease.TargetUserID, lease.TaskID)
+	_, err = tx.Exec(ctx, `SELECT checkpoint_native_research_v3_edit_v1(
+		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, lease.ID, lease.TenantID,
+		lease.UserID, lease.TaskID, lease.LeaseOwner, lease.Fence, cp.from,
+		cp.to, cp.column, snapshot, digest)
 	if err != nil {
-		return err
-	}
-	op, _, err := loadLeasedTaskDefinitionEditOperationProtocol(
-		ctx, tx, lease, types.TaskDefinitionEditProtocolResearchV3)
-	if err != nil {
-		return err
-	}
-	prepared, _, _, err := decodeResearchTaskDefinitionEditOperationV3(op)
-	decoded, decodeErr := decodeResearchTaskEditSnapshotV3Store(snapshot, prepared, op.TaskID)
-	digest := sha256HexTaskDefinitionEdit(snapshot)
-	existing, existingDigest := cp.get(op)
-	if decodeErr != nil || decoded.Phase != cp.expectedPhase {
-		return s.blockInvalidTaskDefinitionEditCheckpoint(ctx, tx, op, lease)
-	}
-	if op.Phase == cp.to {
-		if !bytes.Equal(existing, snapshot) || existingDigest != digest ||
-			assessTaskDefinitionEditScheduleProtocol(op, schedule,
-				types.TaskDefinitionEditProtocolResearchV3) != taskDefinitionEditScheduleExact {
-			return taskDefinitionEditConflict("native V3 checkpoint replay differs")
-		}
-		return nil
-	}
-	if op.Phase != cp.from || len(existing) != 0 || existingDigest != "" ||
-		assessTaskDefinitionEditScheduleProtocol(op, schedule,
-			types.TaskDefinitionEditProtocolResearchV3) != taskDefinitionEditScheduleExact {
-		return taskDefinitionEditConflict("native V3 checkpoint transition differs")
-	}
-	query := `UPDATE task_definition_edit_operations SET ` + cp.column +
-		`_snapshot=$7,` + cp.column + `_snapshot_digest=$8,phase=$9,
-		 updated_at=clock_timestamp()
-		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-		   AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
-		   AND operation_protocol=$10 AND status=$11 AND phase=$12
-		   AND tombstoned_at IS NULL AND lease_owner=$13 AND fence=$14
-		   AND lease_until>clock_timestamp() AND ` + cp.column +
-		`_snapshot IS NULL AND ` + cp.column + `_snapshot_digest=''`
-	tag, err := tx.Exec(ctx, query, op.ID, op.TenantID, op.UserID,
-		op.TargetTenantID, op.TargetUserID, op.TaskID, snapshot, digest, cp.to,
-		types.TaskDefinitionEditProtocolResearchV3,
-		types.TaskDefinitionEditOperationStatusExecuting, cp.from,
-		lease.LeaseOwner, lease.Fence)
-	if err != nil || tag.RowsAffected() != 1 {
-		if err == nil {
-			return taskDefinitionEditLeaseLost()
-		}
 		return taskDefinitionEditDatabaseError("write native V3 checkpoint", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -932,74 +771,16 @@ func (s *Store) checkpointResearchTaskDefinitionEditV3(
 	return nil
 }
 
-func verifyCommittedResearchTaskDefinitionEditV3(
-	ctx context.Context, tx pgx.Tx, op *types.TaskDefinitionEditOperation,
-	target preparedResearchTaskScheduleV3StoreView,
-) error {
-	var schema string
-	var mode types.ExecutionMode
-	var digest, operationRef, status, name, manual string
-	var payload, spec, scope, fetchPlan []byte
-	err := tx.QueryRow(ctx, `
-		SELECT definition.schema_version,definition.execution_mode,
-		       definition.definition_digest,definition.payload,
-		       definition.operation_ref,schedule.status,schedule.nl_description,
-		       schedule.spec_json::text::bytea,schedule.scope_json::text::bytea,
-		       playbook.content,playbook.fetch_plan::text::bytea
-		  FROM task_approved_definition_versions definition
-		  JOIN schedules schedule ON schedule.tenant_id=definition.tenant_id
-		   AND schedule.user_id=definition.user_id AND schedule.id=definition.task_id
-		  JOIN schedule_playbooks playbook ON playbook.schedule_id=schedule.id
-		 WHERE definition.tenant_id=$1 AND definition.user_id=$2
-		   AND definition.task_id=$3 AND definition.version=$4`,
-		op.TenantID, op.UserID, op.TaskID, op.TargetDefinitionVersion).Scan(
-		&schema, &mode, &digest, &payload, &operationRef, &status, &name,
-		&spec, &scope, &manual, &fetchPlan)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return taskDefinitionEditConflict("native V3 target definition is missing")
-	}
-	if err != nil {
-		return taskDefinitionEditDatabaseError("verify native V3 target definition", err)
-	}
-	definition, decodeErr := taskstate.DecodeApprovedDefinitionV3(payload)
-	if decodeErr != nil || schema != taskstate.ApprovedDefinitionSchemaVersionV3 ||
-		mode != types.ExecutionModeDiscoverAtRun || digest != op.TargetDefinitionDigest ||
-		operationRef != "definition-edit-v3/"+op.ID ||
-		!bytes.Equal(payload, op.TargetDefinition) || name != definition.TaskName ||
-		manual != definition.TaskManual || !jsonBytesSemanticEqual(spec, definition.SpecJSON) ||
-		!jsonBytesSemanticEqual(scope, []byte(`{}`)) ||
-		!jsonBytesSemanticEqual(fetchPlan, []byte(`{}`)) {
-		return taskDefinitionEditIntegrity()
-	}
-	if status != string(types.ScheduleStatusPaused) {
-		return taskDefinitionEditConflict("native V3 target schedule is not paused")
-	}
-	return verifyResearchTaskDefinitionEditAuthorityV3(ctx, tx, op,
-		op.TargetDefinitionVersion, op.TargetDefinitionDigest,
-		target.TargetActionDigest, target.ActionAuthorizationDigest, "staged")
-}
-
 func (s *Store) CommitResearchTaskDefinitionEditDefinitionV3(
 	ctx context.Context, lease types.TaskDefinitionEditLease,
 ) error {
 	if err := validateTaskDefinitionEditLease(lease); err != nil {
 		return err
 	}
-	tx, err := s.beginResearchTaskDefinitionEditTxV3(ctx, lease.TenantID, lease.UserID)
-	if err != nil {
-		return err
-	}
-	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	if err := lockTaskScheduleMutation(ctx, tx, lease.TaskID); err != nil {
-		return err
-	}
-	schedule, err := lockTaskDefinitionEditScheduleForUpdate(
-		ctx, tx, lease.TargetTenantID, lease.TargetUserID, lease.TaskID)
-	if err != nil {
-		return err
-	}
-	op, _, err := loadLeasedTaskDefinitionEditOperationProtocol(
-		ctx, tx, lease, types.TaskDefinitionEditProtocolResearchV3)
+	op, err := s.loadResearchTaskDefinitionEditOperationV3(ctx,
+		types.TaskDefinitionEditScope{ID: lease.ID, TenantID: lease.TenantID,
+			UserID: lease.UserID, TargetTenantID: lease.TargetTenantID,
+			TargetUserID: lease.TargetUserID, TaskID: lease.TaskID})
 	if err != nil {
 		return err
 	}
@@ -1007,133 +788,23 @@ func (s *Store) CommitResearchTaskDefinitionEditDefinitionV3(
 	if err != nil {
 		return err
 	}
-	if taskDefinitionEditPhaseHasCommittedDefinition(op.Phase) {
-		if assessTaskDefinitionEditScheduleProtocol(op, schedule,
-			types.TaskDefinitionEditProtocolResearchV3) != taskDefinitionEditScheduleExact {
-			return taskDefinitionEditConflict("native V3 definition replay differs")
-		}
-		if err := verifyCommittedResearchTaskDefinitionEditV3(
-			ctx, tx, op, target); err != nil {
-			return err
-		}
-		return nil
-	}
-	if op.Phase != types.TaskDefinitionEditPhaseTemporalBasePaused ||
-		assessTaskDefinitionEditScheduleProtocol(op, schedule,
-			types.TaskDefinitionEditProtocolResearchV3) != taskDefinitionEditScheduleExact {
-		return taskDefinitionEditConflict("native V3 definition is not commit-ready")
-	}
-	definition, err := taskstate.DecodeApprovedDefinitionV3(op.TargetDefinition)
+	tx, err := s.beginResearchTaskDefinitionEditTxV3(ctx, lease.TenantID, lease.UserID)
 	if err != nil {
-		return taskDefinitionEditIntegrity()
-	}
-	canonical, digest, err := canonicalResearchDefinitionV3(definition)
-	if err != nil || !bytes.Equal(canonical, op.TargetDefinition) ||
-		digest != op.TargetDefinitionDigest || definition.TenantID != op.TenantID ||
-		definition.UserID != op.UserID || definition.TaskID != op.TaskID ||
-		definition.ExecutionMode != types.ExecutionModeDiscoverAtRun {
-		return taskDefinitionEditIntegrity()
-	}
-	if err := verifyResearchTaskDefinitionEditAuthorityV3(ctx, tx, op,
-		op.BaseDefinitionVersion, op.BaseDefinitionDigest,
-		base.TargetActionDigest, base.ActionAuthorizationDigest, "revoked"); err != nil {
 		return err
 	}
-	var baseGeneration int64
-	if err := tx.QueryRow(ctx, `
-		SELECT generation FROM research_v3_delivery_authorities
-		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
-		   AND definition_version=$4 AND definition_digest=$5
-		   AND target_action_digest=$6 AND action_authorization_digest=$7
-		   AND status='revoked' FOR SHARE`, op.TenantID, op.UserID, op.TaskID,
-		op.BaseDefinitionVersion, op.BaseDefinitionDigest,
-		base.TargetActionDigest, base.ActionAuthorizationDigest).Scan(&baseGeneration); err != nil {
-		return taskDefinitionEditDatabaseError("load native V3 base generation", err)
-	}
-	if baseGeneration <= 0 {
-		return taskDefinitionEditIntegrity()
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO task_approved_definition_versions
-		 (tenant_id,user_id,task_id,version,schema_version,execution_mode,
-		  definition_digest,payload,operation_ref)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, op.TenantID, op.UserID, op.TaskID,
-		op.TargetDefinitionVersion, taskstate.ApprovedDefinitionSchemaVersionV3,
-		types.ExecutionModeDiscoverAtRun, op.TargetDefinitionDigest,
-		op.TargetDefinition, "definition-edit-v3/"+op.ID); err != nil {
-		return taskDefinitionEditDatabaseError("append native V3 target definition", err)
-	}
-	tag, err := tx.Exec(ctx, `
-		UPDATE schedules SET nl_description=$4,spec_json=$5::jsonb,
-		 approved_definition_version=$6,approved_definition_digest=$7,
-		 updated_at=clock_timestamp()
-		 WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND status='paused'
-		   AND execution_mode='discover_at_run'
-		   AND approved_definition_version=$8 AND approved_definition_digest=$9
-		   AND definition_edit_operation_id=$10 AND definition_edit_fence=$11
-		   AND scope_json='{}'::jsonb`, op.TenantID, op.UserID, op.TaskID,
-		definition.TaskName, string(definition.SpecJSON), op.TargetDefinitionVersion,
-		op.TargetDefinitionDigest, op.BaseDefinitionVersion, op.BaseDefinitionDigest,
-		op.ID, op.Fence)
-	if err != nil || tag.RowsAffected() != 1 {
-		if err == nil {
-			return taskDefinitionEditConflict("native V3 schedule head changed")
-		}
-		return taskDefinitionEditDatabaseError("advance native V3 schedule head", err)
-	}
-	tag, err = tx.Exec(ctx, `
-		UPDATE schedule_playbooks SET content=$2
-		 WHERE schedule_id=$1 AND fetch_plan='{}'::jsonb`, op.TaskID,
-		definition.TaskManual)
-	if err != nil || tag.RowsAffected() != 1 {
-		if err == nil {
-			return taskDefinitionEditConflict("native V3 task manual changed")
-		}
-		return taskDefinitionEditDatabaseError("update native V3 task manual", err)
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO research_v3_delivery_authorities
-		 (tenant_id,user_id,task_id,generation,definition_version,
-		  definition_digest,target_action_digest,action_authorization_digest,status)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'staged')`, op.TenantID, op.UserID,
-		op.TaskID, baseGeneration+1, op.TargetDefinitionVersion,
-		op.TargetDefinitionDigest, target.TargetActionDigest,
-		target.ActionAuthorizationDigest); err != nil {
-		return taskDefinitionEditDatabaseError("stage native V3 target authority", err)
-	}
-	tag, err = tx.Exec(ctx, `
-		UPDATE task_definition_edit_operations SET phase=$7,updated_at=clock_timestamp()
-		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-		   AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
-		   AND operation_protocol=$8 AND status=$9 AND phase=$10
-		   AND tombstoned_at IS NULL AND lease_owner=$11 AND fence=$12
-		   AND lease_until>clock_timestamp()`, op.ID, op.TenantID, op.UserID,
-		op.TargetTenantID, op.TargetUserID, op.TaskID,
-		types.TaskDefinitionEditPhaseDefinitionCommitted,
-		types.TaskDefinitionEditProtocolResearchV3,
-		types.TaskDefinitionEditOperationStatusExecuting,
-		types.TaskDefinitionEditPhaseTemporalBasePaused,
-		lease.LeaseOwner, lease.Fence)
-	if err != nil || tag.RowsAffected() != 1 {
-		if err == nil {
-			return taskDefinitionEditLeaseLost()
-		}
-		return taskDefinitionEditDatabaseError("checkpoint native V3 definition", err)
+	defer rollbackTaskDefinitionEditTx(ctx, tx)
+	_, err = tx.Exec(ctx, `SELECT commit_native_research_v3_edit_definition_v1(
+		$1,$2,$3,$4,$5,$6,$7,$8,$9)`, lease.ID, lease.TenantID,
+		lease.UserID, lease.TaskID, lease.LeaseOwner, lease.Fence,
+		base.TargetActionDigest, target.TargetActionDigest,
+		target.ActionAuthorizationDigest)
+	if err != nil {
+		return taskDefinitionEditDatabaseError("commit native V3 definition", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskDefinitionEditDatabaseError("commit native V3 definition", err)
 	}
 	return nil
-}
-
-func researchTaskDefinitionEditCompletedScheduleExactV3(
-	op *types.TaskDefinitionEditOperation, schedule *taskDefinitionEditScheduleRow,
-) bool {
-	return schedule != nil && schedule.Status == op.OriginalStatus &&
-		schedule.Mode == types.ExecutionModeDiscoverAtRun &&
-		schedule.Version != nil && *schedule.Version == op.TargetDefinitionVersion &&
-		schedule.Digest != nil && *schedule.Digest == op.TargetDefinitionDigest &&
-		schedule.OperationID == nil && schedule.Fence == nil
 }
 
 func (s *Store) CompleteResearchTaskDefinitionEditOperationV3(
@@ -1143,25 +814,10 @@ func (s *Store) CompleteResearchTaskDefinitionEditOperationV3(
 	if err != nil {
 		return err
 	}
-	tx, err := s.beginResearchTaskDefinitionEditTxV3(ctx, lease.TenantID, lease.UserID)
-	if err != nil {
-		return err
-	}
-	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	if err := lockTaskScheduleMutation(ctx, tx, lease.TaskID); err != nil {
-		return err
-	}
-	schedule, err := lockTaskDefinitionEditScheduleForUpdate(
-		ctx, tx, lease.TargetTenantID, lease.TargetUserID, lease.TaskID)
-	if err != nil {
-		return err
-	}
-	op, err := loadTaskDefinitionEditOperationForUpdateProtocol(ctx, tx,
-		types.TaskDefinitionEditScope{
-			ID: lease.ID, TenantID: lease.TenantID, UserID: lease.UserID,
-			TargetTenantID: lease.TargetTenantID,
-			TargetUserID:   lease.TargetUserID, TaskID: lease.TaskID,
-		}, types.TaskDefinitionEditProtocolResearchV3)
+	op, err := s.loadResearchTaskDefinitionEditOperationV3(ctx,
+		types.TaskDefinitionEditScope{ID: lease.ID, TenantID: lease.TenantID,
+			UserID: lease.UserID, TargetTenantID: lease.TargetTenantID,
+			TargetUserID: lease.TargetUserID, TaskID: lease.TaskID})
 	if err != nil {
 		return err
 	}
@@ -1169,76 +825,18 @@ func (s *Store) CompleteResearchTaskDefinitionEditOperationV3(
 	if err != nil {
 		return err
 	}
-	if op.Status == types.TaskDefinitionEditOperationStatusCompleted {
-		storedResult, storedErr := canonicalTaskDefinitionEditResult(op.Result)
-		if op.Phase != types.TaskDefinitionEditPhaseTemporalTargetRestored ||
-			op.Fence != lease.Fence || op.TombstonedAt == nil || op.LeaseOwner != "" ||
-			op.LeaseUntil != nil || op.TakeoverNotBefore != nil || storedErr != nil ||
-			!bytes.Equal(storedResult, canonicalResult) ||
-			!researchTaskDefinitionEditCompletedScheduleExactV3(op, schedule) {
-			return taskDefinitionEditConflict("native V3 completion replay differs")
-		}
-		if err := verifyResearchTaskDefinitionEditAuthorityV3(ctx, tx, op,
-			op.TargetDefinitionVersion, op.TargetDefinitionDigest,
-			target.TargetActionDigest, target.ActionAuthorizationDigest, "enabled"); err != nil {
-			return err
-		}
-		return verifyTaskDefinitionEditReceiptForTerminal(
-			ctx, tx, op.ID, op.TenantID, op.UserID)
-	}
-	if op.Status != types.TaskDefinitionEditOperationStatusExecuting ||
-		op.Phase != types.TaskDefinitionEditPhaseTemporalTargetRestored ||
-		assessTaskDefinitionEditScheduleProtocol(op, schedule,
-			types.TaskDefinitionEditProtocolResearchV3) != taskDefinitionEditScheduleExact {
-		return taskDefinitionEditConflict("native V3 operation is not completion-ready")
-	}
-	databaseNow, err := taskDefinitionEditDatabaseClock(ctx, tx)
+	tx, err := s.beginResearchTaskDefinitionEditTxV3(ctx, lease.TenantID, lease.UserID)
 	if err != nil {
 		return err
 	}
-	if err := validateLoadedTaskDefinitionEditLease(op, databaseNow, lease); err != nil {
-		return err
-	}
-	if err := verifyResearchTaskDefinitionEditAuthorityV3(ctx, tx, op,
-		op.TargetDefinitionVersion, op.TargetDefinitionDigest,
-		target.TargetActionDigest, target.ActionAuthorizationDigest, "staged"); err != nil {
-		return err
-	}
-	tag, err := tx.Exec(ctx, `
-		UPDATE schedules SET status=$4,definition_edit_operation_id=NULL,
-		 definition_edit_fence=NULL,updated_at=clock_timestamp()
-		 WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND status='paused'
-		   AND definition_edit_operation_id=$5 AND definition_edit_fence=$6
-		   AND execution_mode='discover_at_run'
-		   AND approved_definition_version=$7 AND approved_definition_digest=$8`,
-		op.TenantID, op.UserID, op.TaskID, op.OriginalStatus, op.ID, op.Fence,
-		op.TargetDefinitionVersion, op.TargetDefinitionDigest)
-	if err != nil || tag.RowsAffected() != 1 {
-		if err == nil {
-			return taskDefinitionEditConflict("native V3 schedule changed during completion")
-		}
-		return taskDefinitionEditDatabaseError("restore native V3 schedule status", err)
-	}
-	tag, err = tx.Exec(ctx, `
-		UPDATE research_v3_delivery_authorities
-		   SET status='enabled',enabled_at=clock_timestamp()
-		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
-		   AND definition_version=$4 AND definition_digest=$5
-		   AND target_action_digest=$6 AND action_authorization_digest=$7
-		   AND status='staged' AND enabled_at IS NULL AND revoked_at IS NULL`,
-		op.TenantID, op.UserID, op.TaskID, op.TargetDefinitionVersion,
-		op.TargetDefinitionDigest, target.TargetActionDigest,
-		target.ActionAuthorizationDigest)
-	if err != nil || tag.RowsAffected() != 1 {
-		if err == nil {
-			return taskDefinitionEditConflict("native V3 target authority changed")
-		}
-		return taskDefinitionEditDatabaseError("enable native V3 target authority", err)
-	}
-	if _, err := terminateTaskDefinitionEditTx(ctx, tx, op,
-		types.TaskDefinitionEditOperationStatusCompleted, "", "",
-		canonicalResult, true, &lease); err != nil {
-		return err
+	defer rollbackTaskDefinitionEditTx(ctx, tx)
+	_, err = tx.Exec(ctx, `SELECT finish_native_research_v3_edit_v1(
+		'complete',$1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'','')`, lease.ID,
+		lease.TenantID, lease.UserID, lease.TaskID, lease.LeaseOwner,
+		lease.Fence, target.TargetActionDigest, target.ActionAuthorizationDigest,
+		string(canonicalResult))
+	if err != nil {
+		return taskDefinitionEditDatabaseError("finish native V3 edit", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskDefinitionEditDatabaseError("commit native V3 edit completion", err)
@@ -1259,39 +857,12 @@ func (s *Store) BlockResearchTaskDefinitionEditOperationV3(
 		return err
 	}
 	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	op, err := loadTaskDefinitionEditOperationForUpdateProtocol(ctx, tx,
-		types.TaskDefinitionEditScope{
-			ID: lease.ID, TenantID: lease.TenantID, UserID: lease.UserID,
-			TargetTenantID: lease.TargetTenantID,
-			TargetUserID:   lease.TargetUserID, TaskID: lease.TaskID,
-		}, types.TaskDefinitionEditProtocolResearchV3)
+	_, err = tx.Exec(ctx, `SELECT finish_native_research_v3_edit_v1(
+		'block',$1,$2,$3,$4,$5,$6,'','',NULL,$7,$8)`, lease.ID,
+		lease.TenantID, lease.UserID, lease.TaskID, lease.LeaseOwner,
+		lease.Fence, string(reason), message)
 	if err != nil {
-		return err
-	}
-	if op.Status == types.TaskDefinitionEditOperationStatusBlocked {
-		if op.Fence != lease.Fence || op.ErrorCode != string(reason) ||
-			op.ErrorMessage != message || op.TombstonedAt == nil ||
-			op.LeaseOwner != "" || op.LeaseUntil != nil ||
-			op.TakeoverNotBefore != nil || len(op.Result) != 0 {
-			return taskDefinitionEditConflict("native V3 block replay differs")
-		}
-		return verifyTaskDefinitionEditReceiptForTerminal(
-			ctx, tx, op.ID, op.TenantID, op.UserID)
-	}
-	if taskDefinitionEditOperationIsTerminal(op.Status) {
-		return taskDefinitionEditTerminal()
-	}
-	databaseNow, err := taskDefinitionEditDatabaseClock(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if err := validateLoadedTaskDefinitionEditLease(op, databaseNow, lease); err != nil {
-		return err
-	}
-	if _, err := terminateTaskDefinitionEditTx(ctx, tx, op,
-		types.TaskDefinitionEditOperationStatusBlocked, string(reason), message,
-		nil, false, &lease); err != nil {
-		return err
+		return taskDefinitionEditDatabaseError("block native V3 edit", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskDefinitionEditDatabaseError("commit native V3 edit quarantine", err)
@@ -1311,14 +882,8 @@ func (s *Store) ListStaleResearchTaskDefinitionEditTenantIDsV3(
 	}
 	defer rollbackTaskDefinitionEditTx(ctx, tx)
 	rows, err := tx.Query(ctx, `
-		SELECT DISTINCT tenant_id FROM task_definition_edit_operations
-		 WHERE operation_protocol=$1 AND status=$2 AND tombstoned_at IS NULL
-		   AND tenant_id>$3 AND lease_owner<>'' AND fence>0 AND attempt>0
-		   AND lease_until IS NOT NULL AND takeover_not_before IS NOT NULL
-		   AND lease_until<=clock_timestamp()
-		   AND takeover_not_before<=LEAST($4,clock_timestamp())
-		 ORDER BY tenant_id LIMIT $5`, types.TaskDefinitionEditProtocolResearchV3,
-		types.TaskDefinitionEditOperationStatusExecuting, afterTenantID, before, limit)
+		SELECT * FROM list_stale_native_research_v3_edit_tenants_v1($1,$2,$3)`,
+		before, afterTenantID, limit)
 	if err != nil {
 		return nil, taskDefinitionEditDatabaseError("list native V3 stale tenants", err)
 	}
@@ -1346,21 +911,14 @@ func (s *Store) ListStaleResearchTaskDefinitionEditOperationsV3(
 	if tenantID <= 0 || before.IsZero() || limit <= 0 || limit > 1000 {
 		return nil, taskDefinitionEditValidation("native V3 stale operation query is invalid")
 	}
-	tx, err := s.beginTaskDefinitionEditTx(ctx, tenantID)
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, err
+		return nil, taskDefinitionEditDatabaseError("begin native V3 stale operation scan", err)
 	}
 	defer rollbackTaskDefinitionEditTx(ctx, tx)
 	rows, err := tx.Query(ctx, `SELECT `+taskDefinitionEditOperationColumns+`
-		 FROM task_definition_edit_operations
-		 WHERE tenant_id=$1 AND operation_protocol=$2 AND status=$3
-		   AND tombstoned_at IS NULL AND lease_owner<>'' AND fence>0 AND attempt>0
-		   AND lease_until IS NOT NULL AND takeover_not_before IS NOT NULL
-		   AND lease_until<=clock_timestamp()
-		   AND takeover_not_before<=LEAST($4,clock_timestamp())
-		 ORDER BY takeover_not_before,id LIMIT $5`, tenantID,
-		types.TaskDefinitionEditProtocolResearchV3,
-		types.TaskDefinitionEditOperationStatusExecuting, before, limit)
+		 FROM list_stale_native_research_v3_edit_operations_v1($1,$2,$3)`,
+		tenantID, before, limit)
 	if err != nil {
 		return nil, taskDefinitionEditDatabaseError("list native V3 stale operations", err)
 	}

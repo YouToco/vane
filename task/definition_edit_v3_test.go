@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
@@ -79,6 +80,44 @@ func TestBuildResearchV3DefinitionEditTargetReplacesCompleteOwnerSurfaceOnly(
 		if strings.Contains(string(raw), forbidden) {
 			t.Fatalf("target definition contains retired state %q: %s", forbidden, raw)
 		}
+	}
+}
+
+func TestResearchTaskDefinitionEditProposalMatchesV3AdoptsResponseLossStates(t *testing.T) {
+	expires := time.Now().UTC().Truncate(time.Microsecond)
+	p := types.CreateResearchTaskDefinitionEditOperationV3Params{
+		ID: "edit-v3-response-loss", TenantID: 7, UserID: 42, TaskID: "task-v3",
+		SessionID: 9, ExpiresAt: expires, BaseVersion: 1, TargetVersion: 2,
+		BaseDefinition: []byte("base"), TargetDefinition: []byte("target"),
+		PreparedEdit: []byte("prepared"), BaseSnapshot: []byte("snapshot"),
+	}
+	op := &types.TaskDefinitionEditOperation{
+		Protocol: types.TaskDefinitionEditProtocolResearchV3, ID: p.ID,
+		TenantID: p.TenantID, UserID: p.UserID, TargetTenantID: p.TenantID,
+		TargetUserID: p.UserID, TaskID: p.TaskID, SessionID: p.SessionID,
+		ExpiresAt: p.ExpiresAt, BaseDefinitionVersion: p.BaseVersion,
+		TargetDefinitionVersion: p.TargetVersion, BaseDefinition: p.BaseDefinition,
+		TargetDefinition: p.TargetDefinition, PreparedEdit: p.PreparedEdit,
+		BaseSnapshot: p.BaseSnapshot,
+	}
+	for _, status := range []types.TaskDefinitionEditOperationStatus{
+		types.TaskDefinitionEditOperationStatusPending,
+		types.TaskDefinitionEditOperationStatusExecuting,
+		types.TaskDefinitionEditOperationStatusCompleted,
+	} {
+		op.Status = status
+		if !researchTaskDefinitionEditProposalMatchesV3(op, p) {
+			t.Fatalf("exact %s response-loss state was not adopted", status)
+		}
+	}
+	op.Status = types.TaskDefinitionEditOperationStatusBlocked
+	if researchTaskDefinitionEditProposalMatchesV3(op, p) {
+		t.Fatal("blocked operation was adopted as a successful create response-loss replay")
+	}
+	op.Status = types.TaskDefinitionEditOperationStatusCompleted
+	op.TargetDefinition = []byte("different")
+	if researchTaskDefinitionEditProposalMatchesV3(op, p) {
+		t.Fatal("completed operation with different immutable proposal was adopted")
 	}
 }
 
