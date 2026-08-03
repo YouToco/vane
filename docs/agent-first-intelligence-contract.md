@@ -68,6 +68,22 @@
 - `run`/`delete` 强制使用每个任务的耐久幂等命令。批量部分失败仍继续处理其他目标，并把 completed/failed 写入动作回执；用户只看到可读名称。
 - 开启 exact evidence 后，任何 provider call identity、scope 或 session 不变量不匹配都会中止回复，不能回退到 legacy preview。presentation guard 和内部引用脱敏都发生在最终 turn 提交之前。
 
+### 7.1 内部历史与当前公开证据隔离综合
+
+Agent-first 同一轮需要比较历史与当前网页时，必须先完成
+`query_my_intelligence`，并在首个公开读取执行前冻结模型实际看到的 exact
+内部证据、认证 scope 与集合摘要。公开正文进入后，内部查询和全部写工具继续由
+Harness 确定性关闭；外部正文只能在隔离上下文中继续公开研究，不能改写已经冻结的
+内部查询。
+
+公开研究结束后，模型先在隔离上下文输出严格的
+`vane.public-evidence-summary/v1`。摘要只接受固定字段、受限长度与结构化工具结果中
+真实存在的 URL；Markdown 包装、未知字段、伪造 URL 或无效 `as_of` 均拒绝。最终综合
+请求固定 `Tools:nil`，只包含当前用户原话、冻结的内部 exact evidence 与公开摘要。
+原始网页正文和原生 Tool 协议不得进入最终综合请求或 `agent_sessions` 后续历史；完整
+模型可见工具结果仍按 `AgentToolEvidenceV1` 独立留存。最终 turn 在返回前继续原子封存
+内部与公开工具证据，且不得向用户暴露内部引用或证据摘要。
+
 ## 8. V3 运行权限与付费调用回执
 
 `app.tenant_id` / `app.user_id` 只用于兼容过滤，不能作为 V3 的授权根。每个 V3

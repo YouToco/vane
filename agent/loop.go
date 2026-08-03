@@ -1149,6 +1149,16 @@ func (l *Loop) handleMessage(
 		// 给出了信任标签，未来包装文案改名也不能让原文漏进持久化历史。
 		externalTurn := redactLatestExternalInput(msgs)
 		msgs = truncateMessages(append(history, externalTurn...))
+	} else if state.compartmentedResearch != nil &&
+		state.compartmentedResearch.visibleTurn {
+		// Compartmented synthesis deliberately returns only the safe visible
+		// user/assistant pair. Preserve prior scrubbed history while ensuring the
+		// raw public tool protocol and page body never enter agent_sessions.
+		visible := []llm.ChatMessage{
+			{Role: "user", Content: text},
+			{Role: "assistant", Content: outcome.Reply},
+		}
+		msgs = truncateMessages(append(history, visible...))
 	} else if directProposal {
 		// converse 只处理 current-user-only 视图；持久化时把本轮安全交换追加
 		// 回原有已清洗历史，既不泄漏旧画像给模型，也不抹掉用户会话。
@@ -1397,6 +1407,9 @@ func (l *Loop) converse(
 				system += externalFollowupGroundingRetrySystemNote
 			}
 		}
+		if state.compartmentedResearch != nil && state.untrustedExternalResult {
+			system += compartmentedPublicSummarySystemNote
+		}
 		if state.webSearchSucceeded &&
 			!state.webPageReadSucceeded &&
 			state.webPageReadResponseRejected {
@@ -1548,6 +1561,22 @@ func (l *Loop) converse(
 					Role: "assistant", Content: replyGroundedPageNotRead,
 				})
 				return Outcome{Reply: replyGroundedPageNotRead}, msgs, turns, nil
+			}
+			if state.compartmentedResearch != nil && state.untrustedExternalResult {
+				reply, extraTurns, finishErr := l.finishCompartmentedResearch(
+					ctx, state, msgs, resp.Content,
+					turns+state.contextStepOffset+1,
+				)
+				turns += extraTurns
+				if finishErr != nil {
+					return Outcome{}, nil, 0, finishErr
+				}
+				state.compartmentedResearch.visibleTurn = true
+				msgs = []llm.ChatMessage{
+					{Role: "user", Content: state.ownerRequest},
+					{Role: "assistant", Content: reply},
+				}
+				return Outcome{Reply: reply}, msgs, turns, nil
 			}
 			if state.webResearchSucceeded &&
 				!externalFollowupReplyGrounded(
@@ -2362,6 +2391,9 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 					))) {
 			out = append(out, toolMsg(tc.ID, toolMsgExplicitIntent))
 			continue
+		}
+		if err := beginCompartmentedResearch(ctx, state, spec); err != nil {
+			return out, err
 		}
 		// 外部结果之后仍允许只读公开研究，但内部读取和写入保持确定性关闭。
 		// 此时出站历史已被 isolateExternalResultTurn 缩到当前用户请求与公开

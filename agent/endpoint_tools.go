@@ -95,17 +95,22 @@ type toolRunState struct {
 	intentToolkitsRemoved        []string
 	// Unified loop breaker state. Provider-specific message caps are not used
 	// for planning; this hidden ceiling only stops repeated or runaway calls.
-	toolExecutions      int
-	successfulCalls     map[string]struct{}
-	failedCalls         map[string]int
-	toolEvidence        []store.AgentToolEvidenceV1
-	actionReceipts      []json.RawMessage
-	internalReferences  map[string]struct{}
-	deferEvidenceCommit bool
-	loopBreakReason     string
-	clarificationCount  int
-	candidateSearches   int
-	candidateHits       int
+	toolExecutions     int
+	successfulCalls    map[string]struct{}
+	failedCalls        map[string]int
+	toolEvidence       []store.AgentToolEvidenceV1
+	actionReceipts     []json.RawMessage
+	internalReferences map[string]struct{}
+	// compartmentedResearch freezes exact, authenticated internal query
+	// evidence before the first untrusted public read. Raw public content stays
+	// in the isolated continuation only; the final no-tool synthesis receives
+	// this frozen evidence plus a strict public summary.
+	compartmentedResearch *compartmentedResearchState
+	deferEvidenceCommit   bool
+	loopBreakReason       string
+	clarificationCount    int
+	candidateSearches     int
+	candidateHits         int
 	// sideEffectConstrainedTurn is set for every semantically routed task
 	// action except a uniquely bound definition edit. Only the side-effecting
 	// tool named by allowedSideEffectTool may survive; one-off research instead
