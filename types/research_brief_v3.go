@@ -19,7 +19,10 @@ const ResearchBriefPayloadSchemaV31 = "vane.research-brief/v3.1"
 
 type ResearchBriefAssessmentV31 string
 
-const ResearchBriefAssessmentUnknownV31 ResearchBriefAssessmentV31 = "unknown"
+const (
+	ResearchBriefAssessmentUnknownV31  ResearchBriefAssessmentV31 = "unknown"
+	ResearchBriefAssessmentGroundedV31 ResearchBriefAssessmentV31 = "grounded"
+)
 
 type ResearchBriefSignificanceV3 string
 
@@ -121,6 +124,10 @@ func (p ResearchBriefPayloadV3) Validate() error {
 			if p.Significance != ResearchBriefSignificanceNoneV3 || p.Citations == nil {
 				return NewAppError(CodeValidation, "research Brief unknown assessment 必须静默", ErrValidation)
 			}
+		case ResearchBriefAssessmentGroundedV31:
+			if len(p.Citations) == 0 {
+				return NewAppError(CodeValidation, "research Brief grounded assessment 必须引用证据", ErrValidation)
+			}
 		default:
 			return NewAppError(CodeValidation, "research Brief assessment 无效", ErrValidation)
 		}
@@ -145,7 +152,8 @@ func (p ResearchBriefPayloadV3) Validate() error {
 			}
 		}
 	}
-	if !hasCurrent && p.SchemaVersion == ResearchBriefPayloadSchemaV3 {
+	if !hasCurrent && (p.SchemaVersion == ResearchBriefPayloadSchemaV3 ||
+		p.Assessment == ResearchBriefAssessmentGroundedV31) {
 		return NewAppError(CodeValidation, "research Brief 必须引用当前 Evidence", ErrValidation)
 	}
 	return nil

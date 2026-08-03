@@ -777,6 +777,40 @@ func TestResearchBriefSynthesisV31SealsTerminalFailureAsUnknownAndQuiet(t *testi
 	}
 }
 
+func TestResearchBriefCoverageV31AllowsGroundedOfficialEvidenceDespiteRedundantFailure(t *testing.T) {
+	manifest, err := json.Marshal(researchEvidenceManifestV3{
+		SchemaVersion: researchEvidenceManifestSchemaV31,
+		Items: []researchEvidenceManifestItemV3{
+			{EvidenceID: 7, ToolName: "web_product_status", TrustType: "official"},
+			{EvidenceID: 8, ToolName: "web_search", TrustType: "external"},
+		},
+		ToolFailures: []researchToolFailureContextV31{{
+			Ordinal: 1, ToolName: "web_contents", Phase: string(ResearchRunStepFailedV3),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grounded := types.ResearchBriefPayloadV3{
+		SchemaVersion: types.ResearchBriefPayloadSchemaV31,
+		Assessment:    types.ResearchBriefAssessmentGroundedV31,
+		Headline:      "Kimi status is grounded",
+		Summary:       "The successful official status remains authoritative.",
+		Significance:  types.ResearchBriefSignificanceNoneV3,
+		Citations: []types.ResearchBriefCitationV3{{
+			Kind: types.ResearchBriefCitationCurrentEvidenceV3, Ref: "7",
+		}},
+	}
+	if err := validateResearchBriefCoverageV31(grounded, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	grounded.Citations[0].Ref = "8"
+	if err := validateResearchBriefCoverageV31(grounded, manifest); err == nil {
+		t.Fatal("external-only grounded partial-coverage Brief passed")
+	}
+}
+
 func TestResearchBriefSynthesisV3SpendingRecoveryIsReceiptFirstAndNeverRetriesPending(t *testing.T) {
 	f := newResearchBriefFixtureV3(t, taskstate.NotificationThresholdMajorV3, true)
 	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(t.Context(),

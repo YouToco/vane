@@ -123,6 +123,42 @@ func TestResearchBriefPayloadV31RepresentsUnknownWithoutInventedEvidence(t *test
 	}
 }
 
+func TestResearchBriefPayloadV31RepresentsGroundedPartialCoverage(t *testing.T) {
+	grounded := ResearchBriefPayloadV3{
+		SchemaVersion: ResearchBriefPayloadSchemaV31,
+		Assessment:    ResearchBriefAssessmentGroundedV31,
+		Headline:      "Kimi 套餐仍需预约",
+		Summary:       "官方结构化状态显示付费套餐当前仍不能直接购买。",
+		Significance:  ResearchBriefSignificanceNoneV3,
+		Citations: []ResearchBriefCitationV3{{
+			Kind: ResearchBriefCitationCurrentEvidenceV3, Ref: "7",
+		}},
+	}
+	encoded, err := EncodeResearchBriefPayloadV3(grounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"schema_version":"vane.research-brief/v3.1","assessment":"grounded","headline":"Kimi 套餐仍需预约","summary":"官方结构化状态显示付费套餐当前仍不能直接购买。","significance":"none","citations":[{"kind":"current_evidence","ref":"7"}]}`
+	if string(encoded) != want {
+		t.Fatalf("grounded canonical bytes drifted:\n got %s\nwant %s", encoded, want)
+	}
+
+	for name, mutate := range map[string]func(*ResearchBriefPayloadV3){
+		"no citations": func(value *ResearchBriefPayloadV3) { value.Citations = nil },
+		"history only": func(value *ResearchBriefPayloadV3) {
+			value.Citations = []ResearchBriefCitationV3{{Kind: ResearchBriefCitationHistoryV3, Ref: "brief:1"}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			forged := grounded
+			mutate(&forged)
+			if _, err := EncodeResearchBriefPayloadV3(forged); err == nil {
+				t.Fatal("grounded partial-coverage Brief without current Evidence passed")
+			}
+		})
+	}
+}
+
 func TestResearchBriefPayloadV3RetainsLegacyCanonicalBytes(t *testing.T) {
 	payload := ResearchBriefPayloadV3{
 		SchemaVersion: ResearchBriefPayloadSchemaV3,
