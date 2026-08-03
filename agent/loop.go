@@ -3742,6 +3742,12 @@ func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64,
 	ctx = context.WithValue(ctx, toolCallRecKey{}, rec)
 
 	start := time.Now()
+	if spec.Name() == "web_search" {
+		// A provider call ID may be reused by a malformed model response. Clear
+		// any prior invocation-local display metadata before this execution so a
+		// failed retry cannot inherit links from an earlier successful search.
+		resetInvocationPublicEvidenceURLs(ctx)
+	}
 	result, err := spec.Execute(ctx, userID, args)
 	rec.DurationMs = int(time.Since(start).Milliseconds())
 	if isUntrustedResultTool(spec) {

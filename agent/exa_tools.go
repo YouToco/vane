@@ -277,6 +277,12 @@ func markExternalFollowupSearchSuccess(
 	result string,
 	results []fetcher.SearchResult,
 ) {
+	invocationURLs := make([]string, 0, len(results))
+	for _, item := range results {
+		invocationURLs = append(invocationURLs,
+			truncateRunes(item.URL, exaOutURLMaxRunes))
+	}
+	rememberInvocationPublicEvidenceURLs(ctx, invocationURLs)
 	if state := runStateFrom(ctx); state != nil {
 		state.webResearchSucceeded = true
 		state.webSearchSucceeded = true

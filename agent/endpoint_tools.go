@@ -112,11 +112,15 @@ type toolRunState struct {
 	// materialized by the compartmented public-evidence stage.
 	publicEvidence      map[string]publicEvidenceRecord
 	publicEvidenceOrder []string
-	deferEvidenceCommit bool
-	loopBreakReason     string
-	clarificationCount  int
-	candidateSearches   int
-	candidateHits       int
+	// publicEvidenceDisplayURLs is keyed by the provider tool-call ID and is
+	// overwritten by that exact web_search invocation. It must never reuse the
+	// turn-wide accumulated grounding list, because refs are invocation-local.
+	publicEvidenceDisplayURLs map[string][]string
+	deferEvidenceCommit       bool
+	loopBreakReason           string
+	clarificationCount        int
+	candidateSearches         int
+	candidateHits             int
 	// sideEffectConstrainedTurn is set for every semantically routed task
 	// action except a uniquely bound definition edit. Only the side-effecting
 	// tool named by allowedSideEffectTool may survive; one-off research instead

@@ -82,7 +82,10 @@ Agent；`external`、未知或缺失 provenance 的 `model_visible_result` 在�
 只留下受信元数据与 tenant/user/trace/invocation/arguments/result/coverage 共同派生的
 不可变 `public_evidence_ref`。历史记录、当前网页、动态 API、社媒及
 `read_endpoint_result` 统一使用这一引用；URL 只是由已知 Tool 参数或结构化结果产生的
-可选展示元数据，不参与证据身份。
+可选展示元数据，不参与证据身份。缺失 trace 的 legacy 行明确标记 `unbound_trace` 并
+移除原文；历史 `query_my_intelligence` 的 local wrapper 可能嵌套旧 external 原文，因
+无法递归证明 provenance 而 fail-closed，不得冻结为受信内部证据。展示 URL 必须绑定到
+产生该 ref 的单次 invocation，不得从本轮累计搜索结果串入其他 ref。
 
 公开研究结束后，模型先在隔离上下文输出严格的
 `vane.public-evidence-summary/v1`。摘要只接受固定字段、受限长度与结构化工具结果中

@@ -193,6 +193,30 @@ func projectIntelligenceResultForAgent(
 	}
 	for _, row := range result.Rows {
 		trust, _ := row["trust_type"].(string)
+		traceID, traceOK := row["trace_id"].(string)
+		if !traceOK || strings.TrimSpace(traceID) == "" ||
+			strings.TrimSpace(traceID) != traceID {
+			delete(row, "model_visible_result")
+			row["public_evidence_status"] = "unbound_trace"
+			continue
+		}
+		toolName, toolOK := row["tool_name"].(string)
+		if trust == "local" && (!toolOK || strings.TrimSpace(toolName) == "") {
+			delete(row, "model_visible_result")
+			row["public_evidence_status"] = "unavailable_provenance"
+			continue
+		}
+		if trust == "local" && toolName == "query_my_intelligence" {
+			// Before per-row projection existed, a locally trusted historical
+			// query result could contain an external tool row (and its raw prompt
+			// injection) nested inside model_visible_result. The wrapper has no
+			// trustworthy recursive provenance boundary, so fail closed instead
+			// of freezing it as internal evidence or moving mixed private bytes to
+			// the public sidecar.
+			delete(row, "model_visible_result")
+			row["public_evidence_status"] = "nested_query_unavailable"
+			continue
+		}
 		if trust == "local" {
 			continue
 		}
@@ -203,8 +227,6 @@ func projectIntelligenceResultForAgent(
 			continue
 		}
 		invocationID, invocationOK := row["invocation_id"].(string)
-		toolName, toolOK := row["tool_name"].(string)
-		traceID, _ := row["trace_id"].(string)
 		if !invocationOK || !toolOK || strings.TrimSpace(invocationID) == "" ||
 			strings.TrimSpace(toolName) == "" {
 			return types.NewAppError(types.CodeValidation,
@@ -239,6 +261,10 @@ func projectIntelligenceResultForAgent(
 	if !intelligenceColumnsContain(result.Columns, "public_evidence_ref") {
 		result.Columns = append(result.Columns,
 			store.IntelligenceColumn{Name: "public_evidence_ref", Type: "text"},
+		)
+	}
+	if !intelligenceColumnsContain(result.Columns, "public_evidence_status") {
+		result.Columns = append(result.Columns,
 			store.IntelligenceColumn{Name: "public_evidence_status", Type: "text"},
 		)
 	}
@@ -481,9 +507,7 @@ func rememberCurrentPublicEvidence(
 	}
 	urls := displayURLsFromToolArguments(spec.Name(), string(evidence.Arguments))
 	if spec.Name() == "web_search" {
-		for _, item := range state.externalFollowupSearchEvidence {
-			urls = append(urls, item.URL)
-		}
+		urls = append(urls, takeInvocationPublicEvidenceURLs(ctx, state)...)
 	}
 	record := newPublicEvidenceRecord(
 		meta.scope.TenantID, meta.scope.UserID,
@@ -492,6 +516,40 @@ func rememberCurrentPublicEvidence(
 		int64(evidence.OriginalSize), evidence.OriginalSize > len(evidence.Result), urls,
 	)
 	return rememberPublicEvidenceRecord(state, record)
+}
+
+func resetInvocationPublicEvidenceURLs(ctx context.Context) {
+	state := runStateFrom(ctx)
+	providerCallID, ok := providerToolCallIDFrom(ctx)
+	if state == nil || !ok || state.publicEvidenceDisplayURLs == nil {
+		return
+	}
+	delete(state.publicEvidenceDisplayURLs, providerCallID)
+}
+
+func rememberInvocationPublicEvidenceURLs(ctx context.Context, values []string) {
+	state := runStateFrom(ctx)
+	providerCallID, ok := providerToolCallIDFrom(ctx)
+	if state == nil || !ok {
+		return
+	}
+	if state.publicEvidenceDisplayURLs == nil {
+		state.publicEvidenceDisplayURLs = make(map[string][]string)
+	}
+	state.publicEvidenceDisplayURLs[providerCallID] = append([]string(nil), values...)
+}
+
+func takeInvocationPublicEvidenceURLs(
+	ctx context.Context,
+	state *toolRunState,
+) []string {
+	providerCallID, ok := providerToolCallIDFrom(ctx)
+	if state == nil || !ok || state.publicEvidenceDisplayURLs == nil {
+		return nil
+	}
+	values := append([]string(nil), state.publicEvidenceDisplayURLs[providerCallID]...)
+	delete(state.publicEvidenceDisplayURLs, providerCallID)
+	return values
 }
 
 func frozenInternalEvidenceSetDigest(set frozenInternalEvidenceSetV1) string {
