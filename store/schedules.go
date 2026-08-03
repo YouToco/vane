@@ -30,12 +30,42 @@ const matureSchedulePredicate = `NOT EXISTS (
 	   AND NOT (p.status = 'executed' AND p.phase = 'completed')
 )`
 
-// Research execution and delivery queries use the descriptive schedule alias.
-// Keep one predicate definition so creation-protocol additions cannot diverge
-// between management and money/network effect gates.
-var matureSchedulePredicateForResearch = strings.ReplaceAll(
-	matureSchedulePredicate, "s.", "schedule.",
-)
+const nativeResearchScheduleMaturityFunctionV1 = "public.native_research_schedule_mature_v3_v1(bigint,bigint,text)"
+
+// nativeResearchScheduleMaturityClause keeps pre-109 replay byte-compatible:
+// databases that cannot contain native V3 creation operations do not reference
+// their maturity gate. On 109+, schema-owner control transactions inspect the
+// operation directly. The restricted research executor instead uses the
+// capability-bound SECURITY DEFINER predicate and never gains SELECT on the
+// creation ledger.
+func nativeResearchScheduleMaturityClause(
+	ctx context.Context, tx pgx.Tx,
+) (string, error) {
+	var activeRole string
+	var available bool
+	if err := tx.QueryRow(ctx,
+		`SELECT current_user,to_regprocedure($1) IS NOT NULL`,
+		nativeResearchScheduleMaturityFunctionV1,
+	).Scan(&activeRole, &available); err != nil {
+		return "", err
+	}
+	if !available {
+		return "", nil
+	}
+	if activeRole == researchRuntimeCapabilityRole {
+		return ` AND public.native_research_schedule_mature_v3_v1(
+			schedule.tenant_id,schedule.user_id,schedule.id)`, nil
+	}
+	return ` AND NOT EXISTS (
+		SELECT 1 FROM task_creation_operations operation
+		 WHERE operation.task_id=schedule.id
+		   AND operation.tenant_id=schedule.tenant_id
+		   AND operation.user_id=schedule.user_id
+		   AND operation.execution_version=2
+		   AND operation.tool_name='manage_tasks'
+		   AND NOT (operation.status='executed' AND operation.phase='completed')
+	)`, nil
+}
 
 // scanSchedule 把一行 schedules 扫进 types.Schedule（复用于单行与多行）。
 func scanSchedule(row pgx.Row, sc *types.Schedule) error {

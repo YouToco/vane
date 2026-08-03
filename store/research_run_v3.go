@@ -306,6 +306,11 @@ func loadCurrentResearchDefinitionV3(
 	var version int64
 	var digest, schemaVersion string
 	var payload, scheduleSpec []byte
+	maturityClause, err := nativeResearchScheduleMaturityClause(ctx, tx)
+	if err != nil {
+		return 0, "", taskstate.ApprovedDefinitionV3{},
+			researchRunDatabaseError("inspect native research task maturity", err)
+	}
 	query :=
 		`SELECT schedule.approved_definition_version,
 		        schedule.approved_definition_digest,definition.schema_version,
@@ -324,11 +329,10 @@ func loadCurrentResearchDefinitionV3(
 		        schedule.status='paused' AND public.authorize_manual_task_run_v1(
 		            schedule.tenant_id,schedule.user_id,schedule.id,$4
 		        )
-		    )) AND schedule.execution_mode='discover_at_run'
-		    AND ` + matureSchedulePredicateForResearch + `
+		    )) AND schedule.execution_mode='discover_at_run'` + maturityClause + `
 		  FOR SHARE OF schedule`
 	args := []any{identity.TaskID, identity.TenantID, identity.UserID, identity.TemporalWorkflowID}
-	err := tx.QueryRow(ctx, query, args...).Scan(
+	err = tx.QueryRow(ctx, query, args...).Scan(
 		&version, &digest, &schemaVersion, &payload, &scheduleSpec)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, "", taskstate.ApprovedDefinitionV3{}, researchRunValidationError("research task is not active")
@@ -1420,6 +1424,10 @@ func authorizeResearchRunEffectV3(
 func authorizeLegacyResearchRunEffectV3(
 	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
 ) error {
+	maturityClause, err := nativeResearchScheduleMaturityClause(ctx, tx)
+	if err != nil {
+		return researchRunDatabaseError("inspect native research task maturity", err)
+	}
 	var authorized int
 	if err := tx.QueryRow(ctx,
 		`SELECT 1 FROM schedules schedule
@@ -1431,8 +1439,7 @@ func authorizeLegacyResearchRunEffectV3(
 		      schedule.status='paused' AND public.authorize_research_manual_task_run_cap_v1(
 		          schedule.tenant_id,schedule.user_id,schedule.id,$4
 		      )
-		  )) AND schedule.execution_mode='discover_at_run'
-		  AND `+matureSchedulePredicateForResearch+`
+		  )) AND schedule.execution_mode='discover_at_run'`+maturityClause+`
 		FOR SHARE OF schedule,tenant,membership`,
 		identity.TaskID, identity.TenantID, identity.UserID,
 		identity.TemporalWorkflowID).Scan(&authorized); err != nil {

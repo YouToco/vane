@@ -64,6 +64,49 @@ END $$;
 
 GRANT USAGE ON SCHEMA public TO vane_native_v3_creation_coordinator;
 
+-- Restricted research transactions must not receive SELECT on the creation
+-- ledger merely to prove that an activated native task reached its terminal
+-- creation checkpoint. This predicate is callable only with the exact run
+-- capability already bound to the executor transaction. Pre-109 databases do
+-- not expose it, allowing frozen pre-native replay to keep its original query.
+-- +goose StatementBegin
+CREATE FUNCTION native_research_schedule_mature_v3_v1(
+    expected_tenant_id BIGINT,
+    expected_user_id BIGINT,
+    expected_task_id TEXT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM public.current_research_run_capability_v1() capability
+         WHERE capability.tenant_id=expected_tenant_id
+           AND capability.user_id=expected_user_id
+           AND capability.task_id=expected_task_id
+    ) THEN
+        RAISE EXCEPTION '109: native research maturity capability differs'
+            USING ERRCODE='42501';
+    END IF;
+    RETURN NOT EXISTS (
+        SELECT 1 FROM public.task_creation_operations operation
+         WHERE operation.tenant_id=expected_tenant_id
+           AND operation.user_id=expected_user_id
+           AND operation.task_id=expected_task_id
+           AND operation.execution_version=2
+           AND operation.tool_name='manage_tasks'
+           AND NOT (operation.status='executed' AND operation.phase='completed')
+    );
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION native_research_schedule_mature_v3_v1(
+    BIGINT,BIGINT,TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION native_research_schedule_mature_v3_v1(
+    BIGINT,BIGINT,TEXT) TO vane_research_v3_executor;
+
 -- Migration 098 owns the original exact server shell. This versioned
 -- successor keeps that boundary byte-for-byte exact. Native V3 creation is
 -- deliberately not a long-lived server-runtime capability.
@@ -742,6 +785,7 @@ DROP FUNCTION begin_native_research_task_activation_v3_v1(
     TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,TEXT,SMALLINT);
 DROP FUNCTION commit_native_research_task_creation_v3_v1(
     TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,BYTEA,BYTEA,BYTEA,BYTEA,TEXT,TEXT,SMALLINT);
+DROP FUNCTION native_research_schedule_mature_v3_v1(BIGINT,BIGINT,TEXT);
 DROP FUNCTION deprovision_vane_server_runtime_v2();
 DROP FUNCTION provision_vane_server_runtime_v2();
 REVOKE USAGE ON SCHEMA public FROM vane_native_v3_creation_coordinator;

@@ -65,6 +65,25 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 				securityDefiner, owner, safePath)
 		}
 	}
+	const maturitySignature = "native_research_schedule_mature_v3_v1(bigint,bigint,text)"
+	var publicMaturity, appMaturity, executorMaturity, maturityDefiner, maturitySafePath bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT has_function_privilege('public',p.oid,'EXECUTE'),
+		       has_function_privilege('vane_app',p.oid,'EXECUTE'),
+		       has_function_privilege('vane_research_v3_executor',p.oid,'EXECUTE'),
+		       p.prosecdef,
+		       p.proconfig=ARRAY['search_path=pg_catalog, public, pg_temp']::text[]
+		  FROM pg_proc p WHERE p.oid=$1::regprocedure`, maturitySignature).Scan(
+		&publicMaturity, &appMaturity, &executorMaturity,
+		&maturityDefiner, &maturitySafePath); err != nil {
+		t.Fatal(err)
+	}
+	if publicMaturity || appMaturity || !executorMaturity ||
+		!maturityDefiner || !maturitySafePath {
+		t.Fatalf("unsafe native maturity predicate public=%v app=%v executor=%v definer=%v path=%v",
+			publicMaturity, appMaturity, executorMaturity,
+			maturityDefiner, maturitySafePath)
+	}
 
 	var constraintDefinition string
 	if err := db.QueryRowContext(t.Context(), `
