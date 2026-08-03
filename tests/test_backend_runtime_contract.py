@@ -84,6 +84,8 @@ class BackendRuntimeContractTest(unittest.TestCase):
             "Group=vane",
             "WorkingDirectory=/opt/vane",
             "EnvironmentFile=/opt/vane/env/server-owner-compat.env",
+            "LoadCredential=native_v3_edit_recovery_db_url:"
+            "/etc/vane/credentials/native_v3_edit_recovery_db_url",
             "ExecStart=/opt/vane/bin/vane",
             "NoNewPrivileges=yes",
             "ProtectSystem=strict",
@@ -259,6 +261,42 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertNotIn("/opt/vane/bin/gate -env /opt/vane/.env", remote)
         self.assertIn("-env /opt/vane/env/server.env", remote)
         self.assertNotIn("-env /opt/vane/.env", remote)
+
+    def test_non_systemd_gates_receive_only_the_credential_directory(self) -> None:
+        remote = REMOTE.read_text(encoding="utf-8")
+        prefix = (
+            "env -i PATH=/usr/bin:/bin \\\n"
+            "  CREDENTIALS_DIRECTORY=/etc/vane/credentials \\\n"
+            "  /opt/vane/bin/gate -env "
+        )
+
+        self.assertEqual(remote.count(prefix), 2)
+        self.assertIn(prefix + "/opt/vane/env/server.env.release-next", remote)
+        self.assertIn(prefix + "/opt/vane/env/server.env\n", remote)
+        first_gate = remote.index(prefix)
+        self.assertLess(
+            remote.index(
+                "\nprovision_native_v3_edit_recovery_runtime\n",
+                remote.index("systemctl restart vane-migrate.service"),
+            ),
+            first_gate,
+        )
+        self.assertLess(
+            remote.index(
+                "\nassert_native_v3_edit_recovery_credential\n",
+                remote.index("bootstrap_marker="),
+            ),
+            first_gate,
+        )
+        second_gate = remote.rindex(prefix)
+        rollforward = remote.index(
+            'echo "old vane worker drain verified; starting roll-forward binary"'
+        )
+        self.assertLess(
+            remote.index("\ncommit_legacy_primary_release\n", rollforward),
+            second_gate,
+        )
+        self.assertNotRegex(prefix, r"postgres://|[0-9a-f]{64}")
 
 
 if __name__ == "__main__":

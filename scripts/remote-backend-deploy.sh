@@ -219,7 +219,9 @@ assert_known_split_primary_runtime_contract() {
 }
 
 validate_legacy_compat_unit() {
-  local unit=$1
+  local unit=$1 mode=${2:-strict}
+  local load_credential_count recovery_credential_count
+  local recovery_credential_exact_count
   [[ -f $unit && ! -L $unit &&
      $(grep -Ec '^User=' "$unit" || true) -eq 1 &&
      $(grep -c -Fx 'User=vane' "$unit" || true) -eq 1 &&
@@ -239,6 +241,48 @@ validate_legacy_compat_unit() {
      $(grep -c -Fx 'ProtectHome=yes' "$unit" || true) -eq 1 &&
      $(grep -c -Fx 'PrivateTmp=yes' "$unit" || true) -eq 1 ]] || {
     echo "legacy compatibility unit does not match the audited contract" >&2
+    return 1
+  }
+  load_credential_count=$(grep -Ec '^LoadCredential=' "$unit" || true)
+  recovery_credential_count=$(grep -Ec \
+    '^LoadCredential=native_v3_edit_recovery_db_url:' "$unit" || true)
+  recovery_credential_exact_count=$(grep -c -Fx \
+    'LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url' \
+    "$unit" || true)
+  case "$mode" in
+    strict)
+      [[ $load_credential_count -eq 1 &&
+         $recovery_credential_count -eq 1 &&
+         $recovery_credential_exact_count -eq 1 ]] || {
+        echo "legacy compatibility unit has no exact native V3 edit recovery credential" >&2
+        return 1
+      }
+      ;;
+    existing)
+      [[ $load_credential_count -eq 0 ||
+         ($load_credential_count -eq 1 &&
+          $recovery_credential_count -eq 1 &&
+          $recovery_credential_exact_count -eq 1) ]] || {
+        echo "existing legacy compatibility unit has an unsafe native V3 edit recovery credential" >&2
+        return 1
+      }
+      ;;
+    *)
+      echo "unknown legacy compatibility unit validation mode" >&2
+      return 1
+      ;;
+  esac
+}
+
+validate_native_v3_edit_recovery_unit() {
+  local unit=$1
+  [[ -f $unit && ! -L $unit &&
+     $(grep -Ec '^LoadCredential=native_v3_edit_recovery_db_url:' \
+       "$unit" || true) -eq 1 &&
+     $(grep -c -Fx \
+       'LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url' \
+       "$unit" || true) -eq 1 ]] || {
+    echo "primary unit has no exact native V3 edit recovery credential" >&2
     return 1
   }
 }
@@ -413,8 +457,9 @@ assert_restricted_server_environment_readonly() {
 }
 
 assert_owner_compatible_primary_identity() {
+  local mode=${1:-strict}
   local owner_env_source snapshot_db_url live_db_url
-  validate_legacy_compat_unit /etc/systemd/system/vane.service
+  validate_legacy_compat_unit /etc/systemd/system/vane.service "$mode"
   [[ -f /opt/vane/env/server-owner-compat.env &&
      ! -L /opt/vane/env/server-owner-compat.env &&
      $(stat -c '%U:%G:%a' /opt/vane/env/server-owner-compat.env) == \
@@ -435,8 +480,9 @@ assert_owner_compatible_primary_identity() {
 }
 
 assert_audited_legacy_primary_runtime_contract() {
+  local mode=${1:-strict}
   local research_control_url
-  assert_owner_compatible_primary_identity
+  assert_owner_compatible_primary_identity "$mode"
   research_control_url=$(sed -n 's/^VANE_DB_RESEARCH_CONTROL_URL=//p' \
     /opt/vane/env/server-owner-compat.env)
   [[ $research_control_url == postgres://vane_server_runtime:* ]] || {
@@ -447,7 +493,8 @@ assert_audited_legacy_primary_runtime_contract() {
 }
 
 assert_audited_legacy_primary_runtime_contract_v1() {
-  assert_owner_compatible_primary_identity
+  local mode=${1:-strict}
+  assert_owner_compatible_primary_identity "$mode"
   assert_legacy_research_settings_exact \
     /opt/vane/env/server-owner-compat.env
 }
@@ -459,9 +506,9 @@ assert_existing_audited_primary_runtime_contract() {
   restricted_count=$(grep -c '^VANE_DB_RESEARCH_CONTROL_URL=' \
     /opt/vane/env/server.env || true)
   if [[ $live_count -eq 0 && $restricted_count -eq 0 ]]; then
-    assert_audited_legacy_primary_runtime_contract_v1
+    assert_audited_legacy_primary_runtime_contract_v1 existing
   elif [[ $live_count -eq 1 && $restricted_count -eq 1 ]]; then
-    assert_audited_legacy_primary_runtime_contract
+    assert_audited_legacy_primary_runtime_contract existing
   else
     echo "owner-compatible runtime has a mixed research control contract" >&2
     return 1
@@ -773,6 +820,129 @@ read_hex_secret() {
   printf '%s' "$value"
 }
 
+assert_native_v3_edit_recovery_credential() {
+  local credential=/etc/vane/credentials/native_v3_edit_recovery_db_url
+  [[ -f $credential && ! -L $credential &&
+     $(stat -c '%U:%G:%a' "$credential") == vane:vane:400 &&
+     $(wc -l <"$credential") -eq 1 ]] || {
+    echo "native V3 edit recovery credential has unsafe file metadata" >&2
+    return 1
+  }
+  LC_ALL=C grep -Eq \
+    '^postgres://vane_native_v3_edit_recovery_runtime:[0-9a-f]{64}@127\.0\.0\.1:5432/vane\?sslmode=disable$' \
+    "$credential" || {
+    echo "native V3 edit recovery credential has an invalid database URL" >&2
+    return 1
+  }
+}
+
+# Provision the independent edit-recovery login after migrations have created
+# its NOLOGIN role. The pending password is root-only and survives every
+# client-side response-loss point. A retry therefore repeats ALTER ROLE and
+# the atomic credential write with exactly the same secret.
+provision_native_v3_edit_recovery_runtime() {
+  local marker=/etc/vane/credentials/native_v3_edit_recovery_runtime_v1.complete
+  local pending=/etc/vane/credentials/.native-v3-edit-recovery-runtime-v1.pending
+  local password_file=$pending/password
+  local credential=/etc/vane/credentials/native_v3_edit_recovery_db_url
+  local password
+
+  [[ $- != *x* ]] || {
+    echo "native V3 edit recovery provisioning refuses shell tracing" >&2
+    return 1
+  }
+
+  if [[ -e $marker || -L $marker ]]; then
+    [[ -f $marker && ! -L $marker &&
+       $(stat -c '%U:%G:%a' "$marker") == root:root:600 &&
+       $(tr -d '\r\n' <"$marker") == complete ]] || {
+      echo "native V3 edit recovery upgrade marker is invalid" >&2
+      return 1
+    }
+    assert_native_v3_edit_recovery_credential
+    if [[ -e $pending || -L $pending ]]; then
+      [[ -d $pending && ! -L $pending &&
+         $(stat -c '%U:%G:%a' "$pending") == root:root:700 ]] || {
+        echo "native V3 edit recovery pending path is unsafe" >&2
+        return 1
+      }
+      rm -rf -- "$pending"
+    fi
+    return 0
+  fi
+
+  if [[ -e $pending || -L $pending ]]; then
+    [[ -d $pending && ! -L $pending &&
+       $(stat -c '%U:%G:%a' "$pending") == root:root:700 ]] || {
+      echo "native V3 edit recovery pending path is unsafe" >&2
+      return 1
+    }
+  else
+    install -d -o root -g root -m 0700 "$pending"
+  fi
+  if [[ -e $password_file || -L $password_file ]]; then
+    [[ -f $password_file && ! -L $password_file &&
+       $(stat -c '%U:%G:%a' "$password_file") == root:root:600 ]] || {
+      echo "native V3 edit recovery pending password is unsafe" >&2
+      return 1
+    }
+  else
+    if [[ -e $password_file.next || -L $password_file.next ]]; then
+      [[ -f $password_file.next && ! -L $password_file.next ]] || {
+        echo "native V3 edit recovery next pending password is unsafe" >&2
+        return 1
+      }
+    fi
+    openssl rand -hex 32 >"$password_file.next"
+    chown root:root "$password_file.next"
+    chmod 0600 "$password_file.next"
+    mv -f -- "$password_file.next" "$password_file"
+  fi
+  password=$(read_hex_secret "$password_file") || {
+    echo "native V3 edit recovery pending password is invalid" >&2
+    return 1
+  }
+
+  (
+    cd /opt/vane
+    printf "ALTER ROLE vane_native_v3_edit_recovery_runtime LOGIN PASSWORD '%s';\n" \
+      "$password" |
+      docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U vane -d vane
+  )
+
+  if [[ -e $credential || -L $credential ]]; then
+    [[ -f $credential && ! -L $credential &&
+       $(stat -c '%U:%G:%a' "$credential") == vane:vane:400 ]] || {
+      echo "native V3 edit recovery credential target is unsafe" >&2
+      return 1
+    }
+  fi
+  if [[ -e $credential.next || -L $credential.next ]]; then
+    [[ -f $credential.next && ! -L $credential.next ]] || {
+      echo "native V3 edit recovery next credential is unsafe" >&2
+      return 1
+    }
+  fi
+  printf 'postgres://vane_native_v3_edit_recovery_runtime:%s@127.0.0.1:5432/vane?sslmode=disable\n' \
+    "$password" >"$credential.next"
+  chown vane:vane "$credential.next"
+  chmod 0400 "$credential.next"
+  mv -f -- "$credential.next" "$credential"
+  assert_native_v3_edit_recovery_credential
+
+  if [[ -e $marker.next || -L $marker.next ]]; then
+    [[ -f $marker.next && ! -L $marker.next ]] || {
+      echo "native V3 edit recovery next marker is unsafe" >&2
+      return 1
+    }
+  fi
+  printf 'complete\n' >"$marker.next"
+  chown root:root "$marker.next"
+  chmod 0600 "$marker.next"
+  mv -f -- "$marker.next" "$marker"
+  rm -rf -- "$pending"
+}
+
 ensure_system_user vane
 ensure_system_user vane-migrate
 ensure_system_user vane-research-gateway
@@ -851,6 +1021,7 @@ esac
 # drained. Migration/bootstrap failures therefore leave the proven worker and
 # its old unit untouched.
 validate_legacy_compat_unit "$stage/vane-legacy-compat.service"
+validate_native_v3_edit_recovery_unit "$stage/vane.service"
 expected_server_release_contract='vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1'
 actual_server_release_contract=$(
   env -i PATH=/usr/bin:/bin "$stage/bin/vane" -print-release-contract
@@ -934,6 +1105,7 @@ systemctl daemon-reload
 systemctl enable vane-migrate.service vane-research-gateway.service \
   vane-research-gateway.socket >/dev/null
 systemctl restart vane-migrate.service
+provision_native_v3_edit_recovery_runtime
 
 bootstrap_marker=/etc/vane/credentials/runtime_bootstrap_v1.complete
 pending_dir=/etc/vane/credentials/.runtime-bootstrap-v1.pending
@@ -1106,13 +1278,15 @@ fi
    ! -L /opt/vane/env/research-gateway.env ]] || exit 1
 stage_research_control_environment /opt/vane/env/server.env \
   /opt/vane/env/server.env.release-next
-for credential in migration_db_url gateway_db_url research_llm_api_key_gen1; do
+for credential in migration_db_url gateway_db_url research_llm_api_key_gen1 \
+  native_v3_edit_recovery_db_url; do
   [[ -s /etc/vane/credentials/$credential && \
      ! -L /etc/vane/credentials/$credential ]] || {
     echo "runtime credential is unavailable: $credential" >&2
     exit 1
   }
 done
+assert_native_v3_edit_recovery_credential
 chown root:vane /opt/vane/env/server.env
 chmod 0640 /opt/vane/env/server.env
 assert_restricted_server_environment_readonly
@@ -1198,8 +1372,12 @@ done
 }
 
 # Validate the complete new process configuration and non-owner database path
-# while the proven old worker is still serving traffic.
-/opt/vane/bin/gate -env /opt/vane/env/server.env.release-next >/dev/null
+# while the proven old worker is still serving traffic. Gate is not started by
+# systemd, so pass only the credential directory (never its secret payload) in
+# an otherwise empty process environment.
+env -i PATH=/usr/bin:/bin \
+  CREDENTIALS_DIRECTORY=/etc/vane/credentials \
+  /opt/vane/bin/gate -env /opt/vane/env/server.env.release-next >/dev/null
 
 # scp/install replaces a single-file bind mount's inode. Compare the container
 # view with the host content; only a container recreation repairs a detached
@@ -1348,5 +1526,7 @@ esac
 echo "deploy verified: readyz OK"
 
 # Red (1) and probe failure (2) fail the deployment; yellow remains exit 0.
-/opt/vane/bin/gate -env /opt/vane/env/server.env
+env -i PATH=/usr/bin:/bin \
+  CREDENTIALS_DIRECTORY=/etc/vane/credentials \
+  /opt/vane/bin/gate -env /opt/vane/env/server.env
 old_vane_recovery_required=false

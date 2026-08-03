@@ -117,6 +117,22 @@ the split, mode-0400 migration-owner credential. The owner database URL is
 therefore never copied into the server environment, and merely deploying a new
 release cannot prepare or roll back a V3 task.
 
+Native V3 task-definition edit recovery uses a fourth, independent database
+login. After `vane-migrate` has created the restricted NOLOGIN role, deployment
+runs the resumable `native_v3_edit_recovery_runtime_v1` credential upgrade. A
+root-only mode-0600 pending password is created before `ALTER ROLE`; the same
+password is reused if either the database response or the later atomic file
+rename is lost. The resulting PostgreSQL URL lives only in
+`/etc/vane/credentials/native_v3_edit_recovery_db_url` as `vane:vane` mode 0400.
+It is never placed in an environment variable, process argument, or log. The
+Both the incoming split `vane.service` and the control repository's live
+owner-compatible unit load that exact file through systemd `LoadCredential`;
+either missing consumer fails before the old worker is drained. Direct Gate
+probes run with an empty environment containing only `PATH` and the non-secret
+`CREDENTIALS_DIRECTORY=/etc/vane/credentials` locator.
+Both a host with the existing `runtime_bootstrap_v1.complete` marker and a
+first-time split-runtime bootstrap follow this same versioned upgrade path.
+
 The Aliyun line first requires a closed Vite manifest dependency graph and
 content-addressed names for every runtime JavaScript/CSS object referenced by
 HTML or the Vite manifest. It then publishes every non-HTML object without

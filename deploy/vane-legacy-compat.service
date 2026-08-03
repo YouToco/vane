@@ -9,6 +9,7 @@ User=vane
 Group=vane
 WorkingDirectory=/opt/vane
 EnvironmentFile=/opt/vane/env/server-owner-compat.env
+LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url
 ExecStart=/opt/vane/bin/vane
 Restart=on-failure
 RestartSec=5

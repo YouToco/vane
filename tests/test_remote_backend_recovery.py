@@ -26,7 +26,51 @@ def extract_gateway_boundary() -> str:
     return script[start:finish]
 
 
+def extract_legacy_unit_validator() -> str:
+    script = REMOTE.read_text(encoding="utf-8")
+    start = script.index("validate_legacy_compat_unit()")
+    finish = script.index("owner_snapshot_path()", start)
+    return script[start:finish]
+
+
 class RemoteBackendRecoveryTest(unittest.TestCase):
+    def test_existing_legacy_unit_can_upgrade_but_new_commit_is_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            unit = Path(tempdir) / "vane.service"
+            unit.write_text(
+                "[Service]\n"
+                "User=vane\nGroup=vane\nWorkingDirectory=/opt/vane\n"
+                "EnvironmentFile=/opt/vane/env/server-owner-compat.env\n"
+                "ExecStart=/opt/vane/bin/vane\n"
+                "NoNewPrivileges=yes\nProtectSystem=strict\n"
+                "ProtectHome=yes\nPrivateTmp=yes\n",
+                encoding="utf-8",
+            )
+            script = (
+                "set -euo pipefail\n"
+                f"{extract_legacy_unit_validator()}\n"
+                f"unit={shlex.quote(unit.as_posix())}\n"
+                "validate_legacy_compat_unit \"$unit\" existing\n"
+                "set +e\n"
+                "validate_legacy_compat_unit \"$unit\"\n"
+                "strict_status=$?\n"
+                "set -e\n"
+                "[[ $strict_status -ne 0 ]]\n"
+                "printf '%s\\n' 'LoadCredential=native_v3_edit_recovery_db_url:/attacker' >>\"$unit\"\n"
+                "set +e\n"
+                "validate_legacy_compat_unit \"$unit\" existing\n"
+                "unsafe_status=$?\n"
+                "set -e\n"
+                "[[ $unsafe_status -ne 0 ]]\n"
+            )
+            result = subprocess.run(
+                [BASH], input=script.encode(), capture_output=True, check=False
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn(b"no exact native V3 edit recovery credential", result.stderr)
+        self.assertIn(b"unsafe native V3 edit recovery credential", result.stderr)
+
     def test_active_owner_v1_contract_converges_to_v2_before_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -101,7 +145,7 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                 f"{shlex.quote(opt + '/env/server-owner-compat.env')}\n"
                 f"mv {shlex.quote(opt + '/env/server.env.release-next')} "
                 f"{shlex.quote(opt + '/env/server.env')}\n"
-                "assert_audited_legacy_primary_runtime_contract\n"
+                "assert_audited_legacy_primary_runtime_contract existing\n"
                 f"cat {shlex.quote(opt + '/env/server-owner-compat.env')}\n"
             )
             result = subprocess.run(
@@ -486,6 +530,8 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                 f"User={unit_user}\nGroup={unit_user}\n"
                 f"WorkingDirectory={opt}\n"
                 f"EnvironmentFile={opt}/env/server-owner-compat.env\n"
+                "LoadCredential=native_v3_edit_recovery_db_url:"
+                "/etc/vane/credentials/native_v3_edit_recovery_db_url\n"
                 f"ExecStart={opt}/bin/vane\nRestart=on-failure\n"
                 "NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\n"
                 "EOF\n"
@@ -643,6 +689,13 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
         self.assertIn("User=vane", state["unit"])
         self.assertIn("Group=vane", state["unit"])
         self.assertIn("/env/server-owner-compat.env", state["unit"])
+        self.assertEqual(
+            state["unit"].splitlines().count(
+                "LoadCredential=native_v3_edit_recovery_db_url:"
+                "/etc/vane/credentials/native_v3_edit_recovery_db_url"
+            ),
+            1,
+        )
         self.assertEqual(
             state["legacy_env"],
             "VANE_DB_URL=postgres://vane:owner@db/vane\nOWNER_ONLY=1\n",
