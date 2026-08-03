@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,8 +36,7 @@ type ResearchTaskDefinitionEditStoreV3 interface {
 	CheckpointResearchTaskDefinitionEditTargetRestoredV3(context.Context, types.TaskDefinitionEditLease, []byte) error
 	CompleteResearchTaskDefinitionEditOperationV3(context.Context, types.TaskDefinitionEditLease, json.RawMessage) error
 	BlockResearchTaskDefinitionEditOperationV3(context.Context, types.TaskDefinitionEditLease, types.TaskDefinitionEditBlockReason) error
-	ListStaleResearchTaskDefinitionEditTenantIDsV3(context.Context, time.Time, int64, int) ([]int64, error)
-	ListStaleResearchTaskDefinitionEditOperationsV3(context.Context, int64, time.Time, int) ([]types.TaskDefinitionEditOperation, error)
+	ClaimStaleResearchTaskDefinitionEditOperationV3(context.Context, time.Time, string, time.Duration) (*types.TaskDefinitionEditOperation, error)
 }
 
 type ResearchTaskDefinitionEditSchedulerV3 interface {
@@ -52,11 +50,9 @@ type ResearchTaskDefinitionEditSchedulerV3 interface {
 // saga. It accepts a complete owner-visible target and never produces a card,
 // Source entity, fetch target, or long-lived Tool call.
 type ResearchTaskDefinitionEditCoordinatorV3 struct {
-	store          ResearchTaskDefinitionEditStoreV3
-	scheduler      ResearchTaskDefinitionEditSchedulerV3
-	logger         *slog.Logger
-	recoveryMu     sync.Mutex
-	recoveryCursor int64
+	store     ResearchTaskDefinitionEditStoreV3
+	scheduler ResearchTaskDefinitionEditSchedulerV3
+	logger    *slog.Logger
 }
 
 func NewResearchTaskDefinitionEditCoordinatorV3(
@@ -430,77 +426,23 @@ func (c *ResearchTaskDefinitionEditCoordinatorV3) RecoverStaleOnceV3(
 	if c == nil || c.store == nil || c.scheduler == nil {
 		return errors.New("task: native V3 edit recovery is not configured")
 	}
-	c.recoveryMu.Lock()
-	defer c.recoveryMu.Unlock()
 	before := time.Now().UTC()
-	tenants, err := c.store.ListStaleResearchTaskDefinitionEditTenantIDsV3(
-		ctx, before, c.recoveryCursor, taskDefinitionEditRecoveryTenantLimit)
-	if err != nil {
-		return err
-	}
-	if c.recoveryCursor > 0 && len(tenants) < taskDefinitionEditRecoveryTenantLimit {
-		wrapped, wrapErr := c.store.ListStaleResearchTaskDefinitionEditTenantIDsV3(
-			ctx, before, 0, taskDefinitionEditRecoveryTenantLimit-len(tenants))
-		if wrapErr != nil {
-			return wrapErr
+	for processed := 0; processed < taskDefinitionEditRecoveryPassLimit; processed++ {
+		leaseOwner := "definition-edit-v3-recovery-" + uuid.NewString()
+		acquired, err := c.store.ClaimStaleResearchTaskDefinitionEditOperationV3(
+			ctx, before, leaseOwner, taskDefinitionEditLeaseDuration)
+		if err != nil {
+			return err
 		}
-		seen := make(map[int64]struct{}, len(tenants)+len(wrapped))
-		for _, tenantID := range tenants {
-			seen[tenantID] = struct{}{}
+		if acquired == nil {
+			return nil
 		}
-		for _, tenantID := range wrapped {
-			if _, duplicate := seen[tenantID]; duplicate {
-				continue
-			}
-			seen[tenantID] = struct{}{}
-			tenants = append(tenants, tenantID)
-		}
-	}
-	processed := 0
-	for _, tenantID := range tenants {
-		c.recoveryCursor = tenantID
-		if processed >= taskDefinitionEditRecoveryPassLimit {
-			break
-		}
-		limit := min(taskDefinitionEditRecoveryPerTenant,
-			taskDefinitionEditRecoveryPassLimit-processed)
-		operations, listErr := c.store.ListStaleResearchTaskDefinitionEditOperationsV3(
-			ctx, tenantID, before, limit)
-		if listErr != nil {
-			c.logger.ErrorContext(ctx, "native V3 edit recovery shard failed",
-				"tenant_id", tenantID, "err", listErr)
-			continue
-		}
-		for index := range operations {
-			if processed >= taskDefinitionEditRecoveryPassLimit {
-				return nil
-			}
-			stale := operations[index]
-			processed++
-			acquired, acquireErr := c.acquire(ctx,
-				types.AcquireTaskDefinitionEditOperationParams{
-					Scope:           stale.Scope(),
-					LeaseOwner:      "definition-edit-v3-recovery-" + uuid.NewString(),
-					LeaseDuration:   taskDefinitionEditLeaseDuration,
-					ReceiptProvider: stale.ReceiptProvider,
-					ReceiptTarget:   stale.ReceiptTarget,
-				})
-			if acquireErr != nil {
-				if !errors.Is(acquireErr, types.ErrTaskDefinitionEditBusy) &&
-					!errors.Is(acquireErr, types.ErrTaskDefinitionEditTerminal) {
-					c.logger.ErrorContext(ctx, "native V3 edit recovery acquire failed",
-						"operation_id", stale.ID, "err", acquireErr)
-				}
-				continue
-			}
-			attemptCtx, cancel := context.WithTimeout(
-				ctx, taskDefinitionEditAttemptTimeout)
-			_, runErr := c.run(attemptCtx, acquired)
-			cancel()
-			if runErr != nil {
-				c.logger.WarnContext(ctx, "native V3 edit recovery remains pending",
-					"operation_id", stale.ID, "phase", stale.Phase, "err", runErr)
-			}
+		attemptCtx, cancel := context.WithTimeout(ctx, taskDefinitionEditAttemptTimeout)
+		_, runErr := c.run(attemptCtx, acquired)
+		cancel()
+		if runErr != nil {
+			c.logger.WarnContext(ctx, "native V3 edit recovery remains pending",
+				"operation_id", acquired.ID, "phase", acquired.Phase, "err", runErr)
 		}
 	}
 	return nil

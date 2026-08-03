@@ -125,8 +125,9 @@ func run() error {
 	var researchDeliveryOption workflow.ActivitiesOption
 	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
 		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
-		researchControlStore, err = store.NewServerRuntimeWithResearchRuntimeCapability(
+		researchControlStore, err = store.NewServerRuntimeWithResearchRuntimeCapabilityAndEditRecovery(
 			ctx, cfg.DB.ResearchControlURL, cfg.DB.ResearchRuntimeURL,
+			cfg.DB.NativeV3EditRecoveryRuntimeURL,
 			store.ResearchRunCapabilityConfigV1{
 				ActiveKeyID:  cfg.DB.ResearchCapabilityKeyID,
 				ActiveKeyHex: cfg.DB.ResearchCapabilityKeyHex,

@@ -27,3 +27,22 @@ func TestResearchGatewaySocketPermissions(t *testing.T) {
 		t.Fatal("gateway socket must not be world-accessible")
 	}
 }
+
+func TestNativeV3EditRecoveryUsesIndependentSystemdCredential(t *testing.T) {
+	unit, err := os.ReadFile("vane.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const load = "LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url"
+	if !strings.Contains(string(unit), load) {
+		t.Fatalf("server unit must contain %q", load)
+	}
+	environment, err := os.ReadFile("server.env.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(environment),
+		"VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL=") {
+		t.Fatal("edit recovery credential must not be stored in server.env")
+	}
+}

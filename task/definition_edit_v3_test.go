@@ -1,7 +1,9 @@
 package task
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -80,6 +82,81 @@ func TestBuildResearchV3DefinitionEditTargetReplacesCompleteOwnerSurfaceOnly(
 		if strings.Contains(string(raw), forbidden) {
 			t.Fatalf("target definition contains retired state %q: %s", forbidden, raw)
 		}
+	}
+}
+
+type researchV3RecoveryRestartStoreTest struct {
+	ResearchTaskDefinitionEditStoreV3
+	queue       []*types.TaskDefinitionEditOperation
+	claimed     []string
+	failNext    bool
+	restartFail error
+}
+
+func (s *researchV3RecoveryRestartStoreTest) ClaimStaleResearchTaskDefinitionEditOperationV3(
+	_ context.Context, _ time.Time, leaseOwner string, _ time.Duration,
+) (*types.TaskDefinitionEditOperation, error) {
+	if s.failNext && len(s.claimed) > 0 {
+		s.failNext = false
+		return nil, s.restartFail
+	}
+	if len(s.queue) == 0 {
+		return nil, nil
+	}
+	op := *s.queue[0]
+	s.queue = s.queue[1:]
+	op.LeaseOwner = leaseOwner
+	op.Fence++
+	op.Attempt++
+	s.claimed = append(s.claimed, op.ID)
+	return &op, nil
+}
+
+func (s *researchV3RecoveryRestartStoreTest) LoadResearchTaskDefinitionEditOperationV3(
+	_ context.Context, scope types.TaskDefinitionEditScope,
+) (*types.TaskDefinitionEditOperation, error) {
+	return &types.TaskDefinitionEditOperation{
+		ID: scope.ID, Protocol: types.TaskDefinitionEditProtocolResearchV3,
+		TenantID: scope.TenantID, UserID: scope.UserID,
+		TargetTenantID: scope.TargetTenantID, TargetUserID: scope.TargetUserID,
+		TaskID: scope.TaskID, Status: types.TaskDefinitionEditOperationStatusCompleted,
+	}, nil
+}
+
+type researchV3RecoveryRestartSchedulerTest struct {
+	ResearchTaskDefinitionEditSchedulerV3
+}
+
+func TestResearchTaskDefinitionEditRecoveryRestartUsesDurableClaimOrder(t *testing.T) {
+	restartErr := errors.New("simulated coordinator restart")
+	store := &researchV3RecoveryRestartStoreTest{
+		restartFail: restartErr,
+		queue: []*types.TaskDefinitionEditOperation{
+			{ID: "low-tenant-oldest", Protocol: types.TaskDefinitionEditProtocolResearchV3,
+				TenantID: 1, UserID: 11, TargetTenantID: 1, TargetUserID: 11,
+				TaskID: "low", Status: types.TaskDefinitionEditOperationStatusExecuting,
+				Phase: types.TaskDefinitionEditPhaseProposalSealed, LeaseOwner: "lost", Fence: 1, Attempt: 1},
+			{ID: "high-tenant-next", Protocol: types.TaskDefinitionEditProtocolResearchV3,
+				TenantID: 99, UserID: 22, TargetTenantID: 99, TargetUserID: 22,
+				TaskID: "high", Status: types.TaskDefinitionEditOperationStatusExecuting,
+				Phase: types.TaskDefinitionEditPhaseProposalSealed, LeaseOwner: "lost", Fence: 1, Attempt: 1},
+		},
+	}
+	first := NewResearchTaskDefinitionEditCoordinatorV3(
+		store, &researchV3RecoveryRestartSchedulerTest{}, nil)
+	// The first durable claim succeeds; the following claim simulates process
+	// loss. A new coordinator must continue with the next database-owned row.
+	store.failNext = true
+	if err := first.RecoverStaleOnceV3(t.Context()); !errors.Is(err, restartErr) {
+		t.Fatalf("first recovery err=%v, want restart", err)
+	}
+	second := NewResearchTaskDefinitionEditCoordinatorV3(
+		store, &researchV3RecoveryRestartSchedulerTest{}, nil)
+	if err := second.RecoverStaleOnceV3(t.Context()); err != nil {
+		t.Fatalf("restarted recovery: %v", err)
+	}
+	if !reflect.DeepEqual(store.claimed, []string{"low-tenant-oldest", "high-tenant-next"}) {
+		t.Fatalf("durable claim order=%v", store.claimed)
 	}
 }
 

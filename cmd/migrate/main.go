@@ -36,7 +36,14 @@ func run() error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	return migrateAndProvision(
-		ctx, databaseURL, store.Migrate, store.ProvisionServerRuntime)
+		ctx, databaseURL, store.Migrate, provisionRuntimeBoundaries)
+}
+
+func provisionRuntimeBoundaries(ctx context.Context, databaseURL string) error {
+	if err := store.ProvisionServerRuntime(ctx, databaseURL); err != nil {
+		return err
+	}
+	return store.ProvisionNativeV3EditRecoveryRuntime(ctx, databaseURL)
 }
 
 func migrateAndProvision(
