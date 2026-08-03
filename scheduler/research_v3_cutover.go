@@ -164,12 +164,40 @@ func (s *Scheduler) newResearchV3CutoverCore(
 		return nil, types.NewAppError(types.CodeInternal,
 			"research V3 cutover dependencies are unavailable", nil)
 	}
-	dc := s.taskScheduleDecoder(exactTaskID)
+	encode, err := s.researchV3CutoverParamsEncoder()
+	if err != nil {
+		return nil, err
+	}
 	return newResearchV3CutoverCoordinator(exactTaskID, journal,
 		&schedulerResearchV3ScheduleRemote{scheduler: s},
-		func(params any) (*commonpb.Payload, error) {
-			return dc.ToPayload(params)
-		})
+		encode)
+}
+
+// researchV3CutoverParamsEncoder binds the new Research V3 Action payload to
+// the reserved Temporal JSON protocol. The task ID is an ownership key, never
+// a data-converter registry key. Looking a converter up by task ID returns nil
+// in production and used to make the one-shot cutover command panic before it
+// could create its durable journal.
+func (s *Scheduler) researchV3CutoverParamsEncoder() (
+	researchV3ParamsEncoder, error,
+) {
+	if s == nil {
+		return nil, types.NewAppError(types.CodeInternal,
+			"research V3 cutover data converter is unavailable", nil)
+	}
+	dc := s.taskScheduleDecoder(taskScheduleDefaultConverterID)
+	if dc == nil {
+		return nil, types.NewAppError(types.CodeInternal,
+			"research V3 cutover data converter is unavailable", nil)
+	}
+	return func(params any) (*commonpb.Payload, error) {
+		payload, err := dc.ToPayload(params)
+		if err != nil || payload == nil {
+			return nil, types.NewAppError(types.CodeInternal,
+				"encode research V3 Schedule Action", err)
+		}
+		return payload, nil
+	}, nil
 }
 
 // CutoverResearchV3 replaces one already-shadowed task's Schedule Action via
