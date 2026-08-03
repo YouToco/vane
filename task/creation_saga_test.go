@@ -168,6 +168,24 @@ func (s *creationSagaFakeStore) CreateTaskCreationOperation(
 	return &clone, nil
 }
 
+func (s *creationSagaFakeStore) CreateResearchTaskCreationOperationV3(
+	_ context.Context,
+	p types.CreateResearchTaskCreationOperationV3Params,
+) (*types.TaskCreationOperation, error) {
+	s.createCalls++
+	if s.op.ID != "" {
+		return nil, types.ErrConflict
+	}
+	s.op = types.TaskCreationOperation{
+		ID: p.ID, TenantID: p.TenantID, UserID: p.UserID, SessionID: p.SessionID,
+		ToolName: "create_schedule", Args: bytes.Clone(p.Args), Summary: p.Summary,
+		Status: types.TaskOperationStatusPending, ExpiresAt: p.ExpiresAt,
+		ExecutionVersion: types.TaskCreationExecutionVersionV2,
+	}
+	clone := s.op
+	return &clone, nil
+}
+
 func (s *creationSagaFakeStore) AcquireTaskCreationOperation(
 	_ context.Context,
 	p types.AcquireTaskCreationOperationParams,

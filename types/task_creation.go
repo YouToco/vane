@@ -11,6 +11,11 @@ import (
 // callers must opt a create_schedule action into this protocol explicitly.
 const TaskCreationExecutionVersionV1 int16 = 1
 
+// TaskCreationExecutionVersionV2 is the durable creation protocol for native
+// V3 research tasks. V1 remains frozen for Temporal/history replay; callers
+// must choose V2 explicitly and must never reinterpret a V1 operation.
+const TaskCreationExecutionVersionV2 int16 = 2
+
 // Task-creation terminal/lease errors are deliberately separate from the broad AppError
 // codes. Callers must be able to distinguish "another worker owns this", "the
 // operation is permanently over", and "my fencing token is stale" without
@@ -94,6 +99,37 @@ type CreateTaskCreationOperationParams struct {
 	Args      json.RawMessage
 	Summary   string
 	ExpiresAt time.Time
+}
+
+// CreateResearchTaskCreationOperationV3Params is deliberately a distinct
+// type from the retained V1 request. Args is the canonical, server-policy-
+// injected V3 approved definition; model-facing task creation never controls
+// the execution version or any lease/checkpoint field.
+type CreateResearchTaskCreationOperationV3Params struct {
+	ID        string
+	TenantID  int64
+	UserID    int64
+	SessionID *int64
+	Args      json.RawMessage
+	Summary   string
+	ExpiresAt time.Time
+}
+
+// CommitPausedResearchTaskDefinitionV3ForCreationParams is the exact fenced
+// evidence required after the deterministic Temporal schedule has been
+// ensured paused. DefinitionPayload is decoded as ApprovedDefinitionV3 by the
+// Store; there is intentionally no ToolCalls, Source, subscription, or fetch
+// target field in this protocol.
+type CommitPausedResearchTaskDefinitionV3ForCreationParams struct {
+	Lease                     TaskCreationLease
+	TaskID                    string
+	DefinitionPayload         []byte
+	DefinitionDigest          string
+	PreparedSchedule          []byte
+	EnsureReceipt             []byte
+	TargetAction              []byte
+	TargetActionDigest        string
+	ActionAuthorizationDigest string
 }
 
 // CommitPausedCompiledTaskDefinitionForCreationParams binds the A2 aggregate
