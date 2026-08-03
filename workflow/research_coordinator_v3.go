@@ -426,8 +426,9 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 		}
 		return ResearchBriefRefV3{}, err
 	}
-	_, canonical, decodeErr := types.DecodeResearchBriefPayloadV3(
-		[]byte(receipt.Call.Completion))
+	_, canonical, decodeErr := decodeResearchBriefCompletionV3(
+		[]byte(receipt.Call.Completion),
+		seal.ResearchModel.Synthesis.RendererVersion)
 	if decodeErr != nil {
 		_, failErr := r.store.FailResearchBriefSynthesisV3(ctx,
 			storepkg.FailResearchBriefSynthesisV3Params{
@@ -597,6 +598,41 @@ func decodeResearchPlannerCompletionV3(
 	steps := make([]runcontext.ResearchPlanStepV3, len(output.Steps))
 	copy(steps, output.Steps)
 	return steps, nil
+}
+
+// decodeResearchBriefCompletionV3 separates the model's representation from
+// the durable artifact. Historical v3 snapshots retain their byte-exact
+// contract, while v3.1 accepts representation-only whitespace and object-key
+// order before returning canonical bytes for Store finalization.
+func decodeResearchBriefCompletionV3(
+	raw []byte, rendererVersion string,
+) (types.ResearchBriefPayloadV3, []byte, error) {
+	switch rendererVersion {
+	case runtimepolicy.ResearchSynthesisRendererVersionV3:
+		return types.DecodeResearchBriefPayloadV3(raw)
+	case runtimepolicy.ResearchSynthesisRendererVersionV31:
+		if len(raw) < 2 || len(raw) > 256<<10 {
+			return types.ResearchBriefPayloadV3{}, nil,
+				researchCoordinatorValidationV3("research Brief model output is invalid")
+		}
+		var payload types.ResearchBriefPayloadV3
+		if err := strictjson.DecodeExact(raw, &payload); err != nil {
+			return types.ResearchBriefPayloadV3{}, nil,
+				researchCoordinatorValidationV3("research Brief model output is invalid")
+		}
+		if err := payload.Validate(); err != nil {
+			return types.ResearchBriefPayloadV3{}, nil, err
+		}
+		canonical, err := json.Marshal(payload)
+		if err != nil {
+			return types.ResearchBriefPayloadV3{}, nil,
+				researchCoordinatorValidationV3("research Brief model output is invalid")
+		}
+		return payload, canonical, nil
+	default:
+		return types.ResearchBriefPayloadV3{}, nil,
+			researchCoordinatorValidationV3("research synthesis renderer is unavailable")
+	}
 }
 
 func minimumResearchPlannerStepsV3(rendererVersion string, maxToolCalls int) int {
