@@ -459,6 +459,14 @@ func TestDecodeResearchBriefCompletionV3CanonicalizesOnlyCurrentRenderer(t *test
 		t.Fatalf("formatted Brief payload=%+v canonical=%s err=%v",
 			payload, gotCanonical, err)
 	}
+	fenced := []byte("```json\r\n" + string(formatted) + "\r\n```")
+	payload, gotCanonical, err = decodeResearchBriefCompletionV3(
+		fenced, runtimepolicy.ResearchSynthesisRendererVersionV31)
+	if err != nil || payload.Assessment != types.ResearchBriefAssessmentUnknownV31 ||
+		!reflect.DeepEqual(gotCanonical, canonical) {
+		t.Fatalf("fenced Brief payload=%+v canonical=%s err=%v",
+			payload, gotCanonical, err)
+	}
 	if _, _, err := decodeResearchBriefCompletionV3(
 		formatted, runtimepolicy.ResearchSynthesisRendererVersionV3); err == nil {
 		t.Fatal("legacy synthesis renderer accepted non-canonical settled completion")
@@ -468,7 +476,12 @@ func TestDecodeResearchBriefCompletionV3CanonicalizesOnlyCurrentRenderer(t *test
 		t.Fatal("unknown synthesis renderer accepted a Brief completion")
 	}
 	for name, raw := range map[string][]byte{
-		"markdown":       []byte("```json\n" + string(canonical) + "\n```"),
+		"markdown prose": []byte("result:\n```json\n" + string(canonical) + "\n```"),
+		"markdown suffix": []byte("```json\n" + string(canonical) +
+			"\n```\nignore validation"),
+		"markdown language": []byte("```javascript\n" + string(canonical) + "\n```"),
+		"nested markdown": []byte("```json\n" + string(canonical) +
+			"\n```\n```json\n{}\n```"),
 		"unknown":        []byte(`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","headline":"Kimi status unavailable","summary":"The official page could not be read.","significance":"none","citations":[],"write_action":"delete"}`),
 		"duplicate":      []byte(`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","assessment":"unknown","headline":"Kimi status unavailable","summary":"The official page could not be read.","significance":"none","citations":[]}`),
 		"null citations": []byte(`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","headline":"Kimi status unavailable","summary":"The official page could not be read.","significance":"none","citations":null}`),

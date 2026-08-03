@@ -611,12 +611,13 @@ func decodeResearchBriefCompletionV3(
 	case runtimepolicy.ResearchSynthesisRendererVersionV3:
 		return types.DecodeResearchBriefPayloadV3(raw)
 	case runtimepolicy.ResearchSynthesisRendererVersionV31:
-		if len(raw) < 2 || len(raw) > 256<<10 {
+		normalized, err := normalizeResearchBriefCompletionV31(raw)
+		if err != nil {
 			return types.ResearchBriefPayloadV3{}, nil,
 				researchCoordinatorValidationV3("research Brief model output is invalid")
 		}
 		var payload types.ResearchBriefPayloadV3
-		if err := strictjson.DecodeExact(raw, &payload); err != nil {
+		if err := strictjson.DecodeExact(normalized, &payload); err != nil {
 			return types.ResearchBriefPayloadV3{}, nil,
 				researchCoordinatorValidationV3("research Brief model output is invalid")
 		}
@@ -633,6 +634,52 @@ func decodeResearchBriefCompletionV3(
 		return types.ResearchBriefPayloadV3{}, nil,
 			researchCoordinatorValidationV3("research synthesis renderer is unavailable")
 	}
+}
+
+// normalizeResearchBriefCompletionV31 accepts the one representation defect
+// repeatedly emitted by otherwise-valid production model completions: a
+// single Markdown code fence tagged json. The wrapper carries no semantics and
+// is removed before strict JSON decoding. Any prose, second fence, unknown
+// language tag, or trailing content remains fail-closed.
+func normalizeResearchBriefCompletionV31(raw []byte) ([]byte, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 2 || len(trimmed) > 256<<10 {
+		return nil, types.ErrValidation
+	}
+	if !bytes.HasPrefix(trimmed, []byte("```")) {
+		return trimmed, nil
+	}
+	const open = "```json"
+	if !bytes.HasPrefix(trimmed, []byte(open)) {
+		return nil, types.ErrValidation
+	}
+	remainder := trimmed[len(open):]
+	if len(remainder) == 0 {
+		return nil, types.ErrValidation
+	}
+	if bytes.HasPrefix(remainder, []byte("\r\n")) {
+		remainder = remainder[2:]
+	} else if bytes.HasPrefix(remainder, []byte("\n")) {
+		remainder = remainder[1:]
+	} else {
+		return nil, types.ErrValidation
+	}
+	if !bytes.HasSuffix(remainder, []byte("```")) {
+		return nil, types.ErrValidation
+	}
+	remainder = remainder[:len(remainder)-3]
+	if bytes.HasSuffix(remainder, []byte("\r\n")) {
+		remainder = remainder[:len(remainder)-2]
+	} else if bytes.HasSuffix(remainder, []byte("\n")) {
+		remainder = remainder[:len(remainder)-1]
+	} else {
+		return nil, types.ErrValidation
+	}
+	normalized := bytes.TrimSpace(remainder)
+	if len(normalized) < 2 || bytes.Contains(normalized, []byte("```")) {
+		return nil, types.ErrValidation
+	}
+	return normalized, nil
 }
 
 func minimumResearchPlannerStepsV3(rendererVersion string, maxToolCalls int) int {
