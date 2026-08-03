@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,6 +112,18 @@ func TestNativeResearchTaskCreationV3PostgreSQLAtomicLifecycle(t *testing.T) {
 		TargetAction: action, TargetActionDigest: hexDigestV3Test(action),
 		ActionAuthorizationDigest: hexDigestV3Test([]byte("authorization")),
 	}
+	foreignTenant := params
+	foreignTenant.Lease.TenantID++
+	if err := st.CommitPausedResearchTaskDefinitionV3ForCreation(
+		t.Context(), foreignTenant); err == nil {
+		t.Fatal("cross-tenant native V3 commit succeeded")
+	}
+	foreignUser := params
+	foreignUser.Lease.UserID++
+	if err := st.CommitPausedResearchTaskDefinitionV3ForCreation(
+		t.Context(), foreignUser); err == nil {
+		t.Fatal("cross-user native V3 commit succeeded")
+	}
 	if err := st.CommitPausedResearchTaskDefinitionV3ForCreation(t.Context(), params); err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +150,19 @@ func TestNativeResearchTaskCreationV3PostgreSQLAtomicLifecycle(t *testing.T) {
 		playbook != definition.TaskManual || authorityCount != 1 || fetchTargetCount != 0 {
 		t.Fatalf("paused aggregate status=%s mode=%s version=%d authority=%d targets=%d playbook=%q",
 			status, mode, version, authorityCount, fetchTargetCount, playbook)
+	}
+	assertNativeV3TaskHidden(t, st, user.ID, taskID)
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE schedules SET status='active' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CommitPausedResearchTaskDefinitionV3ForCreation(
+		t.Context(), params); err == nil {
+		t.Fatal("definition_committed replay adopted an active schedule drift")
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE schedules SET status='paused' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
 	}
 
 	started, err := st.BeginResearchTaskCreationActivationV3(t.Context(), lease, taskID)
@@ -190,6 +217,309 @@ func TestNativeResearchTaskCreationV3PostgreSQLAtomicLifecycle(t *testing.T) {
 	if operationPhase != "activated" || status != "active" || authorityStatus != "enabled" {
 		t.Fatalf("activation was not atomic: phase=%s schedule=%s authority=%s",
 			operationPhase, status, authorityStatus)
+	}
+	assertNativeV3TaskHidden(t, st, user.ID, taskID)
+}
+
+func TestNativeResearchTaskCreationV3ReplayRejectsMissingOrRevokedAuthority(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	if err := Migrate(t.Context(), scratchURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	user, err := st.UpsertUserByOpenID(t.Context(), "native-v3-replay-"+uuid.NewString(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tenantID int64
+	if err := st.pool.QueryRow(t.Context(),
+		`INSERT INTO tenants(status,plan) VALUES ('active','free') RETURNING id`).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'owner')`,
+		tenantID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	missing := prepareNativeV3CommitFixture(t, st, tenantID, user.ID, "missing-authority")
+	if err := st.CommitPausedResearchTaskDefinitionV3ForCreation(t.Context(), missing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(), `
+		DELETE FROM research_v3_delivery_authorities
+		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND generation=1`,
+		tenantID, user.ID, missing.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CommitPausedResearchTaskDefinitionV3ForCreation(t.Context(), missing); err == nil {
+		t.Fatal("definition replay adopted a missing authority")
+	}
+
+	revoked := prepareNativeV3CommitFixture(t, st, tenantID, user.ID, "revoked-authority")
+	if err := st.CommitPausedResearchTaskDefinitionV3ForCreation(t.Context(), revoked); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(), `
+		UPDATE research_v3_delivery_authorities
+		   SET status='revoked',revoked_at=clock_timestamp()
+		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND generation=1`,
+		tenantID, user.ID, revoked.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CommitPausedResearchTaskDefinitionV3ForCreation(t.Context(), revoked); err == nil {
+		t.Fatal("definition replay adopted a revoked authority")
+	}
+}
+
+func TestNativeResearchTaskCreationV3WaitsForAdvisoryBeforeRowLock(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	if err := Migrate(t.Context(), scratchURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	user, err := st.UpsertUserByOpenID(t.Context(), "native-v3-lock-"+uuid.NewString(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tenantID int64
+	if err := st.pool.QueryRow(t.Context(),
+		`INSERT INTO tenants(status,plan) VALUES ('active','free') RETURNING id`).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'owner')`,
+		tenantID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	params := prepareNativeV3CommitFixture(t, st, tenantID, user.ID, "lock-order")
+	blocker, err := st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(t.Context()) }()
+	lockKey := fmt.Sprintf("%d/%d/%s", tenantID, user.ID, params.TaskID)
+	if _, err := blocker.Exec(t.Context(),
+		`SELECT pg_advisory_xact_lock(hashtextextended($1,101))`, lockKey); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- st.CommitPausedResearchTaskDefinitionV3ForCreation(t.Context(), params)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	waiting := false
+	for time.Now().Before(deadline) {
+		if err := st.pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+			 SELECT 1 FROM pg_stat_activity
+			  WHERE query LIKE '%commit_native_research_task_creation_v3_v1%'
+			    AND wait_event_type='Lock' AND wait_event='advisory')`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !waiting {
+		t.Fatal("native V3 commit did not block on the exact-task advisory lock")
+	}
+	probe, err := st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := probe.Exec(t.Context(), `
+		SELECT 1 FROM task_creation_operations WHERE id=$1 FOR UPDATE NOWAIT`,
+		params.Lease.ID); err != nil {
+		_ = probe.Rollback(t.Context())
+		t.Fatalf("operation row was locked before advisory authority: %v", err)
+	}
+	if err := probe.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := blocker.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("native V3 commit after advisory release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("native V3 commit remained blocked after advisory release")
+	}
+}
+
+func TestNativeResearchTaskCreationV3CapacitySerializesConcurrentCommits(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	if err := Migrate(t.Context(), scratchURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	user, err := st.UpsertUserByOpenID(t.Context(), "native-v3-capacity-"+uuid.NewString(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tenantID int64
+	if err := st.pool.QueryRow(t.Context(),
+		`INSERT INTO tenants(status,plan) VALUES ('active','free') RETURNING id`).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'owner')`,
+		tenantID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 19; index++ {
+		if _, err := st.pool.Exec(t.Context(), `
+			INSERT INTO schedules(id,tenant_id,user_id,nl_description,spec_json,scope_json,status)
+			VALUES($1,$2,$3,'existing','{"every_seconds":3600}','{}','active')`,
+			"existing-"+uuid.NewString(), tenantID, user.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	left := prepareNativeV3CommitFixture(t, st, tenantID, user.ID, "left")
+	right := prepareNativeV3CommitFixture(t, st, tenantID, user.ID, "right")
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var workers sync.WaitGroup
+	for _, params := range []types.CommitPausedResearchTaskDefinitionV3ForCreationParams{left, right} {
+		workers.Add(1)
+		go func(candidate types.CommitPausedResearchTaskDefinitionV3ForCreationParams) {
+			defer workers.Done()
+			<-start
+			results <- st.CommitPausedResearchTaskDefinitionV3ForCreation(t.Context(), candidate)
+		}(params)
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	succeeded, failed := 0, 0
+	for result := range results {
+		if result == nil {
+			succeeded++
+		} else {
+			failed++
+		}
+	}
+	if succeeded != 1 || failed != 1 {
+		t.Fatalf("capacity race succeeded=%d failed=%d", succeeded, failed)
+	}
+	var created int
+	if err := st.pool.QueryRow(t.Context(), `
+		SELECT count(*) FROM schedules WHERE id IN ($1,$2)`,
+		left.TaskID, right.TaskID).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created != 1 {
+		t.Fatalf("capacity race created %d native schedules, want 1", created)
+	}
+}
+
+func prepareNativeV3CommitFixture(
+	t *testing.T, st *Store, tenantID, userID int64, label string,
+) types.CommitPausedResearchTaskDefinitionV3ForCreationParams {
+	t.Helper()
+	operationID := "native-v3-" + label + "-" + uuid.NewString()
+	taskID := nativeResearchTaskIDV3Test(tenantID, userID, operationID)
+	definition, err := taskstate.BuildApprovedDefinitionV3(taskstate.ApprovedDefinitionInputV3{
+		TenantID: tenantID, UserID: userID, TaskID: taskID,
+		TaskName: "research " + label, TaskManual: "check official evidence for " + label,
+		SpecJSON:      json.RawMessage(`{"tz":"Asia/Shanghai","every_seconds":3600}`),
+		ExecutionMode: types.ExecutionModeDiscoverAtRun,
+		Notification: taskstate.NotificationPolicyV3{
+			MinimumSignificance: taskstate.NotificationThresholdMajorV3, SuppressEmpty: true,
+		},
+		Output: taskstate.OutputPreferenceV3{
+			Language:             taskstate.OutputLanguageEnV3,
+			Format:               taskstate.OutputFormatConciseBriefV3,
+			IncludeEvidenceLinks: true,
+		},
+		PlannerBudget: types.PlannerBudget{
+			MaxPlannerRounds: 8, MaxToolCalls: 16, MaxTokens: 32768,
+			MaxCostMicroUSD: 1_000_000, DurationMs: 300_000,
+		},
+		DeliveryPolicy:     taskstate.DeliveryPolicyOwnerFeishu,
+		TenantBudgetPolicy: taskstate.BudgetPolicyInheritTenantQuota,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := taskstate.EncodeApprovedDefinitionV3(definition)
+	digest, _ := taskstate.DigestApprovedDefinitionV3(definition)
+	if _, err := st.CreateResearchTaskCreationOperationV3(t.Context(),
+		types.CreateResearchTaskCreationOperationV3Params{
+			ID: operationID, TenantID: tenantID, UserID: userID,
+			Args: payload, Summary: definition.TaskName,
+			ExpiresAt: time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond),
+		}); err != nil {
+		t.Fatal(err)
+	}
+	prepared := []byte(`{"prepared":true}`)
+	receipt := []byte(`{"ensured":true}`)
+	action := []byte(`{"runtime":"research-v3"}`)
+	leaseOwner := "native-v3-" + label
+	if _, err := st.pool.Exec(t.Context(), `
+		UPDATE task_creation_operations
+		   SET status='executing',phase='schedule_ensured',lease_owner=$2,
+		       lease_until=clock_timestamp()+interval '1 hour',
+		       takeover_not_before=clock_timestamp()+interval '2 hours',
+		       fence=1,attempt=1,compiled_definition=$3,compiled_digest=$4,
+		       prepared_schedule=$5,ensure_receipt=$6,task_id=$7
+		 WHERE id=$1 AND tool_name='manage_tasks' AND execution_version=2`,
+		operationID, leaseOwner, payload, digest, prepared, receipt, taskID); err != nil {
+		t.Fatal(err)
+	}
+	return types.CommitPausedResearchTaskDefinitionV3ForCreationParams{
+		Lease: types.TaskCreationLease{
+			ID: operationID, TenantID: tenantID, UserID: userID,
+			LeaseOwner: leaseOwner, Fence: 1,
+		},
+		TaskID: taskID, DefinitionPayload: payload, DefinitionDigest: digest,
+		PreparedSchedule: prepared, EnsureReceipt: receipt,
+		TargetAction: action, TargetActionDigest: hexDigestV3Test(action),
+		ActionAuthorizationDigest: hexDigestV3Test([]byte("authorization-" + label)),
+	}
+}
+
+func assertNativeV3TaskHidden(t *testing.T, st *Store, userID int64, taskID string) {
+	t.Helper()
+	schedules, err := st.ListSchedulesByUser(t.Context(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, schedule := range schedules {
+		if schedule.ID == taskID {
+			t.Fatalf("unfinished native V3 aggregate %s escaped mature schedule fence", taskID)
+		}
 	}
 }
 

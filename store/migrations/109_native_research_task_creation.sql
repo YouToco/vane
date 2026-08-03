@@ -12,13 +12,169 @@ ALTER TABLE task_creation_operations
 ALTER TABLE task_creation_operations
     ADD CONSTRAINT task_creation_operations_execution_version_current
     CHECK (execution_version IN (1,2));
+ALTER TABLE task_creation_operations
+    ADD CONSTRAINT task_creation_operations_protocol_tool_binding
+    CHECK ((execution_version=1 AND tool_name='create_schedule') OR
+           (execution_version=2 AND tool_name='manage_tasks'));
 
 DROP INDEX idx_task_creation_operations_stale;
 CREATE INDEX idx_task_creation_operations_stale
     ON task_creation_operations (tenant_id,takeover_not_before,id)
-    WHERE execution_version IN (1,2)
-      AND tool_name='create_schedule' AND status='executing'
+    WHERE ((execution_version=1 AND tool_name='create_schedule') OR
+           (execution_version=2 AND tool_name='manage_tasks'))
+      AND status='executing'
       AND tombstoned_at IS NULL;
+
+-- Only the migration/session owner may enter the native creation coordinator
+-- during migration. vane_app never receives membership or direct function
+-- execution; the separately provisioned NOINHERIT server shell receives this
+-- one capability through the exact closed-set v2 provisioner below.
+-- +goose StatementBegin
+DO $$
+DECLARE membership RECORD;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles
+                    WHERE rolname='vane_native_v3_creation_coordinator') THEN
+        BEGIN
+            CREATE ROLE vane_native_v3_creation_coordinator
+                NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+                NOREPLICATION NOBYPASSRLS;
+        EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
+        END;
+    END IF;
+    ALTER ROLE vane_native_v3_creation_coordinator
+        NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+        NOREPLICATION NOBYPASSRLS;
+    FOR membership IN
+        SELECT granted.rolname AS granted_name,member.rolname AS member_name
+          FROM pg_auth_members edge
+          JOIN pg_roles granted ON granted.oid=edge.roleid
+          JOIN pg_roles member ON member.oid=edge.member
+         WHERE (granted.rolname='vane_native_v3_creation_coordinator'
+                AND member.rolname<>current_user)
+            OR member.rolname='vane_native_v3_creation_coordinator'
+    LOOP
+        EXECUTE format('REVOKE %I FROM %I',
+                       membership.granted_name,membership.member_name);
+    END LOOP;
+    EXECUTE format('GRANT vane_native_v3_creation_coordinator TO %I',current_user);
+END $$;
+-- +goose StatementEnd
+
+GRANT USAGE ON SCHEMA public TO vane_native_v3_creation_coordinator;
+
+-- Migration 098 owns the original exact server shell. This versioned
+-- successor composes that boundary with the capability introduced here, so
+-- both upgraded and freshly migrated databases expose one exact closed set.
+-- +goose StatementBegin
+CREATE FUNCTION provision_vane_server_runtime_v2() RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE owner_name TEXT:=current_user; direct_roles TEXT[]; expected_roles TEXT[];
+        reverse_members TEXT[];
+BEGIN
+    IF session_user<>owner_name THEN
+        RAISE EXCEPTION '109: only the direct migration owner may provision server runtime'
+            USING ERRCODE='42501';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock(6215335020355474248);
+    -- A repeated call must also work: temporarily return the shell to the
+    -- migration-098 set before invoking its owner-only hardening routine.
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles
+                WHERE rolname='vane_server_runtime') THEN
+        EXECUTE 'REVOKE vane_native_v3_creation_coordinator FROM vane_server_runtime';
+    END IF;
+    PERFORM public.provision_vane_server_runtime_v1();
+    EXECUTE 'GRANT vane_native_v3_creation_coordinator TO vane_server_runtime';
+
+    SELECT pg_catalog.array_agg(granted.rolname ORDER BY granted.rolname)
+      INTO direct_roles
+      FROM pg_catalog.pg_auth_members edge
+      JOIN pg_catalog.pg_roles granted ON granted.oid=edge.roleid
+      JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+     WHERE member.rolname='vane_server_runtime';
+    SELECT pg_catalog.array_agg(role_name ORDER BY role_name)
+      INTO expected_roles
+      FROM pg_catalog.unnest(ARRAY[
+          'vane_app','vane_edit_coordinator','vane_edit_receipt',
+          'vane_snapshot_cutover_operator','vane_push_effect_coordinator',
+          'vane_push_effect_receipt','vane_push_effect_operator',
+          'vane_push_batch_authority','vane_schedule_commander',
+          'vane_agent_session_projection_operator',
+          'vane_agent_session_fact_projector','vane_profile_editor',
+          'vane_profile_claim_editor','vane_profile_epoch_editor',
+          'vane_brief_writer','vane_brief_reader',
+          'vane_brief_synthesis_writer','vane_brief_synthesis_recovery',
+          'vane_periodic_brief_writer','vane_run_outcome_recovery',
+          'vane_intelligence_reader','vane_native_v3_creation_coordinator'
+      ]::TEXT[]) AS allowed(role_name);
+    IF direct_roles IS DISTINCT FROM expected_roles THEN
+        RAISE EXCEPTION '109: server runtime memberships differ: got %, expected %',
+            direct_roles,expected_roles USING ERRCODE='42501';
+    END IF;
+    SELECT pg_catalog.array_agg(member.rolname ORDER BY member.rolname)
+      INTO reverse_members
+      FROM pg_catalog.pg_auth_members edge
+      JOIN pg_catalog.pg_roles granted ON granted.oid=edge.roleid
+      JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+     WHERE granted.rolname='vane_server_runtime';
+    IF reverse_members IS NOT NULL THEN
+        RAISE EXCEPTION '109: other roles can enter server runtime: %',reverse_members
+            USING ERRCODE='42501';
+    END IF;
+END $$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION provision_vane_server_runtime_v2() FROM PUBLIC;
+
+-- +goose StatementBegin
+CREATE FUNCTION deprovision_vane_server_runtime_v2() RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE owner_name TEXT:=current_user; runtime_login BOOLEAN;
+        direct_roles TEXT[]; expected_roles TEXT[];
+BEGIN
+    IF session_user<>owner_name THEN
+        RAISE EXCEPTION '109: only the direct migration owner may deprovision server runtime'
+            USING ERRCODE='42501';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock(6215335020355474248);
+    SELECT rolcanlogin INTO runtime_login FROM pg_catalog.pg_roles
+     WHERE rolname='vane_server_runtime';
+    IF runtime_login IS NULL THEN RETURN; END IF;
+    IF runtime_login THEN
+        RAISE EXCEPTION '109: refusing deprovision while vane_server_runtime can login'
+            USING ERRCODE='55000';
+    END IF;
+    SELECT pg_catalog.array_agg(granted.rolname ORDER BY granted.rolname)
+      INTO direct_roles
+      FROM pg_catalog.pg_auth_members edge
+      JOIN pg_catalog.pg_roles granted ON granted.oid=edge.roleid
+      JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+     WHERE member.rolname='vane_server_runtime';
+    SELECT pg_catalog.array_agg(role_name ORDER BY role_name)
+      INTO expected_roles
+      FROM pg_catalog.unnest(ARRAY[
+          'vane_app','vane_edit_coordinator','vane_edit_receipt',
+          'vane_snapshot_cutover_operator','vane_push_effect_coordinator',
+          'vane_push_effect_receipt','vane_push_effect_operator',
+          'vane_push_batch_authority','vane_schedule_commander',
+          'vane_agent_session_projection_operator',
+          'vane_agent_session_fact_projector','vane_profile_editor',
+          'vane_profile_claim_editor','vane_profile_epoch_editor',
+          'vane_brief_writer','vane_brief_reader',
+          'vane_brief_synthesis_writer','vane_brief_synthesis_recovery',
+          'vane_periodic_brief_writer','vane_run_outcome_recovery',
+          'vane_intelligence_reader','vane_native_v3_creation_coordinator'
+      ]::TEXT[]) AS allowed(role_name);
+    IF direct_roles IS DISTINCT FROM expected_roles THEN
+        RAISE EXCEPTION '109: refusing non-exact server runtime memberships: got %, expected %',
+            direct_roles,expected_roles USING ERRCODE='42501';
+    END IF;
+    EXECUTE 'REVOKE vane_native_v3_creation_coordinator FROM vane_server_runtime';
+    PERFORM public.deprovision_vane_server_runtime_v1();
+END $$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION deprovision_vane_server_runtime_v2() FROM PUBLIC;
 
 -- +goose StatementBegin
 CREATE FUNCTION commit_native_research_task_creation_v3_v1(
@@ -99,10 +255,15 @@ BEGIN
         RAISE EXCEPTION '109: native V3 definition shape is invalid' USING ERRCODE='23514';
     END IF;
 
+    -- This is the same exact-task fence and lock order used by migrations
+    -- 101/107: advisory authority first, then operation/schedule rows.
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        requested_tenant_id::text||'/'||requested_user_id::text||'/'||requested_task_id,101));
+
     SELECT * INTO operation_row
       FROM public.task_creation_operations
      WHERE id=operation_id AND tenant_id=requested_tenant_id
-       AND user_id=requested_user_id AND tool_name='create_schedule'
+       AND user_id=requested_user_id AND tool_name='manage_tasks'
        AND execution_version=2
      FOR UPDATE;
     IF NOT FOUND OR operation_row.status<>'executing' OR
@@ -149,20 +310,26 @@ BEGIN
            AND schedule.nl_description=definition_json->>'task_name'
            AND schedule.scope_json='{}'::jsonb
            AND playbook.content=definition_json->>'task_manual'
-           AND playbook.fetch_plan='{}'::jsonb;
+           AND playbook.fetch_plan='{}'::jsonb
+         FOR SHARE OF schedule,playbook,definition;
         SELECT status INTO authority_status
           FROM public.research_v3_delivery_authorities
          WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
            AND task_id=requested_task_id AND generation=1
            AND definition_version=1 AND definition_digest=requested_definition_digest
            AND target_action_digest=requested_target_action_digest
-           AND action_authorization_digest=requested_action_authorization_digest;
+           AND action_authorization_digest=requested_action_authorization_digest
+         FOR SHARE;
         IF existing_mode IS DISTINCT FROM 'discover_at_run' OR
            existing_schema IS DISTINCT FROM 'vane.task-approved-definition/v3' OR
            existing_digest IS DISTINCT FROM requested_definition_digest OR
            existing_payload IS DISTINCT FROM requested_definition OR
-           ((operation_row.phase='activated') IS DISTINCT FROM (existing_status='active')) OR
-           ((operation_row.phase='activated') IS DISTINCT FROM (authority_status='enabled')) THEN
+           (operation_row.phase IN ('definition_committed','activation_started') AND
+                (existing_status IS DISTINCT FROM 'paused' OR
+                 authority_status IS DISTINCT FROM 'staged')) OR
+           (operation_row.phase='activated' AND
+                (existing_status IS DISTINCT FROM 'active' OR
+                 authority_status IS DISTINCT FROM 'enabled')) THEN
             RAISE EXCEPTION '109: native V3 creation replay aggregate differs' USING ERRCODE='40001';
         END IF;
         RETURN;
@@ -176,8 +343,9 @@ BEGIN
          WHERE user_id=requested_user_id AND status='active'
         UNION
         SELECT task_id FROM public.task_creation_operations
-         WHERE user_id=requested_user_id AND tool_name='create_schedule'
-           AND execution_version IN (1,2) AND status='executing'
+         WHERE user_id=requested_user_id AND status='executing'
+           AND ((execution_version=1 AND tool_name='create_schedule') OR
+                (execution_version=2 AND tool_name='manage_tasks'))
            AND tombstoned_at IS NULL AND task_id<>''
            AND phase IN ('definition_committed','activation_started','activated')
     ) reserved;
@@ -222,7 +390,7 @@ BEGIN
     UPDATE public.task_creation_operations
        SET phase='definition_committed',updated_at=clock_timestamp()
      WHERE id=operation_id AND tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND execution_version=2 AND phase='schedule_ensured'
+       AND tool_name='manage_tasks' AND execution_version=2 AND phase='schedule_ensured'
        AND lease_owner=requested_lease_owner AND fence=requested_fence
        AND lease_until>clock_timestamp();
     IF NOT FOUND THEN
@@ -248,9 +416,11 @@ BEGIN
        requested_execution_version IS NULL OR requested_execution_version<>2 THEN
         RAISE EXCEPTION '109: native V3 activation protocol differs' USING ERRCODE='23514';
     END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        requested_tenant_id::text||'/'||requested_user_id::text||'/'||requested_task_id,101));
     SELECT phase INTO operation_phase FROM public.task_creation_operations
      WHERE id=operation_id AND tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND tool_name='create_schedule' AND execution_version=2 AND status='executing'
+       AND tool_name='manage_tasks' AND execution_version=2 AND status='executing'
        AND tombstoned_at IS NULL AND lease_owner=requested_lease_owner
        AND fence=requested_fence AND lease_until>clock_timestamp()
        AND task_id=requested_task_id FOR UPDATE;
@@ -286,7 +456,7 @@ BEGIN
     END IF;
     UPDATE public.task_creation_operations SET phase='activation_started',updated_at=clock_timestamp()
      WHERE id=operation_id AND tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND execution_version=2 AND phase='definition_committed'
+       AND tool_name='manage_tasks' AND execution_version=2 AND phase='definition_committed'
        AND lease_owner=requested_lease_owner AND fence=requested_fence
        AND lease_until>clock_timestamp();
     IF NOT FOUND THEN
@@ -313,9 +483,11 @@ BEGIN
        requested_execution_version IS NULL OR requested_execution_version<>2 THEN
         RAISE EXCEPTION '109: native V3 activation protocol differs' USING ERRCODE='23514';
     END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        requested_tenant_id::text||'/'||requested_user_id::text||'/'||requested_task_id,101));
     SELECT phase INTO operation_phase FROM public.task_creation_operations
      WHERE id=operation_id AND tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND tool_name='create_schedule' AND execution_version=2 AND status='executing'
+       AND tool_name='manage_tasks' AND execution_version=2 AND status='executing'
        AND tombstoned_at IS NULL AND lease_owner=requested_lease_owner
        AND fence=requested_fence AND lease_until>clock_timestamp()
        AND task_id=requested_task_id FOR UPDATE;
@@ -362,7 +534,7 @@ BEGIN
     END IF;
     UPDATE public.task_creation_operations SET phase='activated',updated_at=clock_timestamp()
      WHERE id=operation_id AND tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND execution_version=2 AND phase='activation_started'
+       AND tool_name='manage_tasks' AND execution_version=2 AND phase='activation_started'
        AND lease_owner=requested_lease_owner AND fence=requested_fence
        AND lease_until>clock_timestamp();
     IF NOT FOUND THEN
@@ -378,11 +550,14 @@ REVOKE ALL ON FUNCTION begin_native_research_task_activation_v3_v1(
 REVOKE ALL ON FUNCTION commit_native_research_task_activation_v3_v1(
     TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION commit_native_research_task_creation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,BYTEA,BYTEA,BYTEA,BYTEA,TEXT,TEXT,SMALLINT) TO vane_app;
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,BYTEA,BYTEA,BYTEA,BYTEA,TEXT,TEXT,SMALLINT)
+    TO vane_native_v3_creation_coordinator;
 GRANT EXECUTE ON FUNCTION begin_native_research_task_activation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT) TO vane_app;
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT)
+    TO vane_native_v3_creation_coordinator;
 GRANT EXECUTE ON FUNCTION commit_native_research_task_activation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT) TO vane_app;
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT)
+    TO vane_native_v3_creation_coordinator;
 
 -- +goose Down
 
@@ -393,6 +568,10 @@ DO $$ BEGIN
                 WHERE operation_ref LIKE 'task-create-v3/%') THEN
         RAISE EXCEPTION '109: refusing downgrade while native V3 creation state exists';
     END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles
+                WHERE rolname='vane_server_runtime') THEN
+        RAISE EXCEPTION '109: deprovision vane_server_runtime before schema downgrade';
+    END IF;
 END $$;
 -- +goose StatementEnd
 
@@ -402,11 +581,16 @@ DROP FUNCTION begin_native_research_task_activation_v3_v1(
     TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT);
 DROP FUNCTION commit_native_research_task_creation_v3_v1(
     TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,BYTEA,BYTEA,BYTEA,BYTEA,TEXT,TEXT,SMALLINT);
+DROP FUNCTION deprovision_vane_server_runtime_v2();
+DROP FUNCTION provision_vane_server_runtime_v2();
+REVOKE USAGE ON SCHEMA public FROM vane_native_v3_creation_coordinator;
 DROP INDEX idx_task_creation_operations_stale;
 CREATE INDEX idx_task_creation_operations_stale
     ON task_creation_operations (tenant_id,takeover_not_before,id)
     WHERE execution_version=1 AND tool_name='create_schedule'
       AND status='executing' AND tombstoned_at IS NULL;
+ALTER TABLE task_creation_operations
+    DROP CONSTRAINT task_creation_operations_protocol_tool_binding;
 ALTER TABLE task_creation_operations
     DROP CONSTRAINT task_creation_operations_execution_version_current;
 ALTER TABLE task_creation_operations

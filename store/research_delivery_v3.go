@@ -512,6 +512,7 @@ func authorizeResearchBriefDeliveryPrepareV3(
 		   AND membership.user_id=schedule.user_id
 		 WHERE schedule.id=$1 AND schedule.tenant_id=$2 AND schedule.user_id=$3
 		   AND schedule.status='active' AND schedule.execution_mode='discover_at_run'
+		   AND `+matureSchedulePredicateForResearch+`
 		 FOR SHARE OF schedule,tenant,membership`, identity.TaskID,
 		identity.TenantID, identity.UserID).Scan(&authorized)
 	if errors.Is(err, pgx.ErrNoRows) {

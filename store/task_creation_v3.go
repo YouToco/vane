@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 
@@ -76,7 +77,7 @@ func (s *Store) CreateResearchTaskCreationOperationV3(
 		`INSERT INTO task_creation_operations
 		 (id,tenant_id,user_id,session_id,tool_name,args,summary,status,
 		  expires_at,execution_version)
-		 VALUES ($1,$2,$3,$4,'create_schedule',$5,$6,$7,$8,$9)
+		 VALUES ($1,$2,$3,$4,'manage_tasks',$5,$6,$7,$8,$9)
 		 ON CONFLICT (id) DO NOTHING
 		 RETURNING `+taskCreationOperationColumns,
 		p.ID, p.TenantID, p.UserID, p.SessionID, []byte(p.Args), p.Summary,
@@ -126,7 +127,12 @@ func (s *Store) CommitPausedResearchTaskDefinitionV3ForCreation(
 	if hex.EncodeToString(actionSum[:]) != p.TargetActionDigest {
 		return taskCreationValidation("native V3 target action digest differs")
 	}
-	if _, err := s.pool.Exec(ctx,
+	tx, err := s.beginNativeResearchCreationV3Tx(ctx, p.Lease.TenantID, p.Lease.UserID)
+	if err != nil {
+		return err
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+	if _, err := tx.Exec(ctx,
 		`SELECT commit_native_research_task_creation_v3_v1(
 		 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		p.Lease.ID, p.Lease.TenantID, p.Lease.UserID, p.Lease.LeaseOwner,
@@ -135,6 +141,9 @@ func (s *Store) CommitPausedResearchTaskDefinitionV3ForCreation(
 		p.TargetActionDigest, p.ActionAuthorizationDigest,
 		types.TaskCreationExecutionVersionV2); err != nil {
 		return taskCreationDatabaseError("commit native V3 paused aggregate", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return taskCreationDatabaseError("commit native V3 paused aggregate transaction", err)
 	}
 	return nil
 }
@@ -154,12 +163,20 @@ func (s *Store) BeginResearchTaskCreationActivationV3(
 		return false, err
 	}
 	var started bool
-	if err := s.pool.QueryRow(ctx,
+	tx, err := s.beginNativeResearchCreationV3Tx(ctx, lease.TenantID, lease.UserID)
+	if err != nil {
+		return false, err
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+	if err := tx.QueryRow(ctx,
 		`SELECT begin_native_research_task_activation_v3_v1(
 		 $1,$2,$3,$4,$5,$6,$7)`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		taskID, types.TaskCreationExecutionVersionV2).Scan(&started); err != nil {
 		return false, taskCreationDatabaseError("begin native V3 activation", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, taskCreationDatabaseError("commit native V3 activation authorization", err)
 	}
 	return started, nil
 }
@@ -178,14 +195,43 @@ func (s *Store) CommitResearchTaskCreationActivationV3(
 	if err := validateTaskCreationTaskID(taskID); err != nil {
 		return err
 	}
-	if _, err := s.pool.Exec(ctx,
+	tx, err := s.beginNativeResearchCreationV3Tx(ctx, lease.TenantID, lease.UserID)
+	if err != nil {
+		return err
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+	if _, err := tx.Exec(ctx,
 		`SELECT commit_native_research_task_activation_v3_v1(
 		 $1,$2,$3,$4,$5,$6,$7)`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		taskID, types.TaskCreationExecutionVersionV2); err != nil {
 		return taskCreationDatabaseError("commit native V3 activation", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return taskCreationDatabaseError("commit native V3 activation transaction", err)
+	}
 	return nil
+}
+
+func (s *Store) beginNativeResearchCreationV3Tx(
+	ctx context.Context, tenantID, userID int64,
+) (pgx.Tx, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, taskCreationDatabaseError("begin native V3 coordinator transaction", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(tenantID), fmt.Sprint(userID)); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, taskCreationDatabaseError("bind native V3 coordinator scope", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_native_v3_creation_coordinator`); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, taskCreationDatabaseError("bind native V3 coordinator role", err)
+	}
+	return tx, nil
 }
 
 func loadResearchTaskCreationOperationV3Tx(
@@ -205,7 +251,7 @@ func loadResearchTaskCreationOperationV3Tx(
 		`SELECT `+taskCreationOperationColumns+`
 		   FROM task_creation_operations
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-		    AND tool_name='create_schedule' AND execution_version=$4`+lockClause,
+		    AND tool_name='manage_tasks' AND execution_version=$4`+lockClause,
 		id, tenantID, userID, types.TaskCreationExecutionVersionV2), &op)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil

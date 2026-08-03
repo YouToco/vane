@@ -583,8 +583,10 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		defer runtime.Close()
 		for _, function := range []string{
 			"provision_vane_server_runtime_v1",
+			"provision_vane_server_runtime_v2",
 			"provision_vane_server_runtime_research_binder_v1",
 			"deprovision_vane_server_runtime_v1",
+			"deprovision_vane_server_runtime_v2",
 			"deprovision_vane_server_runtime_research_binder_v1",
 		} {
 			if _, err := runtime.ExecContext(t.Context(),

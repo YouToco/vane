@@ -325,6 +325,7 @@ func loadCurrentResearchDefinitionV3(
 		            schedule.tenant_id,schedule.user_id,schedule.id,$4
 		        )
 		    )) AND schedule.execution_mode='discover_at_run'
+		    AND ` + matureSchedulePredicateForResearch + `
 		  FOR SHARE OF schedule`
 	args := []any{identity.TaskID, identity.TenantID, identity.UserID, identity.TemporalWorkflowID}
 	err := tx.QueryRow(ctx, query, args...).Scan(
@@ -1431,6 +1432,7 @@ func authorizeLegacyResearchRunEffectV3(
 		          schedule.tenant_id,schedule.user_id,schedule.id,$4
 		      )
 		  )) AND schedule.execution_mode='discover_at_run'
+		  AND `+matureSchedulePredicateForResearch+`
 		FOR SHARE OF schedule,tenant,membership`,
 		identity.TaskID, identity.TenantID, identity.UserID,
 		identity.TemporalWorkflowID).Scan(&authorized); err != nil {
