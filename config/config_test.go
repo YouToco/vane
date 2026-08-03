@@ -1476,6 +1476,7 @@ func TestLoadIntentToolkitsRollout(t *testing.T) {
 		t.Setenv("VANE_AGENT_AGENT_FIRST_CANARY_USER_ID", "42")
 		t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://runtime")
 		t.Setenv("VANE_DB_RESEARCH_CONTROL_URL", "postgres://control")
+		t.Setenv("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL", "postgres://edit-recovery")
 		t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "active-v3")
 		t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
 		t.Setenv("VANE_FETCH_EXA_API_KEY", "exa-test")
