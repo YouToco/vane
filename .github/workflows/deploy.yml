@@ -311,12 +311,20 @@ jobs:
       - name: Verify primary server release contract
         if: needs.plan.outputs.backend_changed == 'true'
         id: server_contract
+        env:
+          # Execute the contract probe from the exact clean source with the
+          # selected runner's native architecture; the production artifact's
+          # exact source revision and Linux/amd64 tuple are verified separately.
+          CGO_ENABLED: "0"
         run: |
+          cd "$BUILD_ROOT/source/vane-release"
           contract=$(
-            "$BUILD_ROOT/source/vane-release/bin/vane" -print-release-contract
+            go run ./cmd/server -print-release-contract
           )
           [[ $contract == \
             'vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1' ]]
+          go version -m bin/vane | grep -Fx $'\tbuild\tGOOS=linux'
+          go version -m bin/vane | grep -Fx $'\tbuild\tGOARCH=amd64'
           echo "value=$contract" >>"$GITHUB_OUTPUT"
 
       - name: Package backend release handoff
