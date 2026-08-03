@@ -225,6 +225,7 @@ func TestConverseRedactsKnownInternalReferencesBeforeEvidenceAndReply(t *testing
 	writer := &fakeAgentEvidenceWriter{}
 	queryStoreWithRef := &fakeManageTaskQuery{rows: []map[string]any{{
 		"task_ref": "task-internal-4df9a28b", "task_name": "Kimi 套餐监控",
+		"delivery_ref":        "delivery-internal-6cc102f9",
 		"tool_invocation_ids": []any{"tool-invocation-internal-c9e3"},
 		"action_receipts": []any{map[string]any{
 			"completed_task_refs": []any{"task-internal-receipt-a7c1"},
@@ -241,7 +242,7 @@ func TestConverseRedactsKnownInternalReferencesBeforeEvidenceAndReply(t *testing
 				ID: "query-call", Name: tool.Name(), Arguments: `{"dataset":"tasks"}`,
 			}}}, nil
 		}
-		return &llm.ChatResponse{Content: "任务 task-internal-4df9a28b、task-internal-receipt-a7c1、task-internal-argument-b8d2、tool-invocation-internal-c9e3、schedule-internal-d7f4、schedule-internal-e6a5、task-internal-f5b6 当前正常。"}, nil
+		return &llm.ChatResponse{Content: "任务 task-internal-4df9a28b、投递 delivery-internal-6cc102f9、task-internal-receipt-a7c1、task-internal-argument-b8d2、tool-invocation-internal-c9e3、schedule-internal-d7f4、schedule-internal-e6a5、task-internal-f5b6 当前正常。"}, nil
 	}
 	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
 		traceID: "trace-redact-ref", userID: 42,
@@ -253,6 +254,7 @@ func TestConverseRedactsKnownInternalReferencesBeforeEvidenceAndReply(t *testing
 		&toolRunState{activation: &activationState{}, ownerRequest: "任务状态", agentFirstEnabled: true,
 			successfulCalls: map[string]struct{}{}, failedCalls: map[string]int{}})
 	if err != nil || strings.Contains(outcome.Reply, "task-internal") ||
+		strings.Contains(outcome.Reply, "delivery-internal") ||
 		!strings.Contains(outcome.Reply, "内部引用已隐藏") ||
 		writer.record.AssistantMessage != outcome.Reply {
 		t.Fatalf("outcome=%+v err=%v evidence_reply=%q", outcome, err, writer.record.AssistantMessage)

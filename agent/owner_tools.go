@@ -108,7 +108,7 @@ const queryMyIntelligenceSchema = `{
   "properties": {
     "dataset": {
       "type": "string",
-      "enum": ["tasks","runs","observations","briefs","agent_turns","tool_calls","profile"],
+      "enum": ["tasks","runs","observations","briefs","agent_turns","tool_calls","profile","feedbacks"],
       "description": "一次只查询一个用户情报数据集"
     },
     "select": {
@@ -166,7 +166,7 @@ type queryMyIntelligenceTool struct{ st intelligenceQueryStore }
 
 func (*queryMyIntelligenceTool) Name() string { return "query_my_intelligence" }
 func (*queryMyIntelligenceTool) Description() string {
-	return "查询当前用户自己的任务、历史运行、Observation、Brief、历史 Agent 回答、模型实际看到的工具证据或画像。按名称、主题、用途和自然时间定位，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
+	return "查询当前用户自己的任务、历史运行、Observation、Brief、历史 Agent 回答、模型实际看到的工具证据、画像或推送反馈。按名称、主题、用途和自然时间定位；用户用‘刚才那条’、‘我点的’等方式指代卡片操作时查询 feedbacks，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
 }
 func (*queryMyIntelligenceTool) Parameters() json.RawMessage {
 	return json.RawMessage(queryMyIntelligenceSchema)
