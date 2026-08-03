@@ -44,3 +44,24 @@ func TestDurableProposalExecutesOnlyAsDirectOwnerWrite(t *testing.T) {
 		t.Fatal("detached durable proposal was accepted")
 	}
 }
+
+func TestPublicResearchCatalogDoesNotImplicitlyGrantA2A(t *testing.T) {
+	public := BuildPublicResearchTools(
+		NewEndpointTools(nil, nil, 1, 1),
+		NewExaTools(nil, nil, nil, 1),
+	)
+	if len(public) != 4 {
+		t.Fatalf("public research catalog=%d, want four owner tools", len(public))
+	}
+	filtered, err := FilterAuthorizedTools(public, AuthorizationA2AReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 0 {
+		names := make([]string, 0, len(filtered))
+		for _, spec := range filtered {
+			names = append(names, spec.Name())
+		}
+		t.Fatalf("owner network/billable tools leaked into A2A: %v", names)
+	}
+}

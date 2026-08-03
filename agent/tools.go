@@ -174,9 +174,11 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, runner TaskRunTrigg
 	return tools
 }
 
-// BuildPublicResearchTools is the complete non-internal catalog shared by
+// BuildPublicResearchTools is the complete non-internal starting catalog for
 // production owner chat and the separately authorized A2A projection. It never
-// contains task/profile compatibility tools.
+// contains task/profile compatibility tools. Callers must still apply their
+// trusted authorization scope: the current network/billable tools are
+// owner-only, so AuthorizationA2AReadOnly intentionally filters this to empty.
 func BuildPublicResearchTools(endpoints *EndpointTools, exa *ExaTools) []ToolSpec {
 	var tools []ToolSpec
 	if endpoints != nil {

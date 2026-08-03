@@ -314,9 +314,10 @@ func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Ou
 // 不声明/执行工具；用户本轮可见回答照常返回，但原始外部上下文与派生回答不持久化。
 func (l *Loop) HandleExternalContextMessage(ctx context.Context, userID int64, text string) (Outcome, error)
 // RunOnce 在给定历史上执行一轮多轮 FC（§7.1，2026-07-18 随 A2A PR-4 增补）：
-// 不读写会话存储、不持 userMu 锁、不注入画像——历史与并发语义由调用方管理
+// 不读写会话存储、不持 session admission、不注入画像——历史与并发语义由调用方管理
 //（A2A 侧按 contextId 重建历史，a2a-contract §12 P2）。返回追加了本轮交换的完整历史。
-// 所属实例必须只注册只读工具（a2a 装配显式白名单 list_sources/list_schedules）；
+// 所属 A2A 实例从 public-only catalog 开始并按 AuthorizationA2AReadOnly 过滤；当前
+// Exa/社媒公共研究工具均为 Owner-only，过滤后工具集为空，不读取 owner 业务数据；
 // Confirm 出口在此转为错误（外部 agent 点不了确认卡，挂起即悬空）——agent/runonce_test.go 钉死。
 func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMessage, text string) (Outcome, []llm.ChatMessage, error)
 // ExecuteAction 确认卡回调入口：ClaimPendingAction（原子幂等）→ 找到工具 Execute →
@@ -413,11 +414,12 @@ Loop 行为细则：
 
 决策面以 `ToolPolicy` 为准（7.6）；`Effects` 必须完整声明副作用，
 `EffectDirectOwnerWrite` 表示明确 owner 意图下直接执行。A2A 只读面只按
-`AuthorizationA2AReadOnly` 过滤。
+`AuthorizationA2AReadOnly` 过滤；不能从“公开研究”名称推断授权。当前
+`BuildPublicResearchTools` 的 Exa/社媒工具均为 Owner-only，A2A 过滤结果为空。
 
 | 工具 | 执行方式 | 关键 Effects | 底层调用 | 说明 |
 |---|---|---|---|---|
-| list_schedules | 直接 | internal_read | store.ListSchedulesByUser | 中文列表文本；A2A 可读 |
+| list_schedules | 直接 | internal_read | store.ListSchedulesByUser | 仅遗留 Web 兼容面；Owner/A2A 均不暴露 |
 | create_schedule | Prepare → Execute | durable_proposal + state_write + direct_owner_write | CreationController.Prepare/Execute → creation saga | `{spec,intent,approved_fetch_plan:{fetch_requirements},nl_description?,strictness?}`；只接收 `vane.fetch-requirements/v1` 人类可读抓取要求 |
 | remove_schedule | 直接 | state_write + direct_owner_write | scheduler.DeletePushIdempotent | `{schedule_ids:[string]}`，1–20 个，去重保序 |
 | run_task_now | 直接 | delivery | TaskRunTrigger.RunTasksNow | `{schedule_ids:[string]}`；按任务冻结定义运行 |
@@ -442,8 +444,8 @@ fetcher 层上游行按 `SourceID=0` 无源口径落 tool_calls，归属元数�
 source/content/content_sources。滚动 24h `agent.exa_daily_cap`（默认 100，从
 tool_calls 表按 tool_name IN ('web_search','read_page') COUNT，排除
 invalid_args/budget_exceeded，判定失败 fail-closed）仍强制；`agent.exa_msg_cap`
-已删除，单消息统一由 20 次工具熔断器管理。不进 A2A 只读白名单（显式名单仍为
-list_sources/list_schedules——对外部 agent 暴露付费面是另一个决策）；
+已删除，单消息统一由 20 次工具熔断器管理。不授予 `AuthorizationA2AReadOnly`；
+A2A public-only catalog 因此过滤为空，对外部 agent 暴露联网/付费面是另一个决策；
 Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的分流引导行同样
 条件注入（工具不在场不广告）；maxActivatedEndpoints 同步 13→11（16 基础 + 2 端点
 工具 + 11 激活 = 29 < 30 安全线）。
@@ -686,8 +688,8 @@ callback API 仅用于兼容已发出的历史卡片，不得成为新请求入�
 command，再用 operation ID 构造 server-owned `agent_auto/v1` receipt 立即
 `Confirm`，由同一个 durable coordinator 继续执行/恢复。终态历史写成
 `[Agent执行]`，不得伪造“用户点击确认卡”。
-外部内容 taint 后禁止同轮写、
-A2A 只读白名单、tenant/user 归属校验、预算和幂等边界全部保持不变。
+外部内容 taint 后禁止同轮写、A2A public-only catalog 经只读授权过滤后当前为空、
+tenant/user 归属校验、预算和幂等边界全部保持不变。
 `run_task_now` 与周期调度开关是两个正交操作：它不 Patch/Trigger 周期
 Schedule，而是用耐久 run command ID 启动唯一的一次性工作流。active 与 paused
 任务都可手动运行；paused 时只有与该 command 精确绑定的工作流可通过快照和后续

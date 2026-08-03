@@ -68,6 +68,49 @@ func TestOwnerToolSurfaceIsACompositionInvariant(t *testing.T) {
 	}
 }
 
+func TestA2AUsesOnlyAuthorizedPublicResearchCatalog(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate A2A tool surface wiring test")
+	}
+	file, err := parser.ParseFile(token.NewFileSet(),
+		filepath.Join(filepath.Dir(testFile), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := 0
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || !isPackageSelector(call.Fun, "agent", "FilterAuthorizedTools") {
+			return true
+		}
+		if len(call.Args) != 2 {
+			t.Fatalf("FilterAuthorizedTools args=%d, want public catalog and scope",
+				len(call.Args))
+		}
+		catalog, ok := call.Args[0].(*ast.CallExpr)
+		if !ok || !isPackageSelector(catalog.Fun, "agent", "BuildPublicResearchTools") {
+			t.Fatalf("A2A source catalog=%T, want BuildPublicResearchTools", call.Args[0])
+		}
+		scope, ok := call.Args[1].(*ast.SelectorExpr)
+		if !ok {
+			t.Fatalf("A2A authorization scope=%T, want AuthorizationA2AReadOnly",
+				call.Args[1])
+		}
+		pkg, pkgOK := scope.X.(*ast.Ident)
+		if !pkgOK || pkg.Name != "agent" ||
+			scope.Sel.Name != "AuthorizationA2AReadOnly" {
+			t.Fatalf("A2A authorization scope=%T, want AuthorizationA2AReadOnly",
+				call.Args[1])
+		}
+		matches++
+		return true
+	})
+	if matches != 1 {
+		t.Fatalf("authorized A2A public catalog compositions=%d, want one", matches)
+	}
+}
+
 // TestOwnerRuntimeGatePrecedesAllDurableAssembly proves the process cannot
 // expose unconditional manage_tasks create while its Research V3 worker is
 // dark. The Gate must run before the first Store is opened, and the owner
