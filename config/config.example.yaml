@@ -65,11 +65,12 @@ pipeline:
   # Source-free Tool runtime is deliberately single-task only. To roll back:
   # pause the task first, then clear this ID (V2 definitions cannot run on V1).
   tool_runtime_canary_schedule_id: ""
-  # Research V3 is exact-task only. Shadow never delivers. Authority may only
-  # equal a successfully shadowed task and also requires the same task in
-  # push_effect_recovery_canary_schedule_id.
+  # Shadow/cutover controls remain exact-task only. Once cut over, formal V3
+  # runs are authorized by each task's enabled database authority token.
   research_v3_shadow_canary_schedule_id: ""
   research_v3_authority_canary_schedule_id: ""
+  # Process capability only; it never grants task authority by itself.
+  research_v3_runtime_enabled: false
   # P1-B exact-run lifecycle is independent and remains dark by default.
   run_outcome_enabled: false
   run_outcome_canary_schedule_id: ""

@@ -179,7 +179,7 @@ func TestDurableRunStartsFormalResearchV3Envelope(t *testing.T) {
 	}
 	s := New(client, "vane-tq", st,
 		WithTaskScheduleNamespace("test"),
-		WithResearchRuntimeV3AuthorityCanary(taskID),
+		WithResearchRuntimeV3AuthorityCanary("task-next-cutover"),
 	)
 	command := &types.ScheduleCommand{
 		ID:       "01900000-0000-7000-8000-000000000001",
@@ -210,7 +210,7 @@ func TestDurableRunStartsFormalResearchV3Envelope(t *testing.T) {
 	}
 }
 
-func TestDurableRunRejectsFormalResearchV3OutsideExactAuthority(t *testing.T) {
+func TestDurableRunRejectsFormalResearchV3WithoutEnabledAuthority(t *testing.T) {
 	const taskID = "task-v3-manual-run-no-authority"
 	input := workflow.ResearchScheduledInputV3{
 		TenantID: 1, UserID: 7, TaskID: taskID,
@@ -227,7 +227,7 @@ func TestDurableRunRejectsFormalResearchV3OutsideExactAuthority(t *testing.T) {
 		Kind: types.ScheduleCommandRun, CreatedAt: time.Now().UTC(),
 	})
 	if types.CodeOf(err) != types.CodeConflict {
-		t.Fatalf("manual V3 without exact authority error=%v", err)
+		t.Fatalf("manual V3 without enabled authority error=%v", err)
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()

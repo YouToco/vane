@@ -141,6 +141,37 @@ func TestReconcileActions_RejectsTamperedFormalV3Token(t *testing.T) {
 	assertMondayNineSpec(t, h)
 }
 
+func TestReconcileActions_PreservesMultipleEnabledFormalV3Tasks(t *testing.T) {
+	const taskA, taskB = "task-v3-a", "task-v3-b"
+	tokenA, tokenB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	hA := &fakeScheduleHandle{current: formalResearchV3Schedule(t, taskA, tokenA)}
+	hB := &fakeScheduleHandle{current: formalResearchV3Schedule(t, taskB, tokenB)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handles: map[string]*fakeScheduleHandle{
+		taskA: hA, taskB: hB,
+	}}}
+	st := &fakeScheduleStore{
+		researchV3AuthorizationByTask: map[string]string{taskA: tokenA, taskB: tokenB},
+		researchV3AuthorityEnabled:    true,
+		active: []types.Schedule{
+			{ID: taskA, TenantID: 7, UserID: 42, Status: types.ScheduleStatusActive, ExecutionMode: types.ExecutionModeDiscoverAtRun},
+			{ID: taskB, TenantID: 7, UserID: 42, Status: types.ScheduleStatusActive, ExecutionMode: types.ExecutionModeDiscoverAtRun},
+		},
+	}
+	// The exact control-plane canary may point at the next task (or be empty)
+	// without de-authorizing previously cut-over formal tasks.
+	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary("task-next-cutover"))
+
+	if err := s.ReconcileActions(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if st.researchV3AuthorityCalls != 2 || len(hA.history) != 0 || len(hB.history) != 0 {
+		t.Fatalf("checks=%d updates_a=%d updates_b=%d",
+			st.researchV3AuthorityCalls, len(hA.history), len(hB.history))
+	}
+	assertMondayNineSpec(t, hA)
+	assertMondayNineSpec(t, hB)
+}
+
 func TestReconcileActions_RejectsRevokedFormalV3Authority(t *testing.T) {
 	const taskID = "task-v3-revoked"
 	token := strings.Repeat("f", 64)

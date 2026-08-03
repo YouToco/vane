@@ -6,12 +6,13 @@ Research V3 shadow 是正式切流前的独立技术验证路径。它读取 del
 
 - `pipeline.research_v3_shadow_canary_schedule_id` 只允许一个精确任务 ID；空值是硬关闭。
 - `pipeline.research_v3_authority_canary_schedule_id` 默认必须为空；非空时必须与 shadow ID 完全相同，且没有 allow-all。
+- `pipeline.research_v3_runtime_enabled` 只装载长期 V3 worker/runtime/delivery 能力，不授予任何任务执行权。首个正式切流前保持关闭；启用后，每个正式任务仍必须携带与 tenant/user/task 绑定、数据库状态为 `enabled` 的 authority token。
 - Authority 非空时，`pipeline.push_effect_recovery_canary_schedule_id` 必须配置为同一个精确任务。Server 会在 Temporal worker 和任何飞书入站启动前同步完成 outbound route 预热与首轮 durable recovery；失败则整个服务启动 fail-closed。
 - Authority 配置本身不会修改任何 Action。普通创建、编辑、reconcile 也永远不读取它来切 V3；只有 `researchcutover` 的持久化 saga 可以替换 exact-task Action。
-- 切流后的每次启动 reconcile 都会在 tenant/user RLS 事务中把正式 Action token 的哈希与同任务 `enabled` authority 实时比对；token 被替换或 authority 已撤销时启动 fail-closed，不能把故障拖到下一次周一运行。
+- 切流后的每次启动 reconcile、日常手动运行和 Server runtime 都会在 tenant/user RLS 事务中把正式 Action 的身份与 token 哈希和同任务 `enabled` authority 实时比对；token 被替换、跨任务复用或 authority 已撤销时 fail-closed。reconcile 与手动运行只校验/执行，不改 Schedule spec、status 或 Action。
 - Shadow 使用独立 Workflow ID，不读取、不更新、不触发原 Schedule；原 cron、时区、Overlap、Action 和下次周一 09:00 执行时间均保持不变。
 - Scheduler 再核验任务 owner、active 状态与 exact prepared `vane.task-approved-definition/v3` sidecar；不会回退读取正式 head。
-- Coordinator 在任何 Store、模型或网络副作用前再次核验精确任务授权。
+- Coordinator 在任何 policy 构造、Store 写入、模型或网络副作用前再次核验 Action tenant/user/task 与 enabled authority token。当前 authority canary ID 可以移到下一条待切流任务，已切流任务不会因此失去正式运行权。
 - 每个 Shadow Tool first-writer 还会在数据库内重新核验：exact shadow Workflow、不可变
   snapshot、owner/active 租户与任务、当前 prepared head 及其 prepare journal 必须完全一致；
   正式 Schedule 可保持 `compiled`。撤销 sidecar 后只允许已有 ordinal 的幂等恢复，禁止任何
@@ -73,7 +74,7 @@ go run ./cmd/researchshadow -task-id <schedule-id> -user-id <owner-user-id> -ide
 
 ## 老板 Gate 1：首个真实任务切流
 
-Gate 获批后，把 shadow、authority 与 push-effect recovery ID 配置为同一个已验收任务并部署。Server 必须同时装配独立 Research runtime 与 receipt-backed delivery；任何 user/open_id、App 或 P2P chat 不一致都会在 provider 调用前 fail-closed。
+Gate 获批后，把 shadow、authority 与 push-effect recovery ID 配置为同一个已验收任务，同时启用 `pipeline.research_v3_runtime_enabled` 并部署。Server 必须同时装配独立 Research runtime 与 receipt-backed delivery；任何 user/open_id、App 或 P2P chat 不一致都会在 provider 调用前 fail-closed。
 
 配置不会改变周一 09:00 调度。使用稳定 key 执行唯一切流入口：
 
@@ -84,13 +85,15 @@ go run ./cmd/researchcutover -operation cutover -task-id <schedule-id> -user-id 
 
 `researchcutover` 是一次性 operator 控制面，只接受 migration owner credential（也支持 systemd `CREDENTIALS_DIRECTORY/migration_db_url`）；长期运行的 `vane_server_runtime` 永远不获得 cutover operator 身份。
 
+切完一个任务后，可把 shadow/authority/push-recovery 精确 ID 移到下一条待迁移任务；`research_v3_runtime_enabled` 在仍有任何 enabled V3 authority 时保持开启。数据库中的逐任务 authority 是正式运行唯一授权，静态 ID 只负责一次性 shadow/cutover/rollback 控制面，因此多个已切流 V3 任务可以并存。
+
 该 saga 按“冻结完整 Schedule 与原 DB head/mode → CAS 暂停 → 原子 promote prepared head/mode → 仅替换 Action → 恢复原暂停状态”执行；cron、时区、Overlap、Workflow ID、Task Queue 与其他策略必须逐字保持。命令重试必须复用同一个 key。
 
 切流后只验收一次临时真实运行：官方原文交叉核验、历史对比、专业卡片，以及无重大更新时零 delivery/零飞书消息。正式周一 09:00 不做临时改期。
 
 ## 回滚
 
-先回滚，再清除 authority 配置；不能反序，否则正式 V3 Workflow 会先失去 runtime/delivery 依赖。
+先回滚，再把 authority canary 配置移走；不能反序，否则 operator 控制面会先失去精确回滚目标。只要仍有其他 enabled V3 任务，`research_v3_runtime_enabled` 必须保持开启。
 
 ```powershell
 go run ./cmd/researchcutover -operation rollback -task-id <schedule-id> -user-id <owner-user-id> -idempotency-key <same-stable-cutover-key>

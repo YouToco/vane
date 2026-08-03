@@ -868,23 +868,24 @@ func TestNextRunReadsTemporalAfterOwnershipCheck(t *testing.T) {
 // fakeScheduleStore 按预设让镜像写成功/失败，并记录收到的参数。
 type fakeScheduleStore struct {
 	scheduleStore
-	updateErr                    error
-	gotID                        string
-	gotSpec                      json.RawMessage
-	gotNLDesc                    *string
-	updateCall                   int
-	active                       []types.Schedule // ReconcileActions 用例：ListActiveSchedules 返回值
-	activeErr                    error
-	reconcileCurrent             map[string]*types.Schedule
-	reconcileAcquireCalls        []string
-	reconcileReleaseCalls        int
-	reconcileAcquireErr          error
-	reconcileReleaseErr          error
-	toolDefinition               bool
-	toolDefinitionErr            error
-	researchV3AuthorizationToken string
-	researchV3AuthorityEnabled   bool
-	researchV3AuthorityCalls     int
+	updateErr                     error
+	gotID                         string
+	gotSpec                       json.RawMessage
+	gotNLDesc                     *string
+	updateCall                    int
+	active                        []types.Schedule // ReconcileActions 用例：ListActiveSchedules 返回值
+	activeErr                     error
+	reconcileCurrent              map[string]*types.Schedule
+	reconcileAcquireCalls         []string
+	reconcileReleaseCalls         int
+	reconcileAcquireErr           error
+	reconcileReleaseErr           error
+	toolDefinition                bool
+	toolDefinitionErr             error
+	researchV3AuthorizationToken  string
+	researchV3AuthorizationByTask map[string]string
+	researchV3AuthorityEnabled    bool
+	researchV3AuthorityCalls      int
 }
 
 // ListActiveSchedules 供 ReconcileActions 用例注入存量调度集合。
@@ -943,9 +944,12 @@ func (f *fakeScheduleStore) HasCurrentToolApprovedDefinition(
 }
 
 func (f *fakeScheduleStore) VerifyEnabledResearchV3ActionAuthorization(
-	_ context.Context, _, _ int64, _ string, token string,
+	_ context.Context, _, _ int64, taskID string, token string,
 ) error {
 	f.researchV3AuthorityCalls++
+	if expected, ok := f.researchV3AuthorizationByTask[taskID]; ok && expected == token {
+		return nil
+	}
 	if !f.researchV3AuthorityEnabled || f.researchV3AuthorizationToken == "" ||
 		token != f.researchV3AuthorizationToken {
 		return types.NewAppError(types.CodeConflict,

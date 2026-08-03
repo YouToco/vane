@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -113,7 +114,9 @@ func TestProductionResearchRuntimeV3IsDeliveryHardDark(t *testing.T) {
 		) {
 			return policy, tools, model, nil
 		},
-		func(got types.RunIdentity) bool { return got == identity },
+		func(_ context.Context, got types.RunIdentity, _ string) (bool, error) {
+			return got == identity, nil
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +162,9 @@ func TestProductionResearchRuntimeV3FreezesDedicatedNonThinkingModelPolicy(t *te
 			runtimepolicy.ResearchModelPolicyV3, error,
 		) {
 			return current.Bundle, current.Tools, current.Model, nil
-		}, func(got types.RunIdentity) bool { return got == identity })
+		}, func(_ context.Context, got types.RunIdentity, _ string) (bool, error) {
+			return got == identity, nil
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +204,9 @@ func TestProductionResearchRuntimeV3FreezesExactActionAuthority(t *testing.T) {
 		) {
 			return validToolRuntimePolicyV2(t), coordinatorResearchToolsV3(t),
 				coordinatorResearchModelV3(t), nil
-		}, func(types.RunIdentity) bool { return true })
+		}, func(context.Context, types.RunIdentity, string) (bool, error) {
+			return true, nil
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +249,7 @@ func TestProductionResearchRuntimeV3RecoveryNeverRepeatsPaidToolEffect(t *testin
 		) {
 			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{}, runtimepolicy.ResearchModelPolicyV3{}, nil
 		},
-		func(types.RunIdentity) bool { return true },
+		func(context.Context, types.RunIdentity, string) (bool, error) { return true, nil },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +293,7 @@ func TestProductionResearchRuntimeV3RecoveryReturnsSealedFailureWithoutProviderR
 			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
 				runtimepolicy.ResearchModelPolicyV3{}, nil
 		},
-		func(types.RunIdentity) bool { return true },
+		func(context.Context, types.RunIdentity, string) (bool, error) { return true, nil },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -354,7 +361,7 @@ func TestProductionResearchRuntimeV3LegacySynthesisRendererRejectsPartialCoverag
 			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
 				runtimepolicy.ResearchModelPolicyV3{}, nil
 		},
-		func(types.RunIdentity) bool { return true },
+		func(context.Context, types.RunIdentity, string) (bool, error) { return true, nil },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -384,7 +391,7 @@ func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffect
 			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
 				runtimepolicy.ResearchModelPolicyV3{}, nil
 		},
-		func(types.RunIdentity) bool { return false },
+		func(context.Context, types.RunIdentity, string) (bool, error) { return false, nil },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -395,6 +402,43 @@ func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffect
 		policyCalls != 0 || storeCalls != 0 {
 		t.Fatalf("unauthorized Prepare snapshot=%+v authorized=%v delivery=%v policy=%d store=%d err=%v",
 			snapshot, authorized, deliveryAllowed, policyCalls, storeCalls, err)
+	}
+}
+
+func TestProductionResearchRuntimeV3AuthorityFailurePrecedesPolicyAndStore(t *testing.T) {
+	identity, _, _, _ := researchBridgeFixtureV3(t)
+	wantErr := errors.New("authority revoked")
+	policyCalls, storeCalls := 0, 0
+	store := &coordinatorStoreFakeV3{createSnapshot: func(
+		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
+		runtimepolicy.ResearchToolPolicyV3, runtimepolicy.ResearchModelPolicyV3, string,
+	) (types.ResearchRunSnapshotRefV3, error) {
+		storeCalls++
+		return types.ResearchRunSnapshotRefV3{}, nil
+	}}
+	runtime, err := NewProductionResearchRuntimeV3(
+		store, coordinatorGatewayFakeV3{}, &coordinatorExecutorFakeV3{},
+		func(context.Context, types.RunIdentity) (
+			runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
+			runtimepolicy.ResearchModelPolicyV3, error,
+		) {
+			policyCalls++
+			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
+				runtimepolicy.ResearchModelPolicyV3{}, nil
+		},
+		func(_ context.Context, got types.RunIdentity, token string) (bool, error) {
+			if got != identity || token != "sealed-action-token" {
+				t.Fatalf("authorizer got identity=%+v token=%q", got, token)
+			}
+			return false, wantErr
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = runtime.Prepare(t.Context(), identity, "sealed-action-token")
+	if !errors.Is(err, wantErr) || policyCalls != 0 || storeCalls != 0 {
+		t.Fatalf("Prepare err=%v policy_calls=%d store_calls=%d", err, policyCalls, storeCalls)
 	}
 }
 

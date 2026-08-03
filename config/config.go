@@ -173,6 +173,10 @@ type PipelineConfig struct {
 	// ResearchV3AuthorityCanaryScheduleID permits the receipt-backed cutover
 	// control plane for exactly the already-shadowed task. There is no allow-all.
 	ResearchV3AuthorityCanaryScheduleID string `mapstructure:"research_v3_authority_canary_schedule_id"`
+	// ResearchV3RuntimeEnabled keeps the V3 worker/runtime capability available
+	// after individual tasks have been cut over. It is not task authority: every
+	// formal run must still present an enabled per-task database authority token.
+	ResearchV3RuntimeEnabled bool `mapstructure:"research_v3_runtime_enabled"`
 	// RunOutcome* is the independent P1-B lifecycle rollout. It may select only
 	// Actions already selected by the compiled runtime rollout.
 	RunOutcomeEnabled          bool   `mapstructure:"run_outcome_enabled"`
@@ -439,6 +443,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.tool_runtime_canary_schedule_id", "")
 	v.SetDefault("pipeline.research_v3_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.research_v3_authority_canary_schedule_id", "")
+	v.SetDefault("pipeline.research_v3_runtime_enabled", false)
 	v.SetDefault("pipeline.run_outcome_enabled", false)
 	v.SetDefault("pipeline.run_outcome_canary_schedule_id", "")
 	v.SetDefault("pipeline.run_outcome_allow_all", false)
@@ -1077,7 +1082,8 @@ func (c *Config) Validate() error {
 		c.Fetch.CompiledTikHubCredentialGeneration < 0 {
 		return errors.New("config: fetch compiled credential generation 必须为正数")
 	}
-	if c.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
+	if c.Pipeline.ResearchV3RuntimeEnabled ||
+		c.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
 		c.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" ||
 		c.Agent.AgentFirstOwnerCanary {
 		if strings.TrimSpace(c.DB.ResearchRuntimeURL) == "" {
