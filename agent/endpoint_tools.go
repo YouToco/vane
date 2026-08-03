@@ -83,6 +83,7 @@ type toolRunState struct {
 	// intent routing or direct-write authorization.
 	ownerRequest         string
 	clarifiedOwnerAction string
+	manageTasksResult    string
 	intents              ToolIntent
 	// Intent toolkit rollout is fixed by the locally assembled Loop, never by
 	// model or external content. Shadow records aggregate exposure differences

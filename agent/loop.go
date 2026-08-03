@@ -1685,6 +1685,12 @@ func (l *Loop) converse(
 				Reply: state.directUntrustedWriteResult,
 			}, msgs, turns, nil
 		}
+		if state.manageTasksResult != "" {
+			msgs = append(msgs, llm.ChatMessage{
+				Role: "assistant", Content: state.manageTasksResult,
+			})
+			return Outcome{Reply: state.manageTasksResult}, msgs, turns, nil
+		}
 		if state.externalFollowupSearchAttempted &&
 			!state.externalFollowupSearchSucceeded {
 			msgs = append(msgs, llm.ChatMessage{

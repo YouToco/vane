@@ -265,10 +265,31 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 	if len(receipt) > 0 {
 		appendAgentActionReceipt(state, receipt)
 	}
+	state.manageTasksResult = deterministicManageTasksResult(result, receipt, err)
 	if err != nil {
 		return "", err
 	}
 	return result, nil
+}
+
+func deterministicManageTasksResult(
+	result string, receipt json.RawMessage, actionErr error,
+) string {
+	if actionErr == nil && strings.TrimSpace(result) != "" {
+		return result
+	}
+	var decoded struct {
+		Status string `json:"status"`
+	}
+	if len(receipt) > 0 && json.Unmarshal(receipt, &decoded) == nil {
+		switch decoded.Status {
+		case "execution_indeterminate":
+			return "任务操作结果暂时无法确认；系统会按同一请求安全恢复，本次不能声称已经完成。"
+		case "invalid_outcome":
+			return "任务操作没有返回可信的完成结果，本次不能声称已经完成。"
+		}
+	}
+	return "任务操作未得到可信的完成结果，本次不能声称已经完成。"
 }
 
 // manageTasksClarifiedOwnerRequest reconstructs exactly one pending write

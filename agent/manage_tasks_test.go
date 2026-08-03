@@ -269,12 +269,14 @@ func TestManageTasksFullLoopCompletesOneClarificationWithoutConfirmation(t *test
 		question  string
 		clarified string
 		arguments string
+		wantReply string
 		deps      func(*fakeOwnerActionAuthorizer) (ManageTasksDeps, func() int)
 	}{
 		{
 			name: "run", action: "run", original: "现在运行 Kimi 那个任务可以吗？",
 			question: "你是要立即运行 Kimi 套餐监控吗？", clarified: "对，就是它",
 			arguments: `{"action":"run","task_refs":["kimi"]}`,
+			wantReply: "已受理 1 个任务的立即运行请求：任务 [内部引用已隐藏]。周期调度未改变。",
 			deps: func(authorizer *fakeOwnerActionAuthorizer) (ManageTasksDeps, func() int) {
 				runner := &fakeManageTaskRunner{}
 				return ManageTasksDeps{Queries: &fakeManageTaskQuery{rows: manageTaskRows("kimi")}, Runner: runner, Authorizer: authorizer}, func() int { return len(runner.refs) }
@@ -284,6 +286,7 @@ func TestManageTasksFullLoopCompletesOneClarificationWithoutConfirmation(t *test
 			name: "delete", action: "delete", original: "删掉 Kimi 那个是不是更好？",
 			question: "你是要删除 Kimi 套餐监控吗？", clarified: "对，就是它",
 			arguments: `{"action":"delete","task_refs":["kimi"]}`,
+			wantReply: "已删除 1 个任务：任务 [内部引用已隐藏]。",
 			deps: func(authorizer *fakeOwnerActionAuthorizer) (ManageTasksDeps, func() int) {
 				deleter := &fakeManageTaskDeleter{}
 				return ManageTasksDeps{Queries: &fakeManageTaskQuery{rows: manageTaskRows("kimi")}, Deleter: deleter, Authorizer: authorizer}, func() int { return len(deleter.refs) }
@@ -304,7 +307,6 @@ func TestManageTasksFullLoopCompletesOneClarificationWithoutConfirmation(t *test
 				{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
 					ID: "clarified-" + tc.action, Name: manageTasksName, Arguments: tc.arguments,
 				}}},
-				{Content: "已经完成。", FinishReason: "stop"},
 			}}
 			fs := newFakeStore()
 			loop := New(Deps{
@@ -319,7 +321,7 @@ func TestManageTasksFullLoopCompletesOneClarificationWithoutConfirmation(t *test
 				t.Fatalf("first turn outcome=%+v err=%v writes=%d", first, err, writes())
 			}
 			second, err := loop.HandleMessage(t.Context(), 42, tc.clarified)
-			if err != nil || second.Reply != "已经完成。" || writes() != 1 || authorizer.calls != 2 {
+			if err != nil || second.Reply != tc.wantReply || writes() != 1 || authorizer.calls != 2 || len(chat.requests) != 3 {
 				t.Fatalf("second turn outcome=%+v err=%v writes=%d auth=%d", second, err, writes(), authorizer.calls)
 			}
 			if !strings.Contains(authorizer.inputs[1].OwnerRequest, tc.original) ||
@@ -334,7 +336,7 @@ func TestManageTasksFullLoopCompletesOneClarificationWithoutConfirmation(t *test
 func TestManageTasksFullLoopCarriesNaturalCreateTimezoneClarification(t *testing.T) {
 	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
 	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
-		TaskRef: "internal-kimi", TaskName: "Kimi 套餐监控", Status: "active",
+		TaskRef: "internal-kimi", TaskName: "Kimi 套餐监控", Status: "completed",
 	}}
 	tool := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
@@ -343,12 +345,12 @@ func TestManageTasksFullLoopCarriesNaturalCreateTimezoneClarification(t *testing
 			ID: "create-after-timezone", Name: manageTasksName,
 			Arguments: `{"action":"create","name":"Kimi 套餐监控","manual":"每天检查 Kimi 官方套餐是否开放购买，只在重大更新时推送并附官方证据。","schedule":{"cron":"0 9 * * *","tz":"Asia/Shanghai"},"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},"output":{"language":"zh-CN","format":"executive_brief","include_evidence_links":true}}`,
 		}}},
-		{Content: "任务已创建。", FinishReason: "stop"},
 	}}
 	fs := newFakeStore()
+	writer := &fakeAgentEvidenceWriter{}
 	loop := New(Deps{
 		Store: fs, Profiles: fs, Tools: []ToolSpec{tool},
-		Evidence: &fakeAgentEvidenceWriter{}, AgentFirstEnabled: true,
+		Evidence: writer, AgentFirstEnabled: true,
 		AgentFirstCanaryUserID: 42, MaxTurns: 4,
 	})
 	loop.chatFn = chat.fn
@@ -358,7 +360,9 @@ func TestManageTasksFullLoopCarriesNaturalCreateTimezoneClarification(t *testing
 		t.Fatalf("first turn outcome=%+v err=%v creates=%d", first, err, creator.calls)
 	}
 	second, err := loop.HandleMessage(t.Context(), 42, "北京时间")
-	if err != nil || second.Reply != "任务已创建。" || creator.calls != 1 || authorizer.calls != 1 {
+	if err != nil || second.Reply != "已创建任务：Kimi 套餐监控。" ||
+		creator.calls != 1 || authorizer.calls != 1 || len(chat.requests) != 2 ||
+		!strings.Contains(string(writer.record.ActionReceipts), `"status":"completed"`) {
 		t.Fatalf("second turn outcome=%+v err=%v creates=%d auth=%d",
 			second, err, creator.calls, authorizer.calls)
 	}
@@ -366,6 +370,58 @@ func TestManageTasksFullLoopCarriesNaturalCreateTimezoneClarification(t *testing
 		!strings.Contains(authorizer.input.OwnerRequest, "北京时间") ||
 		authorizer.input.Action != "create" {
 		t.Fatalf("create authorization=%+v", authorizer.input)
+	}
+}
+
+func TestManageTasksFullLoopNeverTurnsIndeterminateCreateIntoSuccess(t *testing.T) {
+	const arguments = `{"action":"create","name":"Kimi 套餐监控","manual":"每天检查 Kimi 官方套餐是否开放购买，只在重大更新时推送并附官方证据。","schedule":{"cron":"0 9 * * *","tz":"Asia/Shanghai"},"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},"output":{"language":"zh-CN","format":"executive_brief","include_evidence_links":true}}`
+	for _, tc := range []struct {
+		name       string
+		outcome    ResearchTaskCreationV3Outcome
+		creatorErr error
+		wantStatus string
+		wantReply  string
+	}{
+		{
+			name: "controller_error", creatorErr: errors.New("temporal response lost"),
+			wantStatus: "execution_indeterminate", wantReply: "任务操作结果暂时无法确认；系统会按同一请求安全恢复，本次不能声称已经完成。",
+		},
+		{
+			name:       "invalid_outcome",
+			outcome:    ResearchTaskCreationV3Outcome{TaskRef: "internal-kimi", TaskName: "Kimi 套餐监控", Status: "active"},
+			wantStatus: "invalid_outcome", wantReply: "任务操作没有返回可信的完成结果，本次不能声称已经完成。",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			creator := &fakeManageTaskCreatorV3{outcome: tc.outcome, err: tc.creatorErr}
+			tool := NewManageTasksTool(ManageTasksDeps{
+				Creator:    creator,
+				Authorizer: &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized},
+			})
+			chat := &scriptedChat{responses: []*llm.ChatResponse{
+				{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
+					ID: "indeterminate-create", Name: manageTasksName, Arguments: arguments,
+				}}},
+				// This false-success response must never be requested or returned.
+				{Content: "任务已创建。", FinishReason: "stop"},
+			}}
+			fs := newFakeStore()
+			writer := &fakeAgentEvidenceWriter{}
+			loop := New(Deps{
+				Store: fs, Profiles: fs, Tools: []ToolSpec{tool}, Evidence: writer,
+				AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 3,
+			})
+			loop.chatFn = chat.fn
+			outcome, err := loop.HandleMessage(t.Context(), 42,
+				"创建 Kimi 套餐监控，每天北京时间 9 点检查，重大更新才推送。")
+			if err != nil || outcome.Reply != tc.wantReply || len(chat.requests) != 1 ||
+				strings.Contains(outcome.Reply, "任务已创建") ||
+				!strings.Contains(string(writer.record.ActionReceipts), `"status":"`+tc.wantStatus+`"`) ||
+				writer.record.AssistantMessage != tc.wantReply {
+				t.Fatalf("outcome=%+v err=%v requests=%d record=%+v",
+					outcome, err, len(chat.requests), writer.record)
+			}
+		})
 	}
 }
 
