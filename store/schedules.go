@@ -16,17 +16,86 @@ import (
 const scheduleColumns = `id, tenant_id, user_id, nl_description, spec_json, scope_json, status, execution_mode, created_at, updated_at`
 
 // matureSchedulePredicate requires the outer schedules table to use alias s.
-// A v1 aggregate is user-manageable only after its operation is both
-// executed/completed; v0/legacy schedules have no matching versioned row and
+// A versioned aggregate is user-manageable only after its operation is both
+// executed/completed. V1 is permanently bound to create_schedule and native
+// V2 to manage_tasks; v0/legacy schedules have no matching versioned row and
 // therefore remain visible.
 const matureSchedulePredicate = `NOT EXISTS (
 	SELECT 1
 	  FROM task_creation_operations p
 	 WHERE p.task_id = s.id
 	   AND p.tenant_id = s.tenant_id AND p.user_id = s.user_id
-	   AND p.tool_name = 'create_schedule' AND p.execution_version = 1
+	   AND ((p.tool_name = 'create_schedule' AND p.execution_version = 1) OR
+	        (p.tool_name = 'manage_tasks' AND p.execution_version = 2))
 	   AND NOT (p.status = 'executed' AND p.phase = 'completed')
 )`
+
+const nativeResearchScheduleMaturityFunctionV1 = "public.native_research_schedule_mature_v3_v1(bigint,bigint,text)"
+const nativeResearchCreationSchemaMarkerV3 = "task_creation_operations_protocol_tool_binding"
+
+func nativeResearchCreationSchemaV3Active(ctx context.Context, tx pgx.Tx) (bool, error) {
+	var active bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM pg_catalog.pg_constraint constraint_row
+			 WHERE constraint_row.conrelid='public.task_creation_operations'::regclass
+			   AND constraint_row.conname=$1
+		)`, nativeResearchCreationSchemaMarkerV3).Scan(&active); err != nil {
+		return false, err
+	}
+	return active, nil
+}
+
+// nativeResearchScheduleMaturityClause keeps the pre-109 V1 creation fence and
+// adds native V2 admission on 109+. Schema-owner control transactions inspect
+// the operation directly. The restricted research executor instead uses the
+// capability-bound SECURITY DEFINER predicate and never gains SELECT on the
+// creation ledger.
+func nativeResearchScheduleMaturityClause(
+	ctx context.Context, tx pgx.Tx,
+) (string, error) {
+	schemaActive, err := nativeResearchCreationSchemaV3Active(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	var activeRole string
+	var available bool
+	if err := tx.QueryRow(ctx,
+		`SELECT current_user,to_regprocedure($1) IS NOT NULL`,
+		nativeResearchScheduleMaturityFunctionV1,
+	).Scan(&activeRole, &available); err != nil {
+		return "", err
+	}
+	if schemaActive != available {
+		return "", fmt.Errorf("native research creation schema boundary is incomplete")
+	}
+	if !schemaActive {
+		// Before migration 108 the restricted executor can only replay a
+		// capability-bound snapshot that was already admitted through the
+		// schema-owner definition fence. It never had direct SELECT on the V1
+		// creation ledger; adding that predicate here would break frozen replay.
+		// Control-plane snapshot and delivery transactions still retain the V1
+		// fence, including on schema 108 where effects use their own definer.
+		if activeRole == researchRuntimeCapabilityRole {
+			return "", nil
+		}
+		return " AND " + strings.ReplaceAll(matureSchedulePredicate, "s.", "schedule."), nil
+	}
+	if activeRole == researchRuntimeCapabilityRole {
+		return ` AND public.native_research_schedule_mature_v3_v1(
+			schedule.tenant_id,schedule.user_id,schedule.id)`, nil
+	}
+	return ` AND NOT EXISTS (
+		SELECT 1 FROM task_creation_operations operation
+		 WHERE operation.task_id=schedule.id
+		   AND operation.tenant_id=schedule.tenant_id
+		   AND operation.user_id=schedule.user_id
+		   AND ((operation.execution_version=1 AND operation.tool_name='create_schedule') OR
+		        (operation.execution_version=2 AND operation.tool_name='manage_tasks'))
+		   AND NOT (operation.status='executed' AND operation.phase='completed')
+	)`, nil
+}
 
 // scanSchedule 把一行 schedules 扫进 types.Schedule（复用于单行与多行）。
 func scanSchedule(row pgx.Row, sc *types.Schedule) error {

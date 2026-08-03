@@ -11,16 +11,23 @@ import (
 // callers must opt a create_schedule action into this protocol explicitly.
 const TaskCreationExecutionVersionV1 int16 = 1
 
+// TaskCreationExecutionVersionV2 is the durable creation protocol for native
+// V3 research tasks. V1 remains frozen for Temporal/history replay; callers
+// must choose V2 explicitly and must never reinterpret a V1 operation.
+const TaskCreationExecutionVersionV2 int16 = 2
+
 // Task-creation terminal/lease errors are deliberately separate from the broad AppError
 // codes. Callers must be able to distinguish "another worker owns this", "the
 // operation is permanently over", and "my fencing token is stale" without
 // parsing a message. Scope mismatches still use ErrNotFound and immutable-CAS
 // mismatches use ErrConflict.
 var (
-	ErrTaskCreationBusy      = errors.New("vane: task creation busy")
-	ErrTaskCreationTerminal  = errors.New("vane: task creation terminal")
-	ErrTaskCreationLeaseLost = errors.New("vane: task creation lease lost")
-	ErrTaskCreationLimit     = errors.New("vane: task creation limit reached")
+	ErrTaskCreationBusy               = errors.New("vane: task creation busy")
+	ErrTaskCreationTerminal           = errors.New("vane: task creation terminal")
+	ErrTaskCreationLeaseLost          = errors.New("vane: task creation lease lost")
+	ErrTaskCreationLimit              = errors.New("vane: task creation limit reached")
+	ErrTaskCreationOwnerScopeInactive = errors.New(
+		"vane: task creation owner scope inactive")
 )
 
 const (
@@ -94,6 +101,49 @@ type CreateTaskCreationOperationParams struct {
 	Args      json.RawMessage
 	Summary   string
 	ExpiresAt time.Time
+}
+
+// CreateResearchTaskCreationOperationV3Params is deliberately a distinct
+// type from the retained V1 request. Args is the canonical, server-policy-
+// injected V3 approved definition; model-facing task creation never controls
+// the execution version or any lease/checkpoint field.
+type CreateResearchTaskCreationOperationV3Params struct {
+	ID        string
+	TenantID  int64
+	UserID    int64
+	SessionID *int64
+	Args      json.RawMessage
+	Summary   string
+	ExpiresAt time.Time
+}
+
+// CommitPausedResearchTaskDefinitionV3ForCreationParams is the exact fenced
+// evidence required after the deterministic Temporal schedule has been
+// ensured paused. DefinitionPayload is decoded as ApprovedDefinitionV3 by the
+// Store; there is intentionally no ToolCalls, Source, subscription, or fetch
+// target field in this protocol.
+type CommitPausedResearchTaskDefinitionV3ForCreationParams struct {
+	Lease                     TaskCreationLease
+	TaskID                    string
+	DefinitionPayload         []byte
+	DefinitionDigest          string
+	PreparedSchedule          []byte
+	EnsureReceipt             []byte
+	TargetAction              []byte
+	TargetActionDigest        string
+	ActionAuthorizationDigest string
+}
+
+// ResearchTaskCreationActivationBindingV3 carries the immutable evidence
+// identity across the database/Temporal phase boundary.  Activation may not
+// authorize or publish an aggregate merely because its task ID and status
+// happen to match: all three digests must still be the ones committed by the
+// same fenced creation operation.
+type ResearchTaskCreationActivationBindingV3 struct {
+	TaskID                    string
+	DefinitionDigest          string
+	TargetActionDigest        string
+	ActionAuthorizationDigest string
 }
 
 // CommitPausedCompiledTaskDefinitionForCreationParams binds the A2 aggregate

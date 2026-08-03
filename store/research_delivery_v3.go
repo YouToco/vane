@@ -501,8 +501,12 @@ func validResearchDeliveryTextV3(value string, max int) bool {
 func authorizeResearchBriefDeliveryPrepareV3(
 	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
 ) error {
+	maturityClause, err := nativeResearchScheduleMaturityClause(ctx, tx)
+	if err != nil {
+		return researchRunDatabaseError("inspect native research task maturity", err)
+	}
 	var authorized int
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT 1
 		  FROM schedules schedule
 		  JOIN tenants tenant ON tenant.id=schedule.tenant_id
@@ -511,7 +515,8 @@ func authorizeResearchBriefDeliveryPrepareV3(
 		    ON membership.tenant_id=schedule.tenant_id
 		   AND membership.user_id=schedule.user_id
 		 WHERE schedule.id=$1 AND schedule.tenant_id=$2 AND schedule.user_id=$3
-		   AND schedule.status='active' AND schedule.execution_mode='discover_at_run'
+		   AND schedule.status='active' AND schedule.execution_mode='discover_at_run'`+
+		maturityClause+`
 		 FOR SHARE OF schedule,tenant,membership`, identity.TaskID,
 		identity.TenantID, identity.UserID).Scan(&authorized)
 	if errors.Is(err, pgx.ErrNoRows) {

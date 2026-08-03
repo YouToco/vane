@@ -502,6 +502,14 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		"freeze_research_llm_gateway_request_v2(bigint,text,text,text)":                                          true,
 		"load_research_run_bound_llm_call_v1(bigint,bigint)":                                                     true,
 	}
+	const nativeScheduleMaturitySignature = "native_research_schedule_mature_v3_v1(bigint,bigint,text)"
+	nativeScheduleMaturityRequired, err := nativeResearchCreationSchemaV3Active(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("inspect native research creation schema version: %w", err)
+	}
+	if nativeScheduleMaturityRequired {
+		allowedDefiners[nativeScheduleMaturitySignature] = true
+	}
 	definerRows, err := tx.Query(ctx,
 		`SELECT procedure.oid::regprocedure::text
 		   FROM pg_catalog.pg_proc procedure
