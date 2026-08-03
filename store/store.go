@@ -31,6 +31,7 @@ type Store struct {
 	researchCapabilityTTL        time.Duration
 	researchCapabilityConfigured bool
 	intelligenceCursorState      *intelligenceCursorState
+	legacyAdmissionClosed        uint32
 }
 
 var errResearchRuntimeUnavailable = errors.New("store: V3 research runtime database is not configured")

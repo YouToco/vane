@@ -92,6 +92,9 @@ func (s *Store) CreateTaskCreationOperation(
 		}
 		return existing, nil
 	}
+	if s.legacyAdmissionIsClosed() {
+		return nil, legacyAdmissionClosed("task creation v1")
+	}
 
 	if err := lockValidMembership(ctx, tx, p.TenantID, p.UserID); err != nil {
 		return nil, err

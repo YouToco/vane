@@ -598,6 +598,9 @@ func (s *Store) CreateTaskDefinitionEditOperation(
 		)
 	}
 	if !operationExists {
+		if s.legacyAdmissionIsClosed() {
+			return nil, legacyAdmissionClosed("task definition edit v1/v2")
+		}
 		if err := validateTaskDefinitionEditCreationProvenance(ctx, tx, frozen); err != nil {
 			return nil, err
 		}
