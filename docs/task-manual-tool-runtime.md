@@ -133,6 +133,16 @@ The regression contract is now:
   Brief must be `unknown` with no significance and the delivery gate stays
   closed.
 
+The inverse is equally important: a failed redundant acquisition path does
+not erase a successful official result. Partial execution coverage is recorded
+separately from conclusion support. A partial-coverage Brief may be
+`assessment=grounded` only when it cites a completed `trust_type=official`
+Evidence item; otherwise it remains `unknown` and quiet. The failed Tool is
+never cited as evidence, and an unmet task-level cross-verification requirement
+still forces `significance=none`. This prevents a general page extractor
+failure from relabeling a successful structured official status as unavailable
+without weakening the no-evidence/no-push boundary.
+
 ## External-fact authority
 
 Model weights are not a current truth source for mutable external facts.
