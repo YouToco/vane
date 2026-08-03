@@ -18,6 +18,37 @@ import (
 	"github.com/YouToco/vane/workflow"
 )
 
+func TestResearchV3CutoverParamsEncoderUsesReservedProtocolNotTaskID(t *testing.T) {
+	s := &Scheduler{}
+	encode, err := s.researchV3CutoverParamsEncoder()
+	if err != nil {
+		t.Fatalf("build cutover encoder: %v", err)
+	}
+	want := workflow.ResearchScheduledInputV3{
+		TenantID: 7, UserID: 9, TaskID: "task-kimi",
+		ActionAuthorizationToken: "authorization-token",
+	}
+	payload, err := encode(want)
+	if err != nil || payload == nil {
+		t.Fatalf("encode cutover payload: payload=%v err=%v", payload, err)
+	}
+	var got workflow.ResearchScheduledInputV3
+	if err := converter.GetDefaultDataConverter().FromPayload(payload, &got); err != nil {
+		t.Fatalf("decode cutover payload: %v", err)
+	}
+	if got != want {
+		t.Fatalf("cutover payload = %#v, want %#v", got, want)
+	}
+}
+
+func TestResearchV3CutoverParamsEncoderFailsClosedWithoutReservedDecoder(t *testing.T) {
+	s := New(nil, "", nil,
+		WithTaskScheduleDataConverter("custom-json-v1", converter.GetDefaultDataConverter()))
+	if _, err := s.researchV3CutoverParamsEncoder(); err == nil {
+		t.Fatal("cutover encoder unexpectedly accepted a scheduler without the reserved decoder")
+	}
+}
+
 type researchV3CutoverJournalFake struct {
 	schedule          *types.Schedule
 	head              types.ResearchV3DefinitionHead
