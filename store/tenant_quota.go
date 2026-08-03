@@ -54,6 +54,9 @@ const (
 	QuotaPush QuotaBucket = "push"
 	// QuotaFetch 抓取轮次。
 	QuotaFetch QuotaBucket = "fetch"
+	// QuotaOfficialCalls bounds credentialless first-party reads for DoS
+	// control. It is not a financial bucket and never represents provider cost.
+	QuotaOfficialCalls QuotaBucket = "official_calls"
 )
 
 // financialBuckets 是"超限即超预算"的那几个。单列出来供调用方判断失败语义，
@@ -87,11 +90,12 @@ var enforcedBuckets = map[QuotaBucket]string{
 	// 于是守卫只能校验"字符串非空"——把空串改成任意一句话就能谎称已接线，
 	// 而测试全绿（2026-07-19 审查实测）。自证式的守卫比没有守卫更糟，
 	// 因为它让人以为这件事有人在看。
-	QuotaLLMTokens:   "llm",
-	QuotaExaCalls:    "store",
-	QuotaTikHubCalls: "",
-	QuotaPush:        "",
-	QuotaFetch:       "",
+	QuotaLLMTokens:     "llm",
+	QuotaExaCalls:      "store",
+	QuotaTikHubCalls:   "",
+	QuotaPush:          "",
+	QuotaFetch:         "",
+	QuotaOfficialCalls: "store",
 }
 
 // IsEnforced 报告该桶是否真的有代码在扣它。
@@ -194,6 +198,7 @@ type QuotaDefault struct {
 var defaultQuotas = []QuotaDefault{
 	{QuotaLLMTokens, 2_000_000.0 / 86400, 2_000_000},
 	{QuotaExaCalls, 500.0 / 86400, 500},
+	{QuotaOfficialCalls, 500.0 / 86400, 500},
 	{QuotaTikHubCalls, 500.0 / 86400, 500},
 	{QuotaPush, 200.0 / 86400, 200},
 	{QuotaFetch, 2000.0 / 86400, 2000},
@@ -344,11 +349,19 @@ func (s *Store) AdjustForUser(ctx context.Context, userID int64, bucket QuotaBuc
 // 失败方向失效——而它防的是"新增了桶却忘了 seed"变成静默的无限额度洞。
 // 启动时补齐是一次可观测的批量动作，懒加载是每次调用都可能悄悄放行。
 func (s *Store) ReconcileTenantQuota(ctx context.Context) (int, error) {
+	buckets := make([]string, 0, len(defaultQuotas))
+	for _, quota := range defaultQuotas {
+		buckets = append(buckets, string(quota.Bucket))
+	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT t.id FROM tenants t
 		  WHERE t.status <> 'deleting'
-		    AND NOT EXISTS (SELECT 1 FROM tenant_quota q WHERE q.tenant_id = t.id)
-		  ORDER BY t.id`)
+		    AND EXISTS (
+		      SELECT 1 FROM unnest($1::text[]) expected(bucket)
+		       WHERE NOT EXISTS (SELECT 1 FROM tenant_quota q
+		                          WHERE q.tenant_id=t.id AND q.bucket=expected.bucket)
+		    )
+		  ORDER BY t.id`, buckets)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "查询缺配额的租户", err)
 	}

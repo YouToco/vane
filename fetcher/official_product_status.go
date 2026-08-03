@@ -83,19 +83,28 @@ func (f *ProductStatusFetcher) fetchWithEffectGate(
 	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) ([]types.ContentItem, error) {
+	items, _, err := f.fetchResearchWithEffectGate(ctx, src, beforeEffect)
+	return items, err
+}
+
+func (f *ProductStatusFetcher) fetchResearchWithEffectGate(
+	ctx context.Context,
+	src types.FetchTarget,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, researchProductStatusResultV1, error) {
 	var cfg productStatusConfig
 	if err := json.Unmarshal(src.Config, &cfg); err != nil {
-		return nil, types.NewAppError(types.CodeValidation,
+		return nil, researchProductStatusResultV1{}, types.NewAppError(types.CodeValidation,
 			"解析 web/product_status 配置失败", err)
 	}
 	pageURL, err := supportedKimiPricingURL(cfg.URL)
 	if err != nil {
-		return nil, types.NewAppError(types.CodeValidation, err.Error(), nil)
+		return nil, researchProductStatusResultV1{}, types.NewAppError(types.CodeValidation, err.Error(), nil)
 	}
 	payload := []byte(`{"pageSize":0,"pageToken":"","domains":[]}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.kimiURL, bytes.NewReader(payload))
 	if err != nil {
-		return nil, types.NewAppError(types.CodeInternal, "构造 Kimi 官方商品请求失败", err)
+		return nil, researchProductStatusResultV1{}, types.NewAppError(types.CodeInternal, "构造 Kimi 官方商品请求失败", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -103,7 +112,7 @@ func (f *ProductStatusFetcher) fetchWithEffectGate(
 	req.Header.Set("x-msh-platform", "web")
 	req.Header.Set("X-Language", "zh-CN")
 	if err := checkEffectGate(ctx, beforeEffect); err != nil {
-		return nil, err
+		return nil, researchProductStatusResultV1{}, err
 	}
 
 	start := time.Now()
@@ -112,40 +121,47 @@ func (f *ProductStatusFetcher) fetchWithEffectGate(
 	if err != nil {
 		ae := classifyDoError(f.kimiURL, err)
 		f.record(ctx, src, payload, nil, 0, elapsed, ae)
-		return nil, ae
+		return nil, researchProductStatusResultV1{}, ae
 	}
 	defer resp.Body.Close()
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, productStatusMaxBytes+1))
 	if readErr != nil {
 		ae := classifyDoError(f.kimiURL, readErr)
 		f.record(ctx, src, payload, body, resp.StatusCode, elapsed, ae)
-		return nil, ae
+		return nil, researchProductStatusResultV1{}, ae
 	}
 	if len(body) > productStatusMaxBytes {
 		ae := types.NewAppError(types.CodeValidation, "Kimi 官方商品响应超过大小上限", nil)
 		f.record(ctx, src, payload, body, resp.StatusCode, elapsed, ae)
-		return nil, ae
+		return nil, researchProductStatusResultV1{}, ae
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		ae := types.NewAppError(types.CodeFetchTimeout,
 			fmt.Sprintf("Kimi 官方商品接口返回 HTTP %d", resp.StatusCode), nil)
 		ae.Retryable = resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		f.record(ctx, src, payload, body, resp.StatusCode, elapsed, ae)
-		return nil, ae
+		return nil, researchProductStatusResultV1{}, ae
 	}
 	var result kimiGoodsResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		ae := types.NewAppError(types.CodeFetchTimeout, "解析 Kimi 官方商品响应失败", err)
 		ae.Retryable = false
 		f.record(ctx, src, payload, body, resp.StatusCode, elapsed, ae)
-		return nil, ae
+		return nil, researchProductStatusResultV1{}, ae
 	}
 	content, status, err := normalizeKimiProductStatus(result)
 	if err != nil {
 		ae := types.NewAppError(types.CodeFetchTimeout, err.Error(), nil)
 		ae.Retryable = false
 		f.record(ctx, src, payload, body, resp.StatusCode, elapsed, ae)
-		return nil, ae
+		return nil, researchProductStatusResultV1{}, ae
+	}
+	modelResult, err := normalizeKimiResearchProductStatus(result)
+	if err != nil {
+		ae := types.NewAppError(types.CodeFetchTimeout, err.Error(), nil)
+		ae.Retryable = false
+		f.record(ctx, src, payload, body, resp.StatusCode, elapsed, ae)
+		return nil, researchProductStatusResultV1{}, ae
 	}
 	f.record(ctx, src, payload, body, resp.StatusCode, elapsed, nil)
 
@@ -164,9 +180,9 @@ func (f *ProductStatusFetcher) fetchWithEffectGate(
 	if reason := finalize(src, &item); reason != dropNone {
 		var tally dropTally
 		tally.add(reason)
-		return nil, allDroppedErr(src, 1, tally)
+		return nil, researchProductStatusResultV1{}, allDroppedErr(src, 1, tally)
 	}
-	return []types.ContentItem{item}, nil
+	return []types.ContentItem{item}, modelResult, nil
 }
 
 func supportedKimiPricingURL(raw string) (string, error) {
@@ -186,7 +202,47 @@ type normalizedKimiPlan struct {
 	Title, Cycle, Currency, Price, Reason string
 }
 
+const productStatusResultSchemaV1 = "vane.product-status-result/v1"
+
+// researchProductStatusResultV1 is the stable model-visible projection. It
+// deliberately excludes the raw provider envelope and retains only fields
+// that the first-party catalog documents through its public response.
+type researchProductStatusResultV1 struct {
+	SchemaVersion  string                        `json:"schema_version"`
+	Provider       string                        `json:"provider"`
+	OfficialPage   string                        `json:"official_page"`
+	PurchaseStatus string                        `json:"purchase_status"`
+	Plans          []researchProductStatusPlanV1 `json:"plans"`
+}
+
+type researchProductStatusPlanV1 struct {
+	Title            string `json:"title"`
+	BillingCycle     string `json:"billing_cycle"`
+	Currency         string `json:"currency"`
+	PriceInCents     string `json:"price_in_cents"`
+	TransitionReason string `json:"transition_reason"`
+}
+
 func normalizeKimiProductStatus(response kimiGoodsResponse) (string, string, error) {
+	plans, status, err := normalizeKimiProductStatusPlans(response)
+	if err != nil {
+		return "", "", err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "购买状态: %s\n", status)
+	b.WriteString("官方页面: https://www.kimi.com/membership/pricing\n")
+	b.WriteString("官方判定字段: transitionSummary.reason\n")
+	b.WriteString("付费套餐:\n")
+	for _, plan := range plans {
+		fmt.Fprintf(&b, "- %s | %s | %s %s cents | reason=%s\n",
+			plan.Title, plan.Cycle, plan.Currency, plan.Price, valueOr(plan.Reason, "NONE"))
+	}
+	return strings.TrimSpace(b.String()), status, nil
+}
+
+func normalizeKimiProductStatusPlans(
+	response kimiGoodsResponse,
+) ([]normalizedKimiPlan, string, error) {
 	plans := make([]normalizedKimiPlan, 0, len(response.Goods))
 	for _, good := range response.Goods {
 		if good.MembershipLevel == "LEVEL_FREE" {
@@ -206,7 +262,7 @@ func normalizeKimiProductStatus(response kimiGoodsResponse) (string, string, err
 		}
 	}
 	if len(plans) == 0 {
-		return "", "", fmt.Errorf("Kimi 官方商品接口未返回任何付费套餐")
+		return nil, "", fmt.Errorf("Kimi 官方商品接口未返回任何付费套餐")
 	}
 	sort.Slice(plans, func(i, j int) bool {
 		a, b := plans[i], plans[j]
@@ -227,16 +283,40 @@ func normalizeKimiProductStatus(response kimiGoodsResponse) (string, string, err
 	if status != "可直接购买" && allNeedApply {
 		status = "仅可预约（尚不可直接购买）"
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "购买状态: %s\n", status)
-	b.WriteString("官方页面: https://www.kimi.com/membership/pricing\n")
-	b.WriteString("官方判定字段: transitionSummary.reason\n")
-	b.WriteString("付费套餐:\n")
-	for _, plan := range plans {
-		fmt.Fprintf(&b, "- %s | %s | %s %s cents | reason=%s\n",
-			plan.Title, plan.Cycle, plan.Currency, plan.Price, valueOr(plan.Reason, "NONE"))
+	return plans, status, nil
+}
+
+func normalizeKimiResearchProductStatus(
+	response kimiGoodsResponse,
+) (researchProductStatusResultV1, error) {
+	plans, displayStatus, err := normalizeKimiProductStatusPlans(response)
+	if err != nil {
+		return researchProductStatusResultV1{}, err
 	}
-	return strings.TrimSpace(b.String()), status, nil
+	status := "unavailable"
+	switch displayStatus {
+	case "可直接购买":
+		status = "direct_purchase"
+	case "仅可预约（尚不可直接购买）":
+		status = "reservation_only"
+	}
+	result := researchProductStatusResultV1{
+		SchemaVersion: productStatusResultSchemaV1,
+		Provider:      "kimi", OfficialPage: "https://www.kimi.com/membership/pricing",
+		PurchaseStatus: status,
+	}
+	for _, plan := range plans {
+		result.Plans = append(result.Plans, researchProductStatusPlanV1{
+			Title: plan.Title, BillingCycle: plan.Cycle, Currency: plan.Currency,
+			PriceInCents:     plan.Price,
+			TransitionReason: valueOr(plan.Reason, "NONE"),
+		})
+	}
+	if len(result.Plans) == 0 {
+		return researchProductStatusResultV1{}, fmt.Errorf(
+			"Kimi 官方商品状态缺少付费套餐")
+	}
+	return result, nil
 }
 
 func valueOr(value, fallback string) string {
@@ -265,6 +345,8 @@ func (f *ProductStatusFetcher) record(
 		ResultPreview: toolResultPreview(result), ResultSize: len(result),
 		HTTPStatus: &status, DurationMs: int(elapsed.Milliseconds()), UsageQuantity: 1,
 	}
+	zeroCost := 0.0
+	rec.CostUSD = &zeroCost
 	if src.ID > 0 {
 		id := src.ID
 		rec.SourceID = &id

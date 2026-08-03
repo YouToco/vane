@@ -56,22 +56,31 @@ func TestMigration097DownRefusesClaimedUnsettledProviderEffectPostgres(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The latest schema intentionally contains several later irreversible
+	// migrations (including 111, whose official Tool admission can never be
+	// reinterpreted). This test owns migration 097's independent Down contract,
+	// so pin only this scratch database's goose ledger to 097 after the
+	// latest-schema fixture has created a genuine claimed provider effect.
+	// No later Down is executed and no production data/schema is altered.
+	if _, err := db.ExecContext(t.Context(),
+		`DELETE FROM goose_db_version WHERE version_id > 97`); err != nil {
+		t.Fatal(err)
+	}
+	var boundary int64
+	if err := db.QueryRowContext(t.Context(), `SELECT max(version_id)
+		FROM goose_db_version WHERE is_applied`).Scan(&boundary); err != nil {
+		t.Fatal(err)
+	}
+	if boundary != 97 {
+		t.Fatalf("097 independent downgrade boundary=%d", boundary)
+	}
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir,
 		goose.WithAllowOutofOrder(true))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Migration 102 is deliberately irreversible because its cutover recovery
-	// state cannot be reconstructed by DDL rollback. On a latest-schema binary,
-	// that stronger outer fence may reject DownTo before migration 097 gets a
-	// chance to evaluate its own claimed-effect fence; either rejection must
-	// leave the 097 recovery rows and gateway privilege untouched below.
 	if _, err := provider.DownTo(t.Context(), 96); err == nil ||
-		(!strings.Contains(err.Error(), "cannot remove frozen or issued process gateway effects") &&
-			!strings.Contains(err.Error(), "irreversible V3 prepare/cutover recovery migration") &&
-			!strings.Contains(err.Error(), "refusing downgrade after shadow Tool admission authority") &&
-			!strings.Contains(err.Error(), "refusing downgrade to row-locking shadow snapshot admission") &&
-			!strings.Contains(err.Error(), "irreversible partial-coverage Brief evidence may exist")) {
+		!strings.Contains(err.Error(), "097: cannot remove frozen or issued process gateway effects") {
 		t.Fatalf("097 Down did not fail closed after unsettled claim: %v", err)
 	}
 

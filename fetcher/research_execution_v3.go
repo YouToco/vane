@@ -15,6 +15,7 @@ import (
 
 	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/researchtools"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
@@ -71,28 +72,29 @@ type ResearchExecutionRequestV3 struct {
 // real value when CostKnown is true. Provider error prose is intentionally not
 // present and therefore can never be mistaken for model-visible evidence.
 type ResearchExecutionReceiptV3 struct {
-	Status               ResearchExecutionStatusV3    `json:"status"`
-	TraceID              string                       `json:"trace_id,omitempty"`
-	Provider             string                       `json:"provider,omitempty"`
-	Attempted            bool                         `json:"attempted"`
-	UsageQuantity        float64                      `json:"usage_quantity"`
-	UsageKnown           bool                         `json:"usage_known"`
-	CostMicroUSD         int64                        `json:"cost_micro_usd"`
-	CostKnown            bool                         `json:"cost_known"`
-	ProviderTruncated    bool                         `json:"provider_truncated"`
-	HTTPStatus           *int                         `json:"http_status,omitempty"`
-	DurationMS           int                          `json:"duration_ms"`
-	Result               []byte                       `json:"result,omitempty"`
-	NormalizedResultSize int                          `json:"normalized_result_size"`
-	ModelResultTruncated bool                         `json:"model_result_truncated"`
-	ResultDigest         string                       `json:"result_digest,omitempty"`
-	ErrorCode            ResearchExecutionErrorCodeV3 `json:"error_code,omitempty"`
+	Status               ResearchExecutionStatusV3         `json:"status"`
+	TraceID              string                            `json:"trace_id,omitempty"`
+	Provider             string                            `json:"provider,omitempty"`
+	Attempted            bool                              `json:"attempted"`
+	UsageQuantity        float64                           `json:"usage_quantity"`
+	UsageKnown           bool                              `json:"usage_known"`
+	CostMicroUSD         int64                             `json:"cost_micro_usd"`
+	CostKnown            bool                              `json:"cost_known"`
+	ProviderTruncated    bool                              `json:"provider_truncated"`
+	HTTPStatus           *int                              `json:"http_status,omitempty"`
+	DurationMS           int                               `json:"duration_ms"`
+	Result               []byte                            `json:"result,omitempty"`
+	NormalizedResultSize int                               `json:"normalized_result_size"`
+	ModelResultTruncated bool                              `json:"model_result_truncated"`
+	ResultDigest         string                            `json:"result_digest,omitempty"`
+	ResultTrust          runtimepolicy.ResearchToolTrustV3 `json:"result_trust,omitempty"`
+	ErrorCode            ResearchExecutionErrorCodeV3      `json:"error_code,omitempty"`
 }
 
 // Validate rejects impossible combinations before the coordinator persists a
 // receipt. Ownership and invocation binding remain the Store step's job.
 func (r ResearchExecutionReceiptV3) Validate() error {
-	if r.Provider != "" && r.Provider != "exa" {
+	if r.Provider != "" && r.Provider != "exa" && r.Provider != "kimi" {
 		return types.NewAppError(types.CodeValidation,
 			"research V3 provider receipt is invalid", nil)
 	}
@@ -118,7 +120,12 @@ func (r ResearchExecutionReceiptV3) Validate() error {
 	switch r.Status {
 	case ResearchExecutionSuccessV3:
 		resultSum := sha256.Sum256(r.Result)
-		if r.Provider != "exa" || !r.Attempted || !r.UsageKnown ||
+		validTrust := (r.Provider == "exa" &&
+			(r.ResultTrust == runtimepolicy.ResearchToolTrustExternalV3 ||
+				r.ResultTrust == "")) ||
+			(r.Provider == "kimi" &&
+				r.ResultTrust == runtimepolicy.ResearchToolTrustOfficialV3)
+		if !validTrust || !r.Attempted || !r.UsageKnown ||
 			!finitePositiveV3(r.UsageQuantity) || !r.CostKnown || r.CostMicroUSD < 0 ||
 			r.ProviderTruncated || r.HTTPStatus == nil || *r.HTTPStatus < 200 ||
 			*r.HTTPStatus >= 300 || len(r.Result) == 0 || !utf8.Valid(r.Result) ||
@@ -131,7 +138,7 @@ func (r ResearchExecutionReceiptV3) Validate() error {
 		}
 	case ResearchExecutionDefiniteFailureV3, ResearchExecutionIndeterminateV3:
 		if r.ErrorCode == "" || len(r.Result) != 0 || r.ResultDigest != "" ||
-			r.NormalizedResultSize != 0 || r.ModelResultTruncated ||
+			r.ResultTrust != "" || r.NormalizedResultSize != 0 || r.ModelResultTruncated ||
 			(r.Status == ResearchExecutionIndeterminateV3 && !r.Attempted) {
 			return types.NewAppError(types.CodeValidation,
 				"research V3 failure receipt is invalid", nil)
@@ -143,18 +150,19 @@ func (r ResearchExecutionReceiptV3) Validate() error {
 	return nil
 }
 
-// ResearchExecutorV3 is a scheduled-only, one-attempt Exa adapter. It does not
-// call the interactive Agent loop and contains no application retry. The two
-// retained provider leaves use POST, so net/http does not transparently replay
-// them as an idempotent GET after a partial transport failure.
+// ResearchExecutorV3 is a scheduled-only, one-attempt provider adapter. It does not
+// call the interactive Agent loop and contains no application retry. Every
+// retained provider leaf uses POST, so net/http does not transparently replay
+// it as an idempotent GET after a partial transport failure.
 type ResearchExecutorV3 struct {
 	exaGeneration int64
 	search        *ExaFetcher
 	contents      *ExaContentsFetcher
+	productStatus *ProductStatusFetcher
 	recorder      *researchReceiptRecorderV3
 }
 
-// NewResearchExecutorV3 constructs dedicated retained Exa leaves so their
+// NewResearchExecutorV3 constructs dedicated retained provider leaves so their
 // accounting receipts cannot be confused with interactive or legacy fetches.
 func NewResearchExecutorV3(cfg config.FetchConfig) (*ResearchExecutorV3, error) {
 	generation := cfg.CompiledExaCredentialGeneration
@@ -170,6 +178,7 @@ func NewResearchExecutorV3(cfg config.FetchConfig) (*ResearchExecutorV3, error) 
 		exaGeneration: generation,
 		search:        NewExa(cfg, recorder),
 		contents:      NewExaContents(cfg, recorder),
+		productStatus: NewProductStatus(cfg, recorder),
 		recorder:      recorder,
 	}, nil
 }
@@ -186,6 +195,7 @@ func (e *ResearchExecutorV3) ExecuteOnceV3(
 			ResearchExecutionRecoveryNoReplayV3)
 	}
 	if e == nil || e.recorder == nil || e.search == nil || e.contents == nil ||
+		e.productStatus == nil ||
 		req.Identity.Validate() != nil || req.RunSnapshotID <= 0 ||
 		!validResearchDigestV3(req.PlanDigest) ||
 		!validResearchInvocationV3(req.InvocationID) {
@@ -200,29 +210,30 @@ func (e *ResearchExecutorV3) ExecuteOnceV3(
 	}
 	canonical, err := acquisitiontool.CanonicalizeToolArgumentsV1(
 		req.Tool.Name, req.Arguments)
-	if err != nil || !bytes.Equal(canonical, req.Arguments) {
+	if err != nil || !bytes.Equal(canonical, req.Arguments) ||
+		researchtools.ValidateCanonicalArgumentsV3(req.Tool.Name, canonical) != nil {
 		return researchFailureReceiptV3(
-			ResearchExecutionDefiniteFailureV3, "exa", false,
+			ResearchExecutionDefiniteFailureV3, req.Tool.Provider, false,
 			ResearchExecutionInvalidRequestV3)
 	}
 	target, err := acquisitiontool.MaterializeApprovedToolCallV1(
 		req.Tool.Name, "v1", canonical)
 	if err != nil || target == nil {
 		return researchFailureReceiptV3(
-			ResearchExecutionDefiniteFailureV3, "exa", false,
+			ResearchExecutionDefiniteFailureV3, req.Tool.Provider, false,
 			ResearchExecutionInvalidRequestV3)
 	}
 
 	callKey := researchCallKeyV3(req)
 	if callKey == "" {
 		return researchFailureReceiptV3(
-			ResearchExecutionDefiniteFailureV3, "exa", false,
+			ResearchExecutionDefiniteFailureV3, req.Tool.Provider, false,
 			ResearchExecutionInvalidRequestV3)
 	}
 	callKey, ok := e.recorder.begin(callKey)
 	if !ok {
 		return researchFailureReceiptV3(
-			ResearchExecutionDefiniteFailureV3, "exa", false,
+			ResearchExecutionDefiniteFailureV3, req.Tool.Provider, false,
 			ResearchExecutionRecoveryNoReplayV3)
 	}
 	defer e.recorder.end(callKey)
@@ -235,14 +246,20 @@ func (e *ResearchExecutorV3) ExecuteOnceV3(
 	callCtx := WithBindingRunAttribution(
 		ctx, callKey, req.Identity.TenantID, req.Identity.UserID, req.RunSnapshotID)
 	var items []types.ContentItem
+	var officialResult *researchProductStatusResultV1
 	switch req.Tool.Implementation {
 	case runtimepolicy.ResearchToolExaSearchV3:
 		items, err = e.search.fetchWithEffectGate(callCtx, *target, gate)
 	case runtimepolicy.ResearchToolExaContentsV3:
 		items, err = e.contents.fetchWithEffectGate(callCtx, *target, gate)
+	case runtimepolicy.ResearchToolKimiProductStatusV3:
+		var result researchProductStatusResultV1
+		items, result, err = e.productStatus.fetchResearchWithEffectGate(
+			callCtx, *target, gate)
+		officialResult = &result
 	default:
 		return researchFailureReceiptV3(
-			ResearchExecutionDefiniteFailureV3, "exa", false,
+			ResearchExecutionDefiniteFailureV3, req.Tool.Provider, false,
 			ResearchExecutionRouteUnavailableV3)
 	}
 	providerReceipt, recorded := e.recorder.take(callKey)
@@ -251,18 +268,24 @@ func (e *ResearchExecutorV3) ExecuteOnceV3(
 	}
 	if err != nil {
 		if !admitted {
+			code := ResearchExecutionEffectDeniedV3
+			if types.CodeOf(err) == types.CodeValidation {
+				code = ResearchExecutionInvalidRequestV3
+			}
 			return researchFailureReceiptV3(
-				ResearchExecutionDefiniteFailureV3, "exa", false,
-				ResearchExecutionEffectDeniedV3)
+				ResearchExecutionDefiniteFailureV3, req.Tool.Provider, false,
+				code)
 		}
-		return e.failedProviderReceiptV3(providerReceipt, recorded, callKey, err)
+		return e.failedProviderReceiptV3(
+			providerReceipt, recorded, callKey, err, req.Tool.Provider)
 	}
 	if !admitted {
 		return researchFailureReceiptV3(
-			ResearchExecutionDefiniteFailureV3, "exa", false,
+			ResearchExecutionDefiniteFailureV3, req.Tool.Provider, false,
 			ResearchExecutionEffectDeniedV3)
 	}
-	return e.successProviderReceiptV3(req.Tool, items, providerReceipt, recorded, callKey)
+	return e.successProviderReceiptV3(
+		req.Tool, items, officialResult, providerReceipt, recorded, callKey)
 }
 
 func (e *ResearchExecutorV3) matchesFrozenRouteV3(
@@ -271,9 +294,16 @@ func (e *ResearchExecutorV3) matchesFrozenRouteV3(
 	policy, err := runtimepolicy.BuildResearchToolPolicyV3(
 		[]runtimepolicy.ResearchToolDefinitionV3{tool})
 	if err != nil || len(policy.AllowedTools) != 1 ||
-		tool.ImplementationGeneration != 1 || tool.Provider != "exa" ||
-		tool.CredentialRef.ID != runtimepolicy.CredentialIDExaPrimaryV1 ||
-		tool.CredentialRef.Generation != e.exaGeneration {
+		tool.ImplementationGeneration != 1 {
+		return false
+	}
+	if tool.Provider == "exa" {
+		if tool.CredentialRef.ID != runtimepolicy.CredentialIDExaPrimaryV1 ||
+			tool.CredentialRef.Generation != e.exaGeneration {
+			return false
+		}
+	} else if tool.Provider != "kimi" ||
+		tool.CredentialRef != (runtimepolicy.CredentialRefV1{}) {
 		return false
 	}
 	original, originalErr := json.Marshal(tool)
@@ -283,12 +313,19 @@ func (e *ResearchExecutorV3) matchesFrozenRouteV3(
 
 func (e *ResearchExecutorV3) failedProviderReceiptV3(
 	call types.ToolCall, recorded bool, callKey string, providerErr error,
+	expectedProvider string,
 ) ResearchExecutionReceiptV3 {
 	if !recorded {
 		receipt := researchFailureReceiptV3(
-			ResearchExecutionIndeterminateV3, "exa", true,
+			ResearchExecutionIndeterminateV3, expectedProvider, true,
 			ResearchExecutionProviderReceiptV3)
 		receipt.TraceID = callKey
+		if expectedProvider == "kimi" {
+			// This allowlisted public endpoint is contractually free; losing the
+			// HTTP receipt does not make its monetary cost unknown.
+			receipt.CostKnown = true
+			receipt.CostMicroUSD = 0
+		}
 		return receipt
 	}
 	receipt := researchReceiptFromCallV3(call)
@@ -310,15 +347,22 @@ func (e *ResearchExecutorV3) failedProviderReceiptV3(
 func (e *ResearchExecutorV3) successProviderReceiptV3(
 	tool runtimepolicy.ResearchToolDefinitionV3,
 	items []types.ContentItem,
+	officialResult *researchProductStatusResultV1,
 	call types.ToolCall,
 	recorded bool,
 	callKey string,
 ) ResearchExecutionReceiptV3 {
 	if !recorded {
 		receipt := researchFailureReceiptV3(
-			ResearchExecutionIndeterminateV3, "exa", true,
+			ResearchExecutionIndeterminateV3, tool.Provider, true,
 			ResearchExecutionProviderReceiptV3)
 		receipt.TraceID = callKey
+		if tool.Provider == "kimi" {
+			// The first-party product endpoint is contractually free even when
+			// its durable HTTP receipt is lost after the request.
+			receipt.CostKnown = true
+			receipt.CostMicroUSD = 0
+		}
 		return receipt
 	}
 	receipt := researchReceiptFromCallV3(call)
@@ -349,7 +393,18 @@ func (e *ResearchExecutorV3) successProviderReceiptV3(
 		receipt.ErrorCode = ResearchExecutionProviderCostExceededV3
 		return receipt
 	}
-	payload, err := json.Marshal(researchDocumentsV3(items))
+	var payload []byte
+	var err error
+	if tool.Implementation == runtimepolicy.ResearchToolKimiProductStatusV3 {
+		if officialResult == nil || officialResult.SchemaVersion != productStatusResultSchemaV1 {
+			receipt.Status = ResearchExecutionIndeterminateV3
+			receipt.ErrorCode = ResearchExecutionProviderReceiptV3
+			return receipt
+		}
+		payload, err = json.Marshal(officialResult)
+	} else {
+		payload, err = json.Marshal(researchDocumentsV3(items))
+	}
 	if err != nil {
 		receipt.Status = ResearchExecutionIndeterminateV3
 		receipt.ErrorCode = ResearchExecutionProviderReceiptV3
@@ -361,6 +416,7 @@ func (e *ResearchExecutorV3) successProviderReceiptV3(
 	receipt.NormalizedResultSize = visible.NormalizedSize
 	receipt.ModelResultTruncated = visible.Truncated
 	receipt.ResultDigest = visible.Digest
+	receipt.ResultTrust = tool.ResultTrust
 	return receipt
 }
 
@@ -370,6 +426,8 @@ func (e *ResearchExecutorV3) providerBodyCapV3(toolName string) int {
 		return int(e.search.maxBytes)
 	case "exa:contents":
 		return int(e.contents.maxBytes)
+	case "kimi:goods_list":
+		return productStatusMaxBytes
 	default:
 		return 0
 	}
@@ -399,7 +457,7 @@ func researchDocumentsV3(items []types.ContentItem) []researchDocumentV3 {
 
 func researchReceiptFromCallV3(call types.ToolCall) ResearchExecutionReceiptV3 {
 	receipt := ResearchExecutionReceiptV3{
-		TraceID: call.TraceID, Provider: "exa", Attempted: true,
+		TraceID: call.TraceID, Provider: call.Provider, Attempted: true,
 		UsageQuantity: call.UsageQuantity,
 		UsageKnown:    finitePositiveV3(call.UsageQuantity),
 		DurationMS:    call.DurationMs,
@@ -408,7 +466,10 @@ func researchReceiptFromCallV3(call types.ToolCall) ResearchExecutionReceiptV3 {
 		status := *call.HTTPStatus
 		receipt.HTTPStatus = &status
 	}
-	if call.CostUSD != nil && finitePositiveV3(*call.CostUSD) &&
+	if call.Provider == "kimi" && call.CostUSD != nil && *call.CostUSD == 0 {
+		receipt.CostKnown = true
+		receipt.CostMicroUSD = 0
+	} else if call.CostUSD != nil && finitePositiveV3(*call.CostUSD) &&
 		*call.CostUSD <= float64(math.MaxInt64)/1_000_000 {
 		receipt.CostKnown = true
 		// Round upward at the micro-dollar boundary so admission never
@@ -480,6 +541,8 @@ func researchReceiptMatchesRequestV3(
 		expectedToolName = "exa:search"
 	case runtimepolicy.ResearchToolExaContentsV3:
 		expectedToolName = "exa:contents"
+	case runtimepolicy.ResearchToolKimiProductStatusV3:
+		expectedToolName = "kimi:goods_list"
 	}
 	return call.TraceID == callKey && call.TenantID != nil &&
 		*call.TenantID == req.Identity.TenantID && call.UserID != nil &&

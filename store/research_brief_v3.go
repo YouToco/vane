@@ -866,7 +866,8 @@ func buildResearchEvidenceManifestV3(
 	for _, item := range items {
 		if item.EvidenceID <= 0 || item.Ordinal < 0 || item.Ordinal >= planRef.StepCount ||
 			!validResearchRunDigest(item.RequestDigest) || !validResearchRunDigest(item.ResultDigest) ||
-			(item.TrustType != "local" && item.TrustType != "external") {
+			(item.TrustType != "local" && item.TrustType != "external" &&
+				item.TrustType != "official") {
 			return nil, nil, nil, researchRunIntegrityError()
 		}
 	}

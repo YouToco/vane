@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/fetcher"
+	"github.com/YouToco/vane/runtimepolicy"
 	storepkg "github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
@@ -54,6 +55,40 @@ func researchBridgeFixtureV3(t *testing.T) (
 		Ordinal: 0, InvocationID: "search-official", ToolName: "web_search",
 		Arguments: []byte(`{"query":"Kimi"}`), RequestDigest: strings.Repeat("3", 64),
 		ReservedQuotaUnits: 1, ReservedCostMicroUSD: 10_000,
+	}
+}
+
+func TestMapResearchOfficialReceiptV3PreservesTrustProviderAndZeroCost(t *testing.T) {
+	identity, snapshot, plan, execution := researchBridgeFixtureV3(t)
+	execution.InvocationID = "kimi-status"
+	execution.ToolName = "web_product_status"
+	execution.Arguments = []byte(`{"page_url":"https://www.kimi.com/membership/pricing"}`)
+	execution.ReservedCostMicroUSD = 1
+	traceID, err := fetcher.ResearchExecutionTraceV3(
+		identity, snapshot.SnapshotID, plan.PlanDigest,
+		execution.Ordinal, execution.InvocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := 200
+	result := []byte(`{"schema_version":"vane.product-status-result/v1","purchase_status":"direct_purchase"}`)
+	sum := sha256.Sum256(result)
+	receipt := fetcher.ResearchExecutionReceiptV3{
+		Status:  fetcher.ResearchExecutionSuccessV3,
+		TraceID: traceID, Provider: "kimi", Attempted: true,
+		UsageQuantity: 1, UsageKnown: true, CostMicroUSD: 0, CostKnown: true,
+		HTTPStatus: &status, DurationMS: 12, Result: result,
+		NormalizedResultSize: len(result), ResultDigest: hex.EncodeToString(sum[:]),
+		ResultTrust: runtimepolicy.ResearchToolTrustOfficialV3,
+	}
+	mapped, err := mapResearchExecutionReceiptV3(
+		identity, snapshot, plan, execution, receipt)
+	if err != nil || mapped.Evidence == nil || mapped.Terminal != nil ||
+		mapped.Evidence.TrustType != "official" || mapped.Evidence.CostMicroUSD != 0 ||
+		mapped.Evidence.ProviderCall.Provider != "kimi" ||
+		mapped.Evidence.ProviderCall.PricingStatus != "calculated" ||
+		mapped.Evidence.ProviderCall.CostCurrency != "USD" {
+		t.Fatalf("official mapping=%+v err=%v", mapped, err)
 	}
 }
 

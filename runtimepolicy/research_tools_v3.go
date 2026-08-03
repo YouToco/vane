@@ -17,8 +17,9 @@ const ResearchToolPolicySchemaVersionV3 = "vane.runtime-tool-policy/v3"
 type ResearchToolImplementationV3 string
 
 const (
-	ResearchToolExaSearchV3   ResearchToolImplementationV3 = "acquisition.web-search/v1"
-	ResearchToolExaContentsV3 ResearchToolImplementationV3 = "acquisition.web-contents/v1"
+	ResearchToolExaSearchV3         ResearchToolImplementationV3 = "acquisition.web-search/v1"
+	ResearchToolExaContentsV3       ResearchToolImplementationV3 = "acquisition.web-contents/v1"
+	ResearchToolKimiProductStatusV3 ResearchToolImplementationV3 = "acquisition.web-product-status/v1"
 )
 
 type ResearchToolEffectV3 string
@@ -31,7 +32,10 @@ const (
 
 type ResearchToolTrustV3 string
 
-const ResearchToolTrustExternalV3 ResearchToolTrustV3 = "external"
+const (
+	ResearchToolTrustExternalV3 ResearchToolTrustV3 = "external"
+	ResearchToolTrustOfficialV3 ResearchToolTrustV3 = "official"
+)
 
 // ResearchToolDefinitionV3 is a non-secret, scheduled-only execution grant.
 // Every field is frozen before planning; execution resolves only a retained
@@ -149,21 +153,37 @@ func normalizeResearchToolPolicyV3(policy ResearchToolPolicyV3) (ResearchToolPol
 func normalizeResearchToolDefinitionV3(tool ResearchToolDefinitionV3) (ResearchToolDefinitionV3, error) {
 	if !validResearchToolTextV3(tool.Name, 128) ||
 		!validResearchToolTextV3(tool.Description, 4096) ||
-		tool.ImplementationGeneration <= 0 || tool.Provider != "exa" ||
-		tool.ResultTrust != ResearchToolTrustExternalV3 ||
-		tool.BudgetBucket != "exa_calls" || tool.MaxCostMicroUSD <= 0 ||
-		tool.MaxCostMicroUSD > 1_000_000 ||
-		tool.CredentialRef.validateFor(CredentialIDExaPrimaryV1) != nil {
+		tool.ImplementationGeneration <= 0 || tool.MaxCostMicroUSD <= 0 ||
+		tool.MaxCostMicroUSD > 1_000_000 {
 		return ResearchToolDefinitionV3{}, invalidPolicy("research tool grant is invalid")
 	}
-	if (tool.Name != "web_search" || tool.Implementation != ResearchToolExaSearchV3) &&
-		(tool.Name != "web_contents" || tool.Implementation != ResearchToolExaContentsV3) {
+	var expectedEffects []ResearchToolEffectV3
+	switch {
+	case tool.Name == "web_search" && tool.Implementation == ResearchToolExaSearchV3,
+		tool.Name == "web_contents" && tool.Implementation == ResearchToolExaContentsV3:
+		if tool.Provider != "exa" || tool.ResultTrust != ResearchToolTrustExternalV3 ||
+			tool.BudgetBucket != "exa_calls" ||
+			tool.CredentialRef.validateFor(CredentialIDExaPrimaryV1) != nil {
+			return ResearchToolDefinitionV3{}, invalidPolicy("research Tool Exa grant is invalid")
+		}
+		expectedEffects = []ResearchToolEffectV3{
+			ResearchToolEffectBillableV3,
+			ResearchToolEffectNetworkReadV3,
+			ResearchToolEffectTrustTaintV3,
+		}
+	case tool.Name == "web_product_status" &&
+		tool.Implementation == ResearchToolKimiProductStatusV3:
+		if tool.Provider != "kimi" || tool.ResultTrust != ResearchToolTrustOfficialV3 ||
+			tool.BudgetBucket != "official_calls" || tool.MaxCostMicroUSD != 1 ||
+			tool.CredentialRef != (CredentialRefV1{}) {
+			return ResearchToolDefinitionV3{}, invalidPolicy("research Tool official grant is invalid")
+		}
+		expectedEffects = []ResearchToolEffectV3{
+			ResearchToolEffectNetworkReadV3,
+			ResearchToolEffectTrustTaintV3,
+		}
+	default:
 		return ResearchToolDefinitionV3{}, invalidPolicy("research tool implementation is unsupported")
-	}
-	expectedEffects := []ResearchToolEffectV3{
-		ResearchToolEffectBillableV3,
-		ResearchToolEffectNetworkReadV3,
-		ResearchToolEffectTrustTaintV3,
 	}
 	if !slices.Equal(tool.Effects, expectedEffects) {
 		return ResearchToolDefinitionV3{}, invalidPolicy("research tool effects are invalid")
