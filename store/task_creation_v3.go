@@ -154,12 +154,12 @@ func (s *Store) CommitPausedResearchTaskDefinitionV3ForCreation(
 func (s *Store) BeginResearchTaskCreationActivationV3(
 	ctx context.Context,
 	lease types.TaskCreationLease,
-	taskID string,
+	binding types.ResearchTaskCreationActivationBindingV3,
 ) (bool, error) {
 	if err := validateTaskCreationLease(lease); err != nil {
 		return false, err
 	}
-	if err := validateTaskCreationTaskID(taskID); err != nil {
+	if err := validateResearchTaskCreationActivationBindingV3(binding); err != nil {
 		return false, err
 	}
 	var started bool
@@ -170,9 +170,11 @@ func (s *Store) BeginResearchTaskCreationActivationV3(
 	defer rollbackTaskCreationTransaction(ctx, tx)
 	if err := tx.QueryRow(ctx,
 		`SELECT begin_native_research_task_activation_v3_v1(
-		 $1,$2,$3,$4,$5,$6,$7)`,
+		 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
-		taskID, types.TaskCreationExecutionVersionV2).Scan(&started); err != nil {
+		binding.TaskID, binding.DefinitionDigest, binding.TargetActionDigest,
+		binding.ActionAuthorizationDigest,
+		types.TaskCreationExecutionVersionV2).Scan(&started); err != nil {
 		return false, taskCreationDatabaseError("begin native V3 activation", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -187,12 +189,12 @@ func (s *Store) BeginResearchTaskCreationActivationV3(
 func (s *Store) CommitResearchTaskCreationActivationV3(
 	ctx context.Context,
 	lease types.TaskCreationLease,
-	taskID string,
+	binding types.ResearchTaskCreationActivationBindingV3,
 ) error {
 	if err := validateTaskCreationLease(lease); err != nil {
 		return err
 	}
-	if err := validateTaskCreationTaskID(taskID); err != nil {
+	if err := validateResearchTaskCreationActivationBindingV3(binding); err != nil {
 		return err
 	}
 	tx, err := s.beginNativeResearchCreationV3Tx(ctx, lease.TenantID, lease.UserID)
@@ -202,13 +204,29 @@ func (s *Store) CommitResearchTaskCreationActivationV3(
 	defer rollbackTaskCreationTransaction(ctx, tx)
 	if _, err := tx.Exec(ctx,
 		`SELECT commit_native_research_task_activation_v3_v1(
-		 $1,$2,$3,$4,$5,$6,$7)`,
+		 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
-		taskID, types.TaskCreationExecutionVersionV2); err != nil {
+		binding.TaskID, binding.DefinitionDigest, binding.TargetActionDigest,
+		binding.ActionAuthorizationDigest,
+		types.TaskCreationExecutionVersionV2); err != nil {
 		return taskCreationDatabaseError("commit native V3 activation", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskCreationDatabaseError("commit native V3 activation transaction", err)
+	}
+	return nil
+}
+
+func validateResearchTaskCreationActivationBindingV3(
+	binding types.ResearchTaskCreationActivationBindingV3,
+) error {
+	if err := validateTaskCreationTaskID(binding.TaskID); err != nil {
+		return err
+	}
+	if !validSHA256Digest(binding.DefinitionDigest) ||
+		!validSHA256Digest(binding.TargetActionDigest) ||
+		!validSHA256Digest(binding.ActionAuthorizationDigest) {
+		return taskCreationValidation("native V3 activation binding is invalid")
 	}
 	return nil
 }

@@ -933,9 +933,10 @@ func countTaskCreationCapacity(
 		     SELECT 0, task_id
 		       FROM task_creation_operations
 		      WHERE user_id = $1
-		        AND tool_name = 'create_schedule' AND execution_version = $3
-		        AND status = $4 AND tombstoned_at IS NULL AND task_id <> ''
-		        AND phase IN ($5, $6, $7)
+		        AND ((tool_name = 'create_schedule' AND execution_version = $3) OR
+		             (tool_name = 'manage_tasks' AND execution_version = $4))
+		        AND status = $5 AND tombstoned_at IS NULL AND task_id <> ''
+		        AND phase IN ($6, $7, $8)
 		     UNION
 		     SELECT
 		       CASE WHEN result->>'task_id_known' = 'true' THEN 0 ELSE 1 END,
@@ -943,12 +944,20 @@ func countTaskCreationCapacity(
 		       FROM task_creation_operations
 		      WHERE user_id = $1
 		        AND tool_name = 'create_schedule' AND execution_version = $3
-		        AND status = $8 AND phase = $9 AND tombstoned_at IS NOT NULL
-		        AND result->>'version' = $10
+		        AND status = $9 AND phase = $10 AND tombstoned_at IS NOT NULL
+		        AND result->>'version' = $11
 		        AND result->>'reservation_retained' = 'true'
+		     UNION
+		     SELECT 0, task_id
+		       FROM task_creation_operations
+		      WHERE user_id = $1
+		        AND tool_name = 'manage_tasks' AND execution_version = $4
+		        AND status = $9 AND phase = $10 AND tombstoned_at IS NOT NULL
+		        AND task_id <> ''
 		   ) reserved`,
 		userID, types.ScheduleStatusActive,
-		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskCreationExecutionVersionV2,
+		types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseDefinitionCommitted,
 		types.TaskCreationPhaseActivationStarted,
 		types.TaskCreationPhaseActivated,

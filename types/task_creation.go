@@ -132,6 +132,18 @@ type CommitPausedResearchTaskDefinitionV3ForCreationParams struct {
 	ActionAuthorizationDigest string
 }
 
+// ResearchTaskCreationActivationBindingV3 carries the immutable evidence
+// identity across the database/Temporal phase boundary.  Activation may not
+// authorize or publish an aggregate merely because its task ID and status
+// happen to match: all three digests must still be the ones committed by the
+// same fenced creation operation.
+type ResearchTaskCreationActivationBindingV3 struct {
+	TaskID                    string
+	DefinitionDigest          string
+	TargetActionDigest        string
+	ActionAuthorizationDigest string
+}
+
 // CommitPausedCompiledTaskDefinitionForCreationParams binds the A2 aggregate
 // write to every immutable proof produced by the same fenced operation. The
 // Store does not interpret PreparedSchedule or EnsureReceipt; byte identity is
