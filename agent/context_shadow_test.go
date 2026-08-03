@@ -12,7 +12,6 @@ import (
 
 	"github.com/YouToco/vane/agentcontext"
 	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
@@ -442,47 +441,6 @@ func TestShadowMessageGroupsEmitContiguousExactOrdinalRanges(t *testing.T) {
 	}
 }
 
-func TestContextShadowDirectCreationHasNoHistoricalMessages(t *testing.T) {
-	store := &contextShadowStore{fakeStore: newFakeStore()}
-	session, err := store.CreateAgentSession(t.Context(), 7)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session.Messages = json.RawMessage(
-		`[{"role":"user","content":"old secret"},{"role":"assistant","content":"old answer"}]`,
-	)
-	store.sessions[session.ID] = session
-	create := &fakeTool{name: "create_schedule", mutating: true}
-	loop := newContextShadowLoop(
-		t, store,
-		func(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
-			return &llm.ChatResponse{
-				ToolCalls: []llm.ToolCall{{
-					ID: "create-1", Name: "create_schedule",
-					Arguments: `{"name":"x"}`,
-				}},
-			}, nil
-		},
-		create,
-	)
-	loop.taskCreation = &fakeCreationController{
-		proposeResult: task.CreationProposal{
-			ID: "proposal-1", Summary: "create",
-		},
-	}
-	_, _ = loop.HandleMessage(
-		t.Context(), 7, "直接创建任务，不要再次搜索。",
-	)
-	snapshots := drainContextShadows(t, loop, store)
-	if len(snapshots) == 0 {
-		t.Fatal("direct creation produced no shadow")
-	}
-	raw, _ := json.Marshal(snapshots[0].CandidateMessages)
-	if strings.Contains(string(raw), "old secret") {
-		t.Fatal("direct creation shadow retained cropped history")
-	}
-}
-
 func TestRunOnceContextShadowNeverPersistsOwnerSnapshot(t *testing.T) {
 	store := &contextShadowStore{fakeStore: newFakeStore()}
 	loop := newContextShadowLoop(
@@ -525,9 +483,6 @@ func newContextShadowLoop(
 	loop := New(Deps{
 		Store: store, Profiles: store,
 		Tools: testToolSpecs(tools...),
-		TaskCreation: &fakeCreationController{
-			executeErr: task.ErrCreationOperationNotFound,
-		},
 		Model: "deepseek-v4-pro", MaxTurns: 5,
 		SessionTTL: 30 * time.Minute,
 	})

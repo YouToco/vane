@@ -788,10 +788,9 @@ func TestOwnerGeneralChatInventoryHidesLegacyTaskTools(t *testing.T) {
 			t.Errorf("Agent-first inventory exposed legacy tool %s", retired)
 		}
 	}
-	if !strings.Contains(agentFirstSystemNote, "Agent-first 工具环境") ||
-		!strings.Contains(agentFirstSystemNote, "query_my_intelligence") ||
-		!strings.Contains(agentFirstSystemNote, "manage_tasks") {
-		t.Fatalf("Agent-first environment note missing: %q", agentFirstSystemNote)
+	if !strings.Contains(systemPrompt, "query_my_intelligence") ||
+		!strings.Contains(systemPrompt, "manage_tasks") {
+		t.Fatalf("Agent-first environment prompt missing: %q", systemPrompt)
 	}
 }
 
@@ -815,7 +814,7 @@ func TestOwnerAgentDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
 	}
 	encoded, _ := json.Marshal(request.Messages)
 	if strings.Contains(string(encoded), "SECRET-INDUSTRY") ||
-		!strings.Contains(string(encoded), "Agent-first 工具环境") {
+		!strings.Contains(string(encoded), "query_my_intelligence") {
 		t.Fatalf("Agent-first request leaked implicit profile or missed environment: %s", encoded)
 	}
 	for _, retiredGuidance := range []string{
@@ -829,23 +828,6 @@ func TestOwnerAgentDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
 	}
 	if !strings.Contains(string(encoded), "创建、编辑、立即运行和批量删除任务统一使用 manage_tasks") {
 		t.Fatalf("Agent-first prompt missed V3 create guidance: %s", encoded)
-	}
-}
-
-func TestAgentFirstPromptSplitPreservesLegacyNonCanaryGuidance(t *testing.T) {
-	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
-	loop := New(Deps{
-		Tools:      BuildOwnerTools(nil, ManageTasksDeps{}, nil, nil, exa),
-		OwnerAgent: true,
-		Evidence:   &fakeAgentEvidenceWriter{},
-	})
-	if !strings.Contains(loop.sys, "统一使用 create_schedule 创建") {
-		t.Fatalf("non-canary prompt lost retained legacy guidance: %q", loop.sys)
-	}
-	if strings.Contains(loop.agentFirstSys, "统一使用 create_schedule 创建") ||
-		strings.Contains(loop.agentFirstSys, "create_schedule 必须带完整 intent") ||
-		!strings.Contains(loop.agentFirstSys, "创建、编辑、立即运行和批量删除任务统一使用 manage_tasks") {
-		t.Fatalf("Agent-first prompt split is not clean: %q", loop.agentFirstSys)
 	}
 }
 

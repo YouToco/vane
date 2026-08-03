@@ -10,8 +10,6 @@ import (
 	"github.com/YouToco/vane/agentcontext"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/task"
-	"github.com/YouToco/vane/types"
 )
 
 type evidenceTestTool struct{ result string }
@@ -145,58 +143,6 @@ func TestOwnerAgentRequiresExactEvidenceAndOrthogonalCatalog(t *testing.T) {
 	if _, err := NewChecked(Deps{OwnerAgent: true,
 		Evidence: &fakeAgentEvidenceWriter{}}); err == nil {
 		t.Fatal("owner Agent accepted a catalog without required tools")
-	}
-}
-
-func TestDirectWebEditSealsExactEvidenceAndActionReceipt(t *testing.T) {
-	writer := &fakeAgentEvidenceWriter{}
-	controller := &fakeDefinitionEditController{execute: task.TaskDefinitionEditOutcome{
-		Status: types.TaskDefinitionEditOperationStatusCompleted,
-		TaskID: "task-direct-internal-7ab4",
-	}}
-	tool := newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(Effects(
-		EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite,
-	), BudgetNone))
-	loop := New(Deps{
-		Tools: []ToolSpec{tool}, Evidence: writer,
-		TaskDefinitionEdit: controller, MaxTurns: 2,
-	})
-	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
-		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-			ID: "direct-edit-provider-call", Name: definitionEditToolName,
-			Arguments: `{"task_id":"task-direct-internal-7ab4","intent":"只推送重大更新"}`,
-		}}}, nil
-	}
-	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
-		traceID: "trace-direct-edit", userID: 42,
-		scope: agentcontext.Scope{TenantID: 7, UserID: 42, SessionID: 9},
-	})
-	sessionID := int64(9)
-	state := &toolRunState{
-		activation: &activationState{}, ownerRequest: "把 Kimi 任务改成只推重大更新",
-		agentFirstEnabled: true, directTaskDefinitionEditID: "task-direct-internal-7ab4",
-		directActionID:  "operation-direct-internal-8bc5",
-		successfulCalls: map[string]struct{}{}, failedCalls: map[string]int{},
-	}
-	outcome, _, _, err := loop.converse(ctx, 42, &sessionID,
-		[]llm.ChatMessage{{Role: "user", Content: state.ownerRequest}}, "", state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if outcome.Reply != "已修改定时推送任务。" || len(writer.record.ToolEvidence) != 1 {
-		t.Fatalf("outcome=%+v record=%+v", outcome, writer.record)
-	}
-	evidence := writer.record.ToolEvidence[0]
-	if evidence.InvocationID != "direct-edit-provider-call" ||
-		evidence.ToolName != definitionEditToolName ||
-		string(evidence.Result) != outcome.Reply ||
-		!strings.Contains(string(evidence.Arguments), "task-direct-internal-7ab4") {
-		t.Fatalf("evidence=%+v", evidence)
-	}
-	if !strings.Contains(string(writer.record.ActionReceipts), `"action":"edit"`) ||
-		!strings.Contains(string(writer.record.ActionReceipts), "operation-direct-internal-8bc5") ||
-		!strings.Contains(string(writer.record.ActionReceipts), "task-direct-internal-7ab4") {
-		t.Fatalf("receipts=%s", writer.record.ActionReceipts)
 	}
 }
 

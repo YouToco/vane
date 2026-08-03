@@ -10,9 +10,8 @@ import (
 )
 
 // TestOwnerToolSurfaceIsACompositionInvariant prevents a deployment flag or
-// catalog fallback from restoring the retired owner tools. The one remaining
-// BuildTools consumer is named and isolated as the Dashboard compatibility
-// loop; A2A starts from the public-only catalog.
+// catalog fallback from restoring the retired owner tools. Dashboard and
+// Feishu share the single owner loop; A2A starts from the public-only catalog.
 func TestOwnerToolSurfaceIsACompositionInvariant(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -59,8 +58,8 @@ func TestOwnerToolSurfaceIsACompositionInvariant(t *testing.T) {
 		t.Fatalf("owner builders/lanes=%d/%d, want one explicit invariant",
 			ownerBuilders, ownerLanes)
 	}
-	if compatibilityBuilders != 1 {
-		t.Fatalf("retained BuildTools consumers=%d, want one explicit Web compatibility loop",
+	if compatibilityBuilders != 0 {
+		t.Fatalf("retired BuildTools consumers=%d, want zero",
 			compatibilityBuilders)
 	}
 	if publicBuilders != 1 {
@@ -171,10 +170,8 @@ func isIdentCall(expr ast.Expr, name string) bool {
 }
 
 // TestSessionAdmissionIsSharedOnlyBySessionBearingLoops pins the composition
-// boundary behind owner chat and Web Dashboard concurrency. They use separate
-// Loop/catalog instances but mutate one active session per user, so both must
-// receive the exact same coordinator. A2A RunOnce is sessionless and must keep
-// an independent admission domain.
+// boundary behind the single owner loop used by both chat and Dashboard. A2A
+// RunOnce is sessionless and must keep an independent admission domain.
 func TestSessionAdmissionIsSharedOnlyBySessionBearingLoops(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -246,7 +243,7 @@ func TestSessionAdmissionIsSharedOnlyBySessionBearingLoops(t *testing.T) {
 		}
 		return true
 	})
-	if constructors != 1 || totalLoops != 3 || injectedLoops != 2 ||
+	if constructors != 1 || totalLoops != 2 || injectedLoops != 1 ||
 		!ownerInjected || a2aInjected {
 		t.Fatalf(
 			"session admission constructors=%d loops=%d injected=%d owner=%v a2a=%v",

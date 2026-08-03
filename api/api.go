@@ -78,17 +78,11 @@ type TaskAgent interface {
 		userID int64,
 		text string,
 	) (agent.Outcome, error)
-	HandleTaskCreationMessage(
+	HandleWebTaskActionMessage(
 		ctx context.Context,
 		userID int64,
 		actionID string,
-		text string,
-	) (agent.Outcome, error)
-	HandleTaskDefinitionEditMessage(
-		ctx context.Context,
-		userID int64,
-		actionID string,
-		taskID string,
+		selectedTaskRef string,
 		text string,
 	) (agent.Outcome, error)
 }

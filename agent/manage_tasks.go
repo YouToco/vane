@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/internal/strictjson"
@@ -21,6 +22,7 @@ const (
 	manageTasksName           = "manage_tasks"
 	manageTasksBatchMax       = 20
 	manageTasksAmbiguousReply = "这条写指令仍有歧义，本次未执行。请只针对缺失信息自然追问一次，不要让用户提供内部 ID，也不要发送确认卡。"
+	durableOperationTTL       = 24 * time.Hour
 )
 
 // OwnerActionDecision is the result of the single write-boundary adjudication.
@@ -141,7 +143,7 @@ type ManageTasksDeps struct {
 }
 
 // NewManageTasksTool builds the single task mutation surface. It is separate
-// from BuildTools while the fixed owner lane coexists with legacy direct Web lanes.
+// through the single owner Agent catalog.
 func NewManageTasksTool(deps ManageTasksDeps) ToolSpec {
 	return newToolSpec(&manageTasksTool{deps: deps}, withToolSurface(ownerPolicy(
 		Effects(EffectDurableProposal, EffectStateWrite, EffectDelivery,

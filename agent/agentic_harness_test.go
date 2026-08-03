@@ -358,10 +358,7 @@ func TestDynamicDescriptionsHideProviderAndTransport(t *testing.T) {
 func TestProductionToolSchemasHideProvidersAndTransport(t *testing.T) {
 	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
 	endpoints := NewEndpointTools(nil, nil, 0, 1_000_000)
-	static := BuildTools(
-		nil, nil, nil, endpoints, exa,
-		&fakeDefinitionEditController{},
-	)
+	static := BuildOwnerTools(nil, ManageTasksDeps{}, nil, endpoints, exa)
 	for _, spec := range static {
 		assertPublicToolSurface(t, spec.Name(),
 			spec.Description(), string(spec.Parameters()))
