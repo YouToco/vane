@@ -55,7 +55,7 @@ func TestFeedbackIntelligenceCatalogV2UsesCanonicalScopedProjection(t *testing.T
 		IntelligenceQuery{
 			Dataset: IntelligenceFeedbacks,
 			Select: []string{
-				"task_ref", "action", "reason_code",
+				"task_ref", "delivered_summary", "action", "reason_code",
 				"detail", "is_effective_attitude", "created_at",
 			},
 			Filters: []IntelligenceFilter{{
@@ -73,8 +73,9 @@ func TestFeedbackIntelligenceCatalogV2UsesCanonicalScopedProjection(t *testing.T
 		"rs.user_id=b.user_id AND rs.task_id=s.id",
 		"LEFT JOIN profile_claim_states pcs", "newer.profile_epoch=f.profile_epoch",
 		"(newer.created_at,newer.id)>(f.created_at,f.id)",
-		"f.action='not_interested'", "btrim(f.detail)=''",
+		"left(d.body_md,2000)", "f.action='not_interested'", "btrim(f.detail)=''",
 		"newer.action='misjudged'", "newer.reason_code IS NOT NULL",
+		"newer.id>f.id",
 		"tenant_id=$1", "user_id=$2", "task_ref=$3",
 	} {
 		if !strings.Contains(compiled.sql, required) {
