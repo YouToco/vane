@@ -40,6 +40,69 @@ func TestCompileIntelligenceQueryUsesFixedCatalogAndBoundValues(t *testing.T) {
 	}
 }
 
+func TestFeedbackIntelligenceCatalogV2UsesCanonicalScopedProjection(t *testing.T) {
+	if IntelligenceCatalogVersion != "vane.intelligence-catalog/v2" {
+		t.Fatalf("catalog version=%q", IntelligenceCatalogVersion)
+	}
+	spec, ok := intelligenceCatalog[IntelligenceFeedbacks]
+	if !ok {
+		t.Fatal("feedbacks dataset is absent from the generic catalog")
+	}
+	st := &Store{}
+	compiled, err := st.compileIntelligenceQuery(
+		t.Context(), nil,
+		IntelligenceScope{TenantID: 7, UserID: 9, TaskID: "task-kimi"},
+		IntelligenceQuery{
+			Dataset: IntelligenceFeedbacks,
+			Select: []string{
+				"task_ref", "delivery_ref", "action", "reason_code",
+				"detail", "is_effective_attitude", "created_at",
+			},
+			Filters: []IntelligenceFilter{{
+				Field: "action", Op: "eq", Value: json.RawMessage(`"misjudged"`),
+			}},
+			Limit: 25,
+		}, spec,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"FROM feedbacks f", "JOIN deliveries d", "JOIN push_batches b",
+		"LEFT JOIN schedules s", "LEFT JOIN task_run_snapshots rs",
+		"rs.user_id=b.user_id AND rs.task_id=s.id",
+		"LEFT JOIN profile_claim_states pcs", "newer.profile_epoch=f.profile_epoch",
+		"(newer.created_at,newer.id)>(f.created_at,f.id)",
+		"tenant_id=$1", "user_id=$2", "task_ref=$3",
+	} {
+		if !strings.Contains(compiled.sql, required) {
+			t.Fatalf("feedback projection is missing %q:\n%s", required, compiled.sql)
+		}
+	}
+	if strings.Contains(compiled.sql, "'misjudged'") {
+		t.Fatalf("model filter value reached SQL text: %s", compiled.sql)
+	}
+	if got := compiled.args[2]; got != "task-kimi" {
+		t.Fatalf("task fence arg=%v", got)
+	}
+	foundAction := false
+	for _, arg := range compiled.args {
+		if arg == "misjudged" {
+			foundAction = true
+			break
+		}
+	}
+	if !foundAction {
+		t.Fatalf("feedback action is not parameter-bound: %#v", compiled.args)
+	}
+	if _, exists := spec.columns["tenant_id"]; exists {
+		t.Fatal("tenant identity became model-selectable")
+	}
+	if _, exists := spec.columns["user_id"]; exists {
+		t.Fatal("user identity became model-selectable")
+	}
+}
+
 func TestCompileIntelligenceQueryRejectsSQLAndUnknownFields(t *testing.T) {
 	st := &Store{}
 	for _, field := range []string{"tenant_id", "user_id", "pg_sleep(5)", "system_prompt"} {
