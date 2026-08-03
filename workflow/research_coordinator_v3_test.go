@@ -442,6 +442,46 @@ func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(
 	}
 }
 
+func TestDecodeResearchBriefCompletionV3CanonicalizesOnlyCurrentRenderer(t *testing.T) {
+	canonical := []byte(`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","headline":"Kimi status unavailable","summary":"The official page could not be read.","significance":"none","citations":[]}`)
+	formatted := []byte("{\n" +
+		"  \"citations\": [],\n" +
+		"  \"significance\": \"none\",\n" +
+		"  \"summary\": \"The official page could not be read.\",\n" +
+		"  \"headline\": \"Kimi status unavailable\",\n" +
+		"  \"assessment\": \"unknown\",\n" +
+		"  \"schema_version\": \"vane.research-brief/v3.1\"\n" +
+		"}")
+	payload, gotCanonical, err := decodeResearchBriefCompletionV3(
+		formatted, runtimepolicy.ResearchSynthesisRendererVersionV31)
+	if err != nil || payload.Assessment != types.ResearchBriefAssessmentUnknownV31 ||
+		!reflect.DeepEqual(gotCanonical, canonical) {
+		t.Fatalf("formatted Brief payload=%+v canonical=%s err=%v",
+			payload, gotCanonical, err)
+	}
+	if _, _, err := decodeResearchBriefCompletionV3(
+		formatted, runtimepolicy.ResearchSynthesisRendererVersionV3); err == nil {
+		t.Fatal("legacy synthesis renderer accepted non-canonical settled completion")
+	}
+	if _, _, err := decodeResearchBriefCompletionV3(
+		canonical, "unknown-renderer"); err == nil {
+		t.Fatal("unknown synthesis renderer accepted a Brief completion")
+	}
+	for name, raw := range map[string][]byte{
+		"markdown":       []byte("```json\n" + string(canonical) + "\n```"),
+		"unknown":        []byte(`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","headline":"Kimi status unavailable","summary":"The official page could not be read.","significance":"none","citations":[],"write_action":"delete"}`),
+		"duplicate":      []byte(`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","assessment":"unknown","headline":"Kimi status unavailable","summary":"The official page could not be read.","significance":"none","citations":[]}`),
+		"null citations": []byte(`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","headline":"Kimi status unavailable","summary":"The official page could not be read.","significance":"none","citations":null}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := decodeResearchBriefCompletionV3(
+				raw, runtimepolicy.ResearchSynthesisRendererVersionV31); err == nil {
+				t.Fatal("non-exact Brief output was accepted")
+			}
+		})
+	}
+}
+
 func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *testing.T) {
 	_, snapshot, _, _ := researchBridgeFixtureV3(t)
 	snapshot.PlannerBudget.MaxPlannerRounds = 2
