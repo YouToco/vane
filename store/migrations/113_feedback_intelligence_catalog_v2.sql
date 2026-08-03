@@ -16,13 +16,16 @@ BEGIN
     ) THEN
         RAISE EXCEPTION '113: intelligence reader attributes are unsafe';
     END IF;
+    -- The production server role is an intentional, NOINHERIT member: it
+    -- enters this reader with SET LOCAL ROLE for each scoped transaction.
+    -- CURRENT_USER owns migrations. No other member may acquire the reader.
     IF EXISTS (
         SELECT 1
           FROM pg_auth_members am
           JOIN pg_roles granted_role ON granted_role.oid=am.roleid
           JOIN pg_roles member_role ON member_role.oid=am.member
          WHERE granted_role.rolname='vane_intelligence_reader'
-           AND member_role.rolname<>CURRENT_USER
+           AND member_role.rolname NOT IN (CURRENT_USER,'vane_server_runtime')
     ) OR EXISTS (
         SELECT 1
           FROM pg_auth_members am
@@ -30,6 +33,19 @@ BEGIN
          WHERE member_role.rolname='vane_intelligence_reader'
     ) THEN
         RAISE EXCEPTION '113: intelligence reader role graph is unsafe';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_auth_members am
+          JOIN pg_roles granted_role ON granted_role.oid=am.roleid
+          JOIN pg_roles runtime_role ON runtime_role.oid=am.member
+         WHERE granted_role.rolname='vane_intelligence_reader'
+           AND runtime_role.rolname='vane_server_runtime'
+           AND (runtime_role.rolsuper OR runtime_role.rolbypassrls
+                OR runtime_role.rolinherit OR runtime_role.rolcreaterole
+                OR runtime_role.rolcreatedb)
+    ) THEN
+        RAISE EXCEPTION '113: server runtime reader member is unsafe';
     END IF;
 END $$;
 -- +goose StatementEnd
