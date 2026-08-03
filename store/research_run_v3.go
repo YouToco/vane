@@ -1389,6 +1389,15 @@ func authorizeResearchRunEffectV3(
 	if runSnapshotID <= 0 {
 		return researchRunValidationError("research run effect snapshot is invalid")
 	}
+	var capabilityAvailable bool
+	if err := tx.QueryRow(ctx, `SELECT to_regprocedure(
+		'public.authorize_research_run_effect_cap_v1(bigint)') IS NOT NULL`,
+	).Scan(&capabilityAvailable); err != nil {
+		return researchRunDatabaseError("inspect research run effect capability", err)
+	}
+	if !capabilityAvailable {
+		return authorizeLegacyResearchRunEffectV3(ctx, tx, identity)
+	}
 	var authorized int
 	if err := tx.QueryRow(ctx,
 		`SELECT 1 WHERE public.authorize_research_run_effect_cap_v1($1)`,
@@ -1400,6 +1409,36 @@ func authorizeResearchRunEffectV3(
 				"research run 当前不允许外部调用", types.ErrValidation)
 		}
 		return researchRunDatabaseError("authorize research run effect", err)
+	}
+	return nil
+}
+
+// authorizeLegacyResearchRunEffectV3 preserves replay for databases that are
+// intentionally held before migration 108. It is the exact formal-only fence
+// that preceded the capability function; shadow admission never falls back.
+func authorizeLegacyResearchRunEffectV3(
+	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
+) error {
+	var authorized int
+	if err := tx.QueryRow(ctx,
+		`SELECT 1 FROM schedules schedule
+		 JOIN tenants tenant ON tenant.id=schedule.tenant_id AND tenant.status='active'
+		 JOIN memberships membership
+		   ON membership.tenant_id=schedule.tenant_id AND membership.user_id=schedule.user_id
+		WHERE schedule.id=$1 AND schedule.tenant_id=$2 AND schedule.user_id=$3
+		  AND (schedule.status='active' OR (
+		      schedule.status='paused' AND public.authorize_research_manual_task_run_cap_v1(
+		          schedule.tenant_id,schedule.user_id,schedule.id,$4
+		      )
+		  )) AND schedule.execution_mode='discover_at_run'
+		FOR SHARE OF schedule,tenant,membership`,
+		identity.TaskID, identity.TenantID, identity.UserID,
+		identity.TemporalWorkflowID).Scan(&authorized); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return types.NewAppError(types.CodeValidation,
+				"research run 当前不允许外部调用", types.ErrValidation)
+		}
+		return researchRunDatabaseError("authorize legacy research run effect", err)
 	}
 	return nil
 }
