@@ -404,7 +404,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		canDirectBindLLMCall, canReadCapabilityRegistry, canCreateSnapshot,
 		canDrainToolQuota, canVerifyRunCapability bool
 	var canAdmitToolStep, canDirectInsertToolReservation,
-		canUseToolReservationSequence bool
+		canUseToolReservationSequence, canAuthorizeResearchEffect bool
 	if err := tx.QueryRow(ctx,
 		`SELECT
 		    has_table_privilege(current_user,'tenants','DELETE'),
@@ -460,6 +460,9 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		    has_function_privilege(current_user,
 		      'admit_research_run_tool_step_cap_v1(bigint,bigint,integer)',
 		      'EXECUTE'),
+		    has_function_privilege(current_user,
+		      'authorize_research_run_effect_cap_v1(bigint)',
+		      'EXECUTE'),
 		    has_any_column_privilege(current_user,
 		      'research_run_step_spend_reservations','INSERT'),
 		    has_sequence_privilege(current_user,
@@ -472,6 +475,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		&canDirectInsertLLMReservation, &canDirectInsertLLMSettlement,
 		&canDirectBindLLMCall, &canReadCapabilityRegistry, &canCreateSnapshot,
 		&canDrainToolQuota, &canVerifyRunCapability, &canAdmitToolStep,
+		&canAuthorizeResearchEffect,
 		&canDirectInsertToolReservation, &canUseToolReservationSequence); err != nil {
 		return fmt.Errorf("inspect research capability privileges: %w", err)
 	}
@@ -481,6 +485,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		canDirectInsertLLMReservation || canDirectInsertLLMSettlement ||
 		canDirectBindLLMCall || canReadCapabilityRegistry || canCreateSnapshot ||
 		canDrainToolQuota || !canVerifyRunCapability || !canAdmitToolStep ||
+		!canAuthorizeResearchEffect ||
 		canDirectInsertToolReservation || canUseToolReservationSequence {
 		return fmt.Errorf("research capability %q retains destructive privileges", activeRole)
 	}
@@ -493,6 +498,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		"read_research_history_cap_v3(bigint,bigint,text,bigint,bigint)":                                         true,
 		"read_research_history_content_cap_v3(bigint,bigint,text,bigint,text,text,integer,integer)":              true,
 		"admit_research_run_tool_step_cap_v1(bigint,bigint,integer)":                                             true,
+		"authorize_research_run_effect_cap_v1(bigint)":                                                           true,
 		"freeze_research_llm_gateway_request_v2(bigint,text,text,text)":                                          true,
 		"load_research_run_bound_llm_call_v1(bigint,bigint)":                                                     true,
 	}

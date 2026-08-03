@@ -1383,7 +1383,42 @@ func loadAndValidateResearchRunPlanV3(
 	return plan, row, nil
 }
 
-func authorizeResearchRunEffectV3(ctx context.Context, tx pgx.Tx, identity types.RunIdentity) error {
+func authorizeResearchRunEffectV3(
+	ctx context.Context, tx pgx.Tx, identity types.RunIdentity, runSnapshotID int64,
+) error {
+	if runSnapshotID <= 0 {
+		return researchRunValidationError("research run effect snapshot is invalid")
+	}
+	var capabilityAvailable bool
+	if err := tx.QueryRow(ctx, `SELECT to_regprocedure(
+		'public.authorize_research_run_effect_cap_v1(bigint)') IS NOT NULL`,
+	).Scan(&capabilityAvailable); err != nil {
+		return researchRunDatabaseError("inspect research run effect capability", err)
+	}
+	if !capabilityAvailable {
+		return authorizeLegacyResearchRunEffectV3(ctx, tx, identity)
+	}
+	var authorized int
+	if err := tx.QueryRow(ctx,
+		`SELECT 1 WHERE public.authorize_research_run_effect_cap_v1($1)`,
+		runSnapshotID).Scan(&authorized); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.Is(err, pgx.ErrNoRows) ||
+			(errors.As(err, &pgErr) && pgErr.Code == "42501") {
+			return types.NewAppError(types.CodeValidation,
+				"research run 当前不允许外部调用", types.ErrValidation)
+		}
+		return researchRunDatabaseError("authorize research run effect", err)
+	}
+	return nil
+}
+
+// authorizeLegacyResearchRunEffectV3 preserves replay for databases that are
+// intentionally held before migration 108. It is the exact formal-only fence
+// that preceded the capability function; shadow admission never falls back.
+func authorizeLegacyResearchRunEffectV3(
+	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
+) error {
 	var authorized int
 	if err := tx.QueryRow(ctx,
 		`SELECT 1 FROM schedules schedule
@@ -1403,7 +1438,7 @@ func authorizeResearchRunEffectV3(ctx context.Context, tx pgx.Tx, identity types
 			return types.NewAppError(types.CodeValidation,
 				"research run 当前不允许外部调用", types.ErrValidation)
 		}
-		return researchRunDatabaseError("authorize research run effect", err)
+		return researchRunDatabaseError("authorize legacy research run effect", err)
 	}
 	return nil
 }

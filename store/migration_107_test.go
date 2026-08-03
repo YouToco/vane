@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
 
 	"github.com/YouToco/vane/taskstate"
@@ -61,6 +63,53 @@ func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *tes
 	if err != nil || !prepared.FirstWriter ||
 		prepared.Synthesis.Status != ResearchBriefSynthesisPreparedV3 {
 		t.Fatalf("legacy prepared=%+v err=%v", prepared, err)
+	}
+	pre108ShadowIdentity := preparedFixture.identity
+	pre108ShadowIdentity.TemporalWorkflowID =
+		"research-v3-shadow-" + strings.Repeat("a", 64)
+	pre108ShadowIdentity.TemporalRunID = "pre-108-shadow-run"
+	pre108ShadowRef, err := st.CreateOrGetResearchRunSnapshotV3(
+		t.Context(), pre108ShadowIdentity, testCompiledRunPolicyV1(t),
+		testResearchToolPolicyStoreV3(t), testResearchModelPolicyStoreV3(t))
+	if err != nil || pre108ShadowRef.SnapshotID <= 0 {
+		t.Fatalf("pre-108 shadow snapshot=%+v err=%v", pre108ShadowRef, err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE schedules SET execution_mode='compiled',
+		 approved_definition_version=NULL,approved_definition_digest=NULL
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		preparedFixture.taskID, preparedFixture.tenantID,
+		preparedFixture.userID); err != nil {
+		t.Fatal(err)
+	}
+	pre108Tx, _, err := st.beginScopedResearchRunTransactionV3(
+		t.Context(), pgx.TxOptions{}, pre108ShadowIdentity,
+		pre108ShadowRef.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockPushEffectSchemaWriter(t.Context(), pre108Tx); err != nil {
+		_ = pre108Tx.Rollback(t.Context())
+		t.Fatal(err)
+	}
+	pre108AuthErr := authorizeResearchRunEffectV3(t.Context(), pre108Tx,
+		pre108ShadowIdentity, pre108ShadowRef.SnapshotID)
+	if err := pre108Tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(pre108AuthErr, types.ErrValidation) {
+		t.Fatalf("pre-108 compatibility fallback admitted compiled shadow: %v",
+			pre108AuthErr)
+	}
+	assertResearchBriefSynthesisStatusV3(t, preparedFixture,
+		prepared.Synthesis.ID, ResearchBriefSynthesisPreparedV3)
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE schedules SET execution_mode='discover_at_run',
+		 approved_definition_version=1,approved_definition_digest=$2
+		 WHERE id=$1 AND tenant_id=$3 AND user_id=$4`,
+		preparedFixture.taskID, preparedFixture.snapshotRef.DefinitionDigest,
+		preparedFixture.tenantID, preparedFixture.userID); err != nil {
+		t.Fatal(err)
 	}
 
 	spendingFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
