@@ -9,9 +9,10 @@ func readyResearchV3ShadowConfig() Config {
 	return Config{
 		DB: DBConfig{
 			URL: "postgres://owner", ResearchRuntimeURL: "postgres://runtime",
-			ResearchControlURL:       "postgres://control",
-			ResearchCapabilityKeyID:  "active-v3",
-			ResearchCapabilityKeyHex: strings.Repeat("42", 32),
+			NativeV3EditRecoveryRuntimeURL: "postgres://edit-recovery",
+			ResearchControlURL:             "postgres://control",
+			ResearchCapabilityKeyID:        "active-v3",
+			ResearchCapabilityKeyHex:       strings.Repeat("42", 32),
 		},
 		LLM: LLMConfig{
 			CompiledEndpointGeneration: 1, CompiledCredentialGeneration: 1,
@@ -187,6 +188,7 @@ func TestEnvOnlyResearchV3ShadowCanary(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("VANE_DB_URL", "postgres://owner")
 	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://runtime")
+	t.Setenv("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL", "postgres://edit-recovery")
 	t.Setenv("VANE_DB_RESEARCH_CONTROL_URL", "postgres://control")
 	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "active-v3")
 	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
@@ -210,6 +212,7 @@ func TestEnvOnlyResearchV3AuthorityRequiresSameShadow(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("VANE_DB_URL", "postgres://owner")
 	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://runtime")
+	t.Setenv("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL", "postgres://edit-recovery")
 	t.Setenv("VANE_DB_RESEARCH_CONTROL_URL", "postgres://control")
 	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "active-v3")
 	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))

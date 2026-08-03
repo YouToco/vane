@@ -25,7 +25,7 @@ import (
 )
 
 const taskDefinitionEditOperationColumns = `
-	id, tenant_id, user_id, target_tenant_id, target_user_id, task_id,
+	id, operation_protocol, tenant_id, user_id, target_tenant_id, target_user_id, task_id,
 	session_id, operation_ref, status, phase, expires_at, execution_started_at,
 	original_status, base_definition_version, base_definition_digest,
 	base_definition, target_definition_version, target_definition_digest,
@@ -61,7 +61,7 @@ func scanTaskDefinitionEditOperation(
 	op *types.TaskDefinitionEditOperation,
 ) error {
 	return row.Scan(
-		&op.ID, &op.TenantID, &op.UserID, &op.TargetTenantID,
+		&op.ID, &op.Protocol, &op.TenantID, &op.UserID, &op.TargetTenantID,
 		&op.TargetUserID, &op.TaskID, &op.SessionID, &op.OperationRef,
 		&op.Status, &op.Phase, &op.ExpiresAt, &op.ExecutionStartedAt,
 		&op.OriginalStatus, &op.BaseDefinitionVersion,
@@ -285,14 +285,29 @@ func loadTaskDefinitionEditOperationForUpdate(
 	tx pgx.Tx,
 	scope types.TaskDefinitionEditScope,
 ) (*types.TaskDefinitionEditOperation, error) {
+	return loadTaskDefinitionEditOperationForUpdateProtocol(
+		ctx, tx, scope, types.TaskDefinitionEditProtocolLegacyV1V2)
+}
+
+func loadTaskDefinitionEditOperationForUpdateProtocol(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope types.TaskDefinitionEditScope,
+	protocol types.TaskDefinitionEditProtocol,
+) (*types.TaskDefinitionEditOperation, error) {
+	if protocol != types.TaskDefinitionEditProtocolLegacyV1V2 &&
+		protocol != types.TaskDefinitionEditProtocolResearchV3 {
+		return nil, taskDefinitionEditIntegrity()
+	}
 	var op types.TaskDefinitionEditOperation
 	err := scanTaskDefinitionEditOperation(tx.QueryRow(ctx,
 		`SELECT `+taskDefinitionEditOperationColumns+`
 		   FROM task_definition_edit_operations
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		    AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
+		    AND operation_protocol=$7
 		  FOR UPDATE`, scope.ID, scope.TenantID, scope.UserID,
-		scope.TargetTenantID, scope.TargetUserID, scope.TaskID,
+		scope.TargetTenantID, scope.TargetUserID, scope.TaskID, protocol,
 	), &op)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, taskDefinitionEditNotFound()
@@ -308,15 +323,25 @@ func loadLeasedTaskDefinitionEditOperation(
 	tx pgx.Tx,
 	lease types.TaskDefinitionEditLease,
 ) (*types.TaskDefinitionEditOperation, time.Time, error) {
+	return loadLeasedTaskDefinitionEditOperationProtocol(
+		ctx, tx, lease, types.TaskDefinitionEditProtocolLegacyV1V2)
+}
+
+func loadLeasedTaskDefinitionEditOperationProtocol(
+	ctx context.Context,
+	tx pgx.Tx,
+	lease types.TaskDefinitionEditLease,
+	protocol types.TaskDefinitionEditProtocol,
+) (*types.TaskDefinitionEditOperation, time.Time, error) {
 	if err := validateTaskDefinitionEditLease(lease); err != nil {
 		return nil, time.Time{}, err
 	}
-	op, err := loadTaskDefinitionEditOperationForUpdate(ctx, tx,
+	op, err := loadTaskDefinitionEditOperationForUpdateProtocol(ctx, tx,
 		types.TaskDefinitionEditScope{
 			ID: lease.ID, TenantID: lease.TenantID, UserID: lease.UserID,
 			TargetTenantID: lease.TargetTenantID,
 			TargetUserID:   lease.TargetUserID, TaskID: lease.TaskID,
-		})
+		}, protocol)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -697,9 +722,11 @@ func (s *Store) LoadTaskDefinitionEditOperation(
 		`SELECT `+taskDefinitionEditOperationColumns+`
 		   FROM task_definition_edit_operations
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-		    AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6`,
+		    AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
+		    AND operation_protocol=$7`,
 		scope.ID, scope.TenantID, scope.UserID, scope.TargetTenantID,
 		scope.TargetUserID, scope.TaskID,
+		types.TaskDefinitionEditProtocolLegacyV1V2,
 	), &op)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, taskDefinitionEditNotFound()
@@ -886,14 +913,93 @@ func assessTaskDefinitionEditSchedule(
 	return taskDefinitionEditScheduleExact
 }
 
+func validateResearchTaskDefinitionEditActiveOwnerV3(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID int64,
+) error {
+	var ownerValid bool
+	err := tx.QueryRow(ctx,
+		`SELECT true
+		   FROM tenants tenant
+		   JOIN memberships membership ON membership.tenant_id=tenant.id
+		  WHERE tenant.id=$1 AND membership.user_id=$2
+		    AND membership.role='owner' AND tenant.status='active'
+		    AND tenant.deleted_at IS NULL
+		  FOR SHARE OF tenant,membership`, tenantID, userID).Scan(&ownerValid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return taskDefinitionEditValidation("native V3 edit owner scope is inactive")
+	}
+	if err != nil {
+		return taskDefinitionEditDatabaseError("validate native V3 edit owner", err)
+	}
+	return nil
+}
+
+func assessTaskDefinitionEditScheduleProtocol(
+	op *types.TaskDefinitionEditOperation,
+	schedule *taskDefinitionEditScheduleRow,
+	protocol types.TaskDefinitionEditProtocol,
+) taskDefinitionEditScheduleAssessment {
+	if protocol == types.TaskDefinitionEditProtocolLegacyV1V2 {
+		return assessTaskDefinitionEditSchedule(op, schedule)
+	}
+	if protocol != types.TaskDefinitionEditProtocolResearchV3 || op == nil ||
+		op.Protocol != protocol || schedule == nil || schedule.Version == nil ||
+		schedule.Digest == nil || schedule.Mode != types.ExecutionModeDiscoverAtRun {
+		return taskDefinitionEditScheduleUnsafe
+	}
+	if *schedule.Version > op.TargetDefinitionVersion {
+		return taskDefinitionEditScheduleSuperseded
+	}
+	expectedVersion := op.BaseDefinitionVersion
+	expectedDigest := op.BaseDefinitionDigest
+	markerRequired := op.Phase != types.TaskDefinitionEditPhaseProposalSealed
+	if op.Phase == types.TaskDefinitionEditPhaseDefinitionCommitted ||
+		op.Phase == types.TaskDefinitionEditPhaseTemporalTargetApplied ||
+		op.Phase == types.TaskDefinitionEditPhaseTemporalTargetRestored {
+		expectedVersion = op.TargetDefinitionVersion
+		expectedDigest = op.TargetDefinitionDigest
+	}
+	if *schedule.Version != expectedVersion ||
+		subtle.ConstantTimeCompare([]byte(*schedule.Digest), []byte(expectedDigest)) != 1 {
+		return taskDefinitionEditScheduleUnsafe
+	}
+	if !markerRequired {
+		if schedule.OperationID != nil || schedule.Fence != nil ||
+			schedule.Status != op.OriginalStatus {
+			return taskDefinitionEditScheduleUnsafe
+		}
+		return taskDefinitionEditScheduleExact
+	}
+	if schedule.Status != types.ScheduleStatusPaused || schedule.OperationID == nil ||
+		*schedule.OperationID != op.ID || schedule.Fence == nil ||
+		*schedule.Fence != op.Fence {
+		return taskDefinitionEditScheduleUnsafe
+	}
+	return taskDefinitionEditScheduleExact
+}
+
 // AcquireTaskDefinitionEditOperation starts a prepared operation or takes over
 // an expired execution. Quiescing PostgreSQL is intentionally a separate CAS.
 func (s *Store) AcquireTaskDefinitionEditOperation(
 	ctx context.Context,
 	p types.AcquireTaskDefinitionEditOperationParams,
 ) (*types.TaskDefinitionEditOperation, error) {
+	return s.acquireTaskDefinitionEditOperationProtocol(
+		ctx, p, types.TaskDefinitionEditProtocolLegacyV1V2)
+}
+
+func (s *Store) acquireTaskDefinitionEditOperationProtocol(
+	ctx context.Context,
+	p types.AcquireTaskDefinitionEditOperationParams,
+	protocol types.TaskDefinitionEditProtocol,
+) (*types.TaskDefinitionEditOperation, error) {
 	if err := validateTaskDefinitionEditAcquire(p); err != nil {
 		return nil, err
+	}
+	if protocol != types.TaskDefinitionEditProtocolLegacyV1V2 {
+		return nil, taskDefinitionEditIntegrity()
 	}
 	tx, err := s.beginTaskDefinitionEditTx(ctx, p.Scope.TenantID)
 	if err != nil {
@@ -906,7 +1012,8 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 	if err != nil {
 		return nil, err
 	}
-	op, err := loadTaskDefinitionEditOperationForUpdate(ctx, tx, p.Scope)
+	op, err := loadTaskDefinitionEditOperationForUpdateProtocol(
+		ctx, tx, p.Scope, protocol)
 	if err != nil {
 		return nil, err
 	}
@@ -920,10 +1027,10 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 
 	switch op.Status {
 	case types.TaskDefinitionEditOperationStatusPending:
-		if err := validateTaskDefinitionEditActiveActor(
-			ctx, tx, op.TenantID, op.UserID,
-		); err != nil {
-			return nil, err
+		actorErr := validateTaskDefinitionEditActiveActor(
+			ctx, tx, op.TenantID, op.UserID)
+		if actorErr != nil {
+			return nil, actorErr
 		}
 		if !pendingTaskDefinitionEditPristine(op) {
 			return nil, taskDefinitionEditConflict("pending operation has durable saga state")
@@ -935,7 +1042,7 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 		if !databaseNow.Before(op.ExpiresAt) {
 			return s.expireTaskDefinitionEditDuringAcquire(ctx, tx, op, p)
 		}
-		assessment := assessTaskDefinitionEditSchedule(op, schedule)
+		assessment := assessTaskDefinitionEditScheduleProtocol(op, schedule, protocol)
 		if assessment != taskDefinitionEditScheduleExact {
 			return s.startAndTerminateTaskDefinitionEditDuringAcquire(
 				ctx, tx, op, p, assessment)
@@ -952,7 +1059,7 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 		}
 		if databaseNow.Before(*op.LeaseUntil) {
 			if op.LeaseOwner == p.LeaseOwner {
-				assessment := assessTaskDefinitionEditSchedule(op, schedule)
+				assessment := assessTaskDefinitionEditScheduleProtocol(op, schedule, protocol)
 				if assessment != taskDefinitionEditScheduleExact {
 					return s.terminateAcquiredTaskDefinitionEditAssessment(
 						ctx, tx, op, assessment)
@@ -964,7 +1071,7 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 		if databaseNow.Before(*op.TakeoverNotBefore) {
 			return cloneTaskDefinitionEditOperation(op), taskDefinitionEditBusy()
 		}
-		assessment := assessTaskDefinitionEditSchedule(op, schedule)
+		assessment := assessTaskDefinitionEditScheduleProtocol(op, schedule, protocol)
 		if assessment != taskDefinitionEditScheduleExact {
 			return s.terminateAcquiredTaskDefinitionEditAssessment(
 				ctx, tx, op, assessment)
@@ -1281,13 +1388,15 @@ func (s *Store) ListStaleTaskDefinitionEditTenantIDs(
 		`SELECT DISTINCT tenant_id
 		   FROM task_definition_edit_operations
 		  WHERE status=$1 AND tombstoned_at IS NULL AND tenant_id>$3
+		    AND operation_protocol=$5
 		    AND lease_owner<>'' AND fence>0 AND attempt>0
 		    AND lease_until IS NOT NULL AND takeover_not_before IS NOT NULL
 		    AND lease_until <= clock_timestamp()
 		    AND takeover_not_before <= LEAST($2, clock_timestamp())
 		  ORDER BY tenant_id
 		  LIMIT $4`, types.TaskDefinitionEditOperationStatusExecuting,
-		before, afterTenantID, limit)
+		before, afterTenantID, limit,
+		types.TaskDefinitionEditProtocolLegacyV1V2)
 	if err != nil {
 		return nil, taskDefinitionEditDatabaseError("list stale tenant shards", err)
 	}
@@ -1331,13 +1440,14 @@ func (s *Store) ListStaleTaskDefinitionEditOperations(
 		`SELECT `+taskDefinitionEditOperationColumns+`
 		   FROM task_definition_edit_operations
 		  WHERE tenant_id=$1 AND status=$2 AND tombstoned_at IS NULL
+		    AND operation_protocol=$5
 		    AND lease_owner<>'' AND fence>0 AND attempt>0
 		    AND lease_until IS NOT NULL AND takeover_not_before IS NOT NULL
 		    AND lease_until <= clock_timestamp()
 		    AND takeover_not_before <= LEAST($3, clock_timestamp())
 		  ORDER BY takeover_not_before, id
 		  LIMIT $4`, tenantID, types.TaskDefinitionEditOperationStatusExecuting,
-		before, limit)
+		before, limit, types.TaskDefinitionEditProtocolLegacyV1V2)
 	if err != nil {
 		return nil, taskDefinitionEditDatabaseError("list stale operations", err)
 	}

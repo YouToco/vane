@@ -19,10 +19,12 @@ import (
 type Store struct {
 	pool                         *pgxpool.Pool
 	researchPool                 *pgxpool.Pool
+	editRecoveryPool             *pgxpool.Pool
 	gatewayPool                  *pgxpool.Pool
 	readinessProbe               func(context.Context) error
 	beginTx                      func(context.Context, pgx.TxOptions) (pgx.Tx, error)
 	beginResearchTx              func(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	beginEditRecoveryTx          func(context.Context, pgx.TxOptions) (pgx.Tx, error)
 	beginGatewayTx               func(context.Context, pgx.TxOptions) (pgx.Tx, error)
 	researchCapabilityActiveKey  string
 	researchCapabilityKeys       map[string][32]byte
@@ -32,6 +34,7 @@ type Store struct {
 }
 
 var errResearchRuntimeUnavailable = errors.New("store: V3 research runtime database is not configured")
+var errNativeV3EditRecoveryRuntimeUnavailable = errors.New("store: native V3 edit recovery runtime database is not configured")
 var errResearchGatewayUnavailable = errors.New("store: V3 research LLM gateway database is not configured")
 
 const (
@@ -201,6 +204,9 @@ func newStore(pool, researchPool *pgxpool.Pool) *Store {
 		intelligenceCursorState: &intelligenceCursorState{},
 		beginResearchTx: func(context.Context, pgx.TxOptions) (pgx.Tx, error) {
 			return nil, errResearchRuntimeUnavailable
+		},
+		beginEditRecoveryTx: func(context.Context, pgx.TxOptions) (pgx.Tx, error) {
+			return nil, errNativeV3EditRecoveryRuntimeUnavailable
 		},
 		beginGatewayTx: func(context.Context, pgx.TxOptions) (pgx.Tx, error) {
 			return nil, errResearchGatewayUnavailable
@@ -671,6 +677,9 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // Close 关闭连接池，等待已借出的连接归还后释放。
 func (s *Store) Close() {
+	if s.editRecoveryPool != nil {
+		s.editRecoveryPool.Close()
+	}
 	if s.researchPool != nil {
 		s.researchPool.Close()
 	}

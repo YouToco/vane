@@ -11,6 +11,8 @@ import (
 )
 
 const serverRuntimeLoginRole = "vane_server_runtime"
+const nativeV3EditRecoveryRuntimeLoginRole = "vane_native_v3_edit_recovery_runtime"
+const nativeV3EditRecoveryCapabilityRole = "vane_native_v3_edit_recovery"
 
 // serverRuntimeCapabilityRoles is intentionally an exact, closed set. Keep it
 // synchronized with migration 098 and with literal production Store SET LOCAL
@@ -92,6 +94,67 @@ func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
 		ctx, dbURL, "deprovision_vane_server_runtime_v1")
 }
 
+// ProvisionNativeV3EditRecoveryRuntime creates only the independent recovery
+// login shell and binds its one opaque claim capability. Credential/login
+// activation remains an operator/systemd responsibility.
+func ProvisionNativeV3EditRecoveryRuntime(ctx context.Context, dbURL string) error {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return fmt.Errorf("store: connect native V3 edit recovery provisioner: %w", err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	_, err = conn.Exec(ctx, `DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='vane_native_v3_edit_recovery_runtime') THEN
+			CREATE ROLE vane_native_v3_edit_recovery_runtime NOLOGIN NOSUPERUSER
+				NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+		END IF;
+		ALTER ROLE vane_native_v3_edit_recovery_runtime NOSUPERUSER NOCREATEDB
+			NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+		IF EXISTS (SELECT 1 FROM pg_auth_members edge
+			JOIN pg_roles granted ON granted.oid=edge.roleid
+			JOIN pg_roles member ON member.oid=edge.member
+			WHERE member.rolname='vane_native_v3_edit_recovery_runtime'
+			  AND granted.rolname<>'vane_native_v3_edit_recovery') THEN
+			RAISE EXCEPTION 'unsafe native V3 edit recovery runtime membership';
+		END IF;
+		IF EXISTS (SELECT 1 FROM pg_auth_members edge
+			JOIN pg_roles granted ON granted.oid=edge.roleid
+			JOIN pg_roles member ON member.oid=edge.member
+			WHERE granted.rolname='vane_native_v3_edit_recovery'
+			  AND member.rolname<>'vane_native_v3_edit_recovery_runtime') THEN
+			RAISE EXCEPTION 'unsafe native V3 edit recovery capability member';
+		END IF;
+		REVOKE vane_native_v3_edit_recovery FROM vane_native_v3_edit_recovery_runtime;
+		GRANT vane_native_v3_edit_recovery TO vane_native_v3_edit_recovery_runtime
+			WITH ADMIN FALSE, SET TRUE, INHERIT FALSE;
+	END $$`)
+	if err != nil {
+		return fmt.Errorf("store: provision native V3 edit recovery runtime: %w", err)
+	}
+	return nil
+}
+
+func DeprovisionNativeV3EditRecoveryRuntime(ctx context.Context, dbURL string) error {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return fmt.Errorf("store: connect native V3 edit recovery deprovisioner: %w", err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	_, err = conn.Exec(ctx, `DO $$ BEGIN
+		IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='vane_native_v3_edit_recovery_runtime') THEN
+			IF (SELECT rolcanlogin FROM pg_roles WHERE rolname='vane_native_v3_edit_recovery_runtime') THEN
+				RAISE EXCEPTION 'native V3 edit recovery runtime must be NOLOGIN before deprovision';
+			END IF;
+			REVOKE vane_native_v3_edit_recovery FROM vane_native_v3_edit_recovery_runtime;
+			DROP ROLE vane_native_v3_edit_recovery_runtime;
+		END IF;
+	END $$`)
+	if err != nil {
+		return fmt.Errorf("store: deprovision native V3 edit recovery runtime: %w", err)
+	}
+	return nil
+}
+
 func callServerRuntimeProvisioner(
 	ctx context.Context, dbURL, functionName string,
 ) error {
@@ -165,6 +228,150 @@ func NewServerRuntimeWithResearchRuntimeCapability(
 		return nil, fmt.Errorf("store: V3 research capability: %w", err)
 	}
 	return store, nil
+}
+
+func NewServerRuntimeWithResearchRuntimeCapabilityAndEditRecovery(
+	ctx context.Context, runtimeURL, researchRuntimeURL, editRecoveryRuntimeURL string,
+	capability ResearchRunCapabilityConfigV1,
+) (*Store, error) {
+	store, err := NewServerRuntimeWithResearchRuntimeCapability(
+		ctx, runtimeURL, researchRuntimeURL, capability)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(editRecoveryRuntimeURL) == "" {
+		store.Close()
+		return nil, errNativeV3EditRecoveryRuntimeUnavailable
+	}
+	recoveryPool, err := newStorePool(
+		ctx, editRecoveryRuntimeURL, initializeNativeV3EditRecoveryRuntimeConnection)
+	if err != nil {
+		store.Close()
+		return nil, fmt.Errorf("store: native V3 edit recovery runtime: %w", err)
+	}
+	store.editRecoveryPool = recoveryPool
+	store.beginEditRecoveryTx = recoveryPool.BeginTx
+	return store, nil
+}
+
+func initializeNativeV3EditRecoveryRuntimeConnection(ctx context.Context, conn *pgx.Conn) error {
+	if conn == nil {
+		return errors.New("native V3 edit recovery runtime connection is nil")
+	}
+	var sessionUser, currentUser string
+	var login, super, bypass, createDB, createRole, inherit, replication bool
+	if err := conn.QueryRow(ctx, `SELECT session_user,current_user,role.rolcanlogin,
+		role.rolsuper,role.rolbypassrls,role.rolcreatedb,role.rolcreaterole,
+		role.rolinherit,role.rolreplication FROM pg_roles role
+		WHERE role.rolname=session_user`).Scan(&sessionUser, &currentUser, &login,
+		&super, &bypass, &createDB, &createRole, &inherit, &replication); err != nil {
+		return fmt.Errorf("read native V3 edit recovery identity: %w", err)
+	}
+	if sessionUser != nativeV3EditRecoveryRuntimeLoginRole ||
+		currentUser != nativeV3EditRecoveryRuntimeLoginRole || !login || super || bypass ||
+		createDB || createRole || inherit || replication {
+		return errors.New("native V3 edit recovery runtime identity is unsafe")
+	}
+	var memberships, exactSafeMemberships, otherCapabilityMembers int
+	if err := conn.QueryRow(ctx, `SELECT count(*),count(*) FILTER (
+		WHERE granted.rolname='vane_native_v3_edit_recovery'
+		  AND NOT edge.admin_option AND edge.set_option AND NOT edge.inherit_option),
+		(SELECT count(*) FROM pg_auth_members capability_edge
+		 JOIN pg_roles capability ON capability.oid=capability_edge.roleid
+		 JOIN pg_roles capability_member ON capability_member.oid=capability_edge.member
+		 WHERE capability.rolname='vane_native_v3_edit_recovery'
+		   AND capability_member.rolname<>session_user)
+		FROM pg_auth_members edge
+		JOIN pg_roles granted ON granted.oid=edge.roleid
+		JOIN pg_roles member ON member.oid=edge.member
+		WHERE member.rolname=session_user`).Scan(
+		&memberships, &exactSafeMemberships, &otherCapabilityMembers); err != nil {
+		return fmt.Errorf("verify native V3 edit recovery memberships: %w", err)
+	}
+	if memberships != 1 || exactSafeMemberships != 1 || otherCapabilityMembers != 0 {
+		return errors.New("native V3 edit recovery runtime membership set is unsafe")
+	}
+	var runtimeDirectACLs, capabilityMemberships int
+	if err := conn.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM (
+			SELECT 1 FROM pg_proc object
+			CROSS JOIN LATERAL aclexplode(COALESCE(object.proacl,
+				acldefault('f',object.proowner))) acl
+			JOIN pg_roles grantee ON grantee.oid=acl.grantee
+			WHERE grantee.rolname=session_user
+			UNION ALL
+			SELECT 1 FROM pg_class object
+			CROSS JOIN LATERAL aclexplode(COALESCE(object.relacl,
+				acldefault(CASE WHEN object.relkind='S' THEN 's'::"char" ELSE 'r'::"char" END,
+				object.relowner))) acl
+			JOIN pg_roles grantee ON grantee.oid=acl.grantee
+			WHERE grantee.rolname=session_user
+			UNION ALL
+			SELECT 1 FROM pg_attribute object
+			CROSS JOIN LATERAL aclexplode(object.attacl) acl
+			JOIN pg_roles grantee ON grantee.oid=acl.grantee
+			WHERE grantee.rolname=session_user
+			UNION ALL
+			SELECT 1 FROM pg_namespace object
+			CROSS JOIN LATERAL aclexplode(COALESCE(object.nspacl,
+				acldefault('n',object.nspowner))) acl
+			JOIN pg_roles grantee ON grantee.oid=acl.grantee
+			WHERE grantee.rolname=session_user) direct_acl),
+		(SELECT count(*) FROM pg_auth_members edge
+		 JOIN pg_roles member ON member.oid=edge.member
+		 WHERE member.rolname='vane_native_v3_edit_recovery')`).Scan(
+		&runtimeDirectACLs, &capabilityMemberships); err != nil {
+		return fmt.Errorf("verify native V3 edit recovery direct authority: %w", err)
+	}
+	if runtimeDirectACLs != 0 || capabilityMemberships != 0 {
+		return errors.New("native V3 edit recovery direct authority is unsafe")
+	}
+	if _, err := conn.Exec(ctx, `SET ROLE vane_native_v3_edit_recovery`); err != nil {
+		return fmt.Errorf("enter native V3 edit recovery capability: %w", err)
+	}
+	var member, claim, directOperationRead, directScheduleWrite bool
+	var capabilityLogin, capabilitySuper, capabilityBypass, capabilityCreateDB,
+		capabilityCreateRole, capabilityInherit, capabilityReplication bool
+	var directFunctions, directSchemas, directRelations int
+	if err := conn.QueryRow(ctx, `SELECT
+		pg_has_role(session_user,'vane_native_v3_edit_recovery','MEMBER'),
+		has_function_privilege(current_user,
+		 'claim_stale_native_research_v3_edit_v1(timestamptz,text,bigint)','EXECUTE'),
+		has_table_privilege(current_user,'task_definition_edit_operations','SELECT'),
+		has_table_privilege(current_user,'schedules','UPDATE'),
+		role.rolcanlogin,role.rolsuper,role.rolbypassrls,role.rolcreatedb,
+		role.rolcreaterole,role.rolinherit,role.rolreplication,
+		(SELECT count(*) FROM pg_proc object
+		 CROSS JOIN LATERAL aclexplode(COALESCE(object.proacl,
+			acldefault('f',object.proowner))) acl
+		 WHERE acl.grantee=role.oid AND acl.privilege_type='EXECUTE'),
+		(SELECT count(*) FROM pg_namespace object
+		 CROSS JOIN LATERAL aclexplode(COALESCE(object.nspacl,
+			acldefault('n',object.nspowner))) acl
+		 WHERE acl.grantee=role.oid AND acl.privilege_type='USAGE'),
+		(SELECT count(*) FROM (
+			SELECT acl.grantee FROM pg_class object
+			CROSS JOIN LATERAL aclexplode(COALESCE(object.relacl,
+				acldefault(CASE WHEN object.relkind='S' THEN 's'::"char" ELSE 'r'::"char" END,
+				object.relowner))) acl
+			UNION ALL
+			SELECT acl.grantee FROM pg_attribute object
+			CROSS JOIN LATERAL aclexplode(object.attacl) acl) grants
+		 WHERE grants.grantee=role.oid)
+		FROM pg_roles role WHERE role.rolname=current_user`).Scan(
+		&member, &claim, &directOperationRead, &directScheduleWrite,
+		&capabilityLogin, &capabilitySuper, &capabilityBypass, &capabilityCreateDB,
+		&capabilityCreateRole, &capabilityInherit, &capabilityReplication,
+		&directFunctions, &directSchemas, &directRelations); err != nil {
+		return fmt.Errorf("verify native V3 edit recovery authority: %w", err)
+	}
+	if !member || !claim || directOperationRead || directScheduleWrite ||
+		capabilityLogin || capabilitySuper || capabilityBypass || capabilityCreateDB ||
+		capabilityCreateRole || capabilityInherit || capabilityReplication ||
+		directFunctions != 1 || directSchemas != 1 || directRelations != 0 {
+		return errors.New("native V3 edit recovery authority is unsafe")
+	}
+	return nil
 }
 
 func initializeServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error {

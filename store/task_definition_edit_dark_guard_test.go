@@ -25,6 +25,7 @@ func TestTaskDefinitionEditStoreAPIsHaveOneCoordinator(t *testing.T) {
 	repoRoot := filepath.Clean(filepath.Dir(storeDir))
 	providerFunctions := taskDefinitionEditStoreProviderFunctionSymbols(storeDir)
 	coordinatorPath := filepath.Join(repoRoot, "task", "definition_edit_coordinator.go")
+	v3CoordinatorPath := filepath.Join(repoRoot, "task", "definition_edit_v3_coordinator.go")
 	dispatcherPath := filepath.Join(
 		repoRoot, "task", "definition_edit_receipt_dispatcher.go",
 	)
@@ -71,6 +72,15 @@ func TestTaskDefinitionEditStoreAPIsHaveOneCoordinator(t *testing.T) {
 			allowed, allowErr = taskDefinitionEditCoordinatorStoreCalls(file)
 			if allowErr != nil {
 				t.Fatalf("validate exact coordinator Store calls: %v", allowErr)
+			}
+		}
+		if cleanPath == v3CoordinatorPath {
+			v3Allowed, allowErr := taskDefinitionEditV3CoordinatorStoreCalls(file)
+			if allowErr != nil {
+				t.Fatalf("validate exact native V3 coordinator Store calls: %v", allowErr)
+			}
+			for position := range v3Allowed {
+				allowed[position] = struct{}{}
 			}
 		}
 		if cleanPath == dispatcherPath {
@@ -483,6 +493,7 @@ func TestTaskDefinitionEditStoreGuardCoversEveryExportedMethod(t *testing.T) {
 	providerFiles := make(map[string]*ast.File, 3)
 	for _, name := range []string{
 		"task_definition_edit_operations.go",
+		"task_definition_edit_v3.go",
 		"task_definition_edit_preflight.go",
 		"task_definition_edit_receipts.go",
 		"task_definition_edit_tx.go",
@@ -598,6 +609,64 @@ func taskDefinitionEditCoordinatorStoreCalls(file *ast.File) (map[token.Pos]stru
 		if got[key] != expected {
 			return nil, fmt.Errorf("coordinator %s must directly call c.store.%s exactly %d time(s), got %d",
 				key.function, key.method, expected, got[key])
+		}
+	}
+	return allowed, nil
+}
+
+func taskDefinitionEditV3CoordinatorStoreCalls(file *ast.File) (map[token.Pos]struct{}, error) {
+	expectations := []taskDefinitionEditStoreCallExpectation{
+		{"LoadResearchTaskDefinitionEditBasisV3", "Prepare", 1},
+		{"CreateResearchTaskDefinitionEditOperationV3", "Prepare", 1},
+		{"LoadResearchTaskDefinitionEditOperationV3", "Prepare", 1},
+		{"LoadResearchTaskDefinitionEditOperationV3", "Execute", 1},
+		{"AcquireResearchTaskDefinitionEditOperationV3", "acquire", 2},
+		{"LoadResearchTaskDefinitionEditOperationV3", "acquire", 1},
+		{"QuiesceResearchTaskDefinitionEditV3", "advance", 1},
+		{"CommitResearchTaskDefinitionEditDefinitionV3", "advance", 1},
+		{"CompleteResearchTaskDefinitionEditOperationV3", "advance", 1},
+		{"AuthorizeResearchTaskDefinitionEditRemotePhaseV3", "runRemote", 1},
+		{"CheckpointResearchTaskDefinitionEditBasePausedV3", "runRemote", 1},
+		{"CheckpointResearchTaskDefinitionEditTargetAppliedV3", "runRemote", 1},
+		{"CheckpointResearchTaskDefinitionEditTargetRestoredV3", "runRemote", 1},
+		{"BlockResearchTaskDefinitionEditOperationV3", "runRemote", 1},
+		{"BlockResearchTaskDefinitionEditOperationV3", "quarantine", 1},
+		{"LoadResearchTaskDefinitionEditOperationV3", "load", 1},
+		{"ClaimStaleResearchTaskDefinitionEditOperationV3", "RecoverStaleOnceV3", 1},
+	}
+	type key struct{ method, function string }
+	want := make(map[key]int, len(expectations))
+	for _, expectation := range expectations {
+		want[key{expectation.method, expectation.function}] = expectation.count
+	}
+	got := make(map[key]int, len(want))
+	allowed := make(map[token.Pos]struct{})
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := taskDefinitionEditStoreUnparen(call.Fun).(*ast.SelectorExpr)
+			if !ok || !taskDefinitionEditIsCoordinatorStoreSelector(selector) {
+				return true
+			}
+			callKey := key{selector.Sel.Name, function.Name.Name}
+			if _, expected := want[callKey]; expected {
+				got[callKey]++
+				allowed[selector.Sel.Pos()] = struct{}{}
+			}
+			return true
+		})
+	}
+	for expected, count := range want {
+		if got[expected] != count {
+			return nil, fmt.Errorf("native V3 coordinator %s must call c.store.%s exactly %d time(s), got %d",
+				expected.function, expected.method, count, got[expected])
 		}
 	}
 	return allowed, nil
@@ -942,6 +1011,7 @@ func taskDefinitionEditStoreTaintSymbols(sets ...map[string]struct{}) map[string
 
 func taskDefinitionEditStoreMutationGraphSymbols() map[string]struct{} {
 	return taskDefinitionEditStoreMethodSet([]string{
+		"acquireTaskDefinitionEditOperationProtocol",
 		"expirePendingTaskDefinitionEdit",
 		"expireTaskDefinitionEditDuringAcquire",
 		"startAndTerminateTaskDefinitionEditDuringAcquire",
@@ -963,16 +1033,17 @@ func taskDefinitionEditStoreMutationGraphSymbols() map[string]struct{} {
 func taskDefinitionEditStoreMutationGraphExpectations() []taskDefinitionEditStoreCallExpectation {
 	return []taskDefinitionEditStoreCallExpectation{
 		{"expirePendingTaskDefinitionEdit", "ExpireTaskDefinitionEditOperation", 1},
-		{"expireTaskDefinitionEditDuringAcquire", "AcquireTaskDefinitionEditOperation", 1},
-		{"startAndTerminateTaskDefinitionEditDuringAcquire", "AcquireTaskDefinitionEditOperation", 1},
-		{"acquirePendingTaskDefinitionEdit", "AcquireTaskDefinitionEditOperation", 1},
-		{"terminateAcquiredTaskDefinitionEditAssessment", "AcquireTaskDefinitionEditOperation", 2},
+		{"acquireTaskDefinitionEditOperationProtocol", "AcquireTaskDefinitionEditOperation", 1},
+		{"expireTaskDefinitionEditDuringAcquire", "acquireTaskDefinitionEditOperationProtocol", 1},
+		{"startAndTerminateTaskDefinitionEditDuringAcquire", "acquireTaskDefinitionEditOperationProtocol", 1},
+		{"acquirePendingTaskDefinitionEdit", "acquireTaskDefinitionEditOperationProtocol", 1},
+		{"terminateAcquiredTaskDefinitionEditAssessment", "acquireTaskDefinitionEditOperationProtocol", 2},
 		{"terminateAcquiredTaskDefinitionEditAssessment", "RenewTaskDefinitionEditLease", 1},
 		{"terminateAcquiredTaskDefinitionEditAssessment", "QuiesceTaskDefinitionEdit", 1},
 		{"terminateAcquiredTaskDefinitionEditAssessment", "AuthorizeTaskDefinitionEditRemotePhase", 1},
 		{"terminateAcquiredTaskDefinitionEditAssessment", "checkpointTaskDefinitionEditSnapshot", 1},
 		{"terminateAcquiredTaskDefinitionEditAssessment", "CommitTaskDefinitionEditDefinition", 1},
-		{"takeOverTaskDefinitionEdit", "AcquireTaskDefinitionEditOperation", 1},
+		{"takeOverTaskDefinitionEdit", "acquireTaskDefinitionEditOperationProtocol", 1},
 		{"checkpointTaskDefinitionEditSnapshot", "CheckpointTaskDefinitionEditBasePaused", 1},
 		{"checkpointTaskDefinitionEditSnapshot", "CheckpointTaskDefinitionEditTargetApplied", 1},
 		{"checkpointTaskDefinitionEditSnapshot", "CheckpointTaskDefinitionEditTargetRestored", 1},
@@ -989,7 +1060,7 @@ func taskDefinitionEditStoreMutationGraphExpectations() []taskDefinitionEditStor
 		{"beginTaskDefinitionEditTx", "CreateTaskDefinitionEditOperation", 1},
 		{"beginTaskDefinitionEditTx", "LoadTaskDefinitionEditOperation", 1},
 		{"beginTaskDefinitionEditTx", "expirePendingTaskDefinitionEdit", 1},
-		{"beginTaskDefinitionEditTx", "AcquireTaskDefinitionEditOperation", 1},
+		{"beginTaskDefinitionEditTx", "acquireTaskDefinitionEditOperationProtocol", 1},
 		{"beginTaskDefinitionEditTx", "RenewTaskDefinitionEditLease", 1},
 		{"beginTaskDefinitionEditTx", "ListStaleTaskDefinitionEditOperations", 1},
 		{"beginTaskDefinitionEditTx", "ListNonterminalTaskDefinitionEditOperations", 1},
@@ -1038,10 +1109,13 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"taskDefinitionEditScopeMatches",
 			"lockTaskDefinitionEditScheduleForUpdate",
 			"loadTaskDefinitionEditOperationForUpdate",
+			"loadTaskDefinitionEditOperationForUpdateProtocol",
 			"loadLeasedTaskDefinitionEditOperation",
+			"loadLeasedTaskDefinitionEditOperationProtocol",
 			"taskDefinitionEditOriginalStatus",
 			"validateTaskDefinitionEditCreationScope",
 			"validateTaskDefinitionEditActiveActor",
+			"validateResearchTaskDefinitionEditActiveOwnerV3",
 			"validateTaskDefinitionEditCreationProvenance",
 			"CreateTaskDefinitionEditOperation",
 			"taskDefinitionEditCreationReplayEqual",
@@ -1052,7 +1126,9 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"pendingTaskDefinitionEditPristine",
 			"pendingTaskDefinitionEditTerminalComplete",
 			"assessTaskDefinitionEditSchedule",
+			"assessTaskDefinitionEditScheduleProtocol",
 			"AcquireTaskDefinitionEditOperation",
+			"acquireTaskDefinitionEditOperationProtocol",
 			"expireTaskDefinitionEditDuringAcquire",
 			"startAndTerminateTaskDefinitionEditDuringAcquire",
 			"acquirePendingTaskDefinitionEdit",
@@ -1082,6 +1158,31 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"taskDefinitionEditPhaseHasCommittedDefinition",
 			"verifyCommittedTaskDefinitionEditTx",
 			"cloneOptionalTaskDefinitionEditString",
+		}),
+		filepath.Clean(filepath.Join(storeDir, "task_definition_edit_v3.go")): taskDefinitionEditStoreMethodSet([]string{
+			"decodePreparedResearchTaskScheduleV3Store",
+			"decodePreparedResearchTaskEditV3Store",
+			"decodeResearchTaskEditSnapshotV3Store",
+			"beginResearchTaskDefinitionEditTxV3",
+			"LoadResearchTaskDefinitionEditBasisV3",
+			"loadResearchTaskDefinitionEditBasisV3Tx",
+			"jsonBytesSemanticEqual",
+			"CreateResearchTaskDefinitionEditOperationV3",
+			"canonicalResearchDefinitionV3",
+			"LoadResearchTaskDefinitionEditOperationV3",
+			"loadResearchTaskDefinitionEditOperationV3",
+			"AcquireResearchTaskDefinitionEditOperationV3",
+			"decodeResearchTaskDefinitionEditOperationV3",
+			"QuiesceResearchTaskDefinitionEditV3",
+			"AuthorizeResearchTaskDefinitionEditRemotePhaseV3",
+			"CheckpointResearchTaskDefinitionEditBasePausedV3",
+			"CheckpointResearchTaskDefinitionEditTargetAppliedV3",
+			"CheckpointResearchTaskDefinitionEditTargetRestoredV3",
+			"checkpointResearchTaskDefinitionEditV3",
+			"CommitResearchTaskDefinitionEditDefinitionV3",
+			"CompleteResearchTaskDefinitionEditOperationV3",
+			"BlockResearchTaskDefinitionEditOperationV3",
+			"ClaimStaleResearchTaskDefinitionEditOperationV3",
 		}),
 		filepath.Clean(filepath.Join(storeDir, "task_definition_edit_receipts.go")): taskDefinitionEditStoreMethodSet([]string{
 			"scanTaskDefinitionEditReceipt",
@@ -1288,6 +1389,19 @@ func taskDefinitionEditStoreIsGoLinkname(text string) bool {
 
 func taskDefinitionEditOperationStoreMethods() map[string]struct{} {
 	return taskDefinitionEditStoreMethodSet([]string{
+		"LoadResearchTaskDefinitionEditBasisV3",
+		"CreateResearchTaskDefinitionEditOperationV3",
+		"LoadResearchTaskDefinitionEditOperationV3",
+		"AcquireResearchTaskDefinitionEditOperationV3",
+		"QuiesceResearchTaskDefinitionEditV3",
+		"AuthorizeResearchTaskDefinitionEditRemotePhaseV3",
+		"CheckpointResearchTaskDefinitionEditBasePausedV3",
+		"CommitResearchTaskDefinitionEditDefinitionV3",
+		"CheckpointResearchTaskDefinitionEditTargetAppliedV3",
+		"CheckpointResearchTaskDefinitionEditTargetRestoredV3",
+		"CompleteResearchTaskDefinitionEditOperationV3",
+		"BlockResearchTaskDefinitionEditOperationV3",
+		"ClaimStaleResearchTaskDefinitionEditOperationV3",
 		"CreateTaskDefinitionEditOperation",
 		"LoadTaskDefinitionEditOperation",
 		"ExpireTaskDefinitionEditOperation",

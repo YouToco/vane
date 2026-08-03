@@ -32,6 +32,16 @@ var (
 // only non-terminal values; every other value is a permanent tombstone.
 type TaskDefinitionEditOperationStatus string
 
+// TaskDefinitionEditProtocol is an explicit durable decoder selector. Legacy
+// v1/v2 proposal/prepared wires remain protocol 1; native Research V3 uses a
+// separate protocol and must never enter the retained decoder.
+type TaskDefinitionEditProtocol int16
+
+const (
+	TaskDefinitionEditProtocolLegacyV1V2 TaskDefinitionEditProtocol = 1
+	TaskDefinitionEditProtocolResearchV3 TaskDefinitionEditProtocol = 3
+)
+
 const (
 	TaskDefinitionEditOperationStatusPending    TaskDefinitionEditOperationStatus = "pending"
 	TaskDefinitionEditOperationStatusExecuting  TaskDefinitionEditOperationStatus = "executing"
@@ -95,6 +105,41 @@ type CreateTaskDefinitionEditOperationParams struct {
 	BaseSnapshot      []byte
 }
 
+// ResearchTaskDefinitionEditBasisV3 is the exact current owner/task head plus
+// the durable prepared Schedule needed to retain the formal Action token.
+// PreparedSchedule is canonical scheduler V3 JSON and contains no credential.
+type ResearchTaskDefinitionEditBasisV3 struct {
+	TenantID                  int64
+	UserID                    int64
+	TaskID                    string
+	Status                    ScheduleStatus
+	DefinitionVersion         int64
+	DefinitionDigest          string
+	DefinitionPayload         []byte
+	PreparedSchedule          []byte
+	AuthorityGeneration       int64
+	TargetActionDigest        string
+	ActionAuthorizationDigest string
+}
+
+// CreateResearchTaskDefinitionEditOperationV3Params carries five canonical
+// checkpoints. Store re-decodes and cross-binds every identity before insert;
+// callers cannot select protocol, status, phase, policy, or authority fields.
+type CreateResearchTaskDefinitionEditOperationV3Params struct {
+	ID               string
+	TenantID         int64
+	UserID           int64
+	TaskID           string
+	SessionID        int64
+	ExpiresAt        time.Time
+	BaseVersion      int64
+	BaseDefinition   []byte
+	TargetVersion    int64
+	TargetDefinition []byte
+	PreparedEdit     []byte
+	BaseSnapshot     []byte
+}
+
 // AcquireTaskDefinitionEditOperationParams starts or recovers one exact
 // operation. LeaseOwner is generated once before the call so a response-lost
 // replay by the same owner can recover the same active fence. The Store owns
@@ -134,6 +179,7 @@ const (
 // sibling digest fields are database-verified SHA-256 values.
 type TaskDefinitionEditOperation struct {
 	ID                 string
+	Protocol           TaskDefinitionEditProtocol
 	TenantID           int64
 	UserID             int64
 	TargetTenantID     int64
