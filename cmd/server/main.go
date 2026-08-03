@@ -769,60 +769,38 @@ func run() error {
 	definitionEditController := task.NewDefinitionEditController(
 		st, definitionEditCoordinator,
 	)
-	var definitionEditToolController agent.DefinitionEditController
-	if cfg.Agent.DefinitionEditEnabled {
-		definitionEditToolController = definitionEditController
-	}
-	tools := agent.BuildTools(
-		st, sched, sched, endpoints, exaTools,
-		definitionEditToolController,
+	authorizer := agent.NewModelOwnerActionAuthorizer(
+		agentLLMClient, recorder, cfg.LLM.AgentModel,
 	)
-	if cfg.Agent.AgentFirstOwnerCanary {
-		authorizer := agent.NewModelOwnerActionAuthorizer(
-			agentLLMClient, recorder, cfg.LLM.AgentModel,
-		)
-		withoutLegacyProfileWriter := tools[:0]
-		for _, tool := range tools {
-			if tool.Name() != "update_profile" {
-				withoutLegacyProfileWriter = append(withoutLegacyProfileWriter, tool)
-			}
-		}
-		tools = withoutLegacyProfileWriter
-		tools = append(tools,
-			agent.NewQueryMyIntelligenceTool(st),
-			agent.NewAuthorizedUpdateProfileTool(st, authorizer),
-			agent.NewManageTasksTool(agent.ManageTasksDeps{
-				Queries: st,
-				Creator: agent.NewResearchTaskCreationV3Executor(
-					creationCoordinator,
-				),
-				Editor: agent.NewResearchTaskDefinitionEditV3Executor(
-					researchDefinitionEditCoordinator,
-				),
-				Runner: sched, Deleter: sched,
-				Authorizer: authorizer,
-			}))
-	}
+	tools := agent.BuildOwnerTools(
+		st,
+		agent.ManageTasksDeps{
+			Queries: st,
+			Creator: agent.NewResearchTaskCreationV3Executor(
+				creationCoordinator,
+			),
+			Editor: agent.NewResearchTaskDefinitionEditV3Executor(
+				researchDefinitionEditCoordinator,
+			),
+			Runner: sched, Deleter: sched,
+			Authorizer: authorizer,
+		},
+		authorizer, endpoints, exaTools,
+	)
 	agentLoop, err := agent.NewChecked(agent.Deps{
-		Client:     agentLLMClient,
-		Recorder:   recorder,
-		Store:      st,
-		Profiles:   st,
-		Tools:      tools,
-		Model:      cfg.LLM.AgentModel,
-		MaxTurns:   cfg.Agent.MaxTurns,
-		SessionTTL: time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
-		IntentToolkitsEnabled: cfg.Agent.IntentToolkitsOwnerCanary ||
-			cfg.Agent.IntentToolkitsAllowAll,
-		IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
-			!cfg.Agent.IntentToolkitsOwnerCanary &&
-			!cfg.Agent.IntentToolkitsAllowAll,
-		AgentFirstEnabled:      cfg.Agent.AgentFirstOwnerCanary,
-		AgentFirstCanaryUserID: cfg.Agent.AgentFirstCanaryUserID,
-		Endpoints:              endpoints,
-		ToolCalls:              agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
-		Evidence:               st,
-		TaskCreation:           creationCoordinator,
+		Client:       agentLLMClient,
+		Recorder:     recorder,
+		Store:        st,
+		Profiles:     st,
+		Tools:        tools,
+		Model:        cfg.LLM.AgentModel,
+		MaxTurns:     cfg.Agent.MaxTurns,
+		SessionTTL:   time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+		OwnerAgent:   true,
+		Endpoints:    endpoints,
+		ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
+		Evidence:     st,
+		TaskCreation: creationCoordinator,
 		// The current controller serves direct durable execution only.
 		TaskDefinitionEdit: definitionEditController,
 	})
@@ -832,13 +810,41 @@ func run() error {
 	}
 	manager.SetAgent(agentLoop)
 
+	// The Dashboard create/edit endpoint remains an explicit compatibility
+	// consumer until it is migrated to manage_tasks. It receives a separate
+	// Loop and catalog; owner chat and A2A can never fall back to it.
+	var definitionEditToolController agent.DefinitionEditController
+	if cfg.Agent.DefinitionEditEnabled {
+		definitionEditToolController = definitionEditController
+	}
+	webTaskLoop, err := agent.NewChecked(agent.Deps{
+		Client:   agentLLMClient,
+		Recorder: recorder,
+		Store:    st,
+		Tools: agent.BuildTools(
+			st, sched, sched, nil, nil, definitionEditToolController,
+		),
+		Model:              cfg.LLM.AgentModel,
+		MaxTurns:           cfg.Agent.MaxTurns,
+		SessionTTL:         time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+		ToolCalls:          agent.NewToolCallRecorder(st),
+		Evidence:           st,
+		TaskCreation:       creationCoordinator,
+		TaskDefinitionEdit: definitionEditController,
+	})
+	if err != nil {
+		closeServerStartupResources(temporalClient.Close, closeStores)
+		return fmt.Errorf("装配 Web 任务兼容 Agent: %w", err)
+	}
+
 	// Build the A2A agent before any worker or recovery goroutine starts. A
 	// composition error is then an ordinary startup failure: no admitted work
 	// needs draining, and both Store boundaries can be closed immediately.
 	var a2aLoop *agent.Loop
 	if cfg.A2A.Enabled {
 		a2aTools, filterErr := agent.FilterAuthorizedTools(
-			tools, agent.AuthorizationA2AReadOnly,
+			agent.BuildPublicResearchTools(endpoints, exaTools),
+			agent.AuthorizationA2AReadOnly,
 		)
 		if filterErr != nil {
 			closeServerStartupResources(temporalClient.Close, closeStores)
@@ -846,16 +852,13 @@ func run() error {
 		}
 		var loopErr error
 		a2aLoop, loopErr = agent.NewChecked(agent.Deps{
-			Client:                agentLLMClient,
-			Recorder:              recorder,
-			Tools:                 a2aTools,
-			Model:                 cfg.LLM.AgentModel,
-			MaxTurns:              cfg.Agent.MaxTurns,
-			SystemPrompt:          a2a.ChatSystemPrompt,
-			IntentToolkitsEnabled: cfg.Agent.IntentToolkitsAllowAll,
-			IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
-				!cfg.Agent.IntentToolkitsAllowAll,
-			ToolCalls: agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
+			Client:       agentLLMClient,
+			Recorder:     recorder,
+			Tools:        a2aTools,
+			Model:        cfg.LLM.AgentModel,
+			MaxTurns:     cfg.Agent.MaxTurns,
+			SystemPrompt: a2a.ChatSystemPrompt,
+			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
 		})
 		if loopErr != nil {
 			closeServerStartupResources(temporalClient.Close, closeStores)
@@ -1200,6 +1203,9 @@ func run() error {
 		if err := agentLoop.DrainSessionWrites(sessionCtx); err != nil {
 			return fmt.Errorf("排空 Agent 会话回写: %w", err)
 		}
+		if err := webTaskLoop.DrainSessionWrites(sessionCtx); err != nil {
+			return fmt.Errorf("排空 Web 任务 Agent 会话回写: %w", err)
+		}
 		return nil
 	}
 
@@ -1222,7 +1228,7 @@ func run() error {
 		Auth:                  st,
 		Manager:               manager,
 		Scheduler:             sched,
-		TaskAgent:             agentLoop,
+		TaskAgent:             webTaskLoop,
 		BriefFeedback:         fbSvc,
 		DefinitionEditEnabled: cfg.Agent.DefinitionEditEnabled,
 		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.

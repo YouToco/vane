@@ -326,9 +326,9 @@ func TestManageTasksFullLoopCompletesOneClarificationWithoutConfirmation(t *test
 			}}
 			fs := newFakeStore()
 			loop := New(Deps{
-				Store: fs, Profiles: fs, Tools: []ToolSpec{tool},
-				Evidence: &fakeAgentEvidenceWriter{}, AgentFirstEnabled: true,
-				AgentFirstCanaryUserID: 42, MaxTurns: 4,
+				Store: fs, Profiles: fs, Tools: ownerTestTools(tool),
+				Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true,
+				MaxTurns: 4,
 			})
 			loop.chatFn = chat.fn
 
@@ -365,9 +365,9 @@ func TestManageTasksFullLoopCarriesNaturalCreateTimezoneClarification(t *testing
 	fs := newFakeStore()
 	writer := &fakeAgentEvidenceWriter{}
 	loop := New(Deps{
-		Store: fs, Profiles: fs, Tools: []ToolSpec{tool},
-		Evidence: writer, AgentFirstEnabled: true,
-		AgentFirstCanaryUserID: 42, MaxTurns: 4,
+		Store: fs, Profiles: fs, Tools: ownerTestTools(tool),
+		Evidence: writer, OwnerAgent: true,
+		MaxTurns: 4,
 	})
 	loop.chatFn = chat.fn
 	original := "每天 9 点监控 Kimi 套餐，有重大更新才推。"
@@ -424,8 +424,8 @@ func TestManageTasksFullLoopNeverTurnsIndeterminateCreateIntoSuccess(t *testing.
 			fs := newFakeStore()
 			writer := &fakeAgentEvidenceWriter{}
 			loop := New(Deps{
-				Store: fs, Profiles: fs, Tools: []ToolSpec{tool}, Evidence: writer,
-				AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 3,
+				Store: fs, Profiles: fs, Tools: ownerTestTools(tool), Evidence: writer,
+				OwnerAgent: true, MaxTurns: 3,
 			})
 			loop.chatFn = chat.fn
 			outcome, err := loop.HandleMessage(t.Context(), 42,
@@ -458,8 +458,8 @@ func TestManageTasksFullLoopNeverTurnsIndeterminateEditIntoSuccess(t *testing.T)
 	fs := newFakeStore()
 	writer := &fakeAgentEvidenceWriter{}
 	loop := New(Deps{
-		Store: fs, Profiles: fs, Tools: []ToolSpec{tool}, Evidence: writer,
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 3,
+		Store: fs, Profiles: fs, Tools: ownerTestTools(tool), Evidence: writer,
+		OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
 	outcome, err := loop.HandleMessage(t.Context(), 42,
@@ -492,8 +492,8 @@ func TestManageTasksFullLoopReportsPresealEditFailureAsNotExecuted(t *testing.T)
 	fs := newFakeStore()
 	writer := &fakeAgentEvidenceWriter{}
 	loop := New(Deps{
-		Store: fs, Profiles: fs, Tools: []ToolSpec{tool}, Evidence: writer,
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 3,
+		Store: fs, Profiles: fs, Tools: ownerTestTools(tool), Evidence: writer,
+		OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
 	outcome, err := loop.HandleMessage(t.Context(), 42,
@@ -760,12 +760,10 @@ func TestManageTasksSchemaIsAgentFirstV3Only(t *testing.T) {
 	}
 }
 
-func TestAgentFirstGeneralChatInventoryHidesLegacyTaskTools(t *testing.T) {
-	tools := BuildTools(&store.Store{}, nil, nil, nil, nil)
-	tools = append(tools, NewQueryMyIntelligenceTool(&fakeManageTaskQuery{}),
-		NewManageTasksTool(ManageTasksDeps{}))
-	loop, err := NewChecked(Deps{Tools: tools, AgentFirstEnabled: true,
-		AgentFirstCanaryUserID: 42, Evidence: &fakeAgentEvidenceWriter{}})
+func TestOwnerGeneralChatInventoryHidesLegacyTaskTools(t *testing.T) {
+	tools := BuildOwnerTools(&store.Store{}, ManageTasksDeps{}, nil, nil, nil)
+	loop, err := NewChecked(Deps{Tools: tools, OwnerAgent: true,
+		Evidence: &fakeAgentEvidenceWriter{}})
 	if err != nil {
 		t.Fatalf("build loop: %v", err)
 	}
@@ -790,21 +788,6 @@ func TestAgentFirstGeneralChatInventoryHidesLegacyTaskTools(t *testing.T) {
 			t.Errorf("Agent-first inventory exposed legacy tool %s", retired)
 		}
 	}
-	legacyDefs := loop.requestTools(&toolRunState{
-		agentFirstEnabled: false, intents: knownToolIntents,
-	})
-	legacyNames := make(map[string]bool, len(legacyDefs))
-	for _, def := range legacyDefs {
-		legacyNames[def.Name] = true
-		if agentFirstOnlyTool(def.Name) {
-			t.Fatalf("non-canary inventory exposed %s", def.Name)
-		}
-	}
-	for _, retained := range []string{"list_schedules", "create_schedule", "run_task_now", "remove_schedule"} {
-		if !legacyNames[retained] {
-			t.Fatalf("non-canary lost legacy tool %s: %v", retained, legacyNames)
-		}
-	}
 	if !strings.Contains(agentFirstSystemNote, "Agent-first 工具环境") ||
 		!strings.Contains(agentFirstSystemNote, "query_my_intelligence") ||
 		!strings.Contains(agentFirstSystemNote, "manage_tasks") {
@@ -818,8 +801,8 @@ func TestAgentFirstCanaryDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
 	writer := &fakeAgentEvidenceWriter{}
 	loop := New(Deps{
 		Store: fs, Profiles: fs, Evidence: writer,
-		Tools:             []ToolSpec{NewQueryMyIntelligenceTool(&fakeManageTaskQuery{})},
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 1,
+		Tools:      ownerTestTools(NewQueryMyIntelligenceTool(&fakeManageTaskQuery{})),
+		OwnerAgent: true, MaxTurns: 1,
 	})
 	var request llm.ChatRequest
 	loop.chatFn = func(_ context.Context, in llm.ChatRequest) (*llm.ChatResponse, error) {
@@ -852,9 +835,9 @@ func TestAgentFirstCanaryDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
 func TestAgentFirstPromptSplitPreservesLegacyNonCanaryGuidance(t *testing.T) {
 	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
 	loop := New(Deps{
-		Tools:             BuildTools(nil, nil, nil, nil, exa),
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42,
-		Evidence: &fakeAgentEvidenceWriter{},
+		Tools:      BuildOwnerTools(nil, ManageTasksDeps{}, nil, nil, exa),
+		OwnerAgent: true,
+		Evidence:   &fakeAgentEvidenceWriter{},
 	})
 	if !strings.Contains(loop.sys, "统一使用 create_schedule 创建") {
 		t.Fatalf("non-canary prompt lost retained legacy guidance: %q", loop.sys)
@@ -866,15 +849,15 @@ func TestAgentFirstPromptSplitPreservesLegacyNonCanaryGuidance(t *testing.T) {
 	}
 }
 
-func TestAgentFirstToolsCannotExecuteForNonCanaryUser(t *testing.T) {
+func TestOwnerToolsAreNotGatedByCanaryUserID(t *testing.T) {
 	queries := &fakeManageTaskQuery{rows: manageTaskRows("kimi")}
 	writer := &fakeAgentEvidenceWriter{}
 	queryTool := NewQueryMyIntelligenceTool(queries)
 	loop := New(Deps{
-		Tools: []ToolSpec{queryTool}, Evidence: writer,
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42,
+		Tools: ownerTestTools(queryTool), Evidence: writer,
+		OwnerAgent: true,
 	})
-	state := &toolRunState{ownerRequest: "查任务", agentFirstEnabled: false}
+	state := &toolRunState{ownerRequest: "查任务", agentFirstEnabled: true}
 	ctx := context.WithValue(t.Context(), toolRunKey{}, state)
 	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{
 		traceID: "non-canary", userID: 43,
@@ -884,8 +867,8 @@ func TestAgentFirstToolsCannotExecuteForNonCanaryUser(t *testing.T) {
 	messages, err := loop.runToolCalls(ctx, 43, &sessionID, []llm.ToolCall{{
 		ID: "hallucinated", Name: queryTool.Name(), Arguments: `{"dataset":"tasks"}`,
 	}})
-	if err != nil || len(messages) != 1 || queries.query.Dataset != "" {
-		t.Fatalf("non-canary execution escaped: messages=%+v query=%+v err=%v", messages, queries.query, err)
+	if err != nil || len(messages) != 1 || queries.query.Dataset != "tasks" {
+		t.Fatalf("owner tool remained canary-gated: messages=%+v query=%+v err=%v", messages, queries.query, err)
 	}
 }
 

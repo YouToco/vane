@@ -1,6 +1,6 @@
 # Agent-first 用户情报与证据契约
 
-> 状态：`vane.intelligence-catalog/v1`、Agent-first owner canary、V3 原生创建与原生编辑已落地；V3 真实任务迁移和旧路径删除按发布列车继续推进。
+> 状态：`vane.intelligence-catalog/v1`、唯一 Agent-first owner 工具面、V3 原生创建与原生编辑已落地；V3 真实任务迁移和旧路径物理删除按发布列车继续推进。
 
 ## 1. 产品边界
 
@@ -59,11 +59,13 @@
 
 整个列车不修改既有周一 9:00 正式调度。老板 Gate 只保留 V3 首个真实任务切流与全部旧运行路径删除。
 
-## 7. Agent-first owner canary
+## 7. Agent-first owner 工具面
 
-- canary 同时要求本地开关与一个精确 `user_id`；进程内其他用户的新工具在声明面和执行面都不可用。
-- canary 普通聊天只暴露 `query_my_intelligence`、`manage_tasks`、`update_profile` 与已装配的公开研究工具；八个旧任务读写工具只留给明确的 Web/历史兼容通道。
-- Agent-first 不再隐式读取或注入画像；需要画像时模型显式查询 `profile`，因此画像影响会进入 exact tool evidence。
+- 生产飞书 owner chat 由 composition root 显式选择 `OwnerAgent` lane；它不是配置开关、灰度比例或用户 ID canary，不能因环境变量缺失回退旧工具。
+- owner 普通聊天只装配 `query_my_intelligence`、`manage_tasks`、经统一裁决的 `update_profile` 与已配置的公开研究工具。构造时缺少 exact evidence writer、任一必需工具或混入八个旧任务工具都会拒绝启动。
+- `list_schedules`、`view_task_playbook`、`view_task_latest_run`、`view_profile`、`create_schedule`、`edit_task_definition`、`run_task_now`、`remove_schedule` 不再进入 owner 或 A2A catalog。其 Go handler 暂只服务显式 Web create/edit 兼容入口与历史测试；待 Web 迁到 `manage_tasks` 后物理删除。
+- 旧 `intent_toolkits_shadow/owner_canary/allow_all` 配置、关键词首轮分类和 shadow diff 已删除。强模型始终看到完整的小型正交工具面；授权仍在工具边界执行。
+- Owner Agent 不再隐式读取或注入画像；需要画像时模型显式查询 `profile`，因此画像影响会进入 exact tool evidence。
 - `manage_tasks` 在 authenticated scope 内重新解析全部目标，再调用只看本轮原话、动作、changes 和可读目标摘要的 `authorize_owner_action`。创建提交完整 owner-visible 定义；编辑只提交用户明确要求改变的字段，由 V3 coordinator 在同一次最新 head 读取上保留其余字段并生成完整目标，避免模型猜旧配置和 read-then-write 覆盖。外部结果与历史不会进入裁决。
 - `run`/`delete` 强制使用每个任务的耐久幂等命令。批量部分失败仍继续处理其他目标，并把 completed/failed 写入动作回执；用户只看到可读名称。
 - 开启 exact evidence 后，任何 provider call identity、scope 或 session 不变量不匹配都会中止回复，不能回退到 legacy preview。presentation guard 和内部引用脱敏都发生在最终 turn 提交之前。

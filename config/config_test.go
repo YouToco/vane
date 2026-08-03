@@ -1456,9 +1456,6 @@ func TestDefaults(t *testing.T) {
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.agent_first_owner_canary", cfg.Agent.AgentFirstOwnerCanary, false},
 		{"agent.agent_first_canary_user_id", cfg.Agent.AgentFirstCanaryUserID, int64(0)},
-		{"agent.intent_toolkits_shadow_enabled", cfg.Agent.IntentToolkitsShadowEnabled, true},
-		{"agent.intent_toolkits_owner_canary", cfg.Agent.IntentToolkitsOwnerCanary, false},
-		{"agent.intent_toolkits_allow_all", cfg.Agent.IntentToolkitsAllowAll, false},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},
 		{"log.level", cfg.Log.Level, "info"},
 	}
@@ -1469,7 +1466,7 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadIntentToolkitsRollout(t *testing.T) {
+func TestLoadResearchV3OwnerAdmissionRollout(t *testing.T) {
 	t.Run("agent first owner canary from environment", func(t *testing.T) {
 		clearVaneEnv(t)
 		t.Setenv("VANE_AGENT_AGENT_FIRST_OWNER_CANARY", "true")
@@ -1492,24 +1489,6 @@ db:
 		}
 	})
 
-	t.Run("owner canary from environment", func(t *testing.T) {
-		clearVaneEnv(t)
-		t.Setenv("VANE_AGENT_INTENT_TOOLKITS_SHADOW_ENABLED", "false")
-		t.Setenv("VANE_AGENT_INTENT_TOOLKITS_OWNER_CANARY", "true")
-		cfg, err := Load(writeTempConfig(t, `
-db:
-  url: "postgres://test"
-`))
-		if err != nil {
-			t.Fatalf("Load() error = %v", err)
-		}
-		if cfg.Agent.IntentToolkitsShadowEnabled ||
-			!cfg.Agent.IntentToolkitsOwnerCanary ||
-			cfg.Agent.IntentToolkitsAllowAll {
-			t.Fatalf("rollout config = %+v", cfg.Agent)
-		}
-	})
-
 	t.Run("agent first canary requires exact user", func(t *testing.T) {
 		clearVaneEnv(t)
 		_, err := Load(writeTempConfig(t, `
@@ -1523,21 +1502,6 @@ agent:
 		}
 	})
 
-	t.Run("canary and allow all conflict", func(t *testing.T) {
-		clearVaneEnv(t)
-		_, err := Load(writeTempConfig(t, `
-db:
-  url: "postgres://test"
-agent:
-  intent_toolkits_owner_canary: true
-  intent_toolkits_allow_all: true
-`))
-		if err == nil || !strings.Contains(
-			err.Error(), "owner canary 与 allow_all 不能同时启用",
-		) {
-			t.Fatalf("Load() error = %v", err)
-		}
-	})
 }
 
 func TestLLMConfigAgentClientConfig(t *testing.T) {

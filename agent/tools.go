@@ -119,7 +119,11 @@ type intelligenceQueryStore interface {
 	) (*store.IntelligenceQueryResult, error)
 }
 
-// BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单的静态部分（契约 §10）：
+// BuildTools assembles the retained Web compatibility tools. Production owner
+// chat and A2A must not use this catalog; see BuildOwnerTools and
+// BuildPublicResearchTools. Keeping this constructor until the Web action
+// endpoints are migrated avoids deleting replay-compatible handlers in the
+// same change that cuts over the owner model surface.
 // loop 只认这里注册的名字 + 会话已激活的 TikHub 端点（端点注册表契约 §4），
 // 模型编造的其余工具名一律拒绝。
 // endpoints 为 nil（TikHub key 未配置）时不装配 search_endpoints，工具面与
@@ -168,6 +172,39 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, runner TaskRunTrigg
 		tools = append(tools, exa.SearchTool(), exa.ReadPageTool())
 	}
 	return tools
+}
+
+// BuildPublicResearchTools is the complete non-internal catalog shared by
+// production owner chat and the separately authorized A2A projection. It never
+// contains task/profile compatibility tools.
+func BuildPublicResearchTools(endpoints *EndpointTools, exa *ExaTools) []ToolSpec {
+	var tools []ToolSpec
+	if endpoints != nil {
+		tools = append(tools, endpoints.SearchTool(), endpoints.ReadResultTool())
+	}
+	if exa != nil {
+		tools = append(tools, exa.SearchTool(), exa.ReadPageTool())
+	}
+	return tools
+}
+
+// BuildOwnerTools is the only production owner-chat catalog. Its construction
+// makes the Agent-first surface an assembly invariant rather than a per-user
+// rollout branch: one generic intelligence reader, one generic task manager,
+// the separately authorized profile writer, and public research capabilities.
+func BuildOwnerTools(
+	st *store.Store,
+	manage ManageTasksDeps,
+	authorizer OwnerActionAuthorizer,
+	endpoints *EndpointTools,
+	exa *ExaTools,
+) []ToolSpec {
+	tools := []ToolSpec{
+		NewQueryMyIntelligenceTool(st),
+		NewManageTasksTool(manage),
+		NewAuthorizedUpdateProfileTool(st, authorizer),
+	}
+	return append(tools, BuildPublicResearchTools(endpoints, exa)...)
 }
 
 func NewQueryMyIntelligenceTool(st intelligenceQueryStore) ToolSpec {

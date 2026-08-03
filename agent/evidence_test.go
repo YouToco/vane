@@ -138,12 +138,13 @@ func TestConverseFailsClosedWhenExactToolEvidenceCannotBeCaptured(t *testing.T) 
 	}
 }
 
-func TestAgentFirstRequiresExactEvidenceAndExactCanaryUser(t *testing.T) {
-	if _, err := NewChecked(Deps{AgentFirstEnabled: true, AgentFirstCanaryUserID: 42}); err == nil {
-		t.Fatal("Agent-first accepted nil evidence writer")
+func TestOwnerAgentRequiresExactEvidenceAndOrthogonalCatalog(t *testing.T) {
+	if _, err := NewChecked(Deps{OwnerAgent: true}); err == nil {
+		t.Fatal("owner Agent accepted nil evidence writer")
 	}
-	if _, err := NewChecked(Deps{AgentFirstEnabled: true, Evidence: &fakeAgentEvidenceWriter{}}); err == nil {
-		t.Fatal("Agent-first accepted zero canary user")
+	if _, err := NewChecked(Deps{OwnerAgent: true,
+		Evidence: &fakeAgentEvidenceWriter{}}); err == nil {
+		t.Fatal("owner Agent accepted a catalog without required tools")
 	}
 }
 
