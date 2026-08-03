@@ -209,11 +209,15 @@ func loadResearchSnapshotAuthorityV3(
 	definitionVersion int64, definitionDigest, token string,
 ) (researchSnapshotAuthorityV3, error) {
 	if token == "" {
-		// Empty remains the delivery-dark compatibility path only while no
-		// authority record exists for this exact definition. Once cutover or
-		// native creation has staged/enabled/revoked authority, omitting the
-		// Action token must not mint an authority-free snapshot that can poison
-		// all later exact-token replays for the same Temporal run.
+		// Exact shadow workflows are permanently delivery-dark and may continue
+		// validating a cut-over definition beside its formal Action authority.
+		// Every other empty-token workflow is compatible only while no authority
+		// record exists for this exact definition. Once cutover or native creation
+		// has staged/enabled/revoked authority, omitting the token must not mint an
+		// authority-free snapshot that can poison later exact-token replays.
+		if isExactResearchV3ShadowWorkflowID(identity.TemporalWorkflowID) {
+			return researchSnapshotAuthorityV3{}, nil
+		}
 		var authorityExists bool
 		if err := tx.QueryRow(ctx, `
 			SELECT EXISTS (
