@@ -190,6 +190,35 @@ func TestResearchExecutorV3ContentsReturnsTypedExactReceipt(t *testing.T) {
 	}
 }
 
+func TestResearchExecutorV3ProviderReportedPageFailureIsDefinite(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{
+			"results":[],
+			"statuses":[{"status":"error","source":"failed"}],
+			"costDollars":{"total":0.001}
+		}`))
+	}))
+	defer server.Close()
+
+	executor := newResearchExecutorV3ForTest(t)
+	executor.contents.contentURL = server.URL
+	receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
+		"contents-provider-reported-failure", researchToolV3ForTest(t, "web_contents", 7),
+		json.RawMessage(`{"page_url":"https://kimi.com/pricing"}`)))
+
+	if requests != 1 || receipt.Status != ResearchExecutionDefiniteFailureV3 ||
+		receipt.ErrorCode != ResearchExecutionProviderReportedV3 ||
+		receipt.HTTPStatus == nil || *receipt.HTTPStatus != http.StatusOK ||
+		!receipt.CostKnown || receipt.CostMicroUSD != 1000 || len(receipt.Result) != 0 {
+		t.Fatalf("requests=%d receipt=%+v", requests, receipt)
+	}
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("provider-reported failure receipt invalid: %v", err)
+	}
+}
+
 func TestResearchExecutorV3UnknownCostFailsClosed(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

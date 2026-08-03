@@ -230,6 +230,53 @@ func TestProductionResearchRuntimeV3RecoveryNeverRepeatsPaidToolEffect(t *testin
 	}
 }
 
+func TestProductionResearchRuntimeV3RecoveryReturnsSealedFailureWithoutProviderReplay(t *testing.T) {
+	identity, snapshot, plan, execution := researchBridgeFixtureV3(t)
+	executor := &coordinatorExecutorFakeV3{}
+	store := &coordinatorStoreFakeV3{
+		beginStep: func(context.Context, types.RunIdentity, int64,
+			types.ResearchRunPlanRefV3, int) (storepkg.ResearchRunStepExecutionV3, error) {
+			execution.FirstWriter = false
+			execution.Arguments = nil
+			return execution, nil
+		},
+		loadResolution: func(context.Context, types.RunIdentity, int64,
+			types.ResearchRunPlanRefV3, int) (storepkg.ResearchRunStepResolutionV3, error) {
+			return storepkg.ResearchRunStepResolutionV3{
+				Phase: storepkg.ResearchRunStepIndeterminateV3,
+				Receipt: storepkg.ResearchRunStepReceiptV3{
+					StepID: 77, Ordinal: 0, Phase: storepkg.ResearchRunStepIndeterminateV3,
+					InvocationID: execution.InvocationID, ToolName: execution.ToolName,
+					RequestDigest: execution.RequestDigest,
+					ErrorCode:     string(fetcher.ResearchExecutionProviderUncertainV3),
+				},
+			}, nil
+		},
+	}
+	runtime, err := NewProductionResearchRuntimeV3(
+		store, coordinatorGatewayFakeV3{}, executor,
+		func(context.Context, types.RunIdentity) (
+			runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
+			runtimepolicy.ResearchModelPolicyV3, error,
+		) {
+			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
+				runtimepolicy.ResearchModelPolicyV3{}, nil
+		},
+		func(types.RunIdentity) bool { return true },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := runtime.ExecuteStep(t.Context(), identity, snapshot, plan, 0, "trace")
+	if err != nil || receipt.StepID != 77 ||
+		receipt.Phase != string(storepkg.ResearchRunStepIndeterminateV3) ||
+		receipt.ErrorCode != string(fetcher.ResearchExecutionProviderUncertainV3) ||
+		receipt.EvidenceID != 0 || receipt.ResultDigest != "" || executor.calls != 0 {
+		t.Fatalf("recovery receipt=%+v provider_calls=%d err=%v",
+			receipt, executor.calls, err)
+	}
+}
+
 func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffects(t *testing.T) {
 	identity, _, _, _ := researchBridgeFixtureV3(t)
 	policyCalls, storeCalls := 0, 0
@@ -283,6 +330,10 @@ func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(
 		formatted, runtimepolicy.ResearchPlannerRendererVersionV31); err != nil || len(steps) != 1 {
 		t.Fatalf("formatted exact planner output steps=%+v err=%v", steps, err)
 	}
+	if steps, err := decodeResearchPlannerCompletionV3(
+		formatted, runtimepolicy.ResearchPlannerRendererVersionV32); err != nil || len(steps) != 1 {
+		t.Fatalf("v3.2 formatted exact planner output steps=%+v err=%v", steps, err)
+	}
 	if _, err := decodeResearchPlannerCompletionV3(formatted, "unknown-renderer"); err == nil {
 		t.Fatal("unknown renderer accepted planner output")
 	}
@@ -304,7 +355,7 @@ func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *test
 	_, snapshot, _, _ := researchBridgeFixtureV3(t)
 	snapshot.PlannerBudget.MaxPlannerRounds = 2
 	seal := runcontext.ResearchSnapshotSealV3{ResearchTools: coordinatorResearchToolsV3(t)}
-	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV31
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV32
 	seal.Payload.PlannerBudget.MaxToolCalls = 4
 	seal.Payload.Definition.TaskName = "Kimi plan watch"
 	seal.Payload.Definition.TaskManual = "Check official pricing and compare history."
@@ -403,7 +454,7 @@ func TestResearchPlannerPromptContainsOnlyFrozenInternalInputs(t *testing.T) {
 		},
 		ResearchTools: tools,
 	}
-	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV31
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV32
 	seal.Payload.Definition.TaskName = "Kimi plan watch"
 	seal.Payload.Definition.TaskManual = "Check official pricing and compare history."
 	prompt, err := buildResearchPlannerPromptV3(seal)

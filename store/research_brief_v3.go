@@ -19,12 +19,14 @@ import (
 )
 
 const (
-	researchBriefSynthesisSchemaV3   = "vane.research-brief-synthesis/v3"
-	researchEvidenceManifestSchemaV3 = "vane.research-evidence-manifest/v3"
-	researchHistoryManifestSchemaV3  = "vane.research-history-manifest/v3"
-	researchSynthesisContextSchemaV3 = "vane.research-synthesis-context/v3"
-	researchSynthesisContextMaxV3    = 32 << 20
-	researchHistoryContextCharsV3    = 4096
+	researchBriefSynthesisSchemaV3    = "vane.research-brief-synthesis/v3"
+	researchEvidenceManifestSchemaV3  = "vane.research-evidence-manifest/v3"
+	researchEvidenceManifestSchemaV31 = "vane.research-evidence-manifest/v3.1"
+	researchHistoryManifestSchemaV3   = "vane.research-history-manifest/v3"
+	researchSynthesisContextSchemaV3  = "vane.research-synthesis-context/v3"
+	researchSynthesisContextSchemaV31 = "vane.research-synthesis-context/v3.1"
+	researchSynthesisContextMaxV3     = 32 << 20
+	researchHistoryContextCharsV3     = 4096
 )
 
 type ResearchBriefSynthesisStatusV3 string
@@ -156,6 +158,7 @@ type researchEvidenceManifestItemV3 struct {
 type researchEvidenceManifestV3 struct {
 	SchemaVersion string                           `json:"schema_version"`
 	Items         []researchEvidenceManifestItemV3 `json:"items"`
+	ToolFailures  []researchToolFailureContextV31  `json:"tool_failures,omitempty"`
 }
 
 type researchEvidenceContextItemV3 struct {
@@ -165,6 +168,19 @@ type researchEvidenceContextItemV3 struct {
 	ContextVisibleSize   int    `json:"context_visible_size"`
 	ContextVisibleDigest string `json:"context_visible_digest"`
 	ContextTruncated     bool   `json:"context_truncated"`
+}
+
+// researchToolFailureContextV31 is a sanitized, immutable coverage fact. It
+// deliberately carries no provider prose or result bytes and therefore can
+// inform a quiet/unknown synthesis without being cited as current Evidence.
+type researchToolFailureContextV31 struct {
+	Ordinal       int    `json:"ordinal"`
+	InvocationID  string `json:"invocation_id"`
+	ToolName      string `json:"tool_name"`
+	RequestDigest string `json:"request_digest"`
+	Phase         string `json:"phase"`
+	ErrorCode     string `json:"error_code"`
+	CostMicroUSD  int64  `json:"cost_micro_usd"`
 }
 
 type researchHistoryManifestItemV3 struct {
@@ -222,6 +238,7 @@ type researchSynthesisContextV3 struct {
 	SchemaVersion   string                               `json:"schema_version"`
 	Definition      researchSynthesisDefinitionContextV3 `json:"definition"`
 	CurrentEvidence []researchEvidenceContextItemV3      `json:"current_evidence"`
+	ToolFailures    []researchToolFailureContextV31      `json:"tool_failures,omitempty"`
 	History         researchHistoryContextV3             `json:"history"`
 }
 
@@ -296,7 +313,8 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 		}
 		return PrepareResearchBriefSynthesisV3Result{Synthesis: existing}, nil
 	}
-	evidencePayload, evidenceContext, err := buildResearchEvidenceManifestV3(ctx, tx, params.Identity, params.PlanRef)
+	evidencePayload, evidenceContext, toolFailures, err :=
+		buildResearchEvidenceManifestV3(ctx, tx, params.Identity, params.PlanRef)
 	if err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, err
 	}
@@ -305,15 +323,20 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 	if err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, err
 	}
+	contextSchema := researchSynthesisContextSchemaV3
+	if len(toolFailures) > 0 {
+		contextSchema = researchSynthesisContextSchemaV31
+	}
 	contextPayload, err := json.Marshal(researchSynthesisContextV3{
-		SchemaVersion: researchSynthesisContextSchemaV3,
+		SchemaVersion: contextSchema,
 		Definition: researchSynthesisDefinitionContextV3{
 			TaskName:     snapshotSeal.Payload.Definition.TaskName,
 			TaskManual:   snapshotSeal.Payload.Definition.TaskManual,
 			Output:       snapshotSeal.Payload.Definition.Output,
 			Notification: snapshotSeal.Payload.Definition.Notification,
 		},
-		CurrentEvidence: evidenceContext, History: historyContext,
+		CurrentEvidence: evidenceContext, ToolFailures: toolFailures,
+		History: historyContext,
 	})
 	if err != nil || len(contextPayload) < 2 || len(contextPayload) > researchSynthesisContextMaxV3 {
 		return PrepareResearchBriefSynthesisV3Result{}, researchRunValidationError("research synthesis exact context exceeds its budget")
@@ -495,6 +518,10 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 	}
 	if row.Status != ResearchBriefSynthesisSpendingV3 {
 		return types.ResearchBriefRefV3{}, researchRunConflictError()
+	}
+	if err := validateResearchBriefCoverageV31(
+		brief, row.EvidenceManifest); err != nil {
+		return types.ResearchBriefRefV3{}, err
 	}
 	if err := validateResearchBriefCitationsV3(brief, row.EvidenceManifest, row.HistoryManifest); err != nil {
 		return types.ResearchBriefRefV3{}, err
@@ -771,7 +798,7 @@ func loadAndValidateResearchBriefSnapshotV3(
 func buildResearchEvidenceManifestV3(
 	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
 	planRef types.ResearchRunPlanRefV3,
-) ([]byte, []researchEvidenceContextItemV3, error) {
+) ([]byte, []researchEvidenceContextItemV3, []researchToolFailureContextV31, error) {
 	rows, err := tx.Query(ctx,
 		`SELECT evidence.id,evidence.step_ordinal,evidence.invocation_id,
 		        evidence.tool_name,evidence.request_digest,evidence.result_digest,
@@ -796,7 +823,7 @@ func buildResearchEvidenceManifestV3(
 		identity.TenantID, identity.UserID, identity.TaskID, planRef.PlanID,
 		identity.TemporalRunID, planRef.PlanDigest)
 	if err != nil {
-		return nil, nil, researchRunDatabaseError("load research Brief Evidence", err)
+		return nil, nil, nil, researchRunDatabaseError("load research Brief Evidence", err)
 	}
 	defer rows.Close()
 	items := make([]researchEvidenceManifestItemV3, 0, planRef.StepCount)
@@ -810,7 +837,7 @@ func buildResearchEvidenceManifestV3(
 			&contextItem.SynthesisVisibleText, &contextItem.ContextStoredSize,
 			&contextItem.ContextVisibleSize, &contextItem.ContextVisibleDigest,
 			&contextItem.ContextTruncated); err != nil {
-			return nil, nil, researchRunDatabaseError("scan research Brief Evidence", err)
+			return nil, nil, nil, researchRunDatabaseError("scan research Brief Evidence", err)
 		}
 		items = append(items, item)
 		contextItem.researchEvidenceManifestItemV3 = item
@@ -818,30 +845,88 @@ func buildResearchEvidenceManifestV3(
 			!validResearchRunDigest(contextItem.ContextVisibleDigest) ||
 			researchRunSHA256([]byte(contextItem.SynthesisVisibleText)) != contextItem.ContextVisibleDigest ||
 			contextItem.ContextTruncated != (contextItem.ContextStoredSize > contextItem.ContextVisibleSize) {
-			return nil, nil, researchRunIntegrityError()
+			return nil, nil, nil, researchRunIntegrityError()
 		}
 		contextItems = append(contextItems, contextItem)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, researchRunDatabaseError("iterate research Brief Evidence", err)
+		return nil, nil, nil, researchRunDatabaseError("iterate research Brief Evidence", err)
 	}
-	if len(items) != planRef.StepCount {
-		return nil, nil, researchRunValidationError("research Brief requires every completed Tool Evidence")
-	}
-	for ordinal, item := range items {
-		if item.EvidenceID <= 0 || item.Ordinal != ordinal ||
+	for _, item := range items {
+		if item.EvidenceID <= 0 || item.Ordinal < 0 || item.Ordinal >= planRef.StepCount ||
 			!validResearchRunDigest(item.RequestDigest) || !validResearchRunDigest(item.ResultDigest) ||
 			(item.TrustType != "local" && item.TrustType != "external") {
-			return nil, nil, researchRunIntegrityError()
+			return nil, nil, nil, researchRunIntegrityError()
 		}
 	}
+	failureRows, err := tx.Query(ctx,
+		`SELECT step_ordinal,invocation_id,tool_name,request_digest,phase,
+		        error_code,cost_micro_usd
+		   FROM research_run_steps
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND plan_id=$4
+		    AND temporal_run_id=$5 AND plan_digest=$6
+		    AND phase IN ('failed','indeterminate')
+		  ORDER BY step_ordinal`,
+		identity.TenantID, identity.UserID, identity.TaskID, planRef.PlanID,
+		identity.TemporalRunID, planRef.PlanDigest)
+	if err != nil {
+		return nil, nil, nil, researchRunDatabaseError(
+			"load research Brief Tool failures", err)
+	}
+	defer failureRows.Close()
+	failures := make([]researchToolFailureContextV31, 0, planRef.StepCount-len(items))
+	for failureRows.Next() {
+		var failure researchToolFailureContextV31
+		if err := failureRows.Scan(&failure.Ordinal, &failure.InvocationID,
+			&failure.ToolName, &failure.RequestDigest, &failure.Phase,
+			&failure.ErrorCode, &failure.CostMicroUSD); err != nil {
+			return nil, nil, nil, researchRunDatabaseError(
+				"scan research Brief Tool failure", err)
+		}
+		if failure.Ordinal < 0 || failure.Ordinal >= planRef.StepCount ||
+			!validResearchRunDigest(failure.RequestDigest) ||
+			(failure.Phase != string(ResearchRunStepFailedV3) &&
+				failure.Phase != string(ResearchRunStepIndeterminateV3)) ||
+			failure.ErrorCode == "" || strings.TrimSpace(failure.ErrorCode) != failure.ErrorCode ||
+			len(failure.ErrorCode) > 128 || failure.CostMicroUSD < 0 {
+			return nil, nil, nil, researchRunIntegrityError()
+		}
+		failures = append(failures, failure)
+	}
+	if err := failureRows.Err(); err != nil {
+		return nil, nil, nil, researchRunDatabaseError(
+			"iterate research Brief Tool failures", err)
+	}
+	covered := make([]bool, planRef.StepCount)
+	for _, item := range items {
+		if covered[item.Ordinal] {
+			return nil, nil, nil, researchRunIntegrityError()
+		}
+		covered[item.Ordinal] = true
+	}
+	for _, failure := range failures {
+		if covered[failure.Ordinal] {
+			return nil, nil, nil, researchRunIntegrityError()
+		}
+		covered[failure.Ordinal] = true
+	}
+	for _, terminal := range covered {
+		if !terminal {
+			return nil, nil, nil, researchRunValidationError(
+				"research Brief requires every Tool step to be terminal")
+		}
+	}
+	manifestSchema := researchEvidenceManifestSchemaV3
+	if len(failures) > 0 {
+		manifestSchema = researchEvidenceManifestSchemaV31
+	}
 	payload, err := json.Marshal(researchEvidenceManifestV3{
-		SchemaVersion: researchEvidenceManifestSchemaV3, Items: items,
+		SchemaVersion: manifestSchema, Items: items, ToolFailures: failures,
 	})
 	if err != nil || len(payload) > 64<<10 {
-		return nil, nil, researchRunIntegrityError()
+		return nil, nil, nil, researchRunIntegrityError()
 	}
-	return payload, contextItems, nil
+	return payload, contextItems, failures, nil
 }
 
 func buildResearchHistoryManifestV3(
@@ -975,7 +1060,10 @@ func validateResearchBriefCitationsV3(
 	var evidence researchEvidenceManifestV3
 	var history researchHistoryManifestV3
 	if json.Unmarshal(evidencePayload, &evidence) != nil ||
-		json.Unmarshal(historyPayload, &history) != nil {
+		json.Unmarshal(historyPayload, &history) != nil ||
+		!validResearchEvidenceManifestVersionV3(
+			evidence.SchemaVersion, len(evidence.ToolFailures)) ||
+		history.SchemaVersion != researchHistoryManifestSchemaV3 {
 		return researchRunIntegrityError()
 	}
 	evidenceRefs := make(map[string]struct{}, len(evidence.Items))
@@ -999,6 +1087,32 @@ func validateResearchBriefCitationsV3(
 		default:
 			return researchRunValidationError("research Brief citation kind is invalid")
 		}
+	}
+	return nil
+}
+
+func validateResearchBriefCoverageV31(
+	brief types.ResearchBriefPayloadV3, evidencePayload []byte,
+) error {
+	var evidence researchEvidenceManifestV3
+	if json.Unmarshal(evidencePayload, &evidence) != nil ||
+		!validResearchEvidenceManifestVersionV3(
+			evidence.SchemaVersion, len(evidence.ToolFailures)) {
+		return researchRunIntegrityError()
+	}
+	if len(evidence.ToolFailures) == 0 {
+		if brief.SchemaVersion != types.ResearchBriefPayloadSchemaV3 ||
+			brief.Assessment != "" {
+			return researchRunValidationError(
+				"complete-coverage research Brief must use the retained payload")
+		}
+		return nil
+	}
+	if brief.SchemaVersion != types.ResearchBriefPayloadSchemaV31 ||
+		brief.Assessment != types.ResearchBriefAssessmentUnknownV31 ||
+		brief.Significance != types.ResearchBriefSignificanceNoneV3 {
+		return researchRunValidationError(
+			"partial-coverage research Brief must be unknown and quiet")
 	}
 	return nil
 }
@@ -1198,11 +1312,15 @@ func researchBriefSynthesisFrozenPayloadsValidV3(row ResearchBriefSynthesisV3) b
 	var evidence researchEvidenceManifestV3
 	var history researchHistoryManifestV3
 	if json.Unmarshal(row.ContextPayload, &contextPayload) != nil ||
-		contextPayload.SchemaVersion != researchSynthesisContextSchemaV3 ||
+		!validResearchSynthesisContextVersionV3(
+			contextPayload.SchemaVersion, len(contextPayload.ToolFailures)) ||
 		json.Unmarshal(row.EvidenceManifest, &evidence) != nil ||
-		evidence.SchemaVersion != researchEvidenceManifestSchemaV3 ||
+		!validResearchEvidenceManifestVersionV3(
+			evidence.SchemaVersion, len(evidence.ToolFailures)) ||
 		json.Unmarshal(row.HistoryManifest, &history) != nil ||
-		history.SchemaVersion != researchHistoryManifestSchemaV3 {
+		history.SchemaVersion != researchHistoryManifestSchemaV3 ||
+		!equalResearchToolFailuresV31(
+			contextPayload.ToolFailures, evidence.ToolFailures) {
 		return false
 	}
 	canonicalContext, contextErr := json.Marshal(contextPayload)
@@ -1212,6 +1330,30 @@ func researchBriefSynthesisFrozenPayloadsValidV3(row ResearchBriefSynthesisV3) b
 		bytes.Equal(canonicalContext, row.ContextPayload) &&
 		bytes.Equal(canonicalEvidence, row.EvidenceManifest) &&
 		bytes.Equal(canonicalHistory, row.HistoryManifest)
+}
+
+func validResearchSynthesisContextVersionV3(version string, failures int) bool {
+	return (version == researchSynthesisContextSchemaV3 && failures == 0) ||
+		(version == researchSynthesisContextSchemaV31 && failures > 0)
+}
+
+func validResearchEvidenceManifestVersionV3(version string, failures int) bool {
+	return (version == researchEvidenceManifestSchemaV3 && failures == 0) ||
+		(version == researchEvidenceManifestSchemaV31 && failures > 0)
+}
+
+func equalResearchToolFailuresV31(
+	left, right []researchToolFailureContextV31,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func researchBriefRefFromSynthesisV3(row ResearchBriefSynthesisV3) (

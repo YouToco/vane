@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"strings"
@@ -39,6 +40,7 @@ const (
 	ResearchExecutionRecoveryNoReplayV3     ResearchExecutionErrorCodeV3 = "recovery_no_provider_replay"
 	ResearchExecutionEffectDeniedV3         ResearchExecutionErrorCodeV3 = "effect_denied"
 	ResearchExecutionProviderRejectedV3     ResearchExecutionErrorCodeV3 = "provider_rejected"
+	ResearchExecutionProviderReportedV3     ResearchExecutionErrorCodeV3 = "provider_reported_failure"
 	ResearchExecutionProviderUncertainV3    ResearchExecutionErrorCodeV3 = "provider_outcome_uncertain"
 	ResearchExecutionProviderTruncatedV3    ResearchExecutionErrorCodeV3 = "provider_result_truncated"
 	ResearchExecutionProviderReceiptV3      ResearchExecutionErrorCodeV3 = "provider_receipt_unavailable"
@@ -253,7 +255,7 @@ func (e *ResearchExecutorV3) ExecuteOnceV3(
 				ResearchExecutionDefiniteFailureV3, "exa", false,
 				ResearchExecutionEffectDeniedV3)
 		}
-		return e.failedProviderReceiptV3(providerReceipt, recorded, callKey)
+		return e.failedProviderReceiptV3(providerReceipt, recorded, callKey, err)
 	}
 	if !admitted {
 		return researchFailureReceiptV3(
@@ -280,7 +282,7 @@ func (e *ResearchExecutorV3) matchesFrozenRouteV3(
 }
 
 func (e *ResearchExecutorV3) failedProviderReceiptV3(
-	call types.ToolCall, recorded bool, callKey string,
+	call types.ToolCall, recorded bool, callKey string, providerErr error,
 ) ResearchExecutionReceiptV3 {
 	if !recorded {
 		receipt := researchFailureReceiptV3(
@@ -292,7 +294,10 @@ func (e *ResearchExecutorV3) failedProviderReceiptV3(
 	receipt := researchReceiptFromCallV3(call)
 	receipt.Status = ResearchExecutionIndeterminateV3
 	receipt.ErrorCode = ResearchExecutionProviderUncertainV3
-	if call.ResultSize > e.providerBodyCapV3(call.ToolName) {
+	if errors.Is(providerErr, ErrPageUnreachable) {
+		receipt.Status = ResearchExecutionDefiniteFailureV3
+		receipt.ErrorCode = ResearchExecutionProviderReportedV3
+	} else if call.ResultSize > e.providerBodyCapV3(call.ToolName) {
 		receipt.ProviderTruncated = true
 		receipt.ErrorCode = ResearchExecutionProviderTruncatedV3
 	} else if call.HTTPStatus != nil && *call.HTTPStatus >= 400 && *call.HTTPStatus < 500 {

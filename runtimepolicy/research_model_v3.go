@@ -19,6 +19,7 @@ const (
 
 	ResearchPlannerRendererVersionV3  = "research-planner.render/v3"
 	ResearchPlannerRendererVersionV31 = "research-planner.render/v3.1"
+	ResearchPlannerRendererVersionV32 = "research-planner.render/v3.2"
 )
 
 type ResearchModelStageV3 struct {
