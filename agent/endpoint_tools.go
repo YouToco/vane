@@ -81,8 +81,10 @@ type toolRunState struct {
 	// ownerRequest is the trusted current-user suffix only. Quoted cards,
 	// previous assistant text and external tool results never participate in
 	// intent routing or direct-write authorization.
-	ownerRequest string
-	intents      ToolIntent
+	ownerRequest         string
+	clarifiedOwnerAction string
+	manageTasksResult    string
+	intents              ToolIntent
 	// Intent toolkit rollout is fixed by the locally assembled Loop, never by
 	// model or external content. Shadow records aggregate exposure differences
 	// while returning the legacy registry unchanged.

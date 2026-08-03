@@ -307,8 +307,7 @@ func researchTaskCreationV3RequestEqual(
 ) bool {
 	if op == nil || op.ExecutionVersion != types.TaskCreationExecutionVersionV2 ||
 		op.ID != p.ID || op.TenantID != p.TenantID || op.UserID != p.UserID ||
-		op.Summary != p.Summary || !researchTaskCreationV3DefinitionsEqual(op.Args, p.Args) ||
-		!op.ExpiresAt.Equal(p.ExpiresAt) {
+		op.Summary != p.Summary || !researchTaskCreationV3DefinitionsEqual(op.Args, p.Args) {
 		return false
 	}
 	if (op.SessionID == nil) != (p.SessionID == nil) {

@@ -167,9 +167,7 @@ func researchV3CreationOperationMatches(
 	if op == nil || op.ID != p.ID || op.TenantID != p.TenantID || op.UserID != p.UserID ||
 		op.ToolName != "manage_tasks" ||
 		op.ExecutionVersion != types.TaskCreationExecutionVersionV2 ||
-		op.Status != types.TaskOperationStatusPending || op.Phase != "" ||
-		op.Summary != p.Summary || !researchV3CreationDefinitionsEqual(op.Args, p.Args) ||
-		!op.ExpiresAt.Equal(p.ExpiresAt) {
+		op.Summary != p.Summary || !researchV3CreationDefinitionsEqual(op.Args, p.Args) {
 		return false
 	}
 	if (op.SessionID == nil) != (p.SessionID == nil) {
