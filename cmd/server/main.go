@@ -772,6 +772,10 @@ func run() error {
 	authorizer := agent.NewModelOwnerActionAuthorizer(
 		agentLLMClient, recorder, cfg.LLM.AgentModel,
 	)
+	// Owner chat and the Dashboard mutate the same per-user Agent session.
+	// Their distinct Loop/catalog instances therefore share one admission
+	// domain; the sessionless A2A Loop below intentionally does not receive it.
+	sessionAdmission := agent.NewSessionAdmissionCoordinator()
 	tools := agent.BuildOwnerTools(
 		st,
 		agent.ManageTasksDeps{
@@ -788,19 +792,20 @@ func run() error {
 		authorizer, endpoints, exaTools,
 	)
 	agentLoop, err := agent.NewChecked(agent.Deps{
-		Client:       agentLLMClient,
-		Recorder:     recorder,
-		Store:        st,
-		Profiles:     st,
-		Tools:        tools,
-		Model:        cfg.LLM.AgentModel,
-		MaxTurns:     cfg.Agent.MaxTurns,
-		SessionTTL:   time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
-		OwnerAgent:   true,
-		Endpoints:    endpoints,
-		ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
-		Evidence:     st,
-		TaskCreation: creationCoordinator,
+		Client:           agentLLMClient,
+		Recorder:         recorder,
+		Store:            st,
+		Profiles:         st,
+		Tools:            tools,
+		Model:            cfg.LLM.AgentModel,
+		MaxTurns:         cfg.Agent.MaxTurns,
+		SessionTTL:       time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+		SessionAdmission: sessionAdmission,
+		OwnerAgent:       true,
+		Endpoints:        endpoints,
+		ToolCalls:        agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
+		Evidence:         st,
+		TaskCreation:     creationCoordinator,
 		// The current controller serves direct durable execution only.
 		TaskDefinitionEdit: definitionEditController,
 	})
@@ -827,6 +832,7 @@ func run() error {
 		Model:              cfg.LLM.AgentModel,
 		MaxTurns:           cfg.Agent.MaxTurns,
 		SessionTTL:         time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+		SessionAdmission:   sessionAdmission,
 		ToolCalls:          agent.NewToolCallRecorder(st),
 		Evidence:           st,
 		TaskCreation:       creationCoordinator,

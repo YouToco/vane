@@ -265,7 +265,7 @@ const (
 		(chatCallTimeout+10*time.Second) +
 		agentChatFirstRetryWait + agentChatLaterRetryWait
 
-	// appendCallbackTimeout 卡片回调回写的 DB 预算，在拿到 userMu 之后才起算——
+	// appendCallbackTimeout 卡片回调回写的 DB 预算，在拿到 session admission 后才起算——
 	// 锁等待可达对端整条消息预算（分钟级），不能占用回写自己的超时窗口。
 	appendCallbackTimeout = 5 * time.Second
 
@@ -333,6 +333,10 @@ type Deps struct {
 	Model      string        // cfg.LLM.AgentModel
 	MaxTurns   int           // cfg.Agent.MaxTurns
 	SessionTTL time.Duration // cfg.Agent.SessionTTLMinutes
+	// SessionAdmission is shared by every authenticated Loop that can mutate
+	// the same users' active Agent sessions. Nil creates a Loop-private domain
+	// for tests and sessionless/A2A composition.
+	SessionAdmission *SessionAdmissionCoordinator
 	// OwnerAgent selects the authenticated owner-chat lane. This is a static
 	// composition identity, not a rollout flag or per-user canary. A2A and
 	// retained Web compatibility loops must leave it false explicitly.
@@ -426,15 +430,10 @@ type Loop struct {
 		[]llm.ChatMessage,
 	) (taskEditIntentDecision, error)
 
-	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
-	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写；
-	// 即使最终 CommitAgentSessionTurn 有 base fence，用户在机器人"思考中"补发第二条消息
-	// 就会整段覆盖丢失第一条的交换，TTL 边界还会双开会话分叉。串行化后第二条消息
-	// 排队等待，天然看到第一条的完整上下文，也更符合"共享多轮会话"的语义。
-	// 等锁必须服从调用方 ctx：HTTP 已断开或 route execution deadline 已到时，
-	// 排队请求不能在旧 turn 结束后又开始读库、调用模型或持久化新 turn。
-	// 单 owner MVP 下 map 只会有一个条目，无清理需求。
-	userMu sync.Map // map[int64]*userTurnLock
+	// sessionAdmission serializes the complete load -> work -> commit turn across
+	// every session-bearing Loop in the same process. Owner chat and Web must
+	// share it; sessionless RunOnce deliberately bypasses it.
+	sessionAdmission *SessionAdmissionCoordinator
 
 	// sessionWriteMu closes admission before shutdown and serializes WaitGroup.Add
 	// with DrainSessionWrites.Wait. Without this gate a card callback can return,
@@ -450,57 +449,8 @@ type Loop struct {
 	contextShadowSlots chan struct{}
 }
 
-// userTurnLock is a context-aware binary semaphore. sync.Mutex cannot abandon
-// Lock when an HTTP request is canceled, so a queued grounded ask could outlive
-// its response deadline and then start a fresh paid/persistent turn.
-type userTurnLock struct {
-	token chan struct{}
-}
-
-func newUserTurnLock() *userTurnLock {
-	lock := &userTurnLock{token: make(chan struct{}, 1)}
-	lock.token <- struct{}{}
-	return lock
-}
-
-func (m *userTurnLock) Lock(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-m.token:
-		// Cancellation may race a ready token. Return it before leaving so the
-		// canceled waiter cannot enter any database/model work or strand the lock.
-		if err := ctx.Err(); err != nil {
-			m.Unlock()
-			return err
-		}
-		return nil
-	}
-}
-
-func (m *userTurnLock) TryLock() bool {
-	select {
-	case <-m.token:
-		return true
-	default:
-		return false
-	}
-}
-
-func (m *userTurnLock) Unlock() {
-	select {
-	case m.token <- struct{}{}:
-	default:
-		panic("agent: unlock of unlocked user turn lock")
-	}
-}
-
 func (l *Loop) lockForUser(userID int64) *userTurnLock {
-	value, _ := l.userMu.LoadOrStore(userID, newUserTurnLock())
-	return value.(*userTurnLock)
+	return l.sessionAdmission.lockForUser(userID)
 }
 
 // chatMetaKey/chatMeta 经 ctx 旁路传递记账元信息：chatFn 的签名由契约固定、
@@ -529,6 +479,10 @@ func New(d Deps) *Loop {
 // rather than silently dropped or overwritten.
 func NewChecked(d Deps) (*Loop, error) {
 	ownerAgent := d.OwnerAgent
+	sessionAdmission := d.SessionAdmission
+	if sessionAdmission == nil {
+		sessionAdmission = NewSessionAdmissionCoordinator()
+	}
 	maxTurns := d.MaxTurns
 	if maxTurns < 1 {
 		maxTurns = defaultMaxTurns
@@ -608,6 +562,7 @@ func NewChecked(d Deps) (*Loop, error) {
 		maxTurns:              maxTurns,
 		sessionTTL:            ttl,
 		ownerAgent:            ownerAgent,
+		sessionAdmission:      sessionAdmission,
 		sessionWriteAccepting: true,
 		contextShadowSlots:    make(chan struct{}, agentContextShadowConcurrency),
 	}
@@ -954,7 +909,7 @@ func (l *Loop) handleMessage(
 	text string,
 	externalInput bool,
 ) (Outcome, error) {
-	// per-user 串行化整个 load→loop→save（见 userMu 字段注释）。
+	// per-user 串行化整个 load→loop→save（跨所有共享 session admission 的 Loop）。
 	mu := l.lockForUser(userID)
 	if err := mu.Lock(ctx); err != nil {
 		return Outcome{}, err
@@ -1213,7 +1168,7 @@ func validDirectActionID(actionID string) bool {
 }
 
 // RunOnce 在给定历史上执行一轮多轮 FC（M4 契约 §7.1，A2A 轨 / a2a-contract §12 P2）：
-// 不读写会话存储、不持 userMu 锁、不注入画像——历史与并发语义完全由调用方管理
+// 不读写会话存储、不持 session admission 锁、不注入画像——历史与并发语义完全由调用方管理
 // （A2A 侧按 contextId 重建历史；外部 agent 的会话不该与 owner 飞书轨互相排队）。
 // 返回更新后的完整历史（含本轮 user/assistant/tool 消息），供调用方按自己的语义留存。
 //
@@ -3461,14 +3416,14 @@ func (l *Loop) RecordDefinitionEditReceiptSession(
 			"agent: task definition edit receipt session store is unavailable",
 		)
 	}
-	userMu := l.lockForUser(receipt.UserID)
-	if !userMu.TryLock() {
+	admission := l.lockForUser(receipt.UserID)
+	if !admission.TryLock() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		return errCreationReceiptSessionBusy
 	}
-	defer userMu.Unlock()
+	defer admission.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -3480,7 +3435,7 @@ func (l *Loop) RecordDefinitionEditReceiptSession(
 // NotifyEvent 把外部事件（推送卡反馈按钮点击，M5 契约 §12.4）以「[卡片回调]」user
 // 通告写入当前 active 会话；notice 由调用方（feedback 层）拼好完整文案（含前缀）。
 // 无 active 会话（TTL 外）直接丢弃、绝不新建——用户没在对话，一条通告不值得开新会话。
-// GetActiveAgentSession 现查必须发生在 userMu 锁内（审查 F14）：锁外查到的会话可能
+// GetActiveAgentSession 现查必须发生在共享 session admission 内（审查 F14）：锁外查到的会话可能
 // 在抢锁期间被换代（TTL 边界上 HandleMessage 新开会话），通告会写进过期会话。
 func (l *Loop) NotifyEvent(
 	ctx context.Context,
@@ -3514,7 +3469,7 @@ func (l *Loop) NotifyEvent(
 // legacy+ledger 原子性与精确重试反重复，不负责从业务事实耐久重建未开始的写入；
 // 扫描/checkpoint/断点重试属于 7.10。
 //
-//   - 持 per-user 锁（与 HandleMessage 的 userMu 同一把）：避免 side-writer
+//   - 持 per-user 锁（与所有 session-bearing HandleMessage 入口同一把）：避免 side-writer
 //     在 HandleMessage 的 load→save 窗口中间提交，使 normal-turn base fence
 //     因看见未加载的新投影而产生可避免的 stale-base conflict。
 //   - 抢锁与写库放在独立 goroutine：HandleMessage 可持锁整条消息预算（分钟级），
