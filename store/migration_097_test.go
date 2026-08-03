@@ -70,7 +70,8 @@ func TestMigration097DownRefusesClaimedUnsettledProviderEffectPostgres(t *testin
 		(!strings.Contains(err.Error(), "cannot remove frozen or issued process gateway effects") &&
 			!strings.Contains(err.Error(), "irreversible V3 prepare/cutover recovery migration") &&
 			!strings.Contains(err.Error(), "refusing downgrade after shadow Tool admission authority") &&
-			!strings.Contains(err.Error(), "refusing downgrade to row-locking shadow snapshot admission")) {
+			!strings.Contains(err.Error(), "refusing downgrade to row-locking shadow snapshot admission") &&
+			!strings.Contains(err.Error(), "irreversible partial-coverage Brief evidence may exist")) {
 		t.Fatalf("097 Down did not fail closed after unsettled claim: %v", err)
 	}
 

@@ -41,7 +41,7 @@ var modelToolDefinitionsV1 = []ModelToolDefinitionV1{
 			Capability: types.CapSearch, Kind: types.KindArticle,
 			ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
 		},
-		Description: "每次任务运行时实时搜索公开网页。query 可由模型按任务手册整理；include_domains 只有用户当前消息明确给出裸域名时才能填写。",
+		Description: "每次任务运行时实时搜索公开网页。query 可由模型按任务手册整理；include_domains 只能逐字使用已冻结在认证当前请求或可信任务手册中的用户明确裸域名。",
 		decoder:     decodeWebSearchArgumentsV1,
 		ExternalLocators: []ExternalLocatorV1{
 			{Argument: "include_domains", Kind: ExternalLocatorDomainsV1},
@@ -51,7 +51,7 @@ var modelToolDefinitionsV1 = []ModelToolDefinitionV1{
 			"properties":{
 				"query":{"type":"string","minLength":1,"description":"实时搜索词，可按用户目标语义整理"},
 				"category":{"type":"string","description":"可选公开网页类别，如 news"},
-				"include_domains":{"type":"array","uniqueItems":true,"items":{"type":"string"},"description":"可选裸域名白名单；只能逐字使用用户当前消息明确给出的域名"}
+				"include_domains":{"type":"array","uniqueItems":true,"items":{"type":"string"},"description":"可选裸域名白名单；只能逐字使用已冻结在认证当前请求或可信任务手册中的用户明确域名"}
 			},
 			"required":["query"],
 			"additionalProperties":false
@@ -84,14 +84,14 @@ var modelToolDefinitionsV1 = []ModelToolDefinitionV1{
 			Capability: types.CapContents, Kind: types.KindPageContent,
 			ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
 		},
-		Description: "每次运行读取一个指定网页并检测内容变化。page_url 必须由用户当前消息明确提供。",
+		Description: "每次运行读取一个指定网页并检测内容变化。page_url 必须由用户明确提供并冻结在认证当前请求或可信任务手册中。",
 		decoder:     decodeWebContentsArgumentsV1,
 		ExternalLocators: []ExternalLocatorV1{
 			{Argument: "page_url", Kind: ExternalLocatorLiteralV1},
 		},
 		ArgumentsSchema: json.RawMessage(`{
 			"type":"object",
-			"properties":{"page_url":{"type":"string","description":"用户明确给出的普通 http/https 页面地址"}},
+			"properties":{"page_url":{"type":"string","description":"用户明确提供并冻结在认证当前请求或可信任务手册中的普通 http/https 页面地址"}},
 			"required":["page_url"],
 			"additionalProperties":false
 		}`),

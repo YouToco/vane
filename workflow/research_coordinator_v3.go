@@ -249,7 +249,8 @@ func researchPlanFromCompletionV3(
 	seal runcontext.ResearchSnapshotSealV3, completion []byte,
 ) (runcontext.ResearchExecutionPlanV3, error) {
 	steps, err := decodeResearchPlannerCompletionV3(
-		completion, seal.ResearchModel.Planner.RendererVersion)
+		completion, seal.ResearchModel.Planner.RendererVersion,
+		snapshot.PlannerBudget.MaxToolCalls)
 	if err != nil {
 		return runcontext.ResearchExecutionPlanV3{}, err
 	}
@@ -326,11 +327,11 @@ func (r *ProductionResearchRuntimeV3) ExecuteStep(
 		return ResearchStepReceiptV3{}, researchCoordinatorValidationV3(
 			"research step produced no terminal receipt")
 	}
-	if _, err := r.store.CommitResearchRunStepV3(ctx, *persistence.Terminal); err != nil {
+	terminal, err := r.store.CommitResearchRunStepV3(ctx, *persistence.Terminal)
+	if err != nil {
 		return ResearchStepReceiptV3{}, err
 	}
-	return ResearchStepReceiptV3{}, types.NewAppError(types.CodeConflict,
-		"research Tool step ended without usable evidence", types.ErrConflict)
+	return researchStepReceiptFromTerminalV3(terminal)
 }
 
 func (r *ProductionResearchRuntimeV3) Synthesize(
@@ -364,6 +365,13 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 	}
 	if err := validateResearchSnapshotSealForCoordinatorV3(seal, snapshot); err != nil {
 		return ResearchBriefRefV3{}, err
+	}
+	if prepared.PartialCoverage &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV31 {
+		return ResearchBriefRefV3{}, types.NewAppError(types.CodeConflict,
+			"frozen research synthesis renderer cannot express partial coverage",
+			types.ErrConflict)
 	}
 	userPrompt := string(prepared.Synthesis.ContextPayload)
 	reservation, err := r.store.BeginResearchRunLLMSpendV3(ctx,
@@ -558,7 +566,7 @@ type researchPlannerOutputV3 struct {
 }
 
 func decodeResearchPlannerCompletionV3(
-	raw []byte, rendererVersion string,
+	raw []byte, rendererVersion string, maxToolCalls int,
 ) ([]runcontext.ResearchPlanStepV3, error) {
 	if len(raw) < 2 || len(raw) > 256<<10 {
 		return nil, researchCoordinatorValidationV3("research planner output is invalid")
@@ -566,7 +574,8 @@ func decodeResearchPlannerCompletionV3(
 	var output researchPlannerOutputV3
 	if err := strictjson.DecodeExact(raw, &output); err != nil ||
 		output.SchemaVersion != researchPlannerOutputSchemaV3 ||
-		len(output.Steps) == 0 || len(output.Steps) > 16 {
+		len(output.Steps) < minimumResearchPlannerStepsV3(rendererVersion, maxToolCalls) ||
+		len(output.Steps) > maxToolCalls || maxToolCalls <= 0 || maxToolCalls > 16 {
 		return nil, researchCoordinatorValidationV3("research planner output is invalid")
 	}
 	switch rendererVersion {
@@ -576,7 +585,8 @@ func decodeResearchPlannerCompletionV3(
 			return nil, researchCoordinatorValidationV3(
 				"research planner output must be canonical JSON")
 		}
-	case runtimepolicy.ResearchPlannerRendererVersionV31:
+	case runtimepolicy.ResearchPlannerRendererVersionV31,
+		runtimepolicy.ResearchPlannerRendererVersionV32:
 		// v3.1 keeps the exact semantic shape but accepts representation-only
 		// whitespace and object-key order. The durable plan is canonicalized by
 		// BuildResearchExecutionPlanV3 before it can be persisted.
@@ -587,6 +597,14 @@ func decodeResearchPlannerCompletionV3(
 	steps := make([]runcontext.ResearchPlanStepV3, len(output.Steps))
 	copy(steps, output.Steps)
 	return steps, nil
+}
+
+func minimumResearchPlannerStepsV3(rendererVersion string, maxToolCalls int) int {
+	if rendererVersion == runtimepolicy.ResearchPlannerRendererVersionV32 &&
+		maxToolCalls >= 2 {
+		return 2
+	}
+	return 1
 }
 
 type researchPlannerPromptToolV3 struct {
@@ -641,7 +659,8 @@ func buildResearchPlannerPromptV3(seal runcontext.ResearchSnapshotSealV3) (strin
 	switch seal.ResearchModel.Planner.RendererVersion {
 	case runtimepolicy.ResearchPlannerRendererVersionV3:
 		return buildResearchPlannerPromptLegacyV3(seal)
-	case runtimepolicy.ResearchPlannerRendererVersionV31:
+	case runtimepolicy.ResearchPlannerRendererVersionV31,
+		runtimepolicy.ResearchPlannerRendererVersionV32:
 		return buildResearchPlannerPromptV31(seal)
 	default:
 		return "", researchCoordinatorValidationV3(
@@ -691,10 +710,12 @@ func buildResearchPlannerPromptV31(
 		MaxToolCalls:      seal.Payload.PlannerBudget.MaxToolCalls,
 		AllowedTools:      researchPlannerPromptToolsV3(seal),
 		ResponseContract: researchPlannerResponseContractV3{
-			SchemaVersionLiteral:       researchPlannerOutputSchemaV3,
-			RequiredTopLevelFields:     []string{"schema_version", "steps"},
-			RequiredStepFields:         []string{"invocation_id", "tool_name", "arguments"},
-			MinSteps:                   1,
+			SchemaVersionLiteral:   researchPlannerOutputSchemaV3,
+			RequiredTopLevelFields: []string{"schema_version", "steps"},
+			RequiredStepFields:     []string{"invocation_id", "tool_name", "arguments"},
+			MinSteps: minimumResearchPlannerStepsV3(
+				seal.ResearchModel.Planner.RendererVersion,
+				seal.Payload.PlannerBudget.MaxToolCalls),
 			MaxSteps:                   seal.Payload.PlannerBudget.MaxToolCalls,
 			ToolNameRule:               "must exactly equal one allowed_tools[].name",
 			ArgumentsRule:              "must be an object matching that allowed tool's parameters schema",
@@ -726,7 +747,8 @@ func buildResearchPlannerCorrectionPromptV3(
 	switch rendererVersion {
 	case runtimepolicy.ResearchPlannerRendererVersionV3:
 		instruction = "The previous response failed the strict schema or canonicalization contract. Return only one canonical JSON object matching the required response schema."
-	case runtimepolicy.ResearchPlannerRendererVersionV31:
+	case runtimepolicy.ResearchPlannerRendererVersionV31,
+		runtimepolicy.ResearchPlannerRendererVersionV32:
 		instruction = "The previous response failed the exact field contract. Return only one JSON object matching response_contract; do not add or rename fields."
 	default:
 		return "", researchCoordinatorValidationV3(
@@ -779,6 +801,7 @@ func researchStepReceiptFromEvidenceV3(
 ) ResearchStepReceiptV3 {
 	return ResearchStepReceiptV3{
 		StepID: receipt.StepID, Ordinal: receipt.Ordinal,
+		Phase:        string(receipt.Phase),
 		InvocationID: receipt.InvocationID, ToolName: receipt.ToolName,
 		RequestDigest: receipt.RequestDigest, ResultDigest: receipt.ResultDigest,
 		EvidenceID: receipt.EvidenceID,
@@ -788,19 +811,44 @@ func researchStepReceiptFromEvidenceV3(
 func researchStepReceiptFromResolutionV3(
 	resolution storepkg.ResearchRunStepResolutionV3,
 ) (ResearchStepReceiptV3, error) {
-	if resolution.Phase != storepkg.ResearchRunStepCompletedV3 ||
-		resolution.Evidence == nil {
-		return ResearchStepReceiptV3{}, types.NewAppError(types.CodeConflict,
-			"research Tool step has no recoverable evidence", types.ErrConflict)
+	if resolution.Phase == storepkg.ResearchRunStepCompletedV3 {
+		if resolution.Evidence == nil {
+			return ResearchStepReceiptV3{}, types.NewAppError(types.CodeConflict,
+				"research completed Tool step has no recoverable evidence", types.ErrConflict)
+		}
+		return ResearchStepReceiptV3{
+			StepID: resolution.Receipt.StepID, Ordinal: resolution.Receipt.Ordinal,
+			Phase:         string(resolution.Phase),
+			InvocationID:  resolution.Receipt.InvocationID,
+			ToolName:      resolution.Receipt.ToolName,
+			RequestDigest: resolution.Receipt.RequestDigest,
+			ResultDigest:  resolution.Receipt.ResultDigest,
+			EvidenceID:    resolution.Evidence.EvidenceID,
+		}, nil
 	}
-	return ResearchStepReceiptV3{
-		StepID: resolution.Receipt.StepID, Ordinal: resolution.Receipt.Ordinal,
-		InvocationID:  resolution.Receipt.InvocationID,
-		ToolName:      resolution.Receipt.ToolName,
-		RequestDigest: resolution.Receipt.RequestDigest,
-		ResultDigest:  resolution.Receipt.ResultDigest,
-		EvidenceID:    resolution.Evidence.EvidenceID,
-	}, nil
+	return researchStepReceiptFromTerminalV3(resolution.Receipt)
+}
+
+func researchStepReceiptFromTerminalV3(
+	receipt storepkg.ResearchRunStepReceiptV3,
+) (ResearchStepReceiptV3, error) {
+	if receipt.Phase != storepkg.ResearchRunStepFailedV3 &&
+		receipt.Phase != storepkg.ResearchRunStepIndeterminateV3 {
+		return ResearchStepReceiptV3{}, types.NewAppError(types.CodeConflict,
+			"research Tool terminal receipt is not recoverable", types.ErrConflict)
+	}
+	result := ResearchStepReceiptV3{
+		StepID: receipt.StepID, Ordinal: receipt.Ordinal,
+		Phase:         string(receipt.Phase),
+		InvocationID:  receipt.InvocationID,
+		ToolName:      receipt.ToolName,
+		RequestDigest: receipt.RequestDigest,
+		ErrorCode:     receipt.ErrorCode,
+	}
+	if err := result.Validate(receipt.Ordinal); err != nil {
+		return ResearchStepReceiptV3{}, err
+	}
+	return result, nil
 }
 
 func researchBriefRefFromCoordinatorSynthesisV3(

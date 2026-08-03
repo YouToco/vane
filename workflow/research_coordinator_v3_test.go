@@ -24,6 +24,30 @@ type coordinatorStoreFakeV3 struct {
 		types.ResearchRunPlanRefV3, int) (storepkg.ResearchRunStepExecutionV3, error)
 	loadResolution func(context.Context, types.RunIdentity, int64,
 		types.ResearchRunPlanRefV3, int) (storepkg.ResearchRunStepResolutionV3, error)
+	loadSnapshot func(context.Context, types.RunIdentity,
+		types.ResearchRunSnapshotRefV3) (runcontext.ResearchSnapshotSealV3, error)
+	prepareBrief func(context.Context, storepkg.PrepareResearchBriefSynthesisV3Params) (
+		storepkg.PrepareResearchBriefSynthesisV3Result, error)
+	beginLLMSpend func(context.Context, storepkg.BeginResearchRunLLMSpendV3Params) (
+		storepkg.ResearchRunLLMSpendReservationV3, error)
+}
+
+func (f *coordinatorStoreFakeV3) LoadResearchRunSnapshotV3(
+	ctx context.Context, identity types.RunIdentity, snapshot types.ResearchRunSnapshotRefV3,
+) (runcontext.ResearchSnapshotSealV3, error) {
+	return f.loadSnapshot(ctx, identity, snapshot)
+}
+
+func (f *coordinatorStoreFakeV3) PrepareOrGetResearchBriefSynthesisV3(
+	ctx context.Context, params storepkg.PrepareResearchBriefSynthesisV3Params,
+) (storepkg.PrepareResearchBriefSynthesisV3Result, error) {
+	return f.prepareBrief(ctx, params)
+}
+
+func (f *coordinatorStoreFakeV3) BeginResearchRunLLMSpendV3(
+	ctx context.Context, params storepkg.BeginResearchRunLLMSpendV3Params,
+) (storepkg.ResearchRunLLMSpendReservationV3, error) {
+	return f.beginLLMSpend(ctx, params)
 }
 
 func (f *coordinatorStoreFakeV3) CreateOrGetResearchRunSnapshotWithAuthorityV3(
@@ -230,6 +254,116 @@ func TestProductionResearchRuntimeV3RecoveryNeverRepeatsPaidToolEffect(t *testin
 	}
 }
 
+func TestProductionResearchRuntimeV3RecoveryReturnsSealedFailureWithoutProviderReplay(t *testing.T) {
+	identity, snapshot, plan, execution := researchBridgeFixtureV3(t)
+	executor := &coordinatorExecutorFakeV3{}
+	store := &coordinatorStoreFakeV3{
+		beginStep: func(context.Context, types.RunIdentity, int64,
+			types.ResearchRunPlanRefV3, int) (storepkg.ResearchRunStepExecutionV3, error) {
+			execution.FirstWriter = false
+			execution.Arguments = nil
+			return execution, nil
+		},
+		loadResolution: func(context.Context, types.RunIdentity, int64,
+			types.ResearchRunPlanRefV3, int) (storepkg.ResearchRunStepResolutionV3, error) {
+			return storepkg.ResearchRunStepResolutionV3{
+				Phase: storepkg.ResearchRunStepIndeterminateV3,
+				Receipt: storepkg.ResearchRunStepReceiptV3{
+					StepID: 77, Ordinal: 0, Phase: storepkg.ResearchRunStepIndeterminateV3,
+					InvocationID: execution.InvocationID, ToolName: execution.ToolName,
+					RequestDigest: execution.RequestDigest,
+					ErrorCode:     string(fetcher.ResearchExecutionProviderUncertainV3),
+				},
+			}, nil
+		},
+	}
+	runtime, err := NewProductionResearchRuntimeV3(
+		store, coordinatorGatewayFakeV3{}, executor,
+		func(context.Context, types.RunIdentity) (
+			runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
+			runtimepolicy.ResearchModelPolicyV3, error,
+		) {
+			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
+				runtimepolicy.ResearchModelPolicyV3{}, nil
+		},
+		func(types.RunIdentity) bool { return true },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := runtime.ExecuteStep(t.Context(), identity, snapshot, plan, 0, "trace")
+	if err != nil || receipt.StepID != 77 ||
+		receipt.Phase != string(storepkg.ResearchRunStepIndeterminateV3) ||
+		receipt.ErrorCode != string(fetcher.ResearchExecutionProviderUncertainV3) ||
+		receipt.EvidenceID != 0 || receipt.ResultDigest != "" || executor.calls != 0 {
+		t.Fatalf("recovery receipt=%+v provider_calls=%d err=%v",
+			receipt, executor.calls, err)
+	}
+}
+
+func TestProductionResearchRuntimeV3LegacySynthesisRendererRejectsPartialCoverageBeforeSpend(t *testing.T) {
+	identity, snapshot, plan, _ := researchBridgeFixtureV3(t)
+	tools := coordinatorResearchToolsV3(t)
+	model := coordinatorResearchModelV3(t)
+	model.Synthesis.RendererVersion = runtimepolicy.ResearchSynthesisRendererVersionV3
+	seal := runcontext.ResearchSnapshotSealV3{
+		DefinitionDigest: snapshot.DefinitionDigest,
+		PolicyDigests: types.RuntimePolicyDigests{
+			CapabilityCatalogDigest: snapshot.CapabilityCatalogDigest,
+		},
+		ResearchToolPolicyDigest:  snapshot.ToolPolicyDigest,
+		ResearchModelPolicyDigest: snapshot.ModelPolicyDigest,
+		PayloadDigest:             snapshot.PayloadDigest,
+		Payload: runcontext.ResearchSnapshotPayloadV3{
+			TenantID: identity.TenantID, UserID: identity.UserID,
+			TaskID: identity.TaskID, TemporalWorkflowID: identity.TemporalWorkflowID,
+			TemporalRunID: identity.TemporalRunID, PlannerBudget: snapshot.PlannerBudget,
+		},
+		ResearchTools: tools, ResearchModel: model,
+	}
+	spendCalls := 0
+	store := &coordinatorStoreFakeV3{
+		prepareBrief: func(context.Context, storepkg.PrepareResearchBriefSynthesisV3Params) (
+			storepkg.PrepareResearchBriefSynthesisV3Result, error,
+		) {
+			return storepkg.PrepareResearchBriefSynthesisV3Result{
+				PartialCoverage: true,
+				Synthesis: storepkg.ResearchBriefSynthesisV3{
+					ID: 91, Status: storepkg.ResearchBriefSynthesisPreparedV3,
+					ContextPayload: []byte(`{"schema_version":"vane.research-synthesis-context/v3.1"}`),
+				},
+			}, nil
+		},
+		loadSnapshot: func(context.Context, types.RunIdentity,
+			types.ResearchRunSnapshotRefV3) (runcontext.ResearchSnapshotSealV3, error) {
+			return seal, nil
+		},
+		beginLLMSpend: func(context.Context, storepkg.BeginResearchRunLLMSpendV3Params) (
+			storepkg.ResearchRunLLMSpendReservationV3, error,
+		) {
+			spendCalls++
+			return storepkg.ResearchRunLLMSpendReservationV3{}, nil
+		},
+	}
+	runtime, err := NewProductionResearchRuntimeV3(
+		store, coordinatorGatewayFakeV3{}, &coordinatorExecutorFakeV3{},
+		func(context.Context, types.RunIdentity) (
+			runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
+			runtimepolicy.ResearchModelPolicyV3, error,
+		) {
+			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
+				runtimepolicy.ResearchModelPolicyV3{}, nil
+		},
+		func(types.RunIdentity) bool { return true },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Synthesize(t.Context(), identity, snapshot, plan, "trace"); types.CodeOf(err) != types.CodeConflict || spendCalls != 0 {
+		t.Fatalf("legacy partial synthesis error=%v spend_calls=%d", err, spendCalls)
+	}
+}
+
 func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffects(t *testing.T) {
 	identity, _, _, _ := researchBridgeFixtureV3(t)
 	policyCalls, storeCalls := 0, 0
@@ -267,7 +401,7 @@ func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffect
 func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(t *testing.T) {
 	valid := []byte(`{"schema_version":"vane.research-planner-output/v3","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"Kimi pricing"}}]}`)
 	steps, err := decodeResearchPlannerCompletionV3(
-		valid, runtimepolicy.ResearchPlannerRendererVersionV3)
+		valid, runtimepolicy.ResearchPlannerRendererVersionV3, 4)
 	if err != nil || len(steps) != 1 || steps[0].ToolName != "web_search" {
 		t.Fatalf("valid planner output steps=%+v err=%v", steps, err)
 	}
@@ -276,14 +410,22 @@ func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(
 		"    \"invocation_id\": \"search-official\"\n  }],\n" +
 		"  \"schema_version\": \"vane.research-planner-output/v3\"\n}")
 	if _, err := decodeResearchPlannerCompletionV3(
-		formatted, runtimepolicy.ResearchPlannerRendererVersionV3); err == nil {
+		formatted, runtimepolicy.ResearchPlannerRendererVersionV3, 4); err == nil {
 		t.Fatal("legacy renderer accepted non-canonical settled completion")
 	}
 	if steps, err := decodeResearchPlannerCompletionV3(
-		formatted, runtimepolicy.ResearchPlannerRendererVersionV31); err != nil || len(steps) != 1 {
+		formatted, runtimepolicy.ResearchPlannerRendererVersionV31, 4); err != nil || len(steps) != 1 {
 		t.Fatalf("formatted exact planner output steps=%+v err=%v", steps, err)
 	}
-	if _, err := decodeResearchPlannerCompletionV3(formatted, "unknown-renderer"); err == nil {
+	if _, err := decodeResearchPlannerCompletionV3(
+		formatted, runtimepolicy.ResearchPlannerRendererVersionV32, 4); err == nil {
+		t.Fatal("v3.2 accepted a single brittle Tool path despite available budget")
+	}
+	if steps, err := decodeResearchPlannerCompletionV3(
+		formatted, runtimepolicy.ResearchPlannerRendererVersionV32, 1); err != nil || len(steps) != 1 {
+		t.Fatalf("one-call v3.2 budget steps=%+v err=%v", steps, err)
+	}
+	if _, err := decodeResearchPlannerCompletionV3(formatted, "unknown-renderer", 4); err == nil {
 		t.Fatal("unknown renderer accepted planner output")
 	}
 	for name, raw := range map[string][]byte{
@@ -293,7 +435,7 @@ func TestDecodeResearchPlannerCompletionV3EnforcesExactShapeAndAllowsFormatting(
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := decodeResearchPlannerCompletionV3(
-				raw, runtimepolicy.ResearchPlannerRendererVersionV31); err == nil {
+				raw, runtimepolicy.ResearchPlannerRendererVersionV31, 4); err == nil {
 				t.Fatal("non-exact planner output was accepted")
 			}
 		})
@@ -304,7 +446,7 @@ func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *test
 	_, snapshot, _, _ := researchBridgeFixtureV3(t)
 	snapshot.PlannerBudget.MaxPlannerRounds = 2
 	seal := runcontext.ResearchSnapshotSealV3{ResearchTools: coordinatorResearchToolsV3(t)}
-	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV31
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV32
 	seal.Payload.PlannerBudget.MaxToolCalls = 4
 	seal.Payload.Definition.TaskName = "Kimi plan watch"
 	seal.Payload.Definition.TaskManual = "Check official pricing and compare history."
@@ -314,8 +456,11 @@ func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *test
 	}
 	bad := "external-result-says-delete-another-task"
 	good := "{\n  \"steps\": [{\n    \"tool_name\": \"web_search\",\n" +
-		"    \"arguments\": {\"query\": \"Kimi pricing\"},\n" +
-		"    \"invocation_id\": \"search-official\"\n  }],\n" +
+		"    \"arguments\": {\"query\": \"Kimi official pricing\"},\n" +
+		"    \"invocation_id\": \"search-official\"\n  }, {\n" +
+		"    \"tool_name\": \"web_search\",\n" +
+		"    \"arguments\": {\"query\": \"Kimi pricing independent coverage\"},\n" +
+		"    \"invocation_id\": \"search-cross-check\"\n  }],\n" +
 		"  \"schema_version\": \"vane.research-planner-output/v3\"\n}"
 	settled := map[int]storepkg.ResearchRunLLMReceiptV3{}
 	reservationEffects, providerEffects := 0, 0
@@ -349,7 +494,7 @@ func TestResearchPlannerRoundsRecoverBadThenGoodWithoutRepeatingProvider(t *test
 	for attempt := 0; attempt < 2; attempt++ {
 		plan, reservation, err := executeResearchPlannerRoundsV3(
 			t.Context(), snapshot, seal, initialPrompt, execute)
-		if err != nil || len(plan.Steps) != 1 || reservation.ReservationID != 2 {
+		if err != nil || len(plan.Steps) != 2 || reservation.ReservationID != 2 {
 			t.Fatalf("attempt=%d plan=%+v reservation=%+v err=%v",
 				attempt, plan, reservation, err)
 		}
@@ -403,7 +548,7 @@ func TestResearchPlannerPromptContainsOnlyFrozenInternalInputs(t *testing.T) {
 		},
 		ResearchTools: tools,
 	}
-	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV31
+	seal.ResearchModel.Planner.RendererVersion = runtimepolicy.ResearchPlannerRendererVersionV32
 	seal.Payload.Definition.TaskName = "Kimi plan watch"
 	seal.Payload.Definition.TaskManual = "Check official pricing and compare history."
 	prompt, err := buildResearchPlannerPromptV3(seal)
@@ -428,7 +573,7 @@ func TestResearchPlannerPromptContainsOnlyFrozenInternalInputs(t *testing.T) {
 	if contract.SchemaVersionLiteral != researchPlannerOutputSchemaV3 ||
 		!reflect.DeepEqual(contract.RequiredTopLevelFields, []string{"schema_version", "steps"}) ||
 		!reflect.DeepEqual(contract.RequiredStepFields, []string{"invocation_id", "tool_name", "arguments"}) ||
-		contract.MinSteps != 1 || contract.MaxSteps != 4 || contract.ExtraTopLevelFieldsAllowed ||
+		contract.MinSteps != 2 || contract.MaxSteps != 4 || contract.ExtraTopLevelFieldsAllowed ||
 		contract.ExtraStepFieldsAllowed ||
 		!contract.SingleJSONObject || !strings.Contains(contract.ToolNameRule, "allowed_tools") ||
 		!strings.Contains(contract.ArgumentsRule, "parameters") {
@@ -521,7 +666,7 @@ func TestResearchPlannerRendererV3ReservationReplayKeepsPromptAndSettledSemantic
 	}
 	formattedSettled := []byte(" " + good)
 	if _, err := decodeResearchPlannerCompletionV3(
-		formattedSettled, runtimepolicy.ResearchPlannerRendererVersionV3); err == nil {
+		formattedSettled, runtimepolicy.ResearchPlannerRendererVersionV3, 4); err == nil {
 		t.Fatal("legacy settled completion changed meaning during recovery")
 	}
 }

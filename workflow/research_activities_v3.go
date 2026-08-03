@@ -9,6 +9,7 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 
+	storepkg "github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
 
@@ -71,19 +72,45 @@ type ExecuteResearchStepV3Input struct {
 type ResearchStepReceiptV3 struct {
 	StepID        int64  `json:"step_id"`
 	Ordinal       int    `json:"ordinal"`
+	Phase         string `json:"phase"`
 	InvocationID  string `json:"invocation_id"`
 	ToolName      string `json:"tool_name"`
 	RequestDigest string `json:"request_digest"`
-	ResultDigest  string `json:"result_digest"`
-	EvidenceID    int64  `json:"evidence_id"`
+	ResultDigest  string `json:"result_digest,omitempty"`
+	EvidenceID    int64  `json:"evidence_id,omitempty"`
+	ErrorCode     string `json:"error_code,omitempty"`
 }
 
 func (r ResearchStepReceiptV3) Validate(ordinal int) error {
-	if r.StepID <= 0 || r.EvidenceID <= 0 || r.Ordinal != ordinal ||
+	if r.StepID <= 0 || r.Ordinal != ordinal ||
 		!researchV3Text(r.InvocationID, 255) || !researchV3Text(r.ToolName, 255) ||
-		!researchV3Digest(r.RequestDigest) || !researchV3Digest(r.ResultDigest) {
+		!researchV3Digest(r.RequestDigest) {
 		return types.NewAppError(types.CodeValidation,
 			"research step receipt is invalid", nil)
+	}
+	switch r.Phase {
+	case "":
+		// Activity results written before the terminal-outcome union had no
+		// phase field. Only the old exact success shape is replay-compatible;
+		// an empty phase can never authorize a failed/indeterminate receipt.
+		if r.EvidenceID <= 0 || !researchV3Digest(r.ResultDigest) || r.ErrorCode != "" {
+			return types.NewAppError(types.CodeValidation,
+				"legacy research completed step receipt is invalid", nil)
+		}
+	case string(storepkg.ResearchRunStepCompletedV3):
+		if r.EvidenceID <= 0 || !researchV3Digest(r.ResultDigest) || r.ErrorCode != "" {
+			return types.NewAppError(types.CodeValidation,
+				"research completed step receipt is invalid", nil)
+		}
+	case string(storepkg.ResearchRunStepFailedV3),
+		string(storepkg.ResearchRunStepIndeterminateV3):
+		if r.EvidenceID != 0 || r.ResultDigest != "" || !researchV3Text(r.ErrorCode, 128) {
+			return types.NewAppError(types.CodeValidation,
+				"research failed step receipt is invalid", nil)
+		}
+	default:
+		return types.NewAppError(types.CodeValidation,
+			"research step receipt phase is invalid", nil)
 	}
 	return nil
 }

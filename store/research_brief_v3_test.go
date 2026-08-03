@@ -58,6 +58,15 @@ func newResearchBriefFixtureWithWorkflowV3(
 ) researchBriefFixtureV3 {
 	t.Helper()
 	st := tenantTestStore(t)
+	return newResearchBriefFixtureWithStoreAndWorkflowV3(
+		t, st, threshold, completeEvidence, evidenceResult, authorityToken, workflowID)
+}
+
+func newResearchBriefFixtureWithStoreAndWorkflowV3(
+	t *testing.T, st *Store, threshold taskstate.NotificationThresholdV3,
+	completeEvidence bool, evidenceResult []byte, authorityToken, workflowID string,
+) researchBriefFixtureV3 {
+	t.Helper()
 	useOwnerResearchRuntimeForTest(st)
 	ctx := t.Context()
 	userID := testUser(t, st)
@@ -675,6 +684,96 @@ func TestResearchBriefSynthesisV3RequiresCompleteEvidenceAndFailsIdempotently(t 
 	}
 	if _, err := complete.st.ClaimResearchBriefSynthesisV3(t.Context(), handle); err == nil {
 		t.Fatal("legacy NULL-bound terminal row authorized a model claim")
+	}
+}
+
+func TestResearchBriefSynthesisV31SealsTerminalFailureAsUnknownAndQuiet(t *testing.T) {
+	f := newResearchBriefFixtureV3(t, taskstate.NotificationThresholdQualifiedV3, false)
+	traceID := researchExecutionTraceV3ForTest(
+		t, f.identity, f.snapshotRef.SnapshotID, f.planRef, 0, "search-official")
+	terminal, err := f.st.CommitResearchRunStepV3(t.Context(), CommitResearchRunStepV3Params{
+		Identity: f.identity, RunSnapshotID: f.snapshotRef.SnapshotID,
+		PlanRef: f.planRef, Ordinal: 0, Phase: ResearchRunStepFailedV3,
+		CostMicroUSD: 100, ErrorCode: "provider_reported_failure",
+		ProviderCall: researchProviderCallV3ForTest(traceID, 100),
+	})
+	if err != nil || terminal.Phase != ResearchRunStepFailedV3 {
+		t.Fatalf("terminal=%+v err=%v", terminal, err)
+	}
+
+	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evidence researchEvidenceManifestV3
+	var context researchSynthesisContextV3
+	if err := json.Unmarshal(prepared.Synthesis.EvidenceManifest, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(prepared.Synthesis.ContextPayload, &context); err != nil {
+		t.Fatal(err)
+	}
+	if evidence.SchemaVersion != researchEvidenceManifestSchemaV31 ||
+		len(evidence.Items) != 0 || len(evidence.ToolFailures) != 1 ||
+		evidence.ToolFailures[0].Phase != string(ResearchRunStepFailedV3) ||
+		evidence.ToolFailures[0].ErrorCode != "provider_reported_failure" ||
+		context.SchemaVersion != researchSynthesisContextSchemaV31 ||
+		!equalResearchToolFailuresV31(context.ToolFailures, evidence.ToolFailures) {
+		t.Fatalf("evidence=%+v context=%+v", evidence, context)
+	}
+	for name, forged := range map[string]types.ResearchBriefPayloadV3{
+		"legacy complete": {
+			SchemaVersion: types.ResearchBriefPayloadSchemaV3,
+			Headline:      "forged", Summary: "forged",
+			Significance: types.ResearchBriefSignificanceNoneV3,
+			Citations: []types.ResearchBriefCitationV3{{
+				Kind: types.ResearchBriefCitationCurrentEvidenceV3, Ref: "1",
+			}},
+		},
+		"verified": {
+			SchemaVersion: types.ResearchBriefPayloadSchemaV31,
+			Assessment:    types.ResearchBriefAssessmentV31("verified"),
+			Headline:      "forged", Summary: "forged",
+			Significance: types.ResearchBriefSignificanceNoneV3,
+			Citations: []types.ResearchBriefCitationV3{{
+				Kind: types.ResearchBriefCitationCurrentEvidenceV3, Ref: "1",
+			}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateResearchBriefCoverageV31(
+				forged, prepared.Synthesis.EvidenceManifest); err == nil {
+				t.Fatal("forged partial-coverage conclusion passed coverage policy")
+			}
+		})
+	}
+
+	handle, reservation := claimResearchBriefWithPendingReceiptV3(
+		t, f, prepared.Synthesis)
+	payload, err := types.EncodeResearchBriefPayloadV3(types.ResearchBriefPayloadV3{
+		SchemaVersion: types.ResearchBriefPayloadSchemaV31,
+		Assessment:    types.ResearchBriefAssessmentUnknownV31,
+		Headline:      "本次检查证据不足",
+		Summary:       "采集路径失败，无法可靠判断套餐是否变化。",
+		Significance:  types.ResearchBriefSignificanceNoneV3,
+		Citations:     []types.ResearchBriefCitationV3{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	settleResearchBriefReceiptV3(t, f, reservation, prepared.Synthesis, payload)
+	ref, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
+		FinalizeResearchBriefSynthesisV3Params{
+			ClaimResearchBriefSynthesisV3Params: handle,
+			BriefPayload:                        payload,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Significance != types.ResearchBriefSignificanceNoneV3 ||
+		ref.Decision != types.ResearchBriefDecisionQuietV3 || ref.DeliveryRequired {
+		t.Fatalf("partial-coverage Brief escaped quiet gate: %+v", ref)
 	}
 }
 

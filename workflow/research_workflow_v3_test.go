@@ -19,6 +19,7 @@ type researchWorkflowV3Stubs struct {
 	threshold       string
 	significance    types.ResearchBriefSignificanceV3
 	deliveryAllowed bool
+	stepFailures    map[int]string
 	mu              sync.Mutex
 	calls           []string
 }
@@ -127,8 +128,17 @@ func (s *researchWorkflowV3Stubs) register(env *testsuite.TestWorkflowEnvironmen
 	})
 	reg("ExecuteResearchStepV3", func(_ context.Context, in ExecuteResearchStepV3Input) (ResearchStepReceiptV3, error) {
 		s.record("step:" + string(rune('0'+in.Ordinal)))
+		if code, failed := s.stepFailures[in.Ordinal]; failed {
+			return ResearchStepReceiptV3{
+				StepID: int64(30 + in.Ordinal), Ordinal: in.Ordinal,
+				Phase: "indeterminate", InvocationID: "invocation",
+				ToolName: "web_search", RequestDigest: strings.Repeat("c", 64),
+				ErrorCode: code,
+			}, nil
+		}
 		return ResearchStepReceiptV3{
 			StepID: int64(30 + in.Ordinal), Ordinal: in.Ordinal,
+			Phase:        "completed",
 			InvocationID: "invocation", ToolName: "web_search",
 			RequestDigest: strings.Repeat("c", 64),
 			ResultDigest:  strings.Repeat("d", 64), EvidenceID: int64(40 + in.Ordinal),
@@ -171,6 +181,51 @@ func (s *researchWorkflowV3Stubs) register(env *testsuite.TestWorkflowEnvironmen
 			ReceiptDigest: strings.Repeat("1", 64),
 		}, nil
 	})
+}
+
+func TestResearchWorkflowV3ContinuesAfterSealedToolFailure(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		stepFailures map[int]string
+		want         []string
+	}{
+		{
+			name:         "partial evidence still reaches synthesis",
+			stepFailures: map[int]string{0: "provider_outcome_uncertain"},
+			want:         []string{"prepare", "plan", "step:0", "step:1", "synthesize"},
+		},
+		{
+			name: "zero evidence reaches unknown synthesis",
+			stepFailures: map[int]string{
+				0: "provider_outcome_uncertain", 1: "provider_rejected",
+			},
+			want: []string{"prepare", "plan", "step:0", "step:1", "synthesize"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestWorkflowEnvironment()
+			env.SetStartWorkflowOptions(client.StartWorkflowOptions{
+				ID: "wf-research-v3-tool-failure-" + strings.ReplaceAll(test.name, " ", "-"),
+			})
+			stubs := &researchWorkflowV3Stubs{
+				stepFailures: test.stepFailures, deliveryAllowed: false,
+			}
+			stubs.register(env)
+			env.ExecuteWorkflow(ResearchShadowWorkflowV3, ResearchShadowInputV3{
+				TenantID: 7, UserID: 42, TaskID: "task-v3",
+			})
+			if err := env.GetWorkflowError(); err != nil {
+				t.Fatal(err)
+			}
+			stubs.mu.Lock()
+			got := append([]string(nil), stubs.calls...)
+			stubs.mu.Unlock()
+			if strings.Join(got, ",") != strings.Join(test.want, ",") {
+				t.Fatalf("calls=%v want=%v", got, test.want)
+			}
+		})
+	}
 }
 
 func TestResearchWorkflowV3UsesSealedDeliveryDecision(t *testing.T) {
