@@ -117,7 +117,16 @@ func ProvisionNativeV3EditRecoveryRuntime(ctx context.Context, dbURL string) err
 			  AND granted.rolname<>'vane_native_v3_edit_recovery') THEN
 			RAISE EXCEPTION 'unsafe native V3 edit recovery runtime membership';
 		END IF;
-		GRANT vane_native_v3_edit_recovery TO vane_native_v3_edit_recovery_runtime;
+		IF EXISTS (SELECT 1 FROM pg_auth_members edge
+			JOIN pg_roles granted ON granted.oid=edge.roleid
+			JOIN pg_roles member ON member.oid=edge.member
+			WHERE granted.rolname='vane_native_v3_edit_recovery'
+			  AND member.rolname<>'vane_native_v3_edit_recovery_runtime') THEN
+			RAISE EXCEPTION 'unsafe native V3 edit recovery capability member';
+		END IF;
+		REVOKE vane_native_v3_edit_recovery FROM vane_native_v3_edit_recovery_runtime;
+		GRANT vane_native_v3_edit_recovery TO vane_native_v3_edit_recovery_runtime
+			WITH ADMIN FALSE, SET TRUE, INHERIT FALSE;
 	END $$`)
 	if err != nil {
 		return fmt.Errorf("store: provision native V3 edit recovery runtime: %w", err)
@@ -263,13 +272,23 @@ func initializeNativeV3EditRecoveryRuntimeConnection(ctx context.Context, conn *
 		createDB || createRole || inherit || replication {
 		return errors.New("native V3 edit recovery runtime identity is unsafe")
 	}
-	var memberships int
-	if err := conn.QueryRow(ctx, `SELECT count(*) FROM pg_auth_members edge
+	var memberships, exactSafeMemberships, otherCapabilityMembers int
+	if err := conn.QueryRow(ctx, `SELECT count(*),count(*) FILTER (
+		WHERE granted.rolname='vane_native_v3_edit_recovery'
+		  AND NOT edge.admin_option AND edge.set_option AND NOT edge.inherit_option),
+		(SELECT count(*) FROM pg_auth_members capability_edge
+		 JOIN pg_roles capability ON capability.oid=capability_edge.roleid
+		 JOIN pg_roles capability_member ON capability_member.oid=capability_edge.member
+		 WHERE capability.rolname='vane_native_v3_edit_recovery'
+		   AND capability_member.rolname<>session_user)
+		FROM pg_auth_members edge
+		JOIN pg_roles granted ON granted.oid=edge.roleid
 		JOIN pg_roles member ON member.oid=edge.member
-		WHERE member.rolname=session_user`).Scan(&memberships); err != nil {
+		WHERE member.rolname=session_user`).Scan(
+		&memberships, &exactSafeMemberships, &otherCapabilityMembers); err != nil {
 		return fmt.Errorf("verify native V3 edit recovery memberships: %w", err)
 	}
-	if memberships != 1 {
+	if memberships != 1 || exactSafeMemberships != 1 || otherCapabilityMembers != 0 {
 		return errors.New("native V3 edit recovery runtime membership set is unsafe")
 	}
 	var runtimeDirectACLs, capabilityMemberships int
