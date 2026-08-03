@@ -171,8 +171,10 @@ Free private repository.
 
 All runner registrations are repository-scoped and implement three roles:
 
-- control-plane pull-request CI: `[self-hosted, Linux, ARM64, vane-test]`; this
-  runner lives in `vane-test`, so PR-controlled checks never enter a trusted VM.
+- control-plane pull-request CI: `[self-hosted, Linux, vane-test]`; architecture
+  is intentionally not part of this trust role, so an isolated ARM64 VM or an
+  isolated X64 WSL runner may execute it. PR-controlled checks never enter a
+  trusted build VM.
 - control-plane exact-`main` push and schedule CI:
   `[self-hosted, Linux, vane-build]`; only trusted default-branch workflow code
   reaches this runner, avoiding a `vane-test` outage becoming a
@@ -199,13 +201,19 @@ runner. The `vps-primary` label was assigned after that state write. This is
 the required failover order: quiesce old DAG, prove live state, atomically
 migrate state, move the unique label, then trigger a fresh plan.
 
-The optional Windows WSL2 build runner uses the same `vane-build` trust role
-without production secrets. Its systemd service must use a dedicated `HOME`
-under the runner directory, a Linux-only `PATH`, and make Windows mounts such
-as `/mnt/c` and `/mnt/d` inaccessible. Install `build-essential` so Go race
-tests retain CGO support. This keeps trusted exact-`main` builds from inheriting
-workstation credentials while providing an X64 fallback when the ARM64 build
-runner is unavailable.
+Runner labels are inclusion selectors, not deny rules. A persistent runner or
+host that has executed PR-controlled code must never also carry `vane-build`,
+even when a workflow request omits that second label: a later trusted job could
+inherit files, processes, tool shims, or daemon state left by the PR. The same
+physical/VM trust-zone rule applies to fallback capacity.
+
+The current Windows WSL2 runner is `vane-test`-only. An optional Windows X64
+`vane-build` fallback must be a separate, clean build-only VM/host with no
+`vane-test` registration. Its systemd service must use a dedicated `HOME` under
+the runner directory, a Linux-only `PATH`, and make Windows mounts such as
+`/mnt/c` and `/mnt/d` inaccessible. Install `build-essential` so Go race tests
+retain CGO support. This provides X64 fallback without letting untrusted PR
+state cross into exact-`main` release construction.
 
 Wrangler is materialized per frontend deployment below that run's private
 `RUNNER_TEMP` directory. `actions/setup-node` pins Node `v22.23.1`, while
