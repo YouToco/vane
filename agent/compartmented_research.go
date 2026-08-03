@@ -50,6 +50,16 @@ var feedbackProjectionRequiredColumns = []string{
 	"record_id", "delivered_summary", "created_at",
 }
 
+// feedbackDefaultProjectionColumns mirrors the feedbacks semantic catalog's
+// default user-facing facts. prepareIntelligenceFeedbackQuery must expand an
+// omitted select before it appends the private provenance columns above;
+// otherwise the explicit select suppresses Store's own default expansion and
+// leaves the Agent with only an opaque public ref and timestamp.
+var feedbackDefaultProjectionColumns = []string{
+	"task_ref", "run_snapshot_id", "delivered_summary", "action",
+	"reason_code", "detail", "is_effective_attitude", "created_at",
+}
+
 const compartmentedPublicSummarySystemNote = `
 
 [隔离公开证据摘要阶段]
@@ -222,8 +232,10 @@ func prepareIntelligenceFeedbackQuery(
 	if query.Dataset != store.IntelligenceFeedbacks {
 		return query, nil
 	}
-	wantsSummary := len(query.Select) == 0 ||
-		slices.Contains(query.Select, "delivered_summary")
+	if len(query.Select) == 0 {
+		query.Select = append([]string(nil), feedbackDefaultProjectionColumns...)
+	}
+	wantsSummary := slices.Contains(query.Select, "delivered_summary")
 	if !wantsSummary {
 		return query, nil
 	}
@@ -508,6 +520,9 @@ func projectFeedbackResultForAgent(
 	if !handled {
 		return nil
 	}
+	result.Columns = intelligenceColumnsWithout(
+		result.Columns, "record_id", "delivered_summary",
+	)
 	if !intelligenceColumnsContain(result.Columns, "public_evidence_ref") {
 		result.Columns = append(result.Columns,
 			store.IntelligenceColumn{Name: "public_evidence_ref", Type: "text"})
@@ -529,6 +544,22 @@ func intelligenceColumnsContain(columns []store.IntelligenceColumn, name string)
 		}
 	}
 	return false
+}
+
+func intelligenceColumnsWithout(
+	columns []store.IntelligenceColumn,
+	names ...string,
+) []store.IntelligenceColumn {
+	if len(columns) == 0 || len(names) == 0 {
+		return columns
+	}
+	filtered := make([]store.IntelligenceColumn, 0, len(columns))
+	for _, column := range columns {
+		if !slices.Contains(names, column.Name) {
+			filtered = append(filtered, column)
+		}
+	}
+	return filtered
 }
 
 func marshalIntelligenceArguments(value any) (string, error) {
