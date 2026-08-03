@@ -47,10 +47,9 @@ func nativeResearchCreationSchemaV3Active(ctx context.Context, tx pgx.Tx) (bool,
 	return active, nil
 }
 
-// nativeResearchScheduleMaturityClause keeps pre-109 replay byte-compatible:
-// databases that cannot contain native V3 creation operations do not reference
-// their maturity gate. On 109+, schema-owner control transactions inspect the
-// operation directly. The restricted research executor instead uses the
+// nativeResearchScheduleMaturityClause keeps the pre-109 V1 creation fence and
+// adds native V2 admission on 109+. Schema-owner control transactions inspect
+// the operation directly. The restricted research executor instead uses the
 // capability-bound SECURITY DEFINER predicate and never gains SELECT on the
 // creation ledger.
 func nativeResearchScheduleMaturityClause(
@@ -72,7 +71,7 @@ func nativeResearchScheduleMaturityClause(
 		return "", fmt.Errorf("native research creation schema boundary is incomplete")
 	}
 	if !schemaActive {
-		return "", nil
+		return " AND " + strings.ReplaceAll(matureSchedulePredicate, "s.", "schedule."), nil
 	}
 	if activeRole == researchRuntimeCapabilityRole {
 		return ` AND public.native_research_schedule_mature_v3_v1(

@@ -93,6 +93,93 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Run("schema 108 retains the unfinished V1 research admission fence", func(t *testing.T) {
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		user, err := st.UpsertUserByOpenID(t.Context(),
+			"ou-server-runtime-v1-research-fence", "runtime V1 fence")
+		if err != nil {
+			t.Fatal(err)
+		}
+		const tenantID int64 = 1
+		if _, err := owner.ExecContext(t.Context(),
+			`INSERT INTO memberships (tenant_id,user_id,role) VALUES ($1,$2,'owner')`,
+			tenantID, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := st.beginTx(t.Context(), pgx.TxOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(t.Context()) }()
+		if err := bindResearchV3AppScopeTx(t.Context(), tx, tenantID, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		taskID := "schema108-v1-cutover-" + uuid.NewString()
+		operationID := "schema108-v1-operation-" + uuid.NewString()
+		if _, err := tx.Exec(t.Context(), `
+			INSERT INTO schedules
+			    (id,tenant_id,user_id,nl_description,spec_json,scope_json,status,execution_mode)
+			VALUES ($1,$2,$3,'V1 cutover fence','{}','{}','active','compiled')`,
+			taskID, tenantID, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		var definitionDigest string
+		if err := tx.QueryRow(t.Context(), `
+			INSERT INTO task_approved_definition_versions
+			    (tenant_id,user_id,task_id,version,schema_version,execution_mode,
+			     definition_digest,payload,operation_ref)
+			VALUES ($1,$2,$3,1,'vane.task-approved-definition/v3','discover_at_run',
+			        encode(sha256($4),'hex'),$4,$5)
+			RETURNING definition_digest`, tenantID, user.ID, taskID, []byte(`{}`),
+			"schema108-v1-cutover/"+operationID).Scan(&definitionDigest); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(t.Context(), `
+			UPDATE schedules SET execution_mode='discover_at_run',
+			       approved_definition_version=1,approved_definition_digest=$2
+			 WHERE id=$1`, taskID, definitionDigest); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(t.Context(), `
+			INSERT INTO task_creation_operations
+			    (id,tenant_id,user_id,tool_name,args,summary,status,expires_at,
+			     execution_version,task_id)
+			VALUES ($1,$2,$3,'create_schedule','{}','V1 cutover fence','pending',
+			        clock_timestamp()+interval '1 hour',1,$4)`,
+			operationID, tenantID, user.ID, taskID); err != nil {
+			t.Fatal(err)
+		}
+		clause, err := nativeResearchScheduleMaturityClause(t.Context(), tx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var visible int
+		if err := tx.QueryRow(t.Context(),
+			`SELECT count(*) FROM schedules schedule WHERE schedule.id=$1`+clause,
+			taskID).Scan(&visible); err != nil {
+			t.Fatal(err)
+		}
+		if visible != 0 {
+			t.Fatal("schema 108 admitted a V3-cutover task with unfinished V1 creation")
+		}
+		if _, err := tx.Exec(t.Context(),
+			`DELETE FROM task_creation_operations WHERE id=$1`, operationID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.QueryRow(t.Context(),
+			`SELECT count(*) FROM schedules schedule WHERE schedule.id=$1`+clause,
+			taskID).Scan(&visible); err != nil {
+			t.Fatal(err)
+		}
+		if visible != 1 {
+			t.Fatal("schema 108 rejected a research task after the V1 fence cleared")
+		}
+	})
+
 	t.Run("valid runtime supports default and explicit Store capabilities", func(t *testing.T) {
 		st, err := NewServerRuntime(t.Context(), runtimeURL)
 		if err != nil {
