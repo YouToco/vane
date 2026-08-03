@@ -667,6 +667,7 @@ func deterministicCreationSideEffectFailure(err error) bool {
 		errors.Is(err, types.ErrConflict) ||
 		errors.Is(err, types.ErrValidation) ||
 		errors.Is(err, types.ErrTaskCreationLimit) ||
+		errors.Is(err, types.ErrTaskCreationOwnerScopeInactive) ||
 		errors.Is(err, scheduler.ErrTaskScheduleInvalid) ||
 		errors.Is(err, scheduler.ErrTaskScheduleNotFound) ||
 		errors.Is(err, scheduler.ErrTaskScheduleConflict) ||

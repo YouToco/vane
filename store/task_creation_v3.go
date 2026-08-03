@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
@@ -140,7 +141,8 @@ func (s *Store) CommitPausedResearchTaskDefinitionV3ForCreation(
 		p.PreparedSchedule, p.EnsureReceipt, p.TargetAction,
 		p.TargetActionDigest, p.ActionAuthorizationDigest,
 		types.TaskCreationExecutionVersionV2); err != nil {
-		return taskCreationDatabaseError("commit native V3 paused aggregate", err)
+		return nativeResearchCreationBoundaryError(
+			"commit native V3 paused aggregate", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskCreationDatabaseError("commit native V3 paused aggregate transaction", err)
@@ -175,7 +177,8 @@ func (s *Store) BeginResearchTaskCreationActivationV3(
 		binding.TaskID, binding.DefinitionDigest, binding.TargetActionDigest,
 		binding.ActionAuthorizationDigest,
 		types.TaskCreationExecutionVersionV2).Scan(&started); err != nil {
-		return false, taskCreationDatabaseError("begin native V3 activation", err)
+		return false, nativeResearchCreationBoundaryError(
+			"begin native V3 activation", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, taskCreationDatabaseError("commit native V3 activation authorization", err)
@@ -209,12 +212,30 @@ func (s *Store) CommitResearchTaskCreationActivationV3(
 		binding.TaskID, binding.DefinitionDigest, binding.TargetActionDigest,
 		binding.ActionAuthorizationDigest,
 		types.TaskCreationExecutionVersionV2); err != nil {
-		return taskCreationDatabaseError("commit native V3 activation", err)
+		return nativeResearchCreationBoundaryError(
+			"commit native V3 activation", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskCreationDatabaseError("commit native V3 activation transaction", err)
 	}
 	return nil
+}
+
+func nativeResearchCreationBoundaryError(action string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "P1091":
+			return types.NewAppError(types.CodeConflict,
+				"task creation: active task limit reached",
+				types.ErrTaskCreationLimit)
+		case "P1092":
+			return types.NewAppError(types.CodeConflict,
+				"task creation: owner scope is inactive",
+				types.ErrTaskCreationOwnerScopeInactive)
+		}
+	}
+	return taskCreationDatabaseError(action, err)
 }
 
 func validateResearchTaskCreationActivationBindingV3(

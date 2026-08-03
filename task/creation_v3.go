@@ -110,7 +110,7 @@ func (c *CreationCoordinator) PrepareResearchV3(
 		in.UserID <= 0 || in.ExpiresAt.IsZero() {
 		return CreationProposal{}, creationValidation("V3 任务创建请求不完整", nil)
 	}
-	tenantID, err := c.resolveActiveTenant(ctx, in.UserID)
+	tenantID, err := c.resolveActiveOwnerTenantV3(ctx, in.UserID)
 	if err != nil {
 		return CreationProposal{}, err
 	}
@@ -342,7 +342,7 @@ func (c *CreationCoordinator) runResearchV3Acquired(
 	if err != nil || current.Lease() != lease {
 		return CreationResult{}, errors.Join(err, types.ErrTaskCreationLeaseLost)
 	}
-	scopeActive, err := c.creationScopeActive(ctx, op.TenantID, op.UserID)
+	scopeActive, err := c.creationOwnerScopeActiveV3(ctx, op.TenantID, op.UserID)
 	if err != nil {
 		return CreationResult{}, err
 	}
@@ -370,6 +370,14 @@ func (c *CreationCoordinator) runResearchV3Acquired(
 			TargetActionDigest:        artifacts.TargetActionDigest,
 			ActionAuthorizationDigest: artifacts.ActionAuthorizationDigest,
 		}); err != nil {
+		if errors.Is(err, types.ErrTaskCreationLimit) {
+			return c.cleanupResearchV3Creation(ctx, store, schedulerV3, current, artifacts,
+				"task_limit_reached", "任务数量已达上限，本次创建已安全撤销", err)
+		}
+		if errors.Is(err, types.ErrTaskCreationOwnerScopeInactive) {
+			return c.cleanupResearchV3Creation(ctx, store, schedulerV3, current, artifacts,
+				"creation_scope_inactive", "创建期间所有者权限失效，本次创建已安全撤销", err)
+		}
 		if deterministicCreationSideEffectFailure(err) {
 			return c.cleanupResearchV3Creation(ctx, store, schedulerV3, current, artifacts,
 				"definition_commit_failed", "V3 任务定义无法安全提交，本次创建已撤销", err)
@@ -384,6 +392,10 @@ func (c *CreationCoordinator) runResearchV3Acquired(
 	started, err := store.BeginResearchTaskCreationActivationV3(
 		ctx, lease, activationBinding)
 	if err != nil {
+		if errors.Is(err, types.ErrTaskCreationOwnerScopeInactive) {
+			return c.cleanupResearchV3Creation(ctx, store, schedulerV3, current, artifacts,
+				"creation_scope_inactive", "激活前所有者权限失效，本次创建已安全撤销", err)
+		}
 		return CreationResult{}, err
 	}
 	if err := c.activateResearchTaskV3(
@@ -396,6 +408,10 @@ func (c *CreationCoordinator) runResearchV3Acquired(
 	}
 	if err := store.CommitResearchTaskCreationActivationV3(
 		ctx, lease, activationBinding); err != nil {
+		if errors.Is(err, types.ErrTaskCreationOwnerScopeInactive) {
+			return c.cleanupResearchV3Creation(ctx, store, schedulerV3, current, artifacts,
+				"creation_scope_inactive", "激活期间所有者权限失效，本次创建已安全撤销", err)
+		}
 		return CreationResult{}, err
 	}
 	resultBytes, err := marshalCreationSuccess(artifacts.Schedule.TaskID)
@@ -423,6 +439,84 @@ func (c *CreationCoordinator) runResearchV3Acquired(
 		OperationID: op.ID, TaskID: artifacts.Schedule.TaskID,
 		Message: "任务已创建并开始监控。", Status: types.TaskOperationStatusExecuted,
 	}, nil
+}
+
+func (c *CreationCoordinator) resolveActiveOwnerTenantV3(
+	ctx context.Context, userID int64,
+) (int64, error) {
+	if userID <= 0 {
+		return 0, creationValidation("用户身份无效", nil)
+	}
+	memberships, err := c.store.ListMembershipsByUser(ctx, userID)
+	if err != nil {
+		return 0, fmt.Errorf("list native V3 owner memberships: %w", err)
+	}
+	active := make([]int64, 0, 1)
+	for _, membership := range memberships {
+		if membership.UserID != userID || membership.TenantID <= 0 {
+			return 0, types.NewAppError(
+				types.CodeInternal, "V3 任务创建成员关系损坏", types.ErrInternal)
+		}
+		if membership.Role != types.MembershipRoleOwner {
+			continue
+		}
+		tenant, err := c.store.GetTenant(ctx, membership.TenantID)
+		if err != nil {
+			return 0, fmt.Errorf("load native V3 owner tenant %d: %w",
+				membership.TenantID, err)
+		}
+		if tenant.Status == types.TenantStatusActive && tenant.DeletedAt == nil {
+			active = append(active, tenant.ID)
+		}
+	}
+	if len(active) != 1 {
+		return 0, creationValidation(
+			"当前账号不是唯一可用工作空间的所有者，暂不能创建任务", nil)
+	}
+	return active[0], nil
+}
+
+func (c *CreationCoordinator) creationOwnerScopeActiveV3(
+	ctx context.Context, tenantID, userID int64,
+) (bool, error) {
+	if tenantID <= 0 || userID <= 0 {
+		return false, types.NewAppError(
+			types.CodeInternal, "V3 任务创建作用域损坏", types.ErrInternal)
+	}
+	memberships, err := c.store.ListMembershipsByUser(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	found := false
+	for _, membership := range memberships {
+		if membership.UserID != userID || membership.TenantID <= 0 {
+			return false, types.NewAppError(
+				types.CodeInternal, "V3 任务创建成员关系损坏", types.ErrInternal)
+		}
+		if membership.TenantID == tenantID &&
+			membership.Role == types.MembershipRoleOwner {
+			if found {
+				return false, types.NewAppError(
+					types.CodeInternal, "V3 任务创建所有者关系重复", types.ErrInternal)
+			}
+			found = true
+		}
+	}
+	if !found {
+		return false, nil
+	}
+	tenant, err := c.store.GetTenant(ctx, tenantID)
+	if err != nil {
+		if errors.Is(err, types.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if tenant.ID != tenantID {
+		return false, types.NewAppError(
+			types.CodeInternal, "V3 任务创建租户边界损坏", types.ErrInternal)
+	}
+	return tenant.Status == types.TenantStatusActive && tenant.DeletedAt == nil, nil
 }
 
 func (c *CreationCoordinator) ensureResearchV3Receipt(

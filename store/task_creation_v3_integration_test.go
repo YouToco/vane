@@ -12,10 +12,32 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
+
+func TestNativeResearchCreationBoundaryErrorUsesExactSQLState(t *testing.T) {
+	limit := nativeResearchCreationBoundaryError("test", &pgconn.PgError{Code: "P1091"})
+	if !errors.Is(limit, types.ErrTaskCreationLimit) ||
+		!errors.Is(limit, types.ErrConflict) || errors.Is(limit, types.ErrDatabase) {
+		t.Fatalf("P1091 mapping=%v", limit)
+	}
+	scope := nativeResearchCreationBoundaryError("test", &pgconn.PgError{Code: "P1092"})
+	if !errors.Is(scope, types.ErrTaskCreationOwnerScopeInactive) ||
+		!errors.Is(scope, types.ErrConflict) || errors.Is(scope, types.ErrDatabase) {
+		t.Fatalf("P1092 mapping=%v", scope)
+	}
+	for _, code := range []string{"23514", "42501"} {
+		mapped := nativeResearchCreationBoundaryError("test", &pgconn.PgError{Code: code})
+		if !errors.Is(mapped, types.ErrDatabase) ||
+			errors.Is(mapped, types.ErrTaskCreationLimit) ||
+			errors.Is(mapped, types.ErrTaskCreationOwnerScopeInactive) {
+			t.Fatalf("generic SQLSTATE %s mapping=%v", code, mapped)
+		}
+	}
+}
 
 func TestNativeResearchTaskCreationV3PostgreSQLAtomicLifecycle(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -588,6 +610,9 @@ func TestNativeResearchTaskCreationV3CapacitySerializesConcurrentCommits(t *test
 		if result == nil {
 			succeeded++
 		} else {
+			if !errors.Is(result, types.ErrTaskCreationLimit) {
+				t.Fatalf("capacity race returned non-limit error: %v", result)
+			}
 			failed++
 		}
 	}

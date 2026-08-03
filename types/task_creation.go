@@ -22,10 +22,12 @@ const TaskCreationExecutionVersionV2 int16 = 2
 // parsing a message. Scope mismatches still use ErrNotFound and immutable-CAS
 // mismatches use ErrConflict.
 var (
-	ErrTaskCreationBusy      = errors.New("vane: task creation busy")
-	ErrTaskCreationTerminal  = errors.New("vane: task creation terminal")
-	ErrTaskCreationLeaseLost = errors.New("vane: task creation lease lost")
-	ErrTaskCreationLimit     = errors.New("vane: task creation limit reached")
+	ErrTaskCreationBusy               = errors.New("vane: task creation busy")
+	ErrTaskCreationTerminal           = errors.New("vane: task creation terminal")
+	ErrTaskCreationLeaseLost          = errors.New("vane: task creation lease lost")
+	ErrTaskCreationLimit              = errors.New("vane: task creation limit reached")
+	ErrTaskCreationOwnerScopeInactive = errors.New(
+		"vane: task creation owner scope inactive")
 )
 
 const (

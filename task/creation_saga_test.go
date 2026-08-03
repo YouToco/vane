@@ -89,13 +89,14 @@ type creationSagaFakeStore struct {
 	resolveSources           map[int64]types.FetchTarget
 	resolveErr               error
 	membershipCalls          int
+	membershipRole           types.MembershipRole
 	tenantCalls              int
 }
 
 func newCreationSagaFakeStore() *creationSagaFakeStore {
 	return &creationSagaFakeStore{tenant: types.Tenant{
 		ID: 7, Status: types.TenantStatusActive,
-	}}
+	}, membershipRole: types.MembershipRoleOwner}
 }
 
 func (s *creationSagaFakeStore) ListMembershipsByUser(
@@ -103,7 +104,9 @@ func (s *creationSagaFakeStore) ListMembershipsByUser(
 	userID int64,
 ) ([]types.Membership, error) {
 	s.membershipCalls++
-	return []types.Membership{{TenantID: s.tenant.ID, UserID: userID}}, nil
+	return []types.Membership{{
+		TenantID: s.tenant.ID, UserID: userID, Role: s.membershipRole,
+	}}, nil
 }
 
 func (s *creationSagaFakeStore) GetTenant(context.Context, int64) (*types.Tenant, error) {
@@ -443,6 +446,7 @@ type creationSagaFakeScheduler struct {
 	ensureErr                error
 	activateErr              error
 	activateApplyBeforeError bool
+	beforeActivate           func(context.Context) error
 	activateCalls            int
 	deleteErr                error
 	deleteCalls              int
@@ -572,6 +576,11 @@ func (s *creationSagaFakeScheduler) ActivateResearchTaskV3(
 	ctx context.Context, prepared scheduler.PreparedResearchTaskScheduleV3,
 	receipt scheduler.TaskScheduleSnapshot,
 ) (scheduler.TaskScheduleSnapshot, error) {
+	if s.beforeActivate != nil {
+		if err := s.beforeActivate(ctx); err != nil {
+			return scheduler.TaskScheduleSnapshot{}, err
+		}
+	}
 	return s.ActivateTask(ctx, prepared.Schedule, receipt)
 }
 

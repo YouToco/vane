@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -36,6 +37,73 @@ type createResearchV3ResponseLossStore struct {
 	*store.Store
 	cancel      context.CancelFunc
 	createCalls int
+}
+
+type researchV3OwnerDowngradeStage string
+
+const (
+	downgradeAtPausedCommit     researchV3OwnerDowngradeStage = "paused_commit"
+	downgradeAtActivationBegin  researchV3OwnerDowngradeStage = "activation_begin"
+	downgradeAtActivationCommit researchV3OwnerDowngradeStage = "activation_commit"
+)
+
+type researchV3OwnerDowngradeStore struct {
+	*store.Store
+	databaseURL string
+	stage       researchV3OwnerDowngradeStage
+	downgraded  bool
+}
+
+func (s *researchV3OwnerDowngradeStore) downgradeOwner(
+	ctx context.Context, lease types.TaskCreationLease,
+) error {
+	if s.downgraded {
+		return nil
+	}
+	s.downgraded = true
+	conn, err := pgx.Connect(ctx, s.databaseURL)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	_, err = conn.Exec(ctx, `UPDATE memberships SET role='member'
+		WHERE tenant_id=$1 AND user_id=$2`, lease.TenantID, lease.UserID)
+	return err
+}
+
+func (s *researchV3OwnerDowngradeStore) CommitPausedResearchTaskDefinitionV3ForCreation(
+	ctx context.Context, params types.CommitPausedResearchTaskDefinitionV3ForCreationParams,
+) error {
+	if s.stage == downgradeAtPausedCommit {
+		if err := s.downgradeOwner(ctx, params.Lease); err != nil {
+			return err
+		}
+	}
+	return s.Store.CommitPausedResearchTaskDefinitionV3ForCreation(ctx, params)
+}
+
+func (s *researchV3OwnerDowngradeStore) BeginResearchTaskCreationActivationV3(
+	ctx context.Context, lease types.TaskCreationLease,
+	binding types.ResearchTaskCreationActivationBindingV3,
+) (bool, error) {
+	if s.stage == downgradeAtActivationBegin {
+		if err := s.downgradeOwner(ctx, lease); err != nil {
+			return false, err
+		}
+	}
+	return s.Store.BeginResearchTaskCreationActivationV3(ctx, lease, binding)
+}
+
+func (s *researchV3OwnerDowngradeStore) CommitResearchTaskCreationActivationV3(
+	ctx context.Context, lease types.TaskCreationLease,
+	binding types.ResearchTaskCreationActivationBindingV3,
+) error {
+	if s.stage == downgradeAtActivationCommit {
+		if err := s.downgradeOwner(ctx, lease); err != nil {
+			return err
+		}
+	}
+	return s.Store.CommitResearchTaskCreationActivationV3(ctx, lease, binding)
 }
 
 type postgresReceiptSessionRecorder struct{ store *store.Store }
@@ -360,6 +428,164 @@ func TestCreationCoordinator_NativeV3PostgreSQLCompleteResponseLoss(t *testing.T
 	}
 }
 
+func TestCreationCoordinator_NativeV3PostgreSQLOwnerDowngradeCleansUp(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		stage        researchV3OwnerDowngradeStage
+		beforeEnsure bool
+		afterBegin   bool
+		wantActivate bool
+	}{
+		{name: "before ensure", beforeEnsure: true},
+		{name: "paused commit", stage: downgradeAtPausedCommit},
+		{name: "activation begin", stage: downgradeAtActivationBegin},
+		{name: "after activation begin", afterBegin: true, wantActivate: true},
+		{name: "after remote activation", stage: downgradeAtActivationCommit, wantActivate: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+			databaseURL := creationCoordinatorTestDatabaseURL()
+			wrapped := &researchV3OwnerDowngradeStore{
+				Store: st, databaseURL: databaseURL, stage: tc.stage,
+			}
+			schedules := &creationSagaFakeScheduler{}
+			if tc.afterBegin {
+				schedules.beforeActivate = func(ctx context.Context) error {
+					return wrapped.downgradeOwner(ctx, types.TaskCreationLease{
+						TenantID: tenantID, UserID: userID,
+					})
+				}
+			}
+			coordinator := NewCreationCoordinator(wrapped, schedules, nil,
+				WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+			input := testResearchV3CreationInput()
+			input.ActionID = "native-v3-owner-downgrade-" + uuid.NewString()
+			input.UserID = userID
+			input.SpecJSON = json.RawMessage(`{"tz":"Asia/Shanghai","every_seconds":3600}`)
+			if _, err := coordinator.PrepareResearchV3(t.Context(), input); err != nil {
+				t.Fatalf("PrepareResearchV3: %v", err)
+			}
+			if tc.beforeEnsure {
+				if err := wrapped.downgradeOwner(t.Context(), types.TaskCreationLease{
+					TenantID: tenantID, UserID: userID,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := coordinator.ExecuteResearchV3(
+				t.Context(), userID, input.ActionID, testCreationReceiptTarget)
+			if err != nil || result.Status != types.TaskOperationStatusFailed ||
+				result.Recovering || result.TaskID == "" {
+				t.Fatalf("owner downgrade result=%+v err=%v events=%v",
+					result, err, schedules.events)
+			}
+			if tc.wantActivate && !slices.Contains(schedules.events, "activate") {
+				t.Fatalf("remote activation was not exercised: %v", schedules.events)
+			}
+			if !slices.Contains(schedules.events, "delete") {
+				t.Fatalf("exact Temporal delete was not exercised: %v", schedules.events)
+			}
+			assertNativeV3CreationCleanupPostgreSQL(
+				t, databaseURL, input.ActionID, tenantID, userID, result.TaskID,
+				"creation_scope_inactive")
+			eventCount := len(schedules.events)
+			replayed, err := coordinator.ExecuteResearchV3(
+				t.Context(), userID, input.ActionID, testCreationReceiptTarget)
+			if err != nil || !replayed.Replayed ||
+				replayed.Status != types.TaskOperationStatusFailed ||
+				len(schedules.events) != eventCount {
+				t.Fatalf("owner downgrade replay=%+v err=%v before=%d after=%d",
+					replayed, err, eventCount, len(schedules.events))
+			}
+		})
+	}
+}
+
+func TestCreationCoordinator_NativeV3PostgreSQLCapacityLimitCleansUp(t *testing.T) {
+	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	databaseURL := creationCoordinatorTestDatabaseURL()
+	conn, err := pgx.Connect(t.Context(), databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 20; index++ {
+		if _, err := conn.Exec(t.Context(), `
+			INSERT INTO schedules(id,tenant_id,user_id,nl_description,spec_json,scope_json,status)
+			VALUES($1,$2,$3,'existing','{"every_seconds":3600}','{}','active')`,
+			"native-v3-capacity-existing-"+uuid.NewString(), tenantID, userID); err != nil {
+			_ = conn.Close(t.Context())
+			t.Fatal(err)
+		}
+	}
+	if err := conn.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	schedules := &creationSagaFakeScheduler{}
+	coordinator := NewCreationCoordinator(st, schedules, nil,
+		WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+	input := testResearchV3CreationInput()
+	input.ActionID = "native-v3-capacity-cleanup-" + uuid.NewString()
+	input.UserID = userID
+	input.SpecJSON = json.RawMessage(`{"tz":"Asia/Shanghai","every_seconds":3600}`)
+	if _, err := coordinator.PrepareResearchV3(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.ExecuteResearchV3(
+		t.Context(), userID, input.ActionID, testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusFailed ||
+		result.Recovering || result.TaskID == "" ||
+		!slices.Contains(schedules.events, "delete") {
+		t.Fatalf("capacity result=%+v err=%v events=%v", result, err, schedules.events)
+	}
+	assertNativeV3CreationCleanupPostgreSQL(
+		t, databaseURL, input.ActionID, tenantID, userID, result.TaskID,
+		"task_limit_reached")
+	eventCount := len(schedules.events)
+	replayed, err := coordinator.ExecuteResearchV3(
+		t.Context(), userID, input.ActionID, testCreationReceiptTarget)
+	if err != nil || !replayed.Replayed ||
+		replayed.Status != types.TaskOperationStatusFailed ||
+		len(schedules.events) != eventCount {
+		t.Fatalf("capacity replay=%+v err=%v before=%d after=%d",
+			replayed, err, eventCount, len(schedules.events))
+	}
+}
+
+func assertNativeV3CreationCleanupPostgreSQL(
+	t *testing.T, databaseURL, operationID string,
+	tenantID, userID int64, taskID, errorCode string,
+) {
+	t.Helper()
+	conn, err := pgx.Connect(t.Context(), databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(t.Context())) }()
+	var status, phase, gotErrorCode string
+	var scheduleCount, authorityCount, receiptCount int
+	if err := conn.QueryRow(t.Context(), `
+		SELECT operation.status,operation.phase,operation.error_code,
+		       (SELECT count(*) FROM schedules
+		         WHERE id=$4 AND tenant_id=$2 AND user_id=$3),
+		       (SELECT count(*) FROM research_v3_delivery_authorities
+		         WHERE task_id=$4 AND tenant_id=$2 AND user_id=$3),
+		       (SELECT count(*) FROM task_creation_receipts
+		         WHERE operation_id=$1 AND tenant_id=$2 AND user_id=$3)
+		  FROM task_creation_operations operation
+		 WHERE operation.id=$1 AND operation.tenant_id=$2 AND operation.user_id=$3`,
+		operationID, tenantID, userID, taskID).Scan(
+		&status, &phase, &gotErrorCode,
+		&scheduleCount, &authorityCount, &receiptCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(types.TaskOperationStatusFailed) ||
+		phase != string(types.TaskCreationPhaseFailed) || gotErrorCode != errorCode ||
+		scheduleCount != 0 || authorityCount != 0 || receiptCount != 1 {
+		t.Fatalf("cleanup status=%s phase=%s code=%s schedule=%d authority=%d receipt=%d",
+			status, phase, gotErrorCode, scheduleCount, authorityCount, receiptCount)
+	}
+}
+
 func TestCreationCoordinator_NativeV3PostgreSQLStaleRecoveryExecutesLifecycle(t *testing.T) {
 	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
 	schedules := &creationSagaFakeScheduler{}
@@ -430,10 +656,7 @@ func newCreationCoordinatorPostgreSQLFixture(
 	t *testing.T,
 ) (*store.Store, int64, int64) {
 	t.Helper()
-	dbURL := os.Getenv("VANE_TEST_DATABASE_URL")
-	if dbURL == "" {
-		dbURL = os.Getenv("DATABASE_URL")
-	}
+	dbURL := creationCoordinatorTestDatabaseURL()
 	if dbURL == "" {
 		t.Skip("未设置 VANE_TEST_DATABASE_URL 或 DATABASE_URL，跳过 Coordinator 真库测试")
 	}
@@ -483,6 +706,13 @@ func newCreationCoordinatorPostgreSQLFixture(
 		}
 	})
 	return st, tenant.ID, user.ID
+}
+
+func creationCoordinatorTestDatabaseURL() string {
+	if databaseURL := os.Getenv("VANE_TEST_DATABASE_URL"); databaseURL != "" {
+		return databaseURL
+	}
+	return os.Getenv("DATABASE_URL")
 }
 
 func waitForDueTaskCreationReceipt(

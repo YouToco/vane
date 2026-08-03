@@ -204,8 +204,58 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 	).Scan(&serverMember); err != nil {
 		t.Fatal(err)
 	}
-	if !serverMember {
-		t.Fatal("provisioned server runtime cannot enter native V3 coordinator")
+	if serverMember {
+		t.Fatal("provisioned server runtime can enter native V3 coordinator")
+	}
+	const runtimePassword = "migration-109-runtime-password"
+	if _, err := db.ExecContext(t.Context(),
+		`ALTER ROLE vane_server_runtime LOGIN PASSWORD '`+runtimePassword+`'`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = db.ExecContext(cleanupCtx,
+			`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
+	})
+	runtimeStore, err := NewServerRuntime(
+		t.Context(), serverRuntimeTestURL(t, scratchURL, runtimePassword))
+	if err != nil {
+		t.Fatalf("NewServerRuntime after migration 109 provisioning: %v", err)
+	}
+	runtimeTx, err := runtimeStore.pool.Begin(t.Context())
+	if err != nil {
+		runtimeStore.Close()
+		t.Fatal(err)
+	}
+	if _, err := runtimeTx.Exec(t.Context(),
+		`SET LOCAL ROLE vane_native_v3_creation_coordinator`); err == nil ||
+		!postgresCodeIs(err, "42501") {
+		_ = runtimeTx.Rollback(t.Context())
+		runtimeStore.Close()
+		t.Fatalf("server runtime entered native V3 coordinator: %v", err)
+	}
+	_ = runtimeTx.Rollback(t.Context())
+	runtimeStore.Close()
+	if _, err := db.ExecContext(t.Context(),
+		`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`); err != nil {
+		t.Fatal(err)
+	}
+	for _, signature := range []string{
+		"commit_native_research_task_creation_v3_v1(text,bigint,bigint,text,bigint,text,text,bytea,bytea,bytea,bytea,text,text,smallint)",
+		"begin_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,text,smallint)",
+		"commit_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,text,smallint)",
+		"cleanup_native_research_task_creation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,smallint)",
+	} {
+		var runtimeExecute bool
+		if err := db.QueryRowContext(t.Context(), `
+			SELECT has_function_privilege('vane_server_runtime',$1::regprocedure,'EXECUTE')`,
+			signature).Scan(&runtimeExecute); err != nil {
+			t.Fatal(err)
+		}
+		if runtimeExecute {
+			t.Fatalf("server runtime can execute native V3 function %s", signature)
+		}
 	}
 
 	migration, err := fs.ReadFile(dir, "109_native_research_task_creation.sql")
@@ -356,7 +406,7 @@ func TestMigration109UpgradesProvisionedLoginRuntimeWithoutLosingLogin(t *testin
 		&login, &coordinatorMember); err != nil {
 		t.Fatal(err)
 	}
-	if !login || !coordinatorMember {
+	if !login || coordinatorMember {
 		t.Fatalf("V2 upgrade lost deployed runtime state login=%v coordinator=%v",
 			login, coordinatorMember)
 	}

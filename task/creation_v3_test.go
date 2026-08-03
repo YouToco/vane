@@ -2,6 +2,7 @@ package task
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -73,5 +74,23 @@ func TestCreationCoordinatorPrepareResearchV3FailsClosedWithoutServerPolicy(t *t
 	if _, err := coordinator.PrepareResearchV3(
 		t.Context(), testResearchV3CreationInput()); err == nil {
 		t.Fatal("native V3 creation was enabled without trusted server policy")
+	}
+}
+
+func TestCreationCoordinatorPrepareResearchV3RejectsNonOwner(t *testing.T) {
+	for _, role := range []types.MembershipRole{
+		types.MembershipRoleAdmin, types.MembershipRoleMember,
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			store := newCreationSagaFakeStore()
+			store.membershipRole = role
+			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil,
+				WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+			_, err := coordinator.PrepareResearchV3(
+				t.Context(), testResearchV3CreationInput())
+			if !errors.Is(err, types.ErrValidation) || store.createCalls != 0 {
+				t.Fatalf("role=%s err=%v create_calls=%d", role, err, store.createCalls)
+			}
+		})
 	}
 }

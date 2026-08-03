@@ -27,7 +27,6 @@ var serverRuntimeCapabilityRoles = []string{
 	"vane_edit_coordinator",
 	"vane_edit_receipt",
 	"vane_intelligence_reader",
-	"vane_native_v3_creation_coordinator",
 	"vane_periodic_brief_writer",
 	"vane_profile_claim_editor",
 	"vane_profile_editor",
@@ -73,7 +72,7 @@ var serverRuntimeForbiddenReadRelations = []string{
 // delegated callers.
 func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 	if err := callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_v2"); err != nil {
+		ctx, dbURL, "provision_vane_server_runtime_v1"); err != nil {
 		return err
 	}
 	return callServerRuntimeProvisioner(
@@ -90,7 +89,7 @@ func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
 		return err
 	}
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "deprovision_vane_server_runtime_v2")
+		ctx, dbURL, "deprovision_vane_server_runtime_v1")
 }
 
 func callServerRuntimeProvisioner(

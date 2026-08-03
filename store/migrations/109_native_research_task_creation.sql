@@ -26,9 +26,10 @@ CREATE INDEX idx_task_creation_operations_stale
       AND tombstoned_at IS NULL;
 
 -- Only the migration/session owner may enter the native creation coordinator
--- during migration. vane_app never receives membership or direct function
--- execution; the separately provisioned NOINHERIT server shell receives this
--- one capability through the exact closed-set v2 provisioner below.
+-- during migration. vane_app and the long-lived server runtime never receive
+-- membership or direct function execution. Native creation runs only through
+-- an owner-compatible primary Store whose direct schema owner may SET ROLE for
+-- the four exact atomic functions below.
 -- +goose StatementBegin
 DO $$
 DECLARE membership RECORD;
@@ -64,8 +65,8 @@ END $$;
 GRANT USAGE ON SCHEMA public TO vane_native_v3_creation_coordinator;
 
 -- Migration 098 owns the original exact server shell. This versioned
--- successor composes that boundary with the capability introduced here, so
--- both upgraded and freshly migrated databases expose one exact closed set.
+-- successor keeps that boundary byte-for-byte exact. Native V3 creation is
+-- deliberately not a long-lived server-runtime capability.
 -- +goose StatementBegin
 CREATE FUNCTION provision_vane_server_runtime_v2() RETURNS VOID
 LANGUAGE plpgsql SECURITY DEFINER
@@ -78,14 +79,7 @@ BEGIN
             USING ERRCODE='42501';
     END IF;
     PERFORM pg_catalog.pg_advisory_xact_lock(6215335020355474248);
-    -- A repeated call must also work: temporarily return the shell to the
-    -- migration-098 set before invoking its owner-only hardening routine.
-    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles
-                WHERE rolname='vane_server_runtime') THEN
-        EXECUTE 'REVOKE vane_native_v3_creation_coordinator FROM vane_server_runtime';
-    END IF;
     PERFORM public.provision_vane_server_runtime_v1();
-    EXECUTE 'GRANT vane_native_v3_creation_coordinator TO vane_server_runtime';
 
     SELECT pg_catalog.array_agg(granted.rolname ORDER BY granted.rolname)
       INTO direct_roles
@@ -106,7 +100,7 @@ BEGIN
           'vane_brief_writer','vane_brief_reader',
           'vane_brief_synthesis_writer','vane_brief_synthesis_recovery',
           'vane_periodic_brief_writer','vane_run_outcome_recovery',
-          'vane_intelligence_reader','vane_native_v3_creation_coordinator'
+          'vane_intelligence_reader'
       ]::TEXT[]) AS allowed(role_name);
     IF direct_roles IS DISTINCT FROM expected_roles THEN
         RAISE EXCEPTION '109: server runtime memberships differ: got %, expected %',
@@ -164,13 +158,12 @@ BEGIN
           'vane_brief_writer','vane_brief_reader',
           'vane_brief_synthesis_writer','vane_brief_synthesis_recovery',
           'vane_periodic_brief_writer','vane_run_outcome_recovery',
-          'vane_intelligence_reader','vane_native_v3_creation_coordinator'
+          'vane_intelligence_reader'
       ]::TEXT[]) AS allowed(role_name);
     IF direct_roles IS DISTINCT FROM expected_roles THEN
         RAISE EXCEPTION '109: refusing non-exact server runtime memberships: got %, expected %',
             direct_roles,expected_roles USING ERRCODE='42501';
     END IF;
-    EXECUTE 'REVOKE vane_native_v3_creation_coordinator FROM vane_server_runtime';
     PERFORM public.deprovision_vane_server_runtime_v1();
 END $$;
 -- +goose StatementEnd
@@ -290,7 +283,7 @@ BEGIN
        AND tenant.deleted_at IS NULL
      FOR UPDATE OF membership FOR SHARE OF tenant;
     IF NOT FOUND THEN
-        RAISE EXCEPTION '109: native V3 creation owner scope is inactive' USING ERRCODE='42501';
+        RAISE EXCEPTION '109: native V3 creation owner scope is inactive' USING ERRCODE='P1092';
     END IF;
 
     IF operation_row.phase IN ('definition_committed','activation_started','activated') THEN
@@ -370,7 +363,7 @@ BEGIN
            AND tombstoned_at IS NOT NULL AND task_id<>''
     ) reserved;
     IF used_capacity>=20 THEN
-        RAISE EXCEPTION '109: active task capacity reached' USING ERRCODE='23514';
+        RAISE EXCEPTION '109: active task capacity reached' USING ERRCODE='P1091';
     END IF;
 
     INSERT INTO public.schedules
@@ -493,7 +486,7 @@ BEGIN
        AND tenant.deleted_at IS NULL
      FOR SHARE OF membership,tenant;
     IF NOT FOUND THEN
-        RAISE EXCEPTION '109: native V3 activation owner scope is inactive' USING ERRCODE='42501';
+        RAISE EXCEPTION '109: native V3 activation owner scope is inactive' USING ERRCODE='P1092';
     END IF;
     UPDATE public.task_creation_operations SET phase='activation_started',updated_at=clock_timestamp()
      WHERE id=operation_id AND tenant_id=requested_tenant_id AND user_id=requested_user_id
@@ -579,7 +572,7 @@ BEGIN
        AND tenant.deleted_at IS NULL
      FOR SHARE OF membership,tenant;
     IF NOT FOUND THEN
-        RAISE EXCEPTION '109: native V3 activation commit owner scope is inactive' USING ERRCODE='42501';
+        RAISE EXCEPTION '109: native V3 activation commit owner scope is inactive' USING ERRCODE='P1092';
     END IF;
     UPDATE public.schedules SET status='active',updated_at=clock_timestamp()
      WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
@@ -607,7 +600,7 @@ END $$;
 
 -- +goose StatementBegin
 CREATE FUNCTION cleanup_native_research_task_creation_v3_v1(
-    operation_id TEXT, requested_tenant_id BIGINT, requested_user_id BIGINT,
+    requested_operation_id TEXT, requested_tenant_id BIGINT, requested_user_id BIGINT,
     requested_lease_owner TEXT, requested_fence BIGINT, requested_task_id TEXT,
     requested_error_code TEXT, requested_error_message TEXT,
     requested_execution_version SMALLINT
@@ -616,7 +609,7 @@ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE operation_row public.task_creation_operations%ROWTYPE;
 BEGIN
-    IF operation_id IS NULL OR requested_tenant_id<=0 OR requested_user_id<=0 OR
+    IF requested_operation_id IS NULL OR requested_tenant_id<=0 OR requested_user_id<=0 OR
        requested_lease_owner IS NULL OR btrim(requested_lease_owner)='' OR
        requested_fence<=0 OR requested_task_id IS NULL OR btrim(requested_task_id)='' OR
        requested_error_code IS NULL OR btrim(requested_error_code)='' OR
@@ -628,7 +621,7 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtextextended(
         requested_tenant_id::text||'/'||requested_user_id::text||'/'||requested_task_id,101));
     SELECT * INTO operation_row FROM public.task_creation_operations
-     WHERE id=operation_id AND tenant_id=requested_tenant_id
+     WHERE id=requested_operation_id AND tenant_id=requested_tenant_id
        AND user_id=requested_user_id AND tool_name='manage_tasks'
        AND execution_version=2 FOR UPDATE;
     IF NOT FOUND THEN
@@ -645,9 +638,10 @@ BEGIN
            EXISTS (SELECT 1 FROM public.research_v3_delivery_authorities
                     WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
                       AND task_id=requested_task_id) OR
-           NOT EXISTS (SELECT 1 FROM public.task_creation_receipts
-                        WHERE operation_id=operation_id AND tenant_id=requested_tenant_id
-                          AND user_id=requested_user_id) THEN
+           NOT EXISTS (SELECT 1 FROM public.task_creation_receipts receipt
+                        WHERE receipt.operation_id=requested_operation_id
+                          AND receipt.tenant_id=requested_tenant_id
+                          AND receipt.user_id=requested_user_id) THEN
             RAISE EXCEPTION '109: native V3 cleanup replay aggregate differs' USING ERRCODE='40001';
         END IF;
         RETURN;
@@ -673,7 +667,7 @@ BEGIN
            error_message=requested_error_message,result=NULL,executed_at=NULL,
            tombstoned_at=clock_timestamp(),lease_owner='',lease_until=NULL,
            takeover_not_before=NULL,updated_at=clock_timestamp()
-     WHERE id=operation_id AND tenant_id=requested_tenant_id
+     WHERE id=requested_operation_id AND tenant_id=requested_tenant_id
        AND user_id=requested_user_id AND tool_name='manage_tasks'
        AND execution_version=2 AND status='executing'
        AND lease_owner=requested_lease_owner AND fence=requested_fence;
@@ -694,7 +688,7 @@ BEGIN
            CASE WHEN operation.receipt_provider='' OR operation.receipt_target=''
                 THEN clock_timestamp() ELSE NULL END
       FROM public.task_creation_operations operation
-     WHERE operation.id=operation_id AND operation.tenant_id=requested_tenant_id
+     WHERE operation.id=requested_operation_id AND operation.tenant_id=requested_tenant_id
        AND operation.user_id=requested_user_id
     ON CONFLICT (operation_id) DO NOTHING;
     IF NOT FOUND THEN
