@@ -192,6 +192,10 @@ func (t *queryMyIntelligenceTool) Execute(ctx context.Context, userID int64, raw
 	if err != nil {
 		return "query_my_intelligence 查询被拒绝：" + err.Error(), nil
 	}
+	storeQuery, err = prepareIntelligenceFeedbackQuery(storeQuery)
+	if err != nil {
+		return "query_my_intelligence 查询被拒绝：" + err.Error(), nil
+	}
 	result, err := t.st.QueryMyIntelligence(ctx, store.IntelligenceScope{
 		TenantID: meta.scope.TenantID, UserID: userID, SessionID: &sessionID,
 	}, storeQuery)
@@ -205,6 +209,9 @@ func (t *queryMyIntelligenceTool) Execute(ctx context.Context, userID int64, raw
 		return "", err
 	}
 	if err := projectObservationResultForAgent(ctx, result); err != nil {
+		return "", err
+	}
+	if err := projectFeedbackResultForAgent(ctx, result); err != nil {
 		return "", err
 	}
 	rememberIntelligenceResultReferences(ctx, result)

@@ -23,7 +23,7 @@
 
 v1 已封存到 `AgentToolEvidenceV1` 的历史结果保持原字节和原版本，不做猜测性重写。v2 对七个 v1 数据集保持字段和关系查询语义兼容；旧签名游标仍可继续同一查询，下一页会如实标记当前 catalog 为 v2。
 
-`feedbacks` 直接读取既有 canonical `feedbacks`，不复制成 Agent turn，也不创建专用反馈工具。`is_effective_attitude` 仅对 `interested/not_interested` 有值，并按当前画像 epoch 与 canonical supersession 规则确定；其他动作返回 null。旧 push-now 投递允许缺少 `task_ref/run_snapshot_id`，owner 仍可读取，定时 Agent 则由 exact-task fence 自动排除。`delivered_summary` 是最多 2,000 字符、用户当时实际收到的历史投递文本，只用于把“刚才那条”关联回具体结论；它仍按不可信数据处理，不能改变查询范围、授权写操作或触发工具。数据集不返回内部 delivery ID、卡片 JSON 或原始网页正文。
+`feedbacks` 直接读取既有 canonical `feedbacks`，不复制成 Agent turn，也不创建专用反馈工具。`is_effective_attitude` 仅对 `interested/not_interested` 有值，并按当前画像 epoch 与 canonical supersession 规则确定；其他动作返回 null。旧 push-now 投递允许缺少 `task_ref/run_snapshot_id`，owner 仍可读取，定时 Agent 则由 exact-task fence 自动排除。`delivered_summary` 最多 2,000 字符，只用于把“刚才那条”关联回具体结论：migration 061 后已 sealed 的 canonical delivery 有不可变证据，旧/open delivery 仅是 `mixed` 的历史展示快照，不能宣称为 exact。Harness 会在通用查询返回前把该字段从可信反馈行删除，转成 historical public evidence sidecar；只有 Tools:nil 的公开摘要阶段能看到原文，最终无工具综合只看到来源绑定的降权摘要。数据集不返回内部 delivery ID、卡片 JSON 或原始网页正文。
 
 查询只接受列选择、参数化过滤、分组、固定聚合、排序、limit 与签名游标。单次只访问一个数据集；跨数据集问题由 Agent 发起多次只读查询，最后在无工具阶段综合。
 
