@@ -705,7 +705,7 @@ func (t *manageTasksTool) executeAuthorized(ctx context.Context, meta chatMeta, 
 		if err != nil {
 			return "", nil, err
 		}
-		actionID := manageTaskCreateIdempotencyKey(meta, args)
+		actionID := manageTaskCreateIdempotencyKey(meta)
 		sessionID := meta.scope.SessionID
 		outcome, err := t.deps.Creator.ExecuteResearchTaskCreationV3(ctx,
 			ResearchTaskCreationV3Input{
@@ -867,11 +867,14 @@ func (t *manageTasksTool) executeAuthorized(ctx context.Context, meta chatMeta, 
 	}
 }
 
-func manageTaskCreateIdempotencyKey(meta chatMeta, args manageTasksArgs) string {
-	changes, _ := args.authorizationChanges()
+func manageTaskCreateIdempotencyKey(meta chatMeta) string {
+	// A stable authenticated turn is the idempotency namespace. In particular,
+	// do not include model-generated task fields: after an HTTP response loss a
+	// repeated model pass may render equivalent fields differently, and letting
+	// that drift create another action ID could duplicate the task.
 	digest := sha256.Sum256([]byte(fmt.Sprintf(
-		"manage_tasks/v1\x00%d\x00%d\x00%s\x00create\x00%s",
-		meta.scope.TenantID, meta.scope.UserID, meta.traceID, changes,
+		"manage_tasks/v1\x00%d\x00%d\x00%s\x00create",
+		meta.scope.TenantID, meta.scope.UserID, meta.traceID,
 	)))
 	return "manage-task-v1-" + hex.EncodeToString(digest[:16])
 }

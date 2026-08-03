@@ -1,8 +1,9 @@
 // assistant.chat executor（契约 §12 P2 / PR-4）：LLM 轨——把入站自然语言交给
-// A2A 轨 agent.Loop（RunOnce，零工具公开对话面），按 contextId 重建多轮历史。
+// A2A 轨 agent.Loop（RunOnce；public-only 候选经 A2A 授权过滤后当前为零工具），
+// 按 contextId 重建多轮历史。
 //
 // 与 content.query 的分工：query 是确定性检索（零 LLM、结果可复现），chat 是
-// 对话式问答（仅依赖当前请求与同 context 历史）。卡片 description 引导对端
+// 对话式问答（仅当前请求与同 context 历史）。卡片 description 引导对端
 // 各取所长（检索找 query、对话找 chat）。
 package a2a
 

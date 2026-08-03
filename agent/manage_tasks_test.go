@@ -83,6 +83,7 @@ func (f *fakeManageTaskDeleter) DeletePushIdempotent(_ context.Context, ref stri
 
 type fakeManageTaskCreatorV3 struct {
 	input   ResearchTaskCreationV3Input
+	inputs  []ResearchTaskCreationV3Input
 	outcome ResearchTaskCreationV3Outcome
 	err     error
 	calls   int
@@ -91,6 +92,7 @@ type fakeManageTaskCreatorV3 struct {
 func (f *fakeManageTaskCreatorV3) ExecuteResearchTaskCreationV3(_ context.Context, in ResearchTaskCreationV3Input) (ResearchTaskCreationV3Outcome, error) {
 	f.calls++
 	f.input = in
+	f.inputs = append(f.inputs, in)
 	return f.outcome, f.err
 }
 
@@ -567,6 +569,38 @@ func TestOwnerManageTasksCreateRunsThroughNativeV3WithoutCanary(t *testing.T) {
 		len(state.actionReceipts) != 1 ||
 		!strings.Contains(string(state.actionReceipts[0]), "task-internal-kimi") {
 		t.Fatalf("create auth/receipt mismatch: auth=%+v receipts=%s", authorizer.input, state.actionReceipts)
+	}
+}
+
+func TestManageTasksCreateIdempotencyIgnoresModelRerenderWithinTurn(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
+		TaskRef: "task-internal-kimi", TaskName: "Kimi 套餐监控", Status: "completed",
+	}}
+	spec := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
+	ctx, _ := manageTasksTestContext("创建 Kimi 套餐监控，每周一九点检查")
+	first := json.RawMessage(`{
+		"action":"create","name":"Kimi 套餐监控","manual":"检查官方套餐页。",
+		"schedule":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},
+		"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},
+		"output":{"language":"zh-CN","format":"executive_brief","include_evidence_links":true}
+	}`)
+	second := json.RawMessage(`{
+		"action":"create","name":"Kimi 套餐监控","manual":"检查 Kimi 官方套餐页并交叉核验。",
+		"schedule":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},
+		"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},
+		"output":{"language":"zh-CN","format":"executive_brief","instructions":"给老板看","include_evidence_links":true}
+	}`)
+	if _, err := spec.Execute(ctx, 42, first); err != nil {
+		t.Fatal(err)
+	}
+	ctx = withToolInvocationID(ctx, "turn-manage-1\x00provider-call-2")
+	if _, err := spec.Execute(ctx, 42, second); err != nil {
+		t.Fatal(err)
+	}
+	if len(creator.inputs) != 2 || creator.inputs[0].ActionID == "" ||
+		creator.inputs[0].ActionID != creator.inputs[1].ActionID {
+		t.Fatalf("same authenticated create turn drifted action IDs: %+v", creator.inputs)
 	}
 }
 

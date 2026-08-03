@@ -69,6 +69,7 @@
 - Owner Agent 不再隐式读取或注入画像；需要画像时模型显式查询 `profile`，因此画像影响会进入 exact tool evidence。
 - `manage_tasks` 在 authenticated scope 内重新解析全部目标，再调用只看本轮原话、动作、changes 和可读目标摘要的 `authorize_owner_action`。创建提交完整 owner-visible 定义；编辑只提交用户明确要求改变的字段，由 V3 coordinator 在同一次最新 head 读取上保留其余字段并生成完整目标，避免模型猜旧配置和 read-then-write 覆盖。外部结果与历史不会进入裁决。
 - `run`/`delete` 强制使用每个任务的耐久幂等命令。批量部分失败仍继续处理其他目标，并把 completed/failed 写入动作回执；用户只看到可读名称。
+- `create` 的 action ID 只由认证 tenant/user/turn trace 派生，不包含模型生成的任务字段；浏览器响应丢失后即使模型把等价手册重新措辞，也只能恢复同一次创建，不能生成第二个任务。
 - 开启 exact evidence 后，任何 provider call identity、scope 或 session 不变量不匹配都会中止回复，不能回退到 legacy preview。presentation guard 和内部引用脱敏都发生在最终 turn 提交之前。
 
 ### 7.1 内部历史与当前公开证据隔离综合
