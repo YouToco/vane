@@ -338,16 +338,36 @@ BEGIN
         RAISE EXCEPTION '109: native V3 definition commit phase is invalid' USING ERRCODE='40001';
     END IF;
 
+    -- This ledger is intentionally identical to the retained V1 Store
+    -- boundary: one user lock protects mature active tasks, unfinished V1/V2
+    -- aggregate reservations, and quarantines whose remote side effect may
+    -- still exist.  The reservation kind keeps an unknown V1 quarantine from
+    -- aliasing a known TaskID while UNION de-duplicates known aggregates.
     SELECT count(*) INTO used_capacity FROM (
-        SELECT id FROM public.schedules
+        SELECT 0 AS reservation_kind,id AS reservation_id
+          FROM public.schedules
          WHERE user_id=requested_user_id AND status='active'
         UNION
-        SELECT task_id FROM public.task_creation_operations
+        SELECT 0,task_id FROM public.task_creation_operations
          WHERE user_id=requested_user_id AND status='executing'
            AND ((execution_version=1 AND tool_name='create_schedule') OR
                 (execution_version=2 AND tool_name='manage_tasks'))
            AND tombstoned_at IS NULL AND task_id<>''
            AND phase IN ('definition_committed','activation_started','activated')
+        UNION
+        SELECT CASE WHEN result->>'task_id_known'='true' THEN 0 ELSE 1 END,
+               CASE WHEN result->>'task_id_known'='true' THEN task_id ELSE id END
+          FROM public.task_creation_operations
+         WHERE user_id=requested_user_id AND execution_version=1
+           AND tool_name='create_schedule' AND status='blocked' AND phase='blocked'
+           AND tombstoned_at IS NOT NULL
+           AND result->>'version'='vane.task-creation-quarantine/v1'
+           AND result->>'reservation_retained'='true'
+        UNION
+        SELECT 0,task_id FROM public.task_creation_operations
+         WHERE user_id=requested_user_id AND execution_version=2
+           AND tool_name='manage_tasks' AND status='blocked' AND phase='blocked'
+           AND tombstoned_at IS NOT NULL AND task_id<>''
     ) reserved;
     IF used_capacity>=20 THEN
         RAISE EXCEPTION '109: active task capacity reached' USING ERRCODE='23514';
@@ -403,42 +423,63 @@ END $$;
 CREATE FUNCTION begin_native_research_task_activation_v3_v1(
     operation_id TEXT, requested_tenant_id BIGINT, requested_user_id BIGINT,
     requested_lease_owner TEXT, requested_fence BIGINT, requested_task_id TEXT,
+    requested_definition_digest TEXT, requested_target_action_digest TEXT,
+    requested_action_authorization_digest TEXT,
     requested_execution_version SMALLINT
 ) RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp
 AS $$
-DECLARE operation_phase TEXT; schedule_status TEXT; authority_status TEXT;
+DECLARE operation_row public.task_creation_operations%ROWTYPE;
+        schedule_status TEXT; authority_status TEXT;
 BEGIN
     IF operation_id IS NULL OR requested_tenant_id IS NULL OR requested_user_id IS NULL OR
        requested_lease_owner IS NULL OR requested_fence IS NULL OR requested_task_id IS NULL OR
+       requested_definition_digest IS NULL OR requested_target_action_digest IS NULL OR
+       requested_action_authorization_digest IS NULL OR
+       requested_definition_digest !~ '^[0-9a-f]{64}$' OR
+       requested_target_action_digest !~ '^[0-9a-f]{64}$' OR
+       requested_action_authorization_digest !~ '^[0-9a-f]{64}$' OR
        requested_execution_version IS NULL OR requested_execution_version<>2 THEN
         RAISE EXCEPTION '109: native V3 activation protocol differs' USING ERRCODE='23514';
     END IF;
     PERFORM pg_advisory_xact_lock(hashtextextended(
         requested_tenant_id::text||'/'||requested_user_id::text||'/'||requested_task_id,101));
-    SELECT phase INTO operation_phase FROM public.task_creation_operations
+    SELECT * INTO operation_row FROM public.task_creation_operations
      WHERE id=operation_id AND tenant_id=requested_tenant_id AND user_id=requested_user_id
        AND tool_name='manage_tasks' AND execution_version=2 AND status='executing'
        AND tombstoned_at IS NULL AND lease_owner=requested_lease_owner
        AND fence=requested_fence AND lease_until>clock_timestamp()
-       AND task_id=requested_task_id FOR UPDATE;
+       AND task_id=requested_task_id
+       AND compiled_digest=requested_definition_digest FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION '109: native V3 activation lease differs' USING ERRCODE='40001';
     END IF;
-    SELECT status INTO schedule_status FROM public.schedules
-     WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND id=requested_task_id AND execution_mode='discover_at_run'
-       AND approved_definition_version=1 FOR UPDATE;
+    SELECT schedule.status INTO schedule_status FROM public.schedules schedule
+      JOIN public.task_approved_definition_versions definition
+        ON definition.tenant_id=schedule.tenant_id AND definition.user_id=schedule.user_id
+       AND definition.task_id=schedule.id AND definition.version=1
+     WHERE schedule.tenant_id=requested_tenant_id AND schedule.user_id=requested_user_id
+       AND schedule.id=requested_task_id AND schedule.execution_mode='discover_at_run'
+       AND schedule.approved_definition_version=1
+       AND schedule.approved_definition_digest=requested_definition_digest
+       AND definition.schema_version='vane.task-approved-definition/v3'
+       AND definition.execution_mode='discover_at_run'
+       AND definition.definition_digest=requested_definition_digest
+       AND definition.payload=operation_row.compiled_definition
+     FOR UPDATE OF schedule,definition;
     SELECT status INTO authority_status FROM public.research_v3_delivery_authorities
      WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND task_id=requested_task_id AND generation=1 FOR UPDATE;
-    IF operation_phase='activation_started' AND schedule_status='paused' AND authority_status='staged' THEN
+       AND task_id=requested_task_id AND generation=1 AND definition_version=1
+       AND definition_digest=requested_definition_digest
+       AND target_action_digest=requested_target_action_digest
+       AND action_authorization_digest=requested_action_authorization_digest FOR UPDATE;
+    IF operation_row.phase='activation_started' AND schedule_status='paused' AND authority_status='staged' THEN
         RETURN false;
-    ELSIF operation_phase='activated' AND schedule_status='active' AND authority_status='enabled' THEN
+    ELSIF operation_row.phase='activated' AND schedule_status='active' AND authority_status='enabled' THEN
         RETURN false;
-    ELSIF operation_phase IS DISTINCT FROM 'definition_committed' OR
+    ELSIF operation_row.phase IS DISTINCT FROM 'definition_committed' OR
           schedule_status IS DISTINCT FROM 'paused' OR
           authority_status IS DISTINCT FROM 'staged' THEN
         RAISE EXCEPTION '109: native V3 activation aggregate differs' USING ERRCODE='40001';
@@ -470,40 +511,61 @@ END $$;
 CREATE FUNCTION commit_native_research_task_activation_v3_v1(
     operation_id TEXT, requested_tenant_id BIGINT, requested_user_id BIGINT,
     requested_lease_owner TEXT, requested_fence BIGINT, requested_task_id TEXT,
+    requested_definition_digest TEXT, requested_target_action_digest TEXT,
+    requested_action_authorization_digest TEXT,
     requested_execution_version SMALLINT
 ) RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp
 AS $$
-DECLARE operation_phase TEXT; schedule_status TEXT; authority_status TEXT;
+DECLARE operation_row public.task_creation_operations%ROWTYPE;
+        schedule_status TEXT; authority_status TEXT;
 BEGIN
     IF operation_id IS NULL OR requested_tenant_id IS NULL OR requested_user_id IS NULL OR
        requested_lease_owner IS NULL OR requested_fence IS NULL OR requested_task_id IS NULL OR
+       requested_definition_digest IS NULL OR requested_target_action_digest IS NULL OR
+       requested_action_authorization_digest IS NULL OR
+       requested_definition_digest !~ '^[0-9a-f]{64}$' OR
+       requested_target_action_digest !~ '^[0-9a-f]{64}$' OR
+       requested_action_authorization_digest !~ '^[0-9a-f]{64}$' OR
        requested_execution_version IS NULL OR requested_execution_version<>2 THEN
         RAISE EXCEPTION '109: native V3 activation protocol differs' USING ERRCODE='23514';
     END IF;
     PERFORM pg_advisory_xact_lock(hashtextextended(
         requested_tenant_id::text||'/'||requested_user_id::text||'/'||requested_task_id,101));
-    SELECT phase INTO operation_phase FROM public.task_creation_operations
+    SELECT * INTO operation_row FROM public.task_creation_operations
      WHERE id=operation_id AND tenant_id=requested_tenant_id AND user_id=requested_user_id
        AND tool_name='manage_tasks' AND execution_version=2 AND status='executing'
        AND tombstoned_at IS NULL AND lease_owner=requested_lease_owner
        AND fence=requested_fence AND lease_until>clock_timestamp()
-       AND task_id=requested_task_id FOR UPDATE;
+       AND task_id=requested_task_id
+       AND compiled_digest=requested_definition_digest FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION '109: native V3 activation commit lease differs' USING ERRCODE='40001';
     END IF;
-    SELECT status INTO schedule_status FROM public.schedules
-     WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND id=requested_task_id AND execution_mode='discover_at_run'
-       AND approved_definition_version=1 FOR UPDATE;
+    SELECT schedule.status INTO schedule_status FROM public.schedules schedule
+      JOIN public.task_approved_definition_versions definition
+        ON definition.tenant_id=schedule.tenant_id AND definition.user_id=schedule.user_id
+       AND definition.task_id=schedule.id AND definition.version=1
+     WHERE schedule.tenant_id=requested_tenant_id AND schedule.user_id=requested_user_id
+       AND schedule.id=requested_task_id AND schedule.execution_mode='discover_at_run'
+       AND schedule.approved_definition_version=1
+       AND schedule.approved_definition_digest=requested_definition_digest
+       AND definition.schema_version='vane.task-approved-definition/v3'
+       AND definition.execution_mode='discover_at_run'
+       AND definition.definition_digest=requested_definition_digest
+       AND definition.payload=operation_row.compiled_definition
+     FOR UPDATE OF schedule,definition;
     SELECT status INTO authority_status FROM public.research_v3_delivery_authorities
      WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
-       AND task_id=requested_task_id AND generation=1 FOR UPDATE;
-    IF operation_phase='activated' AND schedule_status='active' AND authority_status='enabled' THEN
+       AND task_id=requested_task_id AND generation=1 AND definition_version=1
+       AND definition_digest=requested_definition_digest
+       AND target_action_digest=requested_target_action_digest
+       AND action_authorization_digest=requested_action_authorization_digest FOR UPDATE;
+    IF operation_row.phase='activated' AND schedule_status='active' AND authority_status='enabled' THEN
         RETURN;
-    ELSIF operation_phase IS DISTINCT FROM 'activation_started' OR
+    ELSIF operation_row.phase IS DISTINCT FROM 'activation_started' OR
           schedule_status IS DISTINCT FROM 'paused' OR
           authority_status IS DISTINCT FROM 'staged' THEN
         RAISE EXCEPTION '109: native V3 activation commit aggregate differs' USING ERRCODE='40001';
@@ -543,20 +605,123 @@ BEGIN
 END $$;
 -- +goose StatementEnd
 
+-- +goose StatementBegin
+CREATE FUNCTION cleanup_native_research_task_creation_v3_v1(
+    operation_id TEXT, requested_tenant_id BIGINT, requested_user_id BIGINT,
+    requested_lease_owner TEXT, requested_fence BIGINT, requested_task_id TEXT,
+    requested_error_code TEXT, requested_error_message TEXT,
+    requested_execution_version SMALLINT
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE operation_row public.task_creation_operations%ROWTYPE;
+BEGIN
+    IF operation_id IS NULL OR requested_tenant_id<=0 OR requested_user_id<=0 OR
+       requested_lease_owner IS NULL OR btrim(requested_lease_owner)='' OR
+       requested_fence<=0 OR requested_task_id IS NULL OR btrim(requested_task_id)='' OR
+       requested_error_code IS NULL OR btrim(requested_error_code)='' OR
+       octet_length(requested_error_code)>128 OR requested_error_message IS NULL OR
+       btrim(requested_error_message)='' OR octet_length(requested_error_message)>4096 OR
+       requested_execution_version<>2 THEN
+        RAISE EXCEPTION '109: native V3 cleanup request is invalid' USING ERRCODE='23514';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        requested_tenant_id::text||'/'||requested_user_id::text||'/'||requested_task_id,101));
+    SELECT * INTO operation_row FROM public.task_creation_operations
+     WHERE id=operation_id AND tenant_id=requested_tenant_id
+       AND user_id=requested_user_id AND tool_name='manage_tasks'
+       AND execution_version=2 FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '109: native V3 cleanup operation is unavailable' USING ERRCODE='40001';
+    END IF;
+    IF operation_row.status='failed' AND operation_row.phase='failed' AND
+       operation_row.tombstoned_at IS NOT NULL AND
+       operation_row.task_id=requested_task_id AND
+       operation_row.error_code=requested_error_code AND
+       operation_row.error_message=requested_error_message THEN
+        IF EXISTS (SELECT 1 FROM public.schedules
+                    WHERE id=requested_task_id AND tenant_id=requested_tenant_id
+                      AND user_id=requested_user_id) OR
+           EXISTS (SELECT 1 FROM public.research_v3_delivery_authorities
+                    WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
+                      AND task_id=requested_task_id) OR
+           NOT EXISTS (SELECT 1 FROM public.task_creation_receipts
+                        WHERE operation_id=operation_id AND tenant_id=requested_tenant_id
+                          AND user_id=requested_user_id) THEN
+            RAISE EXCEPTION '109: native V3 cleanup replay aggregate differs' USING ERRCODE='40001';
+        END IF;
+        RETURN;
+    END IF;
+    IF operation_row.status<>'executing' OR operation_row.tombstoned_at IS NOT NULL OR
+       operation_row.lease_owner<>requested_lease_owner OR
+       operation_row.fence<>requested_fence OR operation_row.lease_until IS NULL OR
+       operation_row.lease_until<=clock_timestamp() OR
+       operation_row.task_id<>requested_task_id OR
+       operation_row.phase NOT IN ('schedule_prepared','schedule_ensured',
+          'definition_committed','activation_started') THEN
+        RAISE EXCEPTION '109: native V3 cleanup lease or phase differs' USING ERRCODE='40001';
+    END IF;
+
+    DELETE FROM public.schedules
+     WHERE id=requested_task_id AND tenant_id=requested_tenant_id
+       AND user_id=requested_user_id;
+    DELETE FROM public.research_v3_delivery_authorities
+     WHERE tenant_id=requested_tenant_id AND user_id=requested_user_id
+       AND task_id=requested_task_id;
+    UPDATE public.task_creation_operations
+       SET status='failed',phase='failed',error_code=requested_error_code,
+           error_message=requested_error_message,result=NULL,executed_at=NULL,
+           tombstoned_at=clock_timestamp(),lease_owner='',lease_until=NULL,
+           takeover_not_before=NULL,updated_at=clock_timestamp()
+     WHERE id=operation_id AND tenant_id=requested_tenant_id
+       AND user_id=requested_user_id AND tool_name='manage_tasks'
+       AND execution_version=2 AND status='executing'
+       AND lease_owner=requested_lease_owner AND fence=requested_fence;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '109: native V3 cleanup checkpoint lost lease' USING ERRCODE='40001';
+    END IF;
+    INSERT INTO public.task_creation_receipts (
+        operation_id,tenant_id,user_id,session_id,provider,target,provider_key,
+        status,next_attempt_at,failure_class,blocked_at)
+    SELECT operation.id,operation.tenant_id,operation.user_id,operation.session_id,
+           operation.receipt_provider,operation.receipt_target,
+           md5('vane/task-creation-receipt/v1:'||operation.id)::uuid,
+           CASE WHEN operation.receipt_provider='' OR operation.receipt_target=''
+                THEN 'blocked' ELSE 'pending' END,
+           clock_timestamp()+interval '4 seconds',
+           CASE WHEN operation.receipt_provider='' OR operation.receipt_target=''
+                THEN 'target_unbound' ELSE '' END,
+           CASE WHEN operation.receipt_provider='' OR operation.receipt_target=''
+                THEN clock_timestamp() ELSE NULL END
+      FROM public.task_creation_operations operation
+     WHERE operation.id=operation_id AND operation.tenant_id=requested_tenant_id
+       AND operation.user_id=requested_user_id
+    ON CONFLICT (operation_id) DO NOTHING;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '109: native V3 cleanup receipt differs' USING ERRCODE='40001';
+    END IF;
+END $$;
+-- +goose StatementEnd
+
 REVOKE ALL ON FUNCTION commit_native_research_task_creation_v3_v1(
     TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,BYTEA,BYTEA,BYTEA,BYTEA,TEXT,TEXT,SMALLINT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION begin_native_research_task_activation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT) FROM PUBLIC;
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,TEXT,SMALLINT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION commit_native_research_task_activation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT) FROM PUBLIC;
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,TEXT,SMALLINT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION cleanup_native_research_task_creation_v3_v1(
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,SMALLINT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION commit_native_research_task_creation_v3_v1(
     TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,BYTEA,BYTEA,BYTEA,BYTEA,TEXT,TEXT,SMALLINT)
     TO vane_native_v3_creation_coordinator;
 GRANT EXECUTE ON FUNCTION begin_native_research_task_activation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT)
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,TEXT,SMALLINT)
     TO vane_native_v3_creation_coordinator;
 GRANT EXECUTE ON FUNCTION commit_native_research_task_activation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT)
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,TEXT,SMALLINT)
+    TO vane_native_v3_creation_coordinator;
+GRANT EXECUTE ON FUNCTION cleanup_native_research_task_creation_v3_v1(
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,SMALLINT)
     TO vane_native_v3_creation_coordinator;
 
 -- +goose Down
@@ -576,9 +741,11 @@ END $$;
 -- +goose StatementEnd
 
 DROP FUNCTION commit_native_research_task_activation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT);
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,TEXT,SMALLINT);
+DROP FUNCTION cleanup_native_research_task_creation_v3_v1(
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,SMALLINT);
 DROP FUNCTION begin_native_research_task_activation_v3_v1(
-    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,SMALLINT);
+    TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,TEXT,SMALLINT);
 DROP FUNCTION commit_native_research_task_creation_v3_v1(
     TEXT,BIGINT,BIGINT,TEXT,BIGINT,TEXT,TEXT,BYTEA,BYTEA,BYTEA,BYTEA,TEXT,TEXT,SMALLINT);
 DROP FUNCTION deprovision_vane_server_runtime_v2();

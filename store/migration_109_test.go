@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"io/fs"
@@ -40,8 +41,9 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 
 	for _, signature := range []string{
 		"commit_native_research_task_creation_v3_v1(text,bigint,bigint,text,bigint,text,text,bytea,bytea,bytea,bytea,text,text,smallint)",
-		"begin_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,smallint)",
-		"commit_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,smallint)",
+		"begin_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,text,smallint)",
+		"commit_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,text,smallint)",
+		"cleanup_native_research_task_creation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,smallint)",
 	} {
 		var publicExecute, appExecute, coordinatorExecute, securityDefiner, safePath bool
 		var owner string
@@ -129,7 +131,7 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 	_, executeErr := roleTx.ExecContext(t.Context(), `
 		SELECT begin_native_research_task_activation_v3_v1(
 		 NULL::text,NULL::bigint,NULL::bigint,NULL::text,NULL::bigint,
-		 NULL::text,2::smallint)`)
+		 NULL::text,NULL::text,NULL::text,NULL::text,2::smallint)`)
 	if executeErr == nil || !postgresCodeIs(executeErr, "42501") {
 		t.Fatalf("vane_app reached native V3 write function: %v", executeErr)
 	}
@@ -162,7 +164,7 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 	_, executeErr = roleTx.ExecContext(t.Context(), `
 		SELECT begin_native_research_task_activation_v3_v1(
 		 NULL::text,NULL::bigint,NULL::bigint,NULL::text,NULL::bigint,
-		 NULL::text,2::smallint)`)
+		 NULL::text,NULL::text,NULL::text,NULL::text,2::smallint)`)
 	if executeErr == nil || postgresCodeIs(executeErr, "42501") {
 		t.Fatalf("coordinator did not reach guarded function body: %v", executeErr)
 	}
@@ -218,8 +220,9 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 	}
 	for _, signature := range []string{
 		"commit_native_research_task_creation_v3_v1(text,bigint,bigint,text,bigint,text,text,bytea,bytea,bytea,bytea,text,text,smallint)",
-		"begin_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,smallint)",
-		"commit_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,smallint)",
+		"begin_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,text,smallint)",
+		"commit_native_research_task_activation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,text,smallint)",
+		"cleanup_native_research_task_creation_v3_v1(text,bigint,bigint,text,bigint,text,text,text,smallint)",
 	} {
 		var definition string
 		if err := db.QueryRowContext(t.Context(),
@@ -298,6 +301,79 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 
 	if _, err := provider.DownTo(t.Context(), 108); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMigration109UpgradesProvisionedLoginRuntimeWithoutLosingLogin(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	db, err := sql.Open("pgx", scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir,
+		goose.WithAllowOutofOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 108); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `SELECT provision_vane_server_runtime_v1()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `ALTER ROLE vane_server_runtime LOGIN`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = db.ExecContext(cleanupCtx, `ALTER ROLE vane_server_runtime NOLOGIN`)
+		_, _ = db.ExecContext(cleanupCtx, `SELECT deprovision_vane_server_runtime_v2()`)
+	})
+	if _, err := provider.UpTo(t.Context(), 109); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `SELECT provision_vane_server_runtime_v2()`); err != nil {
+		t.Fatalf("upgrade provisioned runtime to exact V2 set: %v", err)
+	}
+	var login, coordinatorMember bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT runtime.rolcanlogin,
+		       pg_has_role(runtime.oid,coordinator.oid,'MEMBER')
+		  FROM pg_roles runtime CROSS JOIN pg_roles coordinator
+		 WHERE runtime.rolname='vane_server_runtime'
+		   AND coordinator.rolname='vane_native_v3_creation_coordinator'`).Scan(
+		&login, &coordinatorMember); err != nil {
+		t.Fatal(err)
+	}
+	if !login || !coordinatorMember {
+		t.Fatalf("V2 upgrade lost deployed runtime state login=%v coordinator=%v",
+			login, coordinatorMember)
+	}
+	if _, err := db.ExecContext(t.Context(), `ALTER ROLE vane_server_runtime NOLOGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `SELECT deprovision_vane_server_runtime_v2()`); err != nil {
+		t.Fatalf("deprovision upgraded runtime: %v", err)
+	}
+	var runtimeExists bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='vane_server_runtime')`).Scan(
+		&runtimeExists); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeExists {
+		t.Fatal("upgraded runtime deprovision left the cluster-global login role")
 	}
 }
 
