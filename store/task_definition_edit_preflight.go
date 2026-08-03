@@ -33,6 +33,7 @@ func (s *Store) ListNonterminalTaskDefinitionEditTenantIDs(
 		SELECT DISTINCT tenant_id
 		  FROM task_definition_edit_operations
 		 WHERE tenant_id > $1
+		   AND operation_protocol=$5
 		   AND status IN ($2,$3)
 		   AND tombstoned_at IS NULL
 		 ORDER BY tenant_id
@@ -41,6 +42,7 @@ func (s *Store) ListNonterminalTaskDefinitionEditTenantIDs(
 		types.TaskDefinitionEditOperationStatusPending,
 		types.TaskDefinitionEditOperationStatusExecuting,
 		limit,
+		types.TaskDefinitionEditProtocolLegacyV1V2,
 	)
 	if err != nil {
 		return nil, taskDefinitionEditDatabaseError(
@@ -91,6 +93,7 @@ func (s *Store) ListNonterminalTaskDefinitionEditOperations(
 		`SELECT `+taskDefinitionEditOperationColumns+`
 		   FROM task_definition_edit_operations
 		  WHERE tenant_id=$1 AND id>$2
+		    AND operation_protocol=$6
 		    AND status IN ($3,$4)
 		    AND tombstoned_at IS NULL
 		  ORDER BY id
@@ -99,6 +102,7 @@ func (s *Store) ListNonterminalTaskDefinitionEditOperations(
 		types.TaskDefinitionEditOperationStatusPending,
 		types.TaskDefinitionEditOperationStatusExecuting,
 		limit,
+		types.TaskDefinitionEditProtocolLegacyV1V2,
 	)
 	if err != nil {
 		return nil, taskDefinitionEditDatabaseError(
