@@ -149,6 +149,7 @@ type CreationCoordinator struct {
 	scheduler CreationTaskScheduler
 	preparer  *CreationPreparer
 	logger    *slog.Logger
+	v3Policy  *CreationV3ServerPolicy
 
 	// Recovery passes are serialized so two callers cannot race the same stale
 	// scan. The cursor rotates tenant order between bounded passes, preventing a
@@ -161,16 +162,23 @@ func NewCreationCoordinator(
 	store CreationSagaStore,
 	schedules CreationTaskScheduler,
 	logger *slog.Logger,
+	options ...CreationCoordinatorOption,
 ) *CreationCoordinator {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CreationCoordinator{
+	coordinator := &CreationCoordinator{
 		store:     store,
 		scheduler: schedules,
 		preparer:  NewCreationPreparer(store, creationSchedulePreparer{scheduler: schedules}),
 		logger:    logger,
 	}
+	for _, option := range options {
+		if option != nil {
+			option(coordinator)
+		}
+	}
+	return coordinator
 }
 
 // Prepare validates and freezes the complete definition. There is no LLM,
