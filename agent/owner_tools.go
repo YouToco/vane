@@ -269,6 +269,9 @@ func (t *updateProfileTool) Execute(ctx context.Context, userID int64, args json
 		return "没有提供任何要修改的字段，请至少提供 industry、occupation、tags 之一", nil
 	}
 	state := runStateFrom(ctx)
+	if state != nil && state.webActionMode != webActionNone {
+		return webActionBoundaryReply, nil
+	}
 	if state != nil && state.agentFirstEnabled {
 		if t.authorizer == nil {
 			return "画像写入授权能力未装配，本次未执行。", nil

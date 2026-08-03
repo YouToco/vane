@@ -65,6 +65,7 @@
 - 因 Owner catalog 无条件提供原生 V3 `manage_tasks create`，server 启动必须显式设置 `pipeline.research_v3_runtime_enabled=true`；该 Gate 在首个 Store、worker 或 ingress 之前失败。此开关只保证运行能力持续在线，不授予任何任务执行权；正式运行仍逐任务校验数据库 authority token，shadow/cutover 仍保持 exact-task 语义。
 - owner 普通聊天只装配 `query_my_intelligence`、`manage_tasks`、经统一裁决的 `update_profile` 与已配置的公开研究工具。构造时缺少 exact evidence writer、任一必需工具或混入八个旧任务工具都会拒绝启动。
 - `list_schedules`、`view_task_playbook`、`view_task_latest_run`、`view_profile`、`create_schedule`、`edit_task_definition`、`run_task_now`、`remove_schedule` 不再进入 owner 或 A2A catalog，其 Go handler 和专用状态机已物理删除。Web `POST /api/task-actions` 与飞书共用唯一 Owner Loop；浏览器 `request_id+digest` 派生稳定 trace，已完成请求从 `AgentTurnRecordV1` 重放，不再调模型或重复写入。
+- Web route 还会把可信 mode/selected task 写入仅存在于本轮 context 的 capability：create route 只能执行一次 `manage_tasks create`；edit route 只能 `edit` server 选中的唯一 task ref。`update_profile`、run/delete、跨目标 edit 和任何其他 mutating tool 都在 authorizer、Store 查询及副作用之前双层拒绝；模型提示词不承担这个安全边界。
 - 旧 `intent_toolkits_shadow/owner_canary/allow_all` 配置、关键词首轮分类和 shadow diff 已删除。强模型始终看到完整的小型正交工具面；授权仍在工具边界执行。
 - Owner Agent 不再隐式读取或注入画像；需要画像时模型显式查询 `profile`，因此画像影响会进入 exact tool evidence。
 - `manage_tasks` 在 authenticated scope 内重新解析全部目标，再调用只看本轮原话、动作、changes 和可读目标摘要的 `authorize_owner_action`。创建提交完整 owner-visible 定义；编辑只提交用户明确要求改变的字段，由 V3 coordinator 在同一次最新 head 读取上保留其余字段并生成完整目标，避免模型猜旧配置和 read-then-write 覆盖。外部结果与历史不会进入裁决。

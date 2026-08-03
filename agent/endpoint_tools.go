@@ -115,6 +115,11 @@ type toolRunState struct {
 	// turn-wide accumulated grounding list, because refs are invocation-local.
 	publicEvidenceDisplayURLs map[string][]string
 	deferEvidenceCommit       bool
+	// webActionMode is derived only by the authenticated Web task-action
+	// ingress. It is a hard execution capability, not model context: create can
+	// only create one task; edit can only edit webSelectedTaskRef.
+	webActionMode    webActionMode
+	webActionClaimed bool
 	// webSelectedTaskRef comes from the authenticated Dashboard edit route.
 	// It is internal model context only and is always redacted from replies.
 	webSelectedTaskRef string
@@ -178,6 +183,14 @@ type toolRunState struct {
 	// 其他会话的旧结果。taint 后 read_endpoint_result 必须命中这个集合。
 	allowedLocalResultHandles map[string]struct{}
 }
+
+type webActionMode uint8
+
+const (
+	webActionNone webActionMode = iota
+	webActionCreate
+	webActionEdit
+)
 
 // inlineBudget 返回本次调用可内联的字符数：预算未尽给满额，尽了给保底
 // （保底仍有句柄可取回，故不是数据丢失，只是首屏变窄）。

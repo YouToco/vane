@@ -729,9 +729,13 @@ func (l *Loop) handleMessage(
 		failedCalls:             make(map[string]int),
 		untrustedExternalResult: externalInput,
 	}
-	if webAgentFirst && webSelectedTaskRef != "" {
-		rememberInternalReference(state, webSelectedTaskRef)
-		state.webSelectedTaskRef = webSelectedTaskRef
+	if webAgentFirst {
+		state.webActionMode = webActionCreate
+		if webSelectedTaskRef != "" {
+			state.webActionMode = webActionEdit
+			rememberInternalReference(state, webSelectedTaskRef)
+			state.webSelectedTaskRef = webSelectedTaskRef
+		}
 	}
 	if externalInput {
 		if request, _, ok := splitExternalInput(text); ok {
@@ -1420,6 +1424,10 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			continue
 		}
 		args := json.RawMessage(tc.Arguments)
+		if message, allowed := validateWebActionToolCall(state, spec, args); !allowed {
+			out = append(out, toolMsg(tc.ID, message))
+			continue
+		}
 		if err := beginCompartmentedResearch(ctx, state, spec); err != nil {
 			return out, err
 		}

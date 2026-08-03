@@ -99,6 +99,7 @@ func (f *fakeManageTaskCreatorV3) ExecuteResearchTaskCreationV3(_ context.Contex
 type fakeManageTaskEditorV3 struct {
 	input   ResearchTaskDefinitionEditV3Input
 	outcome ResearchTaskDefinitionEditV3Outcome
+	execute func(ResearchTaskDefinitionEditV3Input) ResearchTaskDefinitionEditV3Outcome
 	err     error
 	calls   int
 }
@@ -108,6 +109,9 @@ func (f *fakeManageTaskEditorV3) ExecuteResearchTaskDefinitionEditV3(
 ) (ResearchTaskDefinitionEditV3Outcome, error) {
 	f.calls++
 	f.input = in
+	if f.execute != nil {
+		return f.execute(in), f.err
+	}
 	return f.outcome, f.err
 }
 
@@ -572,13 +576,14 @@ func TestOwnerManageTasksCreateRunsThroughNativeV3WithoutCanary(t *testing.T) {
 	}
 }
 
-func TestManageTasksCreateIdempotencyIgnoresModelRerenderWithinTurn(t *testing.T) {
+func TestManageTasksCreateIdempotencyIgnoresModelRerenderAcrossWebRetry(t *testing.T) {
 	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
 	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
 		TaskRef: "task-internal-kimi", TaskName: "Kimi 套餐监控", Status: "completed",
 	}}
 	spec := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
-	ctx, _ := manageTasksTestContext("创建 Kimi 套餐监控，每周一九点检查")
+	ctx, state := manageTasksTestContext("创建 Kimi 套餐监控，每周一九点检查")
+	state.webActionMode = webActionCreate
 	first := json.RawMessage(`{
 		"action":"create","name":"Kimi 套餐监控","manual":"检查官方套餐页。",
 		"schedule":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},
@@ -594,14 +599,326 @@ func TestManageTasksCreateIdempotencyIgnoresModelRerenderWithinTurn(t *testing.T
 	if _, err := spec.Execute(ctx, 42, first); err != nil {
 		t.Fatal(err)
 	}
-	ctx = withToolInvocationID(ctx, "turn-manage-1\x00provider-call-2")
-	if _, err := spec.Execute(ctx, 42, second); err != nil {
+	retryCtx, retryState := manageTasksTestContext("创建 Kimi 套餐监控，每周一九点检查")
+	retryState.webActionMode = state.webActionMode
+	retryCtx = withToolInvocationID(retryCtx, "turn-manage-1\x00provider-call-2")
+	if _, err := spec.Execute(retryCtx, 42, second); err != nil {
 		t.Fatal(err)
 	}
 	if len(creator.inputs) != 2 || creator.inputs[0].ActionID == "" ||
 		creator.inputs[0].ActionID != creator.inputs[1].ActionID {
 		t.Fatalf("same authenticated create turn drifted action IDs: %+v", creator.inputs)
 	}
+}
+
+func TestWebCreateRouteRejectsNonCreateTaskActionsBeforeAuthorization(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	queries := &fakeManageTaskQuery{rows: manageTaskRows("task-a", "task-b")}
+	creator := &fakeManageTaskCreatorV3{}
+	editor := &fakeManageTaskEditorV3{}
+	runner := &fakeManageTaskRunner{}
+	deleter := &fakeManageTaskDeleter{}
+	spec := NewManageTasksTool(ManageTasksDeps{
+		Queries: queries, Creator: creator, Editor: editor, Runner: runner,
+		Deleter: deleter, Authorizer: authorizer,
+	})
+	ctx, state := manageTasksTestContext("创建一个任务")
+	state.webActionMode = webActionCreate
+
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"action":"edit","task_refs":["task-a"],"changes":{"manual":"越界编辑"}}`),
+		json.RawMessage(`{"action":"run","task_refs":["task-a"]}`),
+		json.RawMessage(`{"action":"delete","task_refs":["task-a"]}`),
+	} {
+		result, err := spec.Execute(ctx, 42, raw)
+		if err != nil || result != webActionBoundaryReply {
+			t.Fatalf("route escape result=%q err=%v", result, err)
+		}
+	}
+	if authorizer.calls != 0 || creator.calls != 0 || editor.calls != 0 ||
+		len(runner.refs) != 0 || len(deleter.refs) != 0 || queries.query.Dataset != "" {
+		t.Fatalf("create route reached authorization/effect: auth=%d create=%d edit=%d run=%v delete=%v query=%+v",
+			authorizer.calls, creator.calls, editor.calls, runner.refs, deleter.refs, queries.query)
+	}
+}
+
+func TestWebEditRouteRejectsCreateRunDeleteAndDifferentTargetBeforeAuthorization(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	queries := &fakeManageTaskQuery{rows: manageTaskRows("task-a", "task-b")}
+	creator := &fakeManageTaskCreatorV3{}
+	editor := &fakeManageTaskEditorV3{}
+	runner := &fakeManageTaskRunner{}
+	deleter := &fakeManageTaskDeleter{}
+	spec := NewManageTasksTool(ManageTasksDeps{
+		Queries: queries, Creator: creator, Editor: editor, Runner: runner,
+		Deleter: deleter, Authorizer: authorizer,
+	})
+	ctx, state := manageTasksTestContext("修改当前任务")
+	state.webActionMode = webActionEdit
+	state.webSelectedTaskRef = "task-a"
+
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"action":"create","name":"越界创建","manual":"检查官方更新。","schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}}`),
+		json.RawMessage(`{"action":"run","task_refs":["task-a"]}`),
+		json.RawMessage(`{"action":"delete","task_refs":["task-a"]}`),
+		json.RawMessage(`{"action":"edit","task_refs":["task-b"],"changes":{"manual":"故意编辑 B"}}`),
+	} {
+		result, err := spec.Execute(ctx, 42, raw)
+		if err != nil || result != webActionBoundaryReply {
+			t.Fatalf("route escape result=%q err=%v", result, err)
+		}
+	}
+	if authorizer.calls != 0 || creator.calls != 0 || editor.calls != 0 ||
+		len(runner.refs) != 0 || len(deleter.refs) != 0 || queries.query.Dataset != "" {
+		t.Fatalf("edit route reached authorization/effect: auth=%d create=%d edit=%d run=%v delete=%v query=%+v",
+			authorizer.calls, creator.calls, editor.calls, runner.refs, deleter.refs, queries.query)
+	}
+}
+
+func TestWebTaskRoutesAllowOnlyExactCreateAndSelectedEdit(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+		creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
+			TaskRef: "created-task", TaskName: "Kimi 监控", Status: "completed",
+		}}
+		spec := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
+		ctx, state := manageTasksTestContext("创建 Kimi 监控")
+		state.webActionMode = webActionCreate
+		result, err := spec.Execute(ctx, 42, json.RawMessage(`{
+			"action":"create","name":"Kimi 监控","manual":"检查官方更新。",
+			"schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},
+			"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},
+			"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}
+		}`))
+		if err != nil || result != "已创建任务：Kimi 监控。" ||
+			authorizer.calls != 1 || creator.calls != 1 {
+			t.Fatalf("exact create result=%q err=%v auth=%d calls=%d",
+				result, err, authorizer.calls, creator.calls)
+		}
+	})
+
+	t.Run("selected edit", func(t *testing.T) {
+		authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+		editor := &fakeManageTaskEditorV3{execute: func(in ResearchTaskDefinitionEditV3Input) ResearchTaskDefinitionEditV3Outcome {
+			return ResearchTaskDefinitionEditV3Outcome{
+				OperationID: in.ActionID, TaskRef: in.TaskRef,
+				TaskName: "Kimi 监控", Status: "completed",
+			}
+		}}
+		spec := NewManageTasksTool(ManageTasksDeps{
+			Queries: &fakeManageTaskQuery{rows: manageTaskRows("task-a")},
+			Editor:  editor, Authorizer: authorizer,
+		})
+		ctx, state := manageTasksTestContext("修改当前 Kimi 监控")
+		state.webActionMode = webActionEdit
+		state.webSelectedTaskRef = "task-a"
+		result, err := spec.Execute(ctx, 42, json.RawMessage(
+			`{"action":"edit","task_refs":["task-a"],"changes":{"manual":"只检查官方更新。"}}`,
+		))
+		if err != nil || result != "已修改任务：Kimi 监控。" ||
+			authorizer.calls != 1 || editor.calls != 1 || editor.input.TaskRef != "task-a" {
+			t.Fatalf("exact edit result=%q err=%v auth=%d editor=%+v",
+				result, err, authorizer.calls, editor.input)
+		}
+	})
+}
+
+func TestWebTaskRouteClaimsOnlyOneMutation(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
+		TaskRef: "created-task", TaskName: "Kimi 监控", Status: "completed",
+	}}
+	spec := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
+	ctx, state := manageTasksTestContext("创建 Kimi 监控")
+	state.webActionMode = webActionCreate
+	raw := json.RawMessage(`{
+		"action":"create","name":"Kimi 监控","manual":"检查官方更新。",
+		"schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},
+		"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},
+		"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}
+	}`)
+	if _, err := spec.Execute(ctx, 42, raw); err != nil {
+		t.Fatal(err)
+	}
+	result, err := spec.Execute(ctx, 42, raw)
+	if err != nil || result != webActionBoundaryReply || creator.calls != 1 ||
+		authorizer.calls != 1 {
+		t.Fatalf("second Web mutation escaped: result=%q err=%v create=%d auth=%d",
+			result, err, creator.calls, authorizer.calls)
+	}
+}
+
+func TestWebTaskRouteRejectsUpdateProfileBeforeAuthorization(t *testing.T) {
+	fs := newFakeStore()
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	spec := NewAuthorizedUpdateProfileTool(fs, authorizer)
+	ctx, state := manageTasksTestContext("创建一个任务")
+	state.agentFirstEnabled = true
+	state.webActionMode = webActionCreate
+	result, err := spec.Execute(ctx, 42, json.RawMessage(`{"industry":"AI"}`))
+	if err != nil || result != webActionBoundaryReply || authorizer.calls != 0 ||
+		len(fs.upsertCalls) != 0 {
+		t.Fatalf("Web route update_profile escaped: result=%q err=%v auth=%d upserts=%d",
+			result, err, authorizer.calls, len(fs.upsertCalls))
+	}
+}
+
+func TestWebTaskRouteRejectsAnyOtherMutatingToolBeforeExecution(t *testing.T) {
+	mutating := &fakeTool{name: "unexpected_mutation", mutating: true}
+	spec := newToolSpec(mutating, withToolSurface(ownerPolicy(
+		Effects(EffectStateWrite, EffectDirectOwnerWrite), BudgetNone,
+	), ExposureAlways, IntentTasks, ResultTrustLocal, true))
+	loop := New(Deps{Tools: []ToolSpec{spec}})
+	ctx, state := manageTasksTestContext("创建一个任务")
+	state.webActionMode = webActionCreate
+	messages, err := loop.runToolCalls(ctx, 42, nil, []llm.ToolCall{{
+		ID: "wrong-write", Name: spec.Name(), Arguments: `{}`,
+	}})
+	if err != nil || len(messages) != 1 || messages[0].Content != webActionBoundaryReply ||
+		len(mutating.calls) != 0 {
+		t.Fatalf("other mutation escaped: messages=%+v calls=%+v err=%v",
+			messages, mutating.calls, err)
+	}
+}
+
+func TestHandleWebTaskActionDerivesAndEnforcesTrustedRouteCapability(t *testing.T) {
+	testCases := []struct {
+		name, actionID, selectedRef string
+		call                        llm.ToolCall
+	}{
+		{
+			name: "create route delete", actionID: "bb61791f-c91e-4b00-8280-49994adbda4c",
+			call: llm.ToolCall{ID: "delete", Name: manageTasksName,
+				Arguments: `{"action":"delete","task_refs":["task-a"]}`},
+		},
+		{
+			name: "edit route different target", actionID: "7052b4ba-ec4d-4cd8-9611-bc842b28153d",
+			selectedRef: "task-a", call: llm.ToolCall{ID: "edit-b", Name: manageTasksName,
+				Arguments: `{"action":"edit","task_refs":["task-b"],"changes":{"manual":"故意编辑 B"}}`},
+		},
+		{
+			name: "edit route create", actionID: "a19825c4-6b5b-443c-a6de-fd83dfd447b6",
+			selectedRef: "task-a", call: llm.ToolCall{ID: "create", Name: manageTasksName,
+				Arguments: `{"action":"create","name":"越界创建","manual":"检查官方更新。","schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}}`},
+		},
+		{
+			name: "create route update profile", actionID: "daf93b90-c0d1-4820-bc4c-dd587b98f5ba",
+			call: llm.ToolCall{ID: "profile", Name: "update_profile",
+				Arguments: `{"industry":"AI"}`},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fs := newFakeStore()
+			authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+			queries := &fakeManageTaskQuery{rows: manageTaskRows("task-a", "task-b")}
+			creator := &fakeManageTaskCreatorV3{}
+			editor := &fakeManageTaskEditorV3{}
+			runner := &fakeManageTaskRunner{}
+			deleter := &fakeManageTaskDeleter{}
+			manage := NewManageTasksTool(ManageTasksDeps{
+				Queries: queries, Creator: creator, Editor: editor, Runner: runner,
+				Deleter: deleter, Authorizer: authorizer,
+			})
+			profile := NewAuthorizedUpdateProfileTool(fs, authorizer)
+			chat := &scriptedChat{responses: []*llm.ChatResponse{
+				{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{testCase.call}},
+				{FinishReason: "stop", Content: "本次未执行。"},
+			}}
+			loop := New(Deps{
+				Store: fs, Profiles: fs, Tools: ownerTestTools(manage, profile),
+				OwnerAgent: true, Evidence: &fakeAgentEvidenceWriter{}, MaxTurns: 2,
+				TurnReplay: &fakeAgentTurnReplayReader{err: types.NewAppError(
+					types.CodeNotFound, "missing", types.ErrNotFound,
+				)},
+			})
+			loop.chatFn = chat.fn
+			outcome, err := loop.HandleWebTaskActionMessage(
+				t.Context(), 42, testCase.actionID, testCase.selectedRef, "执行当前页面操作",
+			)
+			if err != nil || outcome.Reply != "本次未执行。" || len(chat.requests) != 2 {
+				t.Fatalf("outcome=%+v requests=%d err=%v", outcome, len(chat.requests), err)
+			}
+			if authorizer.calls != 0 || creator.calls != 0 || editor.calls != 0 ||
+				len(runner.refs) != 0 || len(deleter.refs) != 0 ||
+				len(fs.upsertCalls) != 0 || queries.query.Dataset != "" {
+				t.Fatalf("trusted Web route leaked effect: auth=%d create=%d edit=%d run=%v delete=%v profile=%d query=%+v",
+					authorizer.calls, creator.calls, editor.calls, runner.refs,
+					deleter.refs, len(fs.upsertCalls), queries.query)
+			}
+		})
+	}
+}
+
+func TestHandleWebTaskActionAllowsExactRouteMutation(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		fs := newFakeStore()
+		authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+		creator := &fakeManageTaskCreatorV3{outcome: ResearchTaskCreationV3Outcome{
+			TaskRef: "created-task", TaskName: "Kimi 监控", Status: "completed",
+		}}
+		manage := NewManageTasksTool(ManageTasksDeps{Creator: creator, Authorizer: authorizer})
+		chat := &scriptedChat{responses: []*llm.ChatResponse{{
+			FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
+				ID: "create", Name: manageTasksName,
+				Arguments: `{"action":"create","name":"Kimi 监控","manual":"检查官方更新。","schedule":{"every_seconds":3600,"tz":"Asia/Shanghai"},"notification":{"minimum_significance":"major_updates_only","suppress_empty":true},"output":{"language":"auto","format":"concise_brief","include_evidence_links":true}}`,
+			}},
+		}}}
+		loop := New(Deps{
+			Store: fs, Profiles: fs, Tools: ownerTestTools(manage), OwnerAgent: true,
+			Evidence: &fakeAgentEvidenceWriter{}, MaxTurns: 2,
+			TurnReplay: &fakeAgentTurnReplayReader{err: types.NewAppError(
+				types.CodeNotFound, "missing", types.ErrNotFound,
+			)},
+		})
+		loop.chatFn = chat.fn
+		outcome, err := loop.HandleWebTaskActionMessage(
+			t.Context(), 42, "a8db8ff7-d1c2-49df-bc61-cd7a6d34cf62", "", "创建 Kimi 监控",
+		)
+		if err != nil || outcome.Reply != "已创建任务：Kimi 监控。" ||
+			creator.calls != 1 || authorizer.calls != 1 || len(chat.requests) != 1 {
+			t.Fatalf("outcome=%+v create=%d auth=%d requests=%d err=%v",
+				outcome, creator.calls, authorizer.calls, len(chat.requests), err)
+		}
+	})
+
+	t.Run("selected edit", func(t *testing.T) {
+		fs := newFakeStore()
+		authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+		editor := &fakeManageTaskEditorV3{execute: func(in ResearchTaskDefinitionEditV3Input) ResearchTaskDefinitionEditV3Outcome {
+			return ResearchTaskDefinitionEditV3Outcome{
+				OperationID: in.ActionID, TaskRef: in.TaskRef,
+				TaskName: "Kimi 监控", Status: "completed",
+			}
+		}}
+		manage := NewManageTasksTool(ManageTasksDeps{
+			Queries: &fakeManageTaskQuery{rows: manageTaskRows("task-a")},
+			Editor:  editor, Authorizer: authorizer,
+		})
+		chat := &scriptedChat{responses: []*llm.ChatResponse{{
+			FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
+				ID: "edit-a", Name: manageTasksName,
+				Arguments: `{"action":"edit","task_refs":["task-a"],"changes":{"manual":"只检查官方更新。"}}`,
+			}},
+		}}}
+		loop := New(Deps{
+			Store: fs, Profiles: fs, Tools: ownerTestTools(manage), OwnerAgent: true,
+			Evidence: &fakeAgentEvidenceWriter{}, MaxTurns: 2,
+			TurnReplay: &fakeAgentTurnReplayReader{err: types.NewAppError(
+				types.CodeNotFound, "missing", types.ErrNotFound,
+			)},
+		})
+		loop.chatFn = chat.fn
+		outcome, err := loop.HandleWebTaskActionMessage(
+			t.Context(), 42, "2288c5ab-03d4-4195-b0eb-195a576ec8f2", "task-a", "修改当前任务",
+		)
+		if err != nil || outcome.Reply != "已修改任务：Kimi 监控。" ||
+			editor.calls != 1 || editor.input.TaskRef != "task-a" ||
+			authorizer.calls != 1 || len(chat.requests) != 1 {
+			t.Fatalf("outcome=%+v editor=%+v auth=%d requests=%d err=%v",
+				outcome, editor.input, authorizer.calls, len(chat.requests), err)
+		}
+	})
 }
 
 func TestManageTasksEditUsesExactOwnerChangeSetWithoutEchoingUnchangedPolicy(t *testing.T) {

@@ -22,6 +22,7 @@ const (
 	manageTasksName           = "manage_tasks"
 	manageTasksBatchMax       = 20
 	manageTasksAmbiguousReply = "这条写指令仍有歧义，本次未执行。请只针对缺失信息自然追问一次，不要让用户提供内部 ID，也不要发送确认卡。"
+	webActionBoundaryReply    = "本次 Web 任务操作与当前页面的可信动作范围不一致，已拒绝且未执行。"
 	durableOperationTTL       = 24 * time.Hour
 )
 
@@ -282,6 +283,9 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 	if err != nil {
 		return "当前写操作缺少认证上下文，本次未执行。", nil
 	}
+	if !claimWebManageTasksAction(state, args, refs) {
+		return webActionBoundaryReply, nil
+	}
 	if t.deps.Authorizer == nil {
 		return "任务管理能力当前未完整装配，本次未执行。", nil
 	}
@@ -341,6 +345,69 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 		return "", err
 	}
 	return result, nil
+}
+
+func validateWebActionToolCall(
+	state *toolRunState, spec ToolSpec, raw json.RawMessage,
+) (string, bool) {
+	if state == nil || state.webActionMode == webActionNone ||
+		!toolPolicyMayMutate(spec.Policy.Effects) {
+		return "", true
+	}
+	if spec.Name() != manageTasksName {
+		return webActionBoundaryReply, false
+	}
+	args, refs, message := decodeManageTasksArgs(raw)
+	if message != "" {
+		// Invalid arguments cannot reach a side effect; let manage_tasks return
+		// its precise schema error so the model can repair within the same route.
+		return "", true
+	}
+	if !webManageTasksActionAllowed(state, args, refs) {
+		return webActionBoundaryReply, false
+	}
+	return "", true
+}
+
+func toolPolicyMayMutate(effects EffectSet) bool {
+	return effects.Has(EffectStateWrite) || effects.Has(EffectDelivery) ||
+		effects.Has(EffectDurableProposal) || effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite)
+}
+
+func webManageTasksActionAllowed(
+	state *toolRunState, args manageTasksArgs, refs []string,
+) bool {
+	if state == nil || state.webActionMode == webActionNone {
+		return true
+	}
+	switch state.webActionMode {
+	case webActionCreate:
+		return args.Action == "create" && len(refs) == 0 &&
+			state.webSelectedTaskRef == ""
+	case webActionEdit:
+		return args.Action == "edit" && len(refs) == 1 &&
+			refs[0] == state.webSelectedTaskRef &&
+			state.webSelectedTaskRef != ""
+	default:
+		return false
+	}
+}
+
+func claimWebManageTasksAction(
+	state *toolRunState, args manageTasksArgs, refs []string,
+) bool {
+	if !webManageTasksActionAllowed(state, args, refs) {
+		return false
+	}
+	if state == nil || state.webActionMode == webActionNone {
+		return true
+	}
+	if state.webActionClaimed {
+		return false
+	}
+	state.webActionClaimed = true
+	return true
 }
 
 func deterministicManageTasksResult(
