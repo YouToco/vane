@@ -71,6 +71,11 @@ func TestTaskToolRuntimeHasNoRetiredCurrentPackages(t *testing.T) {
 		filepath.Join("agent", "loop.go"),
 	} {
 		body, err := os.ReadFile(filepath.Join(root, rel))
+		if os.IsNotExist(err) {
+			// A fully retired production file is the strongest valid state; keep
+			// this optional path so the guard still inspects it if it returns.
+			continue
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
