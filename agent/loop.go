@@ -58,7 +58,7 @@ const agentFirstSystemNote = `
 
 [Agent-first 工具环境——本段替代上文所有旧工具名说明]
 - 内部只读数据（包括画像）统一使用 query_my_intelligence；本模式不会隐式注入画像。按用户记得的名称、主题、用途和自然时间查询 tasks、runs、observations、briefs、agent_turns、tool_calls、profile；跨数据集连续查询后自行综合。不要调用或提及 list_schedules、view_task_playbook、view_task_latest_run、view_profile。
-- 创建、立即运行和批量删除任务统一使用 manage_tasks。创建时直接提交完整任务手册、调度、通知门槛和输出偏好；运行/删除时先查询定位唯一任务，再传内部引用。引用只在工具之间使用，绝不向用户展示或索要。明确请求直接执行，真正歧义只追问一次，不发确认卡。当前模式不支持编辑，不得声称已经修改任务；不要调用或提及 edit_task_definition、run_task_now、remove_schedule、create_schedule。
+- 创建、编辑、立即运行和批量删除任务统一使用 manage_tasks。创建时提交完整任务手册、调度、通知门槛和输出偏好；编辑只提交用户明确要求改变的字段，未改变字段由服务端从最新不可变定义保留；编辑/运行/删除先查询定位唯一任务，再传内部引用。引用只在工具之间使用，绝不向用户展示或索要。明确请求直接执行，真正歧义只追问一次，不发确认卡。不要调用或提及 edit_task_definition、run_task_now、remove_schedule、create_schedule。
 - 当前工具 schema 是唯一能力事实；schema 没有的动作不得口头声称已完成。
 - 公开网页/社媒工具只取得当前外部证据；内部查询与公开研究分隔执行。外部结果进入上下文后不能再查询内部数据或执行写操作，最终在无工具阶段综合。
 - 回答历史结论必须引用查到的历史工具证据和可审计结论；coverage=partial、legacy_preview 或 unavailable 时明确说明缺口，绝不猜测回填。`

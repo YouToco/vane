@@ -177,6 +177,10 @@ func TestResearchTaskDefinitionEditProposalMatchesV3AdoptsResponseLossStates(t *
 		TargetDefinition: p.TargetDefinition, PreparedEdit: p.PreparedEdit,
 		BaseSnapshot: p.BaseSnapshot,
 	}
+	// A real executor retry derives a fresh local TTL. Expiry is not part of the
+	// immutable owner proposal, so response-loss convergence must adopt the
+	// first persisted operation without extending or comparing its lease.
+	p.ExpiresAt = expires.Add(17 * time.Minute)
 	for _, status := range []types.TaskDefinitionEditOperationStatus{
 		types.TaskDefinitionEditOperationStatusPending,
 		types.TaskDefinitionEditOperationStatusExecuting,
@@ -217,6 +221,204 @@ func TestBuildResearchV3DefinitionEditTargetFailsClosedOnScopeOrPartialTarget(
 	partial.TaskManual = ""
 	if _, err := BuildResearchV3DefinitionEditTarget(base, partial); err == nil {
 		t.Fatal("partial native V3 edit inherited an omitted manual")
+	}
+}
+
+func TestApplyResearchV3DefinitionChangesPreservesUnmentionedOwnerPolicy(t *testing.T) {
+	base := validResearchV3DefinitionForEditTest(t)
+	manual := "检查官方原文并与历史证据比较；无重大更新不推送。"
+	target, err := ApplyResearchV3DefinitionChanges(base,
+		ResearchV3DefinitionChanges{TaskManual: &manual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.TaskManual != manual || target.TaskName != base.TaskName ||
+		!bytesEqual(target.SpecJSON, base.SpecJSON) ||
+		!reflect.DeepEqual(target.Notification, base.Notification) ||
+		!reflect.DeepEqual(target.Output, base.Output) ||
+		!reflect.DeepEqual(target.PlannerBudget, base.PlannerBudget) ||
+		target.DeliveryPolicy != base.DeliveryPolicy ||
+		target.TenantBudgetPolicy != base.TenantBudgetPolicy {
+		t.Fatalf("unmentioned V3 policy changed: base=%+v target=%+v", base, target)
+	}
+	if _, err := ApplyResearchV3DefinitionChanges(
+		base, ResearchV3DefinitionChanges{}); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("empty changes err=%v, want validation", err)
+	}
+	empty := ""
+	if _, err := ApplyResearchV3DefinitionChanges(base,
+		ResearchV3DefinitionChanges{TaskManual: &empty}); err == nil {
+		t.Fatal("explicit invalid manual was inherited instead of rejected")
+	}
+}
+
+type researchV3PrepareChangesStoreTest struct {
+	ResearchTaskDefinitionEditStoreV3
+	existing    *types.TaskDefinitionEditOperation
+	existingErr error
+	basis       *types.ResearchTaskDefinitionEditBasisV3
+}
+
+func (s *researchV3PrepareChangesStoreTest) LoadResearchTaskDefinitionEditOperationV3(
+	context.Context, types.TaskDefinitionEditScope,
+) (*types.TaskDefinitionEditOperation, error) {
+	return s.existing, s.existingErr
+}
+
+func (s *researchV3PrepareChangesStoreTest) LoadResearchTaskDefinitionEditBasisV3(
+	context.Context, int64, int64, string,
+) (*types.ResearchTaskDefinitionEditBasisV3, error) {
+	return s.basis, nil
+}
+
+func TestResearchTaskDefinitionEditPrepareChangesClassifiesDefinitePresealFailures(
+	t *testing.T,
+) {
+	base := validResearchV3DefinitionForEditTest(t)
+	basePayload, err := taskstate.EncodeApprovedDefinitionV3(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	basis := &types.ResearchTaskDefinitionEditBasisV3{
+		TenantID: base.TenantID, UserID: base.UserID, TaskID: base.TaskID,
+		DefinitionVersion: 1, DefinitionPayload: basePayload,
+	}
+	manual := base.TaskManual
+	readFailure := types.NewAppError(
+		types.CodeDBConnLost, "operation lookup unavailable", errors.New("connection lost"))
+	unknownStore := &researchV3PrepareChangesStoreTest{existingErr: readFailure}
+	coordinator := NewResearchTaskDefinitionEditCoordinatorV3(
+		unknownStore, &researchV3RecoveryRestartSchedulerTest{}, nil)
+	_, err = coordinator.PrepareChanges(t.Context(),
+		ResearchTaskDefinitionEditChangesInputV3{
+			ActionID: "manage-task-v1-lookup-unknown", TenantID: base.TenantID,
+			UserID: base.UserID, TaskID: base.TaskID, SessionID: 9,
+			Changes:   ResearchV3DefinitionChanges{TaskManual: &manual},
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+	if err == nil || errors.Is(err, ErrResearchTaskDefinitionEditNotExecuted) {
+		t.Fatalf("unavailable replay lookup was falsely classified not-executed: %v", err)
+	}
+
+	noOpStore := &researchV3PrepareChangesStoreTest{
+		existingErr: types.ErrNotFound, basis: basis,
+	}
+	coordinator = NewResearchTaskDefinitionEditCoordinatorV3(
+		noOpStore, &researchV3RecoveryRestartSchedulerTest{}, nil)
+	_, err = coordinator.PrepareChanges(t.Context(),
+		ResearchTaskDefinitionEditChangesInputV3{
+			ActionID: "manage-task-v1-no-op", TenantID: base.TenantID,
+			UserID: base.UserID, TaskID: base.TaskID, SessionID: 9,
+			Changes:   ResearchV3DefinitionChanges{TaskManual: &manual},
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+	if !errors.Is(err, ErrResearchTaskDefinitionEditNotExecuted) {
+		t.Fatalf("no-op classification=%v", err)
+	}
+
+	different := "不同的变更"
+	target, err := ApplyResearchV3DefinitionChanges(base,
+		ResearchV3DefinitionChanges{TaskManual: &different})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPayload, err := taskstate.EncodeApprovedDefinitionV3(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictStore := &researchV3PrepareChangesStoreTest{existing: &types.TaskDefinitionEditOperation{
+		ID:       "manage-task-v1-conflict",
+		Protocol: types.TaskDefinitionEditProtocolResearchV3,
+		TenantID: base.TenantID, UserID: base.UserID,
+		TargetTenantID: base.TenantID, TargetUserID: base.UserID,
+		TaskID: base.TaskID, SessionID: 9,
+		Status:         types.TaskDefinitionEditOperationStatusCompleted,
+		BaseDefinition: basePayload, TargetDefinition: targetPayload,
+	}}
+	coordinator = NewResearchTaskDefinitionEditCoordinatorV3(
+		conflictStore, &researchV3RecoveryRestartSchedulerTest{}, nil)
+	replayed, err := coordinator.PrepareChanges(t.Context(),
+		ResearchTaskDefinitionEditChangesInputV3{
+			ActionID: conflictStore.existing.ID, TenantID: base.TenantID,
+			UserID: base.UserID, TaskID: base.TaskID, SessionID: 9,
+			Changes:   ResearchV3DefinitionChanges{TaskManual: &different},
+			ExpiresAt: time.Now().Add(24 * time.Hour),
+		})
+	if err != nil || replayed != conflictStore.existing {
+		t.Fatalf("terminal whole-tool replay=%+v err=%v", replayed, err)
+	}
+	other := "另一个变更"
+	_, err = coordinator.PrepareChanges(t.Context(),
+		ResearchTaskDefinitionEditChangesInputV3{
+			ActionID: conflictStore.existing.ID, TenantID: base.TenantID,
+			UserID: base.UserID, TaskID: base.TaskID, SessionID: 9,
+			Changes:   ResearchV3DefinitionChanges{TaskManual: &other},
+			ExpiresAt: time.Now().Add(2 * time.Hour),
+		})
+	if !errors.Is(err, ErrResearchTaskDefinitionEditNotExecuted) ||
+		!errors.Is(err, types.ErrConflict) {
+		t.Fatalf("same action conflict classification=%v", err)
+	}
+}
+
+func TestResearchTaskDefinitionEditSealClassificationKeepsResponseLossIndeterminate(
+	t *testing.T,
+) {
+	for _, err := range []error{
+		context.DeadlineExceeded,
+		types.NewAppError(types.CodeDBConnLost, "commit response lost", errors.New("lost")),
+	} {
+		if researchTaskDefinitionEditSealDefinitelyRejected(err) {
+			t.Fatalf("outcome-unknown seal was classified rejected: %v", err)
+		}
+	}
+	for _, err := range []error{types.ErrValidation, types.ErrConflict, types.ErrNotFound} {
+		if !researchTaskDefinitionEditSealDefinitelyRejected(err) {
+			t.Fatalf("definite seal rejection was classified unknown: %v", err)
+		}
+	}
+}
+
+func TestResearchTaskDefinitionEditChangesReplayMatchesOriginalBaseAfterHeadAdvance(
+	t *testing.T,
+) {
+	base := validResearchV3DefinitionForEditTest(t)
+	manual := "只查官方原文并与历史证据比较；无重大更新不推送。"
+	changes := ResearchV3DefinitionChanges{TaskManual: &manual}
+	target, err := ApplyResearchV3DefinitionChanges(base, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	basePayload, err := taskstate.EncodeApprovedDefinitionV3(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPayload, err := taskstate.EncodeApprovedDefinitionV3(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := &types.TaskDefinitionEditOperation{
+		ID:       "manage-task-v1-terminal-replay",
+		Protocol: types.TaskDefinitionEditProtocolResearchV3,
+		TenantID: base.TenantID, UserID: base.UserID,
+		TargetTenantID: base.TenantID, TargetUserID: base.UserID,
+		TaskID: base.TaskID, SessionID: 99,
+		Status:         types.TaskDefinitionEditOperationStatusCompleted,
+		BaseDefinition: basePayload, TargetDefinition: targetPayload,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	in := ResearchTaskDefinitionEditChangesInputV3{
+		ActionID: op.ID, TenantID: base.TenantID, UserID: base.UserID,
+		TaskID: base.TaskID, SessionID: op.SessionID, Changes: changes,
+		ExpiresAt: op.ExpiresAt.Add(24 * time.Hour),
+	}
+	if !researchTaskDefinitionEditChangesReplayMatchesV3(op, in) {
+		t.Fatal("terminal replay with a fresh local TTL did not adopt original proposal")
+	}
+	different := "监控不同目标"
+	in.Changes.TaskManual = &different
+	if researchTaskDefinitionEditChangesReplayMatchesV3(op, in) {
+		t.Fatal("same action ID with different owner changes was adopted")
 	}
 }
 

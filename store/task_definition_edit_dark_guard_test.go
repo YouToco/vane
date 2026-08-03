@@ -617,8 +617,10 @@ func taskDefinitionEditCoordinatorStoreCalls(file *ast.File) (map[token.Pos]stru
 func taskDefinitionEditV3CoordinatorStoreCalls(file *ast.File) (map[token.Pos]struct{}, error) {
 	expectations := []taskDefinitionEditStoreCallExpectation{
 		{"LoadResearchTaskDefinitionEditBasisV3", "Prepare", 1},
-		{"CreateResearchTaskDefinitionEditOperationV3", "Prepare", 1},
-		{"LoadResearchTaskDefinitionEditOperationV3", "Prepare", 1},
+		{"LoadResearchTaskDefinitionEditBasisV3", "PrepareChanges", 1},
+		{"LoadResearchTaskDefinitionEditOperationV3", "PrepareChanges", 1},
+		{"CreateResearchTaskDefinitionEditOperationV3", "prepareTarget", 1},
+		{"LoadResearchTaskDefinitionEditOperationV3", "prepareTarget", 1},
 		{"LoadResearchTaskDefinitionEditOperationV3", "Execute", 1},
 		{"AcquireResearchTaskDefinitionEditOperationV3", "acquire", 2},
 		{"LoadResearchTaskDefinitionEditOperationV3", "acquire", 1},
@@ -641,6 +643,7 @@ func taskDefinitionEditV3CoordinatorStoreCalls(file *ast.File) (map[token.Pos]st
 	}
 	got := make(map[key]int, len(want))
 	allowed := make(map[token.Pos]struct{})
+	prepareTargetCalls := make(map[string]int)
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok || function.Body == nil {
@@ -652,7 +655,17 @@ func taskDefinitionEditV3CoordinatorStoreCalls(file *ast.File) (map[token.Pos]st
 				return true
 			}
 			selector, ok := taskDefinitionEditStoreUnparen(call.Fun).(*ast.SelectorExpr)
-			if !ok || !taskDefinitionEditIsCoordinatorStoreSelector(selector) {
+			if !ok {
+				return true
+			}
+			if selector.Sel.Name == "prepareTarget" {
+				receiver, receiverOK := taskDefinitionEditStoreUnparen(
+					selector.X).(*ast.Ident)
+				if receiverOK && receiver.Name == "c" {
+					prepareTargetCalls[function.Name.Name]++
+				}
+			}
+			if !taskDefinitionEditIsCoordinatorStoreSelector(selector) {
 				return true
 			}
 			callKey := key{selector.Sel.Name, function.Name.Name}
@@ -667,6 +680,20 @@ func taskDefinitionEditV3CoordinatorStoreCalls(file *ast.File) (map[token.Pos]st
 		if got[expected] != count {
 			return nil, fmt.Errorf("native V3 coordinator %s must call c.store.%s exactly %d time(s), got %d",
 				expected.function, expected.method, count, got[expected])
+		}
+	}
+	for caller, count := range prepareTargetCalls {
+		if (caller != "Prepare" && caller != "PrepareChanges") || count != 1 {
+			return nil, fmt.Errorf(
+				"native V3 sealed helper caller %s count=%d; only Prepare and PrepareChanges may call it once",
+				caller, count)
+		}
+	}
+	for _, caller := range []string{"Prepare", "PrepareChanges"} {
+		if prepareTargetCalls[caller] != 1 {
+			return nil, fmt.Errorf(
+				"native V3 coordinator %s must call prepareTarget exactly once, got %d",
+				caller, prepareTargetCalls[caller])
 		}
 	}
 	return allowed, nil

@@ -552,6 +552,11 @@ func run() error {
 	// intentionally retained only in this composition root: it is not injected
 	// into Agent, HTTP, Feishu, or the receipt dispatcher.
 	definitionEditCoordinator := task.NewTaskDefinitionEditCoordinator(st, sched, slog.Default())
+	var researchDefinitionEditCoordinator *task.ResearchTaskDefinitionEditCoordinatorV3
+	if researchControlStore != nil {
+		researchDefinitionEditCoordinator = task.NewResearchTaskDefinitionEditCoordinatorV3(
+			researchControlStore, sched, slog.Default())
+	}
 
 	roleGateCtx, cancelRoleGate := context.WithTimeout(ctx, 10*time.Second)
 	roleGateErr := st.ValidateTaskDefinitionEditRuntimeRoles(roleGateCtx)
@@ -593,6 +598,13 @@ func run() error {
 		temporalClient.Close()
 		closeStores()
 		return fmt.Errorf("任务定义编辑首轮恢复 Gate: %w", err)
+	}
+	if researchDefinitionEditCoordinator != nil {
+		if err := researchDefinitionEditCoordinator.RecoverStaleOnceV3(ctx); err != nil {
+			temporalClient.Close()
+			closeStores()
+			return fmt.Errorf("Research V3 任务定义编辑首轮恢复 Gate: %w", err)
+		}
 	}
 	scheduleCommandStartupCtx, cancelScheduleCommandStartup :=
 		context.WithTimeout(
@@ -782,6 +794,9 @@ func run() error {
 				Creator: agent.NewResearchTaskCreationV3Executor(
 					creationCoordinator,
 				),
+				Editor: agent.NewResearchTaskDefinitionEditV3Executor(
+					researchDefinitionEditCoordinator,
+				),
 				Runner: sched, Deleter: sched,
 				Authorizer: authorizer,
 			}))
@@ -970,7 +985,21 @@ func run() error {
 	definitionEditRecoveryDone := make(chan struct{})
 	go func() {
 		defer close(definitionEditRecoveryDone)
-		definitionEditCoordinator.RunRecovery(definitionEditRecoveryCtx)
+		var recoveryGroup sync.WaitGroup
+		recoveryGroup.Add(1)
+		go func() {
+			defer recoveryGroup.Done()
+			definitionEditCoordinator.RunRecovery(definitionEditRecoveryCtx)
+		}()
+		if researchDefinitionEditCoordinator != nil {
+			recoveryGroup.Add(1)
+			go func() {
+				defer recoveryGroup.Done()
+				researchDefinitionEditCoordinator.RunRecoveryV3(
+					definitionEditRecoveryCtx)
+			}()
+		}
+		recoveryGroup.Wait()
 	}()
 	stopDefinitionEditRecovery := func() error {
 		cancelDefinitionEditRecovery()

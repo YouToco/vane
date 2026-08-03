@@ -28,37 +28,35 @@ Otherwise the Agent executes directly.
 
 Natural-language edits are one user operation even when the request changes
 several fields of the same task. The Agent first resolves the task from the
-user's remembered name, schedule, topic or purpose, then submits one complete
-definition edit. A separate side-effect-free semantic adjudication first routes
-the current owner turn to edit, delete, run, create, profile update, one-off
-research, or an answer-only request such as advice, a hypothetical, negation,
-or cancellation.
-Natural first-profile intake, such as directly answering with an industry,
-role, and interests, uses the same semantic route; the profile store still
-rejects overwriting an existing profile.
-Lexical matches never authorize deletion. The edit then requires a second
-independent model decision to call the bound write tool. Other explicit actions
-expose only their matching side-effect capability; unrelated writes remain
-closed. Answer-only decisions and any adjudication error fail closed into a
-side-effect-free turn: all writes, deliveries, activation changes, and billable
-tools are absent at both declaration and execution boundaries. The isolated edit lane
-exposes only `list_schedules` followed by `edit_task_definition`; a requirement
-that future runs open official pages does not authorize ad-hoc web research
-during the edit. The user is never asked for an internal task ID or to split one
-task/manual edit into smaller requests.
-The lookup phrase must be a specific contiguous phrase from the authenticated
-request, the lookup must resolve exactly one owned task, and the durable edit
-must target that exact resolved ID. Zero or multiple matches produce one
-readable clarification and expose no write tool.
+user's remembered name, schedule, topic or purpose with
+`query_my_intelligence`, then submits the exact requested change set through
+`manage_tasks`. The V3 coordinator applies that change set to the latest
+immutable owner-visible definition and generates one complete target; the
+model never has to echo or guess unchanged notification/output policy.
+Lexical matches never authorize a write. After the model has proposed a
+`manage_tasks` call, the separate side-effect-free owner-action adjudicator sees
+only the authenticated current owner turn, action, change set and readable
+target summary. `authorized` executes directly, `ambiguous` produces one
+natural question, and `denied` performs no write. Public web content and prior
+history cannot enter this adjudication or trigger the edit. The user is never
+asked for an internal task ID or to split one task/manual edit into smaller
+requests. Zero or multiple owned-task matches produce one readable
+clarification and expose no durable mutation.
 
-## Current writer contract
+## Current Agent-first writer contract
 
-`create_schedule` accepts:
+`manage_tasks create` accepts:
 
-- `spec`: when to run;
-- `intent`: the complete task manual;
-- `tool_calls`: one or more `{name, arguments}` acquisition Tool calls;
-- optional delivery/observation preferences.
+- a readable task name and complete task manual;
+- `schedule`: when to run and in which timezone;
+- notification threshold, including the no-major-update silence policy;
+- output language, format, instructions and evidence-link preference.
+
+`manage_tasks edit` accepts exactly one internally resolved task reference and
+one or more explicit owner-visible changes: name, manual, schedule,
+notification, or output. Omitted fields are preserved inside the V3
+coordinator from the exact current head. `run` and `delete` accept 1–20
+internally resolved references.
 
 The model must never produce:
 
@@ -67,7 +65,8 @@ The model must never produce:
 - synthetic internal URLs;
 - selectors, provider configuration, credentials, or internal IDs.
 
-Each acquisition Tool owns one definition containing:
+Every V3 run plans against the current authorized Tool catalog. Each
+acquisition Tool owns one definition containing:
 
 - its model-visible name and arguments;
 - its model-visible description and external-locator policy;
@@ -76,14 +75,11 @@ Each acquisition Tool owns one definition containing:
 - output kind;
 - the retained implementation and credential generations used by a run.
 
-No second catalog or specification compiler may restate those facts.
-`create_schedule` embeds a generated discriminated union from these
-definitions; the creation controller calls the same Tool decoder and
-materializer instead of maintaining a second argument switch.
-
-The accepted Tool calls are stored on the approved task head without losing
-the Tool name or canonical arguments. Materialized provider URL/config is
-derived execution data, not the task's authority.
+No second catalog or long-lived specification compiler may restate those
+facts. The approved V3 task head stores no Tool calls, Source/fetch target or
+frozen plan. Every actual invocation is sealed as an immutable run step with
+its Tool name, canonical arguments and runtime capability; materialized
+provider URL/config remains execution evidence, not task authority.
 
 ### Dynamic official product pages
 

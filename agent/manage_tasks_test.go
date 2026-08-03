@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -88,6 +89,21 @@ type fakeManageTaskCreatorV3 struct {
 }
 
 func (f *fakeManageTaskCreatorV3) ExecuteResearchTaskCreationV3(_ context.Context, in ResearchTaskCreationV3Input) (ResearchTaskCreationV3Outcome, error) {
+	f.calls++
+	f.input = in
+	return f.outcome, f.err
+}
+
+type fakeManageTaskEditorV3 struct {
+	input   ResearchTaskDefinitionEditV3Input
+	outcome ResearchTaskDefinitionEditV3Outcome
+	err     error
+	calls   int
+}
+
+func (f *fakeManageTaskEditorV3) ExecuteResearchTaskDefinitionEditV3(
+	_ context.Context, in ResearchTaskDefinitionEditV3Input,
+) (ResearchTaskDefinitionEditV3Outcome, error) {
 	f.calls++
 	f.input = in
 	return f.outcome, f.err
@@ -425,6 +441,73 @@ func TestManageTasksFullLoopNeverTurnsIndeterminateCreateIntoSuccess(t *testing.
 	}
 }
 
+func TestManageTasksFullLoopNeverTurnsIndeterminateEditIntoSuccess(t *testing.T) {
+	editor := &fakeManageTaskEditorV3{err: errors.New("temporal response lost")}
+	tool := NewManageTasksTool(ManageTasksDeps{
+		Queries:    &fakeManageTaskQuery{rows: manageTaskRows("internal-kimi")},
+		Editor:     editor,
+		Authorizer: &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized},
+	})
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
+			ID: "indeterminate-edit", Name: manageTasksName,
+			Arguments: `{"action":"edit","task_refs":["internal-kimi"],"changes":{"manual":"只查官方原文，无重大更新不推送。"}}`,
+		}}},
+		{Content: "任务已经修改。", FinishReason: "stop"},
+	}}
+	fs := newFakeStore()
+	writer := &fakeAgentEvidenceWriter{}
+	loop := New(Deps{
+		Store: fs, Profiles: fs, Tools: []ToolSpec{tool}, Evidence: writer,
+		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 3,
+	})
+	loop.chatFn = chat.fn
+	outcome, err := loop.HandleMessage(t.Context(), 42,
+		"把 Kimi 套餐任务手册改成只查官方原文，无重大更新不推送。")
+	want := "任务操作结果暂时无法确认；系统会按同一请求安全恢复，本次不能声称已经完成。"
+	if err != nil || outcome.Reply != want || len(chat.requests) != 1 ||
+		editor.calls != 1 || strings.Contains(outcome.Reply, "已经修改") ||
+		!strings.Contains(string(writer.record.ActionReceipts),
+			`"status":"execution_indeterminate"`) ||
+		writer.record.AssistantMessage != want {
+		t.Fatalf("outcome=%+v err=%v requests=%d edits=%d record=%+v",
+			outcome, err, len(chat.requests), editor.calls, writer.record)
+	}
+}
+
+func TestManageTasksFullLoopReportsPresealEditFailureAsNotExecuted(t *testing.T) {
+	editor := &fakeManageTaskEditorV3{err: fmt.Errorf(
+		"%w: invalid schedule", errResearchTaskDefinitionEditNotExecuted)}
+	tool := NewManageTasksTool(ManageTasksDeps{
+		Queries:    &fakeManageTaskQuery{rows: manageTaskRows("internal-kimi")},
+		Editor:     editor,
+		Authorizer: &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized},
+	})
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
+			ID: "not-executed-edit", Name: manageTasksName,
+			Arguments: `{"action":"edit","task_refs":["internal-kimi"],"changes":{"schedule":{"every_seconds":3600,"tz":"Bad/Zone"}}}`,
+		}},
+	}, {Content: "任务已经修改。", FinishReason: "stop"}}}
+	fs := newFakeStore()
+	writer := &fakeAgentEvidenceWriter{}
+	loop := New(Deps{
+		Store: fs, Profiles: fs, Tools: []ToolSpec{tool}, Evidence: writer,
+		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 3,
+	})
+	loop.chatFn = chat.fn
+	outcome, err := loop.HandleMessage(t.Context(), 42,
+		"把 Kimi 套餐任务改成每小时检查，时区用 Bad/Zone。")
+	want := "任务修改未执行，原任务保持不变；请修正变更内容后重试。"
+	if err != nil || outcome.Reply != want || len(chat.requests) != 1 ||
+		editor.calls != 1 || strings.Contains(outcome.Reply, "系统会按同一请求安全恢复") ||
+		!strings.Contains(string(writer.record.ActionReceipts),
+			`"status":"not_executed"`) || writer.record.AssistantMessage != want {
+		t.Fatalf("outcome=%+v err=%v requests=%d edits=%d record=%+v",
+			outcome, err, len(chat.requests), editor.calls, writer.record)
+	}
+}
+
 func TestManageTasksPartialFailureKeepsReceiptAndStableTurnKeys(t *testing.T) {
 	queries := &fakeManageTaskQuery{rows: manageTaskRows("kimi", "claude")}
 	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
@@ -484,6 +567,62 @@ func TestManageTasksCreateUsesOnlyNativeV3ExecutorInput(t *testing.T) {
 		len(state.actionReceipts) != 1 ||
 		!strings.Contains(string(state.actionReceipts[0]), "task-internal-kimi") {
 		t.Fatalf("create auth/receipt mismatch: auth=%+v receipts=%s", authorizer.input, state.actionReceipts)
+	}
+}
+
+func TestManageTasksEditUsesExactOwnerChangeSetWithoutEchoingUnchangedPolicy(t *testing.T) {
+	queries := &fakeManageTaskQuery{rows: manageTaskRows("internal-kimi")}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	editor := &fakeManageTaskEditorV3{}
+	spec := NewManageTasksTool(ManageTasksDeps{
+		Queries: queries, Editor: editor, Authorizer: authorizer,
+	})
+	ctx, state := manageTasksTestContext("把 Kimi 套餐监控改成周二上午九点，其他不变")
+	raw := json.RawMessage(`{"action":"edit","task_refs":["internal-kimi"],"changes":{"schedule":{"cron":"0 9 * * 2","tz":"Asia/Shanghai"}}}`)
+	wantActionID := manageTaskIdempotencyKey(chatMeta{
+		traceID: "turn-manage-1",
+		scope:   agentcontext.Scope{TenantID: 7, UserID: 42, SessionID: 9},
+	}, "edit", "internal-kimi")
+	editor.outcome = ResearchTaskDefinitionEditV3Outcome{
+		OperationID: wantActionID, TaskRef: "internal-kimi",
+		TaskName: "Kimi 套餐监控", Status: "completed",
+	}
+	result, err := spec.Execute(ctx, 42, raw)
+	if err != nil || result != "已修改任务：Kimi 套餐监控。" {
+		t.Fatalf("edit result=%q err=%v", result, err)
+	}
+	if editor.calls != 1 || editor.input.ActionID != wantActionID ||
+		editor.input.TenantID != 7 || editor.input.UserID != 42 ||
+		editor.input.SessionID != 9 || editor.input.TaskRef != "internal-kimi" ||
+		string(editor.input.Changes.Schedule) != `{"cron":"0 9 * * 2","tz":"Asia/Shanghai"}` ||
+		editor.input.Changes.Name != nil || editor.input.Changes.Manual != nil ||
+		editor.input.Changes.Notification != nil || editor.input.Changes.Output != nil {
+		t.Fatalf("native V3 edit input=%+v", editor.input)
+	}
+	if authorizer.calls != 1 || authorizer.input.Action != "edit" ||
+		len(authorizer.input.Targets) != 1 ||
+		!strings.Contains(string(authorizer.input.Changes), `"cron":"0 9 * * 2"`) ||
+		len(state.actionReceipts) != 1 ||
+		!strings.Contains(string(state.actionReceipts[0]), `"action":"edit"`) ||
+		strings.Contains(result, "internal-kimi") {
+		t.Fatalf("edit authorization/receipt leaked: auth=%+v result=%q receipts=%s",
+			authorizer.input, result, state.actionReceipts)
+	}
+}
+
+func TestManageTasksEditFailsClosedBeforeAuthorizationWithoutNativeV3Executor(t *testing.T) {
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	spec := NewManageTasksTool(ManageTasksDeps{
+		Queries:    &fakeManageTaskQuery{rows: manageTaskRows("internal-kimi")},
+		Authorizer: authorizer,
+	})
+	ctx, state := manageTasksTestContext("修改 Kimi 任务手册")
+	result, err := spec.Execute(ctx, 42, json.RawMessage(
+		`{"action":"edit","task_refs":["internal-kimi"],"changes":{"manual":"只查官方原文，无重大更新不推送。"}}`))
+	if err != nil || !strings.Contains(result, "未装配") || authorizer.calls != 0 ||
+		len(state.actionReceipts) != 0 {
+		t.Fatalf("unwired edit escaped result=%q err=%v auth=%d receipts=%s",
+			result, err, authorizer.calls, state.actionReceipts)
 	}
 }
 
@@ -567,7 +706,8 @@ func TestManageTasksRejectsMalformedUnionBeforeQuery(t *testing.T) {
 	spec := NewManageTasksTool(ManageTasksDeps{Queries: queries})
 	ctx, _ := manageTasksTestContext("删任务")
 	cases := []string{
-		`{"action":"edit","task_ref":"a","changes":{}}`,
+		`{"action":"edit","task_refs":["a"],"changes":{}}`,
+		`{"action":"edit","task_refs":["a","b"],"changes":{"manual":"更新手册"}}`,
 		`{"action":"run","task_ref":"a"}`,
 		`{"action":"delete","task_refs":[" a"]}`,
 		`{"action":"create","task_refs":["a"]}`,
@@ -601,17 +741,17 @@ func TestManageTasksSchemaIsAgentFirstV3Only(t *testing.T) {
 	if err := json.Unmarshal(schema.Properties["action"], &action); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(action.Enum, ",") != "create,run,delete" {
+	if strings.Join(action.Enum, ",") != "create,edit,run,delete" {
 		t.Fatalf("manage_tasks actions=%v", action.Enum)
 	}
-	for _, required := range []string{"name", "manual", "schedule", "notification", "output", "task_refs"} {
+	for _, required := range []string{"name", "manual", "schedule", "notification", "output", "changes", "task_refs"} {
 		if schema.Properties[required] == nil {
 			t.Errorf("manage_tasks schema missing %s", required)
 		}
 	}
 	visible := strings.ToLower(spec.Description() + "\n" + string(spec.Parameters()))
 	for _, retired := range []string{
-		"\"edit\"", "changes", "tool_calls", "source", "fetch",
+		"tool_calls", "source", "fetch",
 		"budget", "delivery_policy", "create_schedule",
 	} {
 		if strings.Contains(visible, retired) {
@@ -704,7 +844,7 @@ func TestAgentFirstCanaryDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
 				retiredGuidance, encoded)
 		}
 	}
-	if !strings.Contains(string(encoded), "创建、立即运行和批量删除任务统一使用 manage_tasks") {
+	if !strings.Contains(string(encoded), "创建、编辑、立即运行和批量删除任务统一使用 manage_tasks") {
 		t.Fatalf("Agent-first prompt missed V3 create guidance: %s", encoded)
 	}
 }
@@ -721,7 +861,7 @@ func TestAgentFirstPromptSplitPreservesLegacyNonCanaryGuidance(t *testing.T) {
 	}
 	if strings.Contains(loop.agentFirstSys, "统一使用 create_schedule 创建") ||
 		strings.Contains(loop.agentFirstSys, "create_schedule 必须带完整 intent") ||
-		!strings.Contains(loop.agentFirstSys, "创建、立即运行和批量删除任务统一使用 manage_tasks") {
+		!strings.Contains(loop.agentFirstSys, "创建、编辑、立即运行和批量删除任务统一使用 manage_tasks") {
 		t.Fatalf("Agent-first prompt split is not clean: %q", loop.agentFirstSys)
 	}
 }

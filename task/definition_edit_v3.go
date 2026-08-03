@@ -23,6 +23,57 @@ type ResearchV3DefinitionEditInput struct {
 	Output       taskstate.OutputPreferenceV3
 }
 
+// ResearchV3DefinitionChanges is the exact owner-visible change set accepted
+// by manage_tasks. Nil fields are preserved from the immutable base loaded by
+// the coordinator; present fields replace the complete nested value. Keeping
+// this merge inside the coordinator prevents the model from guessing omitted
+// policy and prevents a read-then-write race from overwriting concurrent edits.
+type ResearchV3DefinitionChanges struct {
+	TaskName     *string
+	TaskManual   *string
+	SpecJSON     json.RawMessage
+	Notification *taskstate.NotificationPolicyV3
+	Output       *taskstate.OutputPreferenceV3
+}
+
+func ApplyResearchV3DefinitionChanges(
+	base taskstate.ApprovedDefinitionV3,
+	changes ResearchV3DefinitionChanges,
+) (taskstate.ApprovedDefinitionV3, error) {
+	if err := base.Validate(); err != nil {
+		return taskstate.ApprovedDefinitionV3{}, errors.New(
+			"task: native V3 edit base definition is invalid")
+	}
+	if changes.TaskName == nil && changes.TaskManual == nil &&
+		len(changes.SpecJSON) == 0 && changes.Notification == nil &&
+		changes.Output == nil {
+		return taskstate.ApprovedDefinitionV3{}, creationValidation(
+			"V3 任务编辑至少需要一项明确变更", nil)
+	}
+	target := ResearchV3DefinitionEditInput{
+		TenantID: base.TenantID, UserID: base.UserID, TaskID: base.TaskID,
+		TaskName: base.TaskName, TaskManual: base.TaskManual,
+		SpecJSON: base.SpecJSON, Notification: base.Notification,
+		Output: base.Output,
+	}
+	if changes.TaskName != nil {
+		target.TaskName = *changes.TaskName
+	}
+	if changes.TaskManual != nil {
+		target.TaskManual = *changes.TaskManual
+	}
+	if len(changes.SpecJSON) != 0 {
+		target.SpecJSON = changes.SpecJSON
+	}
+	if changes.Notification != nil {
+		target.Notification = *changes.Notification
+	}
+	if changes.Output != nil {
+		target.Output = *changes.Output
+	}
+	return BuildResearchV3DefinitionEditTarget(base, target)
+}
+
 // BuildResearchV3DefinitionEditTarget preserves every trusted server policy
 // from the exact base and replaces the complete owner-visible target. This is
 // a full-definition writer: omitted/zero fields fail validation instead of
