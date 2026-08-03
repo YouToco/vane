@@ -211,6 +211,9 @@ Wrangler is materialized per frontend deployment below that run's private
 `RUNNER_TEMP` directory. `actions/setup-node` pins Node `v22.23.1`, while
 [`tools/wrangler/package-lock.json`](tools/wrangler/package-lock.json) pins the
 complete Wrangler `4.115.0` dependency tree with registry integrity hashes.
+Its Miniflare dependency is resolved to the patched, same-major Undici
+`7.29.0` through an exact npm override because Wrangler still pins the
+vulnerable `7.28.0` release.
 Lifecycle scripts are disabled; the exact version and Pages command are checked
 before provider credentials enter any step. The deploy VM therefore needs no
 out-of-band Node/Wrangler installation and a replacement runner receives the

@@ -16,9 +16,13 @@ class WranglerLockTest(unittest.TestCase):
             (ROOT / "tools/wrangler/package-lock.json").read_text(encoding="utf-8")
         )
         self.assertEqual(package["dependencies"], {"wrangler": "4.115.0"})
+        self.assertEqual(package["overrides"], {"undici": "7.29.0"})
         self.assertEqual(lock["lockfileVersion"], 3)
         self.assertEqual(
             lock["packages"]["node_modules/wrangler"]["version"], "4.115.0"
+        )
+        self.assertEqual(
+            lock["packages"]["node_modules/undici"]["version"], "7.29.0"
         )
         for path, entry in lock["packages"].items():
             if not path:
