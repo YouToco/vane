@@ -105,6 +105,34 @@ label, credential policy and admin trace untrue. Unsupported product pages
 fail explicitly rather than falling back to model memory or guessing a
 private endpoint.
 
+#### 2026-08-03 production regression finding
+
+The compiled acquisition registry already knew `web_product_status`, but the
+Research V3 runtime froze a second, narrower catalog containing only the two
+Exa Tools. A dynamic V3 task could therefore search for Kimi pricing and read
+an incomplete rendered page, yet could not select the existing first-party
+GoodsService adapter. This was a runtime-discovery gap, not a missing Source or
+a reason to freeze a long-lived fetch plan in the task definition.
+
+The regression contract is now:
+
+- `web_product_status` is the third current Research V3 Tool and remains a
+  runtime catalog capability; it is never stored in the V3 task definition;
+- its only model-visible URL is the Kimi membership pricing page, and runtime
+  validation rejects every other host, path, query and injected endpoint
+  before the network effect;
+- the durable run step and `official_calls` reservation commit before the one
+  upstream request; response loss becomes indeterminate and cannot replay;
+- the provider receipt is `kimi`, usage is one request, calculated cost is
+  exactly zero USD, trust is `official`, and no Exa credential or billable
+  effect appears in the frozen policy;
+- admin evidence preserves the raw operation as
+  `kimi:goods_list` / `official_fetch`, while synthesis sees only the stable
+  `vane.product-status-result/v1` projection;
+- if the official adapter fails, search results are location clues only. The
+  Brief must be `unknown` with no significance and the delivery gate stays
+  closed.
+
 ## External-fact authority
 
 Model weights are not a current truth source for mutable external facts.

@@ -168,14 +168,17 @@ func equalResearchOptionalIntV3(left, right *int) bool {
 }
 
 func (c ResearchProviderCallV3) validateForCompleted(costMicroUSD int64) error {
-	if c.TraceID == "" || len(c.TraceID) > 255 || c.Provider != "exa" ||
+	providerCostValid := (c.Provider == "exa" &&
+		(c.PricingStatus == "provider_reported" || c.PricingStatus == "calculated")) ||
+		(c.Provider == "kimi" && c.PricingStatus == "calculated" &&
+			c.CostMicroUSD == 0 && costMicroUSD == 0)
+	if c.TraceID == "" || len(c.TraceID) > 255 || !providerCostValid ||
 		!finiteResearchSpendV3(c.UsageQuantity) ||
 		c.QuotaUnits != researchRunQuotaUnitsV3 || !c.Attempted || !c.CostKnown ||
 		c.CostMicroUSD != costMicroUSD || c.CostMicroUSD < 0 ||
 		c.HTTPStatus == nil || *c.HTTPStatus < 200 || *c.HTTPStatus >= 300 ||
 		c.DurationMS < 0 || c.DurationMS > 86_400_000 ||
-		(c.PricingStatus != "provider_reported" &&
-			c.PricingStatus != "calculated") || c.CostCurrency != "USD" {
+		c.CostCurrency != "USD" {
 		return researchRunValidationError("research provider accounting receipt is invalid")
 	}
 	return nil
@@ -197,7 +200,8 @@ func (c ResearchProviderCallV3) validateForTerminal(
 		}
 		return nil
 	}
-	if c.TraceID == "" || len(c.TraceID) > 255 || c.Provider != "exa" ||
+	if c.TraceID == "" || len(c.TraceID) > 255 ||
+		(c.Provider != "exa" && c.Provider != "kimi") ||
 		c.DurationMS < 0 || c.DurationMS > 86_400_000 ||
 		c.QuotaUnits != researchRunQuotaUnitsV3 ||
 		c.UsageQuantity < 0 || math.IsNaN(c.UsageQuantity) ||
@@ -205,7 +209,12 @@ func (c ResearchProviderCallV3) validateForTerminal(
 		(c.HTTPStatus != nil && (*c.HTTPStatus < 100 || *c.HTTPStatus > 599)) {
 		return researchRunValidationError("attempted provider receipt is invalid")
 	}
-	if c.CostKnown {
+	if c.Provider == "kimi" {
+		if !c.CostKnown || c.CostMicroUSD != 0 || costMicroUSD != 0 ||
+			c.PricingStatus != "calculated" || c.CostCurrency != "USD" {
+			return researchRunValidationError("official provider spend must be known zero cost")
+		}
+	} else if c.CostKnown {
 		if c.CostMicroUSD < 0 || c.CostMicroUSD != costMicroUSD ||
 			(c.PricingStatus != "provider_reported" &&
 				c.PricingStatus != "calculated") || c.CostCurrency != "USD" {
@@ -248,7 +257,11 @@ func loadResearchRunToolGrantV3(
 	}
 	for _, grant := range seal.ResearchTools.AllowedTools {
 		if grant.Name == toolName {
-			if grant.BudgetBucket != string(QuotaExaCalls) ||
+			validGrant := (grant.BudgetBucket == string(QuotaExaCalls) &&
+				grant.Provider == "exa") ||
+				(grant.BudgetBucket == string(QuotaOfficialCalls) &&
+					grant.Provider == "kimi" && grant.MaxCostMicroUSD == 1)
+			if !validGrant ||
 				grant.MaxCostMicroUSD <= 0 || grant.MaxCostMicroUSD > 1_000_000 {
 				return runtimepolicy.ResearchToolDefinitionV3{}, types.PlannerBudget{}, researchRunIntegrityError()
 			}
@@ -303,7 +316,9 @@ func admitResearchRunSpendBudgetV3(
 func consumeResearchRunQuotaV3(
 	ctx context.Context, tx pgx.Tx, tenantID int64, bucket QuotaBucket, units float64,
 ) error {
-	if tenantID <= 0 || bucket != QuotaExaCalls || units != researchRunQuotaUnitsV3 {
+	if tenantID <= 0 ||
+		(bucket != QuotaExaCalls && bucket != QuotaOfficialCalls) ||
+		units != researchRunQuotaUnitsV3 {
 		return researchRunValidationError("research run quota reservation is invalid")
 	}
 	var admitted bool
@@ -352,7 +367,8 @@ func loadResearchRunSpendReservationV3(
 	}
 	row.QuotaBucket = QuotaBucket(bucket)
 	if row.ID <= 0 || row.ReservedQuotaUnits != researchRunQuotaUnitsV3 ||
-		row.QuotaBucket != QuotaExaCalls || row.ReservedCostMicroUSD <= 0 {
+		(row.QuotaBucket != QuotaExaCalls && row.QuotaBucket != QuotaOfficialCalls) ||
+		row.ReservedCostMicroUSD <= 0 {
 		return ResearchRunStepSpendReservationV3{}, researchRunIntegrityError()
 	}
 	return row, nil
@@ -374,11 +390,17 @@ func insertResearchProviderToolCallV3(
 		previewRunes = previewRunes[:8192]
 	}
 	endpointPath := ""
+	persistedToolName := reservation.ToolName
+	toolKind := string(types.ToolCallKindStatic)
 	switch reservation.ToolName {
 	case "web_search":
 		endpointPath = "/search"
 	case "web_contents":
 		endpointPath = "/contents"
+	case "web_product_status":
+		persistedToolName = "kimi:goods_list"
+		toolKind = string(types.ToolCallKindOfficialFetch)
+		endpointPath = "/apiv2/kimi.gateway.order.v1.GoodsService/ListGoods"
 	default:
 		return 0, researchRunIntegrityError()
 	}
@@ -403,13 +425,13 @@ func insertResearchProviderToolCallV3(
 		     tenant_id,provider,usage_quantity,pricing_rule_id,pricing_status,
 		     cost_amount,cost_currency,run_snapshot_id,
 		     research_run_step_spend_reservation_id
-		 ) VALUES ($1,$2,NULL,$3,'static',$4,$5,$6,$7,$8,$9,$10,$11,'','{}',
-		           CASE WHEN $12::bigint IS NULL THEN NULL ELSE $12::numeric/1000000 END,
-		           NULL,$13,$14,$15,NULL,$16,
-		           CASE WHEN $12::bigint IS NULL THEN NULL ELSE $12::numeric/1000000 END,
-		           $17,$18,$19)
+		 ) VALUES ($1,$2,NULL,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'','{}',
+		           CASE WHEN $13::bigint IS NULL THEN NULL ELSE $13::numeric/1000000 END,
+		           NULL,$14,$15,$16,NULL,$17,
+		           CASE WHEN $13::bigint IS NULL THEN NULL ELSE $13::numeric/1000000 END,
+		           $18,$19,$20)
 		 RETURNING id`,
-		traceID, identity.UserID, reservation.ToolName, endpointPath,
+		traceID, identity.UserID, persistedToolName, toolKind, endpointPath,
 		arguments, string(previewRunes), originalSize, call.HTTPStatus,
 		errorType, errorCode, call.DurationMS, costMicroUSD, identity.TenantID,
 		call.Provider, call.UsageQuantity, pricingStatus, costCurrency,

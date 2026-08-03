@@ -758,7 +758,7 @@ func (s *Store) BeginResearchRunStepV3(
 		execution.ToolName == "" || execution.RequestDigest !=
 		digestResearchRunStepRequestV3(planRef.PlanDigest, ordinal) ||
 		execution.ReservedQuotaUnits != researchRunQuotaUnitsV3 ||
-		execution.ReservedCostMicroUSD <= 0 ||
+		execution.ReservedCostMicroUSD < 0 ||
 		json.Unmarshal(execution.Arguments, &arguments) != nil {
 		return ResearchRunStepExecutionV3{}, researchRunIntegrityError()
 	}
@@ -910,7 +910,8 @@ func (s *Store) LoadResearchRunStepResolutionV3(
 			researchRunSHA256(evidence.Result) != evidence.ResultDigest ||
 			evidence.OriginalSize < len(evidence.Result) ||
 			evidence.Truncated != (evidence.OriginalSize > len(evidence.Result)) ||
-			(evidence.TrustType != "local" && evidence.TrustType != "external") {
+			(evidence.TrustType != "local" && evidence.TrustType != "external" &&
+				evidence.TrustType != "official") {
 			return ResearchRunStepResolutionV3{}, researchRunIntegrityError()
 		}
 		resolution.Evidence = &evidence
@@ -1496,7 +1497,8 @@ func validateResearchRunStepEvidenceCommitV3(
 		len(params.Result) > types.MaxModelVisibleToolResultBytes || !utf8.Valid(params.Result) ||
 		bytes.IndexByte(params.Result, 0) >= 0 ||
 		params.OriginalSize < len(params.Result) || params.OriginalSize > 2147483647 ||
-		(params.TrustType != "local" && params.TrustType != "external") ||
+		(params.TrustType != "local" && params.TrustType != "external" &&
+			params.TrustType != "official") ||
 		params.CostMicroUSD < 0 ||
 		params.ProviderCall.validateForCompleted(params.CostMicroUSD) != nil {
 		return researchRunValidationError("research Tool evidence is invalid")

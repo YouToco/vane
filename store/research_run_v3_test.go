@@ -27,6 +27,28 @@ func researchProviderCallV3ForTest(traceID string, costMicroUSD int64) ResearchP
 	}
 }
 
+func TestResearchProviderCallV3OfficialTerminalCostIsAlwaysKnownZero(t *testing.T) {
+	call := ResearchProviderCallV3{
+		TraceID: strings.Repeat("a", 64), Provider: "kimi", UsageQuantity: 1,
+		QuotaUnits: researchRunQuotaUnitsV3, DurationMS: 1, Attempted: true,
+		CostKnown: true, PricingStatus: "calculated", CostCurrency: "USD",
+	}
+	if err := call.validateForTerminal(ResearchRunStepIndeterminateV3, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*ResearchProviderCallV3){
+		func(value *ResearchProviderCallV3) { value.CostKnown = false },
+		func(value *ResearchProviderCallV3) { value.CostMicroUSD = 1 },
+		func(value *ResearchProviderCallV3) { value.PricingStatus = "provider_reported" },
+	} {
+		tampered := call
+		mutate(&tampered)
+		if err := tampered.validateForTerminal(ResearchRunStepIndeterminateV3, tampered.CostMicroUSD, 1); err == nil {
+			t.Fatal("untruthful official terminal cost accepted")
+		}
+	}
+}
+
 func researchExecutionTraceV3ForTest(
 	t *testing.T,
 	identity types.RunIdentity,
@@ -604,7 +626,7 @@ func researchRunPlanFixtureV3(
 
 func testResearchToolPolicyStoreV3(t *testing.T) runtimepolicy.ResearchToolPolicyV3 {
 	t.Helper()
-	tools := make([]runtimepolicy.ResearchToolDefinitionV3, 0, 2)
+	tools := make([]runtimepolicy.ResearchToolDefinitionV3, 0, 3)
 	for _, item := range []struct {
 		name           string
 		implementation runtimepolicy.ResearchToolImplementationV3
@@ -626,6 +648,18 @@ func testResearchToolPolicyStoreV3(t *testing.T) runtimepolicy.ResearchToolPolic
 			}, MaxCostMicroUSD: 10_000,
 		})
 	}
+	tools = append(tools, runtimepolicy.ResearchToolDefinitionV3{
+		Name: "web_product_status", Description: "Test Kimi official product status",
+		Parameters:               json.RawMessage(`{"type":"object","properties":{"page_url":{"type":"string","enum":["https://www.kimi.com/membership/pricing"]}},"required":["page_url"],"additionalProperties":false}`),
+		Implementation:           runtimepolicy.ResearchToolKimiProductStatusV3,
+		ImplementationGeneration: 1, Provider: "kimi",
+		Effects: []runtimepolicy.ResearchToolEffectV3{
+			runtimepolicy.ResearchToolEffectNetworkReadV3,
+			runtimepolicy.ResearchToolEffectTrustTaintV3,
+		},
+		ResultTrust:  runtimepolicy.ResearchToolTrustOfficialV3,
+		BudgetBucket: "official_calls", MaxCostMicroUSD: 1,
+	})
 	policy, err := runtimepolicy.BuildResearchToolPolicyV3(tools)
 	if err != nil {
 		t.Fatal(err)

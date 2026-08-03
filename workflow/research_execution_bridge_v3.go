@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"github.com/YouToco/vane/fetcher"
+	"github.com/YouToco/vane/runtimepolicy"
 	storepkg "github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
@@ -29,7 +30,7 @@ func mapResearchExecutionReceiptV3(
 	if err := plan.ValidateFor(identity, snapshot.SnapshotID); err != nil ||
 		!execution.FirstWriter || execution.StepID <= 0 ||
 		execution.SpendReservationID <= 0 || execution.Ordinal < 0 ||
-		execution.ReservedQuotaUnits != 1 || execution.ReservedCostMicroUSD <= 0 ||
+		execution.ReservedQuotaUnits != 1 || execution.ReservedCostMicroUSD < 0 ||
 		execution.InvocationID == "" || execution.ToolName == "" ||
 		execution.RequestDigest == "" {
 		return researchStepPersistenceV3{}, types.NewAppError(
@@ -50,6 +51,10 @@ func mapResearchExecutionReceiptV3(
 	}
 
 	provider := mapResearchProviderCallV3(receipt)
+	resultTrust := receipt.ResultTrust
+	if resultTrust == "" && receipt.Provider == "exa" {
+		resultTrust = runtimepolicy.ResearchToolTrustExternalV3
+	}
 	base := storepkg.CommitResearchRunStepV3Params{
 		Identity: identity, RunSnapshotID: snapshot.SnapshotID,
 		PlanRef: plan, Ordinal: execution.Ordinal,
@@ -66,7 +71,7 @@ func mapResearchExecutionReceiptV3(
 			Identity: identity, RunSnapshotID: snapshot.SnapshotID,
 			PlanRef: plan, Ordinal: execution.Ordinal,
 			Result: receipt.Result, OriginalSize: receipt.NormalizedResultSize,
-			TrustType: "external", CostMicroUSD: receipt.CostMicroUSD,
+			TrustType: string(resultTrust), CostMicroUSD: receipt.CostMicroUSD,
 			ProviderCall: provider,
 		}}, nil
 	case fetcher.ResearchExecutionDefiniteFailureV3:
@@ -100,6 +105,9 @@ func mapResearchProviderCallV3(
 	}
 	if receipt.CostKnown {
 		call.PricingStatus = "provider_reported"
+		if receipt.Provider == "kimi" {
+			call.PricingStatus = "calculated"
+		}
 		call.CostCurrency = "USD"
 	} else {
 		call.PricingStatus = "unpriced"

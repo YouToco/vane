@@ -109,7 +109,7 @@ var modelToolDefinitionsV1 = []ModelToolDefinitionV1{
 		},
 		ArgumentsSchema: json.RawMessage(`{
 			"type":"object",
-			"properties":{"page_url":{"type":"string","description":"用户明确给出的受支持官方套餐页面 http/https 地址"}},
+			"properties":{"page_url":{"type":"string","enum":["https://www.kimi.com/membership/pricing"],"description":"Kimi 官方会员定价页；运行时只调用代码白名单内的第一方商品接口"}},
 			"required":["page_url"],
 			"additionalProperties":false
 		}`),

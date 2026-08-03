@@ -31,28 +31,164 @@ func researchToolV3ForTest(
 	if name == "web_contents" {
 		implementation = runtimepolicy.ResearchToolExaContentsV3
 	}
+	provider := "exa"
+	effects := []runtimepolicy.ResearchToolEffectV3{
+		runtimepolicy.ResearchToolEffectBillableV3,
+		runtimepolicy.ResearchToolEffectNetworkReadV3,
+		runtimepolicy.ResearchToolEffectTrustTaintV3,
+	}
+	trust := runtimepolicy.ResearchToolTrustExternalV3
+	bucket := "exa_calls"
+	credential := runtimepolicy.CredentialRefV1{
+		ID: runtimepolicy.CredentialIDExaPrimaryV1, Generation: credentialGeneration,
+	}
+	maxCost := int64(50_000)
+	if name == "web_product_status" {
+		implementation = runtimepolicy.ResearchToolKimiProductStatusV3
+		provider = "kimi"
+		effects = []runtimepolicy.ResearchToolEffectV3{
+			runtimepolicy.ResearchToolEffectNetworkReadV3,
+			runtimepolicy.ResearchToolEffectTrustTaintV3,
+		}
+		trust = runtimepolicy.ResearchToolTrustOfficialV3
+		bucket = "official_calls"
+		credential = runtimepolicy.CredentialRefV1{}
+		maxCost = 1
+	}
 	policy, err := runtimepolicy.BuildResearchToolPolicyV3(
 		[]runtimepolicy.ResearchToolDefinitionV3{{
 			Name: name, Description: model.Description,
 			Parameters: model.ArgumentsSchema, Implementation: implementation,
-			ImplementationGeneration: 1, Provider: "exa",
-			Effects: []runtimepolicy.ResearchToolEffectV3{
-				runtimepolicy.ResearchToolEffectBillableV3,
-				runtimepolicy.ResearchToolEffectNetworkReadV3,
-				runtimepolicy.ResearchToolEffectTrustTaintV3,
-			},
-			ResultTrust:  runtimepolicy.ResearchToolTrustExternalV3,
-			BudgetBucket: "exa_calls",
-			CredentialRef: runtimepolicy.CredentialRefV1{
-				ID:         runtimepolicy.CredentialIDExaPrimaryV1,
-				Generation: credentialGeneration,
-			},
-			MaxCostMicroUSD: 50_000,
+			ImplementationGeneration: 1, Provider: provider,
+			Effects: effects, ResultTrust: trust, BudgetBucket: bucket,
+			CredentialRef: credential, MaxCostMicroUSD: maxCost,
 		}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return policy.AllowedTools[0]
+}
+
+func kimiGoodsResponseForResearchTest(reason string) string {
+	return `{"goods":[{"id":"g1","title":"Kimi Pro","membershipLevel":"LEVEL_PRO",` +
+		`"amounts":[{"currency":"CNY","priceInCents":"12900"}],` +
+		`"transitionSummary":{"reason":"` + reason + `"},` +
+		`"billingCycle":{"duration":1,"timeUnit":"MONTH"}}]}`
+}
+
+func TestResearchExecutorV3OfficialProductStatusEndToEnd(t *testing.T) {
+	for _, testCase := range []struct {
+		name, reason, wantStatus string
+	}{
+		{name: "reservation", reason: "REASON_SUBSCRIPTION_NEED_APPLY", wantStatus: "reservation_only"},
+		{name: "direct purchase", reason: "", wantStatus: "direct_purchase"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if r.Method != http.MethodPost || r.URL.Path != "/goods" ||
+					r.Header.Get("Connect-Protocol-Version") != "1" {
+					t.Fatalf("unexpected Kimi request: %s %s headers=%v", r.Method, r.URL.Path, r.Header)
+				}
+				_, _ = w.Write([]byte(kimiGoodsResponseForResearchTest(testCase.reason)))
+			}))
+			defer server.Close()
+
+			executor := newResearchExecutorV3ForTest(t)
+			executor.productStatus.kimiURL = server.URL + "/goods"
+			receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
+				"kimi-"+strings.ReplaceAll(testCase.name, " ", "-"),
+				researchToolV3ForTest(t, "web_product_status", 0),
+				json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing"}`)))
+
+			if requests != 1 || receipt.Status != ResearchExecutionSuccessV3 ||
+				receipt.Provider != "kimi" || receipt.ResultTrust != runtimepolicy.ResearchToolTrustOfficialV3 ||
+				!receipt.UsageKnown || receipt.UsageQuantity != 1 || !receipt.CostKnown ||
+				receipt.CostMicroUSD != 0 || receipt.HTTPStatus == nil || *receipt.HTTPStatus != 200 ||
+				!strings.Contains(string(receipt.Result), `"purchase_status":"`+testCase.wantStatus+`"`) ||
+				!strings.Contains(string(receipt.Result), `"transition_reason":"`+valueOr(testCase.reason, "NONE")+`"`) {
+				t.Fatalf("requests=%d receipt=%+v result=%s", requests, receipt, receipt.Result)
+			}
+			if err := receipt.Validate(); err != nil {
+				t.Fatalf("official receipt invalid: %v", err)
+			}
+		})
+	}
+}
+
+func TestResearchExecutorV3OfficialRouteAndURLInjectionFailBeforeEffect(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	executor := newResearchExecutorV3ForTest(t)
+	executor.productStatus.kimiURL = server.URL
+	tool := researchToolV3ForTest(t, "web_product_status", 0)
+
+	for _, args := range []json.RawMessage{
+		json.RawMessage(`{"page_url":"https://evil.example/pricing"}`),
+		json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing","endpoint":"https://evil.example"}`),
+	} {
+		receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest("kimi-injection", tool, args))
+		if receipt.Status != ResearchExecutionDefiniteFailureV3 || receipt.Attempted ||
+			receipt.ErrorCode != ResearchExecutionInvalidRequestV3 {
+			t.Fatalf("URL injection was not rejected: %+v", receipt)
+		}
+	}
+	tampered := tool
+	tampered.Provider = "exa"
+	receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
+		"kimi-route", tampered,
+		json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing"}`)))
+	if receipt.ErrorCode != ResearchExecutionRouteUnavailableV3 || requests != 0 {
+		t.Fatalf("route tamper reached network: requests=%d receipt=%+v", requests, receipt)
+	}
+}
+
+func TestResearchExecutorV3OfficialHTTPFailureAndResponseLossNeverReplay(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":"not evidence"}`))
+			}))
+			defer server.Close()
+			executor := newResearchExecutorV3ForTest(t)
+			executor.productStatus.kimiURL = server.URL
+			receipt := executor.ExecuteOnceV3(t.Context(), researchRequestV3ForTest(
+				"kimi-http", researchToolV3ForTest(t, "web_product_status", 0),
+				json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing"}`)))
+			if requests != 1 || !receipt.Attempted || len(receipt.Result) != 0 {
+				t.Fatalf("HTTP failure receipt=%+v requests=%d", receipt, requests)
+			}
+		})
+	}
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(kimiGoodsResponseForResearchTest("")))
+	}))
+	defer server.Close()
+	executor := newResearchExecutorV3ForTest(t)
+	executor.productStatus.kimiURL = server.URL
+	executor.productStatus.recorder = nil // provider succeeds, durable receipt response is lost
+	request := researchRequestV3ForTest(
+		"kimi-response-loss", researchToolV3ForTest(t, "web_product_status", 0),
+		json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing"}`))
+	receipt := executor.ExecuteOnceV3(t.Context(), request)
+	if receipt.Status != ResearchExecutionIndeterminateV3 ||
+		receipt.ErrorCode != ResearchExecutionProviderReceiptV3 ||
+		!receipt.CostKnown || receipt.CostMicroUSD != 0 || requests != 1 {
+		t.Fatalf("response loss receipt=%+v requests=%d", receipt, requests)
+	}
+	request.FirstWriter = false
+	replayed := executor.ExecuteOnceV3(t.Context(), request)
+	if replayed.ErrorCode != ResearchExecutionRecoveryNoReplayV3 || requests != 1 {
+		t.Fatalf("response loss replayed provider: receipt=%+v requests=%d", replayed, requests)
+	}
 }
 
 func newResearchExecutorV3ForTest(t *testing.T) *ResearchExecutorV3 {

@@ -250,7 +250,9 @@ func TestQuota_NewTenantIsSeeded(t *testing.T) {
 // 漏归类的桶会默认落进 DoS 面——一个本该硬拦的财务桶被当成"吵"来处理，
 // 而这个错误不会有任何报错。
 func TestInvariant_EveryBucketIsClassified(t *testing.T) {
-	dosBuckets := map[QuotaBucket]bool{QuotaPush: true, QuotaFetch: true}
+	dosBuckets := map[QuotaBucket]bool{
+		QuotaPush: true, QuotaFetch: true, QuotaOfficialCalls: true,
+	}
 	for _, q := range defaultQuotas {
 		if !q.Bucket.IsFinancial() && !dosBuckets[q.Bucket] {
 			t.Errorf("桶 %s 既不在财务面也不在 DoS 面 —— 两类的失败语义不同，"+
@@ -362,7 +364,7 @@ func TestInvariant_EnforcementClaimIsTrue(t *testing.T) {
 		if pkg == "" {
 			continue // 显式声明未接线，另有守卫要求它必须被显式声明
 		}
-		if bucket == QuotaExaCalls {
+		if bucket == QuotaExaCalls || bucket == QuotaOfficialCalls {
 			// Exa 的 V3 扣减必须和 started step + spend reservation 在同一事务里。
 			// 普通 TryConsume 虽然也会扣桶，却不能证明副作用前已有不可变预留，
 			// 所以不能拿通用判据替代下面更窄的专用 invariant。
@@ -415,6 +417,17 @@ func TestInvariant_ExaCallsUsesResearchRunReservation(t *testing.T) {
 	if callsFunction(begin, "consumeResearchRunQuotaV3") ||
 		functionContainsString(begin, "reserve_research_run_quota_v3") {
 		t.Fatal("BeginResearchRunStepV3 不得回退到可独立重放的旧 quota primitive")
+	}
+}
+
+func TestInvariant_OfficialCallsUsesResearchRunReservation(t *testing.T) {
+	if got := enforcedBuckets[QuotaOfficialCalls]; got != "store" {
+		t.Errorf("official_calls 必须由 V3 first-writer admission 强制执行，实得 %q", got)
+	}
+	begin := productionStoreFunction(t, "BeginResearchRunStepV3")
+	if !functionContainsString(begin, "admit_research_run_tool_step_cap_v1") ||
+		callsFunction(begin, "TryConsume") || callsFunction(begin, "TryConsumeForUser") {
+		t.Fatal("official_calls 未绑定 V3 started step 与不可变 reservation")
 	}
 }
 
