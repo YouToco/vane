@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
 
 	"github.com/YouToco/vane/taskstate"
@@ -54,51 +56,6 @@ func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *tes
 		t.Fatal(err)
 	}
 
-	pre108ShadowFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
-		t, st, taskstate.NotificationThresholdMajorV3, true, nil, "",
-		"research-v3-shadow-"+strings.Repeat("a", 64))
-	pre108ShadowPrepared, err := st.PrepareOrGetResearchBriefSynthesisV3(
-		t.Context(), researchBriefPrepareParamsV3(pre108ShadowFixture))
-	if err != nil || !pre108ShadowPrepared.FirstWriter {
-		t.Fatalf("pre-108 shadow prepare=%+v err=%v", pre108ShadowPrepared, err)
-	}
-	ensureResearchLLMPriceV3(t, st)
-	pre108ShadowReservation, err := st.BeginResearchRunLLMSpendV3(t.Context(),
-		BeginResearchRunLLMSpendV3Params{
-			Identity:     pre108ShadowFixture.identity,
-			SnapshotRef:  pre108ShadowFixture.snapshotRef,
-			Stage:        ResearchRunLLMStageSynthesisV3,
-			SubjectID:    pre108ShadowPrepared.Synthesis.ID,
-			SystemPrompt: "Synthesize without Tools.",
-			UserPrompt:   string(pre108ShadowPrepared.Synthesis.ContextPayload),
-		})
-	if err != nil || !pre108ShadowReservation.FirstWriter {
-		t.Fatalf("pre-108 shadow reservation=%+v err=%v", pre108ShadowReservation, err)
-	}
-	if _, err := st.pool.Exec(t.Context(),
-		`UPDATE schedules SET execution_mode='compiled',
-		 approved_definition_version=NULL,approved_definition_digest=NULL
-		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
-		pre108ShadowFixture.taskID, pre108ShadowFixture.tenantID,
-		pre108ShadowFixture.userID); err != nil {
-		t.Fatal(err)
-	}
-	pre108ShadowClaim, err := st.ClaimResearchBriefSynthesisV3(t.Context(),
-		ClaimResearchBriefSynthesisV3Params{
-			Identity:                  pre108ShadowFixture.identity,
-			SnapshotRef:               pre108ShadowFixture.snapshotRef,
-			PlanRef:                   pre108ShadowFixture.planRef,
-			SynthesisID:               pre108ShadowPrepared.Synthesis.ID,
-			RequestDigest:             pre108ShadowPrepared.Synthesis.RequestDigest,
-			SynthesisLLMReservationID: pre108ShadowReservation.ReservationID,
-		})
-	if err == nil || pre108ShadowClaim.Claimed {
-		t.Fatalf("pre-108 compatibility fallback admitted compiled shadow=%+v err=%v",
-			pre108ShadowClaim, err)
-	}
-	assertResearchBriefSynthesisStatusV3(t, pre108ShadowFixture,
-		pre108ShadowPrepared.Synthesis.ID, ResearchBriefSynthesisPreparedV3)
-
 	preparedFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, nil, "", "")
 	prepared, err := st.PrepareOrGetResearchBriefSynthesisV3(
@@ -106,6 +63,53 @@ func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *tes
 	if err != nil || !prepared.FirstWriter ||
 		prepared.Synthesis.Status != ResearchBriefSynthesisPreparedV3 {
 		t.Fatalf("legacy prepared=%+v err=%v", prepared, err)
+	}
+	pre108ShadowIdentity := preparedFixture.identity
+	pre108ShadowIdentity.TemporalWorkflowID =
+		"research-v3-shadow-" + strings.Repeat("a", 64)
+	pre108ShadowIdentity.TemporalRunID = "pre-108-shadow-run"
+	pre108ShadowRef, err := st.CreateOrGetResearchRunSnapshotV3(
+		t.Context(), pre108ShadowIdentity, testCompiledRunPolicyV1(t),
+		testResearchToolPolicyStoreV3(t), testResearchModelPolicyStoreV3(t))
+	if err != nil || pre108ShadowRef.SnapshotID <= 0 {
+		t.Fatalf("pre-108 shadow snapshot=%+v err=%v", pre108ShadowRef, err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE schedules SET execution_mode='compiled',
+		 approved_definition_version=NULL,approved_definition_digest=NULL
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		preparedFixture.taskID, preparedFixture.tenantID,
+		preparedFixture.userID); err != nil {
+		t.Fatal(err)
+	}
+	pre108Tx, _, err := st.beginScopedResearchRunTransactionV3(
+		t.Context(), pgx.TxOptions{}, pre108ShadowIdentity,
+		pre108ShadowRef.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockPushEffectSchemaWriter(t.Context(), pre108Tx); err != nil {
+		_ = pre108Tx.Rollback(t.Context())
+		t.Fatal(err)
+	}
+	pre108AuthErr := authorizeResearchRunEffectV3(t.Context(), pre108Tx,
+		pre108ShadowIdentity, pre108ShadowRef.SnapshotID)
+	if err := pre108Tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(pre108AuthErr, types.ErrValidation) {
+		t.Fatalf("pre-108 compatibility fallback admitted compiled shadow: %v",
+			pre108AuthErr)
+	}
+	assertResearchBriefSynthesisStatusV3(t, preparedFixture,
+		prepared.Synthesis.ID, ResearchBriefSynthesisPreparedV3)
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE schedules SET execution_mode='discover_at_run',
+		 approved_definition_version=1,approved_definition_digest=$2
+		 WHERE id=$1 AND tenant_id=$3 AND user_id=$4`,
+		preparedFixture.taskID, preparedFixture.snapshotRef.DefinitionDigest,
+		preparedFixture.tenantID, preparedFixture.userID); err != nil {
+		t.Fatal(err)
 	}
 
 	spendingFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
