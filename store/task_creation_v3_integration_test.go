@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -129,11 +130,12 @@ func TestNativeResearchTaskCreationV3PostgreSQLAtomicLifecycle(t *testing.T) {
 		ID: operationID, TenantID: tenantID, UserID: user.ID,
 		LeaseOwner: leaseOwner, Fence: 1,
 	}
+	const actionAuthorizationToken = "native-v3-action-authorization-token-0001"
 	params := types.CommitPausedResearchTaskDefinitionV3ForCreationParams{
 		Lease: lease, TaskID: taskID, DefinitionPayload: payload,
 		DefinitionDigest: digest, PreparedSchedule: prepared, EnsureReceipt: receipt,
 		TargetAction: action, TargetActionDigest: hexDigestV3Test(action),
-		ActionAuthorizationDigest: hexDigestV3Test([]byte("authorization")),
+		ActionAuthorizationDigest: hexDigestV3Test([]byte(actionAuthorizationToken)),
 	}
 	foreignTenant := params
 	foreignTenant.Lease.TenantID++
@@ -286,6 +288,70 @@ func TestNativeResearchTaskCreationV3PostgreSQLAtomicLifecycle(t *testing.T) {
 			operationPhase, status, authorityStatus)
 	}
 	assertNativeV3TaskHidden(t, st, user.ID, taskID)
+
+	result, _ := json.Marshal(map[string]any{
+		"version": "vane.task-creation-result/v1", "task_id": taskID,
+		"message": "任务已创建并开始监控。",
+	})
+	if err := st.CompleteResearchTaskCreationOperationV3(
+		t.Context(), lease, taskID, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.configureResearchRunCapabilityV1(ResearchRunCapabilityConfigV1{
+		ActiveKeyID:  "native-v3-creation-test",
+		ActiveKeyHex: strings.Repeat("11", sha256.Size),
+		TTL:          30 * 24 * time.Hour,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newIdentity := func(suffix string, gotTenantID, gotUserID int64) types.RunIdentity {
+		return types.RunIdentity{
+			TemporalWorkflowID: "workflow-native-v3-" + suffix,
+			TemporalRunID:      "run-native-v3-" + suffix,
+			RunKind:            types.RunSnapshotKindScheduled,
+			TenantID:           gotTenantID, UserID: gotUserID, TaskID: taskID,
+		}
+	}
+	for name, attempt := range map[string]struct {
+		identity types.RunIdentity
+		token    string
+	}{
+		"missing authority token": {newIdentity("missing-token", tenantID, user.ID), ""},
+		"wrong action token":      {newIdentity("wrong-token", tenantID, user.ID), strings.Repeat("x", 32)},
+		"cross user":              {newIdentity("cross-user", tenantID, user.ID+1), actionAuthorizationToken},
+		"cross tenant":            {newIdentity("cross-tenant", tenantID+1, user.ID), actionAuthorizationToken},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := st.CreateOrGetResearchRunSnapshotWithAuthorityV3(
+				t.Context(), attempt.identity, testCompiledRunPolicyV1(t),
+				testResearchToolPolicyStoreV3(t), testResearchModelPolicyStoreV3(t),
+				attempt.token); err == nil {
+				t.Fatal("unauthorized native V3 first run entered snapshot authority")
+			}
+		})
+	}
+	firstRun := newIdentity("authorized", tenantID, user.ID)
+	snapshot, err := st.CreateOrGetResearchRunSnapshotWithAuthorityV3(
+		t.Context(), firstRun, testCompiledRunPolicyV1(t),
+		testResearchToolPolicyStoreV3(t), testResearchModelPolicyStoreV3(t),
+		actionAuthorizationToken)
+	if err != nil || snapshot.AuthorityGeneration != 1 ||
+		snapshot.TaskID != taskID || snapshot.TenantID != tenantID ||
+		snapshot.UserID != user.ID {
+		t.Fatalf("native V3 first run snapshot=%+v err=%v", snapshot, err)
+	}
+	deliveryTx, err := st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authorizeResearchBriefDeliveryPrepareV3(
+		t.Context(), deliveryTx, firstRun); err != nil {
+		_ = deliveryTx.Rollback(t.Context())
+		t.Fatalf("authority-backed native V3 delivery remained dark: %v", err)
+	}
+	if err := deliveryTx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestNativeResearchTaskCreationV3ReplayRejectsMissingOrRevokedAuthority(t *testing.T) {

@@ -209,6 +209,25 @@ func loadResearchSnapshotAuthorityV3(
 	definitionVersion int64, definitionDigest, token string,
 ) (researchSnapshotAuthorityV3, error) {
 	if token == "" {
+		// Empty remains the delivery-dark compatibility path only while no
+		// authority record exists for this exact definition. Once cutover or
+		// native creation has staged/enabled/revoked authority, omitting the
+		// Action token must not mint an authority-free snapshot that can poison
+		// all later exact-token replays for the same Temporal run.
+		var authorityExists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM research_v3_delivery_authorities
+				 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
+				   AND definition_version=$4 AND definition_digest=$5
+			)`, identity.TenantID, identity.UserID, identity.TaskID,
+			definitionVersion, definitionDigest).Scan(&authorityExists); err != nil {
+			return researchSnapshotAuthorityV3{}, researchRunDatabaseError(
+				"inspect research snapshot Action authority", err)
+		}
+		if authorityExists {
+			return researchSnapshotAuthorityV3{}, researchRunConflictError()
+		}
 		return researchSnapshotAuthorityV3{}, nil
 	}
 	if strings.TrimSpace(token) != token || len(token) < 32 || len(token) > 512 {
