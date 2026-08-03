@@ -275,70 +275,14 @@ func TestGroundedResearchRejectsToolsOnReservedFinalRound(t *testing.T) {
 	}
 }
 
-func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
-	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
-	loop := New(Deps{Tools: BuildTools(
-		nil, nil, nil, nil, exa,
-	)})
-	state := &toolRunState{
-		ownerRequest:          "GPT-Live 是否已提供 API 定价？",
-		intents:               classifyOwnerIntents("GPT-Live 是否已提供 API 定价？"),
-		intentToolkitsEnabled: true,
-	}
-	defs := loop.requestTools(state)
-	got := make(map[string]bool, len(defs))
-	for _, def := range defs {
-		got[def.Name] = true
-	}
-	if !got["web_search"] || !got["read_page"] {
-		t.Fatalf("web toolkit missing: %v", got)
-	}
-	for _, hidden := range []string{
-		"view_profile", "list_schedules", "create_schedule",
-	} {
-		if got[hidden] {
-			t.Errorf("unrelated tool %s was exposed", hidden)
-		}
-	}
-}
-
-func TestIntentToolkitsShadowPreservesLegacyExposure(t *testing.T) {
-	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
-	loop := New(Deps{Tools: BuildTools(
-		nil, nil, nil, nil, exa,
-	)})
-	state := &toolRunState{
-		ownerRequest:         "GPT-Live 是否已提供 API 定价？",
-		intents:              classifyOwnerIntents("GPT-Live 是否已提供 API 定价？"),
-		intentToolkitsShadow: true,
-	}
-	defs := loop.requestTools(state)
-	got := make(map[string]bool, len(defs))
-	for _, def := range defs {
-		got[def.Name] = true
-	}
-	if !got["web_search"] || !got["read_page"] ||
-		!got["view_profile"] || !got["list_schedules"] {
-		t.Fatalf("shadow must preserve legacy exposure: %v", got)
-	}
-	if !state.intentToolkitsShadowSeen ||
-		state.intentToolkitsLegacyCount != len(defs) ||
-		state.intentToolkitsCandidateCount >= state.intentToolkitsLegacyCount {
-		t.Fatalf("shadow diff not recorded: %+v", state)
-	}
-	if len(state.intentToolkitsRemoved) == 0 {
-		t.Fatal("shadow diff must identify tools hidden by the candidate surface")
-	}
-}
-
-func TestIntentToolkitsRolloutPropagatesIntoRunOnce(t *testing.T) {
+func TestOwnerAgentCatalogIsNotKeywordRouted(t *testing.T) {
 	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
 	chat := &scriptedChat{responses: []*llm.ChatResponse{{
 		Content: "基于当前信息回答。",
 	}}}
+	tools := BuildOwnerTools(nil, ManageTasksDeps{}, nil, nil, exa)
 	loop := New(Deps{
-		Tools:                 BuildTools(nil, nil, nil, nil, exa),
-		IntentToolkitsEnabled: true,
+		Tools: tools, OwnerAgent: true, Evidence: &fakeAgentEvidenceWriter{},
 	})
 	loop.chatFn = chat.fn
 	if _, _, err := loop.RunOnce(
@@ -353,9 +297,16 @@ func TestIntentToolkitsRolloutPropagatesIntoRunOnce(t *testing.T) {
 	for _, def := range chat.requests[0].Tools {
 		got[def.Name] = true
 	}
-	if !got["web_search"] || !got["read_page"] ||
-		got["view_profile"] || got["list_schedules"] {
-		t.Fatalf("owner canary tool exposure = %v", got)
+	for _, required := range []string{"query_my_intelligence", "manage_tasks",
+		"update_profile", "web_search", "read_page"} {
+		if !got[required] {
+			t.Fatalf("owner catalog missing %s: %v", required, got)
+		}
+	}
+	for _, retired := range []string{"view_profile", "list_schedules", "create_schedule"} {
+		if got[retired] {
+			t.Fatalf("owner catalog exposed retired tool %s: %v", retired, got)
+		}
 	}
 }
 

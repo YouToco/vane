@@ -114,7 +114,7 @@ func notFoundErr(msg string) error {
 	return types.NewAppError(types.CodeNotFound, msg, nil)
 }
 
-// GetActiveAgentSession 计数进 getActiveCalls：NotifyEvent 的"现查必须在 userMu 锁内"
+// GetActiveAgentSession 计数进 getActiveCalls：NotifyEvent 的"现查必须在 session admission 内"
 // （审查 F14）靠"锁被对端持有期间这里有没有被调到"来判定，故计数与回写同一把 mu 保护。
 func (f *fakeStore) GetActiveAgentSession(_ context.Context, userID int64, since time.Time) (*types.AgentSession, error) {
 	f.mu.Lock()
@@ -818,9 +818,8 @@ func TestRecordCreationReceiptSessionUsesAgentUserLock(t *testing.T) {
 		LeaseOwner: "receipt-worker", Fence: 3,
 	}
 	messages := json.RawMessage(`[{"role":"user","content":"[卡片回调] done"}]`)
-	muVal, _ := l.userMu.LoadOrStore(int64(7), newUserTurnLock())
-	userMu := muVal.(*userTurnLock)
-	if err := userMu.Lock(t.Context()); err != nil {
+	admission := l.lockForUser(7)
+	if err := admission.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	started := time.Now()
@@ -831,7 +830,7 @@ func TestRecordCreationReceiptSessionUsesAgentUserLock(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
 		t.Fatalf("receipt recorder blocked dispatcher for %v", elapsed)
 	}
-	userMu.Unlock()
+	admission.Unlock()
 	if err := l.RecordCreationReceiptSession(t.Context(), receipt, messages); err != nil {
 		t.Fatal(err)
 	}
@@ -945,7 +944,7 @@ func appendCallAt(fs *fakeStore, i int) appendRecord {
 // 工具返回裸 error（非 AppError）时回写用通用文案兜底——原始错误文本
 // 一个字都不能进模型上下文。
 
-// 互锁与 ctx 语义：HandleMessage 持 userMu 期间点卡——回写必须排在 saveSession
+// 互锁与 ctx 语义：HandleMessage 持 session admission 期间点卡——回写必须排在 saveSession
 // 之后落地（不被全量覆盖写吞掉），且不受调用方已取消 ctx 的影响（拿锁后另起
 // 独立 ctx；fakeStore.Append 对齐 pgx、见 ctx 已死立即拒绝）。
 
@@ -1174,7 +1173,7 @@ func TestNotifyEvent(t *testing.T) {
 	})
 }
 
-// F14 定向用例（"挪一行就静默失效"的不变式）：HandleMessage 持 userMu 期间来的事件通告，
+// F14 定向用例（"挪一行就静默失效"的不变式）：HandleMessage 持 session admission 期间来的事件通告，
 // ① GetActiveAgentSession 现查必须发生在锁内——锁外查到的会话可能在抢锁期间被换代
 //
 //	（TTL 边界上 HandleMessage 新开会话），通告会写进过期会话；
@@ -1216,7 +1215,7 @@ func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.
 	// 锁仍被 HandleMessage 持有：现查与回写都不可能发生。
 	time.Sleep(30 * time.Millisecond)
 	if got := fs.getActiveCount(); got != baseQueries {
-		t.Fatalf("F14 失守：GetActiveAgentSession 现查发生在 userMu 之外（锁等待期间被调到 %d 次），"+
+		t.Fatalf("F14 失守：GetActiveAgentSession 现查发生在 session admission 之外（锁等待期间被调到 %d 次），"+
 			"锁外查到的会话可能在抢锁期间被换代", got-baseQueries)
 	}
 	if got := fs.appendCount(); got != 0 {
@@ -1256,7 +1255,7 @@ func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.
 // 整个进程。断言两件事：panic 不炸测试进程；同一用户的后续回写照常执行
 // （per-user 锁串行保证第二次在第一次之后跑）。
 func TestAsyncSessionWritePanicRecovered(t *testing.T) {
-	l := &Loop{sessionWriteAccepting: true}
+	l := New(Deps{})
 	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
 		panic("boom（测试构造）")
 	})
@@ -1278,7 +1277,7 @@ func TestDrainSessionWritesClosesAdmissionAndWaits(t *testing.T) {
 	if err := mu.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	l.userMu.Store(int64(42), mu)
+	l.sessionAdmission.users.Store(int64(42), mu)
 	firstRan := make(chan struct{})
 	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
 		close(firstRan)

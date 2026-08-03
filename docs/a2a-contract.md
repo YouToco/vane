@@ -1,7 +1,10 @@
-# A2A 契约：vane 作为 Agent2Agent Server（第一期 content.query）
+# A2A 契约：vane 作为 Agent2Agent Server
 
-> **工具面修订（2026-07-29）：** A2A `assistant.chat` 只保留
-> `list_schedules` 任务级只读能力，不暴露内部抓取目标。
+> **工具面修订（2026-08-03）：** A2A `assistant.chat` 使用 public-only
+> composition，但当前公共研究工具均为 Owner-only 的联网/计费能力，经
+> `AuthorizationA2AReadOnly` 过滤后 Agent 工具集为空。它只做模型一般公共知识问答，
+> 不读取 owner 任务、Owner Agent 对话历史、推送计划或画像，也不声称实时联网；已入库内容检索走独立
+> `content.query` skill。
 >
 > 本文件是 A2A 集成并行实现的**唯一契约**。所有签名/JSON/表结构以此为准，实现中发现契约错误不得自行变更——记录到交付报告，由主控裁决。
 > 事实基准：worktree @ ada0f6e（origin/main，2026-07-16 重新核实全部代码事实——方案定稿后 main 又前进，migration 编号与 wantTables 欠账均与方案原文不同，见 §2/§9.5）。2026-07-17 复核 @ e2136d5：012 已被 kind_backfill 占用，A2A migration 顺延为 **013**（§2）；wantTables 欠账清单不变（012 为纯回填不建表）。
@@ -9,15 +12,16 @@
 
 ## 0. 背景与范围
 
-A2A（Agent2Agent，LF 治理）是 agent 间互操作协议：server 发布 Agent Card 声明能力，client 以任务（Task）粒度发消息、轮询终态、取回产物（Artifact）。vane 第一期只做 **server**，单一 skill：
+A2A（Agent2Agent，LF 治理）是 agent 间互操作协议：server 发布 Agent Card 声明能力，client 以任务（Task）粒度发消息、轮询终态、取回产物（Artifact）。vane 当前只做 **server**，提供两个严格分离的 skill：
 
 | Skill | 说明 | 实现方式 |
 |---|---|---|
-| `content.query`（P1 唯一） | 按关键词/时间窗检索 vane 已入库的多信源内容，返回标题、链接、发布时间、正文摘录（**不含分数、不生成摘要**） | 确定性执行：executor 直接查 store，不经 LLM——零注入面、零 token 成本 |
+| `content.query` | 按关键词/时间窗检索 vane 已入库的多信源内容，返回标题、链接、发布时间、正文摘录（**不含分数、不生成摘要**） | 确定性执行：executor 直接查 store，不经 LLM——零注入面、零 token 成本 |
+| `assistant.chat` | 回答一般公共知识与 Vane A2A 能力边界问题；不读取 owner 业务数据、不实时联网 | LLM `RunOnce`，A2A public-only catalog 经授权过滤后当前为零工具；多轮历史只来自同 contextId 的 A2A 任务 |
 
 **能力面为什么这么窄（数据盘点结论）**：content_items（001_init.sql:66-83，007 加 canonical_key、008 加 kind）只有原始字段，无 score/summary 列；唯一持久化的分数是 deliveries.score（001_init.sql:115），且是按 owner 画像打的**个性化分**（main.go:98-99 hints 注入 scorer）——暴露它即泄露画像偏好，撞 §8 红线。故第一期诚实降级为纯内容检索。
 
-**非目标（第一期不做）**：vane 作为 A2A client；streaming（SSE）与 push notification（card 声明 false 且 handler 显式拒绝，启用前置见 §12）；gRPC/REST binding（只做 JSON-RPC 一种即合规）；extended card / card JWS 签名 / 多 peer 差异化授权；任何写能力；画像与个性化分。（原列于此的 `assistant.chat` 已于 2026-07-18 随 PR-4 实施——只读工具白名单 + RunOnce 无会话形态，见 §12）
+**非目标（第一期不做）**：vane 作为 A2A client；streaming（SSE）与 push notification（card 声明 false 且 handler 显式拒绝，启用前置见 §12）；gRPC/REST binding（只做 JSON-RPC 一种即合规）；extended card / card JWS 签名 / 多 peer 差异化授权；任何写能力；画像与个性化分。（原列于此的 `assistant.chat` 已于 2026-07-18 随 PR-4 实施，并于 2026-08-03 收敛为 public-only、当前零 Agent 工具的 RunOnce 形态，见 §12）
 
 **第一个对接方**：Boss 本机 Claude Code。Claude Code 无原生 A2A client（官方互操作只有 MCP），走官方 `a2a` CLI（`go install github.com/a2aproject/a2a-go/v2/cmd/a2a@latest`）+ 本机 skill 封装，token 走 my-credentials，零开发当天可用。注意：CLI 与 server 同源 SDK，**不构成 Gate ⑦ 的"异构客户端"验证**（§10）。
 
@@ -302,7 +306,7 @@ func sanitize(err error) string
 ```json
 {
   "name": "见微 Vane",
-  "description": "AI 个性化信息推送服务。提供已抓取入库的多信源内容检索（AI 模型厂商动态等）。",
+  "description": "AI 情报与信息推送服务。A2A 提供已抓取入库内容的确定性检索，以及不联网的一般公共知识对话。",
   "version": "<Deps.Version>",
   "supportedInterfaces": [
     { "url": "https://api.vane.zhuoqidev.com/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
@@ -321,6 +325,15 @@ func sanitize(err error) string
       "inputModes": ["text/plain"],
       "outputModes": ["application/json", "text/plain"],
       "examples": ["查询最近 3 天 Anthropic 相关内容", "{\"keyword\":\"GPT\",\"days\":7,\"limit\":10}"]
+    },
+    {
+      "id": "assistant.chat",
+      "name": "对话助理",
+      "description": "自然语言对话：AI 助理用模型已有公共知识回答一般问题和 Vane 能力边界问题；不读取 owner 的任务、Owner Agent 对话历史、推送计划或画像，也不具备实时联网工具。入参为消息首个 text part 的 JSON 对象 {\"skill\":\"assistant.chat\",\"text\":\"<自然语言>\"}（skill 与 text 均必填）。多轮追问：复用同一 contextId 发后续消息，服务端按 contextId 重建对话历史。本 skill 无任何写操作能力；按关键词检索入库内容请用 content.query（确定性检索更完整）。",
+      "tags": ["assistant", "chat", "read-only"],
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/plain"],
+      "examples": ["{\"skill\":\"assistant.chat\",\"text\":\"简要解释 AI Agent 和普通聊天模型的区别。\"}", "{\"skill\":\"assistant.chat\",\"text\":\"这个 A2A 通道能创建监控任务吗？\"}"]
     }
   ]
 }
@@ -427,7 +440,7 @@ if cfg.A2A.Enabled {
 
 1. **错误卫生**：sanitize 是唯一翻译点，原始错误链（pgx/SQL/路径）一个字节不得进协议响应；**突变测试强制**（§9.1）：把坏写法（直接 yield err）放回去必须变红。
 2. **入站消息 = 不可信输入**（协议官方免责声明原话）。P1 不经 LLM，注入面为零；keyword 经 escapeLike 转义（§4.2）。a2a_tasks 里的入站原文**不得回流进任何 LLM prompt**——第一期天然成立，钉为红线防 P2/分析脚本破坏。
-3. **不暴露**：画像（profiles）、个性化分（deliveries.score）、推送历史、任何 Mutating 工具。executor 数据面窄接口只有 SearchContentItems，编译期封死。
+3. **不暴露**：画像（profiles）、个性化分（deliveries.score）、owner 任务/Owner Agent 对话历史/推送计划、任何 Mutating 工具。`content.query` executor 数据面窄接口只有 SearchContentItems；`assistant.chat` 当前 Agent 工具集为空，均由编译期装配封死。
 4. **card 公开是设计选择非规范强制**（§5.2）：卡片内无内部 URL、无密钥、无 owner 信息。
 5. token 比对常数时间；token 本体只存 my-credentials；auth 失败限流（§5.7）。
 6. 全部 SQL 参数化；除 SDK 外不引入新依赖。
@@ -505,14 +518,15 @@ PR-2 与 PR-3 无同包文件耦合可真并行（SDK 触点全在 PR-3）；PR-
 - **streaming 启用前置**：仅需 `/a2a` 路由用 `http.ResponseController.SetWriteDeadline` 逐路由放宽 WriteTimeout=30s（main.go:188，唯一服务端障碍）+ 补 streaming 测试。**Caddy 零工作**：当前 Caddy 对 text/event-stream 自动逐段直通。
 - **push notification 启用前置**（三条全满足才解禁）：SDK 升级到含 #373/#374 的 release + 自建 webhook 域名白名单 + 拒 RFC1918/localhost/云 metadata。启用时补 push 配置表（凭证入库问题届时正面处理）。
 - **INPUT_REQUIRED 启用前置**：先给 agent.Outcome 定义结构化澄清字段（"这是澄清问句"的判定来源），无它则映射不可实现（§5.5）。
-- **P2 `assistant.chat`（✅ 2026-07-18 已实施，PR-4）**——RunOnce 已落地（签名同下，M4 §7.1）；system prompt 参数化已落地（Deps.SystemPrompt 零值回落）；工具白名单只保留 `list_schedules`；多轮历史按 contextId 跨任务重建（终态不可续写 ⇒ 追问=同 context 新任务，每任务折叠一对 user/assistant、上限 8 对）；同步返回靠 /a2a 路由级写超时放宽（150s>chatBudget 120s），超预算走 GetTask 兜底。不复用 agent_sessions、不共享 owner Loop 实例，避免外部只读轨与 Owner 写轨共享会话和用户锁。
+- **P2 `assistant.chat`（✅ 2026-07-18 已实施，2026-08-03 缩面）**——RunOnce 已落地（签名同下，M4 §7.1）；system prompt 参数化已落地（Deps.SystemPrompt 零值回落）；composition 从 `BuildPublicResearchTools` 开始并经 `AuthorizationA2AReadOnly` 过滤，当前 Exa/社媒工具因 Owner-only、联网/计费或 activation effect 全部被剔除，因此 Agent 工具集为空。它只能基于模型已有公共知识回答一般问题，不能查询 owner 任务/Owner Agent 对话历史/推送计划/画像，也不能声称实时联网；已入库内容由独立 `content.query` 确定性检索。多轮历史按 contextId 跨任务重建（终态不可续写 ⇒ 追问=同 context 新任务，每任务折叠一对 user/assistant、上限 8 对）；同步返回靠 /a2a 路由级写超时放宽（150s>chatBudget 120s），超预算走 GetTask 兜底。不复用 agent_sessions、不共享 owner Loop 实例，避免外部轨与 Owner 写轨共享会话和用户锁。
   ```go
   // agent 包新增（HandleMessage 签名不变，内部改为 load→RunOnce→save）：
   // RunOnce 在给定历史上执行一轮多轮 FC，不碰 store 会话。userID 必须入参（Tool.Execute 带
-  // userID）；A2A 轨填 owner userID，只读取该 owner 的任务列表。
+  // userID）；A2A 轨仍传认证 owner identity 用于调用边界一致性，但当前没有可执行工具，
+  // 不读取 owner 任务或其他业务数据。
   func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMessage, text string) (Outcome, []llm.ChatMessage, error)
   ```
-  三项前置改造：消息类型用 `llm.ChatMessage`；system prompt 参数化；sessionID 传 nil 并测试钉死“A2A 轨只允许 `list_schedules`，永不产生耐久写操作”。
+  三项前置改造：消息类型用 `llm.ChatMessage`；system prompt 参数化；sessionID 传 nil 并测试钉死“A2A 轨 Agent 工具集为空，永不读取 owner 数据或产生耐久写操作”。
   **P2 关停纪律**：`returnImmediately` 下 Execute goroutine 脱离请求生命周期——PR-4 开工前实测 SDK goroutine 宿主 ctx；a2a 包维护在飞 WaitGroup 有界等待；超预算任务留 WORKING 不强写终态（重启后可查可 Cancel，进 Gate ⑧ 扩展语义）；executor 预算 120s（对齐 chatCallTimeout，agent/loop.go:75-77）；DB 写自带超时。
 - **vane 作为 A2A client：不做**（无对接对象，完全独立的工程面）。
 - **多 peer 触发点**：需要第二个 token 时再加 peer 列 + 复查 SDK #351 IDOR（§1）。

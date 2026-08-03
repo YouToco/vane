@@ -1716,9 +1716,8 @@ func TestRecordDefinitionEditReceiptSessionUsesAgentUserLock(t *testing.T) {
 	messages := json.RawMessage(
 		`[{"role":"user","content":"[卡片回调] fixed edit fact"}]`,
 	)
-	muValue, _ := loop.userMu.LoadOrStore(int64(7), newUserTurnLock())
-	userMu := muValue.(*userTurnLock)
-	if err := userMu.Lock(t.Context()); err != nil {
+	admission := loop.lockForUser(7)
+	if err := admission.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	started := time.Now()
@@ -1731,7 +1730,7 @@ func TestRecordDefinitionEditReceiptSessionUsesAgentUserLock(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
 		t.Fatalf("edit receipt recorder blocked dispatcher for %v", elapsed)
 	}
-	userMu.Unlock()
+	admission.Unlock()
 	if err := loop.RecordDefinitionEditReceiptSession(
 		t.Context(), receipt, messages,
 	); err != nil {

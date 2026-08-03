@@ -265,7 +265,7 @@ const (
 		(chatCallTimeout+10*time.Second) +
 		agentChatFirstRetryWait + agentChatLaterRetryWait
 
-	// appendCallbackTimeout 卡片回调回写的 DB 预算，在拿到 userMu 之后才起算——
+	// appendCallbackTimeout 卡片回调回写的 DB 预算，在拿到 session admission 后才起算——
 	// 锁等待可达对端整条消息预算（分钟级），不能占用回写自己的超时窗口。
 	appendCallbackTimeout = 5 * time.Second
 
@@ -333,18 +333,14 @@ type Deps struct {
 	Model      string        // cfg.LLM.AgentModel
 	MaxTurns   int           // cfg.Agent.MaxTurns
 	SessionTTL time.Duration // cfg.Agent.SessionTTLMinutes
-	// IntentToolkitsEnabled switches model-visible static tools from the legacy
-	// full registry to the deterministic intent-routed first-request surface.
-	IntentToolkitsEnabled bool
-	// IntentToolkitsShadow computes the routed surface while preserving legacy
-	// exposure and records aggregate differences at turn completion.
-	IntentToolkitsShadow bool
-	// AgentFirstEnabled removes legacy general-chat tools and the pre-routing
-	// intent classifier. Dedicated direct Web lanes retain their exact tools.
-	AgentFirstEnabled bool
-	// AgentFirstCanaryUserID is the only authenticated user switched by the
-	// owner canary. Zero is invalid whenever AgentFirstEnabled is true.
-	AgentFirstCanaryUserID int64
+	// SessionAdmission is shared by every authenticated Loop that can mutate
+	// the same users' active Agent sessions. Nil creates a Loop-private domain
+	// for tests and sessionless/A2A composition.
+	SessionAdmission *SessionAdmissionCoordinator
+	// OwnerAgent selects the authenticated owner-chat lane. This is a static
+	// composition identity, not a rollout flag or per-user canary. A2A and
+	// retained Web compatibility loops must leave it false explicitly.
+	OwnerAgent bool
 	// Endpoints TikHub 端点工具面（端点注册表契约 §3/§4）。nil = 未装配
 	// （key 缺失），agent 退化为纯静态工具面，行为与该特性上线前一致。
 	Endpoints *EndpointTools
@@ -407,26 +403,23 @@ var errCreationReceiptSessionBusy = errors.New("agent: user session is busy")
 // 可安全被多个 goroutine（并发消息）共享。
 type Loop struct {
 	// chatFn 是模型调用入口（契约 §7）：默认包一层 DoChat，测试注入假实现。
-	chatFn                 func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
-	store                  Store
-	profiles               ProfileReader
-	tools                  map[string]ToolSpec // 按 Name 索引的受信白名单注册表（静态部分）
-	toolDefs               []llm.ToolDef       // 预构建的静态工具声明；动态端点声明按会话追加在其后
-	endpoints              *EndpointTools      // 动态端点工具面，nil = 未装配
-	toolCalls              *ToolCallRecorder
-	evidence               AgentEvidenceWriter
-	taskCreation           CreationController
-	taskDefinitionEdit     DefinitionEditController
-	sys                    string // system prompt（含端点检索能力说明段，装配时定型）
-	agentFirstSys          string // 精确 owner canary：不含旧任务工具/冻结抓取计划指引
-	renderProfile          bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
-	model                  string
-	maxTurns               int
-	sessionTTL             time.Duration
-	intentToolkitsEnabled  bool
-	intentToolkitsShadow   bool
-	agentFirstEnabled      bool
-	agentFirstCanaryUserID int64
+	chatFn             func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
+	store              Store
+	profiles           ProfileReader
+	tools              map[string]ToolSpec // 按 Name 索引的受信白名单注册表（静态部分）
+	toolDefs           []llm.ToolDef       // 预构建的静态工具声明；动态端点声明按会话追加在其后
+	endpoints          *EndpointTools      // 动态端点工具面，nil = 未装配
+	toolCalls          *ToolCallRecorder
+	evidence           AgentEvidenceWriter
+	taskCreation       CreationController
+	taskDefinitionEdit DefinitionEditController
+	sys                string // system prompt（含端点检索能力说明段，装配时定型）
+	agentFirstSys      string // 固定 owner lane：不含旧任务工具/冻结抓取计划指引
+	renderProfile      bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
+	model              string
+	maxTurns           int
+	sessionTTL         time.Duration
+	ownerAgent         bool
 	// taskEditIntentFn is an isolated, side-effect-free semantic gate. It is separate
 	// from the main Agent call so a durable edit requires two agreeing model
 	// decisions: classify the current owner turn as an immediate edit, then
@@ -437,15 +430,10 @@ type Loop struct {
 		[]llm.ChatMessage,
 	) (taskEditIntentDecision, error)
 
-	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
-	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写；
-	// 即使最终 CommitAgentSessionTurn 有 base fence，用户在机器人"思考中"补发第二条消息
-	// 就会整段覆盖丢失第一条的交换，TTL 边界还会双开会话分叉。串行化后第二条消息
-	// 排队等待，天然看到第一条的完整上下文，也更符合"共享多轮会话"的语义。
-	// 等锁必须服从调用方 ctx：HTTP 已断开或 route execution deadline 已到时，
-	// 排队请求不能在旧 turn 结束后又开始读库、调用模型或持久化新 turn。
-	// 单 owner MVP 下 map 只会有一个条目，无清理需求。
-	userMu sync.Map // map[int64]*userTurnLock
+	// sessionAdmission serializes the complete load -> work -> commit turn across
+	// every session-bearing Loop in the same process. Owner chat and Web must
+	// share it; sessionless RunOnce deliberately bypasses it.
+	sessionAdmission *SessionAdmissionCoordinator
 
 	// sessionWriteMu closes admission before shutdown and serializes WaitGroup.Add
 	// with DrainSessionWrites.Wait. Without this gate a card callback can return,
@@ -461,57 +449,8 @@ type Loop struct {
 	contextShadowSlots chan struct{}
 }
 
-// userTurnLock is a context-aware binary semaphore. sync.Mutex cannot abandon
-// Lock when an HTTP request is canceled, so a queued grounded ask could outlive
-// its response deadline and then start a fresh paid/persistent turn.
-type userTurnLock struct {
-	token chan struct{}
-}
-
-func newUserTurnLock() *userTurnLock {
-	lock := &userTurnLock{token: make(chan struct{}, 1)}
-	lock.token <- struct{}{}
-	return lock
-}
-
-func (m *userTurnLock) Lock(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-m.token:
-		// Cancellation may race a ready token. Return it before leaving so the
-		// canceled waiter cannot enter any database/model work or strand the lock.
-		if err := ctx.Err(); err != nil {
-			m.Unlock()
-			return err
-		}
-		return nil
-	}
-}
-
-func (m *userTurnLock) TryLock() bool {
-	select {
-	case <-m.token:
-		return true
-	default:
-		return false
-	}
-}
-
-func (m *userTurnLock) Unlock() {
-	select {
-	case m.token <- struct{}{}:
-	default:
-		panic("agent: unlock of unlocked user turn lock")
-	}
-}
-
 func (l *Loop) lockForUser(userID int64) *userTurnLock {
-	value, _ := l.userMu.LoadOrStore(userID, newUserTurnLock())
-	return value.(*userTurnLock)
+	return l.sessionAdmission.lockForUser(userID)
 }
 
 // chatMetaKey/chatMeta 经 ctx 旁路传递记账元信息：chatFn 的签名由契约固定、
@@ -539,8 +478,10 @@ func New(d Deps) *Loop {
 // Duplicate names, invalid schemas and zero/contradictory policies are rejected
 // rather than silently dropped or overwritten.
 func NewChecked(d Deps) (*Loop, error) {
-	if d.AgentFirstEnabled && (d.AgentFirstCanaryUserID <= 0 || d.Evidence == nil) {
-		return nil, errors.New("agent: Agent-first requires an exact canary user and exact evidence writer")
+	ownerAgent := d.OwnerAgent
+	sessionAdmission := d.SessionAdmission
+	if sessionAdmission == nil {
+		sessionAdmission = NewSessionAdmissionCoordinator()
 	}
 	maxTurns := d.MaxTurns
 	if maxTurns < 1 {
@@ -562,6 +503,23 @@ func NewChecked(d Deps) (*Loop, error) {
 		}
 		tools[spec.Name()] = spec
 		defs = append(defs, spec.Definition)
+	}
+	if ownerAgent {
+		if d.Evidence == nil {
+			return nil, errors.New("agent: owner Agent requires an exact evidence writer")
+		}
+		for _, required := range []string{
+			"query_my_intelligence", "manage_tasks", "update_profile",
+		} {
+			if _, ok := tools[required]; !ok {
+				return nil, fmt.Errorf("agent: owner Agent missing required tool %q", required)
+			}
+		}
+		for name := range tools {
+			if legacyGeneralChatTool(name) {
+				return nil, fmt.Errorf("agent: owner Agent contains retired tool %q", name)
+			}
+		}
 	}
 
 	// system prompt：自定义（A2A 轨）优先，零值回落默认飞书常量。
@@ -588,27 +546,25 @@ func NewChecked(d Deps) (*Loop, error) {
 	}
 
 	l := &Loop{
-		store:                  d.Store,
-		profiles:               d.Profiles,
-		tools:                  tools,
-		toolDefs:               defs,
-		endpoints:              d.Endpoints,
-		toolCalls:              d.ToolCalls,
-		taskCreation:           d.TaskCreation,
-		taskDefinitionEdit:     d.TaskDefinitionEdit,
-		evidence:               d.Evidence,
-		sys:                    sys,
-		agentFirstSys:          agentFirstSys,
-		renderProfile:          renderProfile,
-		model:                  d.Model,
-		maxTurns:               maxTurns,
-		sessionTTL:             ttl,
-		intentToolkitsEnabled:  d.IntentToolkitsEnabled,
-		intentToolkitsShadow:   d.IntentToolkitsShadow,
-		agentFirstEnabled:      d.AgentFirstEnabled,
-		agentFirstCanaryUserID: d.AgentFirstCanaryUserID,
-		sessionWriteAccepting:  true,
-		contextShadowSlots:     make(chan struct{}, agentContextShadowConcurrency),
+		store:                 d.Store,
+		profiles:              d.Profiles,
+		tools:                 tools,
+		toolDefs:              defs,
+		endpoints:             d.Endpoints,
+		toolCalls:             d.ToolCalls,
+		taskCreation:          d.TaskCreation,
+		taskDefinitionEdit:    d.TaskDefinitionEdit,
+		evidence:              d.Evidence,
+		sys:                   sys,
+		agentFirstSys:         agentFirstSys,
+		renderProfile:         renderProfile,
+		model:                 d.Model,
+		maxTurns:              maxTurns,
+		sessionTTL:            ttl,
+		ownerAgent:            ownerAgent,
+		sessionAdmission:      sessionAdmission,
+		sessionWriteAccepting: true,
+		contextShadowSlots:    make(chan struct{}, agentContextShadowConcurrency),
 	}
 	l.chatFn = func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
 		meta := llm.CallMeta{TraceID: uuid.NewString(), SpanName: "agent"}
@@ -953,7 +909,7 @@ func (l *Loop) handleMessage(
 	text string,
 	externalInput bool,
 ) (Outcome, error) {
-	// per-user 串行化整个 load→loop→save（见 userMu 字段注释）。
+	// per-user 串行化整个 load→loop→save（跨所有共享 session admission 的 Loop）。
 	mu := l.lockForUser(userID)
 	if err := mu.Lock(ctx); err != nil {
 		return Outcome{}, err
@@ -985,7 +941,7 @@ func (l *Loop) handleMessage(
 		},
 	})
 	directDefinitionEdit := directDefinitionEditTaskID != ""
-	agentFirst := l.agentFirstEnabled && l.agentFirstCanaryUserID == userID
+	agentFirst := l.ownerAgent
 	directTaskCreation := directActionID != "" && !directDefinitionEdit
 	if directActionID == "" {
 		directTaskCreation = !agentFirst && !externalInput &&
@@ -1122,9 +1078,7 @@ func (l *Loop) handleMessage(
 		activation:                 decodeActivation(sess.ActivatedTools),
 		ownerRequest:               ownerRequest,
 		clarifiedOwnerAction:       clarifiedOwnerAction,
-		intents:                    classifyOwnerIntents(ownerRequest),
-		intentToolkitsEnabled:      l.intentToolkitsEnabled,
-		intentToolkitsShadow:       l.intentToolkitsShadow,
+		intents:                    knownToolIntents,
 		agentFirstEnabled:          agentFirst,
 		successfulCalls:            make(map[string]struct{}),
 		failedCalls:                make(map[string]int),
@@ -1214,7 +1168,7 @@ func validDirectActionID(actionID string) bool {
 }
 
 // RunOnce 在给定历史上执行一轮多轮 FC（M4 契约 §7.1，A2A 轨 / a2a-contract §12 P2）：
-// 不读写会话存储、不持 userMu 锁、不注入画像——历史与并发语义完全由调用方管理
+// 不读写会话存储、不持 session admission 锁、不注入画像——历史与并发语义完全由调用方管理
 // （A2A 侧按 contextId 重建历史；外部 agent 的会话不该与 owner 飞书轨互相排队）。
 // 返回更新后的完整历史（含本轮 user/assistant/tool 消息），供调用方按自己的语义留存。
 //
@@ -1234,13 +1188,12 @@ func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMess
 		traceID: turnID, userID: userID,
 	})
 	state := &toolRunState{
-		activation:            &activationState{},
-		ownerRequest:          text,
-		intents:               classifyOwnerIntents(text),
-		intentToolkitsEnabled: l.intentToolkitsEnabled,
-		intentToolkitsShadow:  l.intentToolkitsShadow,
-		successfulCalls:       make(map[string]struct{}),
-		failedCalls:           make(map[string]int),
+		activation:        &activationState{},
+		ownerRequest:      text,
+		intents:           knownToolIntents,
+		agentFirstEnabled: l.ownerAgent,
+		successfulCalls:   make(map[string]struct{}),
+		failedCalls:       make(map[string]int),
 	}
 
 	outcome, msgs, _, err := l.converse(ctx, userID, nil, msgs, "", state)
@@ -1949,10 +1902,6 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		if !ok {
 			continue
 		}
-		if state != nil && !state.agentFirstEnabled &&
-			agentFirstOnlyTool(def.Name) {
-			continue
-		}
 		if state != nil && state.agentFirstEnabled &&
 			legacyGeneralChatTool(def.Name) {
 			continue
@@ -1972,29 +1921,7 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 	}
 	candidate := appendToolDefs(static, dyn)
 	candidate = l.filterConstrainedSideEffectToolDefs(candidate, state)
-	if state != nil && state.agentFirstEnabled {
-		return candidate
-	}
-	if state == nil || state.intentToolkitsEnabled {
-		return candidate
-	}
-	legacyStatic := make([]llm.ToolDef, 0, len(l.toolDefs))
-	for _, def := range l.toolDefs {
-		if def.Name != definitionEditToolName && !agentFirstOnlyTool(def.Name) {
-			legacyStatic = append(legacyStatic, def)
-		}
-	}
-	legacy := appendToolDefs(legacyStatic, dyn)
-	legacy = l.filterConstrainedSideEffectToolDefs(legacy, state)
-	if state.intentToolkitsShadow && !state.intentToolkitsShadowSeen {
-		state.intentToolkitsShadowSeen = true
-		state.intentToolkitsLegacyCount = len(legacy)
-		state.intentToolkitsCandidateCount = len(candidate)
-		state.intentToolkitsRemoved = toolDefNamesMissingFrom(
-			legacy, candidate,
-		)
-	}
-	return legacy
+	return candidate
 }
 
 func (l *Loop) filterConstrainedSideEffectToolDefs(
@@ -2063,20 +1990,6 @@ func appendToolDefs(prefix, suffix []llm.ToolDef) []llm.ToolDef {
 	out := make([]llm.ToolDef, 0, len(prefix)+len(suffix))
 	out = append(out, prefix...)
 	return append(out, suffix...)
-}
-
-func toolDefNamesMissingFrom(all, subset []llm.ToolDef) []string {
-	visible := make(map[string]struct{}, len(subset))
-	for _, def := range subset {
-		visible[def.Name] = struct{}{}
-	}
-	missing := make([]string, 0, len(all)-len(subset))
-	for _, def := range all {
-		if _, ok := visible[def.Name]; !ok {
-			missing = append(missing, def.Name)
-		}
-	}
-	return missing
 }
 
 func projectDirectTaskCreationToolDef(def llm.ToolDef) (llm.ToolDef, bool) {
@@ -2179,17 +2092,6 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 模型单独重试。只“放行一个、拒绝其余”仍会把被拒调用的 args/content
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
-	if state != nil && !state.agentFirstEnabled {
-		for _, call := range calls {
-			if agentFirstOnlyTool(call.Name) {
-				for _, rejected := range calls {
-					out = append(out, toolMsg(rejected.ID,
-						"该工具不在当前用户的可用能力中；本批未执行。"))
-				}
-				return out, nil
-			}
-		}
-	}
 	if state != nil && state.agentFirstEnabled &&
 		state.directTaskDefinitionEditID == "" && !state.directTaskCreation {
 		for _, call := range calls {
@@ -2762,11 +2664,6 @@ func observeAgentRunState(state *toolRunState) {
 		"grounding_failure_count", state.externalFollowupGroundingFailures,
 		"web_research_succeeded", state.webResearchSucceeded,
 		"web_page_read_succeeded", state.webPageReadSucceeded,
-		"intent_toolkits_enabled", state.intentToolkitsEnabled,
-		"intent_toolkits_shadow", state.intentToolkitsShadowSeen,
-		"legacy_tool_count", state.intentToolkitsLegacyCount,
-		"candidate_tool_count", state.intentToolkitsCandidateCount,
-		"shadow_removed_tools", state.intentToolkitsRemoved,
 	)
 }
 
@@ -3076,13 +2973,12 @@ func isNaturalTaskDefinitionEditCandidate(text string) bool {
 		"取消", "停止", "关掉", "停掉", "终止",
 		"create", "delete", "remove", "run", "execute", "launch", "stop",
 	)
-	hasProfileDeclaration := classifyOwnerIntents(text).HasAny(IntentProfile) &&
-		containsAny(normalized,
-			"我是", "我在", "我的行业", "我的职业", "我的岗位",
-			"我负责", "我从事", "我关注",
-			"iam", "i'm", "iworkin", "myrole", "myjob",
-		)
-	hasCapabilityIntent := classifyOwnerIntents(text).HasAny(IntentTasks)
+	hasProfileDeclaration := containsAny(normalized,
+		"我是", "我在", "我的行业", "我的职业", "我的岗位",
+		"我负责", "我从事", "我关注",
+		"iam", "i'm", "iworkin", "myrole", "myjob",
+	)
+	hasCapabilityIntent := hasTaskTarget
 	return hasCapabilityIntent || hasExplicitEdit ||
 		hasTaskContinuation || hasTaskAction || hasProfileDeclaration
 }
@@ -3520,14 +3416,14 @@ func (l *Loop) RecordDefinitionEditReceiptSession(
 			"agent: task definition edit receipt session store is unavailable",
 		)
 	}
-	userMu := l.lockForUser(receipt.UserID)
-	if !userMu.TryLock() {
+	admission := l.lockForUser(receipt.UserID)
+	if !admission.TryLock() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		return errCreationReceiptSessionBusy
 	}
-	defer userMu.Unlock()
+	defer admission.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -3539,7 +3435,7 @@ func (l *Loop) RecordDefinitionEditReceiptSession(
 // NotifyEvent 把外部事件（推送卡反馈按钮点击，M5 契约 §12.4）以「[卡片回调]」user
 // 通告写入当前 active 会话；notice 由调用方（feedback 层）拼好完整文案（含前缀）。
 // 无 active 会话（TTL 外）直接丢弃、绝不新建——用户没在对话，一条通告不值得开新会话。
-// GetActiveAgentSession 现查必须发生在 userMu 锁内（审查 F14）：锁外查到的会话可能
+// GetActiveAgentSession 现查必须发生在共享 session admission 内（审查 F14）：锁外查到的会话可能
 // 在抢锁期间被换代（TTL 边界上 HandleMessage 新开会话），通告会写进过期会话。
 func (l *Loop) NotifyEvent(
 	ctx context.Context,
@@ -3573,7 +3469,7 @@ func (l *Loop) NotifyEvent(
 // legacy+ledger 原子性与精确重试反重复，不负责从业务事实耐久重建未开始的写入；
 // 扫描/checkpoint/断点重试属于 7.10。
 //
-//   - 持 per-user 锁（与 HandleMessage 的 userMu 同一把）：避免 side-writer
+//   - 持 per-user 锁（与所有 session-bearing HandleMessage 入口同一把）：避免 side-writer
 //     在 HandleMessage 的 load→save 窗口中间提交，使 normal-turn base fence
 //     因看见未加载的新投影而产生可避免的 stale-base conflict。
 //   - 抢锁与写库放在独立 goroutine：HandleMessage 可持锁整条消息预算（分钟级），

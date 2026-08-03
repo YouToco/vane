@@ -179,15 +179,14 @@ func TestCompartmentedResearchCombinesKimiHistoryAndCurrentEvidence(t *testing.T
 	fs := newFakeStore()
 	loop := New(Deps{
 		Store: fs, Profiles: fs,
-		Tools: []ToolSpec{
+		Tools: ownerTestTools(
 			NewQueryMyIntelligenceTool(queries),
 			exa.SearchTool(), exa.ReadPageTool(),
-		},
-		Evidence:               writer,
-		AgentFirstEnabled:      true,
-		AgentFirstCanaryUserID: 42,
-		Model:                  "deepseek-v4-pro",
-		MaxTurns:               6,
+		),
+		Evidence:   writer,
+		OwnerAgent: true,
+		Model:      "deepseek-v4-pro",
+		MaxTurns:   6,
 	})
 	loop.chatFn = chatCall
 
@@ -320,8 +319,8 @@ func TestCompartmentedResearchMaliciousPageCannotDeleteTask(t *testing.T) {
 		}
 	}
 	loop := New(Deps{
-		Tools: testToolSpecs(query, external, write), Evidence: writer,
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 6,
+		Tools: ownerTestTools(testToolSpecs(query, external, write)...), Evidence: writer,
+		OwnerAgent: true, MaxTurns: 6,
 	})
 	loop.chatFn = chatCall
 	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
@@ -622,9 +621,9 @@ func TestHistoricalExternalArgumentsDirectSummaryUsesExactBundleOnly(t *testing.
 	}
 	fs := newFakeStore()
 	loop := New(Deps{
-		Store: fs, Profiles: fs, Tools: testToolSpecs(query), Evidence: writer,
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42,
-		Model: "deepseek-v4-pro", MaxTurns: 3,
+		Store: fs, Profiles: fs, Tools: ownerTestTools(testToolSpecs(query)...), Evidence: writer,
+		OwnerAgent: true,
+		Model:      "deepseek-v4-pro", MaxTurns: 3,
 	})
 	loop.chatFn = chatCall
 	out, err := loop.HandleMessage(t.Context(), 42, "总结这条历史工具记录")
@@ -726,9 +725,9 @@ func TestHistoricalObservationUsesPublicOnlyIsolationWithoutNewWebCall(t *testin
 	fs := newFakeStore()
 	loop := New(Deps{
 		Store: fs, Profiles: fs,
-		Tools: testToolSpecs(query, webSearch, readPage), Evidence: writer,
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42,
-		Model: "deepseek-v4-pro", MaxTurns: 3,
+		Tools: ownerTestTools(testToolSpecs(query, webSearch, readPage)...), Evidence: writer,
+		OwnerAgent: true,
+		Model:      "deepseek-v4-pro", MaxTurns: 3,
 	})
 	loop.chatFn = chatCall
 	out, err := loop.HandleMessage(t.Context(), 42, "比较这条历史公开观察记录")
@@ -879,8 +878,8 @@ func TestCompartmentedFinalErrorUsesBoundedFallbackAndCommitsEvidence(t *testing
 		}
 	}
 	loop := New(Deps{
-		Tools: testToolSpecs(query, external), Evidence: writer,
-		AgentFirstEnabled: true, AgentFirstCanaryUserID: 42, MaxTurns: 3,
+		Tools: ownerTestTools(testToolSpecs(query, external)...), Evidence: writer,
+		OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chatCall
 	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{

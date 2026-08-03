@@ -85,3 +85,33 @@ func TestCardCapabilitiesSameSource(t *testing.T) {
 		t.Fatal("第一期 capabilities 必须全 false（契约 §0 非目标）")
 	}
 }
+
+func TestAssistantChatCardMatchesToollessPublicSurface(t *testing.T) {
+	card := buildCard(Deps{})
+	if len(card.Skills) != 2 || card.Skills[1].ID != skillAssistantChat {
+		t.Fatalf("assistant.chat skill missing: %+v", card.Skills)
+	}
+	encoded, err := json.Marshal(card.Skills[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, forbidden := range []string{
+		"可查询本服务的订阅信源", "每天的推送计划是几点", "我现在订了哪些信源",
+		"web_search", "read_page", "search_endpoints",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("assistant.chat card advertises unavailable capability %q: %s",
+				forbidden, text)
+		}
+	}
+	for _, required := range []string{"公共知识", "不读取 owner", "不具备实时联网工具"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("assistant.chat card omits boundary %q: %s", required, text)
+		}
+	}
+	if !strings.Contains(ChatSystemPrompt, "当前不装配任何 Agent 工具") ||
+		!strings.Contains(ChatSystemPrompt, "不能实时联网") {
+		t.Fatalf("assistant.chat prompt does not match card boundary: %q", ChatSystemPrompt)
+	}
+}

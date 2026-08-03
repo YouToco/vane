@@ -85,16 +85,7 @@ type toolRunState struct {
 	clarifiedOwnerAction string
 	manageTasksResult    string
 	intents              ToolIntent
-	// Intent toolkit rollout is fixed by the locally assembled Loop, never by
-	// model or external content. Shadow records aggregate exposure differences
-	// while returning the legacy registry unchanged.
-	intentToolkitsEnabled        bool
-	intentToolkitsShadow         bool
-	agentFirstEnabled            bool
-	intentToolkitsShadowSeen     bool
-	intentToolkitsLegacyCount    int
-	intentToolkitsCandidateCount int
-	intentToolkitsRemoved        []string
+	agentFirstEnabled    bool
 	// Unified loop breaker state. Provider-specific message caps are not used
 	// for planning; this hidden ceiling only stops repeated or runaway calls.
 	toolExecutions     int

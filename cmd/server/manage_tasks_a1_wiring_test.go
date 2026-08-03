@@ -25,19 +25,19 @@ func TestAgentFirstManageTasksDoesNotReuseLegacyEditController(t *testing.T) {
 	var literals []*ast.CompositeLit
 	ast.Inspect(file, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
-		if !ok || !isPackageSelector(call.Fun, "agent", "NewManageTasksTool") ||
-			len(call.Args) != 1 {
+		if !ok || !isPackageSelector(call.Fun, "agent", "BuildOwnerTools") ||
+			len(call.Args) != 5 {
 			return true
 		}
-		literal, ok := call.Args[0].(*ast.CompositeLit)
+		literal, ok := call.Args[1].(*ast.CompositeLit)
 		if !ok {
-			t.Fatalf("NewManageTasksTool argument=%T, want composite literal", call.Args[0])
+			t.Fatalf("BuildOwnerTools manage argument=%T, want composite literal", call.Args[1])
 		}
 		literals = append(literals, literal)
 		return true
 	})
 	if len(literals) != 1 {
-		t.Fatalf("NewManageTasksTool production calls=%d, want 1", len(literals))
+		t.Fatalf("BuildOwnerTools production calls=%d, want 1", len(literals))
 	}
 	fields := make(map[string]bool)
 	creatorWired := false

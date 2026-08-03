@@ -10,10 +10,10 @@ import (
 	"testing"
 )
 
-// TestTaskDefinitionEditWiringUsesFlaggedController pins the C2b3-2d process
-// boundary: one controller always drains historical card callbacks, while the
-// default-off flag alone controls whether the proposal tool is registered.
-func TestTaskDefinitionEditWiringUsesFlaggedController(t *testing.T) {
+// TestTaskDefinitionEditWiringRetainsWebCompatibilityController pins the
+// recovery/Web boundary. The controller remains for the explicit Web action
+// endpoint, but it is not registered in the owner model catalog.
+func TestTaskDefinitionEditWiringRetainsWebCompatibilityController(t *testing.T) {
 	t.Helper()
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -47,7 +47,6 @@ func TestTaskDefinitionEditWiringUsesFlaggedController(t *testing.T) {
 		stopCalls             int
 		controllerCalls       int
 		controllerPos         token.Pos
-		flaggedController     bool
 	)
 
 	ast.Inspect(parsed, func(node ast.Node) bool {
@@ -71,28 +70,6 @@ func TestTaskDefinitionEditWiringUsesFlaggedController(t *testing.T) {
 			}
 			coordinatorName = ident.Name
 		}
-		return true
-	})
-	ast.Inspect(parsed, func(node ast.Node) bool {
-		branch, ok := node.(*ast.IfStmt)
-		if !ok || !isSelectorPath(
-			branch.Cond, "cfg", "Agent", "DefinitionEditEnabled",
-		) {
-			return true
-		}
-		ast.Inspect(branch.Body, func(child ast.Node) bool {
-			assignment, ok := child.(*ast.AssignStmt)
-			if !ok {
-				return true
-			}
-			for _, rhs := range assignment.Rhs {
-				ident, ok := rhs.(*ast.Ident)
-				if ok && ident.Name == "definitionEditController" {
-					flaggedController = true
-				}
-			}
-			return true
-		})
 		return true
 	})
 	if constructorCalls != 1 || coordinatorName == "" {
@@ -156,8 +133,7 @@ func TestTaskDefinitionEditWiringUsesFlaggedController(t *testing.T) {
 		return true
 	})
 
-	if coordinatorIdentCount != 5 || controllerCalls != 1 ||
-		!flaggedController {
+	if coordinatorIdentCount != 5 || controllerCalls != 1 {
 		t.Fatalf("%s production references/controller edges = %d/%d, want assignment plus three recovery/Gate receivers and one narrow controller edge",
 			coordinatorName, coordinatorIdentCount, controllerCalls)
 	}

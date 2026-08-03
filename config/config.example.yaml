@@ -69,8 +69,9 @@ pipeline:
   # runs are authorized by each task's enabled database authority token.
   research_v3_shadow_canary_schedule_id: ""
   research_v3_authority_canary_schedule_id: ""
+  # Required by the unconditional Owner Agent manage_tasks create surface.
   # Process capability only; it never grants task authority by itself.
-  research_v3_runtime_enabled: false
+  research_v3_runtime_enabled: true
   # P1-B exact-run lifecycle is independent and remains dark by default.
   run_outcome_enabled: false
   run_outcome_canary_schedule_id: ""
@@ -114,16 +115,7 @@ pipeline:
   push_effect_recovery_canary_schedule_id: ""
 
 agent:
-  # Owner-only Agent-first canary. Keeps dedicated Web and A2A compatibility
-  # lanes unchanged while general chat uses query_my_intelligence/manage_tasks.
-  agent_first_owner_canary: false
-  agent_first_canary_user_id: 0
   max_turns: 20
-  # 意图工具包发布顺序：默认只记录旧/新曝光差异；owner_canary 仅启用飞书 Owner；
-  # 验收后关闭 canary 并显式打开 allow_all。owner_canary 与 allow_all 不可同时开启。
-  intent_toolkits_shadow_enabled: true
-  intent_toolkits_owner_canary: false
-  intent_toolkits_allow_all: false
   # C2b3-2d 唯一任务定义编辑入口；真卡 Gate 与耐久回执接通前保持 false。
   definition_edit_enabled: false
   session_ttl_minutes: 30 # 同一 owner 会话闲置过期窗口（M4）

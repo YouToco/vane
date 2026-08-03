@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/YouToco/vane/config"
@@ -20,6 +21,33 @@ func TestNativeResearchV3CreationPolicyIsBounded(t *testing.T) {
 		policy.PlannerBudget.MaxCostMicroUSD != 1_000_000 ||
 		policy.PlannerBudget.DurationMs != 300_000 {
 		t.Fatalf("native V3 creation policy drifted: %+v", policy.PlannerBudget)
+	}
+}
+
+func TestOwnerAgentStartupRequiresPersistentResearchV3Runtime(t *testing.T) {
+	if err := requireOwnerAgentResearchV3Runtime(nil); err == nil {
+		t.Fatal("nil configuration crossed owner Agent startup Gate")
+	}
+
+	dark := &config.Config{}
+	// A retained exact authority selector is not a substitute for persistent
+	// runtime capability. This also prevents already-enabled database authority
+	// from being silently stranded after a dark restart.
+	dark.Pipeline.ResearchV3AuthorityCanaryScheduleID = "task-existing"
+	err := requireOwnerAgentResearchV3Runtime(dark)
+	if err == nil || !strings.Contains(err.Error(),
+		"pipeline.research_v3_runtime_enabled=true") {
+		t.Fatalf("dark owner Agent startup error=%v", err)
+	}
+
+	enabled := &config.Config{}
+	enabled.Pipeline.ResearchV3RuntimeEnabled = true
+	if err := requireOwnerAgentResearchV3Runtime(enabled); err != nil {
+		t.Fatalf("persistent owner Agent runtime rejected: %v", err)
+	}
+	if !shouldInitializeResearchV3Runtime(enabled) ||
+		!shouldEnableResearchV3Delivery(enabled) {
+		t.Fatal("enabled owner Agent runtime did not assemble worker and delivery")
 	}
 }
 

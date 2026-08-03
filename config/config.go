@@ -239,23 +239,6 @@ type PipelineConfig struct {
 // AgentConfig 是 agent loop 运行约束配置。
 type AgentConfig struct {
 	MaxTurns int `mapstructure:"max_turns"`
-	// AgentFirstOwnerCanary replaces the production owner chat surface with the
-	// small orthogonal query/manage/profile/research toolset. Dedicated Web
-	// create/edit lanes and A2A remain on their compatibility surfaces.
-	AgentFirstOwnerCanary bool `mapstructure:"agent_first_owner_canary"`
-	// AgentFirstCanaryUserID makes the owner canary an exact authenticated user
-	// rather than a process-wide switch. It is required when the canary is on.
-	AgentFirstCanaryUserID int64 `mapstructure:"agent_first_canary_user_id"`
-	// IntentToolkitsShadowEnabled computes the intent-routed first-request
-	// toolset without changing model-visible tools and records only aggregate
-	// old/new exposure differences. It is the default rollout stage.
-	IntentToolkitsShadowEnabled bool `mapstructure:"intent_toolkits_shadow_enabled"`
-	// IntentToolkitsOwnerCanary enables intent-routed tool exposure only for the
-	// production Feishu owner loop. A2A remains on the legacy exposure surface.
-	IntentToolkitsOwnerCanary bool `mapstructure:"intent_toolkits_owner_canary"`
-	// IntentToolkitsAllowAll enables intent-routed exposure for every locally
-	// assembled Agent loop. It is mutually exclusive with the owner canary.
-	IntentToolkitsAllowAll bool `mapstructure:"intent_toolkits_allow_all"`
 	// DefinitionEditEnabled exposes the single C2b3-2d Agent/controller path.
 	// It is false by default until the real-card Gate and receipt dispatcher
 	// are completed; false omits the tool and controller from Agent entirely.
@@ -477,11 +460,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.push_effect_recovery_canary_schedule_id", "")
 
 	v.SetDefault("agent.max_turns", 20)
-	v.SetDefault("agent.intent_toolkits_shadow_enabled", true)
-	v.SetDefault("agent.agent_first_owner_canary", false)
-	v.SetDefault("agent.agent_first_canary_user_id", int64(0))
-	v.SetDefault("agent.intent_toolkits_owner_canary", false)
-	v.SetDefault("agent.intent_toolkits_allow_all", false)
 	v.SetDefault("agent.definition_edit_enabled", false)
 	v.SetDefault("agent.session_ttl_minutes", 30)
 	v.SetDefault("agent.endpoint_daily_cap", 200)
@@ -1054,15 +1032,6 @@ func (c *Config) Validate() error {
 	if _, err := c.LLM.AgentClientConfig(); err != nil {
 		return err
 	}
-	if c.Agent.IntentToolkitsOwnerCanary &&
-		c.Agent.IntentToolkitsAllowAll {
-		return errors.New(
-			"config: agent intent toolkits owner canary 与 allow_all 不能同时启用",
-		)
-	}
-	if c.Agent.AgentFirstOwnerCanary && c.Agent.AgentFirstCanaryUserID <= 0 {
-		return errors.New("config: agent-first owner canary 必须指定精确 canary user_id")
-	}
 	if c.LLM.CompiledEndpointGeneration == 0 {
 		c.LLM.CompiledEndpointGeneration = 1
 	}
@@ -1084,8 +1053,7 @@ func (c *Config) Validate() error {
 	}
 	if c.Pipeline.ResearchV3RuntimeEnabled ||
 		c.Pipeline.ResearchV3ShadowCanaryScheduleID != "" ||
-		c.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" ||
-		c.Agent.AgentFirstOwnerCanary {
+		c.Pipeline.ResearchV3AuthorityCanaryScheduleID != "" {
 		if strings.TrimSpace(c.DB.ResearchRuntimeURL) == "" {
 			return errors.New("config: Research V3 runtime 要求 db.research_runtime_url")
 		}
