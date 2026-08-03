@@ -377,6 +377,51 @@ func TestPublicEvidenceSummaryIsStrictAndSourceBound(t *testing.T) {
 	}
 }
 
+func TestPublicEvidenceSummaryAcceptsAllBoundedObservationRefs(t *testing.T) {
+	state := &toolRunState{publicEvidence: make(map[string]publicEvidenceRecord)}
+	refs := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		ref := fmt.Sprintf("pe_observation_%02d", i)
+		refs = append(refs, ref)
+		state.publicEvidence[ref] = publicEvidenceRecord{Ref: ref, Digest: "digest"}
+	}
+	raw, err := json.Marshal(publicEvidenceSummaryV1{
+		Schema: publicEvidenceSummarySchema, AsOf: "2026-08-03T12:00:00Z",
+		Claims: []publicEvidenceClaimV1{{
+			Statement: "二十次历史观察共同支持状态未变化",
+			Status:    "supported", PublicEvidenceRefs: refs,
+		}},
+		Gaps: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodePublicEvidenceSummary(string(raw), state); err != nil {
+		t.Fatalf("bounded observation refs rejected: %v", err)
+	}
+
+	tooMany := make([]string, 0, maxPublicEvidenceRefsPerClaim+1)
+	for i := 0; i <= maxPublicEvidenceRefsPerClaim; i++ {
+		ref := fmt.Sprintf("pe_overflow_%02d", i)
+		tooMany = append(tooMany, ref)
+		state.publicEvidence[ref] = publicEvidenceRecord{Ref: ref, Digest: "digest"}
+	}
+	raw, err = json.Marshal(publicEvidenceSummaryV1{
+		Schema: publicEvidenceSummarySchema, AsOf: "2026-08-03T12:00:00Z",
+		Claims: []publicEvidenceClaimV1{{
+			Statement: "越界引用", Status: "supported",
+			PublicEvidenceRefs: tooMany,
+		}},
+		Gaps: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodePublicEvidenceSummary(string(raw), state); err == nil {
+		t.Fatal("summary accepted more refs than the per-turn evidence bound")
+	}
+}
+
 func TestHistoricalToolCallsSeparateExternalProvenanceAndRefsAreIdempotent(t *testing.T) {
 	makeResult := func() *store.IntelligenceQueryResult {
 		return &store.IntelligenceQueryResult{

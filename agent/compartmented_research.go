@@ -33,6 +33,7 @@ const (
 	maxPublicEvidenceClaims           = 24
 	maxPublicEvidenceGaps             = 16
 	maxPublicEvidenceTextBytes        = 8 << 10
+	maxPublicEvidenceRefsPerClaim     = maxPublicEvidenceCount
 )
 
 var toolCallProjectionRequiredColumns = []string{
@@ -53,6 +54,7 @@ const compartmentedPublicSummarySystemNote = `
 - 不得读取新的用户内部数据，不得创建、编辑、运行或删除任务，不得激活或持久化新工具。
 - 证据足够后只输出一个 JSON 对象，不要 Markdown、代码围栏、URL 或说明文字：
 {"schema":"vane.public-evidence-summary/v1","as_of":"RFC3339 时间或 unknown","claims":[{"statement":"公开证据直接支持的简短事实（不得含 URL）","status":"supported|contradicted|uncertain","public_evidence_refs":["逐字复制 bundle 中的 public_evidence_ref"]}],"gaps":["公开证据仍不能回答的缺口（不得含 URL）"]}
+- 每条 claim 最多引用 32 个 bundle ref；只引用直接支持该 claim 的 ref，不得重复。
 - supported/contradicted 必须引用至少一个 bundle ref；uncertain 可无 ref。不得编造、改写或拼接 ref，不得用训练记忆补齐。`
 
 const compartmentedPublicSummaryRetrySystemNote = `
@@ -140,6 +142,8 @@ type publicEvidenceBundleV1 struct {
 	UserRequest string                       `json:"user_request"`
 	Items       []publicEvidenceBundleItemV1 `json:"items"`
 }
+
+const replyCompartmentedEvidenceUngrounded = "已经读取相关历史或公开证据，但现有证据未能通过来源校验；我不会发送无法可靠对应证据的内容。"
 
 // intelligenceToolCallProjectionColumns makes per-row provenance mandatory.
 // A model cannot select model_visible_result while omitting trust_type and
@@ -801,7 +805,7 @@ func decodePublicEvidenceSummary(
 			len(externalFollowupURLs(claim.Statement)) > 0 ||
 			(claim.Status != "supported" && claim.Status != "contradicted" &&
 				claim.Status != "uncertain") || claim.PublicEvidenceRefs == nil ||
-			len(claim.PublicEvidenceRefs) > 12 ||
+			len(claim.PublicEvidenceRefs) > maxPublicEvidenceRefsPerClaim ||
 			(claim.Status != "uncertain" && len(claim.PublicEvidenceRefs) == 0) {
 			return publicEvidenceSummaryV1{}, errors.New("invalid public evidence claim")
 		}
@@ -873,7 +877,7 @@ func (l *Loop) finishCompartmentedResearch(
 		}
 		summary, err = decodePublicEvidenceSummary(resp.Content, state)
 		if err != nil {
-			return replyExternalFollowupUngrounded, extraTurns, nil
+			return replyCompartmentedEvidenceUngrounded, extraTurns, nil
 		}
 	}
 
@@ -904,7 +908,7 @@ func (l *Loop) finishCompartmentedResearch(
 	}
 	reply := rejectRetiredConfirmationClaim(resp.Content)
 	if len(externalFollowupURLs(reply)) > 0 {
-		return replyExternalFollowupUngrounded, extraTurns, nil
+		return replyCompartmentedEvidenceUngrounded, extraTurns, nil
 	}
 	reply = renderCompartmentedEvidenceLinks(reply, summary, state)
 	state.compartmentedResearch.visibleTurn = true

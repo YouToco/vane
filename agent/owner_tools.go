@@ -120,7 +120,10 @@ const queryMyIntelligenceSchema = `{
       "items": {
         "type": "object",
         "properties": {
-          "field": {"type":"string"},
+          "field": {
+            "type":"string",
+            "description":"目录字段名。相对时间通常使用：tasks.updated_at；runs.created_at 或 finalized_at；observations.created_at；briefs.generated_at；agent_turns.created_at；tool_calls.created_at；profile.updated_at。"
+          },
           "op": {"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","in","within"]},
           "value": {"description":"与字段类型匹配的 JSON 值；within 使用 today、yesterday 或 last_7_days"}
         },
@@ -144,7 +147,10 @@ const queryMyIntelligenceSchema = `{
       "items": {
         "type":"object",
         "properties": {
-          "field":{"type":"string"},
+          "field":{
+            "type":"string",
+            "description":"目录字段名；时间排序字段与 filters.field 的数据集映射相同。"
+          },
           "direction":{"type":"string","enum":["asc","desc"]}
         },
         "required":["field"], "additionalProperties":false
