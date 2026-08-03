@@ -32,7 +32,7 @@ func TestResearchTaskDefinitionEditV3ConvergesAfterEveryTemporalResponseLoss(
 
 	target, targetDigest := researchV3EditTargetDefinitionForTest(
 		t, base, `{"cron":"30 9 * * *","tz":"Asia/Shanghai"}`)
-	prepared, baseSnapshot, err := s.Scheduler.PrepareResearchTaskDefinitionEditV3(
+	prepared, baseSnapshot, err := s.Scheduler.PrepareResearchDefinitionEditV3(
 		t.Context(), "manage-tasks-edit-0001", base,
 		1, request.PreparedDigest, 2, target,
 	)
@@ -54,7 +54,7 @@ func TestResearchTaskDefinitionEditV3ConvergesAfterEveryTemporalResponseLoss(
 	}
 
 	fake.unpauseCommitErr = context.DeadlineExceeded
-	paused, err := s.Scheduler.PauseResearchTaskDefinitionEditV3(
+	paused, err := s.Scheduler.PauseResearchDefinitionEditV3(
 		t.Context(), prepared)
 	fake.unpauseCommitErr = nil
 	if err != nil || paused.Phase != "base_paused" || !paused.Paused ||
@@ -63,7 +63,7 @@ func TestResearchTaskDefinitionEditV3ConvergesAfterEveryTemporalResponseLoss(
 	}
 
 	fake.unpauseCommitErr = context.DeadlineExceeded
-	applied, err := s.Scheduler.ApplyResearchTaskDefinitionEditV3(
+	applied, err := s.Scheduler.ApplyResearchDefinitionEditV3(
 		t.Context(), prepared)
 	fake.unpauseCommitErr = nil
 	if err != nil || applied.Phase != "target_paused" || !applied.Paused ||
@@ -72,7 +72,7 @@ func TestResearchTaskDefinitionEditV3ConvergesAfterEveryTemporalResponseLoss(
 	}
 
 	fake.unpauseCommitErr = context.DeadlineExceeded
-	restored, err := s.Scheduler.RestoreResearchTaskDefinitionEditV3(
+	restored, err := s.Scheduler.RestoreResearchDefinitionEditV3(
 		t.Context(), prepared)
 	fake.unpauseCommitErr = nil
 	if err != nil || restored.Phase != "target_final" || restored.Paused ||
@@ -109,7 +109,7 @@ func TestPreparedResearchTaskDefinitionEditV3StrictWireRejectsAuthorizationDrift
 	}
 	target, _ := researchV3EditTargetDefinitionForTest(
 		t, base, `{"every_seconds":7200,"tz":"Asia/Shanghai"}`)
-	prepared, _, err := s.Scheduler.PrepareResearchTaskDefinitionEditV3(
+	prepared, _, err := s.Scheduler.PrepareResearchDefinitionEditV3(
 		t.Context(), "manage-tasks-edit-0002", base, 1, request.PreparedDigest,
 		2, target,
 	)
@@ -169,19 +169,19 @@ func TestResearchTaskDefinitionEditV3PreservesOriginallyPausedStateWithoutPauseR
 	}
 	firstTarget, _ := researchV3EditTargetDefinitionForTest(
 		t, base, `{"every_seconds":7200,"tz":"Asia/Shanghai"}`)
-	first, _, err := s.Scheduler.PrepareResearchTaskDefinitionEditV3(
+	first, _, err := s.Scheduler.PrepareResearchDefinitionEditV3(
 		t.Context(), "manage-tasks-edit-pause-base", base, 1,
 		request.PreparedDigest, 2, firstTarget)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Scheduler.PauseResearchTaskDefinitionEditV3(
+	if _, err := s.Scheduler.PauseResearchDefinitionEditV3(
 		t.Context(), first); err != nil {
 		t.Fatal(err)
 	}
 	secondTarget, _ := researchV3EditTargetDefinitionForTest(
 		t, base, `{"every_seconds":10800,"tz":"Asia/Shanghai"}`)
-	second, snapshot, err := s.Scheduler.PrepareResearchTaskDefinitionEditV3(
+	second, snapshot, err := s.Scheduler.PrepareResearchDefinitionEditV3(
 		t.Context(), "manage-tasks-edit-already-paused", base, 1,
 		request.PreparedDigest, 2, secondTarget)
 	if err != nil || second.OriginalState != ResearchTaskDefinitionEditOriginalPausedV3 ||
@@ -189,7 +189,7 @@ func TestResearchTaskDefinitionEditV3PreservesOriginallyPausedStateWithoutPauseR
 		t.Fatalf("prepare paused: prepared=%+v snapshot=%+v err=%v", second, snapshot, err)
 	}
 	before := fake.counts().unpause
-	paused, err := s.Scheduler.PauseResearchTaskDefinitionEditV3(
+	paused, err := s.Scheduler.PauseResearchDefinitionEditV3(
 		t.Context(), second)
 	after := fake.counts().unpause
 	if err != nil || !paused.Paused || after != before {

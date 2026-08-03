@@ -68,7 +68,7 @@ type ResearchTaskDefinitionEditSnapshotV3 struct {
 // exact native-creation checkpoint and the current formal V3 Schedule. The
 // caller supplies the next immutable definition identity; this method never
 // reads or compiles task semantics.
-func (s *Scheduler) PrepareResearchTaskDefinitionEditV3(
+func (s *Scheduler) PrepareResearchDefinitionEditV3(
 	ctx context.Context,
 	operationID string,
 	base PreparedResearchTaskScheduleV3,
@@ -298,6 +298,33 @@ func validatePreparedResearchTaskScheduleV3Pure(
 	return nil
 }
 
+func EncodePreparedResearchTaskScheduleV3(
+	prepared PreparedResearchTaskScheduleV3,
+) ([]byte, error) {
+	if err := validatePreparedResearchTaskScheduleV3Pure(prepared); err != nil {
+		return nil, err
+	}
+	return json.Marshal(prepared)
+}
+
+func DecodePreparedResearchTaskScheduleV3(
+	raw []byte,
+) (PreparedResearchTaskScheduleV3, error) {
+	var prepared PreparedResearchTaskScheduleV3
+	if len(raw) == 0 || len(raw) > 1<<20 ||
+		strictjson.DecodeExact(raw, &prepared) != nil {
+		return PreparedResearchTaskScheduleV3{},
+			errors.New("research V3 prepared Schedule is invalid")
+	}
+	canonical, err := json.Marshal(prepared)
+	if err != nil || !bytes.Equal(canonical, raw) ||
+		validatePreparedResearchTaskScheduleV3Pure(prepared) != nil {
+		return PreparedResearchTaskScheduleV3{},
+			errors.New("research V3 prepared Schedule is not canonical")
+	}
+	return prepared, nil
+}
+
 // EncodePreparedResearchTaskDefinitionEditV3 produces the immutable Store
 // checkpoint. Strict recovery rejects non-canonical bytes and any token drift.
 func EncodePreparedResearchTaskDefinitionEditV3(
@@ -341,10 +368,70 @@ func researchTaskDefinitionEditSnapshotV3(
 	}
 }
 
+func EncodeResearchTaskDefinitionEditSnapshotV3(
+	prepared PreparedResearchTaskDefinitionEditV3,
+	snapshot ResearchTaskDefinitionEditSnapshotV3,
+) ([]byte, error) {
+	if err := validateResearchTaskDefinitionEditSnapshotV3(prepared, snapshot); err != nil {
+		return nil, err
+	}
+	return json.Marshal(snapshot)
+}
+
+func DecodeResearchTaskDefinitionEditSnapshotV3(
+	raw []byte,
+	prepared PreparedResearchTaskDefinitionEditV3,
+) (ResearchTaskDefinitionEditSnapshotV3, error) {
+	var snapshot ResearchTaskDefinitionEditSnapshotV3
+	if len(raw) == 0 || len(raw) > 16<<10 ||
+		strictjson.DecodeExact(raw, &snapshot) != nil {
+		return ResearchTaskDefinitionEditSnapshotV3{},
+			errors.New("research V3 edit snapshot is invalid")
+	}
+	canonical, err := json.Marshal(snapshot)
+	if err != nil || !bytes.Equal(canonical, raw) ||
+		validateResearchTaskDefinitionEditSnapshotV3(prepared, snapshot) != nil {
+		return ResearchTaskDefinitionEditSnapshotV3{},
+			errors.New("research V3 edit snapshot is not canonical")
+	}
+	return snapshot, nil
+}
+
+func validateResearchTaskDefinitionEditSnapshotV3(
+	prepared PreparedResearchTaskDefinitionEditV3,
+	snapshot ResearchTaskDefinitionEditSnapshotV3,
+) error {
+	if validatePreparedResearchTaskDefinitionEditV3(prepared) != nil ||
+		snapshot.WireVersion != researchTaskDefinitionEditSnapshotV3WireVersion ||
+		snapshot.TaskID != prepared.Base.Schedule.TaskID || snapshot.Revision == "" {
+		return errors.New("research V3 edit snapshot identity is invalid")
+	}
+	var digest string
+	var paused bool
+	switch snapshot.Phase {
+	case "base_original":
+		digest = prepared.BaseDefinitionDigest
+		paused = prepared.OriginalState == ResearchTaskDefinitionEditOriginalPausedV3
+	case "base_paused":
+		digest, paused = prepared.BaseDefinitionDigest, true
+	case "target_paused":
+		digest, paused = prepared.TargetDefinitionDigest, true
+	case "target_final":
+		digest = prepared.TargetDefinitionDigest
+		paused = prepared.OriginalState == ResearchTaskDefinitionEditOriginalPausedV3
+	default:
+		return errors.New("research V3 edit snapshot phase is invalid")
+	}
+	if snapshot.DefinitionDigest != digest || snapshot.Paused != paused {
+		return errors.New("research V3 edit snapshot representation differs")
+	}
+	return nil
+}
+
 // PauseResearchTaskDefinitionEditV3 moves an originally-active schedule to
 // the exact base-paused representation. An originally-paused schedule is only
 // re-described; no RPC is needed.
-func (s *Scheduler) PauseResearchTaskDefinitionEditV3(
+func (s *Scheduler) PauseResearchDefinitionEditV3(
 	ctx context.Context,
 	prepared PreparedResearchTaskDefinitionEditV3,
 ) (ResearchTaskDefinitionEditSnapshotV3, error) {
@@ -353,7 +440,7 @@ func (s *Scheduler) PauseResearchTaskDefinitionEditV3(
 
 // ApplyResearchTaskDefinitionEditV3 swaps base-paused to target-paused. It is
 // safe to retry after UpdateSchedule response loss.
-func (s *Scheduler) ApplyResearchTaskDefinitionEditV3(
+func (s *Scheduler) ApplyResearchDefinitionEditV3(
 	ctx context.Context,
 	prepared PreparedResearchTaskDefinitionEditV3,
 ) (ResearchTaskDefinitionEditSnapshotV3, error) {
@@ -362,7 +449,7 @@ func (s *Scheduler) ApplyResearchTaskDefinitionEditV3(
 
 // RestoreResearchTaskDefinitionEditV3 restores the original active/paused
 // state using the exact target definition representation.
-func (s *Scheduler) RestoreResearchTaskDefinitionEditV3(
+func (s *Scheduler) RestoreResearchDefinitionEditV3(
 	ctx context.Context,
 	prepared PreparedResearchTaskDefinitionEditV3,
 ) (ResearchTaskDefinitionEditSnapshotV3, error) {
