@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -63,6 +64,9 @@ type DBConfig struct {
 	// ResearchRuntimeURL 是 V3 情报运行专用的非 owner LOGIN 连接串。
 	// 留空时旧运行路径保持可用，但所有 V3 Store 入口 fail-closed。
 	ResearchRuntimeURL string `mapstructure:"research_runtime_url"`
+	// NativeV3EditRecoveryRuntimeURL is the independently authenticated,
+	// non-user-facing login used only for atomic stale edit claims.
+	NativeV3EditRecoveryRuntimeURL string `mapstructure:"native_v3_edit_recovery_runtime_url"`
 	// ResearchControlURL is the independently authenticated vane_server_runtime
 	// connection used by the V3 control plane. It must never be the schema-owner
 	// URL or the paid executor URL.
@@ -301,6 +305,7 @@ type A2AConfig struct {
 var sensitiveKeys = []string{
 	"db.url",
 	"db.research_runtime_url",
+	"db.native_v3_edit_recovery_runtime_url",
 	"db.research_control_url",
 	"db.research_capability_key_id",
 	"db.research_capability_key_hex",
@@ -312,6 +317,8 @@ var sensitiveKeys = []string{
 	"dashboard.password",
 	"a2a.token",
 }
+
+const nativeV3EditRecoveryDBCredential = "native_v3_edit_recovery_db_url"
 
 // Load 加载配置并校验。
 //
@@ -345,10 +352,36 @@ func Load(path string) (*Config, error) {
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("config: 解析配置失败: %w", err)
 	}
+	if strings.TrimSpace(cfg.DB.NativeV3EditRecoveryRuntimeURL) == "" {
+		credential, err := loadOptionalSystemdCredential(nativeV3EditRecoveryDBCredential)
+		if err != nil {
+			return nil, err
+		}
+		cfg.DB.NativeV3EditRecoveryRuntimeURL = credential
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func loadOptionalSystemdCredential(name string) (string, error) {
+	directory := strings.TrimSpace(os.Getenv("CREDENTIALS_DIRECTORY"))
+	if directory == "" {
+		return "", nil
+	}
+	payload, err := os.ReadFile(filepath.Join(directory, name))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("config: read %s systemd credential", name)
+	}
+	value := strings.TrimSpace(string(payload))
+	if value == "" {
+		return "", fmt.Errorf("config: %s systemd credential is empty", name)
+	}
+	return value, nil
 }
 
 // setDefaults 注册与 config.example.yaml 一致的非敏感默认值。
@@ -1049,6 +1082,9 @@ func (c *Config) Validate() error {
 		c.Agent.AgentFirstOwnerCanary {
 		if strings.TrimSpace(c.DB.ResearchRuntimeURL) == "" {
 			return errors.New("config: Research V3 runtime 要求 db.research_runtime_url")
+		}
+		if strings.TrimSpace(c.DB.NativeV3EditRecoveryRuntimeURL) == "" {
+			return errors.New("config: Research V3 runtime 要求 db.native_v3_edit_recovery_runtime_url")
 		}
 		if strings.TrimSpace(c.DB.ResearchControlURL) == "" {
 			return errors.New("config: Research V3 runtime 要求 db.research_control_url")

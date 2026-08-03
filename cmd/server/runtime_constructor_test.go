@@ -31,8 +31,9 @@ func TestResearchV3UsesIndependentRestrictedControlStore(t *testing.T) {
 	}
 	source := string(payload)
 	for _, required := range []string{
-		"store.NewServerRuntimeWithResearchRuntimeCapability(",
+		"store.NewServerRuntimeWithResearchRuntimeCapabilityAndEditRecovery(",
 		"ctx, cfg.DB.ResearchControlURL, cfg.DB.ResearchRuntimeURL,",
+		"cfg.DB.NativeV3EditRecoveryRuntimeURL,",
 		"researchControlStore, gatewayClient, researchExecutor,",
 		"researchControlStore.LoadResearchQuotaRuleV3(",
 		"ResearchModel:              cfg.LLM.ResearchModel,",

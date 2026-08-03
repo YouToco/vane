@@ -1669,6 +1669,7 @@ func TestValidateCompiledRouteGenerations(t *testing.T) {
 func TestResearchRuntimeURLFromEnvironment(t *testing.T) {
 	t.Setenv("VANE_DB_URL", "postgres://owner")
 	t.Setenv("VANE_DB_RESEARCH_RUNTIME_URL", "postgres://vane_research_runtime:secret@db/vane")
+	t.Setenv("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL", "postgres://vane_native_v3_edit_recovery_runtime:secret@db/vane")
 	t.Setenv("VANE_DB_RESEARCH_CONTROL_URL", "postgres://vane_server_runtime:secret@db/vane")
 	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_ID", "research-cap-2026-08")
 	t.Setenv("VANE_DB_RESEARCH_CAPABILITY_KEY_HEX", strings.Repeat("42", 32))
@@ -1684,9 +1685,36 @@ func TestResearchRuntimeURLFromEnvironment(t *testing.T) {
 		"postgres://vane_server_runtime:secret@db/vane"; got != want {
 		t.Fatalf("db.research_control_url=%q, want %q", got, want)
 	}
+	if got, want := cfg.DB.NativeV3EditRecoveryRuntimeURL,
+		"postgres://vane_native_v3_edit_recovery_runtime:secret@db/vane"; got != want {
+		t.Fatalf("db.native_v3_edit_recovery_runtime_url=%q, want %q", got, want)
+	}
 	if cfg.DB.ResearchCapabilityKeyID != "research-cap-2026-08" ||
 		cfg.DB.ResearchCapabilityKeyHex != strings.Repeat("42", 32) {
 		t.Fatal("research capability key was not loaded from environment")
+	}
+}
+
+func TestNativeV3EditRecoveryURLFromSystemdCredential(t *testing.T) {
+	clearVaneEnv(t)
+	directory := t.TempDir()
+	credential := "postgres://vane_native_v3_edit_recovery_runtime:secret@db/vane"
+	if err := os.WriteFile(filepath.Join(directory, nativeV3EditRecoveryDBCredential),
+		[]byte(credential+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", directory)
+	t.Setenv("VANE_DB_URL", "postgres://runtime")
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DB.NativeV3EditRecoveryRuntimeURL != credential {
+		t.Fatalf("recovery credential URL=%q", cfg.DB.NativeV3EditRecoveryRuntimeURL)
 	}
 }
 
@@ -1725,6 +1753,7 @@ func TestResearchGatewaySocketRejectsRelativeOrUncleanPath(t *testing.T) {
 func TestResearchRuntimeRequiresCapabilityKey(t *testing.T) {
 	cfg := Config{DB: DBConfig{
 		URL: "postgres://owner", ResearchRuntimeURL: "postgres://runtime",
+		NativeV3EditRecoveryRuntimeURL: "postgres://edit-recovery",
 	}}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "capability") {
 		t.Fatalf("missing research capability key returned %v", err)
@@ -1740,8 +1769,9 @@ func TestResearchV3CanaryRequiresIndependentControlURL(t *testing.T) {
 	cfg := Config{
 		DB: DBConfig{
 			URL: "postgres://owner", ResearchRuntimeURL: "postgres://research",
-			ResearchCapabilityKeyID:  "active",
-			ResearchCapabilityKeyHex: strings.Repeat("ab", 32),
+			NativeV3EditRecoveryRuntimeURL: "postgres://edit-recovery",
+			ResearchCapabilityKeyID:        "active",
+			ResearchCapabilityKeyHex:       strings.Repeat("ab", 32),
 		},
 		Fetch:    FetchConfig{ExaAPIKey: "exa"},
 		Pipeline: PipelineConfig{ResearchV3ShadowCanaryScheduleID: "kimi-v5"},

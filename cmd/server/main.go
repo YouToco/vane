@@ -124,8 +124,9 @@ func run() error {
 	var researchRuntimeOption workflow.ActivitiesOption
 	var researchDeliveryOption workflow.ActivitiesOption
 	if shouldInitializeResearchV3Runtime(cfg) {
-		researchControlStore, err = store.NewServerRuntimeWithResearchRuntimeCapability(
+		researchControlStore, err = store.NewServerRuntimeWithResearchRuntimeCapabilityAndEditRecovery(
 			ctx, cfg.DB.ResearchControlURL, cfg.DB.ResearchRuntimeURL,
+			cfg.DB.NativeV3EditRecoveryRuntimeURL,
 			store.ResearchRunCapabilityConfigV1{
 				ActiveKeyID:  cfg.DB.ResearchCapabilityKeyID,
 				ActiveKeyHex: cfg.DB.ResearchCapabilityKeyHex,

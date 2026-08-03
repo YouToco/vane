@@ -870,72 +870,53 @@ func (s *Store) BlockResearchTaskDefinitionEditOperationV3(
 	return nil
 }
 
-func (s *Store) ListStaleResearchTaskDefinitionEditTenantIDsV3(
-	ctx context.Context, before time.Time, afterTenantID int64, limit int,
-) ([]int64, error) {
-	if before.IsZero() || afterTenantID < 0 || limit <= 0 || limit > 1000 {
-		return nil, taskDefinitionEditValidation("native V3 stale tenant query is invalid")
+func (s *Store) ClaimStaleResearchTaskDefinitionEditOperationV3(
+	ctx context.Context, before time.Time, leaseOwner string, leaseDuration time.Duration,
+) (*types.TaskDefinitionEditOperation, error) {
+	if before.IsZero() || !validTaskDefinitionEditReference(leaseOwner, 255) ||
+		leaseDuration <= 0 || leaseDuration > maxTaskDefinitionEditLease ||
+		leaseDuration.Microseconds() <= 0 {
+		return nil, taskDefinitionEditValidation("native V3 recovery claim is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if s == nil || s.beginEditRecoveryTx == nil {
+		return nil, errNativeV3EditRecoveryRuntimeUnavailable
+	}
+	tx, err := s.beginEditRecoveryTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return nil, taskDefinitionEditDatabaseError("begin native V3 stale tenant scan", err)
+		if errors.Is(err, errNativeV3EditRecoveryRuntimeUnavailable) {
+			return nil, errNativeV3EditRecoveryRuntimeUnavailable
+		}
+		return nil, taskDefinitionEditDatabaseError("begin native V3 recovery claim", err)
 	}
 	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	rows, err := tx.Query(ctx, `
-		SELECT * FROM list_stale_native_research_v3_edit_tenants_v1($1,$2,$3)`,
-		before, afterTenantID, limit)
-	if err != nil {
-		return nil, taskDefinitionEditDatabaseError("list native V3 stale tenants", err)
-	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, taskDefinitionEditDatabaseError("scan native V3 stale tenant", err)
+	var operationID, taskID, claimedOwner string
+	var tenantID, userID, fence int64
+	err = tx.QueryRow(ctx, `SELECT * FROM
+		claim_stale_native_research_v3_edit_v1($1,$2,$3)`, before,
+		leaseOwner, leaseDuration.Microseconds()).Scan(
+		&operationID, &tenantID, &userID, &taskID, &claimedOwner, &fence)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return nil, taskDefinitionEditDatabaseError("commit empty native V3 recovery claim", commitErr)
 		}
-		ids = append(ids, id)
+		return nil, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, taskDefinitionEditDatabaseError("iterate native V3 stale tenants", err)
+	if err != nil {
+		return nil, taskDefinitionEditDatabaseError("claim stale native V3 edit", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, taskDefinitionEditDatabaseError("commit native V3 stale tenant scan", err)
+		return nil, taskDefinitionEditDatabaseError("commit native V3 recovery claim", err)
 	}
-	return ids, nil
-}
-
-func (s *Store) ListStaleResearchTaskDefinitionEditOperationsV3(
-	ctx context.Context, tenantID int64, before time.Time, limit int,
-) ([]types.TaskDefinitionEditOperation, error) {
-	if tenantID <= 0 || before.IsZero() || limit <= 0 || limit > 1000 {
-		return nil, taskDefinitionEditValidation("native V3 stale operation query is invalid")
-	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	operation, err := s.loadResearchTaskDefinitionEditOperationV3(ctx,
+		types.TaskDefinitionEditScope{ID: operationID, TenantID: tenantID,
+			UserID: userID, TargetTenantID: tenantID, TargetUserID: userID,
+			TaskID: taskID})
 	if err != nil {
-		return nil, taskDefinitionEditDatabaseError("begin native V3 stale operation scan", err)
+		return nil, err
 	}
-	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	rows, err := tx.Query(ctx, `SELECT `+taskDefinitionEditOperationColumns+`
-		 FROM list_stale_native_research_v3_edit_operations_v1($1,$2,$3)`,
-		tenantID, before, limit)
-	if err != nil {
-		return nil, taskDefinitionEditDatabaseError("list native V3 stale operations", err)
+	if operation.Status != types.TaskDefinitionEditOperationStatusExecuting ||
+		operation.LeaseOwner != claimedOwner || operation.Fence != fence {
+		return nil, taskDefinitionEditIntegrity()
 	}
-	defer rows.Close()
-	operations := make([]types.TaskDefinitionEditOperation, 0)
-	for rows.Next() {
-		var op types.TaskDefinitionEditOperation
-		if err := scanTaskDefinitionEditOperation(rows, &op); err != nil {
-			return nil, taskDefinitionEditDatabaseError("scan native V3 stale operation", err)
-		}
-		operations = append(operations, *cloneTaskDefinitionEditOperation(&op))
-	}
-	if err := rows.Err(); err != nil {
-		return nil, taskDefinitionEditDatabaseError("iterate native V3 stale operations", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, taskDefinitionEditDatabaseError("commit native V3 stale operation scan", err)
-	}
-	return operations, nil
+	return operation, nil
 }
