@@ -1340,7 +1340,21 @@ func (l *Loop) converse(
 			// 只把 taint 后含工具协议的出站视图投影为纯 user 数据消息。
 			// 继续研究时也使用同一投影，确保第二个公开查询永远看不到
 			// 画像或此前会话，只看到当前 owner request 与公开结果。
-			requestMessages = untrustedContinuationMessages(msgs)
+			if state.compartmentedResearch != nil {
+				var bundleErr error
+				requestMessages, bundleErr = publicEvidenceBundleMessages(state)
+				if bundleErr != nil {
+					reply := replyExternalFollowupUngrounded
+					state.compartmentedResearch.visibleTurn = true
+					msgs = []llm.ChatMessage{
+						{Role: "user", Content: state.ownerRequest},
+						{Role: "assistant", Content: reply},
+					}
+					return Outcome{Reply: reply}, msgs, turns, nil
+				}
+			} else {
+				requestMessages = untrustedContinuationMessages(msgs)
+			}
 		}
 		system := l.sys
 		if state.agentFirstEnabled {
@@ -1564,7 +1578,7 @@ func (l *Loop) converse(
 			}
 			if state.compartmentedResearch != nil && state.untrustedExternalResult {
 				reply, extraTurns, finishErr := l.finishCompartmentedResearch(
-					ctx, state, msgs, resp.Content,
+					ctx, state, resp.Content,
 					turns+state.contextStepOffset+1,
 				)
 				turns += extraTurns
@@ -2076,12 +2090,12 @@ func isSafeAfterUntrusted(spec ToolSpec) bool {
 		effects.Has(EffectStateWrite) ||
 		effects.Has(EffectDelivery) ||
 		effects.Has(EffectDurableProposal) ||
-		effects.Has(EffectDirectOwnerWrite) {
+		effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite) {
 		return false
 	}
 	return effects.Has(EffectLocalHandleRead) ||
-		effects.Has(EffectNetworkRead) ||
-		effects.Has(EffectActivationWrite)
+		effects.Has(EffectNetworkRead)
 }
 
 func canDeclareAfterUntrusted(state *toolRunState, spec ToolSpec) bool {
@@ -3798,7 +3812,7 @@ func (l *Loop) captureExactToolEvidence(
 	if spec.Policy.ResultTrust == ResultTrustExternal {
 		trust = "external"
 	}
-	state.toolEvidence = append(state.toolEvidence, store.AgentToolEvidenceV1{
+	evidence := store.AgentToolEvidenceV1{
 		InvocationID: invocationID,
 		ToolCall:     *rec,
 		ToolName:     spec.Name(),
@@ -3806,7 +3820,11 @@ func (l *Loop) captureExactToolEvidence(
 		Result:       append([]byte(nil), result...),
 		OriginalSize: rec.ResultSize,
 		TrustType:    trust,
-	})
+	}
+	if err := rememberCurrentPublicEvidence(ctx, state, spec, evidence); err != nil {
+		return false
+	}
+	state.toolEvidence = append(state.toolEvidence, evidence)
 	return true
 }
 

@@ -74,15 +74,25 @@ Agent-first 同一轮需要比较历史与当前网页时，必须先完成
 `query_my_intelligence`，并在首个公开读取执行前冻结模型实际看到的 exact
 内部证据、认证 scope 与集合摘要。公开正文进入后，内部查询和全部写工具继续由
 Harness 确定性关闭；外部正文只能在隔离上下文中继续公开研究，不能改写已经冻结的
-内部查询。
+内部查询。`EffectActivationWrite` 同样关闭：动态端点只能在首个外部结果前完成发现，
+不能由外部正文触发新的持久化 activation。
+
+`tool_calls` 数据集必须逐行携带 `trust_type` provenance。`local` 行可以留在受信主
+Agent；`external`、未知或缺失 provenance 的 `model_visible_result` 在工具返回前移出，
+只留下受信元数据与 tenant/user/trace/invocation/arguments/result/coverage 共同派生的
+不可变 `public_evidence_ref`。历史记录、当前网页、动态 API、社媒及
+`read_endpoint_result` 统一使用这一引用；URL 只是由已知 Tool 参数或结构化结果产生的
+可选展示元数据，不参与证据身份。
 
 公开研究结束后，模型先在隔离上下文输出严格的
 `vane.public-evidence-summary/v1`。摘要只接受固定字段、受限长度与结构化工具结果中
-真实存在的 URL；Markdown 包装、未知字段、伪造 URL 或无效 `as_of` 均拒绝。最终综合
+真实存在的 `public_evidence_ref`；Markdown 包装、未知字段、伪造 ref、正文 URL 或无效
+`as_of` 均拒绝。最终综合
 请求固定 `Tools:nil`，只包含当前用户原话、冻结的内部 exact evidence 与公开摘要。
 原始网页正文和原生 Tool 协议不得进入最终综合请求或 `agent_sessions` 后续历史；完整
 模型可见工具结果仍按 `AgentToolEvidenceV1` 独立留存。最终 turn 在返回前继续原子封存
-内部与公开工具证据，且不得向用户暴露内部引用或证据摘要。
+内部与公开工具证据，且不得向用户暴露内部引用或证据摘要。最终模型不得自由输出 URL；
+Harness 只根据摘要已采纳 ref 的可选规范化展示 URL 渲染链接。
 
 ## 8. V3 运行权限与付费调用回执
 

@@ -106,11 +106,17 @@ type toolRunState struct {
 	// in the isolated continuation only; the final no-tool synthesis receives
 	// this frozen evidence plus a strict public summary.
 	compartmentedResearch *compartmentedResearchState
-	deferEvidenceCommit   bool
-	loopBreakReason       string
-	clarificationCount    int
-	candidateSearches     int
-	candidateHits         int
+	// publicEvidence is a per-turn, immutable sidecar. Historical external
+	// tool rows are projected to opaque refs before the main Agent sees them;
+	// current external invocations use the same ref format. Raw bytes are only
+	// materialized by the compartmented public-evidence stage.
+	publicEvidence      map[string]publicEvidenceRecord
+	publicEvidenceOrder []string
+	deferEvidenceCommit bool
+	loopBreakReason     string
+	clarificationCount  int
+	candidateSearches   int
+	candidateHits       int
 	// sideEffectConstrainedTurn is set for every semantically routed task
 	// action except a uniquely bound definition edit. Only the side-effecting
 	// tool named by allowedSideEffectTool may survive; one-off research instead
