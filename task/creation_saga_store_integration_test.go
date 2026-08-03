@@ -26,6 +26,18 @@ type completeResponseLossStore struct {
 	completeCalls int
 }
 
+type completeResearchV3ResponseLossStore struct {
+	*store.Store
+	cancel        context.CancelFunc
+	completeCalls int
+}
+
+type createResearchV3ResponseLossStore struct {
+	*store.Store
+	cancel      context.CancelFunc
+	createCalls int
+}
+
 type postgresReceiptSessionRecorder struct{ store *store.Store }
 
 func (r postgresReceiptSessionRecorder) RecordCreationReceiptSession(
@@ -50,6 +62,33 @@ func (s *completeResponseLossStore) CompleteTaskCreationOperation(
 	}
 	s.cancel()
 	return errors.New("complete committed but response was lost")
+}
+
+func (s *completeResearchV3ResponseLossStore) CompleteResearchTaskCreationOperationV3(
+	ctx context.Context,
+	lease types.TaskCreationLease,
+	taskID string,
+	result json.RawMessage,
+) error {
+	s.completeCalls++
+	if err := s.Store.CompleteResearchTaskCreationOperationV3(
+		ctx, lease, taskID, result); err != nil {
+		return err
+	}
+	s.cancel()
+	return errors.New("native V3 complete committed but response was lost")
+}
+
+func (s *createResearchV3ResponseLossStore) CreateResearchTaskCreationOperationV3(
+	ctx context.Context,
+	params types.CreateResearchTaskCreationOperationV3Params,
+) (*types.TaskCreationOperation, error) {
+	s.createCalls++
+	if _, err := s.Store.CreateResearchTaskCreationOperationV3(ctx, params); err != nil {
+		return nil, err
+	}
+	s.cancel()
+	return nil, errors.New("native V3 create committed but response was lost")
 }
 
 // TestCreationCoordinator_PostgreSQLRoundTrip exercises the complete A5 saga
@@ -202,6 +241,189 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			t.Fatalf("replayed=%+v complete_calls=%d", replayed, responseLoss.completeCalls)
 		}
 	})
+}
+
+func TestCreationCoordinator_NativeV3PostgreSQLTemporalLifecycle(t *testing.T) {
+	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	schedules := &creationSagaFakeScheduler{}
+	coordinator := NewCreationCoordinator(st, schedules, nil,
+		WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+	input := testResearchV3CreationInput()
+	input.ActionID = "native-v3-postgres-" + uuid.NewString()
+	input.UserID = userID
+	input.SpecJSON = json.RawMessage(`{"tz":"Asia/Shanghai","every_seconds":3600}`)
+	if _, err := coordinator.PrepareResearchV3(t.Context(), input); err != nil {
+		t.Fatalf("PrepareResearchV3: %v", err)
+	}
+	result, err := coordinator.ExecuteResearchV3(
+		t.Context(), userID, input.ActionID, testCreationReceiptTarget)
+	if err != nil {
+		t.Fatalf("ExecuteResearchV3: %v", err)
+	}
+	if result.Status != types.TaskOperationStatusExecuted || result.TaskID == "" ||
+		result.Recovering || result.Replayed {
+		t.Fatalf("native V3 result=%+v events=%v", result, schedules.events)
+	}
+	op, err := st.LoadResearchTaskCreationOperationV3(
+		t.Context(), input.ActionID, tenantID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.ExecutionVersion != types.TaskCreationExecutionVersionV2 ||
+		op.ToolName != "manage_tasks" || op.Status != types.TaskOperationStatusExecuted ||
+		op.Phase != types.TaskCreationPhaseCompleted || op.TombstonedAt == nil {
+		t.Fatalf("native V3 terminal operation=%+v", op)
+	}
+	schedule, err := st.GetSchedule(t.Context(), result.TaskID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.TenantID != tenantID || schedule.Status != types.ScheduleStatusActive ||
+		schedule.ExecutionMode != types.ExecutionModeDiscoverAtRun {
+		t.Fatalf("native V3 schedule=%+v", schedule)
+	}
+	if _, err := st.LoadTaskCreationReceiptByOperation(
+		t.Context(), input.ActionID, tenantID, userID); err != nil {
+		t.Fatalf("native V3 terminal receipt: %v", err)
+	}
+	eventCount := len(schedules.events)
+	replayed, err := coordinator.ExecuteResearchV3(
+		t.Context(), userID, input.ActionID, testCreationReceiptTarget)
+	if err != nil || !replayed.Replayed || replayed.TaskID != result.TaskID {
+		t.Fatalf("native V3 terminal replay=%+v err=%v", replayed, err)
+	}
+	if len(schedules.events) != eventCount {
+		t.Fatalf("native V3 replay touched Temporal: before=%d after=%d", eventCount, len(schedules.events))
+	}
+}
+
+func TestCreationCoordinator_NativeV3PostgreSQLCreateResponseLoss(t *testing.T) {
+	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	responseLoss := &createResearchV3ResponseLossStore{Store: st, cancel: cancel}
+	coordinator := NewCreationCoordinator(responseLoss, &creationSagaFakeScheduler{}, nil,
+		WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+	input := testResearchV3CreationInput()
+	input.ActionID = "native-v3-create-loss-" + uuid.NewString()
+	input.UserID = userID
+	input.SpecJSON = json.RawMessage(`{"tz":"Asia/Shanghai","every_seconds":3600}`)
+	proposal, err := coordinator.PrepareResearchV3(ctx, input)
+	if err != nil {
+		t.Fatalf("PrepareResearchV3 should adopt committed operation: %v", err)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) || responseLoss.createCalls != 1 ||
+		proposal.ID != input.ActionID || proposal.Summary != input.TaskName {
+		t.Fatalf("proposal=%+v create_calls=%d ctx=%v",
+			proposal, responseLoss.createCalls, ctx.Err())
+	}
+	op, err := st.LoadResearchTaskCreationOperationV3(
+		t.Context(), input.ActionID, tenantID, userID)
+	if err != nil || op.Status != types.TaskOperationStatusPending ||
+		op.ExecutionVersion != types.TaskCreationExecutionVersionV2 {
+		t.Fatalf("adopted operation=%+v err=%v", op, err)
+	}
+}
+
+func TestCreationCoordinator_NativeV3PostgreSQLCompleteResponseLoss(t *testing.T) {
+	st, _, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	responseLoss := &completeResearchV3ResponseLossStore{Store: st, cancel: cancel}
+	schedules := &creationSagaFakeScheduler{}
+	coordinator := NewCreationCoordinator(responseLoss, schedules, nil,
+		WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+	input := testResearchV3CreationInput()
+	input.ActionID = "native-v3-complete-loss-" + uuid.NewString()
+	input.UserID = userID
+	input.SpecJSON = json.RawMessage(`{"tz":"Asia/Shanghai","every_seconds":3600}`)
+	if _, err := coordinator.PrepareResearchV3(ctx, input); err != nil {
+		t.Fatalf("PrepareResearchV3: %v", err)
+	}
+	result, err := coordinator.ExecuteResearchV3(
+		ctx, userID, input.ActionID, testCreationReceiptTarget)
+	if err != nil {
+		t.Fatalf("ExecuteResearchV3 should adopt committed terminal row: %v", err)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) || responseLoss.completeCalls != 1 ||
+		result.Status != types.TaskOperationStatusExecuted || result.TaskID == "" ||
+		result.Recovering || result.Replayed {
+		t.Fatalf("native V3 result=%+v complete_calls=%d ctx=%v",
+			result, responseLoss.completeCalls, ctx.Err())
+	}
+	replayed, err := coordinator.ExecuteResearchV3(
+		t.Context(), userID, input.ActionID, testCreationReceiptTarget)
+	if err != nil || !replayed.Replayed || replayed.TaskID != result.TaskID ||
+		responseLoss.completeCalls != 1 {
+		t.Fatalf("native V3 replay=%+v complete_calls=%d err=%v",
+			replayed, responseLoss.completeCalls, err)
+	}
+}
+
+func TestCreationCoordinator_NativeV3PostgreSQLStaleRecoveryExecutesLifecycle(t *testing.T) {
+	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	schedules := &creationSagaFakeScheduler{}
+	coordinator := NewCreationCoordinator(st, schedules, nil,
+		WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+	input := testResearchV3CreationInput()
+	input.ActionID = "native-v3-stale-recovery-" + uuid.NewString()
+	input.UserID = userID
+	input.SpecJSON = json.RawMessage(`{"tz":"Asia/Shanghai","every_seconds":3600}`)
+	if _, err := coordinator.PrepareResearchV3(t.Context(), input); err != nil {
+		t.Fatalf("PrepareResearchV3: %v", err)
+	}
+	if _, err := st.AcquireResearchTaskCreationOperationV3(t.Context(),
+		types.AcquireTaskCreationOperationParams{
+			ID: input.ActionID, TenantID: tenantID, UserID: userID,
+			LeaseOwner: "crashed-native-v3-worker", LeaseDuration: time.Minute,
+			ReceiptProvider: testCreationReceiptTarget.Provider,
+			ReceiptTarget:   testCreationReceiptTarget.Target,
+		}); err != nil {
+		t.Fatalf("acquire crashed native V3 operation: %v", err)
+	}
+	dbURL := os.Getenv("VANE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("DATABASE_URL")
+	}
+	conn, err := pgx.Connect(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(t.Context(), `
+		UPDATE task_creation_operations
+		   SET lease_until=clock_timestamp()-interval '2 hours',
+		       takeover_not_before=clock_timestamp()-interval '1 hour'
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		   AND tool_name='manage_tasks' AND execution_version=2`,
+		input.ActionID, tenantID, userID); err != nil {
+		_ = conn.Close(t.Context())
+		t.Fatal(err)
+	}
+	if err := conn.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.RecoverStaleOnce(t.Context()); err != nil {
+		t.Fatalf("RecoverStaleOnce native V3: %v", err)
+	}
+	op, err := st.LoadResearchTaskCreationOperationV3(
+		t.Context(), input.ActionID, tenantID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Status != types.TaskOperationStatusExecuted ||
+		op.Phase != types.TaskCreationPhaseCompleted || op.TaskID == "" ||
+		op.TombstonedAt == nil {
+		t.Fatalf("native V3 stale recovery did not converge: %+v events=%v", op, schedules.events)
+	}
+	for _, want := range []string{"prepare_v3", "ensure", "activate"} {
+		found := false
+		for _, event := range schedules.events {
+			found = found || event == want
+		}
+		if !found {
+			t.Fatalf("native V3 stale recovery missing %q: %v", want, schedules.events)
+		}
+	}
 }
 
 func newCreationCoordinatorPostgreSQLFixture(

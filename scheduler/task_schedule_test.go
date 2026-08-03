@@ -35,6 +35,7 @@ import (
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -1240,6 +1241,129 @@ func validTaskScheduleRequest() TaskScheduleRequest {
 		Scope:          workflow.PushScope{SourceIDs: []int64{11, 22}, TopN: 3},
 		NLDescription:  "每日 AI 情报",
 		PreparedDigest: strings.Repeat("a", 64),
+	}
+}
+
+func TestPrepareResearchTaskScheduleV3FreezesFormalActionAndRecovery(t *testing.T) {
+	s := newTaskScheduleTestScheduler(newTaskScheduleFakeClient())
+	req := validTaskScheduleRequest()
+	prepared, err := s.Scheduler.PrepareResearchTaskScheduleV3(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.WireVersion != preparedResearchTaskScheduleV3WireVersion ||
+		prepared.Schedule.Action.WorkflowType != taskScheduleV1WorkflowType ||
+		!workflow.IsResearchRuntimeV3(prepared.Schedule.Action.Params.RuntimeVersion) {
+		t.Fatalf("formal V3 prepared Action=%+v", prepared.Schedule.Action)
+	}
+	token := prepared.Input.ActionAuthorizationToken
+	authorizationSum := sha256.Sum256([]byte(token))
+	if prepared.ActionAuthorizationDigest != fmt.Sprintf("%x", authorizationSum) {
+		t.Fatal("formal V3 authorization digest differs")
+	}
+	targetSum := sha256.Sum256(prepared.TargetAction)
+	if prepared.TargetActionDigest != fmt.Sprintf("%x", targetSum) {
+		t.Fatal("formal V3 target Action digest differs")
+	}
+	var target schedulepb.ScheduleAction
+	if err := proto.Unmarshal(prepared.TargetAction, &target); err != nil {
+		t.Fatal(err)
+	}
+	start := target.GetStartWorkflow()
+	if start.GetWorkflowType().GetName() != workflow.ResearchScheduledWorkflowV3Name ||
+		len(start.GetInput().GetPayloads()) != 1 {
+		t.Fatalf("target Action is not formal V3: %+v", start)
+	}
+	var input workflow.ResearchScheduledInputV3
+	if err := converter.GetDefaultDataConverter().FromPayload(
+		start.GetInput().GetPayloads()[0], &input); err != nil {
+		t.Fatal(err)
+	}
+	if input != prepared.Input {
+		t.Fatalf("target input=%+v prepared=%+v", input, prepared.Input)
+	}
+	recovered, err := s.Scheduler.RecoverPreparedResearchTaskScheduleV3(
+		t.Context(), prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recovered.TargetAction, prepared.TargetAction) ||
+		recovered.TargetActionDigest != prepared.TargetActionDigest ||
+		recovered.ActionAuthorizationDigest != prepared.ActionAuthorizationDigest {
+		t.Fatal("formal V3 recovered artifacts differ")
+	}
+}
+
+func TestPreparedResearchTaskScheduleV3FullLifecycleConvergesAfterResponseLoss(t *testing.T) {
+	fake := newTaskScheduleFakeClient()
+	s := newTaskScheduleTestScheduler(fake)
+	prepared, err := s.Scheduler.PrepareResearchTaskScheduleV3(
+		t.Context(), validTaskScheduleRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.createCommitErr = context.DeadlineExceeded
+	ensured, err := s.Scheduler.EnsurePausedResearchTaskV3(t.Context(), prepared)
+	if err != nil || ensured.Snapshot.State != TaskSchedulePausedVirginExact {
+		t.Fatalf("ensure after lost response: result=%+v err=%v", ensured, err)
+	}
+	paused, err := s.Scheduler.DescribeResearchTaskV3(t.Context(), prepared)
+	if err != nil || paused.State != TaskSchedulePausedProvisioningExact {
+		t.Fatalf("describe paused: snapshot=%+v err=%v", paused, err)
+	}
+	fake.unpauseCommitErr = context.DeadlineExceeded
+	active, err := s.Scheduler.ActivateResearchTaskV3(
+		t.Context(), prepared, ensured.Snapshot)
+	if err != nil || active.State != TaskScheduleActiveVirginExact {
+		t.Fatalf("activate after lost response: snapshot=%+v err=%v", active, err)
+	}
+	recovered, err := s.Scheduler.RecoverPreparedResearchTaskScheduleV3(t.Context(), prepared)
+	if err != nil || !bytes.Equal(recovered.TargetAction, prepared.TargetAction) {
+		t.Fatalf("recover active checkpoint: recovered=%+v err=%v", recovered, err)
+	}
+	fake.deleteCommitErr = context.DeadlineExceeded
+	if err := s.Scheduler.DeleteResearchTaskV3(t.Context(), recovered); err != nil {
+		t.Fatalf("delete after lost response: %v", err)
+	}
+	if _, exists := fake.snapshot(prepared.Schedule.TaskID); exists {
+		t.Fatal("formal V3 schedule remained after convergent delete")
+	}
+}
+
+func TestPreparedResearchTaskScheduleV3RejectsDurableEvidenceDrift(t *testing.T) {
+	fake := newTaskScheduleFakeClient()
+	s := newTaskScheduleTestScheduler(fake)
+	prepared, err := s.Scheduler.PrepareResearchTaskScheduleV3(
+		t.Context(), validTaskScheduleRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*PreparedResearchTaskScheduleV3){
+		func(value *PreparedResearchTaskScheduleV3) {
+			value.WireVersion = "vane.prepared-research-task-schedule/v4"
+		},
+		func(value *PreparedResearchTaskScheduleV3) { value.Input.TaskID += "-other" },
+		func(value *PreparedResearchTaskScheduleV3) { value.TargetAction = nil },
+		func(value *PreparedResearchTaskScheduleV3) { value.TargetAction[0] ^= 0xff },
+		func(value *PreparedResearchTaskScheduleV3) { value.ActionAuthorizationDigest = strings.Repeat("0", 64) },
+	} {
+		drifted := prepared
+		drifted.TargetAction = bytes.Clone(prepared.TargetAction)
+		mutate(&drifted)
+		if _, err := s.Scheduler.RecoverPreparedResearchTaskScheduleV3(
+			t.Context(), drifted); err == nil {
+			t.Fatal("drifted native V3 checkpoint was accepted")
+		}
+	}
+	drifted := prepared
+	drifted.TargetAction = bytes.Clone(prepared.TargetAction)
+	drifted.TargetAction[0] ^= 0xff
+	if _, err := s.Scheduler.EnsurePausedResearchTaskV3(
+		t.Context(), drifted); err == nil {
+		t.Fatal("lifecycle mutation accepted drifted native V3 evidence")
+	}
+	if _, exists := fake.snapshot(prepared.Schedule.TaskID); exists {
+		t.Fatal("drifted native V3 evidence reached Temporal mutation boundary")
 	}
 }
 

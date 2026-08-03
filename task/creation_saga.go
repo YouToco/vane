@@ -154,8 +154,9 @@ type CreationCoordinator struct {
 	// Recovery passes are serialized so two callers cannot race the same stale
 	// scan. The cursor rotates tenant order between bounded passes, preventing a
 	// noisy oldest shard from starving later tenants forever.
-	recoveryMu     sync.Mutex
-	recoveryCursor int64
+	recoveryMu       sync.Mutex
+	recoveryCursor   int64
+	v3RecoveryCursor int64
 }
 
 func NewCreationCoordinator(
@@ -935,13 +936,18 @@ func (c *CreationCoordinator) RecoverStaleOnce(ctx context.Context) error {
 		tenantIDs = append(tenantIDs, wrapped...)
 	}
 	operations := make([]types.TaskCreationOperation, 0, creationRecoveryPassLimit)
+	v3Store, hasV3Store := c.store.(researchV3CreationSagaStore)
+	v1PassLimit := creationRecoveryPassLimit
+	if hasV3Store {
+		v1PassLimit -= 16
+	}
 	var scanErrors []error
 	visited := 0
-	for visited < len(tenantIDs) && len(operations) < creationRecoveryPassLimit {
+	for visited < len(tenantIDs) && len(operations) < v1PassLimit {
 		tenantID := tenantIDs[visited]
 		visited++
 		c.recoveryCursor = tenantID
-		remaining := creationRecoveryPassLimit - len(operations)
+		remaining := v1PassLimit - len(operations)
 		limit := min(creationRecoveryPerTenant, remaining)
 		shard, err := c.store.ListStaleTaskCreationOperations(
 			passCtx, tenantID, time.Now(), limit,
@@ -955,6 +961,40 @@ func (c *CreationCoordinator) RecoverStaleOnce(ctx context.Context) error {
 			shard = shard[:remaining]
 		}
 		operations = append(operations, shard...)
+	}
+	if hasV3Store && len(operations) < creationRecoveryPassLimit {
+		v3Tenants, v3Err := v3Store.ListStaleResearchTaskCreationTenantIDsV3(
+			passCtx, boundary, c.v3RecoveryCursor, creationRecoveryTenantLimit)
+		if v3Err != nil {
+			scanErrors = append(scanErrors,
+				fmt.Errorf("list stale native V3 tenant shards: %w", v3Err))
+		} else {
+			if c.v3RecoveryCursor > 0 && len(v3Tenants) < creationRecoveryTenantLimit {
+				wrapped, wrapErr := v3Store.ListStaleResearchTaskCreationTenantIDsV3(
+					passCtx, boundary, 0, creationRecoveryTenantLimit-len(v3Tenants))
+				if wrapErr != nil {
+					scanErrors = append(scanErrors,
+						fmt.Errorf("wrap stale native V3 tenant shards: %w", wrapErr))
+				} else {
+					v3Tenants = append(v3Tenants, wrapped...)
+				}
+			}
+			for _, tenantID := range v3Tenants {
+				if len(operations) >= creationRecoveryPassLimit {
+					break
+				}
+				c.v3RecoveryCursor = tenantID
+				remaining := creationRecoveryPassLimit - len(operations)
+				shard, listErr := v3Store.ListStaleResearchTaskCreationOperationsV3(
+					passCtx, tenantID, time.Now(), min(creationRecoveryPerTenant, remaining))
+				if listErr != nil {
+					scanErrors = append(scanErrors, fmt.Errorf(
+						"list stale native V3 operations for tenant %d: %w", tenantID, listErr))
+					continue
+				}
+				operations = append(operations, shard...)
+			}
+		}
 	}
 	semaphore := make(chan struct{}, creationRecoveryConcurrency)
 	var wg sync.WaitGroup
@@ -987,6 +1027,10 @@ func (c *CreationCoordinator) recoverOperation(
 	ctx context.Context,
 	stale types.TaskCreationOperation,
 ) error {
+	if stale.ExecutionVersion == types.TaskCreationExecutionVersionV2 &&
+		stale.ToolName == "manage_tasks" {
+		return c.recoverResearchV3Operation(ctx, stale)
+	}
 	owner := "recovery-" + uuid.NewString()
 	op, err := c.acquireCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
 		ID: stale.ID, TenantID: stale.TenantID, UserID: stale.UserID,
@@ -1007,6 +1051,39 @@ func (c *CreationCoordinator) recoverOperation(
 		return fmt.Errorf("recover operation %s at phase %s: %w", stale.ID, op.Phase, err)
 	}
 	c.logger.InfoContext(ctx, "task creation recovery converged",
+		"operation_id", stale.ID, "tenant_id", stale.TenantID,
+		"user_id", stale.UserID, "status", result.Status, "task_id", result.TaskID)
+	return nil
+}
+
+func (c *CreationCoordinator) recoverResearchV3Operation(
+	ctx context.Context, stale types.TaskCreationOperation,
+) error {
+	store, schedulerV3, err := c.researchV3CreationDependencies()
+	if err != nil {
+		return fmt.Errorf("native V3 recovery dependencies: %w", err)
+	}
+	owner := "recovery-v3-" + uuid.NewString()
+	op, err := c.acquireResearchV3CreationOperation(ctx, store,
+		types.AcquireTaskCreationOperationParams{
+			ID: stale.ID, TenantID: stale.TenantID, UserID: stale.UserID,
+			LeaseOwner: owner, LeaseDuration: creationLeaseDuration,
+			ReceiptProvider: stale.ReceiptProvider, ReceiptTarget: stale.ReceiptTarget,
+		})
+	if err != nil {
+		if errors.Is(err, types.ErrTaskCreationBusy) ||
+			errors.Is(err, types.ErrTaskCreationTerminal) || errors.Is(err, types.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("acquire stale native V3 operation %s: %w", stale.ID, err)
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, creationAttemptTimeout)
+	defer cancel()
+	result, err := c.runResearchV3Acquired(attemptCtx, store, schedulerV3, op)
+	if err != nil {
+		return fmt.Errorf("recover native V3 operation %s at phase %s: %w", stale.ID, op.Phase, err)
+	}
+	c.logger.InfoContext(ctx, "native V3 task creation recovery converged",
 		"operation_id", stale.ID, "tenant_id", stale.TenantID,
 		"user_id", stale.UserID, "status", result.Status, "task_id", result.TaskID)
 	return nil
@@ -1954,6 +2031,12 @@ func opTaskID(op *types.TaskCreationOperation) string {
 		return ""
 	}
 	return op.TaskID
+}
+
+// nativeResearchTaskIDV3 keeps the retained deterministic ID derivation at
+// the creation-Saga boundary. Native V3 entrypoints never ask users for IDs.
+func nativeResearchTaskIDV3(tenantID, userID int64, operationID string) (string, error) {
+	return scheduler.TaskIDForOperation(tenantID, userID, operationID)
 }
 
 func creationValidation(message string, cause error) error {

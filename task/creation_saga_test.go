@@ -16,6 +16,7 @@ import (
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/workflow"
 )
 
 // Retained test adapter: older fixtures describe the same acquisition calls
@@ -181,6 +182,21 @@ func (s *creationSagaFakeStore) CreateResearchTaskCreationOperationV3(
 		ToolName: "manage_tasks", Args: bytes.Clone(p.Args), Summary: p.Summary,
 		Status: types.TaskOperationStatusPending, ExpiresAt: p.ExpiresAt,
 		ExecutionVersion: types.TaskCreationExecutionVersionV2,
+	}
+	clone := s.op
+	return &clone, nil
+}
+
+func (s *creationSagaFakeStore) LoadResearchTaskCreationOperationV3(
+	_ context.Context,
+	id string,
+	tenantID int64,
+	userID int64,
+) (*types.TaskCreationOperation, error) {
+	if s.op.ID != id || s.op.TenantID != tenantID || s.op.UserID != userID ||
+		s.op.ToolName != "manage_tasks" ||
+		s.op.ExecutionVersion != types.TaskCreationExecutionVersionV2 {
+		return nil, types.ErrNotFound
 	}
 	clone := s.op
 	return &clone, nil
@@ -493,6 +509,76 @@ func (s *creationSagaFakeScheduler) PrepareTaskSchedule(
 	}
 	s.prepared = validPreparedSchedule(req)
 	return s.prepared, nil
+}
+
+func (s *creationSagaFakeScheduler) PrepareResearchTaskScheduleV3(
+	_ context.Context,
+	req scheduler.TaskScheduleRequest,
+) (scheduler.PreparedResearchTaskScheduleV3, error) {
+	s.events = append(s.events, "prepare_v3")
+	if s.prepareErr != nil {
+		return scheduler.PreparedResearchTaskScheduleV3{}, s.prepareErr
+	}
+	prepared := validPreparedSchedule(req)
+	prepared.FingerprintVersion = "v2"
+	prepared.Action.Params.TenantID = req.TenantID
+	prepared.Action.Params.ExecutionMode = types.ExecutionModeDiscoverAtRun
+	prepared.Action.Params.RuntimeVersion = workflow.ResearchRuntimeV3
+	prepared.Action.Params.NLDesc = ""
+	prepared.Action.Params.Scope = workflow.PushScope{}
+	recomputePreparedRequestDigest(&prepared)
+	s.prepared = prepared
+	return fakeResearchV3Artifacts(prepared), nil
+}
+
+func (s *creationSagaFakeScheduler) RecoverPreparedResearchTaskScheduleV3(
+	_ context.Context, prepared scheduler.PreparedResearchTaskScheduleV3,
+) (scheduler.PreparedResearchTaskScheduleV3, error) {
+	s.prepared = prepared.Schedule
+	return prepared, nil
+}
+
+func fakeResearchV3Artifacts(
+	prepared scheduler.PreparedTaskSchedule,
+) scheduler.PreparedResearchTaskScheduleV3 {
+	target, _ := json.Marshal(prepared.Action)
+	token := strings.Repeat("a", 64)
+	return scheduler.PreparedResearchTaskScheduleV3{
+		WireVersion: "vane.prepared-research-task-schedule/v3",
+		Schedule:    prepared,
+		Input: workflow.ResearchScheduledInputV3{
+			TenantID: prepared.TenantID, UserID: prepared.UserID, TaskID: prepared.TaskID,
+			ActionAuthorizationToken: token,
+		},
+		TargetAction:              target,
+		TargetActionDigest:        sha256Hex(target),
+		ActionAuthorizationDigest: sha256Hex([]byte(token)),
+	}
+}
+
+func (s *creationSagaFakeScheduler) EnsurePausedResearchTaskV3(
+	ctx context.Context, prepared scheduler.PreparedResearchTaskScheduleV3,
+) (scheduler.EnsurePausedTaskResult, error) {
+	return s.EnsurePausedTask(ctx, prepared.Schedule)
+}
+
+func (s *creationSagaFakeScheduler) DescribeResearchTaskV3(
+	ctx context.Context, prepared scheduler.PreparedResearchTaskScheduleV3,
+) (scheduler.TaskScheduleSnapshot, error) {
+	return s.DescribeTask(ctx, prepared.Schedule)
+}
+
+func (s *creationSagaFakeScheduler) ActivateResearchTaskV3(
+	ctx context.Context, prepared scheduler.PreparedResearchTaskScheduleV3,
+	receipt scheduler.TaskScheduleSnapshot,
+) (scheduler.TaskScheduleSnapshot, error) {
+	return s.ActivateTask(ctx, prepared.Schedule, receipt)
+}
+
+func (s *creationSagaFakeScheduler) DeleteResearchTaskV3(
+	ctx context.Context, prepared scheduler.PreparedResearchTaskScheduleV3,
+) error {
+	return s.DeleteTask(ctx, prepared.Schedule)
 }
 
 func (s *creationSagaFakeScheduler) EnsurePausedTask(
