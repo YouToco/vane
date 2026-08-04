@@ -63,7 +63,7 @@ func TestMigration116BackfillsHistoricalCutoverJournalPostgres(t *testing.T) {
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required")
 	}
-	database, provider := newMigration116ScratchProvider(t, databaseURL)
+	database, provider, _ := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 115); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestMigration116VaneAppPreparedStatusPrivilegeIsSymmetricPostgres(t *testin
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required")
 	}
-	database, provider := newMigration116ScratchProvider(t, databaseURL)
+	database, provider, _ := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 116); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestMigration116RejectsDuplicateDynamicFunctionNeedlePostgres(t *testing.T)
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required")
 	}
-	database, provider := newMigration116ScratchProvider(t, databaseURL)
+	database, provider, _ := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 115); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestMigration116DownRejectsDuplicateDynamicFunctionNeedlePostgres(t *testin
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required")
 	}
-	database, provider := newMigration116ScratchProvider(t, databaseURL)
+	database, provider, _ := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 116); err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +475,7 @@ func TestMigration116DownRejectsEnabledAuthorityAndCutoverAuditPostgres(t *testi
 
 func newMigration116ScratchProvider(
 	t *testing.T, databaseURL string,
-) (*sql.DB, *goose.Provider) {
+) (*sql.DB, *goose.Provider, string) {
 	t.Helper()
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -493,5 +493,5 @@ func newMigration116ScratchProvider(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return database, provider
+	return database, provider, scratchURL
 }
