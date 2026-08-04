@@ -282,6 +282,54 @@ func (s *Store) ReadPushEffectRecoveryCutoff(
 	return cutoff, nil
 }
 
+// ListEnabledResearchV3RecoveryTaskIDs is the only cross-task V3 recovery
+// discovery surface. The definer returns task IDs only; effect rows and every
+// provider claim remain tenant scoped and authority checked.
+func (s *Store) ListEnabledResearchV3RecoveryTaskIDs(
+	ctx context.Context, afterTaskID string, limit int,
+) ([]string, error) {
+	if strings.TrimSpace(afterTaskID) != afterTaskID || len(afterTaskID) > 255 ||
+		limit <= 0 || limit > 1000 {
+		return nil, pushEffectValidation("V3 recovery task query is invalid")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, pushEffectDatabaseError("begin V3 recovery task discovery", err)
+	}
+	defer rollbackPushEffectTx(ctx, tx)
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		return nil, pushEffectDatabaseError("bind V3 recovery task discovery", err)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT task_id FROM list_enabled_research_v3_recovery_tasks_v1($1,$2)`,
+		afterTaskID, limit)
+	if err != nil {
+		return nil, pushEffectDatabaseError("list enabled V3 recovery tasks", err)
+	}
+	defer rows.Close()
+	taskIDs := make([]string, 0)
+	for rows.Next() {
+		var taskID string
+		if err := rows.Scan(&taskID); err != nil {
+			return nil, pushEffectDatabaseError("scan enabled V3 recovery task", err)
+		}
+		if !validTaskRunTaskID(taskID) ||
+			(len(taskIDs) != 0 && taskID <= taskIDs[len(taskIDs)-1]) ||
+			taskID <= afterTaskID {
+			return nil, pushEffectValidation("V3 recovery task discovery is invalid")
+		}
+		taskIDs = append(taskIDs, taskID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, pushEffectDatabaseError("iterate enabled V3 recovery tasks", err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, pushEffectDatabaseError("commit V3 recovery task discovery", err)
+	}
+	return taskIDs, nil
+}
+
 // ListRecoverablePushEffects returns due safe-send rows and stale sending rows
 // for one tenant. Callers must Claim the former or TakeOver the latter; listing
 // itself grants no provider authority.

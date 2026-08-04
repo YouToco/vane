@@ -20,6 +20,7 @@ const researchV3SourceBaselineSchemaV1 = "vane.research-v3-source-baseline/v1"
 
 type researchV3PreparedBinding struct {
 	Target               types.ResearchV3DefinitionHead
+	ScheduleStatus       types.ScheduleStatus
 	BaseMode             types.ExecutionMode
 	BaseHead             *types.ResearchV3DefinitionHead
 	SourceBaselineDigest string
@@ -79,6 +80,7 @@ func loadPreparedResearchV3BindingTx(ctx context.Context, q interface {
 	expectation researchV3ProductionHeadExpectation,
 ) (researchV3PreparedBinding, error) {
 	var binding researchV3PreparedBinding
+	var preparedScheduleStatus types.ScheduleStatus
 	var baseVersion *int64
 	var baseDigest *string
 	var schema, definitionMode, liveMode, name, manual string
@@ -93,8 +95,9 @@ func loadPreparedResearchV3BindingTx(ctx context.Context, q interface {
 	err := q.QueryRow(ctx, `SELECT head.definition_version,head.definition_digest,
 		       head.base_execution_mode,head.base_definition_version,
 		       head.base_definition_digest,head.source_baseline_digest,
+		       head.prepared_schedule_status,
 		       definition.schema_version,definition.execution_mode,definition.payload,
-		       schedule.execution_mode,schedule.approved_definition_version,
+		       schedule.status,schedule.execution_mode,schedule.approved_definition_version,
 		       schedule.approved_definition_digest,schedule.nl_description,
 		       playbook.content,schedule.spec_json,schedule.push_strictness
 		  FROM research_v3_prepared_definition_heads head
@@ -112,8 +115,9 @@ func loadPreparedResearchV3BindingTx(ctx context.Context, q interface {
 		   AND `+statusPredicate+` AND tenant.status='active' AND tenant.deleted_at IS NULL
 		   AND membership.role='owner'`, tenantID, userID, taskID).Scan(
 		&binding.Target.Version, &binding.Target.Digest, &binding.BaseMode,
-		&baseVersion, &baseDigest, &binding.SourceBaselineDigest,
-		&schema, &definitionMode, &payload, &liveMode, &liveVersion, &liveDigest,
+		&baseVersion, &baseDigest, &binding.SourceBaselineDigest, &preparedScheduleStatus,
+		&schema, &definitionMode, &payload, &binding.ScheduleStatus,
+		&liveMode, &liveVersion, &liveDigest,
 		&name, &manual, &liveSpec, &rawStrictness)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return binding, types.NewAppError(types.CodeNotFound,
@@ -124,6 +128,11 @@ func loadPreparedResearchV3BindingTx(ctx context.Context, q interface {
 	}
 	if (baseVersion == nil) != (baseDigest == nil) || (liveVersion == nil) != (liveDigest == nil) {
 		return binding, taskStateIntegrity()
+	}
+	if preparedScheduleStatus != binding.ScheduleStatus {
+		return binding, types.NewAppError(types.CodeConflict,
+			"research V3 schedule status changed after prepare; prepare and shadow it again",
+			types.ErrConflict)
 	}
 	if baseVersion != nil {
 		binding.BaseHead = &types.ResearchV3DefinitionHead{Version: *baseVersion, Digest: *baseDigest}

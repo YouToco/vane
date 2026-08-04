@@ -10,27 +10,19 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/internal/researchoperator"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
 
-const (
-	migrationOwnerDatabaseURLEnv      = "VANE_MIGRATION_DB_URL"
-	migrationOwnerCredentialDirectory = "CREDENTIALS_DIRECTORY"
-	migrationOwnerDatabaseCredential  = "migration_db_url"
-)
-
 type argsV3 struct {
 	operation, taskID, idempotencyKey, policyFile string
-	userID                                        int64
 }
 
 type policyV3 struct {
@@ -51,19 +43,14 @@ func run(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load("")
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID == "" ||
-		a.taskID != cfg.Pipeline.ResearchV3ShadowCanaryScheduleID {
-		return errors.New("task is not the exact configured Research V3 shadow canary")
+	if err := researchoperator.RequireExactTask(a.taskID); err != nil {
+		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	url, err := migrationOwnerDatabaseURL()
+	url, err := researchoperator.MigrationDatabaseURL()
 	if err != nil {
 		return err
 	}
@@ -72,12 +59,9 @@ func run(arguments []string) error {
 		return fmt.Errorf("open migration-owner operator store: %w", err)
 	}
 	defer st.Close()
-	mirror, err := st.GetSchedule(ctx, a.taskID, a.userID)
+	scope, err := st.ResolveResearchV3OperatorScope(ctx, a.taskID)
 	if err != nil {
 		return fmt.Errorf("resolve exact owner task: %w", err)
-	}
-	if mirror == nil || mirror.TenantID <= 0 || mirror.ID != a.taskID || mirror.UserID != a.userID {
-		return errors.New("exact owner task is unavailable")
 	}
 	var op types.ResearchV3DefinitionPrepareOperation
 	if a.operation == "prepare" {
@@ -86,13 +70,13 @@ func run(arguments []string) error {
 			return err
 		}
 		op, err = st.PrepareResearchV3Definition(ctx, taskstate.ResearchV3DefinitionPrepareParams{
-			TenantID: mirror.TenantID, UserID: a.userID, TaskID: a.taskID,
+			TenantID: scope.TenantID, UserID: scope.UserID, TaskID: a.taskID,
 			IdempotencyKey: a.idempotencyKey, Notification: policy.Notification,
 			Output: policy.Output, PlannerBudget: policy.PlannerBudget,
 		})
 	} else {
 		op, err = st.RollbackResearchV3DefinitionPrepare(
-			ctx, mirror.TenantID, a.userID, a.taskID, a.idempotencyKey)
+			ctx, scope.TenantID, scope.UserID, a.taskID, a.idempotencyKey)
 	}
 	if err != nil {
 		return fmt.Errorf("%s Research V3 definition: %w", a.operation, err)
@@ -108,7 +92,6 @@ func parseArgs(arguments []string) (argsV3, error) {
 	var a argsV3
 	set.StringVar(&a.operation, "operation", "", "prepare or rollback")
 	set.StringVar(&a.taskID, "task-id", "", "exact configured schedule ID")
-	set.Int64Var(&a.userID, "user-id", 0, "owning Vane user ID")
 	set.StringVar(&a.idempotencyKey, "idempotency-key", "", "stable operation retry key")
 	set.StringVar(&a.policyFile, "policy-file", "", "explicit V3 policy JSON (prepare only)")
 	if err := set.Parse(arguments); err != nil {
@@ -116,9 +99,9 @@ func parseArgs(arguments []string) (argsV3, error) {
 	}
 	validPolicy := (a.operation == "prepare" && a.policyFile != "") || (a.operation == "rollback" && a.policyFile == "")
 	if set.NArg() != 0 || (a.operation != "prepare" && a.operation != "rollback") || a.taskID == "" ||
-		strings.TrimSpace(a.taskID) != a.taskID || a.userID <= 0 || a.idempotencyKey == "" ||
+		strings.TrimSpace(a.taskID) != a.taskID || a.idempotencyKey == "" ||
 		strings.TrimSpace(a.idempotencyKey) != a.idempotencyKey || len(a.idempotencyKey) > 512 || !validPolicy {
-		return argsV3{}, errors.New("require -operation prepare|rollback, -task-id, positive -user-id, -idempotency-key, and -policy-file only for prepare")
+		return argsV3{}, errors.New("require -operation prepare|rollback, -task-id, -idempotency-key, and -policy-file only for prepare")
 	}
 	return a, nil
 }
@@ -133,23 +116,4 @@ func loadPolicy(path string) (policyV3, error) {
 		return policyV3{}, errors.New("V3 policy file is invalid")
 	}
 	return policy, nil
-}
-
-func migrationOwnerDatabaseURL() (string, error) {
-	if value := strings.TrimSpace(os.Getenv(migrationOwnerDatabaseURLEnv)); value != "" {
-		return value, nil
-	}
-	directory := strings.TrimSpace(os.Getenv(migrationOwnerCredentialDirectory))
-	if directory == "" {
-		return "", errors.New("migration-owner database credential is unavailable")
-	}
-	payload, err := os.ReadFile(filepath.Join(directory, migrationOwnerDatabaseCredential))
-	if err != nil {
-		return "", errors.New("read migration-owner database credential")
-	}
-	value := strings.TrimSpace(string(payload))
-	if value == "" {
-		return "", errors.New("migration-owner database credential is empty")
-	}
-	return value, nil
 }

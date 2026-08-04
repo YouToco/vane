@@ -319,7 +319,7 @@ func loadCurrentResearchDefinitionV3(
 ) (int64, string, taskstate.ApprovedDefinitionV3, error) {
 	if isExactResearchV3ShadowWorkflowID(identity.TemporalWorkflowID) {
 		binding, err := loadPreparedResearchV3BindingTx(
-			ctx, tx, identity.TenantID, identity.UserID, identity.TaskID, true,
+			ctx, tx, identity.TenantID, identity.UserID, identity.TaskID, false,
 			researchV3ExpectBaseOrTargetHead)
 		if err != nil {
 			return 0, "", taskstate.ApprovedDefinitionV3{}, err

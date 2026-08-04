@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	commonpb "go.temporal.io/api/common/v1"
@@ -105,6 +106,8 @@ func (f *researchV3CutoverJournalFake) BeginResearchV3Cutover(
 		TargetActionDigest:        p.TargetActionDigest,
 		ActionAuthorizationDigest: p.ActionAuthorizationDigest,
 		OriginalPaused:            p.OriginalPaused,
+		OriginalScheduleStatus:    p.OriginalScheduleStatus,
+		PreflightDigest:           p.PreflightDigest,
 		Phase:                     types.ResearchV3CutoverPrepared,
 	}
 	f.events = append(f.events, "begin")
@@ -112,6 +115,24 @@ func (f *researchV3CutoverJournalFake) BeginResearchV3Cutover(
 		f.onBegin()
 	}
 	return f.op, nil
+}
+
+func (f *researchV3CutoverJournalFake) LoadResearchV3CutoverAuthorityStatus(
+	context.Context, types.ResearchV3CutoverOperation,
+) (string, error) {
+	if f.revoked {
+		return "revoked", nil
+	}
+	if f.op.Phase == types.ResearchV3CutoverActive {
+		return "enabled", nil
+	}
+	return "pending", nil
+}
+
+func (f *researchV3CutoverJournalFake) VerifyResearchV3CutoverDatabaseState(
+	context.Context, types.ResearchV3CutoverOperation,
+) error {
+	return nil
 }
 
 func (f *researchV3CutoverJournalFake) LoadResearchV3Cutover(
@@ -302,6 +323,80 @@ func TestResearchV3CutoverPreservesMondayNineScheduleAndRecoversLostResponses(t 
 				t.Fatalf("idempotent cutover err=%v updates=%d", err, len(remote.updates))
 			}
 		})
+	}
+}
+
+func TestResearchV3CutoverPreservesPausedMondayTask(t *testing.T) {
+	original := researchV3MondaySchedule(t)
+	original.State.Paused = true
+	original.State.Notes = "paused by owner"
+	journal := researchV3CutoverJournalForTest()
+	journal.schedule.Status = types.ScheduleStatusPaused
+	journal.schedule.SpecJSON = []byte(`{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}`)
+	remote := &researchV3ScheduleRemoteFake{
+		schedule: proto.Clone(original).(*schedulepb.Schedule),
+	}
+	coordinator := researchV3CutoverCoordinatorForTest(t, journal, remote)
+	op, err := coordinator.Cutover(t.Context(), researchV3CutoverRequest{
+		TaskID: "task-kimi", UserID: 42, IdempotencyKey: "paused-cutover",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Phase != types.ResearchV3CutoverActive ||
+		op.OriginalScheduleStatus != types.ScheduleStatusPaused ||
+		!op.OriginalPaused || !remote.schedule.GetState().GetPaused() {
+		t.Fatalf("operation=%+v temporal_paused=%t", op,
+			remote.schedule.GetState().GetPaused())
+	}
+	if !proto.Equal(remote.schedule.GetSpec(), original.GetSpec()) ||
+		!proto.Equal(remote.schedule.GetPolicies(), original.GetPolicies()) ||
+		remote.schedule.GetAction().GetStartWorkflow().GetWorkflowId() !=
+			original.GetAction().GetStartWorkflow().GetWorkflowId() {
+		t.Fatal("paused cutover changed schedule identity, spec, or policy")
+	}
+	if remote.schedule.GetAction().GetStartWorkflow().GetWorkflowType().GetName() !=
+		workflow.ResearchScheduledWorkflowV3Name {
+		t.Fatal("paused cutover did not install V3 action")
+	}
+}
+
+func TestResearchV3CutoverBindsPlanDigestAndReplaysSameKey(t *testing.T) {
+	journal := researchV3CutoverJournalForTest()
+	remote := &researchV3ScheduleRemoteFake{schedule: researchV3MondaySchedule(t)}
+	coordinator := researchV3CutoverCoordinatorForTest(t, journal, remote)
+	req := researchV3CutoverRequest{
+		TaskID: "task-kimi", UserID: 42, IdempotencyKey: "digest-bound",
+	}
+	scope := types.ResearchV3OperatorScope{
+		TenantID: journal.schedule.TenantID, UserID: journal.schedule.UserID,
+		TaskID: journal.schedule.ID, Status: journal.schedule.Status,
+		ExecutionMode: journal.schedule.ExecutionMode,
+		SpecJSON:      append([]byte(nil), journal.schedule.SpecJSON...),
+	}
+	inspection, err := coordinator.Preflight(t.Context(), scope, req)
+	if err != nil || len(inspection.PlanDigest) != 64 || !inspection.Ready {
+		t.Fatalf("preflight=%+v err=%v", inspection, err)
+	}
+	if _, err := coordinator.CutoverWithPreflight(
+		t.Context(), scope, req, strings.Repeat("f", 64)); types.CodeOf(err) != types.CodeConflict || journal.op.ID != 0 || len(remote.updates) != 0 {
+		t.Fatalf("wrong digest err=%v operation=%d updates=%d",
+			err, journal.op.ID, len(remote.updates))
+	}
+	op, err := coordinator.CutoverWithPreflight(
+		t.Context(), scope, req, inspection.PlanDigest)
+	if err != nil || op.Phase != types.ResearchV3CutoverActive {
+		t.Fatalf("cutover=%+v err=%v", op, err)
+	}
+	updates := len(remote.updates)
+	if _, err := coordinator.CutoverWithPreflight(
+		t.Context(), scope, req, inspection.PlanDigest); err != nil ||
+		len(remote.updates) != updates {
+		t.Fatalf("same-key replay err=%v updates=%d/%d", err, len(remote.updates), updates)
+	}
+	if _, err := coordinator.CutoverWithPreflight(
+		t.Context(), scope, req, strings.Repeat("e", 64)); types.CodeOf(err) != types.CodeConflict || len(remote.updates) != updates {
+		t.Fatalf("replay digest drift err=%v updates=%d/%d", err, len(remote.updates), updates)
 	}
 }
 

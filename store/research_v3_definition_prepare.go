@@ -35,12 +35,13 @@ func (s *Store) PrepareResearchV3Definition(
 	}
 
 	var name, manual, rawMode string
+	var originalScheduleStatus types.ScheduleStatus
 	var rawStrictness *string
 	var spec []byte
 	var mainVersion *int64
 	var mainDigest *string
 	err = tx.QueryRow(ctx,
-		`SELECT schedule.nl_description,playbook.content,schedule.spec_json,
+		`SELECT schedule.nl_description,playbook.content,schedule.spec_json,schedule.status,
 		        schedule.execution_mode,schedule.approved_definition_version,
 		        schedule.approved_definition_digest,schedule.push_strictness
 		   FROM schedules schedule
@@ -52,7 +53,8 @@ func (s *Store) PrepareResearchV3Definition(
 		    AND schedule.status IN ('active','paused') AND tenant.status='active'
 		    AND tenant.deleted_at IS NULL AND membership.role='owner'
 		`, p.TenantID, p.UserID, p.TaskID).Scan(
-		&name, &manual, &spec, &rawMode, &mainVersion, &mainDigest, &rawStrictness)
+		&name, &manual, &spec, &originalScheduleStatus,
+		&rawMode, &mainVersion, &mainDigest, &rawStrictness)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return types.ResearchV3DefinitionPrepareOperation{}, types.NewAppError(
 			types.CodeNotFound, "owner research task is unavailable", types.ErrNotFound)
@@ -110,6 +112,7 @@ func (s *Store) PrepareResearchV3Definition(
 			    AND definition_digest=$5`, p.TenantID, p.UserID, p.TaskID,
 			existing.Target.Version, existing.Target.Digest).Scan(&stored)
 		if loadErr != nil || existing.Phase != types.ResearchV3DefinitionPrepared ||
+			existing.OriginalScheduleStatus != originalScheduleStatus ||
 			subtle.ConstantTimeCompare([]byte(existing.SourceBaselineDigest), []byte(baselineDigest)) != 1 ||
 			subtle.ConstantTimeCompare([]byte(existing.Target.Digest), []byte(digest)) != 1 ||
 			!bytes.Equal(stored, payload) {
@@ -168,23 +171,26 @@ func (s *Store) PrepareResearchV3Definition(
 		`INSERT INTO research_v3_definition_prepare_operations
 		 (id,tenant_id,user_id,task_id,idempotency_key,target_definition_version,
 		  target_definition_digest,previous_definition_version,previous_definition_digest,
-		  source_baseline_digest,original_execution_mode,original_definition_version,original_definition_digest)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		  source_baseline_digest,original_schedule_status,original_execution_mode,
+		  original_definition_version,original_definition_digest)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		 RETURNING id,tenant_id,user_id,task_id,idempotency_key,
 		  target_definition_version,target_definition_digest,
 		  previous_definition_version,previous_definition_digest,
-		  source_baseline_digest,original_execution_mode,original_definition_version,original_definition_digest,
+		  source_baseline_digest,original_schedule_status,original_execution_mode,
+		  original_definition_version,original_definition_digest,
 		  phase,created_at,updated_at`, operationID, p.TenantID, p.UserID, p.TaskID,
 		p.IdempotencyKey, version, digest, previousVersion, previousDigest,
-		baselineDigest, rawMode, mainVersion, mainDigest))
+		baselineDigest, originalScheduleStatus, rawMode, mainVersion, mainDigest))
 	if err != nil {
 		return types.ResearchV3DefinitionPrepareOperation{}, taskStateDatabaseError("insert V3 prepare journal", err)
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO research_v3_prepared_definition_heads
 		 (tenant_id,user_id,task_id,definition_version,definition_digest,prepare_operation_id,
-		  base_execution_mode,base_definition_version,base_definition_digest,source_baseline_digest)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		  base_execution_mode,base_definition_version,base_definition_digest,source_baseline_digest,
+		  prepared_schedule_status)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 ON CONFLICT (tenant_id,user_id,task_id) DO UPDATE SET
 		 definition_version=EXCLUDED.definition_version,
 		 definition_digest=EXCLUDED.definition_digest,
@@ -193,8 +199,10 @@ func (s *Store) PrepareResearchV3Definition(
 		 base_definition_version=EXCLUDED.base_definition_version,
 		 base_definition_digest=EXCLUDED.base_definition_digest,
 		 source_baseline_digest=EXCLUDED.source_baseline_digest,
+		 prepared_schedule_status=EXCLUDED.prepared_schedule_status,
 		 updated_at=clock_timestamp()`, p.TenantID, p.UserID, p.TaskID,
-		version, digest, operationID, rawMode, mainVersion, mainDigest, baselineDigest); err != nil {
+		version, digest, operationID, rawMode, mainVersion, mainDigest, baselineDigest,
+		originalScheduleStatus); err != nil {
 		return types.ResearchV3DefinitionPrepareOperation{}, taskStateDatabaseError("publish V3 prepared head", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -267,6 +275,7 @@ func (s *Store) RollbackResearchV3DefinitionPrepare(
 		 base_definition_version=previous.original_definition_version,
 		 base_definition_digest=previous.original_definition_digest,
 		 source_baseline_digest=previous.source_baseline_digest,
+		 prepared_schedule_status=previous.original_schedule_status,
 		 updated_at=clock_timestamp()
 		 FROM LATERAL (SELECT * FROM research_v3_definition_prepare_operations
 		  WHERE tenant_id=$3 AND user_id=$4 AND task_id=$5
@@ -283,7 +292,7 @@ func (s *Store) RollbackResearchV3DefinitionPrepare(
 	if err != nil {
 		return types.ResearchV3DefinitionPrepareOperation{}, taskStateDatabaseError("restore V3 prepared head", err)
 	}
-	op, err = scanResearchV3DefinitionPrepare(tx.QueryRow(ctx, `UPDATE research_v3_definition_prepare_operations SET phase='rolled_back' WHERE id=$1 AND phase='prepared' RETURNING id,tenant_id,user_id,task_id,idempotency_key,target_definition_version,target_definition_digest,previous_definition_version,previous_definition_digest,source_baseline_digest,original_execution_mode,original_definition_version,original_definition_digest,phase,created_at,updated_at`, op.ID))
+	op, err = scanResearchV3DefinitionPrepare(tx.QueryRow(ctx, `UPDATE research_v3_definition_prepare_operations SET phase='rolled_back' WHERE id=$1 AND phase='prepared' RETURNING id,tenant_id,user_id,task_id,idempotency_key,target_definition_version,target_definition_digest,previous_definition_version,previous_definition_digest,source_baseline_digest,original_schedule_status,original_execution_mode,original_definition_version,original_definition_digest,phase,created_at,updated_at`, op.ID))
 	if err != nil {
 		return types.ResearchV3DefinitionPrepareOperation{}, taskStateDatabaseError("checkpoint V3 prepare rollback", err)
 	}
@@ -324,7 +333,7 @@ func loadPreparedResearchV3HeadTx(ctx context.Context, q interface {
 func loadResearchV3DefinitionPrepareTx(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, tenantID, userID int64, taskID, key string) (types.ResearchV3DefinitionPrepareOperation, bool, error) {
-	op, err := scanResearchV3DefinitionPrepare(q.QueryRow(ctx, `SELECT id,tenant_id,user_id,task_id,idempotency_key,target_definition_version,target_definition_digest,previous_definition_version,previous_definition_digest,source_baseline_digest,original_execution_mode,original_definition_version,original_definition_digest,phase,created_at,updated_at FROM research_v3_definition_prepare_operations WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND idempotency_key=$4`, tenantID, userID, taskID, key))
+	op, err := scanResearchV3DefinitionPrepare(q.QueryRow(ctx, `SELECT id,tenant_id,user_id,task_id,idempotency_key,target_definition_version,target_definition_digest,previous_definition_version,previous_definition_digest,source_baseline_digest,original_schedule_status,original_execution_mode,original_definition_version,original_definition_digest,phase,created_at,updated_at FROM research_v3_definition_prepare_operations WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND idempotency_key=$4`, tenantID, userID, taskID, key))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return op, false, nil
 	}
@@ -340,7 +349,8 @@ func scanResearchV3DefinitionPrepare(row pgx.Row) (types.ResearchV3DefinitionPre
 	var previousDigest, originalDigest *string
 	err := row.Scan(&op.ID, &op.TenantID, &op.UserID, &op.TaskID, &op.IdempotencyKey,
 		&op.Target.Version, &op.Target.Digest, &previousVersion, &previousDigest,
-		&op.SourceBaselineDigest, &op.OriginalMode, &originalVersion, &originalDigest,
+		&op.SourceBaselineDigest, &op.OriginalScheduleStatus,
+		&op.OriginalMode, &originalVersion, &originalDigest,
 		&op.Phase, &op.CreatedAt, &op.UpdatedAt)
 	if err != nil {
 		return op, err
@@ -348,6 +358,8 @@ func scanResearchV3DefinitionPrepare(row pgx.Row) (types.ResearchV3DefinitionPre
 	if (previousVersion == nil) != (previousDigest == nil) ||
 		(originalVersion == nil) != (originalDigest == nil) ||
 		!validDigestSyntaxV3(op.SourceBaselineDigest) ||
+		(op.OriginalScheduleStatus != types.ScheduleStatusActive &&
+			op.OriginalScheduleStatus != types.ScheduleStatusPaused) ||
 		(op.OriginalMode != types.ExecutionModeCompiled &&
 			op.OriginalMode != types.ExecutionModeDiscoverAtRun) {
 		return op, taskStateIntegrity()

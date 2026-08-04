@@ -13,17 +13,18 @@ const (
 // for a delivery-dark V3 sidecar head. The primary Schedule head is not
 // changed by this operation.
 type ResearchV3DefinitionPrepareOperation struct {
-	ID                   int64
-	TenantID             int64
-	UserID               int64
-	TaskID               string
-	IdempotencyKey       string
-	Target               ResearchV3DefinitionHead
-	PreviousPreparedHead *ResearchV3DefinitionHead
-	SourceBaselineDigest string
-	OriginalMode         ExecutionMode
-	OriginalHead         *ResearchV3DefinitionHead
-	Phase                ResearchV3DefinitionPreparePhase
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	ID                     int64
+	TenantID               int64
+	UserID                 int64
+	TaskID                 string
+	IdempotencyKey         string
+	Target                 ResearchV3DefinitionHead
+	PreviousPreparedHead   *ResearchV3DefinitionHead
+	SourceBaselineDigest   string
+	OriginalScheduleStatus ScheduleStatus
+	OriginalMode           ExecutionMode
+	OriginalHead           *ResearchV3DefinitionHead
+	Phase                  ResearchV3DefinitionPreparePhase
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }

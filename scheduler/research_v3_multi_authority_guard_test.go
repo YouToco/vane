@@ -20,10 +20,10 @@ func TestResearchV3StaticAuthorityIsControlPlaneOnly(t *testing.T) {
 		}
 	}
 	if got := identifierCountInMethod(
-		t, "research_v3_rollout.go", "TriggerResearchShadowNow", "shadowID",
+		t, "research_v3_rollout.go", "triggerResearchShadowNow", "shadowID",
 	); got == 0 {
 		if helper := identifierCountInMethod(
-			t, "research_v3_rollout.go", "TriggerResearchShadowNow", "shadowIDMatch",
+			t, "research_v3_rollout.go", "triggerResearchShadowNow", "shadowIDMatch",
 		); helper == 0 {
 			t.Fatal("shadow trigger lost exact shadowID guard")
 		}

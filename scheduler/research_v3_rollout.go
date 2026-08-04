@@ -159,45 +159,77 @@ func (s *Scheduler) TriggerResearchShadowNow(
 	userID int64,
 	idempotencyKey string,
 ) error {
-	if s == nil || s.c == nil || s.st == nil {
+	_, err := s.triggerResearchShadowNow(ctx, taskID, userID, idempotencyKey, false)
+	return err
+}
+
+// TriggerResearchShadowNowAndWait starts or rejoins the exact idempotent
+// shadow execution and waits for its terminal Temporal result. Operator code
+// must use this before asking the Store for the immutable delivery-dark proof.
+func (s *Scheduler) TriggerResearchShadowNowAndWait(
+	ctx context.Context, taskID string, userID int64, idempotencyKey string,
+) error {
+	run, err := s.triggerResearchShadowNow(ctx, taskID, userID, idempotencyKey, true)
+	if err != nil {
+		return err
+	}
+	if run == nil {
 		return types.NewAppError(types.CodeInternal,
+			"research V3 shadow workflow handle is unavailable", nil)
+	}
+	if err := run.Get(ctx, nil); err != nil {
+		return types.NewAppError(types.CodeInternal,
+			"research V3 shadow workflow failed", err)
+	}
+	return nil
+}
+
+func (s *Scheduler) triggerResearchShadowNow(
+	ctx context.Context, taskID string, userID int64, idempotencyKey string,
+	rejoin bool,
+) (client.WorkflowRun, error) {
+	if s == nil || s.c == nil || s.st == nil {
+		return nil, types.NewAppError(types.CodeInternal,
 			"research V3 shadow control plane is unavailable", nil)
 	}
 	if !s.researchV3.shadowIDMatch(taskID) {
-		return types.NewAppError(types.CodeNotFound,
+		return nil, types.NewAppError(types.CodeNotFound,
 			"research V3 shadow task is not configured", types.ErrNotFound)
 	}
 	if taskID == "" || strings.TrimSpace(taskID) != taskID || userID <= 0 ||
 		idempotencyKey == "" || strings.TrimSpace(idempotencyKey) != idempotencyKey ||
 		len(idempotencyKey) > 512 {
-		return types.NewAppError(types.CodeValidation,
+		return nil, types.NewAppError(types.CodeValidation,
 			"research V3 shadow request is invalid", types.ErrValidation)
 	}
 	schedule, err := s.st.GetSchedule(ctx, taskID, userID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if schedule == nil || schedule.ID != taskID || schedule.UserID != userID ||
-		schedule.TenantID <= 0 || schedule.Status != types.ScheduleStatusActive {
-		return types.NewAppError(types.CodeNotFound,
-			"research V3 shadow task is not active", types.ErrNotFound)
+		schedule.TenantID <= 0 ||
+		(schedule.Status != types.ScheduleStatusActive &&
+			schedule.Status != types.ScheduleStatusPaused) {
+		return nil, types.NewAppError(types.CodeNotFound,
+			"research V3 shadow task is unavailable", types.ErrNotFound)
 	}
 	definitions, ok := s.st.(researchV3DefinitionStore)
 	if !ok {
-		return types.NewAppError(types.CodeConflict,
+		return nil, types.NewAppError(types.CodeConflict,
 			"research V3 definition preflight is unavailable", types.ErrConflict)
 	}
 	available, err := definitions.HasCurrentResearchApprovedDefinitionV3(
 		ctx, schedule.TenantID, userID, taskID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !available {
-		return types.NewAppError(types.CodeConflict,
+		return nil, types.NewAppError(types.CodeConflict,
 			"task has no current Research V3 approved definition", types.ErrConflict)
 	}
-	_, err = s.c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:                                       researchShadowWorkflowID(taskID, idempotencyKey),
+	workflowID := researchShadowWorkflowID(taskID, idempotencyKey)
+	run, err := s.c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:                                       workflowID,
 		TaskQueue:                                s.tq,
 		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 		WorkflowExecutionErrorWhenAlreadyStarted: true,
@@ -206,13 +238,16 @@ func (s *Scheduler) TriggerResearchShadowNow(
 	})
 	var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
 	if errors.As(err, &alreadyStarted) {
-		return nil
+		if rejoin {
+			return s.c.GetWorkflow(ctx, workflowID, ""), nil
+		}
+		return nil, nil
 	}
 	if err != nil {
-		return types.NewAppError(types.CodeInternal,
+		return nil, types.NewAppError(types.CodeInternal,
 			"start research V3 shadow workflow", err)
 	}
-	return nil
+	return run, nil
 }
 
 func (r researchV3Rollout) shadowIDMatch(taskID string) bool {
