@@ -34,6 +34,9 @@ func scanFetchTarget(row pgx.Row, target *types.FetchTarget) error {
 // created=true 表示本次真的新建。实现同 UpsertContentItem：ON CONFLICT DO NOTHING（冲突不
 // 返回行）+ 命中时回查一次拿既有 id。
 func (s *Store) GetOrCreateFetchTarget(ctx context.Context, target *types.FetchTarget) (id int64, created bool, err error) {
+	if s.legacyAdmissionIsClosed() {
+		return 0, false, legacyAdmissionClosed("fetch target")
+	}
 	cfg := target.Config
 	if len(cfg) == 0 {
 		cfg = json.RawMessage("{}")

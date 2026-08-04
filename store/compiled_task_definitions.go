@@ -61,6 +61,9 @@ func (s *Store) InsertPausedCompiledTaskDefinition(
 	ctx context.Context,
 	def types.PausedCompiledTaskDefinition,
 ) error {
+	if s.legacyAdmissionIsClosed() {
+		return legacyAdmissionClosed("compiled task definition v1")
+	}
 	plan, err := validatePausedCompiledTaskDefinition(def)
 	if err != nil {
 		return err

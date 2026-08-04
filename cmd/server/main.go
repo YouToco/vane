@@ -60,6 +60,11 @@ const vaneVersion = "0.5.1"
 // V3 execution remains on the independently authenticated research runtime.
 const serverReleaseContractV2 = "vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1"
 
+var (
+	_ task.CreationSagaStore       = (*store.LegacyAdmissionFencedStore)(nil)
+	_ task.TaskDefinitionEditStore = (*store.LegacyAdmissionFencedStore)(nil)
+)
+
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "-print-release-contract" {
 		fmt.Println(serverReleaseContractV2)
@@ -122,6 +127,11 @@ func run() error {
 	}
 	var researchControlStore *store.Store
 	closeStores := func() { closeServerStores(st, researchControlStore) }
+	legacyStore, err := store.NewLegacyAdmissionFencedStore(st)
+	if err != nil {
+		closeStores()
+		return fmt.Errorf("关闭 legacy control-plane admission: %w", err)
+	}
 	gatewayClient, err := researchgateway.NewUnixClientV1(cfg.ResearchGateway.SocketPath)
 	if err != nil {
 		closeStores()
@@ -552,14 +562,15 @@ func run() error {
 		return fmt.Errorf("装配周期 Brief recovery: %w", err)
 	}
 	creationCoordinator := task.NewCreationCoordinator(
-		st, sched, slog.Default(),
+		legacyStore, sched, slog.Default(),
 		task.WithResearchV3CreationPolicy(nativeResearchV3CreationPolicy()),
 	)
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns
 	// recovery for durable operations left by a prior process. The coordinator is
 	// intentionally retained only in this composition root: it is not injected
 	// into Agent, HTTP, Feishu, or the receipt dispatcher.
-	definitionEditCoordinator := task.NewTaskDefinitionEditCoordinator(st, sched, slog.Default())
+	definitionEditCoordinator := task.NewTaskDefinitionEditCoordinator(
+		legacyStore, sched, slog.Default())
 	var researchDefinitionEditCoordinator *task.ResearchTaskDefinitionEditCoordinatorV3
 	if researchControlStore != nil {
 		researchDefinitionEditCoordinator = task.NewResearchTaskDefinitionEditCoordinatorV3(

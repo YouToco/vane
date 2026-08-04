@@ -15,6 +15,9 @@ import (
 // set. Re-approving a target also clears an automatic failure pause; recovery
 // therefore happens through a task edit, never through source CRUD.
 func (s *Store) ReplaceTaskFetchTargets(ctx context.Context, userID int64, scheduleID string, targetIDs []int64) error {
+	if s.legacyAdmissionIsClosed() {
+		return legacyAdmissionClosed("task fetch targets")
+	}
 	if targetIDs == nil {
 		targetIDs = []int64{}
 	}

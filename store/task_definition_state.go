@@ -85,6 +85,10 @@ func (s *Store) InsertInitialApprovedDefinition(
 	definition taskstate.ApprovedDefinitionV1,
 	operationRef string,
 ) (ApprovedDefinitionVersionRecord, error) {
+	if s.legacyAdmissionIsClosed() {
+		return ApprovedDefinitionVersionRecord{},
+			legacyAdmissionClosed("initial approved definition v1")
+	}
 	payload, digest, normalizedDefinition, err := encodeApprovedDefinitionForStore(definition)
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
