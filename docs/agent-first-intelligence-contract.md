@@ -1,6 +1,6 @@
 # Agent-first 用户情报与证据契约
 
-> 状态：`vane.intelligence-catalog/v1`、唯一 Agent-first owner 工具面、V3 原生创建与原生编辑已落地；V3 真实任务迁移和旧路径物理删除按发布列车继续推进。
+> 状态：`vane.intelligence-catalog/v2`、唯一 Agent-first owner 工具面、V3 原生创建与原生编辑已落地；V3 真实任务迁移和旧路径物理删除按发布列车继续推进。
 
 ## 1. 产品边界
 
@@ -10,7 +10,7 @@
 
 ## 2. 固定语义目录
 
-目录版本 `vane.intelligence-catalog/v1` 只包含：
+目录版本 `vane.intelligence-catalog/v2` 包含 v1 的全部只读数据集，并新增 canonical 反馈查询：
 
 - `tasks`：任务名称、手册、调度、状态；
 - `runs`：不可变运行身份及终态；
@@ -19,6 +19,11 @@
 - `agent_turns`：用户原话、最终回复、引用的调用与动作回执；
 - `tool_calls`：模型实际看到的参数和结果；
 - `profile`：当前来源化用户画像。
+- `feedbacks`：推送后的追加式反馈事实、问题原因和当前有效态度；通过投递批次绑定任务与运行。
+
+v1 已封存到 `AgentToolEvidenceV1` 的历史结果保持原字节和原版本，不做猜测性重写。v2 对七个 v1 数据集保持字段和关系查询语义兼容；旧签名游标仍可继续同一查询，下一页会如实标记当前 catalog 为 v2。
+
+`feedbacks` 直接读取既有 canonical `feedbacks`，不复制成 Agent turn，也不创建专用反馈工具。`is_effective_attitude` 仅对 `interested/not_interested` 有值，并按当前画像 epoch 与 canonical supersession 规则确定；其他动作返回 null。旧 push-now 投递允许缺少 `task_ref/run_snapshot_id`，owner 仍可读取，定时 Agent 则由 exact-task fence 自动排除。`delivered_summary` 最多 2,000 字符，只用于把“刚才那条”关联回具体结论：migration 061 后已 sealed 的 canonical delivery 有不可变证据，旧/open delivery 仅是 `mixed` 的历史展示快照，不能宣称为 exact。Harness 会在通用查询返回前把该字段从可信反馈行删除，转成 historical public evidence sidecar；只有 Tools:nil 的公开摘要阶段能看到原文，最终无工具综合只看到来源绑定的降权摘要。数据集不返回内部 delivery ID、卡片 JSON 或原始网页正文。
 
 查询只接受列选择、参数化过滤、分组、固定聚合、排序、limit 与签名游标。单次只访问一个数据集；跨数据集问题由 Agent 发起多次只读查询，最后在无工具阶段综合。
 
