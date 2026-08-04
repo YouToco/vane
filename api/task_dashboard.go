@@ -120,7 +120,7 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 		Summary:  *summary,
 		Playbook: playbook, Cost: *cost,
 		Capabilities: scheduleCapabilitiesDTO{
-			DefinitionEdit: s.deps.DefinitionEditEnabled,
+			DefinitionEdit: true,
 		},
 	})
 }

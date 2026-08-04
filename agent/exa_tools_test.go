@@ -347,9 +347,9 @@ func TestExaTools_每日限额与failclosed(t *testing.T) {
 	}
 }
 
-// TestBuildTools_Exa装配 钉住装配语义：exa 非 nil 时两工具进白名单、nil 时工具面与
+// TestBuildPublicResearchTools_Exa装配 钉住装配语义：exa 非 nil 时两工具进白名单。
 // 上线前一致（key 未配置不广告用不了的工具，同 endpoints 语义）。
-func TestBuildTools_Exa装配(t *testing.T) {
+func TestBuildPublicResearchTools_Exa装配(t *testing.T) {
 	names := func(tools []ToolSpec) map[string]bool {
 		m := make(map[string]bool, len(tools))
 		for _, tl := range tools {
@@ -357,16 +357,16 @@ func TestBuildTools_Exa装配(t *testing.T) {
 		}
 		return m
 	}
-	with := names(BuildTools(nil, nil, nil, nil, NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)))
+	with := names(BuildPublicResearchTools(nil, NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)))
 	if !with["web_search"] || !with["read_page"] {
 		t.Errorf("exa 非 nil 时 web_search/read_page 必须在白名单，实得 %v", with)
 	}
-	without := names(BuildTools(nil, nil, nil, nil, nil))
+	without := names(BuildPublicResearchTools(nil, nil))
 	if without["web_search"] || without["read_page"] {
 		t.Errorf("exa=nil 时两工具不得出现（缺 key 不广告），实得 %v", without)
 	}
 	// 两工具成本由工具现有 cap 管理。
-	for _, tl := range BuildTools(nil, nil, nil, nil, NewExaTools(nil, nil, nil, 0)) {
+	for _, tl := range BuildPublicResearchTools(nil, NewExaTools(nil, nil, nil, 0)) {
 		if (tl.Name() == "web_search" || tl.Name() == "read_page") &&
 			tl.Policy.Budget != BudgetToolManaged {
 			t.Errorf("%s 策略不符: %+v", tl.Name(), tl.Policy)
@@ -378,7 +378,7 @@ func TestBuildTools_Exa装配(t *testing.T) {
 // 真装配时出现——缺 key 环境 prompt 不得广告白名单里不存在的工具（否则模型按
 // prompt 调用被白名单拒绝，浪费一轮还向用户食言）。
 func TestSystemPrompt_ExaNote条件注入(t *testing.T) {
-	const marker = "一次性需求"
+	const marker = "使用 web_search/read_page"
 	with := New(Deps{Tools: []ToolSpec{newToolSpec(
 		&webSearchTool{et: newTestExaTools(nil, nil)},
 		ownerPolicy(Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
@@ -392,9 +392,7 @@ func TestSystemPrompt_ExaNote条件注入(t *testing.T) {
 		t.Error("web_search 不在场时不得广告该工具（会制造白名单拒绝循环）")
 	}
 	// A2A 轨（自定义 prompt + 只读白名单，无 web_search）同样不得出现。
-	a2a := New(Deps{SystemPrompt: "A2A 语境", Tools: []ToolSpec{newToolSpec(
-		&listSchedulesTool{}, a2aReadPolicy(Effects(EffectInternalRead)),
-	)}})
+	a2a := New(Deps{SystemPrompt: "A2A 语境"})
 	if strings.Contains(a2a.sys, marker) {
 		t.Error("A2A 轨不得注入飞书轨的分流引导")
 	}

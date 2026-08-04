@@ -239,10 +239,6 @@ type PipelineConfig struct {
 // AgentConfig 是 agent loop 运行约束配置。
 type AgentConfig struct {
 	MaxTurns int `mapstructure:"max_turns"`
-	// DefinitionEditEnabled exposes the single C2b3-2d Agent/controller path.
-	// It is false by default until the real-card Gate and receipt dispatcher
-	// are completed; false omits the tool and controller from Agent entirely.
-	DefinitionEditEnabled bool `mapstructure:"definition_edit_enabled"`
 	// SessionTTLMinutes 是会话闲置过期窗口（分钟）：同一 owner 在窗口内的
 	// 消息共享一个多轮会话（上下文连续），超时后新开会话（契约 §0）。
 	SessionTTLMinutes int `mapstructure:"session_ttl_minutes"`
@@ -460,7 +456,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.push_effect_recovery_canary_schedule_id", "")
 
 	v.SetDefault("agent.max_turns", 20)
-	v.SetDefault("agent.definition_edit_enabled", false)
 	v.SetDefault("agent.session_ttl_minutes", 30)
 	v.SetDefault("agent.endpoint_daily_cap", 200)
 	v.SetDefault("agent.exa_daily_cap", 100)

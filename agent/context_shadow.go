@@ -171,33 +171,6 @@ func (l *Loop) buildShadowAgentContext(
 	tools := make([]agentcontext.Tool, 0, len(request.Tools))
 	for _, definition := range request.Tools {
 		spec, ok := l.resolveTool(definition.Name, state)
-		if !ok && definition.Name == taskDefinitionEditIntentTool.Name {
-			// The semantic edit-intent route is a schema-only model decision,
-			// not an executable Agent tool. It is nevertheless represented in
-			// the context shadow with a zero-effect owner-local policy so the
-			// adjudication call remains fully auditable.
-			tools = append(tools, agentcontext.Tool{
-				Definition: agentcontext.ToolDefinition{
-					Name: definition.Name, Description: definition.Description,
-					Parameters: append(
-						json.RawMessage(nil),
-						definition.Parameters...,
-					),
-				},
-				Policy: agentcontext.PolicySnapshot{
-					Version:       agentcontext.PolicyVersion,
-					Effects:       0,
-					Authorization: uint8(AuthorizationOwner),
-					Budget:        uint8(BudgetNone),
-					Retry:         uint8(RetryNone),
-					Concurrency:   uint8(ConcurrencySequential),
-					Exposure:      uint8(ExposureContext),
-					Intents:       uint16(IntentTasks),
-					ResultTrust:   uint8(ResultTrustLocal),
-				},
-			})
-			continue
-		}
 		if !ok {
 			return agentcontext.CandidateSnapshot{},
 				agentContextShadowError()

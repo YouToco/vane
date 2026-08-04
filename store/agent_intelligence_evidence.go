@@ -47,6 +47,71 @@ type AgentTurnRecordV1 struct {
 	ToolEvidence     []AgentToolEvidenceV1
 }
 
+// AgentTurnReplayV1 is the minimum durable projection required to replay a
+// completed authenticated ingress without asking the model or repeating a
+// side effect. Hidden prompts, policy and tool bodies are deliberately absent.
+type AgentTurnReplayV1 struct {
+	UserMessage      string
+	AssistantMessage string
+}
+
+// FindAgentTurnReplayV1 returns the exact completed turn for a stable trace.
+// The authenticated tenant/user scope is enforced again through RLS, so the
+// trace never becomes a bearer token. NotFound means the original turn did
+// not reach its atomic evidence commit and may reuse the same stable trace.
+func (s *Store) FindAgentTurnReplayV1(
+	ctx context.Context,
+	tenantID, userID int64,
+	traceID string,
+) (AgentTurnReplayV1, error) {
+	if tenantID <= 0 || userID <= 0 || !validEvidenceID(traceID) {
+		return AgentTurnReplayV1{}, types.NewAppError(
+			types.CodeValidation, "Agent turn 重放范围无效", types.ErrValidation)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return AgentTurnReplayV1{}, types.NewAppError(
+			types.CodeDatabase, "开启 Agent turn 重放事务", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SET LOCAL search_path = pg_catalog, public, pg_temp`); err != nil {
+		return AgentTurnReplayV1{}, types.NewAppError(
+			types.CodeDatabase, "固定 Agent turn 重放查询路径", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		strconv.FormatInt(tenantID, 10), strconv.FormatInt(userID, 10)); err != nil {
+		return AgentTurnReplayV1{}, types.NewAppError(
+			types.CodeDatabase, "设置 Agent turn 重放身份范围", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		return AgentTurnReplayV1{}, types.NewAppError(
+			types.CodeDatabase, "进入 Agent turn 重放运行角色", err)
+	}
+	var replay AgentTurnReplayV1
+	err = tx.QueryRow(ctx,
+		`SELECT user_message,assistant_message
+		   FROM agent_turn_records
+		  WHERE tenant_id=$1 AND user_id=$2 AND trace_id=$3`,
+		tenantID, userID, traceID,
+	).Scan(&replay.UserMessage, &replay.AssistantMessage)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AgentTurnReplayV1{}, types.NewAppError(
+			types.CodeNotFound, "Agent turn 重放记录不存在", types.ErrNotFound)
+	}
+	if err != nil {
+		return AgentTurnReplayV1{}, types.NewAppError(
+			types.CodeDatabase, "读取 Agent turn 重放记录", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AgentTurnReplayV1{}, types.NewAppError(
+			types.CodeDatabase, "提交 Agent turn 重放事务", err)
+	}
+	return replay, nil
+}
+
 // CommitAgentTurnRecordV1 atomically seals every model-visible tool result and
 // the final user/assistant turn. Exact replay is idempotent; a reused identity
 // carrying different bytes fails closed.

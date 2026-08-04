@@ -71,7 +71,7 @@ func NewExaTools(
 	}
 }
 
-// SearchTool 返回 web_search（进静态白名单，BuildTools 装配）。
+// SearchTool 返回 web_search（进静态白名单）。
 func (e *ExaTools) SearchTool() ToolSpec {
 	return newToolSpec(&webSearchTool{et: e}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
@@ -79,7 +79,7 @@ func (e *ExaTools) SearchTool() ToolSpec {
 		ExposureAlways, IntentWebResearch, ResultTrustExternal, false))
 }
 
-// ReadPageTool 返回 read_page（进静态白名单，BuildTools 装配）。
+// ReadPageTool 返回 read_page（进静态白名单）。
 func (e *ExaTools) ReadPageTool() ToolSpec {
 	return newToolSpec(&readPageTool{et: e}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),

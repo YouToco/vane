@@ -10,7 +10,6 @@ import (
 	"github.com/YouToco/vane/agentcontext"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
@@ -31,6 +30,80 @@ type fakeAgentEvidenceWriter struct {
 	userID   int64
 	record   store.AgentTurnRecordV1
 	err      error
+}
+
+type fakeAgentTurnReplayReader struct {
+	replay store.AgentTurnReplayV1
+	err    error
+	calls  int
+}
+
+func (f *fakeAgentTurnReplayReader) FindAgentTurnReplayV1(
+	context.Context, int64, int64, string,
+) (store.AgentTurnReplayV1, error) {
+	f.calls++
+	return f.replay, f.err
+}
+
+func TestWebTaskActionReplaysCompletedTurnWithoutModelCall(t *testing.T) {
+	reader := &fakeAgentTurnReplayReader{replay: store.AgentTurnReplayV1{
+		UserMessage: "创建 Kimi 套餐监控", AssistantMessage: "任务已创建。",
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(), Profiles: newFakeStore(),
+		Tools: ownerTestTools(), Evidence: &fakeAgentEvidenceWriter{},
+		TurnReplay: reader, OwnerAgent: true,
+	})
+	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+		t.Fatal("durable replay must not call the model")
+		return nil, nil
+	}
+	out, err := loop.HandleWebTaskActionMessage(
+		t.Context(), 7, "a58d8934-3b23-420c-b58a-93c0208e186d", "",
+		"创建 Kimi 套餐监控",
+	)
+	if err != nil || out.Reply != "任务已创建。" || reader.calls != 1 {
+		t.Fatalf("out=%+v calls=%d err=%v", out, reader.calls, err)
+	}
+}
+
+func TestWebTaskActionRejectsRequestIDReusedWithDifferentMessage(t *testing.T) {
+	reader := &fakeAgentTurnReplayReader{replay: store.AgentTurnReplayV1{
+		UserMessage: "创建 A", AssistantMessage: "已创建 A。",
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(), Profiles: newFakeStore(),
+		Tools: ownerTestTools(), Evidence: &fakeAgentEvidenceWriter{},
+		TurnReplay: reader, OwnerAgent: true,
+	})
+	_, err := loop.HandleWebTaskActionMessage(
+		t.Context(), 7, "d364eb61-a52c-4ddb-8efa-b47fb8c23dc7", "", "创建 B",
+	)
+	if !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("err=%v, want conflict", err)
+	}
+}
+
+func TestWebTaskActionUsesStableActionIDAsEvidenceTrace(t *testing.T) {
+	const actionID = "58ed32df-4bbd-4e06-b9fe-fae2a954c460"
+	reader := &fakeAgentTurnReplayReader{err: types.NewAppError(
+		types.CodeNotFound, "missing", types.ErrNotFound,
+	)}
+	writer := &fakeAgentEvidenceWriter{}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs, Tools: ownerTestTools(), Evidence: writer,
+		TurnReplay: reader, OwnerAgent: true, MaxTurns: 1,
+	})
+	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+		return &llm.ChatResponse{Content: "请补充监控频率？"}, nil
+	}
+	out, err := loop.HandleWebTaskActionMessage(
+		t.Context(), 7, actionID, "", "创建 Kimi 套餐监控",
+	)
+	if err != nil || out.Reply == "" || writer.record.TurnID != actionID {
+		t.Fatalf("out=%+v trace=%q err=%v", out, writer.record.TurnID, err)
+	}
 }
 
 func (f *fakeAgentEvidenceWriter) CommitAgentTurnRecordV1(
@@ -145,58 +218,6 @@ func TestOwnerAgentRequiresExactEvidenceAndOrthogonalCatalog(t *testing.T) {
 	if _, err := NewChecked(Deps{OwnerAgent: true,
 		Evidence: &fakeAgentEvidenceWriter{}}); err == nil {
 		t.Fatal("owner Agent accepted a catalog without required tools")
-	}
-}
-
-func TestDirectWebEditSealsExactEvidenceAndActionReceipt(t *testing.T) {
-	writer := &fakeAgentEvidenceWriter{}
-	controller := &fakeDefinitionEditController{execute: task.TaskDefinitionEditOutcome{
-		Status: types.TaskDefinitionEditOperationStatusCompleted,
-		TaskID: "task-direct-internal-7ab4",
-	}}
-	tool := newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(Effects(
-		EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite,
-	), BudgetNone))
-	loop := New(Deps{
-		Tools: []ToolSpec{tool}, Evidence: writer,
-		TaskDefinitionEdit: controller, MaxTurns: 2,
-	})
-	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
-		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-			ID: "direct-edit-provider-call", Name: definitionEditToolName,
-			Arguments: `{"task_id":"task-direct-internal-7ab4","intent":"只推送重大更新"}`,
-		}}}, nil
-	}
-	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
-		traceID: "trace-direct-edit", userID: 42,
-		scope: agentcontext.Scope{TenantID: 7, UserID: 42, SessionID: 9},
-	})
-	sessionID := int64(9)
-	state := &toolRunState{
-		activation: &activationState{}, ownerRequest: "把 Kimi 任务改成只推重大更新",
-		agentFirstEnabled: true, directTaskDefinitionEditID: "task-direct-internal-7ab4",
-		directActionID:  "operation-direct-internal-8bc5",
-		successfulCalls: map[string]struct{}{}, failedCalls: map[string]int{},
-	}
-	outcome, _, _, err := loop.converse(ctx, 42, &sessionID,
-		[]llm.ChatMessage{{Role: "user", Content: state.ownerRequest}}, "", state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if outcome.Reply != "已修改定时推送任务。" || len(writer.record.ToolEvidence) != 1 {
-		t.Fatalf("outcome=%+v record=%+v", outcome, writer.record)
-	}
-	evidence := writer.record.ToolEvidence[0]
-	if evidence.InvocationID != "direct-edit-provider-call" ||
-		evidence.ToolName != definitionEditToolName ||
-		string(evidence.Result) != outcome.Reply ||
-		!strings.Contains(string(evidence.Arguments), "task-direct-internal-7ab4") {
-		t.Fatalf("evidence=%+v", evidence)
-	}
-	if !strings.Contains(string(writer.record.ActionReceipts), `"action":"edit"`) ||
-		!strings.Contains(string(writer.record.ActionReceipts), "operation-direct-internal-8bc5") ||
-		!strings.Contains(string(writer.record.ActionReceipts), "task-direct-internal-7ab4") {
-		t.Fatalf("receipts=%s", writer.record.ActionReceipts)
 	}
 }
 

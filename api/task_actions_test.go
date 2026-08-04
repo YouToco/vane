@@ -33,25 +33,18 @@ func (f *fakeTaskActionAgent) HandleMessage(
 	return f.result()
 }
 
-func (f *fakeTaskActionAgent) HandleTaskCreationMessage(
-	_ context.Context,
-	userID int64,
-	actionID string,
-	text string,
-) (agent.Outcome, error) {
-	f.createCalls++
-	f.userID, f.actionID, f.text = userID, actionID, text
-	return f.result()
-}
-
-func (f *fakeTaskActionAgent) HandleTaskDefinitionEditMessage(
+func (f *fakeTaskActionAgent) HandleWebTaskActionMessage(
 	_ context.Context,
 	userID int64,
 	actionID string,
 	taskID string,
 	text string,
 ) (agent.Outcome, error) {
-	f.editCalls++
+	if taskID == "" {
+		f.createCalls++
+	} else {
+		f.editCalls++
+	}
 	f.userID, f.actionID, f.taskID, f.text = userID, actionID, taskID, text
 	return f.result()
 }
@@ -66,8 +59,7 @@ func (f *fakeTaskActionAgent) result() (agent.Outcome, error) {
 func TestWebTaskActionExecutesNaturalLanguageDirectly(t *testing.T) {
 	taskAgent := &fakeTaskActionAgent{}
 	deps, cookie := authedDeps(t, Deps{
-		TaskAgent:             taskAgent,
-		DefinitionEditEnabled: true,
+		TaskAgent: taskAgent,
 	})
 	mux := http.NewServeMux()
 	Mount(mux, deps)

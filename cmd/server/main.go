@@ -772,9 +772,6 @@ func run() error {
 	// Legacy v0 create_schedule cards are deliberately drained without execution
 	// in Loop.ExecuteAction. Passing no legacy creator makes the old active-first
 	// CreatePush path unreachable even if that guard regresses.
-	definitionEditController := task.NewDefinitionEditController(
-		st, definitionEditCoordinator,
-	)
 	authorizer := agent.NewModelOwnerActionAuthorizer(
 		agentLLMClient, recorder, cfg.LLM.AgentModel,
 	)
@@ -811,43 +808,13 @@ func run() error {
 		Endpoints:        endpoints,
 		ToolCalls:        agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
 		Evidence:         st,
-		TaskCreation:     creationCoordinator,
-		// The current controller serves direct durable execution only.
-		TaskDefinitionEdit: definitionEditController,
+		TurnReplay:       st,
 	})
 	if err != nil {
 		closeServerStartupResources(temporalClient.Close, closeStores)
 		return fmt.Errorf("装配 Agent 工具注册表: %w", err)
 	}
 	manager.SetAgent(agentLoop)
-
-	// The Dashboard create/edit endpoint remains an explicit compatibility
-	// consumer until it is migrated to manage_tasks. It receives a separate
-	// Loop and catalog; owner chat and A2A can never fall back to it.
-	var definitionEditToolController agent.DefinitionEditController
-	if cfg.Agent.DefinitionEditEnabled {
-		definitionEditToolController = definitionEditController
-	}
-	webTaskLoop, err := agent.NewChecked(agent.Deps{
-		Client:   agentLLMClient,
-		Recorder: recorder,
-		Store:    st,
-		Tools: agent.BuildTools(
-			st, sched, sched, nil, nil, definitionEditToolController,
-		),
-		Model:              cfg.LLM.AgentModel,
-		MaxTurns:           cfg.Agent.MaxTurns,
-		SessionTTL:         time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
-		SessionAdmission:   sessionAdmission,
-		ToolCalls:          agent.NewToolCallRecorder(st),
-		Evidence:           st,
-		TaskCreation:       creationCoordinator,
-		TaskDefinitionEdit: definitionEditController,
-	})
-	if err != nil {
-		closeServerStartupResources(temporalClient.Close, closeStores)
-		return fmt.Errorf("装配 Web 任务兼容 Agent: %w", err)
-	}
 
 	// Build the A2A agent before any worker or recovery goroutine starts. A
 	// composition error is then an ordinary startup failure: no admitted work
@@ -1215,9 +1182,6 @@ func run() error {
 		if err := agentLoop.DrainSessionWrites(sessionCtx); err != nil {
 			return fmt.Errorf("排空 Agent 会话回写: %w", err)
 		}
-		if err := webTaskLoop.DrainSessionWrites(sessionCtx); err != nil {
-			return fmt.Errorf("排空 Web 任务 Agent 会话回写: %w", err)
-		}
 		return nil
 	}
 
@@ -1236,13 +1200,12 @@ func run() error {
 	principals := auth.NewOwnerResolver(st, feishu.SettingKeyOwner)
 
 	api.Mount(mux, api.Deps{
-		Store:                 st,
-		Auth:                  st,
-		Manager:               manager,
-		Scheduler:             sched,
-		TaskAgent:             webTaskLoop,
-		BriefFeedback:         fbSvc,
-		DefinitionEditEnabled: cfg.Agent.DefinitionEditEnabled,
+		Store:         st,
+		Auth:          st,
+		Manager:       manager,
+		Scheduler:     sched,
+		TaskAgent:     agentLoop,
+		BriefFeedback: fbSvc,
 		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
 			ExecutiveBriefWebCanaryScheduleID,
 		ExecutiveBriefWebProjectionAllowAll: cfg.Pipeline.

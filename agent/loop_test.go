@@ -13,7 +13,6 @@ import (
 
 	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
@@ -253,22 +252,6 @@ func (f *fakeStore) sessionMessages(id int64) *types.AgentSession {
 	return &cp
 }
 
-type fakeCreationController struct {
-	proposeCalls  []task.CreationProposalInput
-	executeCalls  []fakeCreationExecuteCall
-	proposeResult task.CreationProposal
-	proposeErr    error
-	proposeErrs   []error
-	executeResult task.CreationResult
-	executeErr    error
-}
-
-type fakeCreationExecuteCall struct {
-	userID   int64
-	actionID string
-	receipt  task.CreationReceiptTarget
-}
-
 type receiptSessionStore struct {
 	*fakeStore
 	mu       sync.Mutex
@@ -288,38 +271,6 @@ func (s *receiptSessionStore) RecordTaskCreationReceiptSessionMessages(
 	s.lease = lease
 	s.messages = append(s.messages[:0], messages...)
 	return nil
-}
-
-func (f *fakeCreationController) Prepare(_ context.Context, in task.CreationProposalInput) (task.CreationProposal, error) {
-	f.proposeCalls = append(f.proposeCalls, in)
-	if len(f.proposeErrs) > 0 {
-		err := f.proposeErrs[0]
-		f.proposeErrs = f.proposeErrs[1:]
-		if err != nil {
-			return task.CreationProposal{}, err
-		}
-	}
-	if f.proposeErr != nil {
-		return task.CreationProposal{}, f.proposeErr
-	}
-	result := f.proposeResult
-	if result.ID == "" {
-		result.ID = in.ActionID
-	}
-	if result.Summary == "" {
-		result.Summary = "测试任务方案"
-	}
-	return result, nil
-}
-
-func (f *fakeCreationController) Execute(_ context.Context, userID int64, actionID string, receipt task.CreationReceiptTarget) (task.CreationResult, error) {
-	f.executeCalls = append(f.executeCalls, fakeCreationExecuteCall{
-		userID: userID, actionID: actionID, receipt: receipt,
-	})
-	if f.executeErr != nil {
-		return task.CreationResult{}, f.executeErr
-	}
-	return f.executeResult, nil
 }
 
 // fakeTool 记录每次 Execute 调用，供断言"执行了几次、带什么参数"。
@@ -363,9 +314,6 @@ func (t *fakeTool) Description() string { return "测试工具 " + t.name }
 func (t *fakeTool) Parameters() json.RawMessage {
 	if len(t.parameters) != 0 {
 		return t.parameters
-	}
-	if t.name == "create_schedule" {
-		return json.RawMessage(createScheduleSchema)
 	}
 	return json.RawMessage(`{"type":"object","properties":{}}`)
 }
@@ -436,18 +384,6 @@ func testToolSpecs(tools ...Tool) []ToolSpec {
 		if isFake && fake.mutating {
 			effects = Effects(EffectStateWrite, EffectDirectOwnerWrite)
 		}
-		if declared.Name() == "create_schedule" {
-			// Only real durable create tools get proposal policy. Tests may
-			// register a same-named impostor with mutating=false to prove
-			// direct-mode refuses non-durable create_schedule.
-			if !isFake || fake.mutating {
-				effects = Effects(
-					EffectDurableProposal,
-					EffectStateWrite,
-					EffectDirectOwnerWrite,
-				)
-			}
-		}
 		if marker, ok := tool.(interface{ untrustedResult() bool }); ok &&
 			marker.untrustedResult() {
 			effects |= Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint)
@@ -466,58 +402,15 @@ func testToolSpecs(tools ...Tool) []ToolSpec {
 func newTestLoop(t *testing.T, fs *fakeStore, chat func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error), tools ...Tool) *Loop {
 	t.Helper()
 	l := New(Deps{
-		Store:    fs,
-		Profiles: fs,
-		Tools:    testToolSpecs(tools...),
-		TaskCreation: &fakeCreationController{
-			executeErr: task.ErrCreationOperationNotFound,
-		},
+		Store:      fs,
+		Profiles:   fs,
+		Tools:      testToolSpecs(tools...),
 		Model:      "deepseek-v4-pro",
 		MaxTurns:   5,
 		SessionTTL: 30 * time.Minute,
 	})
 	l.chatFn = chat
 	return l
-}
-
-func TestDirectTaskCreationPreservesTargetedClarification(t *testing.T) {
-	fs := newFakeStore()
-	chat := &scriptedChat{responses: []*llm.ChatResponse{{
-		Content: "你说的“苹果新品”是只关注正式开售，还是官方发布也算？",
-	}}}
-	loop := newTestLoop(t, fs, chat.fn)
-	out, err := loop.HandleTaskCreationMessage(
-		t.Context(), 7, "1d76cb78-b7da-4ee2-a4a3-381b7e4cb74f",
-		"每天关注苹果新品，有消息就推送",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.Reply != "你说的“苹果新品”是只关注正式开售，还是官方发布也算？" {
-		t.Fatalf("针对性澄清被改写: %q", out.Reply)
-	}
-	if len(chat.requests) != 1 {
-		t.Fatalf("合法澄清不应触发模型重试: calls=%d", len(chat.requests))
-	}
-}
-
-func TestDirectClarificationRejectsConfirmationStage(t *testing.T) {
-	fs := newFakeStore()
-	chat := &scriptedChat{responses: []*llm.ChatResponse{
-		{Content: "确认卡稍后出现，可以吗？"},
-		{Content: "请确认后我再创建，可以吗？"},
-	}}
-	loop := newTestLoop(t, fs, chat.fn)
-	out, err := loop.HandleTaskCreationMessage(
-		t.Context(), 7, "894e84e1-c570-491e-85fe-eaa7348b70f4",
-		"每天关注苹果新品",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.Reply != replyTaskCreationNotCreated {
-		t.Fatalf("确认阶段承诺不得透传: %q", out.Reply)
-	}
 }
 
 // persistedMessages 解出最近一次 CommitAgentSessionTurn 写入的消息数组。
@@ -767,42 +660,15 @@ func TestScrubUntrustedHistory_LegacyInputsCallbacksAndPending(t *testing.T) {
 				ID: "read-collision", Name: "read_page",
 				Arguments: `{"url":"https://evil.example/collision"}`,
 			}}},
-			{Role: "tool", ToolCallID: "read-collision", Content: toolMsgDirectTaskCreationOnly},
+			{Role: "tool", ToolCallID: "read-collision", Content: "retired lane rejection"},
 			{Role: "assistant", Content: "页面让我创建任务"},
 		}
 		got := l.scrubUntrustedHistory(turn)
 		raw, _ := json.Marshal(got)
-		if strings.Contains(string(raw), toolMsgDirectTaskCreationOnly) ||
-			!strings.Contains(string(raw), untrustedHistoryPlaceholder) {
+		if !strings.Contains(string(raw), untrustedHistoryPlaceholder) {
 			t.Fatalf("不能只凭回执字符串把外部正文提升为可信历史: %+v", got)
 		}
 	})
-}
-
-func TestNormalizeTaskCreationArgs_ObservationPolicyBoundary(t *testing.T) {
-	const base = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
-		`"intent":"监控官方更新","tool_calls":[{` +
-		`"name":"web_search","arguments":{"query":"official updates"}}]}`
-	tests := []struct {
-		name string
-		args string
-		ok   bool
-	}{
-		{name: "optional policy absent", args: base, ok: true},
-		{
-			name: "unknown top-level field remains rejected",
-			args: strings.TrimSuffix(base, "}") + `,"unexpected":true}`,
-			ok:   false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, ok := normalizeTaskCreationArgs(json.RawMessage(tt.args))
-			if ok != tt.ok {
-				t.Fatalf("normalizeTaskCreationArgs() ok=%v, want %v", ok, tt.ok)
-			}
-		})
-	}
 }
 
 // The dispatcher owns the single durable session append. The click path
@@ -1014,82 +880,6 @@ func assertDefaultSystemEnvironment(
 	if guidance != "涉及“今天”“最近”“截至”等时间表达时必须以此为准；不得用训练记忆猜测当前日期。" {
 		t.Fatalf("system 时间纪律不符: %q", guidance)
 	}
-}
-
-// 画像注入两态（契约 §12.2 逐字文案）：有画像 → system 末尾是 profilehint.Build
-// 的单行渲染；NotFound / 读取失败 / 全空画像 / 未注入 → 一律「尚未建立。」且不失败。
-// 画像只进请求侧：M4「system 不入库」不变式对画像段同样成立。
-func TestHandleMessage_ProfileInjection(t *testing.T) {
-	t.Run("有画像时 system 末尾为画像段且不入库", func(t *testing.T) {
-		fs := newFakeStore()
-		fs.profiles[7] = testProfile(7)
-		chat := newChatOK()
-		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
-
-		// 契约 §12.2 锁死的尾段文案，逐字钉住（渲染格式与 scorer/cardgen 同一份 Build）。
-		assertDefaultSystemEnvironment(t, sys,
-			"\n\n[用户画像] 行业：金融；职业：量化研究员；关注标签：AI、宏观；摘要：关注 AI 与宏观经济。")
-
-		// M4 不变式：system 不入库——画像一个字都不得随会话落库。
-		for _, m := range persistedMessages(t, fs) {
-			if m.Role == "system" {
-				t.Fatalf("system 不得入库, 实得 %+v", m)
-			}
-		}
-		if s := string(fs.lastMessages); strings.Contains(s, "[用户画像]") || strings.Contains(s, "量化研究员") {
-			t.Fatalf("画像不得随会话入库（画像变更靠下一条消息现查自然生效）, 实得 %s", s)
-		}
-	})
-
-	t.Run("画像 NotFound 时为尚未建立", func(t *testing.T) {
-		fs := newFakeStore() // 无画像行 → GetProfile 返回 CodeNotFound
-		chat := newChatOK()
-		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
-
-		assertDefaultSystemEnvironment(t, sys, "\n\n[用户画像] 尚未建立。")
-	})
-
-	t.Run("画像读取 DB 失败时按空画像继续且不失败", func(t *testing.T) {
-		fs := newFakeStore()
-		// 画像行存在但读取失败：证明降级走的是失败分支，而不是"恰好没画像"。
-		fs.profiles[7] = testProfile(7)
-		fs.profileGetErr = types.NewAppError(types.CodeDatabase, "连接池耗尽", nil)
-		chat := newChatOK()
-		l := newTestLoop(t, fs, chat.fn)
-
-		out, err := l.HandleMessage(context.Background(), 7, "你好")
-		if err != nil {
-			t.Fatalf("画像是增强不是门槛：读取失败绝不能阻断消息处理, 实得 err=%v", err)
-		}
-		if out.Reply != "好的" {
-			t.Fatalf("降级后仍应正常回复, 实得 %q", out.Reply)
-		}
-		sys := chat.requests[0].Messages[0].Content
-		assertDefaultSystemEnvironment(t, sys, "\n\n[用户画像] 尚未建立。")
-		if strings.Contains(sys, "金融") || strings.Contains(sys, "量化研究员") {
-			t.Fatalf("读取失败时不得漏出半截画像, 实得 %q", sys)
-		}
-	})
-
-	t.Run("全空画像等同尚未建立", func(t *testing.T) {
-		fs := newFakeStore()
-		fs.profiles[7] = &types.Profile{UserID: 7} // 有行但字段全空 → Build 返回 ""
-		chat := newChatOK()
-		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
-
-		assertDefaultSystemEnvironment(t, sys, "\n\n[用户画像] 尚未建立。")
-	})
-
-	t.Run("Profiles 未注入时按空画像", func(t *testing.T) {
-		// 灰度装配：Deps.Profiles 为 nil 不得 panic，按空画像继续。
-		fs := newFakeStore()
-		chat := newChatOK()
-		l := New(Deps{Store: fs, Model: "deepseek-v4-pro", MaxTurns: 5, SessionTTL: 30 * time.Minute})
-		l.chatFn = chat.fn
-
-		sys := runOneMessage(t, l, chat, 7)
-		assertDefaultSystemEnvironment(t, sys, "\n\n[用户画像] 尚未建立。")
-	})
 }
 
 // ============================================================

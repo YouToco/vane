@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/internal/strictjson"
@@ -21,6 +22,8 @@ const (
 	manageTasksName           = "manage_tasks"
 	manageTasksBatchMax       = 20
 	manageTasksAmbiguousReply = "这条写指令仍有歧义，本次未执行。请只针对缺失信息自然追问一次，不要让用户提供内部 ID，也不要发送确认卡。"
+	webActionBoundaryReply    = "本次 Web 任务操作与当前页面的可信动作范围不一致，已拒绝且未执行。"
+	durableOperationTTL       = 24 * time.Hour
 )
 
 // OwnerActionDecision is the result of the single write-boundary adjudication.
@@ -141,7 +144,7 @@ type ManageTasksDeps struct {
 }
 
 // NewManageTasksTool builds the single task mutation surface. It is separate
-// from BuildTools while the fixed owner lane coexists with legacy direct Web lanes.
+// through the single owner Agent catalog.
 func NewManageTasksTool(deps ManageTasksDeps) ToolSpec {
 	return newToolSpec(&manageTasksTool{deps: deps}, withToolSurface(ownerPolicy(
 		Effects(EffectDurableProposal, EffectStateWrite, EffectDelivery,
@@ -280,6 +283,9 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 	if err != nil {
 		return "当前写操作缺少认证上下文，本次未执行。", nil
 	}
+	if !claimWebManageTasksAction(state, args, refs) {
+		return webActionBoundaryReply, nil
+	}
 	if t.deps.Authorizer == nil {
 		return "任务管理能力当前未完整装配，本次未执行。", nil
 	}
@@ -339,6 +345,69 @@ func (t *manageTasksTool) Execute(ctx context.Context, userID int64, raw json.Ra
 		return "", err
 	}
 	return result, nil
+}
+
+func validateWebActionToolCall(
+	state *toolRunState, spec ToolSpec, raw json.RawMessage,
+) (string, bool) {
+	if state == nil || state.webActionMode == webActionNone ||
+		!toolPolicyMayMutate(spec.Policy.Effects) {
+		return "", true
+	}
+	if spec.Name() != manageTasksName {
+		return webActionBoundaryReply, false
+	}
+	args, refs, message := decodeManageTasksArgs(raw)
+	if message != "" {
+		// Invalid arguments cannot reach a side effect; let manage_tasks return
+		// its precise schema error so the model can repair within the same route.
+		return "", true
+	}
+	if !webManageTasksActionAllowed(state, args, refs) {
+		return webActionBoundaryReply, false
+	}
+	return "", true
+}
+
+func toolPolicyMayMutate(effects EffectSet) bool {
+	return effects.Has(EffectStateWrite) || effects.Has(EffectDelivery) ||
+		effects.Has(EffectDurableProposal) || effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite)
+}
+
+func webManageTasksActionAllowed(
+	state *toolRunState, args manageTasksArgs, refs []string,
+) bool {
+	if state == nil || state.webActionMode == webActionNone {
+		return true
+	}
+	switch state.webActionMode {
+	case webActionCreate:
+		return args.Action == "create" && len(refs) == 0 &&
+			state.webSelectedTaskRef == ""
+	case webActionEdit:
+		return args.Action == "edit" && len(refs) == 1 &&
+			refs[0] == state.webSelectedTaskRef &&
+			state.webSelectedTaskRef != ""
+	default:
+		return false
+	}
+}
+
+func claimWebManageTasksAction(
+	state *toolRunState, args manageTasksArgs, refs []string,
+) bool {
+	if !webManageTasksActionAllowed(state, args, refs) {
+		return false
+	}
+	if state == nil || state.webActionMode == webActionNone {
+		return true
+	}
+	if state.webActionClaimed {
+		return false
+	}
+	state.webActionClaimed = true
+	return true
 }
 
 func deterministicManageTasksResult(
@@ -703,7 +772,7 @@ func (t *manageTasksTool) executeAuthorized(ctx context.Context, meta chatMeta, 
 		if err != nil {
 			return "", nil, err
 		}
-		actionID := manageTaskCreateIdempotencyKey(meta, args)
+		actionID := manageTaskCreateIdempotencyKey(meta)
 		sessionID := meta.scope.SessionID
 		outcome, err := t.deps.Creator.ExecuteResearchTaskCreationV3(ctx,
 			ResearchTaskCreationV3Input{
@@ -865,11 +934,14 @@ func (t *manageTasksTool) executeAuthorized(ctx context.Context, meta chatMeta, 
 	}
 }
 
-func manageTaskCreateIdempotencyKey(meta chatMeta, args manageTasksArgs) string {
-	changes, _ := args.authorizationChanges()
+func manageTaskCreateIdempotencyKey(meta chatMeta) string {
+	// A stable authenticated turn is the idempotency namespace. In particular,
+	// do not include model-generated task fields: after an HTTP response loss a
+	// repeated model pass may render equivalent fields differently, and letting
+	// that drift create another action ID could duplicate the task.
 	digest := sha256.Sum256([]byte(fmt.Sprintf(
-		"manage_tasks/v1\x00%d\x00%d\x00%s\x00create\x00%s",
-		meta.scope.TenantID, meta.scope.UserID, meta.traceID, changes,
+		"manage_tasks/v1\x00%d\x00%d\x00%s\x00create",
+		meta.scope.TenantID, meta.scope.UserID, meta.traceID,
 	)))
 	return "manage-task-v1-" + hex.EncodeToString(digest[:16])
 }

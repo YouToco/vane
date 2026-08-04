@@ -1,6 +1,6 @@
 package agent
 
-func legacyGeneralChatTool(name string) bool {
+func retiredOwnerToolName(name string) bool {
 	switch name {
 	case "list_schedules", "view_task_playbook", "view_task_latest_run",
 		"view_profile", "create_schedule", "edit_task_definition",
@@ -8,19 +8,6 @@ func legacyGeneralChatTool(name string) bool {
 		return true
 	default:
 		return false
-	}
-}
-
-func explicitOwnerToolIntent(toolName, _ string) bool {
-	switch toolName {
-	case "remove_schedule", "run_task_now", "create_schedule",
-		"update_profile":
-		// Task mutations/delivery are never authorized lexically. The isolated
-		// semantic action gate (or the dedicated direct-creation lane) must name
-		// the exact allowed tool for this turn.
-		return false
-	default:
-		return true
 	}
 }
 

@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/YouToco/vane/agent"
 )
 
 const maxWebTaskActionTextBytes = 8 << 10
@@ -58,10 +56,6 @@ func (s *server) handleExecuteTaskAction(w http.ResponseWriter, r *http.Request)
 	mode := "create"
 	if req.TaskID != "" {
 		mode = "edit"
-		if !s.deps.DefinitionEditEnabled {
-			writeError(w, http.StatusServiceUnavailable, "任务编辑能力尚未开启")
-			return
-		}
 	}
 	if !validWebTaskActionRequestID(req.RequestID, mode, req.TaskID, req.Text) {
 		writeError(
@@ -90,16 +84,9 @@ func (s *server) handleExecuteTaskAction(w http.ResponseWriter, r *http.Request)
 	}
 	defer s.finishTaskActionExecution(userID)
 
-	var outcome agent.Outcome
-	if req.TaskID == "" {
-		outcome, err = s.deps.TaskAgent.HandleTaskCreationMessage(
-			r.Context(), userID, operationID, req.Text,
-		)
-	} else {
-		outcome, err = s.deps.TaskAgent.HandleTaskDefinitionEditMessage(
-			r.Context(), userID, operationID, req.TaskID, req.Text,
-		)
-	}
+	outcome, err := s.deps.TaskAgent.HandleWebTaskActionMessage(
+		r.Context(), userID, operationID, req.TaskID, req.Text,
+	)
 	if err != nil {
 		writeAppError(w, err)
 		return

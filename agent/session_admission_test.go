@@ -3,11 +3,12 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/task"
+	"github.com/YouToco/vane/types"
 )
 
 func TestSharedSessionAdmissionSerializesOwnerAndWebForSameUser(t *testing.T) {
@@ -46,9 +47,9 @@ func TestSharedSessionAdmissionSerializesOwnerAndWebForSameUser(t *testing.T) {
 	webDone := make(chan result, 1)
 	go func() {
 		close(webStarted)
-		out, err := web.HandleTaskCreationMessage(
+		out, err := web.HandleWebTaskActionMessage(
 			t.Context(), 7, "9a4ca406-70d2-4af2-b3ef-acde86339067",
-			"再记录 Web turn",
+			"", "再记录 Web turn",
 		)
 		webDone <- result{out: out, err: err}
 	}()
@@ -106,9 +107,9 @@ func TestSharedSessionAdmissionDoesNotBlockDifferentUsers(t *testing.T) {
 
 	webDone := make(chan error, 1)
 	go func() {
-		_, err := web.HandleTaskCreationMessage(
+		_, err := web.HandleWebTaskActionMessage(
 			t.Context(), 8, "58a783cb-4213-45ae-8421-cd1bf9dd4585",
-			"user 8 的 Web turn",
+			"", "user 8 的 Web turn",
 		)
 		webDone <- err
 	}()
@@ -158,9 +159,9 @@ func TestSharedSessionAdmissionHonorsCanceledWaiter(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	webDone := make(chan error, 1)
 	go func() {
-		_, err := web.HandleTaskCreationMessage(
+		_, err := web.HandleWebTaskActionMessage(
 			ctx, 7, "0e45482a-e0f4-4115-be1e-a7ca2c687bec",
-			"取消的 Web turn",
+			"", "取消的 Web turn",
 		)
 		webDone <- err
 	}()
@@ -180,45 +181,35 @@ func TestSharedSessionAdmissionHonorsCanceledWaiter(t *testing.T) {
 	}
 }
 
-func TestSharedSessionAdmissionKeepsDualLoopDrainIndependent(t *testing.T) {
+func TestSharedSessionAdmissionDrainsSingleOwnerLoop(t *testing.T) {
 	store := newFakeStore()
 	if _, err := store.CreateAgentSession(t.Context(), 42); err != nil {
 		t.Fatal(err)
 	}
 	admission := NewSessionAdmissionCoordinator()
 	owner := New(Deps{Store: store, SessionAdmission: admission})
-	web := New(Deps{Store: store, SessionAdmission: admission})
 	lock := admission.lockForUser(42)
 	if err := lock.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	owner.NotifyEvent(t.Context(), 42, "owner-side-write", "owner notice")
-	web.NotifyEvent(t.Context(), 42, "web-side-write", "web notice")
+	owner.NotifyEvent(t.Context(), 42, "web-side-write", "web notice")
 
 	drainCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	ownerDrained := make(chan error, 1)
-	webDrained := make(chan error, 1)
 	go func() { ownerDrained <- owner.DrainSessionWrites(drainCtx) }()
-	go func() { webDrained <- web.DrainSessionWrites(drainCtx) }()
 	assertNoErrorYet(t, ownerDrained, "owner drain ignored its accepted side-write")
-	assertNoErrorYet(t, webDrained, "web drain ignored its accepted side-write")
 
 	lock.Unlock()
 	if err := waitError(t, ownerDrained, "owner drain"); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitError(t, webDrained, "web drain"); err != nil {
-		t.Fatal(err)
-	}
 	if got := store.appendCount(); got != 2 {
-		t.Fatalf("dual Loop drain lost side-writes: got=%d want=2", got)
+		t.Fatalf("single owner Loop drain lost side-writes: got=%d want=2", got)
 	}
 	if err := owner.DrainSessionWrites(t.Context()); err != nil {
 		t.Fatalf("repeated owner drain: %v", err)
-	}
-	if err := web.DrainSessionWrites(t.Context()); err != nil {
-		t.Fatalf("repeated web drain: %v", err)
 	}
 }
 
@@ -272,16 +263,18 @@ func newSharedAdmissionTestLoops(
 		OwnerAgent: true, Evidence: &fakeAgentEvidenceWriter{},
 		SessionAdmission: admission,
 	})
-	web := New(Deps{
-		Store: store, Profiles: store,
-		Tools:        testToolSpecs(&fakeTool{name: "create_schedule", mutating: true}),
-		TaskCreation: &fakeCreationController{executeErr: task.ErrCreationOperationNotFound},
-		Model:        "test", MaxTurns: 2, SessionTTL: 30 * time.Minute,
-		SessionAdmission: admission,
-	})
-	owner.chatFn = ownerChat
-	web.chatFn = webChat
-	return owner, web
+	owner.turnReplay = &fakeAgentTurnReplayReader{err: types.NewAppError(
+		types.CodeNotFound, "missing replay", types.ErrNotFound,
+	)}
+	owner.chatFn = func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+		if len(req.Messages) > 0 && strings.Contains(
+			req.Messages[len(req.Messages)-1].Content, "Web turn",
+		) {
+			return webChat(ctx, req)
+		}
+		return ownerChat(ctx, req)
+	}
+	return owner, owner
 }
 
 func waitClosed(t *testing.T, ch <-chan struct{}, failure string) {
