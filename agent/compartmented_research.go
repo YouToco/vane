@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -43,8 +44,16 @@ var toolCallProjectionRequiredColumns = []string{
 }
 
 var observationProjectionRequiredColumns = []string{
-	"task_ref", "run_snapshot_id", "invocation_digest", "observation",
-	"observation_digest", "content_count", "created_at",
+	"lineage", "task_ref", "run_snapshot_id", "invocation_ref", "tool_name",
+	"model_visible_result", "result_digest", "stored_size", "original_size",
+	"source_truncated", "payload_coverage", "evidence_coverage", "trust_type",
+	"payload_offset", "payload_total_chars", "payload_complete", "content_count", "created_at",
+}
+
+var briefProjectionRequiredColumns = []string{
+	"lineage", "task_ref", "run_snapshot_id", "brief_preview", "brief_digest",
+	"status", "truth_coverage", "payload_coverage", "payload_offset",
+	"payload_total_chars", "payload_total_bytes", "payload_complete", "generated_at", "created_at",
 }
 
 var feedbackProjectionRequiredColumns = []string{
@@ -210,7 +219,7 @@ func prepareIntelligenceObservationQuery(
 		return query, nil
 	}
 	wantsObservation := len(query.Select) == 0 ||
-		slices.Contains(query.Select, "observation")
+		slices.Contains(query.Select, "model_visible_result")
 	if !wantsObservation {
 		return query, nil
 	}
@@ -219,6 +228,29 @@ func prepareIntelligenceObservationQuery(
 			"历史 Observation 原文只能按逐行 provenance 查询，不能聚合", types.ErrValidation)
 	}
 	for _, required := range observationProjectionRequiredColumns {
+		if !slices.Contains(query.Select, required) {
+			query.Select = append(query.Select, required)
+		}
+	}
+	return query, nil
+}
+
+func prepareIntelligenceBriefQuery(
+	query store.IntelligenceQuery,
+) (store.IntelligenceQuery, error) {
+	if query.Dataset != store.IntelligenceBriefs {
+		return query, nil
+	}
+	wantsBrief := len(query.Select) == 0 || slices.Contains(query.Select, "brief") ||
+		slices.Contains(query.Select, "brief_preview")
+	if !wantsBrief {
+		return query, nil
+	}
+	if len(query.GroupBy) > 0 || len(query.Metrics) > 0 {
+		return store.IntelligenceQuery{}, types.NewAppError(types.CodeValidation,
+			"历史 Brief 原文只能按逐行 provenance 查询，不能聚合", types.ErrValidation)
+	}
+	for _, required := range briefProjectionRequiredColumns {
 		if !slices.Contains(query.Select, required) {
 			query.Select = append(query.Select, required)
 		}
@@ -388,65 +420,193 @@ func projectObservationResultForAgent(
 	}
 	projected := false
 	for _, row := range result.Rows {
-		observation, exists := row["observation"]
+		rawValue, exists := row["model_visible_result"]
 		if !exists {
 			continue
 		}
-		raw, err := json.Marshal(observation)
-		if err != nil || !json.Valid(raw) || !utf8.Valid(raw) {
+		raw, rawOK := rawValue.(string)
+		if !rawOK || !utf8.ValidString(raw) {
 			return types.NewAppError(types.CodeValidation,
-				"历史 Observation 原文无效", types.ErrValidation)
+				"历史 Observation/Evidence 原文无效", types.ErrValidation)
 		}
-		var decoded runcontext.ToolObservationSetV1
-		if strictjson.DecodeExact(raw, &decoded) != nil {
-			return types.NewAppError(types.CodeValidation,
-				"历史 Observation provenance 无效", types.ErrValidation)
-		}
-		canonical, err := json.Marshal(decoded)
-		if err != nil {
-			return fmt.Errorf("canonicalize historical Observation: %w", err)
-		}
-		set, items, digest, err := runcontext.DecodeToolObservationSetV1(canonical)
-		if err != nil {
-			return types.NewAppError(types.CodeValidation,
-				"历史 Observation provenance 无效", types.ErrValidation)
-		}
+		lineage, lineageOK := row["lineage"].(string)
 		runSnapshotID, runOK := row["run_snapshot_id"].(string)
-		invocationDigest, invocationOK := row["invocation_digest"].(string)
-		observationDigest, digestOK := row["observation_digest"].(string)
-		if !runOK || !invocationOK || !digestOK ||
-			runSnapshotID != fmt.Sprintf("%d", set.RunSnapshotID) ||
-			invocationDigest != set.InvocationDigest || observationDigest != digest {
+		invocationRef, invocationOK := row["invocation_ref"].(string)
+		resultDigest, digestOK := row["result_digest"].(string)
+		payloadCoverage, payloadOK := row["payload_coverage"].(string)
+		evidenceCoverage, evidenceOK := row["evidence_coverage"].(string)
+		storedSize, storedOK := intelligenceRowInt64(row["stored_size"])
+		if !lineageOK || !runOK || !invocationOK || !digestOK || !payloadOK ||
+			!evidenceOK || !storedOK || lineage == "" || runSnapshotID == "" ||
+			invocationRef == "" || resultDigest == "" || storedSize < int64(len(raw)) ||
+			(payloadCoverage != "full" && payloadCoverage != "window") ||
+			(evidenceCoverage != "exact" && evidenceCoverage != "legacy_exact") {
 			return types.NewAppError(types.CodeValidation,
-				"历史 Observation 身份不一致", types.ErrValidation)
+				"历史 Observation/Evidence provenance 无效", types.ErrValidation)
+		}
+		originalSize := storedSize
+		if value, ok := intelligenceRowInt64(row["original_size"]); ok {
+			if value < storedSize {
+				return types.NewAppError(types.CodeValidation,
+					"历史 Evidence 原始大小无效", types.ErrValidation)
+			}
+			originalSize = value
+		}
+		sourceTruncated := false
+		if value, ok := row["source_truncated"].(bool); ok {
+			sourceTruncated = value
+		} else if row["source_truncated"] != nil && lineage == "research_tool_evidence_v3" {
+			return types.NewAppError(types.CodeValidation,
+				"历史 Evidence 截断 provenance 无效", types.ErrValidation)
+		}
+		toolName, _ := row["tool_name"].(string)
+		if toolName == "" {
+			toolName = "observation"
+		}
+		var displayURLs []string
+		payloadOffset, offsetOK := intelligenceRowInt64(row["payload_offset"])
+		payloadTotalChars, totalOK := intelligenceRowInt64(row["payload_total_chars"])
+		payloadComplete, completeOK := row["payload_complete"].(bool)
+		if !offsetOK || !totalOK || !completeOK || payloadOffset < 0 ||
+			payloadTotalChars < int64(len([]rune(raw))) || payloadOffset > payloadTotalChars ||
+			payloadComplete != (payloadOffset+int64(len([]rune(raw))) >= payloadTotalChars) {
+			return types.NewAppError(types.CodeValidation,
+				"历史 Evidence 分页 provenance 无效", types.ErrValidation)
+		}
+		if lineage == "legacy_observation_v1" && payloadCoverage == "full" {
+			var decoded runcontext.ToolObservationSetV1
+			if strictjson.DecodeExact(json.RawMessage(raw), &decoded) != nil {
+				return types.NewAppError(types.CodeValidation,
+					"历史 Observation provenance 无效", types.ErrValidation)
+			}
+			canonical, err := json.Marshal(decoded)
+			if err != nil {
+				return fmt.Errorf("canonicalize historical Observation: %w", err)
+			}
+			set, items, digest, err := runcontext.DecodeToolObservationSetV1(canonical)
+			if err != nil || runSnapshotID != fmt.Sprintf("%d", set.RunSnapshotID) ||
+				invocationRef != set.InvocationDigest || resultDigest != digest {
+				return types.NewAppError(types.CodeValidation,
+					"历史 Observation 身份不一致", types.ErrValidation)
+			}
+			displayURLs = make([]string, 0, len(items))
+			for _, item := range items {
+				displayURLs = append(displayURLs, item.URL)
+			}
 		}
 		arguments, err := json.Marshal(map[string]string{
-			"invocation_digest":  invocationDigest,
-			"observation_digest": observationDigest,
-			"run_snapshot_id":    runSnapshotID,
+			"lineage":         lineage,
+			"invocation_ref":  invocationRef,
+			"payload_offset":  strconv.FormatInt(payloadOffset, 10),
+			"payload_total":   strconv.FormatInt(payloadTotalChars, 10),
+			"result_digest":   resultDigest,
+			"run_snapshot_id": runSnapshotID,
 		})
 		if err != nil {
-			return fmt.Errorf("marshal historical Observation provenance: %w", err)
-		}
-		urls := make([]string, 0, len(items))
-		for _, item := range items {
-			urls = append(urls, item.URL)
+			return fmt.Errorf("marshal historical Evidence provenance: %w", err)
 		}
 		record := newPublicEvidenceRecord(
 			meta.scope.TenantID, meta.scope.UserID, "historical",
-			runSnapshotID, invocationDigest, "observation", string(arguments),
-			string(canonical), "exact", int64(len(canonical)), false, urls,
+			runSnapshotID, invocationRef, toolName, string(arguments), raw,
+			evidenceCoverage+":"+payloadCoverage, originalSize,
+			sourceTruncated || payloadCoverage == "window", displayURLs,
 		)
 		if err := rememberPublicEvidenceRecord(state, record); err != nil {
 			return err
 		}
-		delete(row, "invocation_digest")
-		delete(row, "observation")
-		delete(row, "observation_digest")
+		delete(row, "invocation_ref")
+		delete(row, "model_visible_result")
+		delete(row, "result_digest")
 		row["public_evidence_ref"] = record.Ref
 		row["public_evidence_status"] = "isolated"
 		projected = true
 	}
+	if !projected {
+		return nil
+	}
+	if !intelligenceColumnsContain(result.Columns, "public_evidence_ref") {
+		result.Columns = append(result.Columns,
+			store.IntelligenceColumn{Name: "public_evidence_ref", Type: "text"})
+	}
+	if !intelligenceColumnsContain(result.Columns, "public_evidence_status") {
+		result.Columns = append(result.Columns,
+			store.IntelligenceColumn{Name: "public_evidence_status", Type: "text"})
+	}
+	state.historicalPublicPending = true
+	return nil
+}
+
+func projectBriefResultForAgent(
+	ctx context.Context,
+	result *store.IntelligenceQueryResult,
+) error {
+	if result == nil || result.Dataset != store.IntelligenceBriefs {
+		return nil
+	}
+	state := runStateFrom(ctx)
+	meta, ok := ctx.Value(chatMetaKey{}).(chatMeta)
+	if state == nil || !ok || meta.scope.TenantID <= 0 ||
+		meta.scope.UserID <= 0 || meta.scope.SessionID <= 0 {
+		return types.NewAppError(types.CodeValidation,
+			"历史 Brief 缺少认证会话范围", types.ErrValidation)
+	}
+	projected := false
+	for _, row := range result.Rows {
+		rawValue, exists := row["brief_preview"]
+		if !exists || rawValue == nil {
+			delete(row, "brief")
+			continue
+		}
+		raw, rawOK := rawValue.(string)
+		lineage, lineageOK := row["lineage"].(string)
+		runSnapshotID, runOK := row["run_snapshot_id"].(string)
+		briefDigest, digestOK := row["brief_digest"].(string)
+		truthCoverage, truthOK := row["truth_coverage"].(string)
+		payloadCoverage, payloadOK := row["payload_coverage"].(string)
+		payloadOffset, offsetOK := intelligenceRowInt64(row["payload_offset"])
+		payloadTotalChars, totalOK := intelligenceRowInt64(row["payload_total_chars"])
+		payloadTotalBytes, bytesOK := intelligenceRowInt64(row["payload_total_bytes"])
+		payloadComplete, completeOK := row["payload_complete"].(bool)
+		if !rawOK || !utf8.ValidString(raw) || !lineageOK || !runOK || !digestOK ||
+			!truthOK || !payloadOK || !offsetOK || !totalOK || !bytesOK || !completeOK ||
+			lineage == "" || runSnapshotID == "" || briefDigest == "" ||
+			(truthCoverage != "exact" && truthCoverage != "legacy_exact") ||
+			(payloadCoverage != "full" && payloadCoverage != "window") ||
+			payloadOffset < 0 || payloadTotalChars < int64(len([]rune(raw))) ||
+			payloadTotalBytes < int64(len(raw)) ||
+			payloadOffset > payloadTotalChars ||
+			payloadComplete != (payloadOffset+int64(len([]rune(raw))) >= payloadTotalChars) {
+			return types.NewAppError(types.CodeValidation,
+				"历史 Brief provenance 无效", types.ErrValidation)
+		}
+		arguments, err := json.Marshal(map[string]string{
+			"brief_digest": briefDigest, "lineage": lineage,
+			"payload_offset":  strconv.FormatInt(payloadOffset, 10),
+			"payload_total":   strconv.FormatInt(payloadTotalChars, 10),
+			"run_snapshot_id": runSnapshotID,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal historical Brief provenance: %w", err)
+		}
+		record := newPublicEvidenceRecord(
+			meta.scope.TenantID, meta.scope.UserID, "historical",
+			runSnapshotID, briefDigest, "historical_brief", string(arguments), raw,
+			truthCoverage+":"+payloadCoverage, payloadTotalBytes,
+			payloadTotalBytes > int64(len(raw)), nil,
+		)
+		if err := rememberPublicEvidenceRecord(state, record); err != nil {
+			return err
+		}
+		delete(row, "brief")
+		delete(row, "brief_preview")
+		delete(row, "brief_digest")
+		row["public_evidence_ref"] = record.Ref
+		row["public_evidence_status"] = "isolated"
+		projected = true
+	}
+	result.Columns = intelligenceColumnsWithout(
+		result.Columns, "brief", "brief_preview", "brief_digest",
+	)
 	if !projected {
 		return nil
 	}

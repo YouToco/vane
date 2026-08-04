@@ -166,7 +166,7 @@ type queryMyIntelligenceTool struct{ st intelligenceQueryStore }
 
 func (*queryMyIntelligenceTool) Name() string { return "query_my_intelligence" }
 func (*queryMyIntelligenceTool) Description() string {
-	return "查询当前用户自己的任务、历史运行、Observation、Brief、历史 Agent 回答、模型实际看到的工具证据、画像或推送反馈。按名称、主题、用途和自然时间定位；用户用‘刚才那条’、‘我点的’等方式指代卡片操作时查询 feedbacks，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
+	return "查询当前用户自己的任务、历史运行、legacy/V3 Observation/Evidence、legacy/V3 Brief、历史 Agent 回答、模型实际看到的工具证据、画像或推送反馈。按名称、主题、用途和自然时间定位；observations/briefs 的 coverage 会区分 exact、unavailable、全文与分窗，payload_complete=false 或 truncated=true 时必须原样携带 next_cursor 连续查询到完整尾部，不能补猜；用户用‘刚才那条’、‘我点的’等方式指代卡片操作时查询 feedbacks，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
 }
 func (*queryMyIntelligenceTool) Parameters() json.RawMessage {
 	return json.RawMessage(queryMyIntelligenceSchema)
@@ -192,6 +192,10 @@ func (t *queryMyIntelligenceTool) Execute(ctx context.Context, userID int64, raw
 	if err != nil {
 		return "query_my_intelligence 查询被拒绝：" + err.Error(), nil
 	}
+	storeQuery, err = prepareIntelligenceBriefQuery(storeQuery)
+	if err != nil {
+		return "query_my_intelligence 查询被拒绝：" + err.Error(), nil
+	}
 	storeQuery, err = prepareIntelligenceFeedbackQuery(storeQuery)
 	if err != nil {
 		return "query_my_intelligence 查询被拒绝：" + err.Error(), nil
@@ -209,6 +213,9 @@ func (t *queryMyIntelligenceTool) Execute(ctx context.Context, userID int64, raw
 		return "", err
 	}
 	if err := projectObservationResultForAgent(ctx, result); err != nil {
+		return "", err
+	}
+	if err := projectBriefResultForAgent(ctx, result); err != nil {
 		return "", err
 	}
 	if err := projectFeedbackResultForAgent(ctx, result); err != nil {

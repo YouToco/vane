@@ -1,6 +1,6 @@
 # Agent-first 用户情报与证据契约
 
-> 状态：`vane.intelligence-catalog/v2`、唯一 Agent-first owner 工具面、V3 原生创建与原生编辑已落地；V3 真实任务迁移和旧路径物理删除按发布列车继续推进。
+> 状态：`vane.intelligence-catalog/v3`、唯一 Agent-first owner 工具面、V3 原生创建与原生编辑已落地；V3 真实任务迁移和旧路径物理删除按发布列车继续推进。
 
 ## 1. 产品边界
 
@@ -10,18 +10,22 @@
 
 ## 2. 固定语义目录
 
-目录版本 `vane.intelligence-catalog/v2` 包含 v1 的全部只读数据集，并新增 canonical 反馈查询：
+目录版本 `vane.intelligence-catalog/v3` 在同一固定关系工具中联合 retained V1 与 native Research V3，并保留 canonical 反馈查询：
 
 - `tasks`：任务名称、手册、调度、状态；
-- `runs`：不可变运行身份及终态；
-- `observations`：本任务、本次运行的 exact Observation；
-- `briefs`：不可变 Brief 与生成时间；
+- `runs`：不可变运行身份，以及 legacy RunOutcome 或 V3 Brief 终态；
+- `observations`：legacy exact Observation 与 V3 exact model-visible Tool Evidence；
+- `briefs`：legacy/V3 不可变终态 Brief、失败缺口与投递状态；
 - `agent_turns`：用户原话、最终回复、引用的调用与动作回执；
 - `tool_calls`：模型实际看到的参数和结果；
 - `profile`：当前来源化用户画像。
 - `feedbacks`：推送后的追加式反馈事实、问题原因和当前有效态度；通过投递批次绑定任务与运行。
 
-v1 已封存到 `AgentToolEvidenceV1` 的历史结果保持原字节和原版本，不做猜测性重写。v2 对七个 v1 数据集保持字段和关系查询语义兼容；旧签名游标仍可继续同一查询，下一页会如实标记当前 catalog 为 v2。
+v1/v2 已封存到 `AgentToolEvidenceV1` 的历史结果保持原字节和原版本，不做猜测性重写。v3 改变了 `runs/observations/briefs` 的关系语义，因此显式升级目录版本；cursor v2 同时绑定目录版本、查询摘要和认证范围，所有旧 cursor v1/v2 都 fail-closed，调用方应重新发起第一页。
+
+`observations` 的 `evidence_coverage` 只描述数据库血缘是否可审计；`payload_coverage` 单独标记本行是全文还是 8,192 字符窗口，`source_truncated` 单独标记当时模型所见 bytes 相对 provider 原始响应是否截断。`payload_offset/payload_total_chars/payload_complete` 让同一签名游标可以续读所有窗口，不能把未读尾部补成事实。V3 任意 UTF-8 Tool 结果都可读，不要求伪装成 JSON。legacy 与 V3 双写同一 snapshot 时优先 V3，不重复计数。
+
+`briefs` 只联合终态：V3 `finalized` 是 `truth_coverage=exact`；`ambiguous/failed` 只保留 `unavailable` 缺口，绝不猜测结论。大 Brief 与 Evidence 使用相同的 8,192 字符不可变窗口和签名 keyset 续读，不存在 64 KiB 单行导致的不可达尾部。投递连接必须同时匹配 brief、tenant、user、task、snapshot 与 plan 全坐标。
 
 `feedbacks` 直接读取既有 canonical `feedbacks`，不复制成 Agent turn，也不创建专用反馈工具。`is_effective_attitude` 仅对 `interested/not_interested` 有值，并按当前画像 epoch 与 canonical supersession 规则确定；其他动作返回 null。旧 push-now 投递允许缺少 `task_ref/run_snapshot_id`，owner 仍可读取，定时 Agent 则由 exact-task fence 自动排除。`delivered_summary` 最多 2,000 字符，只用于把“刚才那条”关联回具体结论：migration 061 后已 sealed 的 canonical delivery 有不可变证据，旧/open delivery 仅是 `mixed` 的历史展示快照，不能宣称为 exact。Harness 会在通用查询返回前把该字段从可信反馈行删除，转成 historical public evidence sidecar；只有 Tools:nil 的公开摘要阶段能看到原文，最终无工具综合只看到来源绑定的降权摘要。数据集不返回内部 delivery ID、卡片 JSON 或原始网页正文。
 
@@ -32,7 +36,7 @@ v1 已封存到 `AgentToolEvidenceV1` 的历史结果保持原字节和原版本
 - `today`、`yesterday`、`last_7_days` 由 Store 使用 exact task 的调度时区解析。
 - 未先定位任务且用户名下存在零个或多个时区时，查询拒绝，不以 UTC 或服务器时区猜测。
 - limit 为 1–100，返回 JSON 总量不超过 64 KiB，数据库预算 2 秒。
-- 游标使用数据库持久、带版本且可轮换的 HMAC 密钥签名，并绑定 tenant/user/task、查询摘要和第一页的 `as_of` 水位。多实例/重启可继续验证旧版本密钥；跨身份、跨查询或篡改均 fail-closed。
+- 游标使用数据库持久、带版本且可轮换的 HMAC 密钥签名，并绑定 catalog version、tenant/user/task、查询摘要和第一页的 `as_of` 水位。多实例/重启可继续验证同目录旧密钥；跨目录、跨身份、跨查询或篡改均 fail-closed。
 - 分页使用最后一行的不可变排序值与记录引用组成 keyset，不使用 OFFSET；两页之间即使已读任务被硬删除，也不会跳过下一条。任务名称、状态、`updated_at` 等可编辑字段若需要第二页，Store 直接拒绝。
 
 ## 4. 可审计证据
