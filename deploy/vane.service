@@ -1,0 +1,30 @@
+[Unit]
+Description=Vane server (见微)
+After=network-online.target docker.service vane-research-gateway.socket
+Wants=network-online.target
+Requires=vane-research-gateway.socket
+
+[Service]
+Type=simple
+User=vane
+Group=vane
+WorkingDirectory=/opt/vane
+EnvironmentFile=/opt/vane/env/server.env
+LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url
+ExecStart=/opt/vane/bin/vane
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
