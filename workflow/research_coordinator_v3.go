@@ -375,7 +375,9 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 	}
 	if prepared.PartialCoverage &&
 		seal.ResearchModel.Synthesis.RendererVersion !=
-			runtimepolicy.ResearchSynthesisRendererVersionV31 {
+			runtimepolicy.ResearchSynthesisRendererVersionV31 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV32 {
 		return ResearchBriefRefV3{}, types.NewAppError(types.CodeConflict,
 			"frozen research synthesis renderer cannot express partial coverage",
 			types.ErrConflict)
@@ -617,7 +619,8 @@ func decodeResearchBriefCompletionV3(
 	switch rendererVersion {
 	case runtimepolicy.ResearchSynthesisRendererVersionV3:
 		return types.DecodeResearchBriefPayloadV3(raw)
-	case runtimepolicy.ResearchSynthesisRendererVersionV31:
+	case runtimepolicy.ResearchSynthesisRendererVersionV31,
+		runtimepolicy.ResearchSynthesisRendererVersionV32:
 		normalized, err := normalizeResearchBriefCompletionV31(raw)
 		if err != nil {
 			return types.ResearchBriefPayloadV3{}, nil,
@@ -630,6 +633,11 @@ func decodeResearchBriefCompletionV3(
 		}
 		if err := payload.Validate(); err != nil {
 			return types.ResearchBriefPayloadV3{}, nil, err
+		}
+		if rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV31 &&
+			payload.SchemaVersion == types.ResearchBriefPayloadSchemaV32 {
+			return types.ResearchBriefPayloadV3{}, nil,
+				researchCoordinatorValidationV3("research Brief model output is unavailable to the frozen renderer")
 		}
 		canonical, err := json.Marshal(payload)
 		if err != nil {

@@ -1066,6 +1066,38 @@ func (s *Store) CommitResearchRunStepV3(
 	return researchRunStepReceiptV3(stepID, params, step, requestDigest), nil
 }
 
+func loadResearchRunStepToolDefinitionV3(
+	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
+	snapshotID int64, toolPolicyDigest, toolName string,
+) (runtimepolicy.ResearchToolDefinitionV3, error) {
+	row, found, err := loadResearchRunSnapshotRowV3(ctx, tx,
+		CreateOrGetTaskRunSnapshotParams{
+			TenantID: identity.TenantID, UserID: identity.UserID,
+			TaskID: identity.TaskID, TemporalWorkflowID: identity.TemporalWorkflowID,
+			TemporalRunID: identity.TemporalRunID,
+		})
+	if err != nil {
+		return runtimepolicy.ResearchToolDefinitionV3{}, err
+	}
+	if !found || row.ID != snapshotID {
+		return runtimepolicy.ResearchToolDefinitionV3{}, researchRunIntegrityError()
+	}
+	ref, err := validateStoredResearchRunSnapshotV3(identity, row)
+	if err != nil || ref.ToolPolicyDigest != toolPolicyDigest {
+		return runtimepolicy.ResearchToolDefinitionV3{}, researchRunIntegrityError()
+	}
+	seal, err := runcontext.DecodeResearchSnapshotPayloadV3(row.Payload)
+	if err != nil || seal.ResearchToolPolicyDigest != toolPolicyDigest {
+		return runtimepolicy.ResearchToolDefinitionV3{}, researchRunIntegrityError()
+	}
+	for _, tool := range seal.ResearchTools.AllowedTools {
+		if tool.Name == toolName {
+			return tool, nil
+		}
+	}
+	return runtimepolicy.ResearchToolDefinitionV3{}, researchRunIntegrityError()
+}
+
 func (s *Store) CommitResearchRunStepEvidenceV3(
 	ctx context.Context,
 	params CommitResearchRunStepEvidenceV3Params,
@@ -1114,6 +1146,17 @@ func (s *Store) CommitResearchRunStepEvidenceV3(
 		return ResearchRunStepEvidenceReceiptV3{}, researchRunValidationError("research evidence ordinal is outside the plan")
 	}
 	step := plan.Steps[params.Ordinal]
+	tool, err := loadResearchRunStepToolDefinitionV3(
+		ctx, tx, params.Identity, params.RunSnapshotID,
+		params.PlanRef.ToolPolicyDigest, step.ToolName)
+	if err != nil {
+		return ResearchRunStepEvidenceReceiptV3{}, err
+	}
+	if params.TrustType != string(tool.ResultTrust) ||
+		params.ProviderCall.Provider != tool.Provider {
+		return ResearchRunStepEvidenceReceiptV3{}, researchRunValidationError(
+			"research evidence trust differs from the frozen Tool grant")
+	}
 	if err := validateResearchProviderTraceV3(
 		params.Identity, params.RunSnapshotID, params.PlanRef.PlanDigest,
 		params.Ordinal, step, params.ProviderCall); err != nil {

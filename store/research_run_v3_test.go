@@ -462,6 +462,14 @@ func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	visibleResult := []byte(`{"status":"available","source":"official"}`)
 	providerTrace := researchExecutionTraceV3ForTest(
 		t, identity, snapshotID, ref, 0, started.InvocationID)
+	if _, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
+		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
+		Result: visibleResult, OriginalSize: len(visibleResult) + 99,
+		TrustType: "official", CostMicroUSD: 21,
+		ProviderCall: researchProviderCallV3ForTest(providerTrace, 21),
+	}); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("external Tool forged official Evidence: %v", err)
+	}
 	receipt, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
 		Identity: identity, RunSnapshotID: snapshotID, PlanRef: ref, Ordinal: 0,
 		Result: visibleResult, OriginalSize: len(visibleResult) + 99,

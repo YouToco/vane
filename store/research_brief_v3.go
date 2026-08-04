@@ -1120,13 +1120,35 @@ func validateResearchBriefCoverageV31(
 		}
 		return nil
 	}
-	if brief.SchemaVersion != types.ResearchBriefPayloadSchemaV31 ||
-		brief.Assessment != types.ResearchBriefAssessmentUnknownV31 ||
+	if brief.SchemaVersion == types.ResearchBriefPayloadSchemaV31 &&
+		brief.Assessment == types.ResearchBriefAssessmentUnknownV31 {
+		if brief.Significance != types.ResearchBriefSignificanceNoneV3 {
+			return researchRunValidationError(
+				"unknown partial-coverage research Brief must be quiet")
+		}
+		return nil
+	}
+	if brief.SchemaVersion != types.ResearchBriefPayloadSchemaV32 ||
+		brief.Assessment != types.ResearchBriefAssessmentGroundedV31 ||
 		brief.Significance != types.ResearchBriefSignificanceNoneV3 {
 		return researchRunValidationError(
-			"partial-coverage research Brief must be unknown and quiet")
+			"partial-coverage research Brief assessment is invalid")
 	}
-	return nil
+	officialRefs := make(map[string]struct{}, len(evidence.Items))
+	for _, item := range evidence.Items {
+		if item.TrustType == "official" && item.ToolName == "web_product_status" {
+			officialRefs[strconv.FormatInt(item.EvidenceID, 10)] = struct{}{}
+		}
+	}
+	for _, citation := range brief.Citations {
+		if citation.Kind == types.ResearchBriefCitationCurrentEvidenceV3 {
+			if _, ok := officialRefs[citation.Ref]; ok {
+				return nil
+			}
+		}
+	}
+	return researchRunValidationError(
+		"grounded partial-coverage research Brief must cite successful official Evidence")
 }
 
 func digestResearchBriefRequestV3(value researchBriefRequestDigestV3) string {

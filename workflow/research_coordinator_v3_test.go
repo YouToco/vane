@@ -519,6 +519,18 @@ func TestDecodeResearchBriefCompletionV3CanonicalizesOnlyCurrentRenderer(t *test
 		canonical, "unknown-renderer"); err == nil {
 		t.Fatal("unknown synthesis renderer accepted a Brief completion")
 	}
+	grounded := []byte(`{"schema_version":"vane.research-brief/v3.2","assessment":"grounded","headline":"Kimi remains reservation-only","summary":"The completed official status directly reports the current purchase state.","significance":"none","citations":[{"kind":"current_evidence","ref":"7"}]}`)
+	payload, gotCanonical, err = decodeResearchBriefCompletionV3(
+		grounded, runtimepolicy.ResearchSynthesisRendererVersionV32)
+	if err != nil || payload.Assessment != types.ResearchBriefAssessmentGroundedV31 ||
+		!reflect.DeepEqual(gotCanonical, grounded) {
+		t.Fatalf("grounded Brief payload=%+v canonical=%s err=%v",
+			payload, gotCanonical, err)
+	}
+	if _, _, err := decodeResearchBriefCompletionV3(
+		grounded, runtimepolicy.ResearchSynthesisRendererVersionV31); err == nil {
+		t.Fatal("retained v3.1 renderer accepted a v3.2 grounded completion")
+	}
 	for name, raw := range map[string][]byte{
 		"markdown prose": []byte("result:\n```json\n" + string(canonical) + "\n```"),
 		"markdown suffix": []byte("```json\n" + string(canonical) +

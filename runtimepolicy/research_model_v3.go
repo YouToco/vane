@@ -23,6 +23,7 @@ const (
 
 	ResearchSynthesisRendererVersionV3  = "research-synthesis.render/v3"
 	ResearchSynthesisRendererVersionV31 = "research-synthesis.render/v3.1"
+	ResearchSynthesisRendererVersionV32 = "research-synthesis.render/v3.2"
 )
 
 type ResearchModelStageV3 struct {
