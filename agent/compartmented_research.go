@@ -1164,10 +1164,8 @@ func normalizeBoundHistoricalBriefURLs(
 			!strings.HasPrefix(record.Coverage, "exact:") {
 			continue
 		}
-		for _, value := range urls {
-			if strings.Contains(record.Result, value) {
-				allowed[value] = struct{}{}
-			}
+		for _, sourceURL := range externalFollowupURLs(record.Result) {
+			allowed[sourceURL] = struct{}{}
 		}
 	}
 	normalized := statement
