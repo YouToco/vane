@@ -454,7 +454,7 @@ func TestAuthorizeTaskRunSideEffect_RequiresExactPersistedSnapshot(t *testing.T)
 	}
 }
 
-func TestScheduledTaskWorkflowID_MatchesBothSchedulerActionPaths(t *testing.T) {
+func TestScheduledTaskWorkflowID_MatchesCurrentTaskScheduleAction(t *testing.T) {
 	if got := scheduledTaskWorkflowID("push-contract"); got != "wf-push-contract" {
 		t.Fatalf("scheduledTaskWorkflowID() = %q, want %q", got, "wf-push-contract")
 	}
@@ -467,12 +467,6 @@ func TestScheduledTaskWorkflowID_MatchesBothSchedulerActionPaths(t *testing.T) {
 		path      string
 		fragments []string
 	}{
-		{
-			path: filepath.Join(repoRoot, "scheduler", "scheduler.go"),
-			fragments: []string{
-				`ID: "wf-" + schedID, Workflow: workflow.PushPipelineWorkflow,`,
-			},
-		},
 		{
 			path: filepath.Join(repoRoot, "scheduler", "task_schedule.go"),
 			fragments: []string{
