@@ -16,12 +16,13 @@ import (
 
 type fakeAuthorityDiscoveryStore struct {
 	fakeStore
-	mu        sync.Mutex
-	tasks     []string
-	listCalls int
-	listErr   error
-	slowTask  string
-	runOrder  []string
+	mu         sync.Mutex
+	tasks      []string
+	listCalls  int
+	listErr    error
+	slowTask   string
+	slowCancel context.CancelFunc
+	runOrder   []string
 }
 
 func (s *fakeAuthorityDiscoveryStore) ListEnabledResearchV3RecoveryTaskIDs(
@@ -57,8 +58,12 @@ func (s *fakeAuthorityDiscoveryStore) ListRecoverablePushEffectTenantIDs(
 	s.mu.Lock()
 	s.runOrder = append(s.runOrder, taskID)
 	slow := s.slowTask == taskID
+	cancelSlow := s.slowCancel
 	s.mu.Unlock()
 	if slow {
+		if cancelSlow != nil {
+			cancelSlow()
+		}
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -133,26 +138,32 @@ func TestAuthorityRunnerPaginationIsBounded(t *testing.T) {
 }
 
 func TestAuthorityRunnerRotatesPastSlowTaskAndKeepsCompleteSnapshotOnDiscoveryError(t *testing.T) {
+	slowPassCtx, cancelSlowPass := context.WithCancel(t.Context())
+	defer cancelSlowPass()
 	store := &fakeAuthorityDiscoveryStore{
 		tasks: []string{"task-a", "task-b"}, slowTask: "task-a",
+		slowCancel: cancelSlowPass,
 	}
 	runner, err := NewAuthorityRunner(AuthorityRunnerDeps{
 		Store: store, Sender: &fakeSender{}, HistoryResolver: &fakeHistoryResolver{},
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		RunnerConfig: RunnerConfig{
-			PassTimeout: 100 * time.Millisecond, AttemptTimeout: 50 * time.Millisecond,
-		},
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RunnerConfig: RunnerConfig{PassTimeout: time.Second},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.runPass(t.Context(), "slow"); err == nil {
+	if err := runner.runPass(slowPassCtx, "slow"); err == nil {
 		t.Fatal("slow authority pass unexpectedly succeeded")
 	}
 	store.mu.Lock()
+	firstOrder := append([]string(nil), store.runOrder...)
 	store.slowTask = ""
+	store.slowCancel = nil
 	store.runOrder = nil
 	store.mu.Unlock()
+	if len(firstOrder) != 1 || firstOrder[0] != "task-a" {
+		t.Fatalf("canceled pass advanced beyond slow task: %v", firstOrder)
+	}
 	if err := runner.runPass(t.Context(), "rotated"); err != nil {
 		t.Fatal(err)
 	}
