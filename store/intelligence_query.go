@@ -473,6 +473,69 @@ var intelligenceCatalog = map[IntelligenceDataset]intelligenceDatasetSpec{
 	},
 }
 
+// Migration/replay tests intentionally run the current Store against retained
+// pre-115 schemas. These fixed projections are the last catalog-v2 shapes for
+// the three datasets whose v3 SQL names native Research tables. Production
+// reaches the v3 map only after migration 115 is durably applied; no arbitrary
+// relation name or model input participates in this selection.
+var intelligenceCatalogPreV3 = map[IntelligenceDataset]intelligenceDatasetSpec{
+	IntelligenceRuns: {
+		base: `SELECT rs.tenant_id,rs.user_id,rs.id::text AS record_id,
+		              rs.task_id AS task_ref,rs.id::text AS run_snapshot_id,
+		              rs.temporal_workflow_id,rs.temporal_run_id,rs.run_kind,
+		              rs.execution_mode,COALESCE(o.status,'unavailable') AS outcome_status,
+		              o.result,o.source_coverage,o.processing,o.failure_code,
+		              o.failure_message,o.finalized_at,rs.created_at
+		         FROM task_run_snapshots rs
+		         LEFT JOIN task_run_outcomes o
+		           ON o.tenant_id=rs.tenant_id AND o.user_id=rs.user_id
+		          AND o.run_snapshot_id=rs.id`,
+		columns: intelligenceColumns(
+			"record_id:text", "task_ref:text", "run_snapshot_id:text",
+			"temporal_workflow_id:text", "temporal_run_id:text", "run_kind:text",
+			"execution_mode:text", "outcome_status:text", "result:text",
+			"source_coverage:text", "processing:text", "failure_code:text",
+			"failure_message:text", "finalized_at:time", "created_at:time"),
+		defaults:     []string{"task_ref", "run_snapshot_id", "run_kind", "outcome_status", "result", "source_coverage", "processing", "finalized_at", "created_at"},
+		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
+		stableOrder:  intelligenceStableOrder("created_at", "record_id"),
+		coverage:     IntelligenceCoverage{Status: "mixed", Note: "运行快照自 migration 030 完整；061 前的运行没有 RunOutcome，逐行标记 outcome_status=unavailable。"}, relativeTimeZone: true,
+	},
+	IntelligenceObservations: {
+		base: `SELECT p.tenant_id,p.user_id,
+		              (p.run_snapshot_id::text||':'||p.invocation_digest) AS record_id,
+		              p.task_id AS task_ref,p.run_snapshot_id::text AS run_snapshot_id,p.invocation_digest,
+		              convert_from(p.observation_payload,'UTF8')::jsonb AS observation,
+		              p.observation_digest,cardinality(p.content_item_ids) AS content_count,
+		              p.created_at
+		         FROM task_run_content_provenance p`,
+		columns: intelligenceColumns(
+			"record_id:text", "task_ref:text", "run_snapshot_id:text",
+			"invocation_digest:text", "observation:json", "observation_digest:text",
+			"content_count:integer", "created_at:time"),
+		defaults:     []string{"task_ref", "run_snapshot_id", "observation", "content_count", "created_at"},
+		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
+		stableOrder:  intelligenceStableOrder("created_at", "record_id"),
+		coverage:     IntelligenceCoverage{Status: "partial", Note: "076 前没有 exact Observation provenance；缺失历史保持 unavailable，不猜测回填。"}, relativeTimeZone: true,
+	},
+	IntelligenceBriefs: {
+		base: `SELECT b.tenant_id,b.user_id,b.id::text AS record_id,
+		              b.task_id AS task_ref,b.run_snapshot_id::text AS run_snapshot_id,
+		              b.run_outcome_id::text AS run_outcome_id,
+		              convert_from(b.payload,'UTF8')::jsonb AS brief,
+		              b.insight_count,b.generated_at,b.created_at
+		         FROM brief_snapshots b`,
+		columns: intelligenceColumns(
+			"record_id:text", "task_ref:text", "run_snapshot_id:text",
+			"run_outcome_id:text", "brief:json", "insight_count:integer",
+			"generated_at:time", "created_at:time"),
+		defaults:     []string{"task_ref", "run_snapshot_id", "brief", "insight_count", "generated_at"},
+		defaultOrder: []IntelligenceOrder{{Field: "generated_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
+		stableOrder:  intelligenceStableOrder("generated_at", "record_id"),
+		coverage:     IntelligenceCoverage{Status: "partial", Note: "061 前没有不可变 BriefV1 snapshot；缺失历史保持 unavailable，不猜测回填。"}, relativeTimeZone: true,
+	},
+}
+
 func intelligenceColumns(items ...string) map[string]intelligenceColumnSpec {
 	out := make(map[string]intelligenceColumnSpec, len(items))
 	for _, item := range items {
@@ -586,6 +649,23 @@ func (s *Store) QueryMyIntelligence(
 		denialAudited = true
 		return nil, types.NewAppError(types.CodeValidation,
 			"情报查询认证身份与租户不匹配", types.ErrValidation)
+	}
+	var catalogV3Applied bool
+	// Detect the deployed semantic capability, not owner-only migration state.
+	// vane_server_runtime intentionally cannot read goose_db_version; PostgreSQL
+	// privilege introspection is public, fixed, and matches the exact column
+	// grant installed atomically by migration 115.
+	if err := tx.QueryRow(queryCtx, `SELECT has_column_privilege(
+		'vane_intelligence_reader','public.task_run_snapshots',
+		'reference_schema_version','SELECT'
+	)`).Scan(&catalogV3Applied); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			"检测用户情报目录能力", err)
+	}
+	if !catalogV3Applied {
+		if historical, exists := intelligenceCatalogPreV3[query.Dataset]; exists {
+			spec = historical
+		}
 	}
 	if _, err := tx.Exec(queryCtx, `SET LOCAL ROLE vane_intelligence_reader`); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "进入用户情报只读角色", err)
