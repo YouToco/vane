@@ -457,6 +457,38 @@ func TestPublicEvidenceSummaryIsStrictAndSourceBound(t *testing.T) {
 	}
 }
 
+func TestPublicEvidenceSummaryStripsOnlyURLFromCitedExactHistoricalBrief(t *testing.T) {
+	const sourceURL = "https://www.kimi.com/membership/pricing"
+	state := &toolRunState{publicEvidence: map[string]publicEvidenceRecord{
+		"pe_brief": {
+			Ref: "pe_brief", Digest: "digest", Origin: "historical",
+			ToolName: "historical_brief", Coverage: "exact:full",
+			Result: "本次检查无法读取 " + sourceURL + " 的实时购买状态。",
+		},
+		"pe_external": {
+			Ref: "pe_external", Digest: "digest", Origin: "historical",
+			ToolName: "web_search", Coverage: "exact:full",
+			Result: "搜索结果提到 " + sourceURL,
+		},
+	}}
+	bound := `{"schema":"vane.public-evidence-summary/v1","as_of":"2026-08-03T12:00:00Z","claims":[{"statement":"Kimi 官方定价页面（` + sourceURL + `）当时无法确认实时购买状态","status":"supported","public_evidence_refs":["pe_brief"]}],"gaps":[]}`
+	summary, err := decodePublicEvidenceSummary(bound, state)
+	if err != nil || len(summary.Claims) != 1 ||
+		summary.Claims[0].Statement != "Kimi 官方定价页面当时无法确认实时购买状态" {
+		t.Fatalf("bound historical Brief URL summary=%+v err=%v", summary, err)
+	}
+	for name, raw := range map[string]string{
+		"uncited":  strings.Replace(bound, `"pe_brief"`, `"pe_external"`, 1),
+		"invented": strings.Replace(bound, sourceURL, "https://evil.example/injected", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodePublicEvidenceSummary(raw, state); err == nil {
+				t.Fatal("unbound public summary URL was admitted")
+			}
+		})
+	}
+}
+
 func TestPublicEvidenceSummaryAcceptsAllBoundedObservationRefs(t *testing.T) {
 	state := &toolRunState{publicEvidence: make(map[string]publicEvidenceRecord)}
 	refs := make([]string, 0, 20)
