@@ -11,7 +11,8 @@ func TestMigration114FeedbackCatalogCapabilityIsColumnScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sql := string(raw)
+	// Keep this static capability guard deterministic on Windows checkouts too.
+	sql := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	for _, required := range []string{
 		"'feedbacks','invalid'",
 		"member_role.rolname NOT IN (CURRENT_USER,'vane_server_runtime')",
