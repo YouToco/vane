@@ -1099,6 +1099,12 @@ func decodePublicEvidenceSummary(
 	for i := range summary.Claims {
 		claim := &summary.Claims[i]
 		claim.Statement = strings.TrimSpace(claim.Statement)
+		normalizedStatement, normalizeErr :=
+			normalizeBoundHistoricalBriefURLs(claim.Statement, claim.PublicEvidenceRefs, state)
+		if normalizeErr != nil {
+			return publicEvidenceSummaryV1{}, errors.New("invalid public evidence claim")
+		}
+		claim.Statement = normalizedStatement
 		if claim.Statement == "" || len(claim.Statement) > maxPublicEvidenceTextBytes ||
 			len(externalFollowupURLs(claim.Statement)) > 0 ||
 			(claim.Status != "supported" && claim.Status != "contradicted" &&
@@ -1129,6 +1135,53 @@ func decodePublicEvidenceSummary(
 		return publicEvidenceSummaryV1{}, errors.New("empty public evidence summary")
 	}
 	return summary, nil
+}
+
+// normalizeBoundHistoricalBriefURLs removes a representation defect observed
+// in production summaries: the model copied a URL already present in an exact,
+// cited historical Brief into the claim text. URLs never belong in the trusted
+// synthesis input or user-visible reply; the harness renders validated sources
+// separately. Only URLs copied byte-for-byte from a cited historical_brief are
+// removable. Current/external evidence URLs, uncited URLs and invented URLs
+// remain fail-closed.
+func normalizeBoundHistoricalBriefURLs(
+	statement string,
+	refs []string,
+	state *toolRunState,
+) (string, error) {
+	urls := externalFollowupURLs(statement)
+	if len(urls) == 0 {
+		return statement, nil
+	}
+	if state == nil {
+		return "", errors.New("public evidence state is unavailable")
+	}
+	allowed := make(map[string]struct{}, len(urls))
+	for _, ref := range refs {
+		record, ok := state.publicEvidence[ref]
+		if !ok || record.Origin != "historical" ||
+			record.ToolName != "historical_brief" ||
+			!strings.HasPrefix(record.Coverage, "exact:") {
+			continue
+		}
+		for _, sourceURL := range externalFollowupURLs(record.Result) {
+			allowed[sourceURL] = struct{}{}
+		}
+	}
+	normalized := statement
+	for _, value := range urls {
+		if _, ok := allowed[value]; !ok {
+			return "", errors.New("unbound URL in public evidence claim")
+		}
+		normalized = strings.ReplaceAll(normalized, "（"+value+"）", "")
+		normalized = strings.ReplaceAll(normalized, "("+value+")", "")
+		normalized = strings.ReplaceAll(normalized, value, "")
+	}
+	normalized = strings.TrimSpace(normalized)
+	if normalized == "" || len(externalFollowupURLs(normalized)) > 0 {
+		return "", errors.New("public evidence claim URL normalization failed")
+	}
+	return normalized, nil
 }
 
 func (l *Loop) finishCompartmentedResearch(
