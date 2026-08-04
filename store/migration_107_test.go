@@ -42,6 +42,14 @@ func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *tes
 	if _, err := provider.UpTo(t.Context(), 106); err != nil {
 		t.Fatal(err)
 	}
+	// This fixture intentionally remains at schema 106 while it exercises the
+	// migration 107 byte-preservation contract. The current Store binary reads
+	// the schedule-status binding introduced by migration 116, so provide only
+	// that compatibility column without running or weakening migration 107.
+	if _, err := db.ExecContext(t.Context(), `ALTER TABLE research_v3_prepared_definition_heads
+		ADD COLUMN prepared_schedule_status TEXT NOT NULL DEFAULT 'active'`); err != nil {
+		t.Fatal(err)
+	}
 
 	st, err := New(t.Context(), scratchURL)
 	if err != nil {

@@ -111,7 +111,7 @@ const (
 	replyMaxTokens = 2048
 	// These are hidden execution fuses, not model-visible planning quotas.
 	// The loop preserves a final tool-free turn to synthesize partial evidence.
-	// Eight executions cover the complete six-dataset intelligence lookup plus
+	// Eight executions cover the complete intelligence catalog lookup plus
 	// bounded pagination/current verification. Production UAT showed that a
 	// limit of twenty let one ambiguous historical follow-up issue seventeen
 	// progressively narrower queries and exhaust the tenant LLM bucket before

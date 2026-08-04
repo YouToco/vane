@@ -33,7 +33,7 @@
 - 最新事实问题允许同一消息内连续 `web_search` / `read_page` / 社媒只读查询，优先核验
   第一方页面并只引用结构化结果中真实出现的 URL；证据不足时明确说不足。
 - 与订阅/推送无关的闲聊：模型直接文字回答（不调工具），行为与现 chat_reply 一致。
-- 单消息由 maxTurns（默认 20）和统一 20 次工具执行熔断器保护；相同成功调用不重复，
+- 单消息由 maxTurns（默认 20）和统一 8 次工具执行熔断器保护；相同成功调用不重复，
   网络超时/429/5xx 最多自动重试两次，同一错误签名连续两次终止该分支并基于已有证据回答。
 - 会话：同一 owner 30 分钟内的消息共享一个 agent 会话（多轮上下文），超时新开。
 
@@ -449,7 +449,7 @@ fetcher 层上游行按 `SourceID=0` 无源口径落 tool_calls，归属元数�
 source/content/content_sources。滚动 24h `agent.exa_daily_cap`（默认 100，从
 tool_calls 表按 tool_name IN ('web_search','read_page') COUNT，排除
 invalid_args/budget_exceeded，判定失败 fail-closed）仍强制；`agent.exa_msg_cap`
-已删除，单消息统一由 20 次工具熔断器管理。不授予 `AuthorizationA2AReadOnly`；
+已删除，单消息统一由 8 次工具执行熔断器管理。不授予 `AuthorizationA2AReadOnly`；
 A2A public-only catalog 因此过滤为空，对外部 agent 暴露联网/付费面是另一个决策；
 Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的分流引导行同样
 条件注入（工具不在场不广告）；maxActivatedEndpoints 同步 13→11（16 基础 + 2 端点

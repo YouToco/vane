@@ -138,13 +138,16 @@ func TestMigration101ScheduleDeleteSerializesWithExactTaskClaimPostgres(t *testi
 		 (tenant_id,user_id,task_id,idempotency_key,generation,definition_version,
 		  definition_digest,frozen_schedule,frozen_schedule_digest,
 		  frozen_conflict_token,conflict_token_digest,target_action,
-		  target_action_digest,action_authorization_digest,original_paused,phase,
+		  target_action_digest,action_authorization_digest,original_paused,
+		  original_schedule_status,preflight_digest,phase,
 		  original_execution_mode,original_definition_version,original_definition_digest,
 		  source_baseline_digest)
-		 VALUES ($1,$2,$3,$4,1,1,$5,'frozen',$6,'token',$7,'target',$8,$9,false,'active',
+		 VALUES ($1,$2,$3,$4,1,1,$5,'frozen',$6,'token',$7,'target',$8,$9,false,
+		         'active',$10,'active',
 		         'discover_at_run',1,$5,$5)`,
 		f.tenantID, f.userID, f.identity.TaskID, "delete-race-"+f.identity.TemporalRunID,
-		f.definitionDigest, digest("c"), digest("d"), digest("a"), digest("b")); err != nil {
+		f.definitionDigest, digest("c"), digest("d"), digest("a"), digest("b"),
+		digest("e")); err != nil {
 		t.Fatal(err)
 	}
 

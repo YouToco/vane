@@ -199,7 +199,7 @@ Tool 接口签名由 M4 契约固定且工具实例是全局单例，per-message
 
 ## §7 成本护栏（免确认的代价，Boss 拍板：双重限额）
 
-- 单条消息统一由 Agent 的 20 次工具熔断器管理；旧
+- 单条消息统一由 Agent 的 8 次工具执行熔断器管理；旧
   `agent.endpoint_msg_cap` 已删除，避免存在两个互相漂移的消息级上限。
 - 滚动 24h 上限 `agent.endpoint_daily_cap`（默认 200）：从 tool_calls COUNT——
   限额与账本同源。口径：打到上游的都算（含 HTTP 错误/超时，失败同样计费）；
