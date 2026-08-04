@@ -31,8 +31,31 @@ BEGIN
     ) THEN
         RAISE EXCEPTION '115: intelligence reader role graph is unsafe';
     END IF;
+    -- Migration 114 deliberately permits exactly one NOINHERIT runtime member.
+    -- Recheck its attributes before every later capability expansion: role
+    -- attributes are cluster state and may drift between schema migrations.
+    IF EXISTS (
+        SELECT 1
+          FROM pg_auth_members am
+          JOIN pg_roles granted_role ON granted_role.oid=am.roleid
+          JOIN pg_roles runtime_role ON runtime_role.oid=am.member
+         WHERE granted_role.rolname='vane_intelligence_reader'
+           AND runtime_role.rolname='vane_server_runtime'
+           AND (runtime_role.rolsuper OR runtime_role.rolbypassrls
+                OR runtime_role.rolinherit OR runtime_role.rolcreaterole
+                OR runtime_role.rolcreatedb OR runtime_role.rolreplication)
+    ) THEN
+        RAISE EXCEPTION '115: server runtime reader member is unsafe';
+    END IF;
 END $$;
 -- +goose StatementEnd
+
+-- These three tables are new catalog surfaces. Normalize any out-of-band ACL
+-- drift before installing the exact column projection; shared v1/v2 tables
+-- retain their existing migration-085 column grants and only gain one column.
+REVOKE ALL ON research_run_plans,research_brief_syntheses,
+              research_brief_deliveries
+    FROM vane_intelligence_reader;
 
 GRANT SELECT (
     id,tenant_id,user_id,task_id,run_snapshot_id,temporal_run_id,plan_digest

@@ -14,6 +14,9 @@ func TestMigration115IntelligenceProjectionIsColumnScoped(t *testing.T) {
 	sql := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	for _, required := range []string{
 		"member_role.rolname NOT IN (CURRENT_USER,'vane_server_runtime')",
+		"runtime_role.rolname='vane_server_runtime'",
+		"runtime_role.rolsuper OR runtime_role.rolbypassrls",
+		"REVOKE ALL ON research_run_plans,research_brief_syntheses,",
 		"id,tenant_id,user_id,task_id,run_snapshot_id,temporal_run_id,plan_digest",
 		"GRANT SELECT (reference_schema_version)",
 		"GRANT SELECT (task_id)",
