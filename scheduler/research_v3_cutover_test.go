@@ -383,6 +383,17 @@ func TestResearchV3CutoverBindsPlanDigestAndReplaysSameKey(t *testing.T) {
 		t.Fatalf("wrong digest err=%v operation=%d updates=%d",
 			err, journal.op.ID, len(remote.updates))
 	}
+	otherKey := req
+	otherKey.IdempotencyKey = "digest-bound-other"
+	otherInspection, err := coordinator.Preflight(t.Context(), scope, otherKey)
+	if err != nil || otherInspection.PlanDigest == inspection.PlanDigest {
+		t.Fatalf("different-key preflight=%+v err=%v", otherInspection, err)
+	}
+	if _, err := coordinator.CutoverWithPreflight(
+		t.Context(), scope, otherKey, inspection.PlanDigest); types.CodeOf(err) != types.CodeConflict || journal.op.ID != 0 || len(remote.updates) != 0 {
+		t.Fatalf("cross-key digest replay err=%v operation=%d updates=%d",
+			err, journal.op.ID, len(remote.updates))
+	}
 	op, err := coordinator.CutoverWithPreflight(
 		t.Context(), scope, req, inspection.PlanDigest)
 	if err != nil || op.Phase != types.ResearchV3CutoverActive {

@@ -26,7 +26,9 @@ func TestMigration116KeepsRecoveryDiscoveryNarrowAndShadowOnly(t *testing.T) {
 		"current_setting('role',true)<>'vane_app'",
 		"pg_has_role(session_user,'vane_app','MEMBER')",
 		"schedule.status IN ('active','paused')",
-		"cannot downgrade with multiple enabled V3 authorities",
+		"cannot downgrade with enabled V3 authority",
+		"cannot downgrade with V3 cutover audit",
+		"cannot downgrade with paused V3 preparation audit",
 		"paused shadow admission patch is ambiguous",
 		"paused shadow snapshot patch is ambiguous",
 		"prepared status binding patch is ambiguous",
@@ -148,7 +150,46 @@ func TestMigration116PausedTaskPreparedWhilePausedCanShadowPostgres(t *testing.T
 	}
 }
 
-func TestMigration116DownRejectsMultipleEnabledAuthoritiesPostgres(t *testing.T) {
+func TestMigration116PausedShadowRunsPlannerToolsEffectAndSynthesisDarkPostgres(t *testing.T) {
+	// This fixture creates the paused schedule and paused prepared head before
+	// the shadow snapshot. It then persists a receipt-backed Plan, executes all
+	// Tool steps, authorizes synthesis through the run-effect capability, and
+	// claims the no-Tools synthesis spend. Every admission therefore traverses
+	// the real migration-116 PostgreSQL predicates rather than a Go-only fake.
+	spend := newPausedResearchShadowRunSpendFixtureV3(t, 1_000_000)
+	fixture, synthesis, reservation := preparedPartialResearchBriefV3(t, spend)
+	claim, err := fixture.st.ClaimResearchBriefSynthesisV3(
+		t.Context(), researchShadowBriefClaimV3(fixture, synthesis, reservation))
+	if err != nil || !claim.Claimed ||
+		claim.Synthesis.Status != ResearchBriefSynthesisSpendingV3 ||
+		claim.ReceiptState != ResearchBriefLLMReceiptPendingV3 {
+		t.Fatalf("paused shadow full-chain claim=%+v err=%v", claim, err)
+	}
+	var status types.ScheduleStatus
+	var plans, terminalSteps, briefs, deliveries int
+	if err := fixture.st.pool.QueryRow(t.Context(), `SELECT
+		(SELECT status FROM schedules
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3),
+		(SELECT count(*) FROM research_run_plans
+		  WHERE tenant_id=$2 AND user_id=$3 AND task_id=$1),
+		(SELECT count(*) FROM research_run_steps
+		  WHERE tenant_id=$2 AND user_id=$3 AND task_id=$1 AND phase<>'started'),
+		(SELECT count(*) FROM research_brief_syntheses
+		  WHERE tenant_id=$2 AND user_id=$3 AND task_id=$1),
+		(SELECT count(*) FROM research_brief_deliveries
+		  WHERE tenant_id=$2 AND user_id=$3 AND task_id=$1)`,
+		fixture.taskID, fixture.tenantID, fixture.userID,
+	).Scan(&status, &plans, &terminalSteps, &briefs, &deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if status != types.ScheduleStatusPaused || plans != 1 ||
+		terminalSteps != spend.planRef.StepCount || briefs != 1 || deliveries != 0 {
+		t.Fatalf("paused shadow chain status=%s plans=%d steps=%d/%d briefs=%d deliveries=%d",
+			status, plans, terminalSteps, spend.planRef.StepCount, briefs, deliveries)
+	}
+}
+
+func TestMigration116DownRejectsEnabledAuthorityAndCutoverAuditPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required")
@@ -173,19 +214,17 @@ func TestMigration116DownRejectsMultipleEnabledAuthoritiesPostgres(t *testing.T)
 		t.Fatal(err)
 	}
 	digest := strings.Repeat("a", 64)
-	for index, taskID := range []string{"task-one", "task-two"} {
-		if _, err := database.ExecContext(t.Context(), `
+	if _, err := database.ExecContext(t.Context(), `
 			INSERT INTO research_v3_delivery_authorities (
 			 tenant_id,user_id,task_id,generation,definition_version,
 			 definition_digest,target_action_digest,action_authorization_digest,
 			 status,enabled_at
-			) VALUES (1,1,$1,$2,1,$3,$3,$3,'enabled',clock_timestamp())`,
-			taskID, index+1, digest); err != nil {
-			t.Fatal(err)
-		}
+			) VALUES (1,1,'task-one',1,1,$1,$1,$1,'enabled',clock_timestamp())`,
+		digest); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(t.Context(), 113); err == nil ||
-		!strings.Contains(err.Error(), "cannot downgrade with multiple enabled V3 authorities") {
+		!strings.Contains(err.Error(), "cannot downgrade with enabled V3 authority") {
 		t.Fatalf("unsafe migration 116 downgrade result: %v", err)
 	}
 	var version int64
@@ -195,5 +234,37 @@ func TestMigration116DownRejectsMultipleEnabledAuthoritiesPostgres(t *testing.T)
 	}
 	if version != 116 {
 		t.Fatalf("failed downgrade changed schema version to %d", version)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		UPDATE research_v3_delivery_authorities
+		   SET status='revoked',revoked_at=clock_timestamp()
+		 WHERE tenant_id=1 AND user_id=1 AND task_id='task-one'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		INSERT INTO research_v3_cutover_operations (
+		 tenant_id,user_id,task_id,idempotency_key,generation,
+		 definition_version,definition_digest,frozen_schedule,
+		 frozen_schedule_digest,frozen_conflict_token,conflict_token_digest,
+		 target_action,target_action_digest,action_authorization_digest,
+		 original_paused,original_schedule_status,preflight_digest,phase,
+		 original_execution_mode,source_baseline_digest
+		) VALUES (
+		 1,1,'task-one','cutover-audit',1,1,$1,decode('01','hex'),$1,
+		 decode('02','hex'),$1,decode('03','hex'),$1,$1,true,'paused',$1,
+		 'rolled_back','compiled',$1
+		)`, digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(t.Context(), 113); err == nil ||
+		!strings.Contains(err.Error(), "cannot downgrade with V3 cutover audit") {
+		t.Fatalf("audit-destroying migration 116 downgrade result: %v", err)
+	}
+	if err := database.QueryRowContext(t.Context(),
+		`SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 116 {
+		t.Fatalf("audit downgrade changed schema version to %d", version)
 	}
 }

@@ -150,18 +150,30 @@ GRANT EXECUTE ON FUNCTION list_enabled_research_v3_recovery_tasks_v1(TEXT,INTEGE
 
 -- +goose Down
 
--- More than one enabled authority requires the dynamic selector introduced
--- above. Refuse a downgrade that would silently strand recovery for tasks the
--- single exact-task legacy canary cannot cover.
+-- Any enabled authority requires the dynamic selector introduced above; the
+-- long-lived server intentionally keeps the legacy exact-task canary empty.
+-- Cutover journals and paused sidecars also contain status/digest evidence
+-- that cannot be represented by migration 115, so never erase it on Down.
 -- +goose StatementBegin
 DO $$
-DECLARE enabled_tasks BIGINT;
 BEGIN
-    SELECT count(*) INTO enabled_tasks
-      FROM research_v3_delivery_authorities
-     WHERE status='enabled';
-    IF enabled_tasks>1 THEN
-        RAISE EXCEPTION '116: cannot downgrade with multiple enabled V3 authorities';
+    IF EXISTS (
+        SELECT 1 FROM research_v3_delivery_authorities
+         WHERE status='enabled'
+    ) THEN
+        RAISE EXCEPTION '116: cannot downgrade with enabled V3 authority';
+    END IF;
+    IF EXISTS (SELECT 1 FROM research_v3_cutover_operations) THEN
+        RAISE EXCEPTION '116: cannot downgrade with V3 cutover audit';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM research_v3_definition_prepare_operations
+         WHERE original_schedule_status='paused'
+        UNION ALL
+        SELECT 1 FROM research_v3_prepared_definition_heads
+         WHERE prepared_schedule_status='paused'
+    ) THEN
+        RAISE EXCEPTION '116: cannot downgrade with paused V3 preparation audit';
     END IF;
 END $$;
 -- +goose StatementEnd

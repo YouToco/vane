@@ -312,7 +312,8 @@ func (c *researchV3CutoverCoordinator) Preflight(
 	if err != nil {
 		return types.ResearchV3CutoverInspection{}, err
 	}
-	planDigest := researchV3PreflightDigest(scope, head, frozenDigest)
+	planDigest := researchV3PreflightDigest(
+		scope, head, frozenDigest, req.IdempotencyKey)
 	return types.ResearchV3CutoverInspection{
 		SchemaVersion: "vane.research-v3-cutover-inspection/v1",
 		TaskID:        scope.TaskID, TenantID: scope.TenantID, UserID: scope.UserID,
@@ -325,7 +326,7 @@ func (c *researchV3CutoverCoordinator) Preflight(
 
 func researchV3PreflightDigest(
 	scope types.ResearchV3OperatorScope, head types.ResearchV3DefinitionHead,
-	frozenScheduleDigest string,
+	frozenScheduleDigest, idempotencyKey string,
 ) string {
 	productionVersion, productionDigest := int64(0), ""
 	if scope.ProductionHead != nil {
@@ -333,10 +334,10 @@ func researchV3PreflightDigest(
 		productionDigest = scope.ProductionHead.Digest
 	}
 	payload := fmt.Sprintf(
-		"vane/research-v3-cutover-preflight/v1\x00%d\x00%d\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%s\x00%s",
+		"vane/research-v3-cutover-preflight/v2\x00%d\x00%d\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s",
 		scope.TenantID, scope.UserID, scope.TaskID, scope.Status,
 		scope.ExecutionMode, productionVersion, productionDigest,
-		head.Version, head.Digest, frozenScheduleDigest)
+		head.Version, head.Digest, frozenScheduleDigest, idempotencyKey)
 	digest := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(digest[:])
 }

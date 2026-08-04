@@ -90,6 +90,16 @@ func TestAuthorityRunnerDiscoversNewDurableAuthoritiesAndExcludesStaticCanary(t 
 	if runner.runners["task-c"] == nil {
 		t.Fatal("newly enabled database authority was not discovered")
 	}
+	store.mu.Lock()
+	store.tasks = []string{"task-c"}
+	store.mu.Unlock()
+	if err := runner.runPass(t.Context(), "evict"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.runners) != 1 || runner.runners["task-c"] == nil ||
+		runner.runners["task-b"] != nil {
+		t.Fatalf("revoked authority runner cache was not pruned: %v", runner.runners)
+	}
 }
 
 func TestAuthorityRunnerPaginationIsBounded(t *testing.T) {

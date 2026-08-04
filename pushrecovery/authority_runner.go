@@ -38,6 +38,7 @@ type AuthorityRunner struct {
 	config          RunnerConfig
 	logger          *slog.Logger
 	excludeTaskID   string
+	passMu          sync.Mutex
 	mu              sync.Mutex
 	runners         map[string]*Runner
 }
@@ -117,10 +118,17 @@ func (r *AuthorityRunner) runPass(ctx context.Context, trigger string) error {
 	if r == nil || r.store == nil {
 		return ErrDependencies
 	}
+	r.passMu.Lock()
+	defer r.passMu.Unlock()
 	passCtx, cancel := context.WithTimeout(ctx, r.config.PassTimeout)
 	defer cancel()
 	after := ""
 	discovered := 0
+	seen := make(map[string]struct{})
+	// The map is only a per-authority construction cache. Prune it after every
+	// pass, including partial/error passes, so durable authority churn can never
+	// grow process memory beyond the bounded discovery set.
+	defer func() { r.retainRunners(seen) }()
 	var passErrors []error
 	for {
 		tasks, err := r.store.ListEnabledResearchV3RecoveryTaskIDs(
@@ -137,6 +145,7 @@ func (r *AuthorityRunner) runPass(ctx context.Context, trigger string) error {
 			if taskID == r.excludeTaskID {
 				continue
 			}
+			seen[taskID] = struct{}{}
 			runner, err := r.runnerFor(taskID)
 			if err != nil {
 				passErrors = append(passErrors, err)
@@ -151,6 +160,16 @@ func (r *AuthorityRunner) runPass(ctx context.Context, trigger string) error {
 		}
 	}
 	return errors.Join(passErrors...)
+}
+
+func (r *AuthorityRunner) retainRunners(seen map[string]struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for taskID := range r.runners {
+		if _, ok := seen[taskID]; !ok {
+			delete(r.runners, taskID)
+		}
+	}
 }
 
 func (r *AuthorityRunner) runnerFor(taskID string) (*Runner, error) {
