@@ -205,7 +205,7 @@ type scheduleSummariesResp struct {
 }
 
 // handleListScheduleSummaries 返回当前用户全部任务的运行概览（列表页 6.7 一次请求喂饱：
-// 上次运行/近 7 天推送/信源数）。与 GET /api/schedules 同序，前端按 schedule_id 装配。
+// 上次运行/近 7 天批次、空批与推送数）。与 GET /api/schedules 同序，前端按 schedule_id 装配。
 // GET /api/schedules/summary → 200 scheduleSummariesResp
 func (s *server) handleListScheduleSummaries(w http.ResponseWriter, r *http.Request) {
 	userID, err := s.ownerUserID(r.Context())

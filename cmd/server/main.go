@@ -804,9 +804,8 @@ func run() error {
 		exaTools = agent.NewExaTools(fetch.Exa(), fetch.ExaContents(), st,
 			cfg.Agent.ExaDailyCap)
 	}
-	// Legacy v0 create_schedule cards are deliberately drained without execution
-	// in Loop.ExecuteAction. Passing no legacy creator makes the old active-first
-	// CreatePush path unreachable even if that guard regresses.
+	// Migration 074 removed the legacy confirmation/action roots. Owner task
+	// writes now enter only through the native V3 manage_tasks dependencies below.
 	authorizer := agent.NewModelOwnerActionAuthorizer(
 		agentLLMClient, recorder, cfg.LLM.AgentModel,
 	)

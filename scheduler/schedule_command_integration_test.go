@@ -5,6 +5,7 @@ package scheduler
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -113,10 +114,8 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 		server.Client(), taskQueue, st,
 		WithTaskScheduleNamespace(namespace),
 	)
-	taskID, err := base.CreatePush(
-		ctx, user.ID,
-		ScheduleSpec{Cron: "0 0 1 1 *", TZ: "UTC"},
-		workflow.PushScope{}, "schedule command integration",
+	taskID, err := seedHistoricalScheduleCommandFixture(
+		ctx, base, st, user.ID,
 	)
 	if err != nil {
 		t.Fatalf("create integration schedule: %v", err)
@@ -465,6 +464,54 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 	); err != nil {
 		t.Fatalf("delete terminal replay: %v", err)
 	}
+}
+
+// seedHistoricalScheduleCommandFixture installs one retained compiled task so
+// the current idempotent command protocol is exercised against the historical
+// schedule shape it must continue to manage. This is deliberately test-only;
+// new product admission goes through the native V3 creation coordinator.
+func seedHistoricalScheduleCommandFixture(
+	ctx context.Context,
+	s *Scheduler,
+	st *store.Store,
+	userID int64,
+) (string, error) {
+	const tenantID = int64(types.SingleTenantID)
+	taskID := fmt.Sprintf("push-%d-%s", userID, uuid.NewString())
+	spec := ScheduleSpec{Cron: "0 0 1 1 *", TZ: "UTC"}
+	sdkSpec, err := translateSpec(spec)
+	if err != nil {
+		return "", err
+	}
+	params := makePushParams(
+		tenantID, userID, taskID, workflow.PushScope{},
+		"schedule command integration",
+	)
+	if _, err := s.c.ScheduleClient().Create(ctx, client.ScheduleOptions{
+		ID:   taskID,
+		Spec: sdkSpec,
+		Action: &client.ScheduleWorkflowAction{
+			ID: "wf-" + taskID, Workflow: workflow.PushPipelineWorkflow,
+			Args: []any{params}, TaskQueue: s.tq,
+		},
+		Overlap: enums.SCHEDULE_OVERLAP_POLICY_SKIP,
+	}); err != nil {
+		return "", err
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		return "", err
+	}
+	if err := st.InsertSchedule(ctx, &types.Schedule{
+		ID: taskID, TenantID: tenantID, UserID: userID,
+		NLDescription: "schedule command integration",
+		SpecJSON:      json.RawMessage(specJSON), ScopeJSON: json.RawMessage(`{}`),
+		Status: types.ScheduleStatusActive,
+	}); err != nil {
+		_ = s.c.ScheduleClient().GetHandle(ctx, taskID).Delete(ctx)
+		return "", err
+	}
+	return taskID, nil
 }
 
 type scheduleCommandFaultClient struct {
