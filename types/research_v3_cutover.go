@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -37,6 +38,18 @@ type ResearchV3DefinitionHead struct {
 	Digest  string
 }
 
+// ResearchV3OperatorScope is resolved by the migration-owner database from a
+// globally unique task ID. Operator commands never accept tenant or user IDs.
+type ResearchV3OperatorScope struct {
+	TenantID       int64
+	UserID         int64
+	TaskID         string
+	Status         ScheduleStatus
+	ExecutionMode  ExecutionMode
+	SpecJSON       json.RawMessage
+	ProductionHead *ResearchV3DefinitionHead
+}
+
 // ResearchV3CutoverOperation contains only durable control-plane evidence.
 // Protobuf bytes are opaque to Store and decoded by the scheduler.
 type ResearchV3CutoverOperation struct {
@@ -60,6 +73,8 @@ type ResearchV3CutoverOperation struct {
 	TargetActionDigest        string
 	ActionAuthorizationDigest string
 	OriginalPaused            bool
+	OriginalScheduleStatus    ScheduleStatus
+	PreflightDigest           string
 	Phase                     ResearchV3CutoverPhase
 	CreatedAt                 time.Time
 	UpdatedAt                 time.Time
@@ -79,6 +94,30 @@ type BeginResearchV3CutoverParams struct {
 	TargetActionDigest        string
 	ActionAuthorizationDigest string
 	OriginalPaused            bool
+	OriginalScheduleStatus    ScheduleStatus
+	PreflightDigest           string
+}
+
+// ResearchV3CutoverInspection is the operator-safe, secret-free result of a
+// read-only preflight/status/verify. Frozen protobufs, conflict tokens and the
+// Action bearer token never cross this boundary.
+type ResearchV3CutoverInspection struct {
+	SchemaVersion          string                    `json:"schema_version"`
+	TaskID                 string                    `json:"task_id"`
+	TenantID               int64                     `json:"tenant_id"`
+	UserID                 int64                     `json:"user_id"`
+	ScheduleStatus         ScheduleStatus            `json:"schedule_status"`
+	ExecutionMode          ExecutionMode             `json:"execution_mode"`
+	ProductionHead         *ResearchV3DefinitionHead `json:"production_head,omitempty"`
+	PreparedHead           ResearchV3DefinitionHead  `json:"prepared_head"`
+	TemporalPaused         bool                      `json:"temporal_paused"`
+	FrozenScheduleDigest   string                    `json:"frozen_schedule_digest"`
+	PlanDigest             string                    `json:"plan_digest"`
+	OperationGeneration    int64                     `json:"operation_generation,omitempty"`
+	OperationPhase         ResearchV3CutoverPhase    `json:"operation_phase,omitempty"`
+	DeliveryAuthorityState string                    `json:"delivery_authority_state,omitempty"`
+	Ready                  bool                      `json:"ready"`
+	Verified               bool                      `json:"verified"`
 }
 
 // ResearchV3DeliveryAuthority is the durable precondition for every new V3

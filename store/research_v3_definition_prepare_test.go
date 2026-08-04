@@ -43,6 +43,8 @@ func researchV3CutoverParamsForTest(tenantID, userID int64, taskID, key string,
 		Definition: head, FrozenSchedule: frozen, FrozenScheduleDigest: digest(frozen),
 		FrozenConflictToken: token, ConflictTokenDigest: digest(token), TargetAction: target,
 		TargetActionDigest: digest(target), ActionAuthorizationDigest: strings.Repeat("0", 64),
+		OriginalScheduleStatus: types.ScheduleStatusActive,
+		PreflightDigest:        strings.Repeat("1", 64),
 	}
 }
 
@@ -494,7 +496,7 @@ func TestResearchV3CutoverPromotesAndRestoresDefinitionHeadPostgres(t *testing.T
 	}
 	frozen, token, target := []byte("frozen-schedule"), []byte("conflict-token"), []byte("target-action")
 	digest := func(payload []byte) string { sum := sha256.Sum256(payload); return hex.EncodeToString(sum[:]) }
-	op, err := st.BeginResearchV3Cutover(ctx, types.BeginResearchV3CutoverParams{TenantID: tenantID, UserID: userID, TaskID: taskID, IdempotencyKey: "cutover", Definition: prepared.Target, FrozenSchedule: frozen, FrozenScheduleDigest: digest(frozen), FrozenConflictToken: token, ConflictTokenDigest: digest(token), TargetAction: target, TargetActionDigest: digest(target), ActionAuthorizationDigest: strings.Repeat("0", 64)})
+	op, err := st.BeginResearchV3Cutover(ctx, types.BeginResearchV3CutoverParams{TenantID: tenantID, UserID: userID, TaskID: taskID, IdempotencyKey: "cutover", Definition: prepared.Target, FrozenSchedule: frozen, FrozenScheduleDigest: digest(frozen), FrozenConflictToken: token, ConflictTokenDigest: digest(token), TargetAction: target, TargetActionDigest: digest(target), ActionAuthorizationDigest: strings.Repeat("0", 64), OriginalScheduleStatus: types.ScheduleStatusActive, PreflightDigest: strings.Repeat("1", 64)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,5 +553,53 @@ func TestResearchV3CutoverPromotesAndRestoresDefinitionHeadPostgres(t *testing.T
 		restoredDigest == nil || *restoredVersion != 1 ||
 		*restoredDigest != prepared.OriginalHead.Digest {
 		t.Fatalf("restored schedule=%s/%s/%v/%v", mode, status, restoredVersion, restoredDigest)
+	}
+}
+
+func TestResearchV3PausedCutoverPreservesPausedSchedulePostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE schedules SET status='paused' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	policy := researchV3PreparePolicyForTest()
+	policy.TenantID, policy.UserID, policy.TaskID = tenantID, userID, taskID
+	policy.IdempotencyKey = "paused-prepare"
+	prepared, err := st.PrepareResearchV3Definition(t.Context(), policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := researchV3CutoverParamsForTest(
+		tenantID, userID, taskID, "paused-cutover", prepared.Target)
+	params.OriginalPaused = true
+	params.OriginalScheduleStatus = types.ScheduleStatusPaused
+	op, err := st.BeginResearchV3Cutover(t.Context(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err = st.AdvanceResearchV3Cutover(t.Context(), op,
+		types.ResearchV3CutoverPrepared, types.ResearchV3CutoverPauseRequested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err = st.AdvanceResearchV3Cutover(t.Context(), op,
+		types.ResearchV3CutoverPauseRequested, types.ResearchV3CutoverPaused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PromoteResearchV3PreparedDefinition(t.Context(), op); err != nil {
+		t.Fatal(err)
+	}
+	var status, mode, spec string
+	if err := st.pool.QueryRow(t.Context(), `SELECT status,execution_mode,spec_json::text
+		FROM schedules WHERE id=$1`, taskID).Scan(&status, &mode, &spec); err != nil {
+		t.Fatal(err)
+	}
+	if status != "paused" || mode != "discover_at_run" ||
+		spec != `{"tz": "Asia/Shanghai", "cron": "0 9 * * 1"}` {
+		t.Fatalf("paused promotion status=%s mode=%s spec=%s", status, mode, spec)
 	}
 }

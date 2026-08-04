@@ -688,11 +688,13 @@ func run() error {
 		return fmt.Errorf("周期 Brief recovery 首轮 Gate: %w", err)
 	}
 
-	// Push-effect recovery has a separate exact-task switch from fresh sends.
-	// When enabled, prepare outbound API authority without opening Feishu WS,
-	// then finish a complete recovery pass before any external ingress.
+	// Compiled recovery retains its exact-task switch. Research V3 recovery is
+	// discovered from enabled database authorities, so cutover tasks remain
+	// recoverable after a transient operator canary disappears.
 	var pushRecoveryRunner *pushrecovery.Runner
-	if cfg.Pipeline.PushEffectRecoveryCanaryScheduleID != "" {
+	var authorityPushRecoveryRunner *pushrecovery.AuthorityRunner
+	if cfg.Pipeline.PushEffectRecoveryCanaryScheduleID != "" ||
+		cfg.Pipeline.ResearchV3RuntimeEnabled {
 		outboundCtx, cancelOutbound := context.WithTimeout(ctx, 30*time.Second)
 		outboundErr := manager.PrepareOutbound(outboundCtx)
 		cancelOutbound()
@@ -702,6 +704,8 @@ func run() error {
 			return fmt.Errorf("push effect recovery 飞书发送端 Gate: %w",
 				outboundErr)
 		}
+	}
+	if cfg.Pipeline.PushEffectRecoveryCanaryScheduleID != "" {
 		pushRecoveryCoordinator, err := pushrecovery.New(
 			pushrecovery.Deps{
 				Store: st, Sender: push, HistoryResolver: manager,
@@ -734,6 +738,26 @@ func run() error {
 			temporalClient.Close()
 			closeStores()
 			return fmt.Errorf("push effect recovery 首轮恢复 Gate: %w", err)
+		}
+	}
+	if cfg.Pipeline.ResearchV3RuntimeEnabled {
+		authorityPushRecoveryRunner, err = pushrecovery.NewAuthorityRunner(
+			pushrecovery.AuthorityRunnerDeps{
+				Store: st, Sender: push, HistoryResolver: manager,
+				RunnerConfig:  pushrecovery.RunnerConfig{},
+				Logger:        slog.Default(),
+				ExcludeTaskID: cfg.Pipeline.PushEffectRecoveryCanaryScheduleID,
+			},
+		)
+		if err != nil {
+			temporalClient.Close()
+			closeStores()
+			return fmt.Errorf("装配 V3 authority push recovery: %w", err)
+		}
+		if err := authorityPushRecoveryRunner.RunStartup(ctx); err != nil {
+			temporalClient.Close()
+			closeStores()
+			return fmt.Errorf("V3 authority push recovery 首轮恢复 Gate: %w", err)
 		}
 	}
 	var maintenanceWG sync.WaitGroup
@@ -1041,12 +1065,21 @@ func run() error {
 
 	pushRecoveryCtx, cancelPushRecovery := context.WithCancel(ctx)
 	pushRecoveryDone := make(chan struct{})
-	if pushRecoveryRunner == nil {
+	if pushRecoveryRunner == nil && authorityPushRecoveryRunner == nil {
 		close(pushRecoveryDone)
 	} else {
 		go func() {
 			defer close(pushRecoveryDone)
-			pushRecoveryRunner.Run(pushRecoveryCtx)
+			var recoveryWG sync.WaitGroup
+			if pushRecoveryRunner != nil {
+				recoveryWG.Go(func() { pushRecoveryRunner.Run(pushRecoveryCtx) })
+			}
+			if authorityPushRecoveryRunner != nil {
+				recoveryWG.Go(func() {
+					authorityPushRecoveryRunner.Run(pushRecoveryCtx)
+				})
+			}
+			recoveryWG.Wait()
 		}()
 	}
 	stopPushRecovery := func() error {

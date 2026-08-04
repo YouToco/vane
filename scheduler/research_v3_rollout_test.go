@@ -52,7 +52,7 @@ func TestResearchRuntimeV3AuthorityCanaryCannotRewriteNormalActions(t *testing.T
 func TestResearchV3CutoverPublicControlPlaneIsExactTaskOnly(t *testing.T) {
 	s := New(nil, "", nil, WithResearchRuntimeV3AuthorityCanary("task-v3"))
 	if _, err := s.CutoverResearchV3(
-		t.Context(), "task-other", 42, "gate-1"); types.CodeOf(err) != types.CodeNotFound {
+		t.Context(), types.ResearchV3OperatorScope{TaskID: "task-other", UserID: 42}, "gate-1", strings.Repeat("a", 64)); types.CodeOf(err) != types.CodeNotFound {
 		t.Fatalf("cross-task cutover error=%v", err)
 	}
 	if _, err := s.RollbackResearchV3(
@@ -60,14 +60,14 @@ func TestResearchV3CutoverPublicControlPlaneIsExactTaskOnly(t *testing.T) {
 		t.Fatalf("cross-task rollback error=%v", err)
 	}
 	if _, err := s.CutoverResearchV3(
-		t.Context(), "task-v3", 42, "gate-1"); types.CodeOf(err) != types.CodeInternal {
+		t.Context(), types.ResearchV3OperatorScope{TaskID: "task-v3", UserID: 42}, "gate-1", strings.Repeat("a", 64)); types.CodeOf(err) != types.CodeInternal {
 		t.Fatalf("exact task bypassed dependency readiness: %v", err)
 	}
 
 	invalid := New(nil, "", nil,
 		WithResearchRuntimeV3AuthorityCanary("task-v3\nother"))
 	if _, err := invalid.CutoverResearchV3(
-		t.Context(), "task-v3\nother", 42, "gate-1"); types.CodeOf(err) != types.CodeNotFound {
+		t.Context(), types.ResearchV3OperatorScope{TaskID: "task-v3\nother", UserID: 42}, "gate-1", strings.Repeat("a", 64)); types.CodeOf(err) != types.CodeNotFound {
 		t.Fatalf("control-character task was admitted: %v", err)
 	}
 }
@@ -457,9 +457,6 @@ func TestTriggerResearchShadowNow_FailsClosedBeforeTemporal(t *testing.T) {
 		{name: "not configured", userID: 42, schedule: active, definition: true},
 		{name: "different exact shadow", configured: "task-other", userID: 42, schedule: active, definition: true},
 		{name: "cross owner", configured: taskID, userID: 99, schedule: active, definition: true},
-		{name: "inactive", configured: taskID, userID: 42, schedule: &types.Schedule{
-			ID: taskID, TenantID: 7, UserID: 42, Status: types.ScheduleStatusPaused,
-		}, definition: true},
 		{name: "no V3 definition", configured: taskID, userID: 42, schedule: active},
 	}
 	for _, tc := range tests {

@@ -16,14 +16,13 @@ import (
 
 	"go.temporal.io/sdk/client"
 
-	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/internal/researchoperator"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/store"
 )
 
 type shadowArgs struct {
 	taskID         string
-	userID         int64
 	idempotencyKey string
 }
 
@@ -39,41 +38,56 @@ func run(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load("")
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+	if err := researchoperator.RequireExactTask(args.taskID); err != nil {
+		return err
 	}
-	if cfg.Pipeline.ResearchV3ShadowCanaryScheduleID == "" ||
-		args.taskID != cfg.Pipeline.ResearchV3ShadowCanaryScheduleID {
-		return errors.New("task is not the exact configured Research V3 shadow canary")
+	temporalConfig, err := researchoperator.LoadTemporalConfig()
+	if err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	st, err := store.NewServerRuntime(ctx, cfg.DB.URL)
+	url, err := researchoperator.MigrationDatabaseURL()
 	if err != nil {
-		return fmt.Errorf("open server runtime store: %w", err)
+		return err
+	}
+	st, err := store.New(ctx, url)
+	if err != nil {
+		return fmt.Errorf("open migration-owner operator store: %w", err)
 	}
 	defer st.Close()
+	scope, err := st.ResolveResearchV3OperatorScope(ctx, args.taskID)
+	if err != nil {
+		return fmt.Errorf("resolve exact owner task: %w", err)
+	}
 	temporalClient, err := client.Dial(client.Options{
-		HostPort:  cfg.Temporal.Host,
-		Namespace: cfg.Temporal.Namespace,
+		HostPort: temporalConfig.Host, Namespace: temporalConfig.Namespace,
 	})
 	if err != nil {
 		return fmt.Errorf("connect Temporal: %w", err)
 	}
 	defer temporalClient.Close()
-	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st,
+	sched := scheduler.New(temporalClient, temporalConfig.TaskQueue, st,
 		scheduler.WithResearchRuntimeV3ShadowCanary(
-			cfg.Pipeline.ResearchV3ShadowCanaryScheduleID))
-	if err := sched.TriggerResearchShadowNow(
-		ctx, args.taskID, args.userID, args.idempotencyKey); err != nil {
-		return fmt.Errorf("start shadow: %w", err)
+			args.taskID))
+	if err := sched.TriggerResearchShadowNowAndWait(
+		ctx, args.taskID, scope.UserID, args.idempotencyKey); err != nil {
+		return fmt.Errorf("run shadow: %w", err)
 	}
-	fmt.Printf("research V3 shadow accepted: task=%s user=%d key=%s\n",
-		args.taskID, args.userID, args.idempotencyKey)
+	head, err := st.LoadPreparedResearchApprovedDefinitionV3Head(
+		ctx, scope.TenantID, scope.UserID, scope.TaskID)
+	if err != nil {
+		return fmt.Errorf("load shadow definition proof: %w", err)
+	}
+	if err := st.RequireSuccessfulResearchV3ShadowPreflight(
+		ctx, scope.TenantID, scope.UserID, scope.TaskID, head); err != nil {
+		return fmt.Errorf("verify delivery-dark shadow: %w", err)
+	}
+	fmt.Printf("research V3 shadow verified delivery-dark: task=%s user=%d key=%s\n",
+		args.taskID, scope.UserID, args.idempotencyKey)
 	return nil
 }
 
@@ -82,16 +96,15 @@ func parseShadowArgs(arguments []string) (shadowArgs, error) {
 	set.SetOutput(os.Stderr)
 	var args shadowArgs
 	set.StringVar(&args.taskID, "task-id", "", "exact configured schedule ID")
-	set.Int64Var(&args.userID, "user-id", 0, "owning Vane user ID")
 	set.StringVar(&args.idempotencyKey, "idempotency-key", "", "stable retry key")
 	if err := set.Parse(arguments); err != nil {
 		return shadowArgs{}, err
 	}
 	if set.NArg() != 0 || args.taskID == "" || strings.TrimSpace(args.taskID) != args.taskID ||
-		args.userID <= 0 || args.idempotencyKey == "" ||
+		args.idempotencyKey == "" ||
 		strings.TrimSpace(args.idempotencyKey) != args.idempotencyKey {
 		return shadowArgs{}, errors.New(
-			"require -task-id, positive -user-id and -idempotency-key")
+			"require -task-id and -idempotency-key")
 	}
 	return args, nil
 }

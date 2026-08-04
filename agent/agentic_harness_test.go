@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -338,6 +339,46 @@ func TestUnifiedLoopFuseRejectsDuplicateAndCap(t *testing.T) {
 	); err != nil || got != toolMsgLoopFuse ||
 		capped.loopBreakReason != "tool_execution_cap" {
 		t.Fatalf("cap got=%q err=%v reason=%q", got, err, capped.loopBreakReason)
+	}
+}
+
+func TestUnifiedLoopFuseReservesToolFreePartialSynthesis(t *testing.T) {
+	tool := &fakeTool{name: "query_my_intelligence", result: `{"rows":[]}`}
+	responses := make([]*llm.ChatResponse, 0, maxToolExecutionsPerMessage+2)
+	for index := 0; index <= maxToolExecutionsPerMessage; index++ {
+		responses = append(responses, &llm.ChatResponse{
+			ToolCalls: []llm.ToolCall{{
+				ID: "query_" + strconv.Itoa(index), Name: tool.name,
+				Arguments: `{"window":` + strconv.Itoa(index) + `}`,
+			}},
+			FinishReason: "tool_calls",
+		})
+	}
+	responses = append(responses, &llm.ChatResponse{
+		Content: "基于已查到的证据给出部分结论，并明确历史缺口。",
+	})
+	chat := &scriptedChat{responses: responses}
+	loop := New(Deps{
+		Tools: testToolSpecs(tool), Model: "deepseek-v4-pro",
+		MaxTurns: maxToolExecutionsPerMessage + 2,
+	})
+	loop.chatFn = chat.fn
+
+	out, _, err := loop.RunOnce(t.Context(), 7, nil, "为什么当时这么判断？")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != "基于已查到的证据给出部分结论，并明确历史缺口。" {
+		t.Fatalf("reply=%q", out.Reply)
+	}
+	if len(tool.calls) != maxToolExecutionsPerMessage {
+		t.Fatalf("executed calls=%d, want %d", len(tool.calls), maxToolExecutionsPerMessage)
+	}
+	if len(chat.requests) != maxToolExecutionsPerMessage+2 {
+		t.Fatalf("model turns=%d, want %d", len(chat.requests), maxToolExecutionsPerMessage+2)
+	}
+	if len(chat.requests[len(chat.requests)-1].Tools) != 0 {
+		t.Fatal("post-fuse synthesis turn still exposed tools")
 	}
 }
 

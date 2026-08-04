@@ -35,6 +35,12 @@ type researchV3CutoverJournal interface {
 	LoadResearchV3Cutover(
 		context.Context, int64, int64, string, string,
 	) (types.ResearchV3CutoverOperation, bool, error)
+	LoadResearchV3CutoverAuthorityStatus(
+		context.Context, types.ResearchV3CutoverOperation,
+	) (string, error)
+	VerifyResearchV3CutoverDatabaseState(
+		context.Context, types.ResearchV3CutoverOperation,
+	) error
 	RecheckResearchV3CutoverDefinition(
 		context.Context, types.ResearchV3CutoverOperation,
 	) error
@@ -86,6 +92,16 @@ type researchV3CutoverRequest struct {
 	TaskID         string
 	UserID         int64
 	IdempotencyKey string
+}
+
+// researchV3CutoverPreflight keeps the exact Temporal description that was
+// hashed into the operator-visible plan. Cutover must consume these same
+// immutable bytes rather than issuing another Describe after the digest has
+// already been accepted.
+type researchV3CutoverPreflight struct {
+	inspection    types.ResearchV3CutoverInspection
+	frozen        *schedulepb.Schedule
+	conflictToken []byte
 }
 
 const researchV3CutoverConflictRollbackTimeout = 30 * time.Second
@@ -203,20 +219,230 @@ func (s *Scheduler) researchV3CutoverParamsEncoder() (
 // CutoverResearchV3 replaces one already-shadowed task's Schedule Action via
 // the durable pause/CAS/restore saga. Config alone never changes an Action.
 func (s *Scheduler) CutoverResearchV3(
-	ctx context.Context, taskID string, userID int64, idempotencyKey string,
+	ctx context.Context, scope types.ResearchV3OperatorScope,
+	idempotencyKey, expectedPlanDigest string,
 ) (types.ResearchV3CutoverOperation, error) {
 	if s == nil || s.researchV3.authorityID == "" ||
-		taskID != s.researchV3.authorityID {
+		scope.TaskID != s.researchV3.authorityID {
 		return types.ResearchV3CutoverOperation{}, types.NewAppError(
 			types.CodeNotFound, "research V3 cutover task is not configured", types.ErrNotFound)
 	}
-	core, err := s.newResearchV3CutoverCore(taskID)
+	core, err := s.newResearchV3CutoverCore(scope.TaskID)
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, err
 	}
-	return core.Cutover(ctx, researchV3CutoverRequest{
-		TaskID: taskID, UserID: userID, IdempotencyKey: idempotencyKey,
+	return core.CutoverWithPreflight(ctx, scope, researchV3CutoverRequest{
+		TaskID: scope.TaskID, UserID: scope.UserID, IdempotencyKey: idempotencyKey,
+	}, expectedPlanDigest)
+}
+
+// PreflightResearchV3 is read-only. It binds the exact database owner scope,
+// successful delivery-dark shadow and full Temporal Schedule bytes into a
+// digest that CutoverResearchV3 must receive unchanged.
+func (s *Scheduler) PreflightResearchV3(
+	ctx context.Context, scope types.ResearchV3OperatorScope,
+	idempotencyKey string,
+) (types.ResearchV3CutoverInspection, error) {
+	if s == nil || s.researchV3.authorityID == "" ||
+		scope.TaskID != s.researchV3.authorityID {
+		return types.ResearchV3CutoverInspection{}, types.NewAppError(
+			types.CodeNotFound, "research V3 preflight task is not configured", types.ErrNotFound)
+	}
+	core, err := s.newResearchV3CutoverCore(scope.TaskID)
+	if err != nil {
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	return core.Preflight(ctx, scope, researchV3CutoverRequest{
+		TaskID: scope.TaskID, UserID: scope.UserID, IdempotencyKey: idempotencyKey,
 	})
+}
+
+func (c *researchV3CutoverCoordinator) Preflight(
+	ctx context.Context, scope types.ResearchV3OperatorScope,
+	req researchV3CutoverRequest,
+) (types.ResearchV3CutoverInspection, error) {
+	preflight, err := c.preflight(ctx, scope, req)
+	if err != nil {
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	return preflight.inspection, nil
+}
+
+func (c *researchV3CutoverCoordinator) preflight(
+	ctx context.Context, scope types.ResearchV3OperatorScope,
+	req researchV3CutoverRequest,
+) (researchV3CutoverPreflight, error) {
+	if err := c.validateRequest(req); err != nil ||
+		scope.TaskID != req.TaskID || scope.UserID != req.UserID || scope.TenantID <= 0 ||
+		(scope.Status != types.ScheduleStatusActive &&
+			scope.Status != types.ScheduleStatusPaused) {
+		if err != nil {
+			return researchV3CutoverPreflight{}, err
+		}
+		return researchV3CutoverPreflight{}, types.NewAppError(
+			types.CodeValidation, "research V3 preflight scope is invalid", types.ErrValidation)
+	}
+	if existing, found, err := c.journal.LoadResearchV3Cutover(
+		ctx, scope.TenantID, scope.UserID, scope.TaskID, req.IdempotencyKey,
+	); err != nil {
+		return researchV3CutoverPreflight{}, err
+	} else if found {
+		return researchV3CutoverPreflight{}, types.NewAppError(
+			types.CodeConflict,
+			fmt.Sprintf("research V3 cutover already began at phase %s", existing.Phase),
+			types.ErrConflict)
+	}
+	mirror, err := c.journal.GetSchedule(ctx, scope.TaskID, scope.UserID)
+	if err != nil {
+		return researchV3CutoverPreflight{}, err
+	}
+	if mirror == nil || mirror.TenantID != scope.TenantID ||
+		mirror.UserID != scope.UserID || mirror.ID != scope.TaskID ||
+		mirror.Status != scope.Status || mirror.ExecutionMode != scope.ExecutionMode ||
+		!bytes.Equal(mirror.SpecJSON, scope.SpecJSON) {
+		return researchV3CutoverPreflight{}, types.NewAppError(
+			types.CodeConflict, "research V3 preflight database scope changed", types.ErrConflict)
+	}
+	head, err := c.journal.LoadCurrentResearchApprovedDefinitionV3Head(
+		ctx, scope.TenantID, scope.UserID, scope.TaskID)
+	if err != nil {
+		return researchV3CutoverPreflight{}, err
+	}
+	if err := c.journal.RequireSuccessfulResearchV3ShadowPreflight(
+		ctx, scope.TenantID, scope.UserID, scope.TaskID, head); err != nil {
+		return researchV3CutoverPreflight{}, err
+	}
+	desc, err := c.remote.Describe(ctx, scope.TaskID)
+	if err != nil {
+		return researchV3CutoverPreflight{}, cutoverRemoteError("preflight describe", err)
+	}
+	frozen, err := cloneDescribedScheduleV3(desc)
+	if err != nil {
+		return researchV3CutoverPreflight{}, err
+	}
+	paused := frozen.GetState().GetPaused()
+	if paused != (scope.Status == types.ScheduleStatusPaused) {
+		return researchV3CutoverPreflight{}, types.NewAppError(
+			types.CodeConflict, "research V3 preflight database and Temporal pause differ", types.ErrConflict)
+	}
+	if desc.GetInfo() != nil && len(desc.GetInfo().GetRunningWorkflows()) != 0 {
+		return researchV3CutoverPreflight{}, types.NewAppError(
+			types.CodeConflict, "research V3 preflight has running workflows", types.ErrConflict)
+	}
+	_, frozenDigest, err := marshalScheduleArtifactV3(frozen)
+	if err != nil {
+		return researchV3CutoverPreflight{}, err
+	}
+	planDigest := researchV3PreflightDigest(
+		scope, head, frozenDigest, req.IdempotencyKey)
+	inspection := types.ResearchV3CutoverInspection{
+		SchemaVersion: "vane.research-v3-cutover-inspection/v1",
+		TaskID:        scope.TaskID, TenantID: scope.TenantID, UserID: scope.UserID,
+		ScheduleStatus: scope.Status, ExecutionMode: scope.ExecutionMode,
+		ProductionHead: scope.ProductionHead, PreparedHead: head,
+		TemporalPaused: paused, FrozenScheduleDigest: frozenDigest,
+		PlanDigest: planDigest, Ready: true,
+	}
+	return researchV3CutoverPreflight{
+		inspection: inspection, frozen: frozen,
+		conflictToken: append([]byte(nil), desc.GetConflictToken()...),
+	}, nil
+}
+
+func researchV3PreflightDigest(
+	scope types.ResearchV3OperatorScope, head types.ResearchV3DefinitionHead,
+	frozenScheduleDigest, idempotencyKey string,
+) string {
+	productionVersion, productionDigest := int64(0), ""
+	if scope.ProductionHead != nil {
+		productionVersion = scope.ProductionHead.Version
+		productionDigest = scope.ProductionHead.Digest
+	}
+	payload := fmt.Sprintf(
+		"vane/research-v3-cutover-preflight/v2\x00%d\x00%d\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s",
+		scope.TenantID, scope.UserID, scope.TaskID, scope.Status,
+		scope.ExecutionMode, productionVersion, productionDigest,
+		head.Version, head.Digest, frozenScheduleDigest, idempotencyKey)
+	digest := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(digest[:])
+}
+
+// StatusResearchV3 describes a durable operation without resuming it.
+func (s *Scheduler) StatusResearchV3(
+	ctx context.Context, scope types.ResearchV3OperatorScope, idempotencyKey string,
+) (types.ResearchV3CutoverInspection, error) {
+	if s == nil || s.researchV3.authorityID == "" ||
+		scope.TaskID != s.researchV3.authorityID {
+		return types.ResearchV3CutoverInspection{}, types.ErrNotFound
+	}
+	core, err := s.newResearchV3CutoverCore(scope.TaskID)
+	if err != nil {
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	req := researchV3CutoverRequest{
+		TaskID: scope.TaskID, UserID: scope.UserID, IdempotencyKey: idempotencyKey,
+	}
+	if err := core.validateRequest(req); err != nil {
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	op, found, err := core.journal.LoadResearchV3Cutover(
+		ctx, scope.TenantID, scope.UserID, scope.TaskID, idempotencyKey)
+	if err != nil || !found {
+		if err == nil {
+			err = types.NewAppError(types.CodeNotFound,
+				"research V3 cutover journal is unavailable", types.ErrNotFound)
+		}
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	frozen, target, err := decodeCutoverArtifactsV3(op)
+	if err != nil {
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	desc, err := core.remote.Describe(ctx, scope.TaskID)
+	if err != nil {
+		return types.ResearchV3CutoverInspection{}, cutoverRemoteError("status describe", err)
+	}
+	observed, err := verifyCutoverScheduleV3(desc, frozen, target)
+	if err != nil {
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	authorityStatus, err := core.journal.LoadResearchV3CutoverAuthorityStatus(ctx, op)
+	if err != nil {
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	inspection := types.ResearchV3CutoverInspection{
+		SchemaVersion: "vane.research-v3-cutover-inspection/v1",
+		TaskID:        op.TaskID, TenantID: op.TenantID, UserID: op.UserID,
+		ScheduleStatus: scope.Status, ExecutionMode: scope.ExecutionMode,
+		ProductionHead: scope.ProductionHead, PreparedHead: op.Definition,
+		TemporalPaused:       observed.paused,
+		FrozenScheduleDigest: op.FrozenScheduleDigest,
+		PlanDigest:           op.PreflightDigest, OperationGeneration: op.Generation,
+		OperationPhase: op.Phase, DeliveryAuthorityState: authorityStatus,
+	}
+	terminalRemote := (op.Phase == types.ResearchV3CutoverActive && observed.target &&
+		observed.paused == op.OriginalPaused) ||
+		((op.Phase == types.ResearchV3CutoverRolledBack ||
+			op.Phase == types.ResearchV3CutoverAborted) && !observed.target &&
+			observed.paused == op.OriginalPaused)
+	if terminalRemote {
+		inspection.Verified = core.journal.VerifyResearchV3CutoverDatabaseState(ctx, op) == nil
+	}
+	return inspection, nil
+}
+
+func (s *Scheduler) VerifyResearchV3(
+	ctx context.Context, scope types.ResearchV3OperatorScope, idempotencyKey string,
+) (types.ResearchV3CutoverInspection, error) {
+	inspection, err := s.StatusResearchV3(ctx, scope, idempotencyKey)
+	if err != nil {
+		return types.ResearchV3CutoverInspection{}, err
+	}
+	if !inspection.Verified {
+		return inspection, types.NewAppError(types.CodeConflict,
+			"research V3 cutover terminal invariants are not verified", types.ErrConflict)
+	}
+	return inspection, nil
 }
 
 // RollbackResearchV3 revokes delivery authority before restoring the frozen
@@ -247,6 +473,9 @@ func (s *Scheduler) RollbackResearchV3(
 	})
 }
 
+// Cutover is the package-level saga entry retained for focused coordinator
+// tests. It derives the same immutable scope and plan digest as the operator
+// preflight; production callers use CutoverResearchV3 and must echo that digest.
 func (c *researchV3CutoverCoordinator) Cutover(
 	ctx context.Context, req researchV3CutoverRequest,
 ) (types.ResearchV3CutoverOperation, error) {
@@ -257,35 +486,91 @@ func (c *researchV3CutoverCoordinator) Cutover(
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, err
 	}
+	if mirror == nil {
+		return types.ResearchV3CutoverOperation{}, types.ErrNotFound
+	}
+	scope := types.ResearchV3OperatorScope{
+		TenantID: mirror.TenantID, UserID: mirror.UserID, TaskID: mirror.ID,
+		Status: mirror.Status, ExecutionMode: mirror.ExecutionMode,
+		SpecJSON: append([]byte(nil), mirror.SpecJSON...),
+	}
+	if existing, found, loadErr := c.journal.LoadResearchV3Cutover(
+		ctx, scope.TenantID, scope.UserID, scope.TaskID, req.IdempotencyKey,
+	); loadErr != nil {
+		return types.ResearchV3CutoverOperation{}, loadErr
+	} else if found {
+		return c.resumeCutover(ctx, existing)
+	}
+	preflight, err := c.preflight(ctx, scope, req)
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	return c.beginCutoverWithPreflight(ctx, scope, req, mirror, preflight)
+}
+
+func (c *researchV3CutoverCoordinator) CutoverWithPreflight(
+	ctx context.Context, scope types.ResearchV3OperatorScope,
+	req researchV3CutoverRequest, expectedPlanDigest string,
+) (types.ResearchV3CutoverOperation, error) {
+	if err := c.validateRequest(req); err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	mirror, err := c.journal.GetSchedule(ctx, req.TaskID, req.UserID)
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
 	if mirror == nil || mirror.ID != req.TaskID || mirror.UserID != req.UserID ||
-		mirror.TenantID <= 0 || mirror.Status != types.ScheduleStatusActive {
+		mirror.TenantID <= 0 || mirror.TenantID != scope.TenantID ||
+		mirror.Status != scope.Status || mirror.ExecutionMode != scope.ExecutionMode ||
+		!bytes.Equal(mirror.SpecJSON, scope.SpecJSON) ||
+		(mirror.Status != types.ScheduleStatusActive &&
+			mirror.Status != types.ScheduleStatusPaused) {
 		return types.ResearchV3CutoverOperation{}, types.NewAppError(
-			types.CodeNotFound, "research V3 cutover task is not active", types.ErrNotFound)
+			types.CodeNotFound, "research V3 cutover task scope changed", types.ErrNotFound)
 	}
 	if existing, found, loadErr := c.journal.LoadResearchV3Cutover(
 		ctx, mirror.TenantID, req.UserID, req.TaskID, req.IdempotencyKey,
 	); loadErr != nil {
 		return types.ResearchV3CutoverOperation{}, loadErr
 	} else if found {
+		if expectedPlanDigest == "" || existing.PreflightDigest != expectedPlanDigest {
+			return types.ResearchV3CutoverOperation{}, types.NewAppError(
+				types.CodeConflict, "research V3 cutover preflight digest differs", types.ErrConflict)
+		}
 		return c.resumeCutover(ctx, existing)
 	}
+	preflight, err := c.preflight(ctx, scope, req)
+	if err != nil {
+		return types.ResearchV3CutoverOperation{}, err
+	}
+	if expectedPlanDigest == "" ||
+		preflight.inspection.PlanDigest != expectedPlanDigest {
+		return types.ResearchV3CutoverOperation{}, types.NewAppError(
+			types.CodeConflict, "research V3 cutover preflight digest differs", types.ErrConflict)
+	}
+	return c.beginCutoverWithPreflight(ctx, scope, req, mirror, preflight)
+}
+
+func (c *researchV3CutoverCoordinator) beginCutoverWithPreflight(
+	ctx context.Context, scope types.ResearchV3OperatorScope,
+	req researchV3CutoverRequest, mirror *types.Schedule,
+	preflight researchV3CutoverPreflight,
+) (types.ResearchV3CutoverOperation, error) {
 	head, err := c.journal.LoadCurrentResearchApprovedDefinitionV3Head(
 		ctx, mirror.TenantID, req.UserID, req.TaskID)
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, err
 	}
+	if head != preflight.inspection.PreparedHead {
+		return types.ResearchV3CutoverOperation{}, types.NewAppError(
+			types.CodeConflict, "research V3 prepared head changed after preflight",
+			types.ErrConflict)
+	}
 	if err := c.journal.RequireSuccessfulResearchV3ShadowPreflight(
 		ctx, mirror.TenantID, req.UserID, req.TaskID, head); err != nil {
 		return types.ResearchV3CutoverOperation{}, err
 	}
-	desc, err := c.remote.Describe(ctx, req.TaskID)
-	if err != nil {
-		return types.ResearchV3CutoverOperation{}, cutoverRemoteError("describe", err)
-	}
-	frozen, err := cloneDescribedScheduleV3(desc)
-	if err != nil {
-		return types.ResearchV3CutoverOperation{}, err
-	}
+	frozen := proto.Clone(preflight.frozen).(*schedulepb.Schedule)
 	authorityToken, authorityDigest, err := newResearchV3ActionAuthorization()
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, err
@@ -295,14 +580,17 @@ func (c *researchV3CutoverCoordinator) Cutover(
 		return types.ResearchV3CutoverOperation{}, err
 	}
 	frozenBytes, frozenDigest, err := marshalScheduleArtifactV3(frozen)
-	if err != nil {
+	if err != nil || frozenDigest != preflight.inspection.FrozenScheduleDigest {
+		if err == nil {
+			err = types.ErrConflict
+		}
 		return types.ResearchV3CutoverOperation{}, err
 	}
 	targetBytes, targetDigest, err := marshalScheduleArtifactV3(targetAction)
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, err
 	}
-	conflictToken := append([]byte(nil), desc.GetConflictToken()...)
+	conflictToken := append([]byte(nil), preflight.conflictToken...)
 	conflictDigestBytes := sha256.Sum256(conflictToken)
 	op, err := c.journal.BeginResearchV3Cutover(ctx,
 		types.BeginResearchV3CutoverParams{
@@ -314,6 +602,8 @@ func (c *researchV3CutoverCoordinator) Cutover(
 			TargetAction:        targetBytes, TargetActionDigest: targetDigest,
 			ActionAuthorizationDigest: authorityDigest,
 			OriginalPaused:            frozen.GetState().GetPaused(),
+			OriginalScheduleStatus:    scope.Status,
+			PreflightDigest:           preflight.inspection.PlanDigest,
 		})
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, err

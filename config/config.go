@@ -242,7 +242,7 @@ type AgentConfig struct {
 	// SessionTTLMinutes 是会话闲置过期窗口（分钟）：同一 owner 在窗口内的
 	// 消息共享一个多轮会话（上下文连续），超时后新开会话（契约 §0）。
 	SessionTTLMinutes int `mapstructure:"session_ttl_minutes"`
-	// 社媒端点调用护栏。单消息统一由 Agent 20 次隐藏熔断器保护；
+	// 社媒端点调用护栏。单消息最多执行 8 次工具，另有 20 轮总循环上限；
 	// EndpointDailyCap 是滚动 24h 总量上限（从 tool_calls 表 COUNT，含失败调用）。
 	EndpointDailyCap int `mapstructure:"endpoint_daily_cap"`
 	// 网页研究工具护栏。单消息边界同样由统一熔断器负责；

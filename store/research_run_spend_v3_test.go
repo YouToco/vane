@@ -51,7 +51,7 @@ func newResearchRunSpendFixtureWithModelPolicyV3(
 ) researchRunSpendFixtureV3 {
 	t.Helper()
 	return newResearchRunSpendFixtureModeV3(t, maxRunCostMicroUSD,
-		maxToolCalls, createPlan, modelPolicy, false)
+		maxToolCalls, createPlan, modelPolicy, false, false)
 }
 
 func newResearchShadowRunSpendFixtureV3(
@@ -59,12 +59,20 @@ func newResearchShadowRunSpendFixtureV3(
 ) researchRunSpendFixtureV3 {
 	t.Helper()
 	return newResearchRunSpendFixtureModeV3(t, maxRunCostMicroUSD,
-		16, true, testResearchModelPolicyStoreV3(t), true)
+		16, true, testResearchModelPolicyStoreV3(t), true, false)
+}
+
+func newPausedResearchShadowRunSpendFixtureV3(
+	t *testing.T, maxRunCostMicroUSD int64,
+) researchRunSpendFixtureV3 {
+	t.Helper()
+	return newResearchRunSpendFixtureModeV3(t, maxRunCostMicroUSD,
+		16, true, testResearchModelPolicyStoreV3(t), true, true)
 }
 
 func newResearchRunSpendFixtureModeV3(
 	t *testing.T, maxRunCostMicroUSD int64, maxToolCalls int, createPlan bool,
-	modelPolicy runtimepolicy.ResearchModelPolicyV3, shadow bool,
+	modelPolicy runtimepolicy.ResearchModelPolicyV3, shadow, pausedShadow bool,
 ) researchRunSpendFixtureV3 {
 	t.Helper()
 	if os.Getenv("DATABASE_URL") == "" {
@@ -111,14 +119,18 @@ func newResearchRunSpendFixtureModeV3(
 		UserID:             userID,
 		TaskID:             taskID,
 	}
+	scheduleStatus := types.ScheduleStatusActive
+	if shadow && pausedShadow {
+		scheduleStatus = types.ScheduleStatusPaused
+	}
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO schedules (
 		     id,tenant_id,user_id,nl_description,spec_json,scope_json,status,
 		     push_strictness
 		 ) VALUES ($1,$2,$3,'Kimi pricing spend test',
 		           '{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}',
-		           '{}','active','strict')`,
-		taskID, tenantID, userID); err != nil {
+		           '{}',$4,'strict')`,
+		taskID, tenantID, userID, scheduleStatus); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.pool.Exec(ctx,
@@ -179,18 +191,21 @@ func newResearchRunSpendFixtureModeV3(
 		if err := st.pool.QueryRow(ctx,
 			`INSERT INTO research_v3_definition_prepare_operations (
 			     tenant_id,user_id,task_id,idempotency_key,target_definition_version,
-			     target_definition_digest,source_baseline_digest,original_execution_mode
-			 ) VALUES ($1,$2,$3,$4,1,$5,$6,'compiled') RETURNING id`,
+			     target_definition_digest,source_baseline_digest,original_execution_mode,
+			     original_schedule_status
+			 ) VALUES ($1,$2,$3,$4,1,$5,$6,'compiled',$7) RETURNING id`,
 			tenantID, userID, taskID, "shadow-tool-admission-"+uuid.NewString(),
-			digest, baselineDigest).Scan(&operationID); err != nil {
+			digest, baselineDigest, scheduleStatus).Scan(&operationID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.pool.Exec(ctx,
 			`INSERT INTO research_v3_prepared_definition_heads (
 			     tenant_id,user_id,task_id,definition_version,definition_digest,
-			     prepare_operation_id,base_execution_mode,source_baseline_digest
-			 ) VALUES ($1,$2,$3,1,$4,$5,'compiled',$6)`,
-			tenantID, userID, taskID, digest, operationID, baselineDigest); err != nil {
+			     prepare_operation_id,base_execution_mode,source_baseline_digest,
+			     prepared_schedule_status
+			 ) VALUES ($1,$2,$3,1,$4,$5,'compiled',$6,$7)`,
+			tenantID, userID, taskID, digest, operationID, baselineDigest,
+			scheduleStatus); err != nil {
 			t.Fatal(err)
 		}
 	} else if _, err := st.pool.Exec(ctx,

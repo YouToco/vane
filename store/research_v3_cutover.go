@@ -195,12 +195,13 @@ func (s *Store) BeginResearchV3Cutover(
 			existing.Phase == types.ResearchV3CutoverPauseRequested ||
 			existing.Phase == types.ResearchV3CutoverPaused {
 			binding, bindErr := loadPreparedResearchV3BindingTx(
-				ctx, tx, p.TenantID, p.UserID, p.TaskID, true,
+				ctx, tx, p.TenantID, p.UserID, p.TaskID, false,
 				researchV3ExpectBaseHead)
 			if bindErr != nil {
 				return types.ResearchV3CutoverOperation{}, bindErr
 			}
 			if binding.Target != existing.Definition ||
+				binding.ScheduleStatus != existing.OriginalScheduleStatus ||
 				binding.SourceBaselineDigest != existing.SourceBaselineDigest ||
 				binding.BaseMode != existing.OriginalExecutionMode ||
 				!researchV3HeadsEqual(binding.BaseHead, existing.OriginalDefinition) {
@@ -211,11 +212,11 @@ func (s *Store) BeginResearchV3Cutover(
 		return existing, nil
 	}
 	binding, err := loadPreparedResearchV3BindingTx(ctx, tx, p.TenantID, p.UserID,
-		p.TaskID, true, researchV3ExpectBaseHead)
+		p.TaskID, false, researchV3ExpectBaseHead)
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, err
 	}
-	if binding.Target != p.Definition {
+	if binding.Target != p.Definition || binding.ScheduleStatus != p.OriginalScheduleStatus {
 		return types.ResearchV3CutoverOperation{}, types.NewAppError(
 			types.CodeConflict, "research V3 definition changed before cutover", types.ErrConflict)
 	}
@@ -248,22 +249,25 @@ func (s *Store) BeginResearchV3Cutover(
 		 (tenant_id,user_id,task_id,idempotency_key,generation,
 		  definition_version,definition_digest,frozen_schedule,
 		  frozen_schedule_digest,frozen_conflict_token,conflict_token_digest,
-		  target_action,target_action_digest,action_authorization_digest,original_paused,phase,
+		  target_action,target_action_digest,action_authorization_digest,original_paused,
+		  original_schedule_status,preflight_digest,phase,
 		  original_execution_mode,original_definition_version,original_definition_digest,
 		  source_baseline_digest)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'prepared',$16,$17,$18,$19)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'prepared',$18,$19,$20,$21)
 		 RETURNING id,tenant_id,user_id,task_id,idempotency_key,generation,
 		  definition_version,definition_digest,frozen_schedule,
 		  frozen_schedule_digest,frozen_conflict_token,conflict_token_digest,
 		  rollback_conflict_token,rollback_token_digest,
 		  target_action,target_action_digest,action_authorization_digest,
-		  original_paused,original_execution_mode,original_definition_version,
+		  original_paused,original_schedule_status,preflight_digest,
+		  original_execution_mode,original_definition_version,
 		  original_definition_digest,source_baseline_digest,phase,created_at,updated_at`,
 		p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey, generation,
 		p.Definition.Version, p.Definition.Digest, p.FrozenSchedule,
 		p.FrozenScheduleDigest, p.FrozenConflictToken, p.ConflictTokenDigest,
 		p.TargetAction, p.TargetActionDigest, p.ActionAuthorizationDigest,
-		p.OriginalPaused, originalMode, originalVersion, originalDigest,
+		p.OriginalPaused, p.OriginalScheduleStatus, p.PreflightDigest,
+		originalMode, originalVersion, originalDigest,
 		binding.SourceBaselineDigest))
 	if err != nil {
 		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("insert V3 cutover journal", err)
@@ -278,6 +282,103 @@ func (s *Store) LoadResearchV3Cutover(
 	ctx context.Context, tenantID, userID int64, taskID, key string,
 ) (types.ResearchV3CutoverOperation, bool, error) {
 	return loadResearchV3CutoverTx(ctx, s.pool, tenantID, userID, taskID, key)
+}
+
+// LoadResearchV3CutoverAuthorityStatus returns only the durable state bound to
+// one immutable cutover generation. It never exposes the Action bearer token.
+func (s *Store) LoadResearchV3CutoverAuthorityStatus(
+	ctx context.Context, op types.ResearchV3CutoverOperation,
+) (string, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return "", taskStateDatabaseError("begin V3 authority status", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3CutoverOperatorTx(
+		ctx, tx, op.TenantID, op.UserID); err != nil {
+		return "", err
+	}
+	var status string
+	if err := tx.QueryRow(ctx, `
+		SELECT status FROM research_v3_delivery_authorities
+		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND generation=$4
+		   AND definition_version=$5 AND definition_digest=$6
+		   AND target_action_digest=$7 AND action_authorization_digest=$8`,
+		op.TenantID, op.UserID, op.TaskID, op.Generation,
+		op.Definition.Version, op.Definition.Digest, op.TargetActionDigest,
+		op.ActionAuthorizationDigest).Scan(&status); err != nil {
+		return "", taskStateDatabaseError("load V3 authority status", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", taskStateDatabaseError("commit V3 authority status", err)
+	}
+	return status, nil
+}
+
+// VerifyResearchV3CutoverDatabaseState proves the terminal DB half of the
+// saga without advancing it. Temporal is verified separately from Describe.
+func (s *Store) VerifyResearchV3CutoverDatabaseState(
+	ctx context.Context, op types.ResearchV3CutoverOperation,
+) error {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return taskStateDatabaseError("begin V3 cutover verification", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := bindResearchV3CutoverOperatorTx(
+		ctx, tx, op.TenantID, op.UserID); err != nil {
+		return err
+	}
+	var status, mode string
+	var version *int64
+	var digest *string
+	if err := tx.QueryRow(ctx, `
+		SELECT status,execution_mode,approved_definition_version,
+		       approved_definition_digest
+		  FROM schedules
+		 WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		op.TenantID, op.UserID, op.TaskID).Scan(
+		&status, &mode, &version, &digest); err != nil {
+		return taskStateDatabaseError("load V3 cutover verification head", err)
+	}
+	if status != string(op.OriginalScheduleStatus) {
+		return types.NewAppError(types.CodeConflict,
+			"research V3 cutover changed schedule status", types.ErrConflict)
+	}
+	var authorityStatus string
+	if err := tx.QueryRow(ctx, `
+		SELECT status FROM research_v3_delivery_authorities
+		 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND generation=$4
+		   AND definition_version=$5 AND definition_digest=$6
+		   AND target_action_digest=$7 AND action_authorization_digest=$8`,
+		op.TenantID, op.UserID, op.TaskID, op.Generation,
+		op.Definition.Version, op.Definition.Digest, op.TargetActionDigest,
+		op.ActionAuthorizationDigest).Scan(&authorityStatus); err != nil {
+		return taskStateDatabaseError("load V3 cutover verification authority", err)
+	}
+	switch op.Phase {
+	case types.ResearchV3CutoverActive:
+		if mode != string(types.ExecutionModeDiscoverAtRun) || version == nil || digest == nil ||
+			*version != op.Definition.Version || *digest != op.Definition.Digest ||
+			authorityStatus != "enabled" {
+			return types.NewAppError(types.CodeConflict,
+				"research V3 active database state differs", types.ErrConflict)
+		}
+	case types.ResearchV3CutoverRolledBack, types.ResearchV3CutoverAborted:
+		if mode != string(op.OriginalExecutionMode) ||
+			!nullableHeadEqual(version, digest, op.OriginalDefinition) ||
+			authorityStatus != "revoked" {
+			return types.NewAppError(types.CodeConflict,
+				"research V3 rollback database state differs", types.ErrConflict)
+		}
+	default:
+		return types.NewAppError(types.CodeConflict,
+			"research V3 cutover is not terminal", types.ErrConflict)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return taskStateDatabaseError("commit V3 cutover verification", err)
+	}
+	return nil
 }
 
 // RecheckResearchV3CutoverDefinition closes the pause-to-CAS definition race.
@@ -299,14 +400,15 @@ func (s *Store) RecheckResearchV3CutoverDefinition(
 		expectation = researchV3ExpectTargetHead
 	}
 	binding, err := loadPreparedResearchV3BindingTx(ctx, tx, op.TenantID, op.UserID,
-		op.TaskID, true, expectation)
+		op.TaskID, false, expectation)
 	if err != nil {
 		if types.CodeOf(err) == types.CodeDatabase || types.CodeOf(err) == types.CodeInternal {
 			return err
 		}
 		return researchV3CutoverDrift("research V3 definition is no longer admissible")
 	}
-	if binding.Target != op.Definition || binding.SourceBaselineDigest != op.SourceBaselineDigest ||
+	if binding.Target != op.Definition || binding.ScheduleStatus != op.OriginalScheduleStatus ||
+		binding.SourceBaselineDigest != op.SourceBaselineDigest ||
 		binding.BaseMode != op.OriginalExecutionMode || !researchV3HeadsEqual(binding.BaseHead, op.OriginalDefinition) {
 		return researchV3CutoverDrift("research V3 definition changed during cutover")
 	}
@@ -335,8 +437,9 @@ func (s *Store) PromoteResearchV3PreparedDefinition(
 		return types.ResearchV3CutoverOperation{}, taskStateDatabaseError("lock V3 definition promotion", err)
 	}
 	binding, err := loadPreparedResearchV3BindingTx(ctx, tx, op.TenantID, op.UserID,
-		op.TaskID, true, researchV3ExpectBaseHead)
+		op.TaskID, false, researchV3ExpectBaseHead)
 	if err != nil || binding.Target != op.Definition ||
+		binding.ScheduleStatus != op.OriginalScheduleStatus ||
 		binding.SourceBaselineDigest != op.SourceBaselineDigest ||
 		binding.BaseMode != op.OriginalExecutionMode ||
 		!researchV3HeadsEqual(binding.BaseHead, op.OriginalDefinition) {
@@ -516,9 +619,10 @@ func (s *Store) AdvanceResearchV3Cutover(
 		promoted := next == types.ResearchV3CutoverActionSwapped || next == types.ResearchV3CutoverActive
 		if !promoted {
 			binding, headErr := loadPreparedResearchV3BindingTx(
-				ctx, tx, op.TenantID, op.UserID, op.TaskID, true,
+				ctx, tx, op.TenantID, op.UserID, op.TaskID, false,
 				researchV3ExpectBaseHead)
 			if headErr != nil || binding.Target != op.Definition ||
+				binding.ScheduleStatus != op.OriginalScheduleStatus ||
 				binding.SourceBaselineDigest != op.SourceBaselineDigest ||
 				binding.BaseMode != op.OriginalExecutionMode ||
 				!researchV3HeadsEqual(binding.BaseHead, op.OriginalDefinition) {
@@ -534,9 +638,10 @@ func (s *Store) AdvanceResearchV3Cutover(
 			}
 		} else {
 			binding, headErr := loadPreparedResearchV3BindingTx(
-				ctx, tx, op.TenantID, op.UserID, op.TaskID, true,
+				ctx, tx, op.TenantID, op.UserID, op.TaskID, false,
 				researchV3ExpectTargetHead)
 			if headErr != nil || binding.Target != op.Definition ||
+				binding.ScheduleStatus != op.OriginalScheduleStatus ||
 				binding.SourceBaselineDigest != op.SourceBaselineDigest {
 				if headErr != nil {
 					if types.CodeOf(headErr) == types.CodeDatabase || types.CodeOf(headErr) == types.CodeInternal {
@@ -870,7 +975,8 @@ func loadResearchV3CutoverTx(
 		        frozen_schedule_digest,frozen_conflict_token,conflict_token_digest,
 		        rollback_conflict_token,rollback_token_digest,
 		        target_action,target_action_digest,action_authorization_digest,
-		        original_paused,original_execution_mode,original_definition_version,
+		        original_paused,original_schedule_status,preflight_digest,
+		        original_execution_mode,original_definition_version,
 		        original_definition_digest,source_baseline_digest,phase,created_at,updated_at
 		   FROM research_v3_cutover_operations
 		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND idempotency_key=$4`,
@@ -895,12 +1001,16 @@ func scanResearchV3Cutover(row pgx.Row) (types.ResearchV3CutoverOperation, error
 		&op.FrozenConflictToken, &op.ConflictTokenDigest,
 		&op.RollbackConflictToken, &rollbackDigest,
 		&op.TargetAction, &op.TargetActionDigest, &op.ActionAuthorizationDigest,
-		&op.OriginalPaused, &op.OriginalExecutionMode, &originalVersion, &originalDigest,
+		&op.OriginalPaused, &op.OriginalScheduleStatus, &op.PreflightDigest,
+		&op.OriginalExecutionMode, &originalVersion, &originalDigest,
 		&op.SourceBaselineDigest, &op.Phase, &op.CreatedAt, &op.UpdatedAt)
 	if err != nil {
 		return op, err
 	}
 	if (originalVersion == nil) != (originalDigest == nil) ||
+		(op.OriginalScheduleStatus != types.ScheduleStatusActive &&
+			op.OriginalScheduleStatus != types.ScheduleStatusPaused) ||
+		!validDigestSyntaxV3(op.PreflightDigest) ||
 		!validDigestSyntaxV3(op.SourceBaselineDigest) {
 		return op, taskStateIntegrity()
 	}
@@ -924,6 +1034,9 @@ func validateResearchV3CutoverBegin(p types.BeginResearchV3CutoverParams) error 
 		!validDigestSyntaxV3(p.Definition.Digest) || !validDigestSyntaxV3(p.FrozenScheduleDigest) ||
 		!validDigestSyntaxV3(p.ConflictTokenDigest) || !validDigestSyntaxV3(p.TargetActionDigest) ||
 		!validDigestSyntaxV3(p.ActionAuthorizationDigest) ||
+		!validDigestSyntaxV3(p.PreflightDigest) ||
+		(p.OriginalScheduleStatus != types.ScheduleStatusActive &&
+			p.OriginalScheduleStatus != types.ScheduleStatusPaused) ||
 		len(p.FrozenSchedule) == 0 || len(p.FrozenConflictToken) == 0 || len(p.FrozenConflictToken) > 4096 ||
 		len(p.FrozenSchedule) > 1<<20 || len(p.TargetAction) == 0 || len(p.TargetAction) > 1<<19 {
 		return types.NewAppError(types.CodeValidation,
@@ -960,6 +1073,8 @@ func researchV3CutoverMatches(
 	op types.ResearchV3CutoverOperation, p types.BeginResearchV3CutoverParams,
 ) bool {
 	return op.Definition == p.Definition && op.OriginalPaused == p.OriginalPaused &&
+		op.OriginalScheduleStatus == p.OriginalScheduleStatus &&
+		op.PreflightDigest == p.PreflightDigest &&
 		op.FrozenScheduleDigest == p.FrozenScheduleDigest &&
 		op.ConflictTokenDigest == p.ConflictTokenDigest &&
 		op.TargetActionDigest == p.TargetActionDigest &&

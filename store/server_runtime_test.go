@@ -417,6 +417,13 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		}
 	})
 
+	// The preceding cases deliberately prove the schema-108 runtime boundary.
+	// The remaining V3 runtime cases use the current Store contract, including
+	// migration 116's immutable schedule-status cutover binding.
+	if _, err := provider.UpTo(t.Context(), 116); err != nil {
+		t.Fatal(err)
+	}
+
 	t.Run("V3 shadow binds exact app tenant and user scope", func(t *testing.T) {
 		ownerStore, err := New(t.Context(), scratchURL)
 		if err != nil {
