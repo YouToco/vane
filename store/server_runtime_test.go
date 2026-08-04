@@ -419,8 +419,8 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 
 	// The preceding cases deliberately prove the schema-108 runtime boundary.
 	// The remaining V3 runtime cases use the current Store contract, including
-	// migration 116's immutable schedule-status cutover binding.
-	if _, err := provider.UpTo(t.Context(), 116); err != nil {
+	// migrations 116/117's immutable schedule-status and quota bindings.
+	if _, err := provider.UpTo(t.Context(), 117); err != nil {
 		t.Fatal(err)
 	}
 
@@ -608,6 +608,46 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 					t.Fatalf("%s quota err=%v", name, err)
 				}
 			})
+		}
+		pausedTaskID := "v3-runtime-paused-" + uuid.NewString()
+		if _, err := owner.ExecContext(t.Context(), `INSERT INTO schedules
+			(id,tenant_id,user_id,nl_description,spec_json,scope_json,status,push_strictness)
+			VALUES($1,$2,$3,'paused runtime V3',
+			'{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}','{}','paused','strict')`,
+			pausedTaskID, tenantID, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(), `INSERT INTO schedule_playbooks
+			(schedule_id,content,fetch_plan) VALUES($1,'paused runtime shadow test','{}')`,
+			pausedTaskID); err != nil {
+			t.Fatal(err)
+		}
+		pausedPolicy := researchV3PreparePolicyForTest()
+		pausedPolicy.TenantID, pausedPolicy.UserID, pausedPolicy.TaskID,
+			pausedPolicy.IdempotencyKey = tenantID, user.ID, pausedTaskID, "runtime-paused-prepare"
+		if _, err := ownerStore.PrepareResearchV3Definition(t.Context(), pausedPolicy); err != nil {
+			t.Fatal(err)
+		}
+		pausedIdentity := identity
+		pausedIdentity.TaskID = pausedTaskID
+		pausedIdentity.TemporalRunID = "runtime-paused-run-" + uuid.NewString()
+		for _, bucket := range []QuotaBucket{QuotaLLMTokens, QuotaExaCalls} {
+			quota, err := runtimeStore.LoadResearchQuotaRuleV3(
+				t.Context(), pausedIdentity, bucket)
+			if err != nil || quota.Rate <= 0 || quota.Burst <= 0 {
+				t.Fatalf("paused prepared V3 %s quota=%+v err=%v", bucket, quota, err)
+			}
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`DELETE FROM research_v3_prepared_definition_heads
+			  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+			tenantID, user.ID, pausedTaskID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtimeStore.LoadResearchQuotaRuleV3(
+			t.Context(), pausedIdentity, QuotaLLMTokens,
+		); !errors.Is(err, ErrQuotaExceeded) {
+			t.Fatalf("paused task without prepared sidecar quota err=%v", err)
 		}
 		ref, err := runtimeStore.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
 			testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
