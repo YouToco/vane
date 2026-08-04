@@ -1120,18 +1120,17 @@ func validateResearchBriefCoverageV31(
 		}
 		return nil
 	}
-	if brief.SchemaVersion != types.ResearchBriefPayloadSchemaV31 {
-		return researchRunValidationError(
-			"partial-coverage research Brief must use the partial-coverage payload")
-	}
-	if brief.Assessment == types.ResearchBriefAssessmentUnknownV31 {
+	if brief.SchemaVersion == types.ResearchBriefPayloadSchemaV31 &&
+		brief.Assessment == types.ResearchBriefAssessmentUnknownV31 {
 		if brief.Significance != types.ResearchBriefSignificanceNoneV3 {
 			return researchRunValidationError(
 				"unknown partial-coverage research Brief must be quiet")
 		}
 		return nil
 	}
-	if brief.Assessment != types.ResearchBriefAssessmentGroundedV31 {
+	if brief.SchemaVersion != types.ResearchBriefPayloadSchemaV32 ||
+		brief.Assessment != types.ResearchBriefAssessmentGroundedV31 ||
+		brief.Significance != types.ResearchBriefSignificanceNoneV3 {
 		return researchRunValidationError(
 			"partial-coverage research Brief assessment is invalid")
 	}

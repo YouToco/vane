@@ -575,6 +575,12 @@ func TestMigration107SQLRetainsLegacyRouteAndRejectsUnknownSchemas(t *testing.T)
 func migration107PreparedBriefFixture(
 	t *testing.T, completedOrdinals map[int]bool,
 ) (researchBriefFixtureV3, ResearchBriefSynthesisV3) {
+	return migrationPreparedBriefFixtureV31(t, completedOrdinals, "external")
+}
+
+func migrationPreparedBriefFixtureV31(
+	t *testing.T, completedOrdinals map[int]bool, trustType string,
+) (researchBriefFixtureV3, ResearchBriefSynthesisV3) {
 	t.Helper()
 	f := newResearchRunSpendFixtureV3(t, 1_000_000)
 	for ordinal := 0; ordinal < f.planRef.StepCount; ordinal++ {
@@ -588,7 +594,7 @@ func migration107PreparedBriefFixture(
 				CommitResearchRunStepEvidenceV3Params{
 					Identity: f.identity, RunSnapshotID: f.snapshotID,
 					PlanRef: f.planRef, Ordinal: ordinal,
-					Result: result, OriginalSize: len(result), TrustType: "external",
+					Result: result, OriginalSize: len(result), TrustType: trustType,
 					CostMicroUSD: 100,
 					ProviderCall: researchProviderCallV3ForTest(
 						f.trace(t, ordinal, started.InvocationID), 100),

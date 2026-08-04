@@ -16,6 +16,7 @@ const ResearchBriefRefSchemaV3 = "vane.research-brief-ref/v3"
 
 const ResearchBriefPayloadSchemaV3 = "vane.research-brief/v3"
 const ResearchBriefPayloadSchemaV31 = "vane.research-brief/v3.1"
+const ResearchBriefPayloadSchemaV32 = "vane.research-brief/v3.2"
 
 type ResearchBriefAssessmentV31 string
 
@@ -108,7 +109,8 @@ func EncodeResearchBriefPayloadV3(payload ResearchBriefPayloadV3) ([]byte, error
 
 func (p ResearchBriefPayloadV3) Validate() error {
 	if (p.SchemaVersion != ResearchBriefPayloadSchemaV3 &&
-		p.SchemaVersion != ResearchBriefPayloadSchemaV31) || !p.Significance.Valid() ||
+		p.SchemaVersion != ResearchBriefPayloadSchemaV31 &&
+		p.SchemaVersion != ResearchBriefPayloadSchemaV32) || !p.Significance.Valid() ||
 		!validResearchBriefPayloadTextV3(p.Headline, 1024) ||
 		!validResearchBriefPayloadTextV3(p.Summary, 64<<10) ||
 		len(p.Citations) > 64 {
@@ -118,19 +120,18 @@ func (p ResearchBriefPayloadV3) Validate() error {
 		if p.Assessment != "" || len(p.Citations) == 0 {
 			return NewAppError(CodeValidation, "research Brief payload 无效", ErrValidation)
 		}
-	} else {
+	} else if p.SchemaVersion == ResearchBriefPayloadSchemaV31 {
 		switch p.Assessment {
 		case ResearchBriefAssessmentUnknownV31:
 			if p.Significance != ResearchBriefSignificanceNoneV3 || p.Citations == nil {
 				return NewAppError(CodeValidation, "research Brief unknown assessment 必须静默", ErrValidation)
 			}
-		case ResearchBriefAssessmentGroundedV31:
-			if len(p.Citations) == 0 {
-				return NewAppError(CodeValidation, "research Brief grounded assessment 必须引用证据", ErrValidation)
-			}
 		default:
 			return NewAppError(CodeValidation, "research Brief assessment 无效", ErrValidation)
 		}
+	} else if p.Assessment != ResearchBriefAssessmentGroundedV31 ||
+		p.Significance != ResearchBriefSignificanceNoneV3 || len(p.Citations) == 0 {
+		return NewAppError(CodeValidation, "research Brief grounded assessment 必须有证据且保持静默", ErrValidation)
 	}
 	seen := make(map[string]struct{}, len(p.Citations))
 	hasCurrent := false
@@ -153,7 +154,7 @@ func (p ResearchBriefPayloadV3) Validate() error {
 		}
 	}
 	if !hasCurrent && (p.SchemaVersion == ResearchBriefPayloadSchemaV3 ||
-		p.Assessment == ResearchBriefAssessmentGroundedV31) {
+		p.SchemaVersion == ResearchBriefPayloadSchemaV32) {
 		return NewAppError(CodeValidation, "research Brief 必须引用当前 Evidence", ErrValidation)
 	}
 	return nil

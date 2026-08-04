@@ -125,7 +125,7 @@ func TestResearchBriefPayloadV31RepresentsUnknownWithoutInventedEvidence(t *test
 
 func TestResearchBriefPayloadV31RepresentsGroundedPartialCoverage(t *testing.T) {
 	grounded := ResearchBriefPayloadV3{
-		SchemaVersion: ResearchBriefPayloadSchemaV31,
+		SchemaVersion: ResearchBriefPayloadSchemaV32,
 		Assessment:    ResearchBriefAssessmentGroundedV31,
 		Headline:      "Kimi 套餐仍需预约",
 		Summary:       "官方结构化状态显示付费套餐当前仍不能直接购买。",
@@ -138,13 +138,19 @@ func TestResearchBriefPayloadV31RepresentsGroundedPartialCoverage(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"schema_version":"vane.research-brief/v3.1","assessment":"grounded","headline":"Kimi 套餐仍需预约","summary":"官方结构化状态显示付费套餐当前仍不能直接购买。","significance":"none","citations":[{"kind":"current_evidence","ref":"7"}]}`
+	want := `{"schema_version":"vane.research-brief/v3.2","assessment":"grounded","headline":"Kimi 套餐仍需预约","summary":"官方结构化状态显示付费套餐当前仍不能直接购买。","significance":"none","citations":[{"kind":"current_evidence","ref":"7"}]}`
 	if string(encoded) != want {
 		t.Fatalf("grounded canonical bytes drifted:\n got %s\nwant %s", encoded, want)
 	}
 
 	for name, mutate := range map[string]func(*ResearchBriefPayloadV3){
 		"no citations": func(value *ResearchBriefPayloadV3) { value.Citations = nil },
+		"nonquiet significance": func(value *ResearchBriefPayloadV3) {
+			value.Significance = ResearchBriefSignificanceMajorV3
+		},
+		"legacy schema": func(value *ResearchBriefPayloadV3) {
+			value.SchemaVersion = ResearchBriefPayloadSchemaV31
+		},
 		"history only": func(value *ResearchBriefPayloadV3) {
 			value.Citations = []ResearchBriefCitationV3{{Kind: ResearchBriefCitationHistoryV3, Ref: "brief:1"}}
 		},

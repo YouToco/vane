@@ -792,7 +792,7 @@ func TestResearchBriefCoverageV31AllowsGroundedOfficialEvidenceDespiteRedundantF
 		t.Fatal(err)
 	}
 	grounded := types.ResearchBriefPayloadV3{
-		SchemaVersion: types.ResearchBriefPayloadSchemaV31,
+		SchemaVersion: types.ResearchBriefPayloadSchemaV32,
 		Assessment:    types.ResearchBriefAssessmentGroundedV31,
 		Headline:      "Kimi status is grounded",
 		Summary:       "The successful official status remains authoritative.",

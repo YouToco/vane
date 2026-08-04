@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 111
+const latestMigrationVersion int64 = 112
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
