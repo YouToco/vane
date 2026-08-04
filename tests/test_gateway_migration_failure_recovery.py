@@ -477,6 +477,64 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
         self.assertIn("recovery failed", stderr)
         self.assertNotIn("contract restored", stderr)
 
+    def test_copy_zero_success_is_verified_by_effect(self) -> None:
+        faults = {
+            "no-op": "cp() { return 0; }",
+            "wrong-content": r'''cp() {
+  local destination=${!#}
+  printf 'wrong-content\n' >"$destination"
+  return 0
+}''',
+        }
+        for name, fault in faults.items():
+            with self.subTest(name=name):
+                result, live, retained = self.run_quiescent_restore_fault(
+                    fault, 34
+                )
+                self.assertEqual(result.returncode, 34, result.stderr.decode())
+                self.assertTrue(retained)
+                self.assertEqual(live, [f"new-{index}" for index in range(8)])
+                stderr = result.stderr.decode()
+                self.assertIn(
+                    "prepared research gateway restore does not match snapshot: binary",
+                    stderr,
+                )
+                self.assertIn("recovery failed", stderr)
+                self.assertNotIn("contract restored", stderr)
+
+    def test_move_zero_success_is_verified_by_effect(self) -> None:
+        faults = {
+            "no-op": "mv() { return 0; }",
+            "wrong-content": r'''mv() {
+  local destination=${!#}
+  printf 'wrong-content\n' >"$destination"
+  return 0
+}''',
+        }
+        for name, fault in faults.items():
+            with self.subTest(name=name):
+                result, live, retained = self.run_quiescent_restore_fault(
+                    fault, 35
+                )
+                self.assertEqual(result.returncode, 35, result.stderr.decode())
+                self.assertTrue(retained)
+                if name == "no-op":
+                    self.assertEqual(
+                        live, [f"new-{index}" for index in range(8)]
+                    )
+                else:
+                    self.assertEqual(live[0], "wrong-content")
+                    self.assertEqual(
+                        live[1:], [f"new-{index}" for index in range(1, 8)]
+                    )
+                stderr = result.stderr.decode()
+                self.assertIn(
+                    "committed research gateway restore does not match snapshot: binary",
+                    stderr,
+                )
+                self.assertIn("recovery failed", stderr)
+                self.assertNotIn("contract restored", stderr)
+
     def test_commit_failure_detects_mixed_state_and_preserves_snapshot(self) -> None:
         fault = r'''fail_mv_target=${gateway_snapshot_paths[5]}
 mv() {

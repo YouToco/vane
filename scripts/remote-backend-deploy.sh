@@ -675,6 +675,50 @@ snapshot_previous_gateway_release() {
   previous_gateway_snapshot_ready=true
 }
 
+gateway_regular_matches_snapshot() {
+  local snapshot=$1 key=$2 path=$3 state
+  local snapshot_metadata path_metadata
+  read -r state <"$snapshot/$key.state" || return 1
+  if [[ $state == absent ]]; then
+    if [[ ! -e $path && ! -L $path ]]; then return 0; fi
+    return 1
+  fi
+  [[ $state == present && -f $snapshot/$key && ! -L $snapshot/$key &&
+     -f $path && ! -L $path ]] || return 1
+  cmp -s -- "$snapshot/$key" "$path" || return 1
+  snapshot_metadata=$(stat -c '%u:%g:%a' "$snapshot/$key") || return 1
+  path_metadata=$(stat -c '%u:%g:%a' "$path") || return 1
+  [[ $path_metadata == "$snapshot_metadata" ]] || return 1
+  return 0
+}
+
+verify_gateway_runtime_restore() {
+  local snapshot=$1 state expected actual uid gid mode
+  read -r state <"$snapshot/runtime-directory.state" || return 1
+  if [[ $state == absent ]]; then
+    [[ ! -e /run/vane-research-gateway &&
+       ! -L /run/vane-research-gateway ]] || {
+      echo "research gateway runtime directory should be absent" >&2
+      return 1
+    }
+    return 0
+  fi
+  [[ $state == present && -d /run/vane-research-gateway &&
+     ! -L /run/vane-research-gateway ]] || {
+    echo "research gateway runtime directory type did not restore" >&2
+    return 1
+  }
+  read -r uid <"$snapshot/runtime-directory.uid" || return 1
+  read -r gid <"$snapshot/runtime-directory.gid" || return 1
+  read -r mode <"$snapshot/runtime-directory.mode" || return 1
+  expected=$uid:$gid:$mode
+  actual=$(stat -c '%u:%g:%a' /run/vane-research-gateway) || return 1
+  [[ $actual == "$expected" ]] || {
+    echo "research gateway runtime directory metadata did not restore" >&2
+    return 1
+  }
+}
+
 prepare_gateway_regular_restore() {
   local snapshot=$1 key=$2 path=$3 state
   read -r state <"$snapshot/$key.state" || return 1
@@ -694,6 +738,11 @@ prepare_gateway_regular_restore() {
       return 1
     }
   fi
+  gateway_regular_matches_snapshot "$snapshot" "$key" \
+    "$path.rollback-next" || {
+    echo "prepared research gateway restore does not match snapshot: $key" >&2
+    return 1
+  }
 }
 
 commit_gateway_regular_restore() {
@@ -710,6 +759,10 @@ commit_gateway_regular_restore() {
       return 1
     }
   fi
+  gateway_regular_matches_snapshot "$snapshot" "$key" "$path" || {
+    echo "committed research gateway restore does not match snapshot: $key" >&2
+    return 1
+  }
 }
 
 validate_gateway_restore_snapshot() {
@@ -940,6 +993,7 @@ restore_previous_gateway_release() (
        ! -L /run/vane-research-gateway ]] || return 1
     rmdir -- /run/vane-research-gateway || return 1
   fi
+  verify_gateway_runtime_restore "$snapshot" || return 1
   systemctl daemon-reload || return 1
   if [[ $socket_enabled == true ]]; then
     systemctl enable vane-research-gateway.socket >/dev/null || return 1
@@ -954,6 +1008,7 @@ restore_previous_gateway_release() (
     systemctl start vane-research-gateway.service || return 1
   fi
   verify_gateway_systemd_snapshot "$snapshot" || return 1
+  verify_gateway_runtime_restore "$snapshot" || return 1
   if [[ $service_active == false ]]; then
     echo "previous quiescent research gateway contract restored" >&2
     return 0
@@ -968,6 +1023,7 @@ restore_previous_gateway_release() (
     if [[ $gateway_exe == /opt/vane/bin/vane-research-gateway ]] &&
        gateway_functional; then
       verify_gateway_systemd_snapshot "$snapshot" || return 1
+      verify_gateway_runtime_restore "$snapshot" || return 1
       echo "previous research gateway contract recovery verified" >&2
       return 0
     fi
