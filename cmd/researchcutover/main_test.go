@@ -8,7 +8,7 @@ import (
 
 func TestParseCutoverArgs(t *testing.T) {
 	digest := strings.Repeat("a", 64)
-	for _, operation := range []string{"preflight", "status", "verify", "rollback", "cutover"} {
+	for _, operation := range []string{"preflight", "status", "verify", "cutover"} {
 		arguments := []string{"-operation", operation, "-task-id", "task-v3", "-idempotency-key", "gate-1-attempt"}
 		if operation == "cutover" {
 			arguments = append(arguments, "-plan-digest", digest)
@@ -24,10 +24,11 @@ func TestParseCutoverArgs(t *testing.T) {
 func TestParseCutoverArgsRejectsUnsafeScope(t *testing.T) {
 	tests := [][]string{
 		{"-operation", "delete", "-task-id", "task-v3", "-idempotency-key", "key"},
+		{"-operation", "rollback", "-task-id", "task-v3", "-idempotency-key", "key"},
 		{"-operation", "cutover", "-task-id", "task-other ", "-idempotency-key", "key", "-plan-digest", strings.Repeat("a", 64)},
 		{"-operation", "cutover", "-task-id", "task-v3", "-idempotency-key", "key"},
-		{"-operation", "rollback", "-task-id", "task-v3", "-user-id", "42", "-idempotency-key", "key"},
-		{"-operation", "rollback", "-task-id", "task-v3", "-idempotency-key", " "},
+		{"-operation", "verify", "-task-id", "task-v3", "-user-id", "42", "-idempotency-key", "key"},
+		{"-operation", "verify", "-task-id", "task-v3", "-idempotency-key", " "},
 	}
 	for _, args := range tests {
 		if _, err := parseCutoverArgs(args); err == nil {

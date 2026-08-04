@@ -31,6 +31,16 @@ func TestVerifyEnabledResearchV3ActionAuthorizationPostgres(t *testing.T) {
 		t.Context(), f.tenantID, f.userID, f.taskID, token); err != nil {
 		t.Fatalf("matching enabled authority: %v", err)
 	}
+	if err := f.st.VerifyEnabledResearchV3ActionEvidence(
+		t.Context(), f.tenantID, f.userID, f.taskID, token,
+		strings.Repeat("b", 64)); err != nil {
+		t.Fatalf("matching enabled Action evidence: %v", err)
+	}
+	if err := f.st.VerifyEnabledResearchV3ActionEvidence(
+		t.Context(), f.tenantID, f.userID, f.taskID, token,
+		strings.Repeat("d", 64)); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("tampered Action digest error=%v", err)
+	}
 	if err := f.st.VerifyEnabledResearchV3ActionAuthorization(
 		t.Context(), f.tenantID, f.userID, f.taskID,
 		strings.Repeat("c", 64)); types.CodeOf(err) != types.CodeConflict {

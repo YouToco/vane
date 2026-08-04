@@ -87,6 +87,65 @@ func (s *Store) VerifyEnabledResearchV3ActionAuthorization(
 	return nil
 }
 
+// VerifyEnabledResearchV3ActionEvidence binds a raw Temporal Schedule Action
+// to the same durable authority as its bearer token. Manual run/resume paths
+// use this stronger check so a privileged Temporal-side queue or envelope edit
+// cannot borrow an otherwise valid token.
+func (s *Store) VerifyEnabledResearchV3ActionEvidence(
+	ctx context.Context,
+	tenantID, userID int64,
+	taskID, token, targetActionDigest string,
+) error {
+	if err := validateTaskStateScope(tenantID, userID, taskID); err != nil {
+		return err
+	}
+	if len(token) != 64 || token != strings.ToLower(token) ||
+		!validDigestSyntaxV3(targetActionDigest) {
+		return types.NewAppError(types.CodeConflict,
+			"research V3 Schedule Action evidence is invalid", types.ErrConflict)
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return types.NewAppError(types.CodeConflict,
+			"research V3 Schedule Action evidence is invalid", types.ErrConflict)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return taskStateDatabaseError(
+			"begin research V3 Action evidence verification", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true)`,
+		strconv.FormatInt(tenantID, 10), strconv.FormatInt(userID, 10)); err != nil {
+		return taskStateDatabaseError("bind research V3 Action evidence scope", err)
+	}
+	var expectedTokenDigest, expectedTargetDigest string
+	err = tx.QueryRow(ctx,
+		`SELECT action_authorization_digest,target_action_digest
+		   FROM research_v3_delivery_authorities
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND status='enabled'`,
+		tenantID, userID, taskID,
+	).Scan(&expectedTokenDigest, &expectedTargetDigest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.NewAppError(types.CodeConflict,
+			"enabled research V3 Action authority is unavailable", types.ErrConflict)
+	}
+	if err != nil {
+		return taskStateDatabaseError("load research V3 Action evidence", err)
+	}
+	tokenDigest := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare(
+		[]byte(hex.EncodeToString(tokenDigest[:])), []byte(expectedTokenDigest),
+	) != 1 || subtle.ConstantTimeCompare(
+		[]byte(targetActionDigest), []byte(expectedTargetDigest),
+	) != 1 {
+		return types.NewAppError(types.CodeConflict,
+			"research V3 Schedule Action does not match durable evidence",
+			types.ErrConflict)
+	}
+	return nil
+}
+
 // RequireSuccessfulResearchV3ShadowPreflight proves that the exact current
 // definition has already completed synthesis through the delivery-dark shadow
 // workflow. The proof is rebuilt from immutable snapshot and Brief rows; a

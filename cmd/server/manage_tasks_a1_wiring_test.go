@@ -87,20 +87,15 @@ func TestNativeV3CreationPolicyIsInjectedIntoProductionCoordinator(t *testing.T)
 	wired := false
 	ast.Inspect(file, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
-		if !ok || !isPackageSelector(call.Fun, "task", "NewCreationCoordinator") {
+		if !ok || !isPackageSelector(call.Fun, "task", "NewResearchCreationCoordinatorV3") {
 			return true
 		}
 		if len(call.Args) != 4 {
-			t.Fatalf("NewCreationCoordinator args=%d, want V3 policy option", len(call.Args))
+			t.Fatalf("NewResearchCreationCoordinatorV3 args=%d, want trusted V3 policy", len(call.Args))
 		}
-		option, ok := call.Args[3].(*ast.CallExpr)
-		if !ok || !isPackageSelector(option.Fun, "task", "WithResearchV3CreationPolicy") ||
-			len(option.Args) != 1 {
-			t.Fatalf("creation option=%T, want WithResearchV3CreationPolicy", call.Args[3])
-		}
-		policy, ok := option.Args[0].(*ast.CallExpr)
+		policy, ok := call.Args[3].(*ast.CallExpr)
 		if !ok || len(policy.Args) != 0 {
-			t.Fatalf("V3 creation policy=%T, want zero-arg trusted server policy", option.Args[0])
+			t.Fatalf("V3 creation policy=%T, want zero-arg trusted server policy", call.Args[3])
 		}
 		name, ok := policy.Fun.(*ast.Ident)
 		wired = ok && name.Name == "nativeResearchV3CreationPolicy"

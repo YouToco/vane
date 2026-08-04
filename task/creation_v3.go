@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +27,164 @@ type CreationV3ServerPolicy struct {
 // CreationCoordinatorOption configures trusted control-plane behavior without
 // changing retained V1 creation semantics.
 type CreationCoordinatorOption func(*CreationCoordinator)
+
+// ResearchCreationCoordinatorV3 is the production-facing native V3 creation
+// controller. Its narrow method set deliberately excludes every retained V1
+// proposal and recovery entry point; historical coordinators remain available
+// only to offline replay and migration tests.
+type ResearchCreationCoordinatorV3 struct {
+	inner *CreationCoordinator
+}
+
+func NewResearchCreationCoordinatorV3(
+	store CreationSagaStore,
+	schedules CreationTaskScheduler,
+	logger *slog.Logger,
+	policy CreationV3ServerPolicy,
+) *ResearchCreationCoordinatorV3 {
+	return &ResearchCreationCoordinatorV3{inner: NewCreationCoordinator(
+		store, schedules, logger, WithResearchV3CreationPolicy(policy),
+	)}
+}
+
+func (c *ResearchCreationCoordinatorV3) PrepareResearchV3(
+	ctx context.Context,
+	in ResearchV3CreationProposalInput,
+) (CreationProposal, error) {
+	if c == nil || c.inner == nil {
+		return CreationProposal{}, errors.New("task: native V3 creation is not configured")
+	}
+	return c.inner.PrepareResearchV3(ctx, in)
+}
+
+func (c *ResearchCreationCoordinatorV3) ExecuteResearchV3(
+	ctx context.Context,
+	userID int64,
+	actionID string,
+	receiptTarget CreationReceiptTarget,
+) (CreationResult, error) {
+	if c == nil || c.inner == nil {
+		return CreationResult{}, errors.New("task: native V3 creation is not configured")
+	}
+	return c.inner.ExecuteResearchV3(ctx, userID, actionID, receiptTarget)
+}
+
+// RunRecoveryV3 scans only execution-version-2 manage_tasks operations. It is
+// the sole creation recovery loop wired into the production server after the
+// Agent-first cutover.
+func (c *ResearchCreationCoordinatorV3) RunRecoveryV3(ctx context.Context) {
+	if c == nil || c.inner == nil {
+		return
+	}
+	c.recoverAndLogV3(ctx)
+	ticker := time.NewTicker(creationRecoveryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.recoverAndLogV3(ctx)
+		}
+	}
+}
+
+func (c *ResearchCreationCoordinatorV3) recoverAndLogV3(ctx context.Context) {
+	if err := c.RecoverStaleOnceV3(ctx); err != nil &&
+		!errors.Is(err, context.Canceled) {
+		c.inner.logger.ErrorContext(ctx,
+			"native V3 task creation recovery pass failed", "err", err)
+	}
+}
+
+// RecoverStaleOnceV3 is a bounded recovery pass that cannot enumerate or
+// acquire retained V1 creation journals.
+func (c *ResearchCreationCoordinatorV3) RecoverStaleOnceV3(
+	ctx context.Context,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c == nil || c.inner == nil {
+		return errors.New("task: native V3 creation is not configured")
+	}
+	store, _, err := c.inner.researchV3CreationDependencies()
+	if err != nil {
+		return err
+	}
+	c.inner.recoveryMu.Lock()
+	defer c.inner.recoveryMu.Unlock()
+	passCtx, cancelPass := context.WithTimeout(ctx, creationRecoveryPassTimeout)
+	defer cancelPass()
+	boundary := time.Now()
+	tenantIDs, err := store.ListStaleResearchTaskCreationTenantIDsV3(
+		passCtx, boundary, c.inner.v3RecoveryCursor,
+		creationRecoveryTenantLimit,
+	)
+	if err != nil {
+		return fmt.Errorf("list stale native V3 tenant shards: %w", err)
+	}
+	if c.inner.v3RecoveryCursor > 0 &&
+		len(tenantIDs) < creationRecoveryTenantLimit {
+		wrapped, wrapErr := store.ListStaleResearchTaskCreationTenantIDsV3(
+			passCtx, boundary, 0,
+			creationRecoveryTenantLimit-len(tenantIDs),
+		)
+		if wrapErr != nil {
+			return fmt.Errorf("wrap stale native V3 tenant shards: %w", wrapErr)
+		}
+		tenantIDs = append(tenantIDs, wrapped...)
+	}
+	operations := make([]types.TaskCreationOperation, 0,
+		creationRecoveryPassLimit)
+	var scanErrors []error
+	for _, tenantID := range tenantIDs {
+		if len(operations) >= creationRecoveryPassLimit {
+			break
+		}
+		c.inner.v3RecoveryCursor = tenantID
+		remaining := creationRecoveryPassLimit - len(operations)
+		shard, listErr := store.ListStaleResearchTaskCreationOperationsV3(
+			passCtx, tenantID, time.Now(),
+			min(creationRecoveryPerTenant, remaining),
+		)
+		if listErr != nil {
+			scanErrors = append(scanErrors, fmt.Errorf(
+				"list stale native V3 operations for tenant %d: %w",
+				tenantID, listErr))
+			continue
+		}
+		if len(shard) > remaining {
+			shard = shard[:remaining]
+		}
+		operations = append(operations, shard...)
+	}
+	semaphore := make(chan struct{}, creationRecoveryConcurrency)
+	var wg sync.WaitGroup
+	var errorsMu sync.Mutex
+	recoveryErrors := scanErrors
+	for i := range operations {
+		op := operations[i]
+		select {
+		case semaphore <- struct{}{}:
+		case <-passCtx.Done():
+			wg.Wait()
+			return errors.Join(passCtx.Err(), errors.Join(recoveryErrors...))
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			if err := c.inner.recoverResearchV3Operation(passCtx, op); err != nil {
+				errorsMu.Lock()
+				recoveryErrors = append(recoveryErrors, err)
+				errorsMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(recoveryErrors...)
+}
 
 // WithResearchV3CreationPolicy enables native V3 proposal persistence. An
 // invalid policy leaves the path disabled so startup wiring fails closed.

@@ -2,9 +2,6 @@ package store
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -14,6 +11,9 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+// Retained profile-transition lock identity for historical session-fact rows.
+// New feedback no longer produces those rows, but replay/downgrade code must
+// keep the frozen lock domain until the schema itself can be retired.
 const (
 	agentSessionFactAdmissionClass = 1447120453 // "VANE"
 	agentSessionFactAdmissionKey   = 1095976527 // "ASFO"
@@ -37,14 +37,14 @@ func (s *Store) InsertFeedback(ctx context.Context, f *types.Feedback) (int64, e
 	return s.InsertFeedbackWithSessionCutoff(ctx, f, time.Time{})
 }
 
-// InsertFeedbackWithSessionCutoff is the production feedback ingress. The
-// cutoff is frozen into the same repeatable-read decision as the business
-// fact, preserving Agent's configured inactivity TTL without a runtime
-// session rediscovery.
+// InsertFeedbackWithSessionCutoff is the legacy-compatible production feedback
+// ingress. activeSince remains in the signature for existing callers, but new
+// feedback no longer produces retired Agent session facts and intentionally
+// ignores that historical session cutoff.
 func (s *Store) InsertFeedbackWithSessionCutoff(
 	ctx context.Context,
 	f *types.Feedback,
-	activeSince time.Time,
+	_ time.Time,
 ) (int64, error) {
 	if f == nil {
 		return 0, types.NewAppError(types.CodeValidation, "反馈不能为空", nil)
@@ -68,16 +68,6 @@ func (s *Store) InsertFeedbackWithSessionCutoff(
 			types.CodeDatabase, "开始反馈事实事务", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock($1,$2)
-		   /* agent session fact producer/downgrade admission */`,
-		agentSessionFactAdmissionClass,
-		agentSessionFactAdmissionKey,
-	); err != nil {
-		return 0, types.NewAppError(
-			types.CodeDatabase, "acquire feedback fact admission", err)
-	}
-
 	var tenantID int64
 	if err := tx.QueryRow(ctx,
 		`SELECT tenant_id FROM deliveries WHERE id=$1 AND user_id=$2`,
@@ -90,7 +80,7 @@ func (s *Store) InsertFeedbackWithSessionCutoff(
 		return 0, err
 	}
 
-	id, inserted, frozenReason, frozenDetail, err := insertFeedbackFact(
+	id, _, frozenReason, frozenDetail, err := insertFeedbackFact(
 		ctx, tx, tenantID, f)
 	if err != nil {
 		return 0, err
@@ -144,16 +134,6 @@ func (s *Store) InsertFeedbackWithSessionCutoff(
 			auditReason != string(frozenReason) ||
 			auditDetail != frozenDetail {
 			return 0, agentEventIntegrityError()
-		}
-	}
-	if inserted {
-		if f.Action != types.FeedbackActionQuestion &&
-			f.Action != types.FeedbackActionDeepDive {
-			if err := enqueueAgentSessionFeedbackFact(
-				ctx, tx, tenantID, id, f, activeSince,
-			); err != nil {
-				return 0, err
-			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -253,92 +233,6 @@ func insertFeedbackFact(
 	return id, true, frozenReason, frozenDetail, nil
 }
 
-func enqueueAgentSessionFeedbackFact(
-	ctx context.Context,
-	tx pgx.Tx,
-	tenantID int64,
-	feedbackID int64,
-	f *types.Feedback,
-	activeSince time.Time,
-) error {
-	var sessionID int64
-	err := tx.QueryRow(ctx,
-		`SELECT id
-		   FROM agent_sessions
-		  WHERE tenant_id=$1 AND user_id=$2 AND status=$3
-		    AND updated_at >= $4
-		  ORDER BY updated_at DESC,id DESC
-		  LIMIT 1
-		  FOR SHARE`,
-		tenantID, f.UserID, types.AgentSessionStatusActive, activeSince,
-	).Scan(&sessionID)
-	sourceIdentity := fmt.Sprintf("feedback-click:%d", feedbackID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = tx.Exec(ctx,
-			`INSERT INTO agent_session_fact_outbox (
-			     tenant_id,user_id,fact_type,fact_id,source_identity,
-			     status,suppression_reason
-			 )
-			 VALUES ($1,$2,'feedback',$3,$4,'suppressed',
-			         'no_active_session')`,
-			tenantID, f.UserID, feedbackID, sourceIdentity,
-		)
-		if err != nil {
-			return types.NewAppError(types.CodeDatabase,
-				"record suppressed feedback session fact", err)
-		}
-		return nil
-	}
-	if err != nil {
-		return types.NewAppError(types.CodeDatabase,
-			"freeze feedback agent session", err)
-	}
-	label := feedbackActionLabel(f.Action)
-	if f.Action == types.FeedbackActionMisjudged {
-		label = "反馈问题：" + f.ReasonCode.Label()
-	}
-	content := fmt.Sprintf(
-		"[卡片回调] 用户在推送卡片（delivery_id=%d）上点击了「%s」",
-		f.DeliveryID, label,
-	)
-	messages, err := json.Marshal([]struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}{{Role: "user", Content: content}})
-	if err != nil {
-		return types.NewAppError(types.CodeInternal,
-			"encode feedback session fact", err)
-	}
-	sum := sha256.Sum256(messages)
-	digest := hex.EncodeToString(sum[:])
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO agent_session_fact_outbox (
-		     tenant_id,user_id,fact_type,fact_id,source_identity,
-		     session_id,session_messages,payload_digest,status
-		 )
-		 VALUES ($1,$2,'feedback',$3,$4,$5,$6,$7,'pending')`,
-		tenantID, f.UserID, feedbackID, sourceIdentity,
-		sessionID, messages, digest,
-	); err != nil {
-		return types.NewAppError(types.CodeDatabase,
-			"enqueue feedback session fact", err)
-	}
-	return nil
-}
-
-func feedbackActionLabel(action types.FeedbackAction) string {
-	switch action {
-	case types.FeedbackActionInterested:
-		return "感兴趣"
-	case types.FeedbackActionNotInterested:
-		return "不感兴趣"
-	case types.FeedbackActionMisjudged:
-		return "误判"
-	default:
-		return string(action)
-	}
-}
-
 // InsertDeepDiveFeedback 幂等插入 deep_dive 行。f.Detail 是生成正文（调用方截 4000 rune），
 // 幂等命中时回传既有 detail 供重发（审查 F4：烧钱结果永不丢失）。
 // ⚠️ ON CONFLICT 谓词必须与 067 部分唯一索引
@@ -364,15 +258,6 @@ func (s *Store) InsertDeepDiveFeedback(ctx context.Context, f *types.Feedback) (
 			types.CodeDatabase, "开始深度解读反馈事务", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock($1,$2)
-		   /* deep-dive feedback fact admission */`,
-		agentSessionFactAdmissionClass,
-		agentSessionFactAdmissionKey,
-	); err != nil {
-		return 0, "", false, types.NewAppError(
-			types.CodeDatabase, "锁定深度解读反馈事实准入", err)
-	}
 	var tenantID int64
 	if err := tx.QueryRow(ctx,
 		`SELECT tenant_id FROM deliveries WHERE id=$1 AND user_id=$2`,

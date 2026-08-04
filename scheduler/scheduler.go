@@ -24,6 +24,7 @@ import (
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
@@ -157,6 +158,12 @@ type toolRuntimeCapabilityStore interface {
 type researchV3ActionAuthorityStore interface {
 	VerifyEnabledResearchV3ActionAuthorization(
 		context.Context, int64, int64, string, string,
+	) error
+}
+
+type researchV3ActionEvidenceStore interface {
+	VerifyEnabledResearchV3ActionEvidence(
+		context.Context, int64, int64, string, string, string,
 	) error
 }
 
@@ -578,17 +585,28 @@ func (s *Scheduler) validateAuthorizedResearchV3Schedule(
 			errors.Join(types.ErrConflict, err),
 		)
 	}
-	verifier, ok := s.st.(researchV3ActionAuthorityStore)
+	actionBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(
+		description.GetSchedule().GetAction())
+	if err != nil || len(actionBytes) == 0 {
+		return workflow.ResearchScheduledInputV3{}, "", types.NewAppError(
+			types.CodeConflict,
+			"Research V3 Schedule Action evidence cannot be verified",
+			errors.Join(types.ErrConflict, err),
+		)
+	}
+	actionDigest := sha256.Sum256(actionBytes)
+	verifier, ok := s.st.(researchV3ActionEvidenceStore)
 	if !ok {
 		return workflow.ResearchScheduledInputV3{}, "", types.NewAppError(
 			types.CodeInternal,
-			"Research V3 Action authority verifier is unavailable",
+			"Research V3 Action evidence verifier is unavailable",
 			types.ErrInternal,
 		)
 	}
-	if err := verifier.VerifyEnabledResearchV3ActionAuthorization(
+	if err := verifier.VerifyEnabledResearchV3ActionEvidence(
 		ctx, tenantID, userID, taskID,
 		input.ActionAuthorizationToken,
+		fmt.Sprintf("%x", actionDigest[:]),
 	); err != nil {
 		return workflow.ResearchScheduledInputV3{}, "", err
 	}
@@ -782,8 +800,8 @@ func (s *Scheduler) runScheduleCommandAttempt(
 				ctx, scheduleCommandFactReadbackTimeout)
 			blockErr := block(
 				finishCtx,
-				"tool_runtime_canary_disabled",
-				"Tool runtime canary 已关闭，任务保持暂停",
+				"research_v3_action_invalid",
+				"Research V3 调度授权无效，任务保持暂停",
 			)
 			cancelFinish()
 			return errors.Join(err, blockErr)
@@ -810,6 +828,18 @@ func (s *Scheduler) runScheduleCommandAttempt(
 				)
 			}
 			return scheduleCommandNotFound(command.TaskID, remoteErr)
+		}
+		if command.Kind == types.ScheduleCommandRun &&
+			errors.Is(remoteErr, types.ErrConflict) {
+			finishCtx, cancelFinish := scheduleCommandDetachedContext(
+				ctx, scheduleCommandFactReadbackTimeout)
+			blockErr := block(
+				finishCtx,
+				"research_v3_action_invalid",
+				"Research V3 调度授权或执行定义无效",
+			)
+			cancelFinish()
+			return errors.Join(remoteErr, blockErr)
 		}
 		ae := types.NewAppError(
 			types.CodeInternal,

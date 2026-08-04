@@ -417,12 +417,12 @@ func TestMigration056DownRefusesDurableFacts(t *testing.T) {
 	}
 }
 
-func TestMigration056EmptyOutboxDownConvergesWithAdmittedProducer(
+func TestMigration056EmptyOutboxDownWaitsForRetainedProfileTransitionLock(
 	t *testing.T,
 ) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 056 producer/Down 真库并发测试")
+		t.Skip("未设置 DATABASE_URL，跳过 056 profile-transition/Down 真库并发测试")
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
@@ -446,85 +446,20 @@ func TestMigration056EmptyOutboxDownConvergesWithAdmittedProducer(
 	if _, err := migrationProvider.UpTo(ctx, 56); err != nil {
 		t.Fatal(err)
 	}
-	if err := migrationDB.Close(); err != nil {
-		t.Fatal(err)
-	}
-	st, err := New(ctx, scratchURL)
+	lockTx, err := migrationDB.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
-
-	var tenantID int64
-	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO tenants DEFAULT VALUES RETURNING id`,
-	).Scan(&tenantID); err != nil {
-		t.Fatal(err)
-	}
-	user, err := st.UpsertUserByOpenID(
-		ctx, "m056_down_producer", "m056 producer")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.pool.Exec(ctx,
-		`INSERT INTO memberships (tenant_id,user_id,role)
-		 VALUES ($1,$2,'owner')`,
-		tenantID, user.ID,
+	if _, err := lockTx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock($1,$2)
+		   /* retained profile transition/downgrade admission */`,
+		agentSessionFactAdmissionClass,
+		agentSessionFactAdmissionKey,
 	); err != nil {
+		_ = lockTx.Rollback()
 		t.Fatal(err)
 	}
-	if _, err := st.pool.Exec(ctx,
-		`INSERT INTO agent_sessions (tenant_id,user_id)
-		 VALUES ($1,$2)`,
-		tenantID, user.ID,
-	); err != nil {
-		t.Fatal(err)
-	}
-	var batchID, deliveryID int64
-	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO push_batches (tenant_id,user_id)
-		 VALUES ($1,$2) RETURNING id`,
-		tenantID, user.ID,
-	).Scan(&batchID); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO deliveries (tenant_id,batch_id,user_id)
-		 VALUES ($1,$2,$3) RETURNING id`,
-		tenantID, batchID, user.ID,
-	).Scan(&deliveryID); err != nil {
-		t.Fatal(err)
-	}
-
-	sessionLocked := make(chan struct{})
-	releaseProducer := make(chan struct{})
-	producerStore := *st
-	producerStore.beginTx = func(
-		ctx context.Context,
-		options pgx.TxOptions,
-	) (pgx.Tx, error) {
-		tx, err := st.pool.BeginTx(ctx, options)
-		if err != nil {
-			return nil, err
-		}
-		return &m056BlockingSessionTx{
-			Tx: tx, locked: sessionLocked, release: releaseProducer,
-		}, nil
-	}
-	producerDone := make(chan error, 1)
-	go func() {
-		_, err := producerStore.InsertFeedbackWithSessionCutoff(
-			ctx, &types.Feedback{
-				UserID: user.ID, DeliveryID: deliveryID,
-				Action: types.FeedbackActionInterested,
-			}, time.Now().Add(-time.Hour))
-		producerDone <- err
-	}()
-	select {
-	case <-sessionLocked:
-	case <-ctx.Done():
-		t.Fatal("producer did not reach frozen session lock")
-	}
+	defer lockTx.Rollback() //nolint:errcheck
 
 	db, err := sql.Open("pgx", scratchURL)
 	if err != nil {
@@ -549,74 +484,23 @@ func TestMigration056EmptyOutboxDownConvergesWithAdmittedProducer(
 	}()
 	select {
 	case err := <-downDone:
-		t.Fatalf("Down bypassed producer admission: %v", err)
+		t.Fatalf("Down bypassed retained profile transition admission: %v", err)
 	case <-time.After(150 * time.Millisecond):
 	}
-	close(releaseProducer)
-	if err := <-producerDone; err != nil {
-		t.Fatalf("admitted producer: %v", err)
+	if err := lockTx.Commit(); err != nil {
+		t.Fatalf("release retained profile transition admission: %v", err)
 	}
 	downErr := <-downDone
-	if downErr == nil ||
-		!strings.Contains(
-			downErr.Error(),
-			"refusing downgrade while Agent continuation facts exist",
-		) ||
-		strings.Contains(downErr.Error(), "40P01") ||
-		strings.Contains(strings.ToLower(downErr.Error()), "deadlock") {
-		t.Fatalf("concurrent Down err=%v", downErr)
+	if downErr != nil {
+		t.Fatalf("empty outbox Down after profile transition release: %v", downErr)
 	}
-	var facts int
-	if err := st.pool.QueryRow(ctx,
-		`SELECT count(*) FROM agent_session_fact_outbox`,
-	).Scan(&facts); err != nil {
+	var outbox sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT to_regclass('public.agent_session_fact_outbox')`,
+	).Scan(&outbox); err != nil {
 		t.Fatal(err)
 	}
-	if facts != 1 {
-		t.Fatalf("durable producer facts=%d want=1", facts)
-	}
-}
-
-type m056BlockingSessionTx struct {
-	pgx.Tx
-	locked  chan struct{}
-	release chan struct{}
-}
-
-func (tx *m056BlockingSessionTx) QueryRow(
-	ctx context.Context,
-	sql string,
-	args ...any,
-) pgx.Row {
-	row := tx.Tx.QueryRow(ctx, sql, args...)
-	if !strings.Contains(sql, "FOR SHARE") {
-		return row
-	}
-	return m056BlockingRow{
-		Row: row, ctx: ctx, locked: tx.locked, release: tx.release,
-	}
-}
-
-type m056BlockingRow struct {
-	pgx.Row
-	ctx     context.Context
-	locked  chan struct{}
-	release chan struct{}
-}
-
-func (row m056BlockingRow) Scan(dest ...any) error {
-	if err := row.Row.Scan(dest...); err != nil {
-		return err
-	}
-	select {
-	case <-row.locked:
-	default:
-		close(row.locked)
-	}
-	select {
-	case <-row.release:
-		return nil
-	case <-row.ctx.Done():
-		return row.ctx.Err()
+	if outbox.Valid {
+		t.Fatalf("056 Down left agent_session_fact_outbox=%q", outbox.String)
 	}
 }

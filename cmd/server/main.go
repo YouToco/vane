@@ -20,7 +20,6 @@ import (
 
 	"github.com/YouToco/vane/a2a"
 	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/agentcontinuation"
 	"github.com/YouToco/vane/api"
 	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/cardgen"
@@ -519,30 +518,15 @@ func run() error {
 		closeStores()
 		return fmt.Errorf("装配周期 Brief recovery: %w", err)
 	}
-	creationCoordinator := task.NewCreationCoordinator(
-		legacyStore, sched, slog.Default(),
-		task.WithResearchV3CreationPolicy(nativeResearchV3CreationPolicy()),
+	creationCoordinator := task.NewResearchCreationCoordinatorV3(
+		legacyStore, sched, slog.Default(), nativeResearchV3CreationPolicy(),
 	)
-	// C2b3-2c keeps definition editing dark at every ingress, but already owns
-	// recovery for durable operations left by a prior process. The coordinator is
-	// intentionally retained only in this composition root: it is not injected
-	// into Agent, HTTP, Feishu, or the receipt dispatcher.
-	definitionEditCoordinator := task.NewTaskDefinitionEditCoordinator(
-		legacyStore, sched, slog.Default())
 	var researchDefinitionEditCoordinator *task.ResearchTaskDefinitionEditCoordinatorV3
 	if researchControlStore != nil {
 		researchDefinitionEditCoordinator = task.NewResearchTaskDefinitionEditCoordinatorV3(
 			researchControlStore, sched, slog.Default())
 	}
 
-	roleGateCtx, cancelRoleGate := context.WithTimeout(ctx, 10*time.Second)
-	roleGateErr := st.ValidateTaskDefinitionEditRuntimeRoles(roleGateCtx)
-	cancelRoleGate()
-	if roleGateErr != nil {
-		temporalClient.Close()
-		closeStores()
-		return fmt.Errorf("任务定义编辑受限角色 Gate: %w", roleGateErr)
-	}
 	commandRoleGateCtx, cancelCommandRoleGate := context.WithTimeout(
 		ctx, 10*time.Second,
 	)
@@ -554,27 +538,6 @@ func run() error {
 		temporalClient.Close()
 		closeStores()
 		return fmt.Errorf("任务命令受限角色 Gate: %w", commandRoleGateErr)
-	}
-	environmentGateCtx, cancelEnvironmentGate := context.WithTimeout(ctx, 90*time.Second)
-	environmentGateErr := definitionEditCoordinator.ValidateRuntimeEnvironment(
-		environmentGateCtx,
-	)
-	cancelEnvironmentGate()
-	if environmentGateErr != nil {
-		temporalClient.Close()
-		closeStores()
-		return fmt.Errorf("任务定义编辑 Temporal 环境 Gate: %w", environmentGateErr)
-	}
-
-	// C2b3-2d startup barrier: finish one bounded recovery pass before legacy
-	// Action reconciliation. Reconcile additionally re-authorizes each schedule
-	// under the same PostgreSQL advisory lock used by edit quiesce, so a failed
-	// recovery pass cannot turn an old active discovery snapshot into a write
-	// across a live operation marker.
-	if err := definitionEditCoordinator.RecoverStaleOnce(ctx); err != nil {
-		temporalClient.Close()
-		closeStores()
-		return fmt.Errorf("任务定义编辑首轮恢复 Gate: %w", err)
 	}
 	if researchDefinitionEditCoordinator != nil {
 		if err := researchDefinitionEditCoordinator.RecoverStaleOnceV3(ctx); err != nil {
@@ -934,49 +897,20 @@ func run() error {
 		closeStores()
 		return fmt.Errorf("装配任务定义编辑耐久回执: %w", err)
 	}
-	continuationDispatcher, err := agentcontinuation.New(
-		st, slog.Default(),
-	)
-	if err != nil {
-		stop()
-		maintenanceCtx, cancelMaintenance := context.WithTimeout(
-			context.Background(), 30*time.Second,
-		)
-		maintenanceErr := waitMaintenance(maintenanceCtx)
-		cancelMaintenance()
-		if maintenanceErr != nil {
-			return errors.Join(
-				fmt.Errorf("装配 Agent 耐久延续投影器: %w", err),
-				fmt.Errorf("排空启动维护任务: %w", maintenanceErr),
-			)
-		}
-		temporalClient.Close()
-		closeStores()
-		return fmt.Errorf("装配 Agent 耐久延续投影器: %w", err)
-	}
-	// Definition-edit recovery starts before any Feishu/HTTP ingress is admitted.
-	// The optional Agent controller below shares this coordinator only after all
-	// startup Gates; terminal receipt dispatch remains a separate later step.
+	// Native V3 definition-edit recovery starts before any Feishu/HTTP ingress.
+	// Retained V1/V2 journals are audit-only and have no production recovery
+	// writer after the physical cleanup Gate.
 	definitionEditRecoveryCtx, cancelDefinitionEditRecovery := context.WithCancel(ctx)
 	definitionEditRecoveryDone := make(chan struct{})
-	go func() {
-		defer close(definitionEditRecoveryDone)
-		var recoveryGroup sync.WaitGroup
-		recoveryGroup.Add(1)
+	if researchDefinitionEditCoordinator == nil {
+		close(definitionEditRecoveryDone)
+	} else {
 		go func() {
-			defer recoveryGroup.Done()
-			definitionEditCoordinator.RunRecovery(definitionEditRecoveryCtx)
+			defer close(definitionEditRecoveryDone)
+			researchDefinitionEditCoordinator.RunRecoveryV3(
+				definitionEditRecoveryCtx)
 		}()
-		if researchDefinitionEditCoordinator != nil {
-			recoveryGroup.Add(1)
-			go func() {
-				defer recoveryGroup.Done()
-				researchDefinitionEditCoordinator.RunRecoveryV3(
-					definitionEditRecoveryCtx)
-			}()
-		}
-		recoveryGroup.Wait()
-	}()
+	}
 	stopDefinitionEditRecovery := func() error {
 		cancelDefinitionEditRecovery()
 		select {
@@ -1049,13 +983,13 @@ func run() error {
 		}
 	}
 
-	// A5 创建恢复器在飞书 WS/HTTP 接收新确认之前启动。首次扫描与周期扫描都
-	// 在后台执行，不阻塞 readyz；关停时必须先等它退出，再释放 Temporal/DB。
+	// Native V3 creation recovery starts before ingress and never enumerates or
+	// acquires retained V1 creation journals.
 	creationRecoveryCtx, cancelCreationRecovery := context.WithCancel(ctx)
 	creationRecoveryDone := make(chan struct{})
 	go func() {
 		defer close(creationRecoveryDone)
-		creationCoordinator.RunRecovery(creationRecoveryCtx)
+		creationCoordinator.RunRecoveryV3(creationRecoveryCtx)
 	}()
 	stopCreationRecovery := func() error {
 		cancelCreationRecovery()
@@ -1105,13 +1039,6 @@ func run() error {
 			)
 		}
 	}
-
-	// Feedback producers freeze exact session scope in their business
-	// transaction. The projector starts before every ingress, scans only that
-	// durable outbox, and has no provider dependency.
-	runMaintenance(func() {
-		continuationDispatcher.Run(ctx)
-	})
 
 	// The worker is an ingress too: a registered task queue can immediately
 	// receive scheduled runs. Start it only after every configured recovery

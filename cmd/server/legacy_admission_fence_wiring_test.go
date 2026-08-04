@@ -67,8 +67,7 @@ func TestLegacyAdmissionFenceOwnsEveryRetainedCoordinator(t *testing.T) {
 		t.Fatalf("legacy fence constructors=%+v, want one over primary st", fences)
 	}
 	for _, target := range []string{
-		"task.NewCreationCoordinator",
-		"task.NewTaskDefinitionEditCoordinator",
+		"task.NewResearchCreationCoordinatorV3",
 	} {
 		found := find(target)
 		if len(found) != 1 || len(found[0].args) == 0 ||
@@ -78,6 +77,12 @@ func TestLegacyAdmissionFenceOwnsEveryRetainedCoordinator(t *testing.T) {
 		if found[0].pos <= fences[0].pos {
 			t.Fatalf("%s is constructed before the admission fence", target)
 		}
+	}
+	if old := find("task.NewCreationCoordinator"); len(old) != 0 {
+		t.Fatalf("production server constructs retained V1 creation coordinator: %+v", old)
+	}
+	if old := find("task.NewTaskDefinitionEditCoordinator"); len(old) != 0 {
+		t.Fatalf("production server constructs retained V1 edit coordinator: %+v", old)
 	}
 	v3Edits := find("task.NewResearchTaskDefinitionEditCoordinatorV3")
 	if len(v3Edits) != 1 || len(v3Edits[0].args) == 0 ||

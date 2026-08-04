@@ -703,58 +703,7 @@ func taskDefinitionEditStartupStoreCalls(
 	file *ast.File,
 ) (map[token.Pos]struct{}, error) {
 	const method = "ValidateTaskDefinitionEditRuntimeRoles"
-	var run *ast.FuncDecl
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Recv != nil || function.Name.Name != "run" {
-			continue
-		}
-		if run != nil {
-			return nil, fmt.Errorf("cmd/server must define exactly one top-level run")
-		}
-		run = function
-	}
-	if run == nil || run.Body == nil {
-		return nil, fmt.Errorf("cmd/server top-level run function is missing")
-	}
-
-	var storeObject *ast.Object
-	for _, statement := range run.Body.List {
-		assignment, ok := statement.(*ast.AssignStmt)
-		if !ok {
-			continue
-		}
-		constructsStore := slices.ContainsFunc(assignment.Rhs, func(expr ast.Expr) bool {
-			call, ok := taskDefinitionEditStoreUnparen(expr).(*ast.CallExpr)
-			if !ok {
-				return false
-			}
-			selector, ok := taskDefinitionEditStoreUnparen(call.Fun).(*ast.SelectorExpr)
-			if !ok {
-				return false
-			}
-			receiver, receiverOK := taskDefinitionEditStoreUnparen(selector.X).(*ast.Ident)
-			return receiverOK && receiver.Name == "store" &&
-				(selector.Sel.Name == "New" || selector.Sel.Name == "NewWithResearchRuntime" ||
-					selector.Sel.Name == "NewWithResearchRuntimeCapability" ||
-					selector.Sel.Name == "NewServerRuntimeWithResearchRuntimeCapability")
-		})
-		if !constructsStore {
-			continue
-		}
-		for _, lhs := range assignment.Lhs {
-			ident, ok := taskDefinitionEditStoreUnparen(lhs).(*ast.Ident)
-			if ok && ident.Name == "st" {
-				storeObject = ident.Obj
-			}
-		}
-	}
-	if storeObject == nil {
-		return nil, fmt.Errorf("cmd/server run must bind a Store constructor result to st")
-	}
-
 	totalCalls := 0
-	var allowedPosition token.Pos
 	ast.Inspect(file, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
@@ -767,37 +716,13 @@ func taskDefinitionEditStartupStoreCalls(
 		totalCalls++
 		return true
 	})
-	for _, statement := range run.Body.List {
-		assignment, ok := statement.(*ast.AssignStmt)
-		if !ok {
-			continue
-		}
-		for _, rhs := range assignment.Rhs {
-			call, ok := taskDefinitionEditStoreUnparen(rhs).(*ast.CallExpr)
-			if !ok {
-				continue
-			}
-			selector, ok := taskDefinitionEditStoreUnparen(call.Fun).(*ast.SelectorExpr)
-			if !ok || selector.Sel.Name != method {
-				continue
-			}
-			receiver, ok := taskDefinitionEditStoreUnparen(selector.X).(*ast.Ident)
-			if !ok || receiver.Name != "st" || receiver.Obj != storeObject {
-				continue
-			}
-			if allowedPosition != token.NoPos {
-				return nil, fmt.Errorf("cmd/server run calls %s more than once", method)
-			}
-			allowedPosition = selector.Sel.Pos()
-		}
-	}
-	if totalCalls != 1 || allowedPosition == token.NoPos {
+	if totalCalls != 0 {
 		return nil, fmt.Errorf(
-			"cmd/server run must directly and unconditionally assign st.%s exactly once, got total=%d",
+			"cmd/server must not admit retired edit runtime role %s, got total=%d",
 			method, totalCalls,
 		)
 	}
-	return map[token.Pos]struct{}{allowedPosition: {}}, nil
+	return map[token.Pos]struct{}{}, nil
 }
 
 func taskDefinitionEditStoreReferenceViolations(

@@ -600,8 +600,8 @@ func assertNativeV3CreationCleanupPostgreSQL(
 func TestCreationCoordinator_NativeV3PostgreSQLStaleRecoveryExecutesLifecycle(t *testing.T) {
 	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
 	schedules := &creationSagaFakeScheduler{}
-	coordinator := NewCreationCoordinator(st, schedules, nil,
-		WithResearchV3CreationPolicy(testResearchV3CreationPolicy()))
+	coordinator := NewResearchCreationCoordinatorV3(
+		st, schedules, nil, testResearchV3CreationPolicy())
 	input := testResearchV3CreationInput()
 	input.ActionID = "native-v3-stale-recovery-" + uuid.NewString()
 	input.UserID = userID
@@ -639,8 +639,8 @@ func TestCreationCoordinator_NativeV3PostgreSQLStaleRecoveryExecutesLifecycle(t 
 	if err := conn.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := coordinator.RecoverStaleOnce(t.Context()); err != nil {
-		t.Fatalf("RecoverStaleOnce native V3: %v", err)
+	if err := coordinator.RecoverStaleOnceV3(t.Context()); err != nil {
+		t.Fatalf("RecoverStaleOnceV3 native V3: %v", err)
 	}
 	op, err := st.LoadResearchTaskCreationOperationV3(
 		t.Context(), input.ActionID, tenantID, userID)
@@ -660,6 +660,66 @@ func TestCreationCoordinator_NativeV3PostgreSQLStaleRecoveryExecutesLifecycle(t 
 		if !found {
 			t.Fatalf("native V3 stale recovery missing %q: %v", want, schedules.events)
 		}
+	}
+}
+
+func TestResearchCreationCoordinatorV3PostgreSQLIgnoresStaleV1Journal(t *testing.T) {
+	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	schedules := &creationSagaFakeScheduler{}
+	legacy := NewCreationCoordinator(st, schedules, nil)
+	actionID := "retained-v1-stale-" + uuid.NewString()
+	proposal, err := legacy.Prepare(t.Context(), CreationProposalInput{
+		ActionID: actionID, UserID: userID,
+		RawArgs:   mustCreateProposalArgs(t, "每天检查旧协议任务", "旧协议任务"),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil || proposal.ID != actionID {
+		t.Fatalf("prepare retained V1 operation=%+v err=%v", proposal, err)
+	}
+	if _, err := st.AcquireTaskCreationOperation(t.Context(),
+		types.AcquireTaskCreationOperationParams{
+			ID: actionID, TenantID: tenantID, UserID: userID,
+			LeaseOwner: "retained-v1-crashed-worker", LeaseDuration: time.Minute,
+			ReceiptProvider: testCreationReceiptTarget.Provider,
+			ReceiptTarget:   testCreationReceiptTarget.Target,
+		}); err != nil {
+		t.Fatalf("acquire retained V1 operation: %v", err)
+	}
+	dbURL := creationCoordinatorTestDatabaseURL()
+	conn, err := pgx.Connect(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(t.Context(), `
+		UPDATE task_creation_operations
+		   SET lease_until=clock_timestamp()-interval '2 hours',
+		       takeover_not_before=clock_timestamp()-interval '1 hour'
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		   AND tool_name='create_schedule' AND execution_version=1`,
+		actionID, tenantID, userID); err != nil {
+		_ = conn.Close(t.Context())
+		t.Fatal(err)
+	}
+	if err := conn.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	production := NewResearchCreationCoordinatorV3(
+		st, schedules, nil, testResearchV3CreationPolicy())
+	if err := production.RecoverStaleOnceV3(t.Context()); err != nil {
+		t.Fatalf("native V3 recovery inspected retained V1 journal: %v", err)
+	}
+	if len(schedules.events) != 0 {
+		t.Fatalf("retained V1 journal caused Temporal mutation: %v", schedules.events)
+	}
+	op, err := st.LoadTaskCreationOperation(
+		t.Context(), actionID, tenantID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.ExecutionVersion != types.TaskCreationExecutionVersionV1 ||
+		op.Status != types.TaskOperationStatusExecuting ||
+		op.LeaseOwner != "retained-v1-crashed-worker" {
+		t.Fatalf("retained V1 journal was mutated: %+v", op)
 	}
 }
 

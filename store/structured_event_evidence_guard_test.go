@@ -96,7 +96,6 @@ func TestStructuredEventEvidenceV1HasExactProductionCallPoints(
 			"workflow/activities.go:preparePushDeliveries",
 		},
 		"CardGenOutcomeV3": {
-			"cmd/server/main.go:run",
 			"workflow/workflow.go:PushPipelineWorkflow",
 		},
 	}
