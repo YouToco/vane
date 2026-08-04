@@ -52,6 +52,15 @@ class ReleaseHandoffTests(unittest.TestCase):
             )
             self.assertRegex(self.workflow, pattern)
 
+    def test_deploy_fails_fast_when_cache_codec_is_missing(self) -> None:
+        prereq = "- name: Verify release handoff cache prerequisites"
+        restore = "- name: Restore backend release handoff from this run"
+        self.assertIn(prereq, self.workflow)
+        self.assertLess(self.workflow.index(prereq), self.workflow.index(restore))
+        self.assertIn("command -v tar >/dev/null", self.workflow)
+        self.assertIn("command -v zstd >/dev/null", self.workflow)
+        self.assertIn("zstd --version", self.workflow)
+
     def test_self_hosted_handoff_roots_are_recreated_private(self) -> None:
         self.assertEqual(
             self.workflow.count('rm -rf -- "$HANDOFF_ROOT"'), 4

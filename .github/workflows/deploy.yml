@@ -478,6 +478,14 @@ jobs:
           echo "DEPLOY_ROOT=$DEPLOY_ROOT" >>"$GITHUB_ENV"
           echo "HANDOFF_ROOT=$HANDOFF_ROOT" >>"$GITHUB_ENV"
 
+      - name: Verify release handoff cache prerequisites
+        run: |
+          set -euo pipefail
+          command -v tar >/dev/null
+          command -v zstd >/dev/null
+          tar --version
+          zstd --version
+
       - name: Checkout deployment control plane
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

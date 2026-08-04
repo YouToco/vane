@@ -188,7 +188,11 @@ All runner registrations are repository-scoped and implement three roles:
   durable-state owner; a broad-label fallback must not split a single DAG or
   create a second certificate/deployed-SHA authority. Install Git, Python 3,
   OpenSSH, OpenSSL, `flock`, GNU `date`, `curl`, `sha256sum`, and `strings`.
-  Do not install Docker access or `sudo` for the runner user. The primary is
+  Install `zstd` as well: the GitHub Actions cache handoff is versioned by the
+  available compression tools, so a runner without `zstd` cannot restore the
+  hosted build VM's release cache even when the exact key exists. The deploy
+  job verifies `tar` and `zstd` before any restore. Do not install Docker access
+  or `sudo` for the runner user. The primary is
   the isolated VPS runner so a Mac login, sleep, or Colima outage cannot block
   production. A standby runner requires an explicit state migration and unique
   label handoff before it can become primary; the broad `vane-deploy` label
