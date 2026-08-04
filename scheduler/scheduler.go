@@ -867,21 +867,6 @@ func (s *Scheduler) authorizeToolRuntimeResumeRemote(
 		ctx, sc, found, params)
 }
 
-// TriggerScheduleNow retains the pre-6.8 internal signature. HTTP callers use
-// TriggerScheduleNowIdempotent so a retry carries the same client key.
-func (s *Scheduler) TriggerScheduleNow(
-	ctx context.Context,
-	schedID string,
-	userID int64,
-) error {
-	if _, ok := s.st.(scheduleCommandStore); !ok {
-		return s.triggerScheduleNowLegacy(ctx, schedID, userID)
-	}
-	return s.TriggerScheduleNowIdempotent(
-		ctx, schedID, userID, legacyScheduleCommandKey(),
-	)
-}
-
 // TriggerScheduleNowIdempotent starts the exact stored Action for one owned
 // active or paused task without changing its recurring schedule state.
 // A durable command ID becomes the one-off workflow ID, so response loss and
@@ -897,20 +882,6 @@ func (s *Scheduler) TriggerScheduleNowIdempotent(
 	)
 }
 
-// PausePush retains the pre-6.8 internal signature.
-func (s *Scheduler) PausePush(
-	ctx context.Context,
-	schedID string,
-	userID int64,
-) error {
-	if _, ok := s.st.(scheduleCommandStore); !ok {
-		return s.changePushPausedLegacy(ctx, schedID, userID, true)
-	}
-	return s.PausePushIdempotent(
-		ctx, schedID, userID, legacyScheduleCommandKey(),
-	)
-}
-
 func (s *Scheduler) PausePushIdempotent(
 	ctx context.Context,
 	schedID string,
@@ -919,20 +890,6 @@ func (s *Scheduler) PausePushIdempotent(
 ) error {
 	return s.executeNewScheduleCommand(
 		ctx, schedID, userID, idempotencyKey, types.ScheduleCommandPause,
-	)
-}
-
-// ResumePush retains the pre-6.8 internal signature.
-func (s *Scheduler) ResumePush(
-	ctx context.Context,
-	schedID string,
-	userID int64,
-) error {
-	if _, ok := s.st.(scheduleCommandStore); !ok {
-		return s.changePushPausedLegacy(ctx, schedID, userID, false)
-	}
-	return s.ResumePushIdempotent(
-		ctx, schedID, userID, legacyScheduleCommandKey(),
 	)
 }
 
@@ -945,10 +902,6 @@ func (s *Scheduler) ResumePushIdempotent(
 	return s.executeNewScheduleCommand(
 		ctx, schedID, userID, idempotencyKey, types.ScheduleCommandResume,
 	)
-}
-
-func legacyScheduleCommandKey() string {
-	return "legacy-" + uuid.NewString()
 }
 
 func (s *Scheduler) triggerScheduleNowLegacy(
@@ -1716,18 +1669,6 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 		return mirrorErr
 	}
 	return nil
-}
-
-// DeletePush retains the pre-6.8 internal signature. Production Store values
-// still use the durable command path; narrow unit fakes retain the historical
-// behavior so old interface consumers do not need to know about HTTP keys.
-func (s *Scheduler) DeletePush(ctx context.Context, schedID string, userID int64) error {
-	if _, ok := s.st.(scheduleCommandStore); ok {
-		return s.DeletePushIdempotent(
-			ctx, schedID, userID, legacyScheduleCommandKey(),
-		)
-	}
-	return s.deletePushLegacy(ctx, schedID, userID)
 }
 
 func (s *Scheduler) DeletePushIdempotent(

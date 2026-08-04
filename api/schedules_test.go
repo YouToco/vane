@@ -18,8 +18,6 @@ type fakeScheduler struct {
 	calls     int
 }
 
-func (f *fakeScheduler) DeletePush(context.Context, string, int64) error { return nil }
-
 func (f *fakeScheduler) UpdatePush(
 	_ context.Context,
 	id string,
@@ -36,7 +34,7 @@ func (f *fakeScheduler) UpdatePush(
 // 包级变量在此可接受：api 包的用例不并行（无 t.Parallel）。
 var schedSession *http.Cookie
 
-func newScheduleMux(t *testing.T, sched Scheduler) *http.ServeMux {
+func newScheduleMux(t *testing.T, sched any) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
 	deps, cookie := authedDeps(t, Deps{Scheduler: sched})

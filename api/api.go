@@ -31,12 +31,6 @@ type Manager interface {
 	SendTestCard(ctx context.Context) error
 }
 
-// Scheduler abstracts the remaining API-safe scheduler capabilities. Task
-// definition writes are intentionally absent from this consumer interface.
-type Scheduler interface {
-	DeletePush(ctx context.Context, schedID string, userID int64) error
-}
-
 type scheduleActionController interface {
 	TriggerScheduleNowIdempotent(
 		ctx context.Context,
@@ -120,9 +114,12 @@ type AuthStore interface {
 type Deps struct {
 	Store *store.Store
 	// Auth 是认证路径的窄接口；生产与 Store 同为 *store.Store。
-	Auth      AuthStore
-	Manager   Manager
-	Scheduler Scheduler
+	Auth    AuthStore
+	Manager Manager
+	// Scheduler is capability-checked per endpoint below. Keeping this slot
+	// untyped lets each handler require only its idempotent command/read surface
+	// and removes the retired pre-6.8 DeletePush admission signature.
+	Scheduler any
 	TaskAgent TaskAgent
 	// BriefFeedback is separate from grounded read-only Agent follow-up:
 	// deep-dive is an explicit fixed action and keeps the existing durable

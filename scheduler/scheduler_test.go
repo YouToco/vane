@@ -740,7 +740,7 @@ func TestTaskLifecycleActionsPreserveSelectedScheduleIdentity(t *testing.T) {
 	}
 	s := New(temporal, "tq", store)
 
-	if err := s.TriggerScheduleNow(
+	if err := s.triggerScheduleNowLegacy(
 		t.Context(), "task-web-1", 7,
 	); err != nil {
 		t.Fatal(err)
@@ -753,8 +753,8 @@ func TestTaskLifecycleActionsPreserveSelectedScheduleIdentity(t *testing.T) {
 		)
 	}
 
-	if err := s.PausePush(
-		t.Context(), "task-web-1", 7,
+	if err := s.changePushPausedLegacy(
+		t.Context(), "task-web-1", 7, true,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -765,7 +765,7 @@ func TestTaskLifecycleActionsPreserveSelectedScheduleIdentity(t *testing.T) {
 			store.status, handle.pauseCalls, store.commitCalls,
 		)
 	}
-	if err := s.TriggerScheduleNow(
+	if err := s.triggerScheduleNowLegacy(
 		t.Context(), "task-web-1", 7,
 	); err != nil {
 		t.Fatalf("paused one-off trigger: %v", err)
@@ -777,8 +777,8 @@ func TestTaskLifecycleActionsPreserveSelectedScheduleIdentity(t *testing.T) {
 			store.status, handle.triggerCalls,
 		)
 	}
-	if err := s.ResumePush(
-		t.Context(), "task-web-1", 7,
+	if err := s.changePushPausedLegacy(
+		t.Context(), "task-web-1", 7, false,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -816,8 +816,8 @@ func TestLegacyResumeKeepsToolTaskPausedUntilCanaryReenabled(t *testing.T) {
 		"tq", store,
 		WithCompiledRuntimeRollout(true, taskID, false),
 	)
-	if err := s.ResumePush(
-		t.Context(), taskID, 7,
+	if err := s.changePushPausedLegacy(
+		t.Context(), taskID, 7, false,
 	); err == nil {
 		t.Fatal("legacy resume bypassed disabled Tool canary")
 	}
@@ -827,8 +827,8 @@ func TestLegacyResumeKeepsToolTaskPausedUntilCanaryReenabled(t *testing.T) {
 			store.status, handle.unpauseCalls, store.beginCalls)
 	}
 	WithCompiledToolRuntimeCanary(taskID)(s)
-	if err := s.ResumePush(
-		t.Context(), taskID, 7,
+	if err := s.changePushPausedLegacy(
+		t.Context(), taskID, 7, false,
 	); err != nil {
 		t.Fatalf("reenabled Tool canary resume: %v", err)
 	}
@@ -1429,7 +1429,7 @@ func TestOwnershipCheckedBeforeTemporal(t *testing.T) {
 	// c 为 nil：任何触碰 Temporal 的操作都会 panic。
 	s := &Scheduler{st: st}
 
-	err := s.DeletePush(context.Background(), "push-1-victim", 999) // 攻击者 999
+	err := s.deletePushLegacy(context.Background(), "push-1-victim", 999) // 攻击者 999
 	if err == nil {
 		t.Fatal("越权删除应被拒")
 	}
