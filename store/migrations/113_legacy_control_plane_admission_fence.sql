@@ -26,6 +26,7 @@ WITH expired AS (
        AND normalized_command IS NULL AND compiled_definition IS NULL
        AND compiled_digest='' AND prepared_schedule IS NULL
        AND ensure_receipt IS NULL AND task_id=''
+       AND result IS NULL AND executed_at IS NULL
        AND error_code='' AND error_message=''
        AND ((receipt_provider='' AND receipt_target='') OR
             (receipt_provider='agent_auto/v1' AND receipt_target=id))
@@ -65,6 +66,7 @@ BEGIN
            AND operation.compiled_digest=''
            AND operation.prepared_schedule IS NULL
            AND operation.ensure_receipt IS NULL AND operation.task_id=''
+           AND operation.result IS NULL AND operation.executed_at IS NULL
            AND operation.error_code='' AND operation.error_message=''
            AND ((operation.receipt_provider='' AND operation.receipt_target='') OR
                 (operation.receipt_provider='agent_auto/v1' AND

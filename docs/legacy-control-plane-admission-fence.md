@@ -1,6 +1,6 @@
 # Legacy control-plane admission fence
 
-Status: active migration boundary  
+Status: active migration boundary
 Owner decision: 2026-08-03
 
 ## Closed admission
@@ -32,7 +32,9 @@ Migration 074 normalized historical automatic receipts to exactly
 `receipt_provider='agent_auto/v1'` and `receipt_target=operation.id`. Migration
 113 therefore recognizes only two pristine receipt shapes: the pre-074 empty
 pair, or that exact normalized pair. Any mismatched provider/target remains
-untouched for investigation. A read-only production audit is:
+untouched for investigation. A row carrying a historical result or execution
+timestamp is also non-pristine and remains byte-for-byte untouched. A read-only
+production audit is:
 
 ```sql
 SELECT id,receipt_provider,receipt_target

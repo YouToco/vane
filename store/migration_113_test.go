@@ -57,8 +57,9 @@ func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *test
 		t.Fatal(err)
 	}
 	for _, fixture := range []struct {
-		id, expires, provider, target string
-		attempt                       int
+		id, expires, provider, target, result string
+		attempt                               int
+		executed                              bool
 	}{
 		{id: "migration-111-expired", expires: "clock_timestamp()-interval '1 hour'"},
 		{id: "migration-111-live", expires: "clock_timestamp()+interval '1 hour'"},
@@ -70,6 +71,10 @@ func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *test
 			provider: "agent_auto/v2", target: "migration-113-wrong-provider"},
 		{id: "migration-113-wrong-target", expires: "clock_timestamp()-interval '1 hour'",
 			provider: "agent_auto/v1", target: "another-operation"},
+		{id: "migration-113-result-bearing", expires: "clock_timestamp()-interval '1 hour'",
+			result: `{"historical":"kept"}`},
+		{id: "migration-113-executed-bearing", expires: "clock_timestamp()-interval '1 hour'",
+			executed: true},
 	} {
 		if _, err := db.ExecContext(t.Context(), `
 			INSERT INTO task_creation_operations
@@ -89,6 +94,18 @@ func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *test
 				SET receipt_provider=$2,receipt_target=$3 WHERE id=$1`,
 				fixture.id, fixture.provider, fixture.target); err != nil {
 				t.Fatalf("set %s receipt shape: %v", fixture.id, err)
+			}
+		}
+		if fixture.result != "" {
+			if _, err := db.ExecContext(t.Context(), `UPDATE task_creation_operations
+				SET result=$2::jsonb WHERE id=$1`, fixture.id, fixture.result); err != nil {
+				t.Fatalf("set %s historical result: %v", fixture.id, err)
+			}
+		}
+		if fixture.executed {
+			if _, err := db.ExecContext(t.Context(), `UPDATE task_creation_operations
+				SET executed_at='2026-08-03T00:00:00Z' WHERE id=$1`, fixture.id); err != nil {
+				t.Fatalf("set %s historical execution time: %v", fixture.id, err)
 			}
 		}
 	}
@@ -144,6 +161,31 @@ func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *test
 		if status != "pending" || phase != "" || tombstoned {
 			t.Fatalf("non-pristine legacy operation %s was tombstoned", id)
 		}
+	}
+	var historicalResult string
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT status,phase,tombstoned_at IS NOT NULL,result::text
+		  FROM task_creation_operations WHERE id='migration-113-result-bearing'`).Scan(
+		&status, &phase, &tombstoned, &historicalResult); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || phase != "" || tombstoned ||
+		historicalResult != `{"historical": "kept"}` {
+		t.Fatalf("result-bearing operation changed: status=%q phase=%q tombstoned=%v result=%q",
+			status, phase, tombstoned, historicalResult)
+	}
+	var historicalExecutedAt time.Time
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT status,phase,tombstoned_at IS NOT NULL,executed_at
+		  FROM task_creation_operations WHERE id='migration-113-executed-bearing'`).Scan(
+		&status, &phase, &tombstoned, &historicalExecutedAt); err != nil {
+		t.Fatal(err)
+	}
+	wantExecutedAt := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	if status != "pending" || phase != "" || tombstoned ||
+		!historicalExecutedAt.Equal(wantExecutedAt) {
+		t.Fatalf("executed operation changed: status=%q phase=%q tombstoned=%v executed_at=%s",
+			status, phase, tombstoned, historicalExecutedAt)
 	}
 	var receiptStatus, providerMessageID, failureClass string
 	if err := db.QueryRowContext(t.Context(), `
