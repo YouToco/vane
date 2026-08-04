@@ -9,7 +9,6 @@ package scheduler
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -245,9 +244,8 @@ func (s *Scheduler) newScheduleCommandWorkContext(
 	return context.WithTimeout(parent, total-reserve)
 }
 
-// makePushParams 构造 PushPipelineWorkflow 的入参（= Schedule.Action.Args[0]）。
-// Retained V1/V2 recovery and ReconcileActions share this constructor so
-// immutable legacy actions keep one exact wire representation.
+// makePushParams constructs the frozen V1/V2 wire retained only by historical
+// creation recovery and offline replay compatibility.
 func makePushParams(tenantID, userID int64, schedID string, scope workflow.PushScope, nlDesc string) workflow.PushParams {
 	return workflow.PushParams{
 		TenantID:      tenantID,
@@ -260,30 +258,10 @@ func makePushParams(tenantID, userID int64, schedID string, scope workflow.PushS
 	}
 }
 
-// ReconcileActions 把存量 active 调度的 Temporal Action 入参补齐到当前代码构造的 params
-// （含 TenantID / RunKind / ExecutionMode / RuntimeVersion / ScheduleID / NLDesc）。
-// **由 cmd/server 在启动时调用一次**。
-//
-// 为什么需要（P1b 上线才暴露的断裂）：Temporal 在**建调度那一刻**就把 workflow 启动入参
-// 冻结进 schedule spec，早期创建路径没有把 ScheduleID 写进 Action.Args。该路径之前建的
-// 存量调度（如 07-14 建的早报任务）Action.Args 里没有 schedule_id，每次定时触发 workflow
-// 都拿到空 ScheduleID → b3 的 planScoped 恒 false → 隔离永不激活。于是决策 #4 的"老任务
-// 补手册→自包含"迁移成了死胡同：手册编译写了 task_fetch_targets，调度触发却照旧抓全部订阅。
-// 本方法在启动时给存量调度补上 schedule_id，让已编译手册的任务真正走隔离；**b3 仍以
-// ScheduleHasSources 门禁把关**——无手册任务的 schedule_id 到了 workflow 也因 task_fetch_targets
-// 为空而回落用户级，决策 #4「无手册老任务抓全部订阅」不破。
-//
-// 同时以数据库镜像的 TenantID 升级旧 tenant=0 Action，并补齐显式 scheduled RunKind、
-// Compiled 语义及当前 runtime rollout 版本；未知或不完整的新信封会 fail-closed。
-//
-// 顺带自愈任务名漂移（#3）：判据比对整套会漂移的字段，不只 schedule_id。
-// 早期原地编辑只换 Spec、不碰 Action，镜像 nl_description 新而 Action.NLDesc 旧 → 聚合卡
-// header 永久显示旧任务名；本方法在下次启动时据镜像把 Action 刷回新名。
-//
-// fail-closed：单条失败会继续检查其余调度以收集诊断，但最终返回聚合错误，调用方不得
-// 开放 worker/Agent/HTTP/飞书 ingress；全局预算耗尽时立即停止，不再按 active 数线性等待。
-// 幂等：先 Describe 看 Action.Args 的可漂移字段是否已与期望 params 一致，一致则跳过、
-// 不写 Temporal（新建调度、以及上次已 reconcile 过且未改名的调度，重启时都命中跳过）。
+// ReconcileActions is the startup invariant audit for active schedules. Every
+// live Action must be an authorized ResearchScheduledWorkflowV3 envelope.
+// Retired Actions are never repaired or rewritten: one such task blocks all
+// worker, Agent, HTTP and Feishu ingress until the migration is completed.
 func (s *Scheduler) ReconcileActions(ctx context.Context) error {
 	return s.reconcileActions(ctx, scheduleReconcilePassTimeout)
 }
@@ -349,8 +327,9 @@ done:
 	return errors.Join(reconcileErrors...)
 }
 
-// reconcileOne 把单个调度的 Action.Args 自愈到期望 params。
-// 返回 didUpdate=true 表示确实写了 Temporal。
+// reconcileOne verifies one live Action under the exact-task database gate.
+// The bool remains in the frozen caller contract but is always false now that
+// startup reconciliation is read-only.
 func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (updated bool, err error) {
 	attemptCtx, cancelAttempt := context.WithTimeout(ctx, scheduleReconcileAttemptTimeout)
 	defer cancelAttempt()
@@ -391,20 +370,6 @@ func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (up
 		return false, nil
 	}
 
-	var scope workflow.PushScope
-	if len(sc.ScopeJSON) > 0 {
-		if err := json.Unmarshal(sc.ScopeJSON, &scope); err != nil {
-			return false, fmt.Errorf("解析 scope_json（id=%s）: %w", sc.ID, err)
-		}
-	}
-	want := makePushParams(sc.TenantID, sc.UserID, sc.ID, scope, sc.NLDescription)
-	// The database mirror is the current control-plane routing truth. Reconcile
-	// repairs frozen Action fields; it must never silently downgrade a dynamic
-	// task to compiled merely because makePushParams is also used by legacy
-	// compiled creation paths.
-	want.ExecutionMode = sc.ExecutionMode
-	want = s.actionParamsFor(want)
-
 	h := s.c.ScheduleClient().GetHandle(attemptCtx, sc.ID)
 	desc, err := h.Describe(attemptCtx)
 	if err != nil {
@@ -415,98 +380,33 @@ func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (up
 	if err != nil {
 		return false, err
 	}
-	if isFormalV3 {
-		if formalV3.TenantID != sc.TenantID ||
-			formalV3.UserID != sc.UserID || formalV3.TaskID != sc.ID {
-			return false, types.NewAppError(types.CodeConflict,
-				"research V3 Schedule Action identity does not match the task scope", types.ErrConflict)
-		}
-		verifier, ok := s.st.(researchV3ActionAuthorityStore)
-		if !ok {
-			return false, types.NewAppError(types.CodeInternal,
-				"research V3 Action authority verifier is unavailable", types.ErrInternal)
-		}
-		if err := verifier.VerifyEnabledResearchV3ActionAuthorization(
-			ctx, sc.TenantID, sc.UserID, sc.ID,
-			formalV3.ActionAuthorizationToken,
-		); err != nil {
-			return false, err
-		}
-		// Only the cutover/rollback saga may replace this envelope. In
-		// particular, startup reconciliation must preserve its capability token.
-		return false, nil
+	if !isFormalV3 {
+		return false, types.NewAppError(types.CodeConflict,
+			"active task still uses the retired pre-V3 Schedule Action", types.ErrConflict)
 	}
-	current, found, err := decodeScheduleActionPushParams(
-		desc.Schedule.Action)
-	if err != nil {
+	if formalV3.TenantID != sc.TenantID ||
+		formalV3.UserID != sc.UserID || formalV3.TaskID != sc.ID {
+		return false, types.NewAppError(types.CodeConflict,
+			"research V3 Schedule Action identity does not match the task scope", types.ErrConflict)
+	}
+	verifier, ok := s.st.(researchV3ActionAuthorityStore)
+	if !ok {
+		return false, types.NewAppError(types.CodeInternal,
+			"research V3 Action authority verifier is unavailable", types.ErrInternal)
+	}
+	if err := verifier.VerifyEnabledResearchV3ActionAuthorization(
+		ctx, sc.TenantID, sc.UserID, sc.ID,
+		formalV3.ActionAuthorizationToken,
+	); err != nil {
 		return false, err
 	}
-	if found &&
-		workflow.IsCompiledToolRuntimeV2(current.RuntimeVersion) &&
-		!workflow.IsCompiledToolRuntimeV2(want.RuntimeVersion) {
-		return false, fmt.Errorf(
-			"Tool runtime task %s must be paused before canary removal",
-			sc.ID)
-	}
-	if workflow.IsCompiledToolRuntimeV2(want.RuntimeVersion) {
-		if err := requireToolRuntimeDefinition(
-			attemptCtx, s.st,
-			sc.TenantID, sc.UserID, sc.ID); err != nil {
-			return false, err
-		}
-	}
-	matches, err := actionMatchesParams(desc.Schedule.Action, want)
-	if err != nil {
-		return false, err
-	}
-	if matches {
-		return false, nil // Action 的可漂移入参已与期望一致，无需重写
-	}
-
-	// 只替换 Action.Args，其余（Workflow 类型名、ID、TaskQueue、超时、Spec、Overlap、State）
-	// 一律原样带走；自己 new 一个 Action 会静默丢掉这些字段。
-	err = h.Update(attemptCtx, client.ScheduleUpdateOptions{
-		DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
-			sch := in.Description.Schedule
-			wf, ok := sch.Action.(*client.ScheduleWorkflowAction)
-			if !ok {
-				return nil, fmt.Errorf("调度 %s 的 Action 非 workflow 类型，无法 reconcile", sc.ID)
-			}
-			na := *wf                     // 值拷贝 Action 结构体
-			na.Args = []interface{}{want} // 只换入参
-			sch.Action = &na
-			return &client.ScheduleUpdate{Schedule: &sch}, nil
-		},
-	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	// Only the cutover/rollback saga may replace this envelope. Startup
+	// reconciliation is now an invariant audit and never rewrites Actions.
+	return false, nil
 }
 
-// actionMatchesParams 判断一个 Schedule Action 的入参是否已与期望 params 一致。
-// Describe/Update 返回的 Action.Args 是 *commonpb.Payload（未解码原始态，见 SDK 注释），
-// 故解出首个入参为 PushParams 再逐字段比对。非 workflow-action / 空入参 / 首参非 Payload
-// 一律视为"不一致"（返回 false）——让 reconcile 走重建分支自愈，而非报错卡住。
-//
-// 只比 TenantID / RunKind / ScheduleID / NLDesc，不比整份 params：TenantID 从
-// 数据库镜像恢复任务归属；RunKind 补齐旧 Action 的未知零值；ScheduleID 激活
-// 任务级隔离；NLDesc 自愈改名后的聚合卡标题漂移。Scope 目前建后不可改，
-// 纳入比较只会因 nil/空切片等价问题诱发无谓重写；将来 Scope 可改时再纳入。
-// Snapshot 不属于漂移自愈字段：A5 构造器确保持久 Action 始终为 nil，每轮引用只能
-// 由 PrepareRun 在 workflow 内存中产生；异常非 nil 入参会在 PrepareRun 中 fail-closed。
-func actionMatchesParams(action client.ScheduleAction, want workflow.PushParams) (bool, error) {
-	got, found, err := decodeScheduleActionPushParams(action)
-	if err != nil || !found {
-		return false, err
-	}
-	return got.TenantID == want.TenantID && got.RunKind == want.RunKind &&
-		got.ExecutionMode == want.ExecutionMode &&
-		got.RuntimeVersion == want.RuntimeVersion &&
-		got.ScheduleID == want.ScheduleID &&
-		got.NLDesc == want.NLDesc, nil
-}
-
+// decodeScheduleActionPushParams is retained for immutable legacy decoding in
+// replay tests and migration audits; no production path starts this protocol.
 func decodeScheduleActionPushParams(
 	action client.ScheduleAction,
 ) (workflow.PushParams, bool, error) {
@@ -530,17 +430,6 @@ func decodeScheduleActionPushParams(
 	}
 }
 
-func (s *Scheduler) decodeRawScheduleActionPushParams(
-	response *workflowservice.DescribeScheduleResponse,
-	taskID string,
-) (workflow.PushParams, bool, error) {
-	var params workflow.PushParams
-	found, err := s.decodeRawScheduleActionInput(
-		response, taskID, &params,
-	)
-	return params, found, err
-}
-
 func (s *Scheduler) decodeRawScheduleActionResearchV3Input(
 	response *workflowservice.DescribeScheduleResponse,
 	taskID string,
@@ -555,8 +444,7 @@ func (s *Scheduler) decodeRawScheduleActionResearchV3Input(
 // decodeRawScheduleActionInput decodes the one immutable argument from a
 // persisted Schedule Action with the converter identity sealed in its memo.
 // It deliberately accepts an output pointer instead of selecting a workflow
-// protocol: durable manual runs must preserve both the frozen PushParams wire
-// and the independent ResearchScheduledInputV3 cutover wire.
+// protocol: current durable commands decode only ResearchScheduledInputV3.
 func (s *Scheduler) decodeRawScheduleActionInput(
 	response *workflowservice.DescribeScheduleResponse,
 	taskID string,
@@ -641,87 +529,7 @@ func (s *Scheduler) decodeRawScheduleActionInput(
 		errors.New("恢复任务无法解析版本化 Temporal Action")
 }
 
-func (s *Scheduler) authorizeToolRuntimeResume(
-	ctx context.Context,
-	sc *types.Schedule,
-) error {
-	if sc == nil {
-		return types.NewAppError(
-			types.CodeConflict,
-			"恢复任务缺少调度定义", types.ErrConflict)
-	}
-	description, err := s.c.ScheduleClient().GetHandle(
-		ctx, sc.ID).Describe(ctx)
-	if err != nil {
-		return err
-	}
-	if description == nil {
-		return types.NewAppError(
-			types.CodeConflict,
-			"恢复任务无法验证 Temporal Action",
-			types.ErrConflict)
-	}
-	params, found, err := decodeScheduleActionPushParams(
-		description.Schedule.Action)
-	if err != nil {
-		return err
-	}
-	return s.validateToolRuntimeResume(
-		ctx, sc, found, params)
-}
-
-func (s *Scheduler) validateToolRuntimeResume(
-	ctx context.Context,
-	sc *types.Schedule,
-	actionFound bool,
-	params workflow.PushParams,
-) error {
-	capabilities, ok := s.st.(toolRuntimeCapabilityStore)
-	if !ok {
-		return types.NewAppError(
-			types.CodeConflict,
-			"恢复任务无法验证 Tool runtime 定义",
-			types.ErrConflict)
-	}
-	isToolTask, err := capabilities.HasCurrentToolApprovedDefinition(
-		ctx, sc.TenantID, sc.UserID, sc.ID)
-	if err != nil {
-		return err
-	}
-	actionIsTool := actionFound &&
-		workflow.IsCompiledToolRuntimeV2(params.RuntimeVersion)
-	if !actionFound || actionIsTool != isToolTask {
-		return types.NewAppError(
-			types.CodeConflict,
-			"恢复任务的 Action 与 Tool runtime 定义不一致",
-			types.ErrConflict)
-	}
-	if !actionIsTool {
-		return nil
-	}
-	if params.TenantID != sc.TenantID ||
-		params.UserID != sc.UserID ||
-		params.ScheduleID != sc.ID ||
-		params.RunKind != workflow.PushRunKindScheduled ||
-		params.ExecutionMode != types.ExecutionModeCompiled ||
-		params.Snapshot != nil {
-		return types.NewAppError(
-			types.CodeConflict,
-			"恢复任务的 Tool runtime Action 身份与任务不一致",
-			types.ErrConflict)
-	}
-	if !workflow.IsCompiledToolRuntimeV2(
-		s.runtimeVersionFor(sc.ID, sc.ExecutionMode),
-	) {
-		return types.NewAppError(
-			types.CodeConflict,
-			"Tool runtime canary 已关闭，任务保持暂停",
-			types.ErrConflict)
-	}
-	return nil
-}
-
-func (s *Scheduler) authorizeToolRuntimeResumeRemote(
+func (s *Scheduler) authorizeResearchV3ResumeRemote(
 	ctx context.Context,
 	sc *types.Schedule,
 ) error {
@@ -738,17 +546,53 @@ func (s *Scheduler) authorizeToolRuntimeResumeRemote(
 	if err != nil {
 		return err
 	}
-	params, found, err := s.decodeRawScheduleActionPushParams(
-		response, sc.ID)
-	if err != nil {
-		return types.NewAppError(
+	_, _, err = s.validateAuthorizedResearchV3Schedule(
+		ctx, response, sc.TenantID, sc.UserID, sc.ID)
+	return err
+}
+
+func (s *Scheduler) validateAuthorizedResearchV3Schedule(
+	ctx context.Context,
+	description *workflowservice.DescribeScheduleResponse,
+	tenantID, userID int64,
+	taskID string,
+) (workflow.ResearchScheduledInputV3, string, error) {
+	start := description.GetSchedule().GetAction().GetStartWorkflow()
+	if start == nil || start.GetWorkflowType().GetName() !=
+		workflow.ResearchScheduledWorkflowV3Name {
+		return workflow.ResearchScheduledInputV3{}, "", types.NewAppError(
 			types.CodeConflict,
-			"恢复任务无法验证版本化 Temporal Action",
+			"task still uses the retired pre-V3 Schedule Action",
+			types.ErrConflict,
+		)
+	}
+	input, found, err := s.decodeRawScheduleActionResearchV3Input(
+		description, taskID)
+	queue := strings.TrimSpace(start.GetTaskQueue().GetName())
+	if err != nil || !found || input.TenantID != tenantID ||
+		input.UserID != userID || input.TaskID != taskID ||
+		validateResearchScheduledInputV3(input) != nil || queue == "" {
+		return workflow.ResearchScheduledInputV3{}, "", types.NewAppError(
+			types.CodeConflict,
+			"Research V3 Schedule Action does not match the durable command",
 			errors.Join(types.ErrConflict, err),
 		)
 	}
-	return s.validateToolRuntimeResume(
-		ctx, sc, found, params)
+	verifier, ok := s.st.(researchV3ActionAuthorityStore)
+	if !ok {
+		return workflow.ResearchScheduledInputV3{}, "", types.NewAppError(
+			types.CodeInternal,
+			"Research V3 Action authority verifier is unavailable",
+			types.ErrInternal,
+		)
+	}
+	if err := verifier.VerifyEnabledResearchV3ActionAuthorization(
+		ctx, tenantID, userID, taskID,
+		input.ActionAuthorizationToken,
+	); err != nil {
+		return workflow.ResearchScheduledInputV3{}, "", err
+	}
+	return input, queue, nil
 }
 
 // TriggerScheduleNowIdempotent starts the exact stored Action for one owned
@@ -915,7 +759,7 @@ func (s *Scheduler) runScheduleCommandAttempt(
 				"恢复任务缺少已锁定的调度定义",
 				types.ErrConflict)
 		}
-		if err := s.authorizeToolRuntimeResumeRemote(
+		if err := s.authorizeResearchV3ResumeRemote(
 			ctx, schedule); err != nil {
 			if isTaskScheduleNotFound(err) {
 				finishCtx, cancelFinish := scheduleCommandDetachedContext(
@@ -1034,77 +878,10 @@ func (s *Scheduler) applyScheduleCommandRemote(
 		if err != nil {
 			return err
 		}
-		start := description.GetSchedule().GetAction().GetStartWorkflow()
-		if start != nil && start.GetWorkflowType().GetName() ==
-			workflow.ResearchScheduledWorkflowV3Name {
-			input, found, err := s.decodeRawScheduleActionResearchV3Input(
-				description, command.TaskID,
-			)
-			if err != nil {
-				return err
-			}
-			if !found ||
-				input.TenantID != command.TenantID ||
-				input.UserID != command.UserID || input.TaskID != command.TaskID ||
-				validateResearchScheduledInputV3(input) != nil ||
-				strings.TrimSpace(start.GetTaskQueue().GetName()) == "" {
-				return types.NewAppError(
-					types.CodeConflict,
-					"立即运行的 Research V3 执行定义与耐久命令不一致",
-					types.ErrConflict,
-				)
-			}
-			verifier, ok := s.st.(researchV3ActionAuthorityStore)
-			if !ok {
-				return types.NewAppError(
-					types.CodeInternal,
-					"Research V3 立即运行授权校验器未配置",
-					types.ErrInternal,
-				)
-			}
-			if err := verifier.VerifyEnabledResearchV3ActionAuthorization(
-				ctx, command.TenantID, command.UserID, command.TaskID,
-				input.ActionAuthorizationToken,
-			); err != nil {
-				return err
-			}
-			_, err = s.c.ExecuteWorkflow(
-				ctx,
-				client.StartWorkflowOptions{
-					ID: manualTaskWorkflowID(
-						command.ID, command.CreatedAt,
-					),
-					TaskQueue: start.GetTaskQueue().GetName(),
-					WorkflowIDReusePolicy: enums.
-						WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
-					WorkflowExecutionErrorWhenAlreadyStarted: true,
-				},
-				workflow.ResearchScheduledWorkflowV3,
-				input,
-			)
-			var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
-			if errors.As(err, &alreadyStarted) {
-				return nil
-			}
-			return err
-		}
-		params, found, err := s.decodeRawScheduleActionPushParams(
-			description, command.TaskID,
-		)
+		input, taskQueue, err := s.validateAuthorizedResearchV3Schedule(
+			ctx, description, command.TenantID, command.UserID, command.TaskID)
 		if err != nil {
 			return err
-		}
-		if !found ||
-			params.UserID != command.UserID ||
-			params.ScheduleID != command.TaskID ||
-			params.RunKind != workflow.PushRunKindScheduled ||
-			params.Snapshot != nil ||
-			(params.TenantID != 0 && params.TenantID != command.TenantID) {
-			return types.NewAppError(
-				types.CodeConflict,
-				"立即运行的任务执行定义与耐久命令不一致",
-				types.ErrConflict,
-			)
 		}
 		_, err = s.c.ExecuteWorkflow(
 			ctx,
@@ -1112,16 +889,13 @@ func (s *Scheduler) applyScheduleCommandRemote(
 				ID: manualTaskWorkflowID(
 					command.ID, command.CreatedAt,
 				),
-				TaskQueue: s.tq,
+				TaskQueue: taskQueue,
 				WorkflowIDReusePolicy: enums.
 					WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
-				// A response-lost retry must surface AlreadyStarted so this
-				// command can adopt the exact existing execution instead of
-				// silently attaching to some unrelated caller state.
 				WorkflowExecutionErrorWhenAlreadyStarted: true,
 			},
-			workflow.PushPipelineWorkflow,
-			params,
+			workflow.ResearchScheduledWorkflowV3,
+			input,
 		)
 		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
 		if errors.As(err, &alreadyStarted) {

@@ -17,6 +17,8 @@ import (
 // activityRegisterRe 抓 main.go 里的 w.RegisterActivity(activities.Xxx)。
 var activityRegisterRe = regexp.MustCompile(`w\.RegisterActivity\(activities\.(\w+)\)`)
 var workflowRegisterRe = regexp.MustCompile(`w\.RegisterWorkflow\(workflow\.(\w+)\)`)
+var periodicActivityRegisterRe = regexp.MustCompile(`w\.RegisterActivity\(periodicActivities\.(\w+)\)`)
+var periodicWorkflowRegisterRe = regexp.MustCompile(`w\.RegisterWorkflow\(periodicbrief\.(\w+)\)`)
 
 var productionResearchActivitiesV3 = map[string]bool{
 	"PrepareResearchRunV3":      true,
@@ -66,6 +68,25 @@ func TestRetiredPushWorkflowIsNotRegisteredInProduction(t *testing.T) {
 	}
 	if got["PushPipelineWorkflow"] {
 		t.Error("retired PushPipelineWorkflow remains registered in production")
+	}
+}
+
+func TestProductionWorkerKeepsPeriodicBriefRuntime(t *testing.T) {
+	src := readMainSource(t)
+	workflows := periodicWorkflowRegisterRe.FindAllStringSubmatch(src, -1)
+	if len(workflows) != 1 || workflows[0][1] != "WorkflowV1" {
+		t.Fatalf("periodic workflow registrations=%v, want only WorkflowV1", workflows)
+	}
+	got := map[string]bool{}
+	for _, match := range periodicActivityRegisterRe.FindAllStringSubmatch(src, -1) {
+		got[match[1]] = true
+	}
+	want := map[string]bool{
+		"SynthesizePeriodicBriefV1": true,
+		"DeliverPeriodicBriefV1":    true,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("periodic activity registrations=%v, want %v", got, want)
 	}
 }
 

@@ -72,7 +72,7 @@ func TestResearchV3CutoverPublicControlPlaneIsExactTaskOnly(t *testing.T) {
 	}
 }
 
-func TestResearchRuntimeV3AuthorityCannotRewriteMondayNineSchedule(t *testing.T) {
+func TestResearchRuntimeV3AuthorityCannotAdmitLegacyMondayNineSchedule(t *testing.T) {
 	const taskID = "task-v3-monday-nine"
 	initial := makePushParams(
 		7, 42, taskID, workflow.PushScope{SourceIDs: []int64{21}, TopN: 4},
@@ -94,8 +94,8 @@ func TestResearchRuntimeV3AuthorityCannotRewriteMondayNineSchedule(t *testing.T)
 	}}}
 	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
 
-	if err := s.ReconcileActions(t.Context()); err != nil {
-		t.Fatal(err)
+	if err := s.ReconcileActions(t.Context()); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("legacy Monday 09:00 schedule error=%v", err)
 	}
 	if len(h.history) != 0 {
 		t.Fatalf("hard-disabled authority rewrote Action %d times", len(h.history))

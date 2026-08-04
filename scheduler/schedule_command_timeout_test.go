@@ -236,6 +236,28 @@ func TestDurableRunRejectsFormalResearchV3WithoutEnabledAuthority(t *testing.T) 
 	}
 }
 
+func TestDurableRunRejectsRetiredPushAction(t *testing.T) {
+	const taskID = "task-retired-manual-run"
+	client := &scheduleCommandTimeoutClient{service: &scheduleCommandStaticDescribe{
+		action: rawResumeScheduleAction(taskID, workflow.CompiledRuntimeSnapshotV1),
+	}}
+	s := New(client, "vane-tq", &scheduleCommandTimeoutStore{},
+		WithTaskScheduleNamespace("test"))
+	err := s.applyScheduleCommandRemote(t.Context(), &types.ScheduleCommand{
+		ID:       "01900000-0000-7000-8000-000000000003",
+		TenantID: 1, UserID: 7, TaskID: taskID,
+		Kind: types.ScheduleCommandRun, CreatedAt: time.Now().UTC(),
+	})
+	if types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("retired manual run error=%v", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.executeCalls != 0 {
+		t.Fatalf("retired manual workflow executions=%d", client.executeCalls)
+	}
+}
+
 func (s *scheduleCommandFirstRPCBlackhole) PatchSchedule(
 	ctx context.Context,
 	request *workflowservice.PatchScheduleRequest,
@@ -464,13 +486,23 @@ func TestScheduleCommandFirstRPCBlackholeUsesSharedAttemptBudget(
 		types.ScheduleCommandDelete,
 	} {
 		t.Run(string(kind), func(t *testing.T) {
-			st := &scheduleCommandTimeoutStore{}
+			token := strings.Repeat("c", 64)
+			st := &scheduleCommandTimeoutStore{
+				researchV3AuthorityEnabled: true,
+				researchV3AuthorityToken:   token,
+				schedule: types.Schedule{
+					ID: "blackhole-task", TenantID: 1, UserID: 7,
+					Status:        types.ScheduleStatusActive,
+					ExecutionMode: types.ExecutionModeDiscoverAtRun,
+				},
+			}
 			remote := &scheduleCommandFirstRPCBlackhole{
 				paused: kind == types.ScheduleCommandResume,
-				action: rawResumeScheduleAction(
-					"blackhole-task",
-					workflow.CompiledRuntimeSnapshotV1,
-				),
+				action: rawResearchV3ScheduleAction("blackhole-task",
+					workflow.ResearchScheduledInputV3{
+						TenantID: 1, UserID: 7, TaskID: "blackhole-task",
+						ActionAuthorizationToken: token,
+					}),
 			}
 			s := New(
 				&scheduleCommandTimeoutClient{service: remote},
@@ -521,7 +553,7 @@ func TestScheduleCommandFirstRPCBlackholeUsesSharedAttemptBudget(
 	}
 }
 
-func TestDurableResumeBlocksToolTaskAfterCanaryRemoval(t *testing.T) {
+func TestDurableResumeRejectsRetiredPushAction(t *testing.T) {
 	const taskID = "task-tool-resume-durable"
 	st := &scheduleCommandTimeoutStore{
 		toolDefinition: true,
@@ -544,9 +576,9 @@ func TestDurableResumeBlocksToolTaskAfterCanaryRemoval(t *testing.T) {
 		WithCompiledRuntimeRollout(true, taskID, false),
 	)
 	err := s.ResumePushIdempotent(
-		t.Context(), taskID, 7, "resume-without-tool-canary")
+		t.Context(), taskID, 7, "resume-retired-action")
 	if err == nil {
-		t.Fatal("durable resume bypassed disabled Tool canary")
+		t.Fatal("durable resume accepted a retired Push Action")
 	}
 	status, locked := st.state()
 	if status != types.ScheduleCommandBlocked || locked {

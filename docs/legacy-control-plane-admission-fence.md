@@ -47,7 +47,8 @@ WHERE execution_version=1 AND status='pending' AND expires_at<=clock_timestamp()
 The following is historical/recovery state, not a current product surface:
 
 - V1/V2 Approved Definition encoders and decoders;
-- V1/V2 run snapshot readers and Temporal workflow/activity registrations;
+- V1/V2 run snapshot readers and offline Temporal replay implementations; live
+  worker registrations are removed only after the retention Gate is proven;
 - the compiled-task creation/edit commit code that may finish an operation
   admitted before the fence;
 - `fetch_targets`, `task_fetch_targets`, and `content_sources` rows referenced

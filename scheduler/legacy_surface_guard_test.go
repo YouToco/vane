@@ -40,6 +40,13 @@ func TestRetiredSchedulerActionSurfaceIsAbsent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			selector, ok := node.(*ast.SelectorExpr)
+			if ok && selector.Sel.Name == "PushPipelineWorkflow" {
+				t.Errorf("retired PushPipelineWorkflow is production-reachable in %s", path)
+			}
+			return true
+		})
 		for _, declaration := range file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
 			if !ok {
