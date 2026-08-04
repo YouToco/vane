@@ -31,7 +31,7 @@ func (s *server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
 // handleDeleteSchedule 删除一个调度（Temporal + 镜像）。
 // DELETE /api/schedules/{id} → 200 {ok}
 //
-// 归属校验由 Scheduler.DeletePush 内的 GetSchedule(id, userID) 承担：
+// 归属校验由 Scheduler.DeletePushIdempotent 内的 GetSchedule(id, userID) 承担：
 // 「不存在」与「不属于你」归一为 NotFound，不给调用方枚举他人调度 id 的机会。
 //
 // 此处原注释写着「单 owner：所有调度同属一人，故不再逐条校验归属」——那是 M3 的实情，
