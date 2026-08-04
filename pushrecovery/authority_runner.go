@@ -41,6 +41,7 @@ type AuthorityRunner struct {
 	passMu          sync.Mutex
 	mu              sync.Mutex
 	runners         map[string]*Runner
+	lastTaskID      string
 }
 
 func NewAuthorityRunner(deps AuthorityRunnerDeps) (*AuthorityRunner, error) {
@@ -122,44 +123,83 @@ func (r *AuthorityRunner) runPass(ctx context.Context, trigger string) error {
 	defer r.passMu.Unlock()
 	passCtx, cancel := context.WithTimeout(ctx, r.config.PassTimeout)
 	defer cancel()
-	after := ""
-	discovered := 0
-	seen := make(map[string]struct{})
-	// The map is only a per-authority construction cache. Prune it after every
-	// pass, including partial/error passes, so durable authority churn can never
-	// grow process memory beyond the bounded discovery set.
-	defer func() { r.retainRunners(seen) }()
+	tasks, err := r.discoverAuthorityTasks(passCtx)
+	if err != nil {
+		// A partial catalog is not authority truth. Keep the previous complete
+		// snapshot and every task Runner's recovery cursor for the next pass.
+		return err
+	}
+	runnable := make([]string, 0, len(tasks))
+	seen := make(map[string]struct{}, len(tasks))
+	for _, taskID := range tasks {
+		if taskID == r.excludeTaskID {
+			continue
+		}
+		runnable = append(runnable, taskID)
+		seen[taskID] = struct{}{}
+	}
+	r.retainRunners(seen)
+	if len(runnable) == 0 {
+		r.lastTaskID = ""
+		return nil
+	}
+	start := 0
+	for index, taskID := range runnable {
+		if taskID > r.lastTaskID {
+			start = index
+			break
+		}
+		if index == len(runnable)-1 {
+			start = 0
+		}
+	}
 	var passErrors []error
+	for offset := 0; offset < len(runnable); offset++ {
+		if err := passCtx.Err(); err != nil {
+			passErrors = append(passErrors, err)
+			break
+		}
+		taskID := runnable[(start+offset)%len(runnable)]
+		runner, err := r.runnerFor(taskID)
+		if err != nil {
+			passErrors = append(passErrors, err)
+			r.lastTaskID = taskID
+			continue
+		}
+		if err := runner.runPass(passCtx, "v3-authority-"+trigger); err != nil {
+			passErrors = append(passErrors, err)
+		}
+		// Advance even on task-local timeout/failure: the next pass starts after
+		// this task, so one slow authority cannot permanently starve its peers.
+		r.lastTaskID = taskID
+	}
+	return errors.Join(passErrors...)
+}
+
+func (r *AuthorityRunner) discoverAuthorityTasks(ctx context.Context) ([]string, error) {
+	after := ""
+	tasksFound := make([]string, 0, defaultAuthorityTaskPageSize)
 	for {
 		tasks, err := r.store.ListEnabledResearchV3RecoveryTaskIDs(
-			passCtx, after, defaultAuthorityTaskPageSize)
+			ctx, after, defaultAuthorityTaskPageSize)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, taskID := range tasks {
-			discovered++
-			if discovered > maxAuthorityTasksPerPass {
-				return errors.New("V3 authority recovery task bound exceeded")
+			if taskID <= after {
+				return nil, errors.New("V3 authority recovery cursor did not advance")
 			}
 			after = taskID
-			if taskID == r.excludeTaskID {
-				continue
-			}
-			seen[taskID] = struct{}{}
-			runner, err := r.runnerFor(taskID)
-			if err != nil {
-				passErrors = append(passErrors, err)
-				continue
-			}
-			if err := runner.runPass(passCtx, "v3-authority-"+trigger); err != nil {
-				passErrors = append(passErrors, err)
+			tasksFound = append(tasksFound, taskID)
+			if len(tasksFound) > maxAuthorityTasksPerPass {
+				return nil, errors.New("V3 authority recovery task bound exceeded")
 			}
 		}
 		if len(tasks) < defaultAuthorityTaskPageSize {
 			break
 		}
 	}
-	return errors.Join(passErrors...)
+	return tasksFound, nil
 }
 
 func (r *AuthorityRunner) retainRunners(seen map[string]struct{}) {

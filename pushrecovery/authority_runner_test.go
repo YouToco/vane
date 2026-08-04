@@ -2,6 +2,7 @@ package pushrecovery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +19,9 @@ type fakeAuthorityDiscoveryStore struct {
 	mu        sync.Mutex
 	tasks     []string
 	listCalls int
+	listErr   error
+	slowTask  string
+	runOrder  []string
 }
 
 func (s *fakeAuthorityDiscoveryStore) ListEnabledResearchV3RecoveryTaskIDs(
@@ -26,6 +30,9 @@ func (s *fakeAuthorityDiscoveryStore) ListEnabledResearchV3RecoveryTaskIDs(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.listCalls++
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
 	tasks := append([]string(nil), s.tasks...)
 	sort.Strings(tasks)
 	result := make([]string, 0, limit)
@@ -44,9 +51,17 @@ func (*fakeAuthorityDiscoveryStore) ReadPushEffectRecoveryCutoff(context.Context
 	return time.Now(), nil
 }
 
-func (*fakeAuthorityDiscoveryStore) ListRecoverablePushEffectTenantIDs(
-	context.Context, string, time.Time, int64, int,
+func (s *fakeAuthorityDiscoveryStore) ListRecoverablePushEffectTenantIDs(
+	ctx context.Context, taskID string, _ time.Time, _ int64, _ int,
 ) ([]int64, error) {
+	s.mu.Lock()
+	s.runOrder = append(s.runOrder, taskID)
+	slow := s.slowTask == taskID
+	s.mu.Unlock()
+	if slow {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return nil, nil
 }
 
@@ -114,6 +129,47 @@ func TestAuthorityRunnerPaginationIsBounded(t *testing.T) {
 	}
 	if store.listCalls > maxAuthorityTasksPerPass/defaultAuthorityTaskPageSize+1 {
 		t.Fatalf("authority discovery calls=%d", store.listCalls)
+	}
+}
+
+func TestAuthorityRunnerRotatesPastSlowTaskAndKeepsCompleteSnapshotOnDiscoveryError(t *testing.T) {
+	store := &fakeAuthorityDiscoveryStore{
+		tasks: []string{"task-a", "task-b"}, slowTask: "task-a",
+	}
+	runner, err := NewAuthorityRunner(AuthorityRunnerDeps{
+		Store: store, Sender: &fakeSender{}, HistoryResolver: &fakeHistoryResolver{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RunnerConfig: RunnerConfig{
+			PassTimeout: 100 * time.Millisecond, AttemptTimeout: 50 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.runPass(t.Context(), "slow"); err == nil {
+		t.Fatal("slow authority pass unexpectedly succeeded")
+	}
+	store.mu.Lock()
+	store.slowTask = ""
+	store.runOrder = nil
+	store.mu.Unlock()
+	if err := runner.runPass(t.Context(), "rotated"); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	order := append([]string(nil), store.runOrder...)
+	store.listErr = errors.New("catalog unavailable")
+	store.tasks = []string{"task-c"}
+	store.mu.Unlock()
+	if len(order) == 0 || order[0] != "task-b" {
+		t.Fatalf("recovery did not rotate past slow task: %v", order)
+	}
+	if err := runner.runPass(t.Context(), "catalog-error"); err == nil {
+		t.Fatal("authority catalog error was ignored")
+	}
+	if runner.runners["task-a"] == nil || runner.runners["task-b"] == nil ||
+		runner.runners["task-c"] != nil {
+		t.Fatalf("partial discovery replaced complete runner snapshot: %v", runner.runners)
 	}
 }
 
