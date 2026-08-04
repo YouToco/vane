@@ -677,134 +677,297 @@ snapshot_previous_gateway_release() {
 
 prepare_gateway_regular_restore() {
   local snapshot=$1 key=$2 path=$3 state
-  read -r state <"$snapshot/$key.state"
+  read -r state <"$snapshot/$key.state" || return 1
   [[ $state == present || $state == absent ]] || {
     echo "research gateway snapshot has an invalid path state: $key" >&2
     return 1
   }
-  rm -f -- "$path.rollback-next"
+  rm -f -- "$path.rollback-next" || return 1
   if [[ $state == present ]]; then
     [[ -f $snapshot/$key && ! -L $snapshot/$key ]] || {
       echo "research gateway snapshot is incomplete: $key" >&2
       return 1
     }
-    cp --archive --reflink=auto -- "$snapshot/$key" "$path.rollback-next"
+    cp --archive --reflink=auto -- "$snapshot/$key" \
+      "$path.rollback-next" || {
+      echo "failed to prepare research gateway restore: $key" >&2
+      return 1
+    }
   fi
 }
 
 commit_gateway_regular_restore() {
   local snapshot=$1 key=$2 path=$3 state
-  read -r state <"$snapshot/$key.state"
+  read -r state <"$snapshot/$key.state" || return 1
   if [[ $state == present ]]; then
-    mv -f -- "$path.rollback-next" "$path"
+    mv -f -- "$path.rollback-next" "$path" || {
+      echo "failed to commit research gateway restore: $key" >&2
+      return 1
+    }
   else
-    rm -f -- "$path"
+    rm -f -- "$path" || {
+      echo "failed to remove absent research gateway path: $key" >&2
+      return 1
+    }
   fi
 }
 
-restore_previous_gateway_release() (
-  set -euo pipefail
-  local snapshot=$rollback_dir/gateway index key path state name
-  local runtime_uid runtime_gid runtime_mode
-  local service_active socket_active service_enabled socket_enabled
-  local gateway_pid gateway_exe attempt
-  [[ $previous_gateway_snapshot_ready == true && -d $snapshot &&
-     ! -L $snapshot ]] || return 1
+validate_gateway_restore_snapshot() {
+  local snapshot=$1 index key state name
+  local service_active socket_active
+  [[ -d $snapshot && ! -L $snapshot ]] || return 1
   for name in service-active socket-active service-enabled socket-enabled; do
-    [[ -f $snapshot/$name && ! -L $snapshot/$name ]] || return 1
-  done
-  read -r service_active <"$snapshot/service-active"
-  read -r socket_active <"$snapshot/socket-active"
-  read -r service_enabled <"$snapshot/service-enabled"
-  read -r socket_enabled <"$snapshot/socket-enabled"
-  for state in "$service_active" "$socket_active" "$service_enabled" \
-    "$socket_enabled"; do
+    [[ -f $snapshot/$name && ! -L $snapshot/$name ]] || {
+      echo "research gateway snapshot is missing systemd state: $name" >&2
+      return 1
+    }
+    read -r state <"$snapshot/$name" || return 1
     [[ $state == true || $state == false ]] || {
-      echo "research gateway snapshot has an invalid systemd state" >&2
+      echo "research gateway snapshot has invalid systemd state: $name" >&2
       return 1
     }
   done
+  read -r service_active <"$snapshot/service-active" || return 1
+  read -r socket_active <"$snapshot/socket-active" || return 1
+  [[ $service_active == false || $socket_active == true ]] || {
+    echo "research gateway snapshot has active service without socket" >&2
+    return 1
+  }
 
   for index in "${!gateway_snapshot_keys[@]}"; do
     key=${gateway_snapshot_keys[$index]}
-    path=${gateway_snapshot_paths[$index]}
-    prepare_gateway_regular_restore "$snapshot" "$key" "$path"
+    [[ -f $snapshot/$key.state && ! -L $snapshot/$key.state ]] || {
+      echo "research gateway snapshot is missing path state: $key" >&2
+      return 1
+    }
+    read -r state <"$snapshot/$key.state" || return 1
+    [[ $state == present || $state == absent ]] || {
+      echo "research gateway snapshot has invalid path state: $key" >&2
+      return 1
+    }
+    if [[ $state == present ]]; then
+      [[ -f $snapshot/$key && ! -L $snapshot/$key ]] || {
+        echo "research gateway snapshot is missing member: $key" >&2
+        return 1
+      }
+    fi
   done
-  read -r state <"$snapshot/runtime-directory.state"
+
+  [[ -f $snapshot/runtime-directory.state &&
+     ! -L $snapshot/runtime-directory.state ]] || {
+    echo "research gateway snapshot is missing runtime directory state" >&2
+    return 1
+  }
+  read -r state <"$snapshot/runtime-directory.state" || return 1
   [[ $state == present || $state == absent ]] || {
-    echo "research gateway snapshot has an invalid runtime directory state" >&2
+    echo "research gateway snapshot has invalid runtime directory state" >&2
     return 1
   }
   if [[ $state == present ]]; then
     for name in uid gid mode; do
       [[ -f $snapshot/runtime-directory.$name &&
-         ! -L $snapshot/runtime-directory.$name ]] || return 1
+         ! -L $snapshot/runtime-directory.$name ]] || {
+        echo "research gateway snapshot is missing runtime metadata: $name" >&2
+        return 1
+      }
     done
-    read -r runtime_uid <"$snapshot/runtime-directory.uid"
-    read -r runtime_gid <"$snapshot/runtime-directory.gid"
-    read -r runtime_mode <"$snapshot/runtime-directory.mode"
-    [[ $runtime_uid =~ ^[0-9]+$ && $runtime_gid =~ ^[0-9]+$ &&
-       $runtime_mode =~ ^[0-7]{3,4}$ ]] || {
-      echo "research gateway runtime directory metadata is invalid" >&2
+    read -r state <"$snapshot/runtime-directory.uid" || return 1
+    [[ $state =~ ^[0-9]+$ ]] || return 1
+    read -r state <"$snapshot/runtime-directory.gid" || return 1
+    [[ $state =~ ^[0-9]+$ ]] || return 1
+    read -r state <"$snapshot/runtime-directory.mode" || return 1
+    [[ $state =~ ^[0-7]{3,4}$ ]] || return 1
+  fi
+}
+
+gateway_unit_active_boolean() {
+  local unit=$1 output status=0
+  if output=$(systemctl is-active "$unit" 2>/dev/null); then
+    status=0
+  else
+    status=$?
+  fi
+  case "$output:$status" in
+    active:0) printf 'true\n' ;;
+    inactive:*|failed:*|unknown:*) printf 'false\n' ;;
+    *)
+      echo "unable to determine research gateway active state: $unit" >&2
+      return 1
+      ;;
+  esac
+}
+
+gateway_unit_enabled_boolean() {
+  local unit=$1 output status=0
+  if output=$(systemctl is-enabled "$unit" 2>/dev/null); then
+    status=0
+  else
+    status=$?
+  fi
+  case "$output:$status" in
+    enabled:0|enabled-runtime:0|linked:0|linked-runtime:0|alias:0)
+      printf 'true\n'
+      ;;
+    disabled:*|masked:*|masked-runtime:*|static:*|indirect:*|generated:*|transient:*|not-found:*|bad:*)
+      printf 'false\n'
+      ;;
+    *)
+      echo "unable to determine research gateway enablement: $unit" >&2
+      return 1
+      ;;
+  esac
+}
+
+quiesce_gateway_unit() {
+  local unit=$1 active enabled
+  active=$(gateway_unit_active_boolean "$unit") || return 1
+  if [[ $active == true ]]; then
+    systemctl stop "$unit" || {
+      echo "failed to stop research gateway unit: $unit" >&2
+      return 1
+    }
+    active=$(gateway_unit_active_boolean "$unit") || return 1
+    [[ $active == false ]] || {
+      echo "research gateway unit remained active after stop: $unit" >&2
       return 1
     }
   fi
+  enabled=$(gateway_unit_enabled_boolean "$unit") || return 1
+  if [[ $enabled == true ]]; then
+    systemctl disable "$unit" >/dev/null || {
+      echo "failed to disable research gateway unit: $unit" >&2
+      return 1
+    }
+    enabled=$(gateway_unit_enabled_boolean "$unit") || return 1
+    [[ $enabled == false ]] || {
+      echo "research gateway unit remained enabled after disable: $unit" >&2
+      return 1
+    }
+  fi
+}
 
-  systemctl stop vane-research-gateway.service || true
-  systemctl stop vane-research-gateway.socket || true
-  systemctl disable vane-research-gateway.service \
-    vane-research-gateway.socket >/dev/null || true
-  systemctl reset-failed vane-research-gateway.service \
-    vane-research-gateway.socket || true
+verify_gateway_systemd_snapshot() {
+  local snapshot=$1 expected actual name unit
+  for name in service socket; do
+    unit=vane-research-gateway.$name
+    read -r expected <"$snapshot/$name-active" || return 1
+    actual=$(gateway_unit_active_boolean "$unit") || return 1
+    [[ $actual == "$expected" ]] || {
+      echo "research gateway active state did not converge: $unit" >&2
+      return 1
+    }
+    read -r expected <"$snapshot/$name-enabled" || return 1
+    actual=$(gateway_unit_enabled_boolean "$unit") || return 1
+    [[ $actual == "$expected" ]] || {
+      echo "research gateway enablement did not converge: $unit" >&2
+      return 1
+    }
+  done
+}
+
+restore_previous_gateway_release() (
+  set -uo pipefail
+  local snapshot=$rollback_dir/gateway index key path state name
+  local runtime_uid runtime_gid runtime_mode
+  local service_active socket_active service_enabled socket_enabled
+  local service_unit_known=false socket_unit_known=false
+  local gateway_pid gateway_exe attempt
+  [[ $previous_gateway_snapshot_ready == true && -d $snapshot &&
+     ! -L $snapshot ]] || return 1
+  validate_gateway_restore_snapshot "$snapshot" || return 1
+  read -r service_active <"$snapshot/service-active" || return 1
+  read -r socket_active <"$snapshot/socket-active" || return 1
+  read -r service_enabled <"$snapshot/service-enabled" || return 1
+  read -r socket_enabled <"$snapshot/socket-enabled" || return 1
+
+  # Every snapshot member and state is validated before even scratch files are
+  # prepared. Every prepare must succeed before live services or paths change.
+  for index in "${!gateway_snapshot_keys[@]}"; do
+    key=${gateway_snapshot_keys[$index]}
+    path=${gateway_snapshot_paths[$index]}
+    prepare_gateway_regular_restore "$snapshot" "$key" "$path" || return 1
+  done
+  read -r state <"$snapshot/runtime-directory.state" || return 1
+  if [[ $state == present ]]; then
+    read -r runtime_uid <"$snapshot/runtime-directory.uid" || return 1
+    read -r runtime_gid <"$snapshot/runtime-directory.gid" || return 1
+    read -r runtime_mode <"$snapshot/runtime-directory.mode" || return 1
+  fi
+
+  if [[ -e /etc/systemd/system/vane-research-gateway.service ||
+        -L /etc/systemd/system/vane-research-gateway.service ]]; then
+    service_unit_known=true
+  fi
+  if [[ -e /etc/systemd/system/vane-research-gateway.socket ||
+        -L /etc/systemd/system/vane-research-gateway.socket ]]; then
+    socket_unit_known=true
+  fi
+  read -r state <"$snapshot/systemd-service.state" || return 1
+  if [[ $state == present ]]; then service_unit_known=true; fi
+  read -r state <"$snapshot/systemd-socket.state" || return 1
+  if [[ $state == present ]]; then socket_unit_known=true; fi
+
+  quiesce_gateway_unit vane-research-gateway.service || return 1
+  quiesce_gateway_unit vane-research-gateway.socket || return 1
+  if [[ $service_unit_known == true ]]; then
+    systemctl reset-failed vane-research-gateway.service || return 1
+  fi
+  if [[ $socket_unit_known == true ]]; then
+    systemctl reset-failed vane-research-gateway.socket || return 1
+  fi
 
   for index in "${!gateway_snapshot_keys[@]}"; do
     key=${gateway_snapshot_keys[$index]}
     path=${gateway_snapshot_paths[$index]}
-    commit_gateway_regular_restore "$snapshot" "$key" "$path"
+    commit_gateway_regular_restore "$snapshot" "$key" "$path" || return 1
   done
 
-  read -r state <"$snapshot/runtime-directory.state"
+  read -r state <"$snapshot/runtime-directory.state" || return 1
   if [[ $state == present ]]; then
     if [[ -e /run/vane-research-gateway ||
           -L /run/vane-research-gateway ]]; then
       [[ -d /run/vane-research-gateway &&
          ! -L /run/vane-research-gateway ]] || return 1
     else
-      mkdir -- /run/vane-research-gateway
+      mkdir -- /run/vane-research-gateway || return 1
     fi
-    chown "$runtime_uid:$runtime_gid" /run/vane-research-gateway
-    chmod "$runtime_mode" /run/vane-research-gateway
+    chown "$runtime_uid:$runtime_gid" \
+      /run/vane-research-gateway || return 1
+    chmod "$runtime_mode" /run/vane-research-gateway || return 1
   elif [[ -e /run/vane-research-gateway ||
           -L /run/vane-research-gateway ]]; then
     [[ -d /run/vane-research-gateway &&
        ! -L /run/vane-research-gateway ]] || return 1
-    rmdir -- /run/vane-research-gateway
+    rmdir -- /run/vane-research-gateway || return 1
   fi
-  systemctl daemon-reload
+  systemctl daemon-reload || return 1
   if [[ $socket_enabled == true ]]; then
-    systemctl enable vane-research-gateway.socket >/dev/null
+    systemctl enable vane-research-gateway.socket >/dev/null || return 1
   fi
   if [[ $service_enabled == true ]]; then
-    systemctl enable vane-research-gateway.service >/dev/null
+    systemctl enable vane-research-gateway.service >/dev/null || return 1
   fi
   if [[ $socket_active == true ]]; then
-    systemctl start vane-research-gateway.socket
+    systemctl start vane-research-gateway.socket || return 1
   fi
   if [[ $service_active == true ]]; then
-    systemctl start vane-research-gateway.service
-  else
+    systemctl start vane-research-gateway.service || return 1
+  fi
+  verify_gateway_systemd_snapshot "$snapshot" || return 1
+  if [[ $service_active == false ]]; then
     echo "previous quiescent research gateway contract restored" >&2
     return 0
   fi
   for attempt in {1..12}; do
     gateway_pid=$(systemctl show vane-research-gateway.service \
-      --property=MainPID --value)
+      --property=MainPID --value) || return 1
     gateway_exe=
     if [[ $gateway_pid =~ ^[1-9][0-9]*$ ]]; then
       gateway_exe=$(readlink /proc/"$gateway_pid"/exe 2>/dev/null || true)
     fi
     if [[ $gateway_exe == /opt/vane/bin/vane-research-gateway ]] &&
        gateway_functional; then
+      verify_gateway_systemd_snapshot "$snapshot" || return 1
       echo "previous research gateway contract recovery verified" >&2
       return 0
     fi
@@ -1060,7 +1223,9 @@ cleanup_remote_deploy() {
   fi
   rm -f -- /etc/systemd/system/vane.service.release-next \
     /etc/systemd/system/vane-research-gateway.service.release-next \
+    /etc/systemd/system/vane-research-gateway.service.rollback-next \
     /etc/systemd/system/vane-research-gateway.socket.release-next \
+    /etc/systemd/system/vane-research-gateway.socket.rollback-next \
     /opt/vane/bin/vane-research-gateway.release-next \
     /opt/vane/bin/vane-research-gateway.rollback-next \
     /opt/vane/vane-research-gateway.service.release-next \

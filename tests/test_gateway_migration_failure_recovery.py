@@ -66,7 +66,175 @@ def filesystem_mode(path: str) -> int:
     return int(result.stdout.strip(), 8)
 
 
+def stateful_systemctl() -> str:
+    return r'''stub_service_active=false
+stub_socket_active=false
+stub_service_enabled=false
+stub_socket_enabled=false
+fail_systemctl_action=
+suppress_start_transition=false
+unit_active() {
+  case "$1" in
+    vane-research-gateway.service) printf '%s\n' "$stub_service_active" ;;
+    vane-research-gateway.socket) printf '%s\n' "$stub_socket_active" ;;
+    *) return 1 ;;
+  esac
+}
+unit_enabled() {
+  case "$1" in
+    vane-research-gateway.service) printf '%s\n' "$stub_service_enabled" ;;
+    vane-research-gateway.socket) printf '%s\n' "$stub_socket_enabled" ;;
+    *) return 1 ;;
+  esac
+}
+set_unit_active() {
+  case "$1" in
+    vane-research-gateway.service) stub_service_active=$2 ;;
+    vane-research-gateway.socket) stub_socket_active=$2 ;;
+    *) return 1 ;;
+  esac
+}
+set_unit_enabled() {
+  case "$1" in
+    vane-research-gateway.service) stub_service_enabled=$2 ;;
+    vane-research-gateway.socket) stub_socket_enabled=$2 ;;
+    *) return 1 ;;
+  esac
+}
+systemctl() {
+  local action=$1 unit value
+  shift
+  if [[ -n $fail_systemctl_action && $action == "$fail_systemctl_action" ]]; then
+    return 70
+  fi
+  case "$action" in
+    is-active)
+      unit=${!#}
+      value=$(unit_active "$unit") || return 5
+      if [[ $value == true ]]; then printf 'active\n'; return 0; fi
+      printf 'inactive\n'; return 3
+      ;;
+    is-enabled)
+      unit=${!#}
+      value=$(unit_enabled "$unit") || return 5
+      if [[ $value == true ]]; then printf 'enabled\n'; return 0; fi
+      printf 'disabled\n'; return 1
+      ;;
+    stop)
+      for unit in "$@"; do set_unit_active "$unit" false || return 1; done
+      ;;
+    disable)
+      for unit in "$@"; do set_unit_enabled "$unit" false || return 1; done
+      ;;
+    enable)
+      for unit in "$@"; do set_unit_enabled "$unit" true || return 1; done
+      ;;
+    start)
+      if [[ $suppress_start_transition == false ]]; then
+        for unit in "$@"; do set_unit_active "$unit" true || return 1; done
+      fi
+      ;;
+    reset-failed|daemon-reload) ;;
+    show) printf '4242\n' ;;
+    *) return 1 ;;
+  esac
+  printf '%s %s\n' "$action" "$*" >>"${log:-/dev/null}"
+}
+'''
+
+
 class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
+    def run_quiescent_restore_fault(
+        self, fault: str, exit_code: int
+    ) -> tuple[subprocess.CompletedProcess[bytes], list[str], bool]:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            recovery, opt, systemd, etc_vane, _ = relocated_recovery(root)
+            stage = f"{opt}/.deploy-{SHA}-1-1"
+            rollback = f"{opt}/.rollback-vane-{SHA}-1-1"
+            paths = gateway_paths(opt, systemd, etc_vane)
+            old_files = "".join(
+                f"printf 'old-{index}\\n' >{shlex.quote(path)}\n"
+                for index, path in enumerate(paths)
+            )
+            new_files = "".join(
+                f"printf 'new-{index}\\n' >{shlex.quote(path)}\n"
+                for index, path in enumerate(paths)
+            )
+            script = (
+                "set -euo pipefail\n"
+                f"stage={shlex.quote(stage)}\n"
+                f"{recovery}\n"
+                f"{stateful_systemctl()}\n"
+                "install() { local destination=${!#}; mkdir -p \"$destination\"; chmod 0700 \"$destination\"; }\n"
+                f"mkdir -p {shlex.quote(stage)} {shlex.quote(rollback)} "
+                f"{shlex.quote(opt + '/bin')} {shlex.quote(opt + '/env')} "
+                f"{shlex.quote(systemd)} {shlex.quote(etc_vane + '/credentials')}\n"
+                f"{old_files}"
+                "previous_vane_snapshot_ready=true\n"
+                "snapshot_previous_gateway_release\n"
+                f"{new_files}"
+                f"{fault}\n"
+                "gateway_recovery_required=true\n"
+                "trap cleanup_remote_deploy EXIT\n"
+                f"exit {exit_code}\n"
+            )
+            result = subprocess.run(
+                [BASH], input=script.encode(), capture_output=True, check=False
+            )
+            live = [Path(path).read_text(encoding="utf-8").strip() for path in paths]
+            snapshot_retained = Path(rollback).is_dir()
+        return result, live, snapshot_retained
+
+    def run_active_systemctl_fault(
+        self, action: str = "", suppress_start: bool = False
+    ) -> tuple[subprocess.CompletedProcess[bytes], list[str], bool]:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            recovery, opt, systemd, etc_vane, runtime = relocated_recovery(root)
+            stage = f"{opt}/.deploy-{SHA}-1-1"
+            rollback = f"{opt}/.rollback-vane-{SHA}-1-1"
+            paths = gateway_paths(opt, systemd, etc_vane)
+            old_files = "".join(
+                f"printf 'old-{index}\\n' >{shlex.quote(path)}\n"
+                for index, path in enumerate(paths)
+            )
+            new_files = "".join(
+                f"printf 'new-{index}\\n' >{shlex.quote(path)}\n"
+                for index, path in enumerate(paths)
+            )
+            script = (
+                "set -euo pipefail\n"
+                f"stage={shlex.quote(stage)}\n"
+                f"{recovery}\n"
+                f"{stateful_systemctl()}\n"
+                "install() { local destination=${!#}; mkdir -p \"$destination\"; chmod 0700 \"$destination\"; }\n"
+                "gateway_functional() { return 0; }\n"
+                f"mkdir -p {shlex.quote(stage)} {shlex.quote(rollback)} "
+                f"{shlex.quote(opt + '/bin')} {shlex.quote(opt + '/env')} "
+                f"{shlex.quote(systemd)} {shlex.quote(etc_vane + '/credentials')} "
+                f"{shlex.quote(runtime)}\n"
+                f"{old_files}"
+                "stub_service_active=true\n"
+                "stub_socket_active=true\n"
+                "stub_service_enabled=true\n"
+                "stub_socket_enabled=true\n"
+                "previous_vane_snapshot_ready=true\n"
+                "snapshot_previous_gateway_release\n"
+                f"{new_files}"
+                f"fail_systemctl_action={shlex.quote(action)}\n"
+                f"suppress_start_transition={'true' if suppress_start else 'false'}\n"
+                "gateway_recovery_required=true\n"
+                "trap cleanup_remote_deploy EXIT\n"
+                "exit 37\n"
+            )
+            result = subprocess.run(
+                [BASH], input=script.encode(), capture_output=True, check=False
+            )
+            live = [Path(path).read_text(encoding="utf-8").strip() for path in paths]
+            snapshot_retained = Path(rollback).is_dir()
+        return result, live, snapshot_retained
+
     def test_failed_migration_does_not_touch_live_gateway_or_vane(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -137,11 +305,7 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
                 f"stage={shlex.quote(stage)}\n"
                 f"{recovery}\n"
                 f"log={shlex.quote(log)}\n"
-                "systemctl() {\n"
-                "  if [[ $1 == show ]]; then printf '4242\\n'; return 0; fi\n"
-                "  if [[ $1 == is-active || $1 == is-enabled ]]; then return 0; fi\n"
-                "  printf '%s\\n' \"$*\" >>\"$log\"\n"
-                "}\n"
+                f"{stateful_systemctl()}\n"
                 "install() { local destination=${!#}; mkdir -p \"$destination\"; chmod 0700 \"$destination\"; }\n"
                 f"readlink() {{ printf '%s\\n' {shlex.quote(opt + '/bin/vane-research-gateway')}; }}\n"
                 "gateway_functional() { return 0; }\n"
@@ -150,6 +314,10 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
                 f"{shlex.quote(opt + '/env')} {shlex.quote(systemd)} "
                 f"{shlex.quote(etc_vane + '/credentials')} {shlex.quote(runtime)}\n"
                 f"{old_files}"
+                "stub_service_active=true\n"
+                "stub_socket_active=true\n"
+                "stub_service_enabled=true\n"
+                "stub_socket_enabled=true\n"
                 "previous_vane_snapshot_ready=true\n"
                 "snapshot_previous_gateway_release\n"
                 f"{new_files}"
@@ -162,9 +330,12 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
             commands = Path(log).read_text(encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn("start vane-research-gateway.socket", commands, commands)
+        self.assertIn("start vane-research-gateway.service", commands, commands)
         self.assertLess(
             commands.index("start vane-research-gateway.socket"),
             commands.index("start vane-research-gateway.service"),
+            commands,
         )
 
     def test_fresh_absent_failure_trap_removes_every_gateway_path(self) -> None:
@@ -179,7 +350,9 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
                 f"{opt}/vane-research-gateway.service.release-next",
                 f"{opt}/vane-research-gateway.socket.release-next",
                 f"{systemd}/vane-research-gateway.service.release-next",
+                f"{systemd}/vane-research-gateway.service.rollback-next",
                 f"{systemd}/vane-research-gateway.socket.release-next",
+                f"{systemd}/vane-research-gateway.socket.rollback-next",
                 f"{opt}/env/research-gateway.env.next",
                 f"{etc_vane}/credentials/gateway_db_url.next",
                 f"{etc_vane}/credentials/research_llm_api_key_gen1.next",
@@ -192,10 +365,7 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
                 "set -euo pipefail\n"
                 f"stage={shlex.quote(stage)}\n"
                 f"{recovery}\n"
-                "systemctl() {\n"
-                "  if [[ $1 == is-active || $1 == is-enabled ]]; then return 1; fi\n"
-                "  return 0\n"
-                "}\n"
+                f"{stateful_systemctl()}\n"
                 "install() { local destination=${!#}; mkdir -p \"$destination\"; chmod 0700 \"$destination\"; }\n"
                 f"mkdir -p {shlex.quote(stage)} {shlex.quote(rollback)} "
                 f"{shlex.quote(opt + '/bin')} {shlex.quote(opt + '/env')} "
@@ -242,10 +412,7 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
                 "set -euo pipefail\n"
                 f"stage={shlex.quote(stage)}\n"
                 f"{recovery}\n"
-                "systemctl() {\n"
-                "  if [[ $1 == is-active || $1 == is-enabled ]]; then return 1; fi\n"
-                "  return 0\n"
-                "}\n"
+                f"{stateful_systemctl()}\n"
                 "install() { local destination=${!#}; mkdir -p \"$destination\"; chmod 0700 \"$destination\"; }\n"
                 f"mkdir -p {shlex.quote(stage)} {shlex.quote(rollback)} "
                 f"{shlex.quote(opt + '/bin')} {shlex.quote(opt + '/env')} "
@@ -283,6 +450,73 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
                 self.assertFalse(Path(path).exists(), path)
             self.assertTrue(Path(runtime).is_dir())
             self.assertEqual(filesystem_mode(runtime), original_runtime_mode)
+
+    def test_missing_snapshot_member_fails_before_live_mutation(self) -> None:
+        result, live, retained = self.run_quiescent_restore_fault(
+            'rm -f -- "$rollback_dir/gateway/llm-credential"', 31
+        )
+
+        self.assertEqual(result.returncode, 31, result.stderr.decode())
+        self.assertTrue(retained)
+        self.assertEqual(live, [f"new-{index}" for index in range(8)])
+        stderr = result.stderr.decode()
+        self.assertIn("snapshot is missing member: llm-credential", stderr)
+        self.assertIn("recovery failed", stderr)
+        self.assertNotIn("contract restored", stderr)
+
+    def test_prepare_copy_failure_preserves_snapshot_without_live_mutation(self) -> None:
+        result, live, retained = self.run_quiescent_restore_fault(
+            "cp() { return 71; }", 32
+        )
+
+        self.assertEqual(result.returncode, 32, result.stderr.decode())
+        self.assertTrue(retained)
+        self.assertEqual(live, [f"new-{index}" for index in range(8)])
+        stderr = result.stderr.decode()
+        self.assertIn("failed to prepare research gateway restore: binary", stderr)
+        self.assertIn("recovery failed", stderr)
+        self.assertNotIn("contract restored", stderr)
+
+    def test_commit_failure_detects_mixed_state_and_preserves_snapshot(self) -> None:
+        fault = r'''fail_mv_target=${gateway_snapshot_paths[5]}
+mv() {
+  if [[ ${!#} == "$fail_mv_target" ]]; then return 72; fi
+  command mv "$@"
+}'''
+        result, live, retained = self.run_quiescent_restore_fault(fault, 33)
+
+        self.assertEqual(result.returncode, 33, result.stderr.decode())
+        self.assertTrue(retained)
+        self.assertEqual(live[:5], [f"old-{index}" for index in range(5)])
+        self.assertEqual(live[5:], [f"new-{index}" for index in range(5, 8)])
+        stderr = result.stderr.decode()
+        self.assertIn("failed to commit research gateway restore: environment", stderr)
+        self.assertIn("recovery failed", stderr)
+        self.assertNotIn("contract restored", stderr)
+
+    def test_systemctl_failures_are_not_swallowed(self) -> None:
+        for action in ("stop", "disable", "reset-failed"):
+            with self.subTest(action=action):
+                result, live, retained = self.run_active_systemctl_fault(action)
+                self.assertEqual(result.returncode, 37, result.stderr.decode())
+                self.assertTrue(retained)
+                self.assertEqual(live, [f"new-{index}" for index in range(8)])
+                stderr = result.stderr.decode()
+                self.assertIn("recovery failed", stderr)
+                self.assertNotIn("contract recovery verified", stderr)
+
+    def test_final_systemd_state_mismatch_fails_and_preserves_snapshot(self) -> None:
+        result, live, retained = self.run_active_systemctl_fault(
+            suppress_start=True
+        )
+
+        self.assertEqual(result.returncode, 37, result.stderr.decode())
+        self.assertTrue(retained)
+        self.assertEqual(live, [f"old-{index}" for index in range(8)])
+        stderr = result.stderr.decode()
+        self.assertIn("active state did not converge", stderr)
+        self.assertIn("recovery failed", stderr)
+        self.assertNotIn("contract recovery verified", stderr)
 
     def test_recovery_is_armed_before_live_gateway_configuration_mutation(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")
