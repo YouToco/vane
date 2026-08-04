@@ -38,6 +38,8 @@ func TestMigration116KeepsRecoveryDiscoveryNarrowAndShadowOnly(t *testing.T) {
 		"head.prepared_schedule_status=schedule.status",
 		"tenant.status='active' AND tenant.deleted_at IS NULL",
 		"membership.role='owner'",
+		"DISABLE TRIGGER protect_research_v3_cutover_operation",
+		"ENABLE TRIGGER protect_research_v3_cutover_operation",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("migration 116 is missing %q", required)
@@ -53,6 +55,68 @@ func TestMigration116KeepsRecoveryDiscoveryNarrowAndShadowOnly(t *testing.T) {
 		if strings.Contains(source, forbidden) {
 			t.Fatalf("migration 116 exposes forbidden authority %q", forbidden)
 		}
+	}
+}
+
+func TestMigration116BackfillsHistoricalCutoverJournalPostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	database, provider := newMigration116ScratchProvider(t, databaseURL)
+	if _, err := provider.UpTo(t.Context(), 115); err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", 64)
+	if _, err := database.ExecContext(t.Context(), `
+		INSERT INTO research_v3_delivery_authorities (
+		 tenant_id,user_id,task_id,generation,definition_version,
+		 definition_digest,target_action_digest,action_authorization_digest,status
+		) VALUES (1,1,'historical-task',1,1,$1,$1,$1,'staged')`, digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		INSERT INTO research_v3_cutover_operations (
+		 tenant_id,user_id,task_id,idempotency_key,generation,
+		 definition_version,definition_digest,frozen_schedule,
+		 frozen_schedule_digest,frozen_conflict_token,conflict_token_digest,
+		 target_action,target_action_digest,action_authorization_digest,
+		 original_paused,phase,original_execution_mode,source_baseline_digest
+		) VALUES (
+		 1,1,'historical-task','historical-terminal',1,1,$1,decode('01','hex'),$1,
+		 decode('02','hex'),$1,decode('03','hex'),$1,$1,false,'prepared','compiled',$1
+		)`, digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 116); err != nil {
+		t.Fatalf("upgrade schema 115 with historical journal: %v", err)
+	}
+	var phase, originalStatus, preflightDigest string
+	if err := database.QueryRowContext(t.Context(), `
+		SELECT phase,original_schedule_status,preflight_digest
+		  FROM research_v3_cutover_operations
+		 WHERE task_id='historical-task'`,
+	).Scan(&phase, &originalStatus, &preflightDigest); err != nil {
+		t.Fatal(err)
+	}
+	if phase != "prepared" || originalStatus != "active" ||
+		len(preflightDigest) != 64 {
+		t.Fatalf("backfill phase=%q original_status=%q digest=%q",
+			phase, originalStatus, preflightDigest)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		UPDATE research_v3_cutover_operations
+		   SET preflight_digest=$1,phase='pause_requested'
+		 WHERE task_id='historical-task'`, strings.Repeat("b", 64)); err == nil ||
+		!strings.Contains(err.Error(), "immutable V3 cutover preflight changed") {
+		t.Fatalf("migration 116 immutability trigger was not restored: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		UPDATE research_v3_cutover_operations
+		   SET phase='prepared'
+		 WHERE task_id='historical-task'`); err == nil ||
+		!strings.Contains(err.Error(), "illegal V3 cutover phase transition") {
+		t.Fatalf("migration 102 transition trigger was not restored: %v", err)
 	}
 }
 

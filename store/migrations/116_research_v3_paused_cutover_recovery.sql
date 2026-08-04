@@ -13,10 +13,21 @@ ALTER TABLE research_v3_cutover_operations
     ADD CONSTRAINT ck_research_v3_cutover_preflight_digest
         CHECK (preflight_digest IS NULL OR preflight_digest ~ '^[0-9a-f]{64}$');
 
+-- Migration 102's immutable phase trigger intentionally rejects same-phase
+-- UPDATEs. Migration 116 must nevertheless bind its newly added evidence to
+-- pre-existing journals. The ALTER statements above retain an
+-- ACCESS EXCLUSIVE lock until this transactional migration commits, so no
+-- concurrent cutover write can pass while only this named trigger is disabled.
+ALTER TABLE research_v3_cutover_operations
+    DISABLE TRIGGER protect_research_v3_cutover_operation;
+
 UPDATE research_v3_cutover_operations
    SET preflight_digest=encode(sha256(convert_to(
        'vane/research-v3-cutover/legacy/'||id::text,'UTF8')),'hex')
  WHERE preflight_digest IS NULL;
+
+ALTER TABLE research_v3_cutover_operations
+    ENABLE TRIGGER protect_research_v3_cutover_operation;
 
 ALTER TABLE research_v3_cutover_operations
     ALTER COLUMN preflight_digest SET NOT NULL;
