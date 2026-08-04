@@ -66,6 +66,16 @@ func newResearchBriefFixtureWithStoreAndWorkflowV3(
 	t *testing.T, st *Store, threshold taskstate.NotificationThresholdV3,
 	completeEvidence bool, evidenceResult []byte, authorityToken, workflowID string,
 ) researchBriefFixtureV3 {
+	return newResearchBriefFixtureWithStoreWorkflowAndModelV3(
+		t, st, threshold, completeEvidence, evidenceResult, authorityToken,
+		workflowID, testResearchModelPolicyStoreV3(t))
+}
+
+func newResearchBriefFixtureWithStoreWorkflowAndModelV3(
+	t *testing.T, st *Store, threshold taskstate.NotificationThresholdV3,
+	completeEvidence bool, evidenceResult []byte, authorityToken, workflowID string,
+	modelPolicy runtimepolicy.ResearchModelPolicyV3,
+) researchBriefFixtureV3 {
 	t.Helper()
 	useOwnerResearchRuntimeForTest(st)
 	ctx := t.Context()
@@ -198,7 +208,7 @@ func newResearchBriefFixtureWithStoreAndWorkflowV3(
 	researchTools := researchBriefToolPolicyV3(t)
 	snapshotRef, err := st.CreateOrGetResearchRunSnapshotWithAuthorityV3(
 		ctx, identity, testCompiledRunPolicyV1(t), researchTools,
-		testResearchModelPolicyStoreV3(t), authorityToken)
+		modelPolicy, authorityToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -808,6 +818,22 @@ func TestResearchBriefCoverageV31AllowsGroundedOfficialEvidenceDespiteRedundantF
 	grounded.Citations[0].Ref = "8"
 	if err := validateResearchBriefCoverageV31(grounded, manifest); err == nil {
 		t.Fatal("external-only grounded partial-coverage Brief passed")
+	}
+	manifest, err = json.Marshal(researchEvidenceManifestV3{
+		SchemaVersion: researchEvidenceManifestSchemaV31,
+		Items: []researchEvidenceManifestItemV3{{
+			EvidenceID: 7, ToolName: "web_search", TrustType: "official",
+		}},
+		ToolFailures: []researchToolFailureContextV31{{
+			Ordinal: 1, ToolName: "web_contents", Phase: string(ResearchRunStepFailedV3),
+		}},
+	})
+	grounded.Citations[0].Ref = "7"
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateResearchBriefCoverageV31(grounded, manifest); err == nil {
+		t.Fatal("non-official Tool forged an official trust label")
 	}
 }
 

@@ -7,7 +7,15 @@
 
 -- +goose Up
 
-LOCK TABLE research_brief_syntheses IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE task_run_snapshots,research_run_evidence,research_brief_syntheses
+    IN ACCESS EXCLUSIVE MODE;
+
+ALTER TABLE research_run_evidence
+    ADD CONSTRAINT ck_research_run_evidence_official_tool_v112 CHECK (
+        (trust_type='official')=(tool_name='web_product_status')
+    ) NOT VALID;
+ALTER TABLE research_run_evidence
+    VALIDATE CONSTRAINT ck_research_run_evidence_official_tool_v112;
 
 DROP TRIGGER research_brief_synthesis_admission_v31
     ON research_brief_syntheses;
@@ -117,6 +125,7 @@ BEGIN
                ON citation->>'kind'='current_evidence'
               AND citation->>'ref'=item->>'evidence_id'
             WHERE item->>'trust_type'='official'
+              AND item->>'tool_name'='web_product_status'
        ) THEN
         RAISE EXCEPTION '112: grounded partial Brief must cite official Evidence and stay quiet';
     END IF;
@@ -141,17 +150,25 @@ EXECUTE FUNCTION enforce_research_brief_grounded_partial_v32();
 
 -- +goose Down
 
+LOCK TABLE task_run_snapshots,research_run_evidence,research_brief_syntheses
+    IN ACCESS EXCLUSIVE MODE;
+
 -- +goose StatementBegin
 DO $$
 BEGIN
     IF EXISTS (
+        SELECT 1 FROM task_run_snapshots
+         WHERE convert_from(payload,'UTF8')::jsonb
+                   #>>'{research_model,synthesis,renderer_version}'=
+               'research-synthesis.render/v3.2'
+    ) OR EXISTS (
         SELECT 1 FROM research_brief_syntheses
          WHERE status='finalized' AND
                convert_from(brief_payload,'UTF8')::jsonb->>'schema_version'=
                    'vane.research-brief/v3.2'
     ) THEN
         RAISE EXCEPTION
-            '112: grounded partial-coverage Brief evidence exists; restore from backup';
+            '112: v3.2 research artifacts exist; restore from backup';
     END IF;
 END
 $$;
@@ -160,6 +177,9 @@ $$;
 DROP TRIGGER research_brief_synthesis_grounded_partial_v32
     ON research_brief_syntheses;
 DROP FUNCTION enforce_research_brief_grounded_partial_v32();
+
+ALTER TABLE research_run_evidence
+    DROP CONSTRAINT ck_research_run_evidence_official_tool_v112;
 
 DROP TRIGGER research_brief_synthesis_admission_v31
     ON research_brief_syntheses;

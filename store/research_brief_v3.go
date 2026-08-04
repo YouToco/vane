@@ -1136,7 +1136,7 @@ func validateResearchBriefCoverageV31(
 	}
 	officialRefs := make(map[string]struct{}, len(evidence.Items))
 	for _, item := range evidence.Items {
-		if item.TrustType == "official" {
+		if item.TrustType == "official" && item.ToolName == "web_product_status" {
 			officialRefs[strconv.FormatInt(item.EvidenceID, 10)] = struct{}{}
 		}
 	}
