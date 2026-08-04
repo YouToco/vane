@@ -626,6 +626,13 @@ func decodeResearchBriefCompletionV3(
 			return types.ResearchBriefPayloadV3{}, nil,
 				researchCoordinatorValidationV3("research Brief model output is invalid")
 		}
+		if rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV32 {
+			normalized, err = normalizeNumericCurrentEvidenceRefsV32(normalized)
+			if err != nil {
+				return types.ResearchBriefPayloadV3{}, nil,
+					researchCoordinatorValidationV3("research Brief model output is invalid")
+			}
+		}
 		var payload types.ResearchBriefPayloadV3
 		if err := strictjson.DecodeExact(normalized, &payload); err != nil {
 			return types.ResearchBriefPayloadV3{}, nil,
@@ -649,6 +656,65 @@ func decodeResearchBriefCompletionV3(
 		return types.ResearchBriefPayloadV3{}, nil,
 			researchCoordinatorValidationV3("research synthesis renderer is unavailable")
 	}
+}
+
+type researchBriefCompletionWireV32 struct {
+	SchemaVersion string                            `json:"schema_version"`
+	Assessment    types.ResearchBriefAssessmentV31  `json:"assessment,omitempty"`
+	Headline      string                            `json:"headline"`
+	Summary       string                            `json:"summary"`
+	Significance  types.ResearchBriefSignificanceV3 `json:"significance"`
+	Citations     []researchBriefCitationWireV32    `json:"citations"`
+}
+
+type researchBriefCitationWireV32 struct {
+	Kind types.ResearchBriefCitationKindV3 `json:"kind"`
+	Ref  json.RawMessage                   `json:"ref"`
+}
+
+// normalizeNumericCurrentEvidenceRefsV32 repairs one representation-only
+// provider defect observed in production: decimal Evidence ids emitted as JSON
+// numbers instead of strings. Only positive, base-10 current_evidence refs are
+// eligible. History refs remain opaque, and every repaired ref must still pass
+// the unchanged payload and frozen-manifest validation before finalization.
+func normalizeNumericCurrentEvidenceRefsV32(raw []byte) ([]byte, error) {
+	var wire researchBriefCompletionWireV32
+	if err := strictjson.DecodeExact(raw, &wire); err != nil {
+		return nil, err
+	}
+	changed := false
+	for i := range wire.Citations {
+		citation := &wire.Citations[i]
+		if citation.Kind != types.ResearchBriefCitationCurrentEvidenceV3 {
+			continue
+		}
+		ref := bytes.TrimSpace(citation.Ref)
+		if !isPositiveDecimalEvidenceRefV32(ref) {
+			continue
+		}
+		quoted, err := json.Marshal(string(ref))
+		if err != nil {
+			return nil, err
+		}
+		citation.Ref = quoted
+		changed = true
+	}
+	if !changed {
+		return raw, nil
+	}
+	return json.Marshal(wire)
+}
+
+func isPositiveDecimalEvidenceRefV32(ref []byte) bool {
+	if len(ref) == 0 || len(ref) > 255 || ref[0] < '1' || ref[0] > '9' {
+		return false
+	}
+	for _, value := range ref[1:] {
+		if value < '0' || value > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeResearchBriefCompletionV31 accepts the one representation defect

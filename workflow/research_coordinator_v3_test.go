@@ -531,6 +531,33 @@ func TestDecodeResearchBriefCompletionV3CanonicalizesOnlyCurrentRenderer(t *test
 		grounded, runtimepolicy.ResearchSynthesisRendererVersionV31); err == nil {
 		t.Fatal("retained v3.1 renderer accepted a v3.2 grounded completion")
 	}
+	numericRef := []byte(`{"schema_version":"vane.research-brief/v3.2","assessment":"grounded","headline":"Kimi remains reservation-only","summary":"The completed official status directly reports the current purchase state.","significance":"none","citations":[{"kind":"current_evidence","ref":7}]}`)
+	payload, gotCanonical, err = decodeResearchBriefCompletionV3(
+		numericRef, runtimepolicy.ResearchSynthesisRendererVersionV32)
+	if err != nil || payload.Citations[0].Ref != "7" ||
+		!reflect.DeepEqual(gotCanonical, grounded) {
+		t.Fatalf("numeric current Evidence ref payload=%+v canonical=%s err=%v",
+			payload, gotCanonical, err)
+	}
+	if _, _, err := decodeResearchBriefCompletionV3(
+		numericRef, runtimepolicy.ResearchSynthesisRendererVersionV31); err == nil {
+		t.Fatal("retained v3.1 renderer repaired a numeric Evidence ref")
+	}
+	for name, ref := range map[string]string{
+		"history number": `{"kind":"history","ref":7}`,
+		"zero":           `{"kind":"current_evidence","ref":0}`,
+		"negative":       `{"kind":"current_evidence","ref":-7}`,
+		"decimal":        `{"kind":"current_evidence","ref":7.0}`,
+		"exponent":       `{"kind":"current_evidence","ref":7e0}`,
+	} {
+		t.Run("numeric ref "+name, func(t *testing.T) {
+			raw := []byte(`{"schema_version":"vane.research-brief/v3.2","assessment":"grounded","headline":"Kimi remains reservation-only","summary":"The completed official status directly reports the current purchase state.","significance":"none","citations":[` + ref + `]}`)
+			if _, _, err := decodeResearchBriefCompletionV3(
+				raw, runtimepolicy.ResearchSynthesisRendererVersionV32); err == nil {
+				t.Fatal("unsafe numeric citation representation was accepted")
+			}
+		})
+	}
 	for name, raw := range map[string][]byte{
 		"markdown prose": []byte("result:\n```json\n" + string(canonical) + "\n```"),
 		"markdown suffix": []byte("```json\n" + string(canonical) +
