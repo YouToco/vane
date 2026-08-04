@@ -2,8 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testing.T) {
@@ -242,4 +248,146 @@ func TestMigration114FeedbackIntelligenceIsolationAndSemanticsPostgres(t *testin
 		t.Fatalf("feedback reader capability table=%v body_md=%v card_json=%v policies=%v",
 			tableSelect, bodyMDSelect, cardJSONSelect, policyCount)
 	}
+
+	assertReaderCount := func(
+		name, tenantSetting, userSetting, query string, want int,
+	) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			tx, err := db.BeginTx(t.Context(), &sql.TxOptions{ReadOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback() }()
+			if _, err := tx.ExecContext(t.Context(), `
+				SELECT set_config('app.tenant_id',$1,true),
+				       set_config('app.user_id',$2,true)`,
+				tenantSetting, userSetting,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(t.Context(),
+				`SET LOCAL ROLE vane_intelligence_reader`); err != nil {
+				t.Fatal(err)
+			}
+			var got int
+			if err := tx.QueryRowContext(t.Context(), query).Scan(&got); err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("reader count=%d, want %d", got, want)
+			}
+		})
+	}
+	assertReaderCount("exact authenticated user", "1", strconv.FormatInt(userA, 10),
+		`SELECT count(*) FROM feedbacks`, 4)
+	assertReaderCount("same tenant other user hidden", "1", strconv.FormatInt(userA, 10),
+		`SELECT count(*) FROM feedbacks WHERE user_id<>`+strconv.FormatInt(userA, 10), 0)
+	assertReaderCount("other tenant hidden", "1", strconv.FormatInt(userA, 10),
+		`SELECT count(*) FROM feedbacks WHERE tenant_id<>1`, 0)
+	assertReaderCount("cross tenant guc pair fails closed", "1",
+		strconv.FormatInt(userOtherTenant, 10), `SELECT count(*) FROM feedbacks`, 0)
+	assertReaderCount("missing gucs fail closed", "", "",
+		`SELECT count(*) FROM feedbacks`, 0)
+	assertReaderCount("joined delivery is exact user", "1", strconv.FormatInt(userA, 10),
+		`SELECT count(*) FROM deliveries`, 2)
+
+	t.Run("ungranted delivery card is denied", func(t *testing.T) {
+		tx, err := db.BeginTx(t.Context(), &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.ExecContext(t.Context(), `
+			SELECT set_config('app.tenant_id',$1,true),
+			       set_config('app.user_id',$2,true)`,
+			"1", strconv.FormatInt(userA, 10),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(t.Context(),
+			`SET LOCAL ROLE vane_intelligence_reader`); err != nil {
+			t.Fatal(err)
+		}
+		var card []byte
+		err = tx.QueryRowContext(t.Context(),
+			`SELECT card_json FROM deliveries LIMIT 1`).Scan(&card)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Fatalf("card_json read err=%v, want SQLSTATE 42501", err)
+		}
+	})
+}
+
+func TestMigration114DowngradePreservesFeedbackAudit(t *testing.T) {
+	_, db, provider := openMigration066Database(
+		t, "vane_feedback_intelligence_down_114",
+	)
+	if _, err := provider.UpTo(t.Context(), 114); err != nil {
+		t.Fatal(err)
+	}
+
+	assertState := func(wantVersion, wantPolicies int64, wantCapability, wantFeedbackConstraint bool) {
+		t.Helper()
+		var version, policies int64
+		var bodyMDSelect, cardJSONSelect, feedbackConstraint bool
+		if err := db.QueryRowContext(t.Context(), `
+			SELECT
+			  (SELECT max(version_id) FROM goose_db_version WHERE is_applied),
+			  (SELECT count(*) FROM pg_policies
+			    WHERE policyname='intelligence_feedback_identity'),
+			  has_column_privilege(
+			    'vane_intelligence_reader','deliveries','body_md','SELECT'),
+			  has_column_privilege(
+			    'vane_intelligence_reader','deliveries','card_json','SELECT'),
+			  (SELECT position('feedbacks' in pg_get_constraintdef(oid))>0
+			     FROM pg_constraint
+			    WHERE conname='ck_agent_intelligence_query_dataset')`,
+		).Scan(&version, &policies, &bodyMDSelect, &cardJSONSelect,
+			&feedbackConstraint); err != nil {
+			t.Fatal(err)
+		}
+		if version != wantVersion || policies != wantPolicies ||
+			bodyMDSelect != wantCapability || cardJSONSelect ||
+			feedbackConstraint != wantFeedbackConstraint {
+			t.Fatalf("migration state version=%d policies=%d body_md=%v card_json=%v constraint=%v",
+				version, policies, bodyMDSelect, cardJSONSelect, feedbackConstraint)
+		}
+	}
+
+	if _, err := provider.DownTo(t.Context(), 113); err != nil {
+		t.Fatalf("clean migration 114 Down: %v", err)
+	}
+	assertState(113, 0, false, false)
+
+	if _, err := provider.UpTo(t.Context(), 114); err != nil {
+		t.Fatal(err)
+	}
+	var userID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users(feishu_open_id,name)
+		VALUES('feedback-down-guard-114','feedback-down-guard-114')
+		RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role) VALUES(1,$1,'owner')`,
+		userID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO agent_intelligence_query_audits(
+		    tenant_id,user_id,dataset,query_digest,query_summary,status
+		) VALUES(1,$1,'feedbacks',repeat('a',64),'{}','completed')`, userID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(t.Context(), 113); err == nil ||
+		!strings.Contains(err.Error(),
+			"refusing downgrade while feedback intelligence audits exist") {
+		t.Fatalf("guarded migration 114 Down err=%v", err)
+	}
+	assertState(114, 5, true, true)
 }
