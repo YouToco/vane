@@ -7,89 +7,65 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
-	"sort"
 	"testing"
 )
 
-// Activity 注册完整性守卫。
-//
-// 为什么需要这么一个怪测试：Temporal 的 Activity 注册是**运行时按名查表**，
-// 漏注册一个 Activity 编译器抓不到、go vet 抓不到、单测也抓不到（testsuite 的
-// TestActivityEnvironment 各测各的，不看生产装配）。它只在**线上**表现为
-// ActivityNotRegisteredError，而本 pipeline 恰好又刻意吞掉记账类活动的错误
-// （无内容可推必须仍是正常终态），于是漏注册的净效果是：
-// 功能完全不工作，日志只有一行 Warn，Temporal 显示 Completed，测试全绿。
-//
-// 这不是假设。009 加 RecordEmptyBatch 时就是这么漏的——整个"空批次可见化"
-// 在生产上是死代码，库里依旧零行，与没做这个功能逐字一致，由合并前的怀疑者
-// 审查抓出。契约 §13 早已写明这个失效模式（"漏注册=每批推送静默拖慢数分钟——
-// 必须显式列出"），也没能挡住它：光靠"记得写"是挡不住的，得让它响。
-//
-// 手法沿用 probe/literals_test.go 的先例：跨包的字面量耦合编译器管不着时，
-// 就直接读源码比对。丑，但它咬得住——而"咬得住"是这里唯一重要的性质。
-//
-// 为什么不干脆改成 w.RegisterActivity(activities)（注册整个结构体，天然免疫）：
-// 契约 §13 明确裁定"main 是逐个注册…必须显式列出"（审查一致性 MEDIUM）。
-// 本测试在不推翻那个裁定的前提下补上它缺的那半边——契约要的是"显式"，
-// 而显式的代价就是会漏，那就让漏这件事变红。
+// Production registration is an admission boundary, not a reflection of every
+// historical method that remains compilable for replay. The live worker must
+// expose the complete V3 activity set and no retired V1/V2 activity.
 
 // activityRegisterRe 抓 main.go 里的 w.RegisterActivity(activities.Xxx)。
 var activityRegisterRe = regexp.MustCompile(`w\.RegisterActivity\(activities\.(\w+)\)`)
+var workflowRegisterRe = regexp.MustCompile(`w\.RegisterWorkflow\(workflow\.(\w+)\)`)
+
+var productionResearchActivitiesV3 = map[string]bool{
+	"PrepareResearchRunV3":      true,
+	"PlanResearchRunV3":         true,
+	"ExecuteResearchStepV3":     true,
+	"SynthesizeResearchBriefV3": true,
+	"DeliverResearchBriefV3":    true,
+}
 
 // nonActivityMethods 是 *Activities 上**不是** Temporal Activity 的导出方法。
 // 目前为空——若将来给 Activities 加了导出的辅助方法（非 Activity），登记在这里，
 // 并写清为什么它不该被注册。留空且有注释，比没有这个口子更诚实。
 var nonActivityMethods = map[string]bool{}
 
-func TestEveryActivityIsRegisteredInMain(t *testing.T) {
-	// 反射拿 *Activities 的全部导出方法 = 应当被注册的全集。
-	var want []string
-	rt := reflect.TypeOf(&Activities{})
-	for i := 0; i < rt.NumMethod(); i++ {
-		name := rt.Method(i).Name
-		if nonActivityMethods[name] {
-			continue
-		}
-		want = append(want, name)
-	}
-	sort.Strings(want)
-	if len(want) == 0 {
-		t.Fatal("反射没拿到任何 Activity 方法——测试本身坏了，不是代码对了")
-	}
-
+func TestProductionWorkerRegistersOnlyResearchActivitiesV3(t *testing.T) {
 	src := readMainSource(t)
-	var got []string
+	got := map[string]bool{}
 	for _, m := range activityRegisterRe.FindAllStringSubmatch(src, -1) {
-		got = append(got, m[1])
+		got[m[1]] = true
 	}
-	sort.Strings(got)
 	if len(got) == 0 {
 		t.Fatal("没能从 cmd/server/main.go 解析出任何 RegisterActivity 调用——" +
 			"要么装配方式变了（那本测试得跟着改），要么正则失效了。别忽略这条。")
 	}
-
-	wantSet := map[string]bool{}
-	for _, n := range want {
-		wantSet[n] = true
-	}
-	gotSet := map[string]bool{}
-	for _, n := range got {
-		gotSet[n] = true
-	}
-
-	for _, n := range want {
-		if !gotSet[n] {
-			t.Errorf("Activity %s 没有在 cmd/server/main.go 注册。"+
-				"后果不是启动失败，是线上**静默不工作**——Temporal 按名查表找不到它，"+
-				"而 workflow 侧对记账类活动是吞错只 Warn 的。补一行 "+
-				"w.RegisterActivity(activities.%s)。", n, n)
+	for name := range productionResearchActivitiesV3 {
+		if !got[name] {
+			t.Errorf("current V3 Activity %s is not registered", name)
 		}
 	}
-	for _, n := range got {
-		if !wantSet[n] {
-			t.Errorf("cmd/server/main.go 注册了 activities.%s，但 *Activities 上没有这个"+
-				"导出方法——清单已过期（方法被删/改名了？）", n)
+	for name := range got {
+		if !productionResearchActivitiesV3[name] {
+			t.Errorf("retired non-V3 Activity %s is still registered", name)
 		}
+	}
+}
+
+func TestRetiredPushWorkflowIsNotRegisteredInProduction(t *testing.T) {
+	src := readMainSource(t)
+	got := map[string]bool{}
+	for _, m := range workflowRegisterRe.FindAllStringSubmatch(src, -1) {
+		got[m[1]] = true
+	}
+	for _, name := range []string{"ResearchShadowWorkflowV3", "ResearchScheduledWorkflowV3"} {
+		if !got[name] {
+			t.Errorf("current V3 Workflow %s is not registered", name)
+		}
+	}
+	if got["PushPipelineWorkflow"] {
+		t.Error("retired PushPipelineWorkflow remains registered in production")
 	}
 }
 

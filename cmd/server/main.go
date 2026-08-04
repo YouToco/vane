@@ -438,60 +438,18 @@ func run() error {
 	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。显式 stop timeout
 	// 保证 Stop 不会采用 SDK 的 0 秒默认值、在 Activity 仍收尾时就释放 DB/Temporal。
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, temporalWorkerOptions())
-	w.RegisterWorkflow(workflow.PushPipelineWorkflow)
 	w.RegisterWorkflow(workflow.ResearchShadowWorkflowV3)
 	w.RegisterWorkflow(workflow.ResearchScheduledWorkflowV3)
 	w.RegisterWorkflow(periodicbrief.WorkflowV1)
-	// 逐个注册（非整体 Register）：漏注册不会启动失败，而是每批推送在该活动上
-	// 重试到超时——EvolveProfile 的错误被 workflow 刻意吞掉，漏注册只会表现为
-	// 推送莫名变慢（M5 契约 §13 明示）。
-	//
-	// 这份清单漏一个的后果在 009 上真实发生过：RecordEmptyBatch 加进 workflow 却
-	// 忘了加进这里，全套测试与 go build 照样绿（Temporal 按名查表是运行时行为），
-	// 而线上五处闸门的记账**全部静默失败**——整个"空批次可见化"沦为死代码，
-	// 库里依旧零行，与没做这个功能逐字一致。由怀疑者审查在合并前抓出。
-	// 现已由 workflow/registration_test.go 钉死：它反射 *Activities 的全部
-	// Activity 方法并逐字比对本清单，漏一个 CI 就红。**新增 Activity 时改这里即可，
-	// 那个测试会告诉你漏没漏。**
-	w.RegisterActivity(activities.AuthorizeRun)
-	w.RegisterActivity(activities.PrepareRun)
-	w.RegisterActivity(activities.PrepareToolRunV2)
-	w.RegisterActivity(activities.ExecuteToolInvocationV2)
-	w.RegisterActivity(activities.CollectToolRunContentV2)
-	w.RegisterActivity(activities.DedupToolCandidatesV2)
-	w.RegisterActivity(activities.QualifyToolCandidatesV2)
-	w.RegisterActivity(activities.ScoreToolCandidatesV2)
-	w.RegisterActivity(activities.SelectToolCandidatesV2)
-	w.RegisterActivity(activities.CardGenToolCandidatesV2)
-	w.RegisterActivity(activities.PushToolCardsV2)
-	w.RegisterActivity(activities.RecordEmptyToolRunV2)
+	// Only V3 research activities remain registered in the production worker.
+	// V1/V2 implementations stay in source solely for retained-history replay and
+	// decoding; after the retention gate they must not be executable by a live
+	// worker. workflow/registration_test.go pins both sides of this inventory.
 	w.RegisterActivity(activities.PrepareResearchRunV3)
 	w.RegisterActivity(activities.PlanResearchRunV3)
 	w.RegisterActivity(activities.ExecuteResearchStepV3)
 	w.RegisterActivity(activities.SynthesizeResearchBriefV3)
 	w.RegisterActivity(activities.DeliverResearchBriefV3)
-	w.RegisterActivity(activities.BeginRunOutcomeV1)
-	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
-	w.RegisterActivity(activities.BeginToolRunOutcomeV2)
-	w.RegisterActivity(activities.FinalizeToolRunOutcomeV2)
-	w.RegisterActivity(activities.PrepareCanonicalBriefV1)
-	w.RegisterActivity(activities.SynthesizeExecutiveBriefV1)
-	w.RegisterActivity(activities.FreezeExecutiveBriefV1)
-	w.RegisterActivity(activities.EvolveProfile)
-	w.RegisterActivity(activities.Fetch)
-	w.RegisterActivity(activities.FetchOutcomeV1)
-	w.RegisterActivity(activities.Dedup)
-	w.RegisterActivity(activities.QualifyEvents)
-	w.RegisterActivity(activities.Score)
-	w.RegisterActivity(activities.ScoreOutcomeV1)
-	w.RegisterActivity(activities.Select)
-	w.RegisterActivity(activities.CardGen)
-	w.RegisterActivity(activities.CardGenOutcomeV1)
-	w.RegisterActivity(activities.CardGenOutcomeV2)
-	w.RegisterActivity(activities.CardGenOutcomeV3)
-	w.RegisterActivity(activities.RecordEmptyBatch)
-	w.RegisterActivity(activities.NotifyEmptyResult)
-	w.RegisterActivity(activities.Push)
 	w.RegisterActivity(periodicActivities.SynthesizePeriodicBriefV1)
 	w.RegisterActivity(periodicActivities.DeliverPeriodicBriefV1)
 
