@@ -2,6 +2,9 @@ package store
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -40,8 +43,8 @@ func TestCompileIntelligenceQueryUsesFixedCatalogAndBoundValues(t *testing.T) {
 	}
 }
 
-func TestFeedbackIntelligenceCatalogV2UsesCanonicalScopedProjection(t *testing.T) {
-	if IntelligenceCatalogVersion != "vane.intelligence-catalog/v2" {
+func TestFeedbackIntelligenceCatalogV3UsesCanonicalScopedProjection(t *testing.T) {
+	if IntelligenceCatalogVersion != "vane.intelligence-catalog/v3" {
 		t.Fatalf("catalog version=%q", IntelligenceCatalogVersion)
 	}
 	spec, ok := intelligenceCatalog[IntelligenceFeedbacks]
@@ -106,6 +109,73 @@ func TestFeedbackIntelligenceCatalogV2UsesCanonicalScopedProjection(t *testing.T
 	}
 }
 
+func TestIntelligenceCatalogV3UnifiesNativeResearchArtifacts(t *testing.T) {
+	for dataset, required := range map[IntelligenceDataset][]string{
+		IntelligenceRuns: {
+			"LEFT JOIN research_brief_syntheses rb", "rb.run_snapshot_id=rs.id",
+			"'research_v3'", "runtime_generation",
+		},
+		IntelligenceObservations: {
+			"FROM task_run_content_provenance p", "UNION ALL",
+			"FROM research_run_evidence e", "JOIN research_run_plans rp",
+			"rp.id=e.plan_id", "rp.tenant_id=e.tenant_id", "rp.user_id=e.user_id",
+			"rp.task_id=e.task_id", "rp.temporal_run_id=e.temporal_run_id",
+			"rp.plan_digest=e.plan_digest", "substring(payload_text FROM chunk_index*8192+1 FOR 8192)",
+			"generate_series", "payload_coverage", "payload_offset",
+			"payload_total_chars", "payload_complete", "source_truncated", "evidence_coverage",
+		},
+		IntelligenceBriefs: {
+			"FROM brief_snapshots b", "UNION ALL",
+			"FROM research_brief_syntheses rb", "LEFT JOIN research_brief_deliveries rd",
+			"rd.brief_id=rb.id", "rd.tenant_id=rb.tenant_id", "rd.user_id=rb.user_id",
+			"rd.task_id=rb.task_id", "rd.run_snapshot_id=rb.run_snapshot_id",
+			"rd.plan_id=rb.plan_id", "rb.status IN ('finalized','ambiguous','failed')",
+			"truth_coverage", "payload_coverage", "octet_length(b.payload)",
+			"octet_length(rb.brief_payload)",
+		},
+	} {
+		spec := intelligenceCatalog[dataset]
+		compiled, err := (&Store{}).compileIntelligenceQuery(
+			t.Context(), nil, IntelligenceScope{TenantID: 7, UserID: 9, TaskID: "task-kimi"},
+			IntelligenceQuery{Dataset: dataset}, spec,
+		)
+		if err != nil {
+			t.Fatalf("compile %s: %v", dataset, err)
+		}
+		for _, fragment := range required {
+			if !strings.Contains(compiled.sql, fragment) {
+				t.Fatalf("%s projection is missing %q:\n%s", dataset, fragment, compiled.sql)
+			}
+		}
+		for _, identity := range []string{"tenant_id=$1", "user_id=$2", "task_ref=$3"} {
+			if !strings.Contains(compiled.sql, identity) {
+				t.Fatalf("%s projection is missing %s", dataset, identity)
+			}
+		}
+	}
+
+	observations := intelligenceCatalog[IntelligenceObservations]
+	for _, field := range []string{
+		"lineage", "model_visible_result", "stored_size", "original_size",
+		"source_truncated", "payload_coverage", "evidence_coverage", "trust_type",
+		"payload_offset", "payload_total_chars", "payload_complete",
+	} {
+		if _, ok := observations.columns[field]; !ok {
+			t.Fatalf("observations catalog omitted %q", field)
+		}
+	}
+	briefs := intelligenceCatalog[IntelligenceBriefs]
+	for _, field := range []string{
+		"lineage", "brief_preview", "status", "truth_coverage",
+		"payload_coverage", "payload_offset", "payload_total_chars", "payload_total_bytes",
+		"payload_complete", "delivery_status",
+	} {
+		if _, ok := briefs.columns[field]; !ok {
+			t.Fatalf("briefs catalog omitted %q", field)
+		}
+	}
+}
+
 func TestCompileIntelligenceQueryRejectsSQLAndUnknownFields(t *testing.T) {
 	st := &Store{}
 	for _, field := range []string{"tenant_id", "user_id", "pg_sleep(5)", "system_prompt"} {
@@ -153,6 +223,20 @@ func TestIntelligenceCursorBindsScopeAndQuery(t *testing.T) {
 				t.Fatalf("tampered cursor error=%v", err)
 			}
 		})
+	}
+	legacyPayload, _ := json.Marshal(intelligenceCursor{
+		Version: 1, KeyVersion: 1, TenantID: scope.TenantID, UserID: scope.UserID,
+		TaskID: scope.TaskID, QueryDigest: strings.Repeat("a", 64), After: after,
+		AsOfUnixNano: time.Now().UnixNano(),
+	})
+	legacyMAC := hmac.New(sha256.New, st.intelligenceCursorState.keys[1])
+	_, _ = legacyMAC.Write(legacyPayload)
+	legacyCursor := base64.RawURLEncoding.EncodeToString(legacyPayload) + "." +
+		base64.RawURLEncoding.EncodeToString(legacyMAC.Sum(nil))
+	if _, _, err := st.verifyIntelligenceCursor(
+		t.Context(), scope, strings.Repeat("a", 64), legacyCursor,
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("signed catalog-v2 cursor was accepted: %v", err)
 	}
 }
 

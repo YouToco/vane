@@ -20,10 +20,9 @@ import (
 )
 
 const (
-	// V1 remains a historical result marker in sealed AgentToolEvidence. V2 is
-	// additive: every V1 dataset keeps the same columns and query semantics,
-	// while feedbacks exposes canonical post-delivery business events.
-	IntelligenceCatalogVersion = "vane.intelligence-catalog/v2"
+	// V1/V2 remain historical result markers in sealed AgentToolEvidence. V3
+	// unifies retained V1 artifacts with native Research V3 evidence and Briefs.
+	IntelligenceCatalogVersion = "vane.intelligence-catalog/v3"
 	maxIntelligenceRows        = 100
 	maxIntelligenceBytes       = 64 * 1024
 	intelligenceQueryBudget    = 2 * time.Second
@@ -135,56 +134,207 @@ var intelligenceCatalog = map[IntelligenceDataset]intelligenceDatasetSpec{
 		base: `SELECT rs.tenant_id,rs.user_id,rs.id::text AS record_id,
 		              rs.task_id AS task_ref,rs.id::text AS run_snapshot_id,
 		              rs.temporal_workflow_id,rs.temporal_run_id,rs.run_kind,
-		              rs.execution_mode,COALESCE(o.status,'unavailable') AS outcome_status,
-		              o.result,o.source_coverage,o.processing,o.failure_code,
-		              o.failure_message,o.finalized_at,rs.created_at
+		              rs.execution_mode,
+		              CASE WHEN rs.reference_schema_version='vane.research-run-snapshot-ref/v3'
+		                   THEN 'research_v3' ELSE 'legacy' END AS runtime_generation,
+		              CASE WHEN rs.reference_schema_version='vane.research-run-snapshot-ref/v3'
+		                   THEN COALESCE(CASE WHEN rb.status IN ('prepared','spending') THEN 'pending'
+		                                           ELSE rb.status END,'unavailable')
+		                   ELSE COALESCE(o.status,'unavailable') END AS outcome_status,
+		              CASE WHEN rs.reference_schema_version='vane.research-run-snapshot-ref/v3'
+		                   THEN CASE WHEN rb.status='finalized' AND rb.decision='deliver' THEN 'content'
+		                                  WHEN rb.status='finalized' AND rb.decision='quiet' THEN 'quiet'
+		                                  WHEN rb.status='failed' THEN 'failed'
+		                                  WHEN rb.status='ambiguous' THEN 'interrupted' END
+		                   ELSE o.result END AS result,
+		              CASE WHEN rs.reference_schema_version='vane.research-run-snapshot-ref/v3'
+		                   THEN 'unavailable' ELSE o.source_coverage END AS source_coverage,
+		              CASE WHEN rs.reference_schema_version='vane.research-run-snapshot-ref/v3'
+		                   THEN 'unavailable' ELSE o.processing END AS processing,
+		              CASE WHEN rs.reference_schema_version='vane.research-run-snapshot-ref/v3'
+		                   THEN COALESCE(rb.failure_code,'') ELSE COALESCE(o.failure_code,'') END AS failure_code,
+		              CASE WHEN rs.reference_schema_version='vane.research-run-snapshot-ref/v3'
+		                   THEN '' ELSE COALESCE(o.failure_message,'') END AS failure_message,
+		              CASE WHEN rs.reference_schema_version='vane.research-run-snapshot-ref/v3'
+		                   THEN rb.finalized_at ELSE o.finalized_at END AS finalized_at,rs.created_at
 		         FROM task_run_snapshots rs
 		         LEFT JOIN task_run_outcomes o
 		           ON o.tenant_id=rs.tenant_id AND o.user_id=rs.user_id
-		          AND o.run_snapshot_id=rs.id`,
+		          AND o.task_id=rs.task_id AND o.run_snapshot_id=rs.id
+		         LEFT JOIN research_brief_syntheses rb
+		           ON rb.tenant_id=rs.tenant_id AND rb.user_id=rs.user_id
+		          AND rb.task_id=rs.task_id AND rb.run_snapshot_id=rs.id`,
 		columns: intelligenceColumns(
 			"record_id:text", "task_ref:text", "run_snapshot_id:text",
 			"temporal_workflow_id:text", "temporal_run_id:text", "run_kind:text",
-			"execution_mode:text", "outcome_status:text", "result:text",
+			"execution_mode:text", "runtime_generation:text", "outcome_status:text", "result:text",
 			"source_coverage:text", "processing:text", "failure_code:text",
 			"failure_message:text", "finalized_at:time", "created_at:time"),
-		defaults:     []string{"task_ref", "run_snapshot_id", "run_kind", "outcome_status", "result", "source_coverage", "processing", "finalized_at", "created_at"},
+		defaults:     []string{"task_ref", "run_snapshot_id", "run_kind", "runtime_generation", "outcome_status", "result", "source_coverage", "processing", "finalized_at", "created_at"},
 		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
 		stableOrder:  intelligenceStableOrder("created_at", "record_id"),
 		coverage:     IntelligenceCoverage{Status: "mixed", Note: "运行快照自 migration 030 完整；061 前的运行没有 RunOutcome，逐行标记 outcome_status=unavailable。"}, relativeTimeZone: true,
 	},
 	IntelligenceObservations: {
 		base: `SELECT p.tenant_id,p.user_id,
-		              (p.run_snapshot_id::text||':'||p.invocation_digest) AS record_id,
-		              p.task_id AS task_ref,p.run_snapshot_id::text AS run_snapshot_id,p.invocation_digest,
-		              convert_from(p.observation_payload,'UTF8')::jsonb AS observation,
-		              p.observation_digest,cardinality(p.content_item_ids) AS content_count,
-		              p.created_at
-		         FROM task_run_content_provenance p`,
+		              ('legacy:'||lpad(p.run_snapshot_id::text,20,'0')||':'||
+		               p.invocation_digest||':'||lpad(chunk_index::text,6,'0')) AS record_id,
+		              'legacy_observation_v1'::text AS lineage,
+		              p.task_id AS task_ref,p.run_snapshot_id::text AS run_snapshot_id,
+		              p.invocation_digest AS invocation_ref,NULL::text AS tool_name,
+		              substring(payload_text FROM chunk_index*8192+1 FOR 8192) AS model_visible_result,
+		              p.observation_digest AS result_digest,
+		              octet_length(p.observation_payload) AS stored_size,NULL::integer AS original_size,
+		              NULL::boolean AS source_truncated,
+		              CASE WHEN char_length(payload_text)>8192
+		                   THEN 'window' ELSE 'full' END::text AS payload_coverage,
+		              'legacy_exact'::text AS evidence_coverage,
+		              'legacy_external'::text AS trust_type,
+		              chunk_index*8192 AS payload_offset,
+		              char_length(payload_text) AS payload_total_chars,
+		              (chunk_index*8192+8192>=char_length(payload_text)) AS payload_complete,
+		              cardinality(p.content_item_ids) AS content_count,p.created_at
+		         FROM task_run_content_provenance p
+		        CROSS JOIN LATERAL (
+		              SELECT convert_from(p.observation_payload,'UTF8') AS payload_text
+		        ) payload
+		        CROSS JOIN LATERAL generate_series(
+		              0,GREATEST((char_length(payload_text)-1)/8192,0)
+		        ) chunk_index
+		        WHERE NOT EXISTS (
+		              SELECT 1 FROM research_run_plans rp_legacy
+		               WHERE rp_legacy.tenant_id=p.tenant_id
+		                 AND rp_legacy.user_id=p.user_id
+		                 AND rp_legacy.task_id=p.task_id
+		                 AND rp_legacy.run_snapshot_id=p.run_snapshot_id
+		        )
+		        UNION ALL
+		       SELECT e.tenant_id,e.user_id,
+		              ('v3:'||lpad(e.id::text,20,'0')||':'||lpad(chunk_index::text,6,'0')) AS record_id,
+		              'research_tool_evidence_v3'::text AS lineage,
+		              e.task_id AS task_ref,rp.run_snapshot_id::text AS run_snapshot_id,
+		              e.invocation_id AS invocation_ref,e.tool_name,
+		              substring(payload_text FROM chunk_index*8192+1 FOR 8192) AS model_visible_result,
+		              e.result_digest,octet_length(e.result_bytes) AS stored_size,e.original_size,
+		              e.truncated AS source_truncated,
+		              CASE WHEN char_length(payload_text)>8192
+		                   THEN 'window' ELSE 'full' END::text AS payload_coverage,
+		              'exact'::text AS evidence_coverage,e.trust_type,
+		              chunk_index*8192 AS payload_offset,
+		              char_length(payload_text) AS payload_total_chars,
+		              (chunk_index*8192+8192>=char_length(payload_text)) AS payload_complete,
+		              NULL::integer AS content_count,e.created_at
+		         FROM research_run_evidence e
+		         JOIN research_run_plans rp
+		           ON rp.id=e.plan_id AND rp.tenant_id=e.tenant_id
+		          AND rp.user_id=e.user_id AND rp.task_id=e.task_id
+		          AND rp.temporal_run_id=e.temporal_run_id
+		          AND rp.plan_digest=e.plan_digest
+		        CROSS JOIN LATERAL (
+		              SELECT convert_from(e.result_bytes,'UTF8') AS payload_text
+		        ) payload
+		        CROSS JOIN LATERAL generate_series(
+		              0,GREATEST((char_length(payload_text)-1)/8192,0)
+		        ) chunk_index`,
 		columns: intelligenceColumns(
-			"record_id:text", "task_ref:text", "run_snapshot_id:text",
-			"invocation_digest:text", "observation:json", "observation_digest:text",
-			"content_count:integer", "created_at:time"),
-		defaults:     []string{"task_ref", "run_snapshot_id", "observation", "content_count", "created_at"},
-		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
+			"record_id:text", "lineage:text", "task_ref:text", "run_snapshot_id:text",
+			"invocation_ref:text", "tool_name:text", "model_visible_result:text",
+			"result_digest:text", "stored_size:integer", "original_size:integer",
+			"source_truncated:boolean", "payload_coverage:text", "evidence_coverage:text",
+			"trust_type:text", "payload_offset:integer", "payload_total_chars:integer",
+			"payload_complete:boolean", "content_count:integer", "created_at:time"),
+		defaults:     []string{"lineage", "task_ref", "run_snapshot_id", "invocation_ref", "tool_name", "model_visible_result", "result_digest", "stored_size", "original_size", "source_truncated", "payload_coverage", "evidence_coverage", "trust_type", "payload_offset", "payload_total_chars", "payload_complete", "content_count", "created_at"},
+		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "asc"}},
 		stableOrder:  intelligenceStableOrder("created_at", "record_id"),
-		coverage:     IntelligenceCoverage{Status: "partial", Note: "076 前没有 exact Observation provenance；缺失历史保持 unavailable，不猜测回填。"}, relativeTimeZone: true,
+		coverage:     IntelligenceCoverage{Status: "mixed", Note: "076 前缺少 legacy exact Observation；V3 自 087 起保存 exact model-visible Evidence。大结果按 8192 字符不可变窗口分页，逐页 payload_offset/total/complete 明确，不猜测或丢弃尾部；source_truncated 单独表示上游模型当时是否已截断。"}, relativeTimeZone: true,
 	},
 	IntelligenceBriefs: {
-		base: `SELECT b.tenant_id,b.user_id,b.id::text AS record_id,
+		base: `SELECT b.tenant_id,b.user_id,
+		              ('legacy:'||lpad(b.id::text,20,'0')||':'||lpad(chunk_index::text,6,'0')) AS record_id,
+		              'legacy_brief_v1'::text AS lineage,
 		              b.task_id AS task_ref,b.run_snapshot_id::text AS run_snapshot_id,
 		              b.run_outcome_id::text AS run_outcome_id,
-		              convert_from(b.payload,'UTF8')::jsonb AS brief,
+		              CASE WHEN char_length(payload_text)<=8192 THEN payload_text::jsonb END AS brief,
+		              substring(payload_text FROM chunk_index*8192+1 FOR 8192) AS brief_preview,
+		              b.payload_digest AS brief_digest,'finalized'::text AS status,
+		              NULL::text AS significance,NULL::text AS decision,
+		              NULL::boolean AS delivery_required,''::text AS failure_code,
+		              NULL::text AS delivery_status,NULL::timestamptz AS sent_at,
+		              'legacy_exact'::text AS truth_coverage,
+		              CASE WHEN char_length(payload_text)>8192
+		                   THEN 'window' ELSE 'full' END::text AS payload_coverage,
+		              chunk_index*8192 AS payload_offset,
+		              char_length(payload_text) AS payload_total_chars,
+		              octet_length(b.payload) AS payload_total_bytes,
+		              (chunk_index*8192+8192>=char_length(payload_text)) AS payload_complete,
 		              b.insight_count,b.generated_at,b.created_at
-		         FROM brief_snapshots b`,
+		         FROM brief_snapshots b
+		        CROSS JOIN LATERAL (
+		              SELECT convert_from(b.payload,'UTF8') AS payload_text
+		        ) payload
+		        CROSS JOIN LATERAL generate_series(
+		              0,GREATEST((char_length(payload_text)-1)/8192,0)
+		        ) chunk_index
+		        WHERE NOT EXISTS (
+		              SELECT 1 FROM research_brief_syntheses rb_legacy
+		               WHERE rb_legacy.tenant_id=b.tenant_id
+		                 AND rb_legacy.user_id=b.user_id
+		                 AND rb_legacy.task_id=b.task_id
+		                 AND rb_legacy.run_snapshot_id=b.run_snapshot_id
+		        )
+		        UNION ALL
+		       SELECT rb.tenant_id,rb.user_id,
+		              ('v3:'||lpad(rb.id::text,20,'0')||':'||lpad(chunk_index::text,6,'0')) AS record_id,
+		              'research_brief_v3'::text AS lineage,
+		              rb.task_id AS task_ref,rb.run_snapshot_id::text AS run_snapshot_id,
+		              NULL::text AS run_outcome_id,
+		              CASE WHEN rb.status='finalized' AND char_length(payload_text)<=8192
+		                   THEN payload_text::jsonb END AS brief,
+		              CASE WHEN rb.status='finalized' THEN
+		                   substring(payload_text FROM chunk_index*8192+1 FOR 8192) END AS brief_preview,
+		              rb.brief_digest,rb.status,rb.significance,rb.decision,
+		              rb.delivery_required,rb.failure_code,
+		              COALESCE(rd.status,
+		                CASE WHEN rb.delivery_required=false THEN 'not_required'
+		                     ELSE 'unavailable' END) AS delivery_status,
+		              rd.sent_at,
+		              CASE WHEN rb.status='finalized' THEN 'exact'
+		                   ELSE 'unavailable' END::text AS truth_coverage,
+		              CASE WHEN rb.status<>'finalized' THEN 'unavailable'
+		                   WHEN char_length(payload_text)>8192
+		                     THEN 'window' ELSE 'full' END::text AS payload_coverage,
+		              chunk_index*8192 AS payload_offset,
+		              char_length(COALESCE(payload_text,'')) AS payload_total_chars,
+		              CASE WHEN rb.status='finalized' THEN octet_length(rb.brief_payload)
+		                   ELSE 0 END AS payload_total_bytes,
+		              (chunk_index*8192+8192>=char_length(COALESCE(payload_text,''))) AS payload_complete,
+		              NULL::integer AS insight_count,rb.finalized_at AS generated_at,rb.created_at
+		         FROM research_brief_syntheses rb
+		         LEFT JOIN research_brief_deliveries rd
+		           ON rd.brief_id=rb.id AND rd.tenant_id=rb.tenant_id
+		          AND rd.user_id=rb.user_id AND rd.task_id=rb.task_id
+		          AND rd.run_snapshot_id=rb.run_snapshot_id AND rd.plan_id=rb.plan_id
+		        CROSS JOIN LATERAL (
+		              SELECT CASE WHEN rb.status='finalized'
+		                          THEN convert_from(rb.brief_payload,'UTF8') END AS payload_text
+		        ) payload
+		        CROSS JOIN LATERAL generate_series(
+		              0,GREATEST((char_length(COALESCE(payload_text,''))-1)/8192,0)
+		        ) chunk_index
+		        WHERE rb.status IN ('finalized','ambiguous','failed')`,
 		columns: intelligenceColumns(
-			"record_id:text", "task_ref:text", "run_snapshot_id:text",
-			"run_outcome_id:text", "brief:json", "insight_count:integer",
+			"record_id:text", "lineage:text", "task_ref:text", "run_snapshot_id:text",
+			"run_outcome_id:text", "brief:json", "brief_preview:text", "brief_digest:text",
+			"status:text", "significance:text", "decision:text", "delivery_required:boolean",
+			"failure_code:text", "delivery_status:text", "sent_at:time",
+			"truth_coverage:text", "payload_coverage:text", "payload_offset:integer",
+			"payload_total_chars:integer", "payload_total_bytes:integer",
+			"payload_complete:boolean", "insight_count:integer",
 			"generated_at:time", "created_at:time"),
-		defaults:     []string{"task_ref", "run_snapshot_id", "brief", "insight_count", "generated_at"},
-		defaultOrder: []IntelligenceOrder{{Field: "generated_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
+		defaults:     []string{"lineage", "task_ref", "run_snapshot_id", "brief_preview", "brief_digest", "status", "significance", "decision", "delivery_required", "failure_code", "delivery_status", "truth_coverage", "payload_coverage", "payload_offset", "payload_total_chars", "payload_total_bytes", "payload_complete", "generated_at", "created_at"},
+		defaultOrder: []IntelligenceOrder{{Field: "generated_at", Direction: "desc"}, {Field: "record_id", Direction: "asc"}},
 		stableOrder:  intelligenceStableOrder("generated_at", "record_id"),
-		coverage:     IntelligenceCoverage{Status: "partial", Note: "061 前没有不可变 BriefV1 snapshot；缺失历史保持 unavailable，不猜测回填。"}, relativeTimeZone: true,
+		coverage:     IntelligenceCoverage{Status: "mixed", Note: "061 前没有不可变 legacy Brief；V3 finalized 为 exact，ambiguous/failed 只保留 unavailable 失败事实，不猜测结论。大 Brief 按 8192 字符不可变窗口分页，尾部可由同一工具 next_cursor 续读。"}, relativeTimeZone: true,
 	},
 	IntelligenceAgentTurns: {
 		base: `SELECT t.tenant_id,t.user_id,t.id::text AS record_id,t.session_id::text AS session_id,
@@ -1095,7 +1245,10 @@ func intelligenceQueryDigest(query IntelligenceQuery, includeCursor bool) string
 	if !includeCursor {
 		copyQuery.Cursor = ""
 	}
-	raw, _ := json.Marshal(copyQuery)
+	raw, _ := json.Marshal(struct {
+		CatalogVersion string            `json:"catalog_version"`
+		Query          IntelligenceQuery `json:"query"`
+	}{IntelligenceCatalogVersion, copyQuery})
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:])
 }
@@ -1152,6 +1305,7 @@ func boundedAuditString(value string) string {
 
 type intelligenceCursor struct {
 	Version      int               `json:"v"`
+	Catalog      string            `json:"catalog"`
 	KeyVersion   int               `json:"k"`
 	TenantID     int64             `json:"t"`
 	UserID       int64             `json:"u"`
@@ -1167,7 +1321,7 @@ func (s *Store) signIntelligenceCursor(scope IntelligenceScope, queryDigest stri
 	defer state.Unlock()
 	keyVersion := state.activeKey
 	payload, _ := json.Marshal(intelligenceCursor{
-		Version: 1, KeyVersion: keyVersion,
+		Version: 2, Catalog: IntelligenceCatalogVersion, KeyVersion: keyVersion,
 		TenantID: scope.TenantID, UserID: scope.UserID,
 		TaskID: scope.TaskID, QueryDigest: queryDigest, After: after,
 		AsOfUnixNano: asOf.UnixNano(),
@@ -1193,7 +1347,8 @@ func (s *Store) verifyIntelligenceCursor(ctx context.Context, scope Intelligence
 		return nil, time.Time{}, invalidIntelligenceCursor()
 	}
 	var cursor intelligenceCursor
-	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Version != 1 ||
+	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Version != 2 ||
+		cursor.Catalog != IntelligenceCatalogVersion ||
 		len(cursor.After) == 0 || len(cursor.After) > 9 {
 		return nil, time.Time{}, invalidIntelligenceCursor()
 	}
