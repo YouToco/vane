@@ -28,6 +28,44 @@ def extract_recovery() -> str:
     return script[start:finish]
 
 
+def relocated_recovery(root: Path) -> tuple[str, str, str, str, str]:
+    opt = (root / "opt/vane").as_posix()
+    systemd = (root / "etc/systemd/system").as_posix()
+    etc_vane = (root / "etc/vane").as_posix()
+    runtime = (root / "run/vane-research-gateway").as_posix()
+    recovery = (
+        extract_recovery()
+        .replace("/opt/vane", opt)
+        .replace("/etc/systemd/system", systemd)
+        .replace("/etc/vane", etc_vane)
+        .replace("/run/vane-research-gateway", runtime)
+    )
+    return recovery, opt, systemd, etc_vane, runtime
+
+
+def gateway_paths(opt: str, systemd: str, etc_vane: str) -> list[str]:
+    return [
+        f"{opt}/bin/vane-research-gateway",
+        f"{opt}/vane-research-gateway.service",
+        f"{opt}/vane-research-gateway.socket",
+        f"{systemd}/vane-research-gateway.service",
+        f"{systemd}/vane-research-gateway.socket",
+        f"{opt}/env/research-gateway.env",
+        f"{etc_vane}/credentials/gateway_db_url",
+        f"{etc_vane}/credentials/research_llm_api_key_gen1",
+    ]
+
+
+def filesystem_mode(path: str) -> int:
+    result = subprocess.run(
+        [BASH, "-lc", f"stat -c %a {shlex.quote(path)}"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    return int(result.stdout.strip(), 8)
+
+
 class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
     def test_failed_migration_does_not_touch_live_gateway_or_vane(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -77,20 +115,23 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
     def test_gateway_restore_reinstates_complete_previous_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            opt = (root / "opt/vane").as_posix()
-            systemd = (root / "etc/systemd/system").as_posix()
-            etc_vane = (root / "etc/vane").as_posix()
-            run = (root / "run").as_posix()
+            recovery, opt, systemd, etc_vane, runtime = relocated_recovery(root)
             log = (root / "commands.log").as_posix()
             stage = f"{opt}/.deploy-{SHA}-1-1"
-            recovery = (
-                extract_recovery()
-                .replace("/opt/vane", opt)
-                .replace("/etc/systemd/system", systemd)
-                .replace("/etc/vane", etc_vane)
-                .replace("/run/vane-research-gateway", run)
+            rollback = f"{opt}/.rollback-vane-{SHA}-1-1"
+            paths = gateway_paths(opt, systemd, etc_vane)
+            old_files = "".join(
+                f"printf 'old-{index}\\n' >{shlex.quote(path)}\n"
+                for index, path in enumerate(paths)
             )
-            snapshot = f"{opt}/.rollback-vane-{SHA}-1-1/gateway"
+            new_files = "".join(
+                f"printf 'new-{index}\\n' >{shlex.quote(path)}\n"
+                for index, path in enumerate(paths)
+            )
+            assertions = "".join(
+                f"[[ $(cat {shlex.quote(path)}) == old-{index} ]]\n"
+                for index, path in enumerate(paths)
+            )
             script = (
                 "set -euo pipefail\n"
                 f"stage={shlex.quote(stage)}\n"
@@ -101,33 +142,19 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
                 "  if [[ $1 == is-active || $1 == is-enabled ]]; then return 0; fi\n"
                 "  printf '%s\\n' \"$*\" >>\"$log\"\n"
                 "}\n"
+                "install() { local destination=${!#}; mkdir -p \"$destination\"; chmod 0700 \"$destination\"; }\n"
                 f"readlink() {{ printf '%s\\n' {shlex.quote(opt + '/bin/vane-research-gateway')}; }}\n"
                 "gateway_functional() { return 0; }\n"
                 "sleep() { :; }\n"
-                f"mkdir -p {shlex.quote(snapshot)} {shlex.quote(opt + '/bin')} "
+                f"mkdir -p {shlex.quote(rollback)} {shlex.quote(opt + '/bin')} "
                 f"{shlex.quote(opt + '/env')} {shlex.quote(systemd)} "
-                f"{shlex.quote(etc_vane + '/credentials')}\n"
-                f"printf 'present\\n' >{shlex.quote(snapshot + '/state')}\n"
-                f"printf 'old-binary\\n' >{shlex.quote(snapshot + '/vane-research-gateway')}\n"
-                f"printf 'old-service\\n' >{shlex.quote(snapshot + '/vane-research-gateway.service')}\n"
-                f"printf 'old-socket\\n' >{shlex.quote(snapshot + '/vane-research-gateway.socket')}\n"
-                f"printf 'old-env\\n' >{shlex.quote(snapshot + '/research-gateway.env')}\n"
-                f"printf 'old-db\\n' >{shlex.quote(snapshot + '/gateway_db_url')}\n"
-                f"printf 'old-key\\n' >{shlex.quote(snapshot + '/research_llm_api_key_gen1')}\n"
-                f"printf 'new-binary\\n' >{shlex.quote(opt + '/bin/vane-research-gateway')}\n"
-                f"printf 'new-service\\n' >{shlex.quote(systemd + '/vane-research-gateway.service')}\n"
-                f"printf 'new-socket\\n' >{shlex.quote(systemd + '/vane-research-gateway.socket')}\n"
-                f"printf 'new-env\\n' >{shlex.quote(opt + '/env/research-gateway.env')}\n"
-                f"printf 'new-db\\n' >{shlex.quote(etc_vane + '/credentials/gateway_db_url')}\n"
-                f"printf 'new-key\\n' >{shlex.quote(etc_vane + '/credentials/research_llm_api_key_gen1')}\n"
-                "previous_gateway_snapshot_ready=true\n"
+                f"{shlex.quote(etc_vane + '/credentials')} {shlex.quote(runtime)}\n"
+                f"{old_files}"
+                "previous_vane_snapshot_ready=true\n"
+                "snapshot_previous_gateway_release\n"
+                f"{new_files}"
                 "restore_previous_gateway_release\n"
-                f"[[ $(cat {shlex.quote(opt + '/bin/vane-research-gateway')}) == old-binary ]]\n"
-                f"[[ $(cat {shlex.quote(systemd + '/vane-research-gateway.service')}) == old-service ]]\n"
-                f"[[ $(cat {shlex.quote(systemd + '/vane-research-gateway.socket')}) == old-socket ]]\n"
-                f"[[ $(cat {shlex.quote(opt + '/env/research-gateway.env')}) == old-env ]]\n"
-                f"[[ $(cat {shlex.quote(etc_vane + '/credentials/gateway_db_url')}) == old-db ]]\n"
-                f"[[ $(cat {shlex.quote(etc_vane + '/credentials/research_llm_api_key_gen1')}) == old-key ]]\n"
+                f"{assertions}"
             )
             result = subprocess.run(
                 [BASH], input=script.encode(), capture_output=True, check=False
@@ -139,6 +166,141 @@ class GatewayMigrationFailureRecoveryTest(unittest.TestCase):
             commands.index("start vane-research-gateway.socket"),
             commands.index("start vane-research-gateway.service"),
         )
+
+    def test_fresh_absent_failure_trap_removes_every_gateway_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            recovery, opt, systemd, etc_vane, runtime = relocated_recovery(root)
+            stage = f"{opt}/.deploy-{SHA}-1-1"
+            rollback = f"{opt}/.rollback-vane-{SHA}-1-1"
+            paths = gateway_paths(opt, systemd, etc_vane)
+            scratch_paths = [
+                f"{opt}/bin/vane-research-gateway.release-next",
+                f"{opt}/vane-research-gateway.service.release-next",
+                f"{opt}/vane-research-gateway.socket.release-next",
+                f"{systemd}/vane-research-gateway.service.release-next",
+                f"{systemd}/vane-research-gateway.socket.release-next",
+                f"{opt}/env/research-gateway.env.next",
+                f"{etc_vane}/credentials/gateway_db_url.next",
+                f"{etc_vane}/credentials/research_llm_api_key_gen1.next",
+            ]
+            new_files = "".join(
+                f"printf 'new\\n' >{shlex.quote(path)}\n"
+                for path in paths + scratch_paths
+            )
+            script = (
+                "set -euo pipefail\n"
+                f"stage={shlex.quote(stage)}\n"
+                f"{recovery}\n"
+                "systemctl() {\n"
+                "  if [[ $1 == is-active || $1 == is-enabled ]]; then return 1; fi\n"
+                "  return 0\n"
+                "}\n"
+                "install() { local destination=${!#}; mkdir -p \"$destination\"; chmod 0700 \"$destination\"; }\n"
+                f"mkdir -p {shlex.quote(stage)} {shlex.quote(rollback)} "
+                f"{shlex.quote(opt + '/bin')} {shlex.quote(opt + '/env')} "
+                f"{shlex.quote(systemd)} {shlex.quote(etc_vane + '/credentials')}\n"
+                "previous_vane_snapshot_ready=true\n"
+                "snapshot_previous_gateway_release\n"
+                f"{new_files}"
+                f"mkdir -p {shlex.quote(runtime)}\n"
+                "gateway_recovery_required=true\n"
+                "trap cleanup_remote_deploy EXIT\n"
+                "exit 23\n"
+            )
+            result = subprocess.run(
+                [BASH], input=script.encode(), capture_output=True, check=False
+            )
+
+            self.assertEqual(result.returncode, 23, result.stderr.decode())
+            for path in paths + scratch_paths:
+                self.assertFalse(Path(path).exists(), path)
+            self.assertFalse(Path(runtime).exists())
+
+    def test_partial_preexisting_failure_trap_restores_exact_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            recovery, opt, systemd, etc_vane, runtime = relocated_recovery(root)
+            stage = f"{opt}/.deploy-{SHA}-1-1"
+            rollback = f"{opt}/.rollback-vane-{SHA}-1-1"
+            paths = gateway_paths(opt, systemd, etc_vane)
+            present = {
+                paths[1]: "old-opt-service",
+                paths[5]: "old-env",
+                paths[6]: "old-db",
+            }
+            expected_file_mode = root / "expected-file-mode"
+            expected_runtime_mode = root / "expected-runtime-mode"
+            old_files = "".join(
+                f"printf '{value}\\n' >{shlex.quote(path)}\n"
+                for path, value in present.items()
+            )
+            new_files = "".join(
+                f"printf 'new\\n' >{shlex.quote(path)}\n" for path in paths
+            )
+            script = (
+                "set -euo pipefail\n"
+                f"stage={shlex.quote(stage)}\n"
+                f"{recovery}\n"
+                "systemctl() {\n"
+                "  if [[ $1 == is-active || $1 == is-enabled ]]; then return 1; fi\n"
+                "  return 0\n"
+                "}\n"
+                "install() { local destination=${!#}; mkdir -p \"$destination\"; chmod 0700 \"$destination\"; }\n"
+                f"mkdir -p {shlex.quote(stage)} {shlex.quote(rollback)} "
+                f"{shlex.quote(opt + '/bin')} {shlex.quote(opt + '/env')} "
+                f"{shlex.quote(systemd)} {shlex.quote(etc_vane + '/credentials')} "
+                f"{shlex.quote(runtime)}\n"
+                f"{old_files}"
+                "chmod 0640 "
+                + " ".join(shlex.quote(path) for path in present)
+                + "\n"
+                + f"chmod 0751 {shlex.quote(runtime)}\n"
+                + f"stat -c %a {shlex.quote(next(iter(present)))} >"
+                f"{shlex.quote(expected_file_mode.as_posix())}\n"
+                + f"stat -c %a {shlex.quote(runtime)} >"
+                f"{shlex.quote(expected_runtime_mode.as_posix())}\n"
+                "previous_vane_snapshot_ready=true\n"
+                "snapshot_previous_gateway_release\n"
+                f"{new_files}"
+                f"chmod 0700 {shlex.quote(runtime)}\n"
+                "gateway_recovery_required=true\n"
+                "trap cleanup_remote_deploy EXIT\n"
+                "exit 29\n"
+            )
+            result = subprocess.run(
+                [BASH], input=script.encode(), capture_output=True, check=False
+            )
+
+            self.assertEqual(result.returncode, 29, result.stderr.decode())
+            original_file_mode = int(expected_file_mode.read_text().strip(), 8)
+            original_runtime_mode = int(expected_runtime_mode.read_text().strip(), 8)
+            for path, value in present.items():
+                restored = Path(path)
+                self.assertEqual(restored.read_text(encoding="utf-8"), value + "\n")
+                self.assertEqual(filesystem_mode(path), original_file_mode)
+            for path in set(paths) - set(present):
+                self.assertFalse(Path(path).exists(), path)
+            self.assertTrue(Path(runtime).is_dir())
+            self.assertEqual(filesystem_mode(runtime), original_runtime_mode)
+
+    def test_recovery_is_armed_before_live_gateway_configuration_mutation(self) -> None:
+        remote = REMOTE.read_text(encoding="utf-8")
+        migration = remote.index("systemd-run --quiet --wait --collect")
+        arm = remote.index(
+            "gateway_recovery_required=true",
+            remote.index("# From the first live gateway configuration mutation"),
+        )
+        environment_promotion = remote.index(
+            "mv -f /opt/vane/env/research-gateway.env.next"
+        )
+        credential_promotion = remote.index(
+            'mv -f "/etc/vane/credentials/$credential.next"'
+        )
+
+        self.assertLess(migration, arm)
+        self.assertLess(arm, environment_promotion)
+        self.assertLess(arm, credential_promotion)
 
 
 if __name__ == "__main__":
