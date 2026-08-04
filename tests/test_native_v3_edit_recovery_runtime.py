@@ -220,8 +220,11 @@ fi
         self.assertIn("validate_native_v3_edit_recovery_unit \"$stage/vane.service\"", script)
         self.assertIn(exact_load, script)
         self.assertLess(
-            script.index("systemctl restart vane-migrate.service"),
-            script.index("provision_native_v3_edit_recovery_runtime\n", script.index("systemctl restart vane-migrate.service")),
+            script.index("systemd-run --quiet --wait --collect"),
+            script.index(
+                "provision_native_v3_edit_recovery_runtime\n",
+                script.index("systemd-run --quiet --wait --collect"),
+            ),
         )
         provision_start = script.index("provision_native_v3_edit_recovery_runtime() {")
         provision = script[

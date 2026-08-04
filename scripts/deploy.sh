@@ -140,7 +140,7 @@ deploy_backend() {
     exit 1
   }
 
-  local binary infra legacy_compat_unit
+  local binary infra legacy_compat_unit primary_unit gateway_unit
   for binary in vane useradmin gate runtimeadmin vane-migrate \
     vane-research-gateway vane-research-prepare researchshadow \
     researchcutover; do
@@ -167,8 +167,15 @@ deploy_backend() {
     }
   done
   legacy_compat_unit=$(dirname "$0")/../deploy/vane-legacy-compat.service
+  primary_unit=$(dirname "$0")/../deploy/vane.service
+  gateway_unit=$(dirname "$0")/../deploy/vane-research-gateway.service
   [[ -f $legacy_compat_unit && ! -L $legacy_compat_unit ]] || {
     echo "audited legacy compatibility unit is unavailable" >&2
+    exit 1
+  }
+  [[ -f $primary_unit && ! -L $primary_unit &&
+     -f $gateway_unit && ! -L $gateway_unit ]] || {
+    echo "audited deploy-time runtime units are unavailable" >&2
     exit 1
   }
 
@@ -237,10 +244,10 @@ deploy_backend() {
   scp "${scp_opts[@]}" \
     "$payload/deploy/Caddyfile" \
     "$payload/deploy/docker-compose.yml" \
-    "$payload/deploy/vane.service" \
     "$payload/deploy/vane-migrate.service" \
-    "$payload/deploy/vane-research-gateway.service" \
     "$payload/deploy/vane-research-gateway.socket" \
+    "$primary_unit" \
+    "$gateway_unit" \
     "$legacy_compat_unit" \
     "$backend_ssh_target:$backend_remote_stage/"
   scp "${scp_opts[@]}" \

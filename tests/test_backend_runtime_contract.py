@@ -8,6 +8,8 @@ WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
 DEPLOY = ROOT / "scripts" / "deploy.sh"
 REMOTE = ROOT / "scripts" / "remote-backend-deploy.sh"
 LEGACY_COMPAT_UNIT = ROOT / "deploy" / "vane-legacy-compat.service"
+PRIMARY_UNIT = ROOT / "deploy" / "vane.service"
+GATEWAY_UNIT = ROOT / "deploy" / "vane-research-gateway.service"
 SPEC = importlib.util.spec_from_file_location("artifact", ROOT / "scripts/artifact.py")
 assert SPEC and SPEC.loader
 artifact = importlib.util.module_from_spec(SPEC)
@@ -99,10 +101,69 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertNotIn("ExecStartPost=", unit)
         self.assertNotIn("User=root", unit)
 
+    def test_deploy_owned_runtime_units_do_not_depend_on_migration(self) -> None:
+        primary = PRIMARY_UNIT.read_text(encoding="utf-8")
+        gateway = GATEWAY_UNIT.read_text(encoding="utf-8")
+        deploy = DEPLOY.read_text(encoding="utf-8")
+
+        for unit in (primary, gateway):
+            self.assertEqual(
+                unit.splitlines().count("Requires=vane-research-gateway.socket"),
+                1,
+            )
+            self.assertNotIn("vane-migrate.service", unit)
+        self.assertIn('primary_unit=$(dirname "$0")/../deploy/vane.service', deploy)
+        self.assertIn(
+            'gateway_unit=$(dirname "$0")/../deploy/vane-research-gateway.service',
+            deploy,
+        )
+        self.assertIn('"$primary_unit"', deploy)
+        self.assertIn('"$gateway_unit"', deploy)
+
+    def test_gateway_is_promoted_only_after_the_transient_migration_gate(self) -> None:
+        remote = REMOTE.read_text(encoding="utf-8")
+        gate = remote.index("systemd-run --quiet --wait --collect")
+        promotion = remote.index(
+            "mv -f -- /opt/vane/bin/vane-research-gateway.release-next"
+        )
+
+        self.assertLess(gate, promotion)
+        self.assertIn(
+            "install -m 0755 \"$stage/bin/vane-research-gateway\" \\\n"
+            "  /opt/vane/bin/vane-research-gateway.release-next",
+            remote,
+        )
+        before_gate = remote[:gate]
+        self.assertNotIn(
+            "install -m 0755 \"$stage/bin/vane-research-gateway\" "
+            "/opt/vane/bin/vane-research-gateway\n",
+            before_gate,
+        )
+        self.assertNotIn("systemctl enable vane-migrate.service", remote)
+        self.assertNotIn("systemctl restart vane-migrate.service", remote)
+        self.assertIn("systemctl disable vane-migrate.service", remote)
+        self.assertIn(
+            "migration_run_unit=vane-deploy-migrate-${stage##*/.deploy-}", remote
+        )
+        self.assertIn("gateway_recovery_required=true", remote[promotion - 1200 :])
+        cleanup = remote[
+            remote.index("cleanup_remote_deploy()") : remote.index(
+                "trap cleanup_remote_deploy EXIT"
+            )
+        ]
+        self.assertLess(
+            cleanup.index("restore_previous_gateway_release"),
+            cleanup.index("restore_previous_vane_release"),
+        )
+        self.assertGreater(
+            remote.rindex("gateway_recovery_required=false"),
+            remote.rindex("/opt/vane/bin/gate -env /opt/vane/env/server.env"),
+        )
+
     def test_bootstrap_keeps_owner_out_of_long_lived_server(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")
 
-        self.assertIn("systemctl restart vane-migrate.service", remote)
+        self.assertIn("systemd-run --quiet --wait --collect", remote)
         self.assertIn("runtime_bootstrap_v1.complete", remote)
         self.assertIn("vane_server_runtime", remote)
         self.assertIn("vane_research_runtime", remote)
@@ -113,12 +174,18 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertNotIn("systemctl restart vane-research-prepare", remote)
         self.assertIn("/opt/vane/bin/vane.next", remote)
         self.assertLess(
-            remote.index("systemctl restart vane-migrate.service"),
+            remote.index("systemd-run --quiet --wait --collect"),
             remote.index("systemctl stop vane\n"),
         )
+        gateway_promotion = remote.index(
+            "gateway_recovery_required=true",
+            remote.index("install -d -o root -g root -m 0711"),
+        )
         self.assertLess(
-            remote.index("systemctl restart vane-research-gateway.service"),
-            remote.index("systemctl stop vane\n"),
+            remote.index(
+                "systemctl start vane-research-gateway.service", gateway_promotion
+            ),
+            remote.index("systemctl stop vane\n", gateway_promotion),
         )
         self.assertIn("gateway_exe=$(readlink", remote)
         self.assertIn(
@@ -142,13 +209,15 @@ class BackendRuntimeContractTest(unittest.TestCase):
             remote.index(
                 "install -d -o root -g root -m 0711 /run/vane-research-gateway"
             ),
-            remote.index("systemctl enable --now vane-research-gateway.socket"),
+            remote.index(
+                "systemctl start vane-research-gateway.socket", gateway_promotion
+            ),
         )
         self.assertLess(
             remote.index(
                 "install -d -o root -g root -m 0711 /run/vane-research-gateway"
             ),
-            remote.index("runuser -u vane -- curl"),
+            remote.index("runuser -u vane -- curl", gateway_promotion),
         )
         self.assertIn("capability_source=legacy", remote)
         self.assertIn("capability_retired", remote)
@@ -277,7 +346,7 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertLess(
             remote.index(
                 "\nprovision_native_v3_edit_recovery_runtime\n",
-                remote.index("systemctl restart vane-migrate.service"),
+                remote.index("systemd-run --quiet --wait --collect"),
             ),
             first_gate,
         )

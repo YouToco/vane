@@ -17,6 +17,9 @@ old_vane_restart_safe=false
 previous_vane_snapshot_ready=false
 previous_vane_restart_expected=false
 preserve_vane_snapshot=false
+gateway_recovery_required=false
+previous_gateway_snapshot_ready=false
+preserve_gateway_snapshot=false
 rollback_dir=/opt/vane/.rollback-vane-${stage##*/.deploy-}
 research_legacy_env_keys=(
   VANE_DB_RESEARCH_RUNTIME_URL
@@ -281,8 +284,40 @@ validate_native_v3_edit_recovery_unit() {
        "$unit" || true) -eq 1 &&
      $(grep -c -Fx \
        'LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url' \
-       "$unit" || true) -eq 1 ]] || {
+       "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'Requires=vane-research-gateway.socket' \
+       "$unit" || true) -eq 1 &&
+     $(grep -c 'vane-migrate.service' "$unit" || true) -eq 0 ]] || {
     echo "primary unit has no exact native V3 edit recovery credential" >&2
+    return 1
+  }
+}
+
+validate_gateway_unit() {
+  local unit=$1
+  [[ -f $unit && ! -L $unit &&
+     $(grep -Ec '^User=' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'User=vane-research-gateway' "$unit" || true) -eq 1 &&
+     $(grep -Ec '^Group=' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'Group=vane-research-gateway' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'Requires=vane-research-gateway.socket' \
+       "$unit" || true) -eq 1 &&
+     $(grep -c 'vane-migrate.service' "$unit" || true) -eq 0 &&
+     $(grep -c -Fx \
+       'EnvironmentFile=/opt/vane/env/research-gateway.env' \
+       "$unit" || true) -eq 1 &&
+     $(grep -c -Fx \
+       'LoadCredential=gateway_db_url:/etc/vane/credentials/gateway_db_url' \
+       "$unit" || true) -eq 1 &&
+     $(grep -c -Fx \
+       'LoadCredential=llm_api_key_gen1:/etc/vane/credentials/research_llm_api_key_gen1' \
+       "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'ExecStart=/opt/vane/bin/vane-research-gateway' \
+       "$unit" || true) -eq 1 &&
+     $(grep -Ec '^Exec(StartPre|StartPost|Reload)=' "$unit" || true) -eq 0 &&
+     $(grep -c -Fx 'NoNewPrivileges=yes' "$unit" || true) -eq 1 &&
+     $(grep -c -Fx 'ProtectSystem=strict' "$unit" || true) -eq 1 ]] || {
+    echo "research gateway unit does not match the deploy-owned contract" >&2
     return 1
   }
 }
@@ -522,6 +557,482 @@ assert_existing_audited_primary_runtime_contract() {
     }
 }
 
+gateway_functional() {
+  local http_code
+  http_code=$(runuser -u vane -- curl --silent --show-error \
+    --output /dev/null --write-out '%{http_code}' --max-time 2 \
+    --unix-socket /run/vane-research-gateway/gateway.sock \
+    http://research-gateway/v1/research/llm/execute 2>/dev/null || true)
+  [[ $http_code == 405 ]] &&
+    systemctl is-active --quiet vane-research-gateway.service
+}
+
+gateway_snapshot_keys=(
+  binary
+  opt-service
+  opt-socket
+  systemd-service
+  systemd-socket
+  environment
+  database-credential
+  llm-credential
+)
+gateway_snapshot_paths=(
+  /opt/vane/bin/vane-research-gateway
+  /opt/vane/vane-research-gateway.service
+  /opt/vane/vane-research-gateway.socket
+  /etc/systemd/system/vane-research-gateway.service
+  /etc/systemd/system/vane-research-gateway.socket
+  /opt/vane/env/research-gateway.env
+  /etc/vane/credentials/gateway_db_url
+  /etc/vane/credentials/research_llm_api_key_gen1
+)
+
+snapshot_gateway_regular_path() {
+  local snapshot=$1 key=$2 path=$3
+  if [[ -e $path || -L $path ]]; then
+    [[ -f $path && ! -L $path ]] || {
+      echo "research gateway path is not a regular file: $path" >&2
+      return 1
+    }
+    cp --archive --reflink=auto -- "$path" "$snapshot/$key"
+    printf 'present\n' >"$snapshot/$key.state"
+  else
+    printf 'absent\n' >"$snapshot/$key.state"
+  fi
+}
+
+snapshot_previous_gateway_release() {
+  local snapshot=$rollback_dir/gateway index key path state
+  local service_active=false socket_active=false
+  local service_enabled=false socket_enabled=false
+  [[ $previous_vane_snapshot_ready == true && -d $rollback_dir &&
+     ! -L $rollback_dir && ! -e $snapshot && ! -L $snapshot ]] || {
+    echo "research gateway rollback snapshot path is unsafe" >&2
+    return 1
+  }
+  install -d -o root -g root -m 0700 "$snapshot"
+
+  for index in "${!gateway_snapshot_keys[@]}"; do
+    key=${gateway_snapshot_keys[$index]}
+    path=${gateway_snapshot_paths[$index]}
+    snapshot_gateway_regular_path "$snapshot" "$key" "$path"
+  done
+
+  if [[ -e /run/vane-research-gateway ||
+        -L /run/vane-research-gateway ]]; then
+    [[ -d /run/vane-research-gateway &&
+       ! -L /run/vane-research-gateway ]] || {
+      echo "research gateway runtime path is not a real directory" >&2
+      return 1
+    }
+    printf 'present\n' >"$snapshot/runtime-directory.state"
+    stat -c '%u' /run/vane-research-gateway \
+      >"$snapshot/runtime-directory.uid"
+    stat -c '%g' /run/vane-research-gateway \
+      >"$snapshot/runtime-directory.gid"
+    stat -c '%a' /run/vane-research-gateway \
+      >"$snapshot/runtime-directory.mode"
+  else
+    printf 'absent\n' >"$snapshot/runtime-directory.state"
+  fi
+
+  if systemctl is-active --quiet vane-research-gateway.service; then
+    service_active=true
+  fi
+  if systemctl is-active --quiet vane-research-gateway.socket; then
+    socket_active=true
+  fi
+  if systemctl is-enabled --quiet vane-research-gateway.service; then
+    service_enabled=true
+  fi
+  if systemctl is-enabled --quiet vane-research-gateway.socket; then
+    socket_enabled=true
+  fi
+  printf '%s\n' "$service_active" >"$snapshot/service-active"
+  printf '%s\n' "$socket_active" >"$snapshot/socket-active"
+  printf '%s\n' "$service_enabled" >"$snapshot/service-enabled"
+  printf '%s\n' "$socket_enabled" >"$snapshot/socket-enabled"
+
+  if [[ $service_active == true ]]; then
+    [[ $socket_active == true ]] || {
+      echo "active research gateway has no active socket" >&2
+      return 1
+    }
+    for key in binary systemd-service systemd-socket environment \
+      database-credential llm-credential; do
+      read -r state <"$snapshot/$key.state"
+      [[ $state == present ]] || {
+        echo "active research gateway snapshot is incomplete: $key" >&2
+        return 1
+      }
+    done
+    gateway_functional || {
+      echo "active research gateway is not functional" >&2
+      return 1
+    }
+  fi
+  previous_gateway_snapshot_ready=true
+}
+
+gateway_regular_matches_snapshot() {
+  local snapshot=$1 key=$2 path=$3 state
+  local snapshot_metadata path_metadata
+  read -r state <"$snapshot/$key.state" || return 1
+  if [[ $state == absent ]]; then
+    if [[ ! -e $path && ! -L $path ]]; then return 0; fi
+    return 1
+  fi
+  [[ $state == present && -f $snapshot/$key && ! -L $snapshot/$key &&
+     -f $path && ! -L $path ]] || return 1
+  cmp -s -- "$snapshot/$key" "$path" || return 1
+  snapshot_metadata=$(stat -c '%u:%g:%a' "$snapshot/$key") || return 1
+  path_metadata=$(stat -c '%u:%g:%a' "$path") || return 1
+  [[ $path_metadata == "$snapshot_metadata" ]] || return 1
+  return 0
+}
+
+verify_gateway_runtime_restore() {
+  local snapshot=$1 state expected actual uid gid mode
+  read -r state <"$snapshot/runtime-directory.state" || return 1
+  if [[ $state == absent ]]; then
+    [[ ! -e /run/vane-research-gateway &&
+       ! -L /run/vane-research-gateway ]] || {
+      echo "research gateway runtime directory should be absent" >&2
+      return 1
+    }
+    return 0
+  fi
+  [[ $state == present && -d /run/vane-research-gateway &&
+     ! -L /run/vane-research-gateway ]] || {
+    echo "research gateway runtime directory type did not restore" >&2
+    return 1
+  }
+  read -r uid <"$snapshot/runtime-directory.uid" || return 1
+  read -r gid <"$snapshot/runtime-directory.gid" || return 1
+  read -r mode <"$snapshot/runtime-directory.mode" || return 1
+  expected=$uid:$gid:$mode
+  actual=$(stat -c '%u:%g:%a' /run/vane-research-gateway) || return 1
+  [[ $actual == "$expected" ]] || {
+    echo "research gateway runtime directory metadata did not restore" >&2
+    return 1
+  }
+}
+
+prepare_gateway_regular_restore() {
+  local snapshot=$1 key=$2 path=$3 state
+  read -r state <"$snapshot/$key.state" || return 1
+  [[ $state == present || $state == absent ]] || {
+    echo "research gateway snapshot has an invalid path state: $key" >&2
+    return 1
+  }
+  rm -f -- "$path.rollback-next" || return 1
+  if [[ $state == present ]]; then
+    [[ -f $snapshot/$key && ! -L $snapshot/$key ]] || {
+      echo "research gateway snapshot is incomplete: $key" >&2
+      return 1
+    }
+    cp --archive --reflink=auto -- "$snapshot/$key" \
+      "$path.rollback-next" || {
+      echo "failed to prepare research gateway restore: $key" >&2
+      return 1
+    }
+  fi
+  gateway_regular_matches_snapshot "$snapshot" "$key" \
+    "$path.rollback-next" || {
+    echo "prepared research gateway restore does not match snapshot: $key" >&2
+    return 1
+  }
+}
+
+commit_gateway_regular_restore() {
+  local snapshot=$1 key=$2 path=$3 state
+  read -r state <"$snapshot/$key.state" || return 1
+  if [[ $state == present ]]; then
+    mv -f -- "$path.rollback-next" "$path" || {
+      echo "failed to commit research gateway restore: $key" >&2
+      return 1
+    }
+  else
+    rm -f -- "$path" || {
+      echo "failed to remove absent research gateway path: $key" >&2
+      return 1
+    }
+  fi
+  gateway_regular_matches_snapshot "$snapshot" "$key" "$path" || {
+    echo "committed research gateway restore does not match snapshot: $key" >&2
+    return 1
+  }
+}
+
+validate_gateway_restore_snapshot() {
+  local snapshot=$1 index key state name
+  local service_active socket_active
+  [[ -d $snapshot && ! -L $snapshot ]] || return 1
+  for name in service-active socket-active service-enabled socket-enabled; do
+    [[ -f $snapshot/$name && ! -L $snapshot/$name ]] || {
+      echo "research gateway snapshot is missing systemd state: $name" >&2
+      return 1
+    }
+    read -r state <"$snapshot/$name" || return 1
+    [[ $state == true || $state == false ]] || {
+      echo "research gateway snapshot has invalid systemd state: $name" >&2
+      return 1
+    }
+  done
+  read -r service_active <"$snapshot/service-active" || return 1
+  read -r socket_active <"$snapshot/socket-active" || return 1
+  [[ $service_active == false || $socket_active == true ]] || {
+    echo "research gateway snapshot has active service without socket" >&2
+    return 1
+  }
+
+  for index in "${!gateway_snapshot_keys[@]}"; do
+    key=${gateway_snapshot_keys[$index]}
+    [[ -f $snapshot/$key.state && ! -L $snapshot/$key.state ]] || {
+      echo "research gateway snapshot is missing path state: $key" >&2
+      return 1
+    }
+    read -r state <"$snapshot/$key.state" || return 1
+    [[ $state == present || $state == absent ]] || {
+      echo "research gateway snapshot has invalid path state: $key" >&2
+      return 1
+    }
+    if [[ $state == present ]]; then
+      [[ -f $snapshot/$key && ! -L $snapshot/$key ]] || {
+        echo "research gateway snapshot is missing member: $key" >&2
+        return 1
+      }
+    fi
+  done
+
+  [[ -f $snapshot/runtime-directory.state &&
+     ! -L $snapshot/runtime-directory.state ]] || {
+    echo "research gateway snapshot is missing runtime directory state" >&2
+    return 1
+  }
+  read -r state <"$snapshot/runtime-directory.state" || return 1
+  [[ $state == present || $state == absent ]] || {
+    echo "research gateway snapshot has invalid runtime directory state" >&2
+    return 1
+  }
+  if [[ $state == present ]]; then
+    for name in uid gid mode; do
+      [[ -f $snapshot/runtime-directory.$name &&
+         ! -L $snapshot/runtime-directory.$name ]] || {
+        echo "research gateway snapshot is missing runtime metadata: $name" >&2
+        return 1
+      }
+    done
+    read -r state <"$snapshot/runtime-directory.uid" || return 1
+    [[ $state =~ ^[0-9]+$ ]] || return 1
+    read -r state <"$snapshot/runtime-directory.gid" || return 1
+    [[ $state =~ ^[0-9]+$ ]] || return 1
+    read -r state <"$snapshot/runtime-directory.mode" || return 1
+    [[ $state =~ ^[0-7]{3,4}$ ]] || return 1
+  fi
+}
+
+gateway_unit_active_boolean() {
+  local unit=$1 output status=0
+  if output=$(systemctl is-active "$unit" 2>/dev/null); then
+    status=0
+  else
+    status=$?
+  fi
+  case "$output:$status" in
+    active:0) printf 'true\n' ;;
+    inactive:*|failed:*|unknown:*) printf 'false\n' ;;
+    *)
+      echo "unable to determine research gateway active state: $unit" >&2
+      return 1
+      ;;
+  esac
+}
+
+gateway_unit_enabled_boolean() {
+  local unit=$1 output status=0
+  if output=$(systemctl is-enabled "$unit" 2>/dev/null); then
+    status=0
+  else
+    status=$?
+  fi
+  case "$output:$status" in
+    enabled:0|enabled-runtime:0|linked:0|linked-runtime:0|alias:0)
+      printf 'true\n'
+      ;;
+    disabled:*|masked:*|masked-runtime:*|static:*|indirect:*|generated:*|transient:*|not-found:*|bad:*)
+      printf 'false\n'
+      ;;
+    *)
+      echo "unable to determine research gateway enablement: $unit" >&2
+      return 1
+      ;;
+  esac
+}
+
+quiesce_gateway_unit() {
+  local unit=$1 active enabled
+  active=$(gateway_unit_active_boolean "$unit") || return 1
+  if [[ $active == true ]]; then
+    systemctl stop "$unit" || {
+      echo "failed to stop research gateway unit: $unit" >&2
+      return 1
+    }
+    active=$(gateway_unit_active_boolean "$unit") || return 1
+    [[ $active == false ]] || {
+      echo "research gateway unit remained active after stop: $unit" >&2
+      return 1
+    }
+  fi
+  enabled=$(gateway_unit_enabled_boolean "$unit") || return 1
+  if [[ $enabled == true ]]; then
+    systemctl disable "$unit" >/dev/null || {
+      echo "failed to disable research gateway unit: $unit" >&2
+      return 1
+    }
+    enabled=$(gateway_unit_enabled_boolean "$unit") || return 1
+    [[ $enabled == false ]] || {
+      echo "research gateway unit remained enabled after disable: $unit" >&2
+      return 1
+    }
+  fi
+}
+
+verify_gateway_systemd_snapshot() {
+  local snapshot=$1 expected actual name unit
+  for name in service socket; do
+    unit=vane-research-gateway.$name
+    read -r expected <"$snapshot/$name-active" || return 1
+    actual=$(gateway_unit_active_boolean "$unit") || return 1
+    [[ $actual == "$expected" ]] || {
+      echo "research gateway active state did not converge: $unit" >&2
+      return 1
+    }
+    read -r expected <"$snapshot/$name-enabled" || return 1
+    actual=$(gateway_unit_enabled_boolean "$unit") || return 1
+    [[ $actual == "$expected" ]] || {
+      echo "research gateway enablement did not converge: $unit" >&2
+      return 1
+    }
+  done
+}
+
+restore_previous_gateway_release() (
+  set -uo pipefail
+  local snapshot=$rollback_dir/gateway index key path state name
+  local runtime_uid runtime_gid runtime_mode
+  local service_active socket_active service_enabled socket_enabled
+  local service_unit_known=false socket_unit_known=false
+  local gateway_pid gateway_exe attempt
+  [[ $previous_gateway_snapshot_ready == true && -d $snapshot &&
+     ! -L $snapshot ]] || return 1
+  validate_gateway_restore_snapshot "$snapshot" || return 1
+  read -r service_active <"$snapshot/service-active" || return 1
+  read -r socket_active <"$snapshot/socket-active" || return 1
+  read -r service_enabled <"$snapshot/service-enabled" || return 1
+  read -r socket_enabled <"$snapshot/socket-enabled" || return 1
+
+  # Every snapshot member and state is validated before even scratch files are
+  # prepared. Every prepare must succeed before live services or paths change.
+  for index in "${!gateway_snapshot_keys[@]}"; do
+    key=${gateway_snapshot_keys[$index]}
+    path=${gateway_snapshot_paths[$index]}
+    prepare_gateway_regular_restore "$snapshot" "$key" "$path" || return 1
+  done
+  read -r state <"$snapshot/runtime-directory.state" || return 1
+  if [[ $state == present ]]; then
+    read -r runtime_uid <"$snapshot/runtime-directory.uid" || return 1
+    read -r runtime_gid <"$snapshot/runtime-directory.gid" || return 1
+    read -r runtime_mode <"$snapshot/runtime-directory.mode" || return 1
+  fi
+
+  if [[ -e /etc/systemd/system/vane-research-gateway.service ||
+        -L /etc/systemd/system/vane-research-gateway.service ]]; then
+    service_unit_known=true
+  fi
+  if [[ -e /etc/systemd/system/vane-research-gateway.socket ||
+        -L /etc/systemd/system/vane-research-gateway.socket ]]; then
+    socket_unit_known=true
+  fi
+  read -r state <"$snapshot/systemd-service.state" || return 1
+  if [[ $state == present ]]; then service_unit_known=true; fi
+  read -r state <"$snapshot/systemd-socket.state" || return 1
+  if [[ $state == present ]]; then socket_unit_known=true; fi
+
+  quiesce_gateway_unit vane-research-gateway.service || return 1
+  quiesce_gateway_unit vane-research-gateway.socket || return 1
+  if [[ $service_unit_known == true ]]; then
+    systemctl reset-failed vane-research-gateway.service || return 1
+  fi
+  if [[ $socket_unit_known == true ]]; then
+    systemctl reset-failed vane-research-gateway.socket || return 1
+  fi
+
+  for index in "${!gateway_snapshot_keys[@]}"; do
+    key=${gateway_snapshot_keys[$index]}
+    path=${gateway_snapshot_paths[$index]}
+    commit_gateway_regular_restore "$snapshot" "$key" "$path" || return 1
+  done
+
+  read -r state <"$snapshot/runtime-directory.state" || return 1
+  if [[ $state == present ]]; then
+    if [[ -e /run/vane-research-gateway ||
+          -L /run/vane-research-gateway ]]; then
+      [[ -d /run/vane-research-gateway &&
+         ! -L /run/vane-research-gateway ]] || return 1
+    else
+      mkdir -- /run/vane-research-gateway || return 1
+    fi
+    chown "$runtime_uid:$runtime_gid" \
+      /run/vane-research-gateway || return 1
+    chmod "$runtime_mode" /run/vane-research-gateway || return 1
+  elif [[ -e /run/vane-research-gateway ||
+          -L /run/vane-research-gateway ]]; then
+    [[ -d /run/vane-research-gateway &&
+       ! -L /run/vane-research-gateway ]] || return 1
+    rmdir -- /run/vane-research-gateway || return 1
+  fi
+  verify_gateway_runtime_restore "$snapshot" || return 1
+  systemctl daemon-reload || return 1
+  if [[ $socket_enabled == true ]]; then
+    systemctl enable vane-research-gateway.socket >/dev/null || return 1
+  fi
+  if [[ $service_enabled == true ]]; then
+    systemctl enable vane-research-gateway.service >/dev/null || return 1
+  fi
+  if [[ $socket_active == true ]]; then
+    systemctl start vane-research-gateway.socket || return 1
+  fi
+  if [[ $service_active == true ]]; then
+    systemctl start vane-research-gateway.service || return 1
+  fi
+  verify_gateway_systemd_snapshot "$snapshot" || return 1
+  verify_gateway_runtime_restore "$snapshot" || return 1
+  if [[ $service_active == false ]]; then
+    echo "previous quiescent research gateway contract restored" >&2
+    return 0
+  fi
+  for attempt in {1..12}; do
+    gateway_pid=$(systemctl show vane-research-gateway.service \
+      --property=MainPID --value) || return 1
+    gateway_exe=
+    if [[ $gateway_pid =~ ^[1-9][0-9]*$ ]]; then
+      gateway_exe=$(readlink /proc/"$gateway_pid"/exe 2>/dev/null || true)
+    fi
+    if [[ $gateway_exe == /opt/vane/bin/vane-research-gateway ]] &&
+       gateway_functional; then
+      verify_gateway_systemd_snapshot "$snapshot" || return 1
+      verify_gateway_runtime_restore "$snapshot" || return 1
+      echo "previous research gateway contract recovery verified" >&2
+      return 0
+    fi
+    sleep 1
+  done
+  echo "previous research gateway contract recovery failed readiness" >&2
+  return 1
+)
+
 commit_legacy_primary_release() {
   local owner_env_source
   [[ $previous_vane_snapshot_ready == true &&
@@ -730,6 +1241,19 @@ cleanup_remote_deploy() {
   local status=$?
   trap - EXIT
   set +e
+  if [[ $status -ne 0 && $gateway_recovery_required == true ]]; then
+    if [[ $previous_gateway_snapshot_ready == true ]]; then
+      echo "deployment failed after research gateway promotion;" \
+        "restoring its previous runtime contract" >&2
+      if ! restore_previous_gateway_release; then
+        preserve_gateway_snapshot=true
+        echo "previous research gateway recovery failed; snapshot is preserved at $rollback_dir" >&2
+      fi
+    else
+      preserve_gateway_snapshot=true
+      echo "research gateway promotion has no trusted rollback snapshot; automatic recovery is refused" >&2
+    fi
+  fi
   if [[ $old_vane_recovery_required == true ]]; then
     if [[ $old_vane_restart_safe == true &&
           $previous_vane_snapshot_ready == true ]]; then
@@ -746,13 +1270,30 @@ cleanup_remote_deploy() {
     fi
   fi
   if [[ -e $rollback_dir || -L $rollback_dir ]]; then
-    if [[ $preserve_vane_snapshot == true ]]; then
+    if [[ $preserve_vane_snapshot == true ||
+          $preserve_gateway_snapshot == true ]]; then
       echo "vane rollback snapshot retained: $rollback_dir" >&2
     else
       rm -rf -- "$rollback_dir"
     fi
   fi
   rm -f -- /etc/systemd/system/vane.service.release-next \
+    /etc/systemd/system/vane-research-gateway.service.release-next \
+    /etc/systemd/system/vane-research-gateway.service.rollback-next \
+    /etc/systemd/system/vane-research-gateway.socket.release-next \
+    /etc/systemd/system/vane-research-gateway.socket.rollback-next \
+    /opt/vane/bin/vane-research-gateway.release-next \
+    /opt/vane/bin/vane-research-gateway.rollback-next \
+    /opt/vane/vane-research-gateway.service.release-next \
+    /opt/vane/vane-research-gateway.service.rollback-next \
+    /opt/vane/vane-research-gateway.socket.release-next \
+    /opt/vane/vane-research-gateway.socket.rollback-next \
+    /opt/vane/env/research-gateway.env.next \
+    /opt/vane/env/research-gateway.env.rollback-next \
+    /etc/vane/credentials/gateway_db_url.next \
+    /etc/vane/credentials/gateway_db_url.rollback-next \
+    /etc/vane/credentials/research_llm_api_key_gen1.next \
+    /etc/vane/credentials/research_llm_api_key_gen1.rollback-next \
     /opt/vane/env/server-owner-compat.env.release-next \
     /opt/vane/env/server.env.release-next \
     /opt/vane/env/server.env.release-next.stage-next
@@ -1022,6 +1563,7 @@ esac
 # its old unit untouched.
 validate_legacy_compat_unit "$stage/vane-legacy-compat.service"
 validate_native_v3_edit_recovery_unit "$stage/vane.service"
+validate_gateway_unit "$stage/vane-research-gateway.service"
 expected_server_release_contract='vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1'
 actual_server_release_contract=$(
   env -i PATH=/usr/bin:/bin "$stage/bin/vane" -print-release-contract
@@ -1030,6 +1572,11 @@ actual_server_release_contract=$(
   echo "incoming vane binary has an unexpected release contract" >&2
   exit 1
 }
+
+# The current gateway remains live throughout the migration gate. Capture its
+# complete process contract before bootstrap can rotate its environment or
+# credentials. First deployments record a deliberate absent state.
+snapshot_previous_gateway_release
 
 assert_gateway_peer_and_credential_boundary() {
   local allowed_uid credential
@@ -1059,7 +1606,9 @@ assert_gateway_peer_and_credential_boundary() {
   done
 }
 install -m 0755 "$stage/bin/vane" /opt/vane/bin/vane.next
-for binary in useradmin gate runtimeadmin vane-migrate vane-research-gateway \
+install -m 0755 "$stage/bin/vane-research-gateway" \
+  /opt/vane/bin/vane-research-gateway.release-next
+for binary in useradmin gate runtimeadmin vane-migrate \
   vane-research-prepare researchshadow researchcutover; do
   install -m 0755 "$stage/bin/$binary" "/opt/vane/bin/$binary"
 done
@@ -1072,9 +1621,9 @@ install -m 0644 "$stage/vane-legacy-compat.service" \
   /opt/vane/vane-legacy-compat.service
 install -m 0644 "$stage/vane-migrate.service" /opt/vane/vane-migrate.service
 install -m 0644 "$stage/vane-research-gateway.service" \
-  /opt/vane/vane-research-gateway.service
+  /opt/vane/vane-research-gateway.service.release-next
 install -m 0644 "$stage/vane-research-gateway.socket" \
-  /opt/vane/vane-research-gateway.socket
+  /opt/vane/vane-research-gateway.socket.release-next
 install -m 0644 \
   "$stage/dynamicconfig/development-sql.yaml" \
   /opt/vane/dynamicconfig/development-sql.yaml
@@ -1095,16 +1644,36 @@ chmod 0400 /etc/vane/credentials/migration_db_url.next
 mv -f /etc/vane/credentials/migration_db_url.next \
   /etc/vane/credentials/migration_db_url
 
+# test-anchor: gateway-migration-gate-begin
+# Migration is a deploy-time gate, never a boot dependency or enabled unit.
+# A uniquely named transient unit prevents a failure from propagating through
+# an older live gateway's Requires=vane-migrate.service relationship.
+systemctl disable vane-migrate.service >/dev/null || true
+migration_run_unit=vane-deploy-migrate-${stage##*/.deploy-}
+systemd-run --quiet --wait --collect --unit="$migration_run_unit" \
+  --property=Type=oneshot \
+  --property=User=vane-migrate \
+  --property=Group=vane-migrate \
+  --property=WorkingDirectory=/opt/vane \
+  --property=LoadCredential=migration_db_url:/etc/vane/credentials/migration_db_url \
+  --property=NoNewPrivileges=yes \
+  --property=ProtectSystem=strict \
+  --property=ProtectHome=yes \
+  --property=PrivateTmp=yes \
+  --property=PrivateDevices=yes \
+  --property=ProtectProc=invisible \
+  --property=RestrictSUIDSGID=yes \
+  --property=LockPersonality=yes \
+  --property=MemoryDenyWriteExecute=yes \
+  --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
+  --property=TimeoutStartSec=6min \
+  /opt/vane/bin/vane-migrate
+# test-anchor: gateway-migration-gate-end
+# Only a successful gate may update the disabled diagnostic unit on disk.
 install -m 0644 /opt/vane/vane-migrate.service \
   /etc/systemd/system/vane-migrate.service
-install -m 0644 /opt/vane/vane-research-gateway.service \
-  /etc/systemd/system/vane-research-gateway.service
-install -m 0644 /opt/vane/vane-research-gateway.socket \
-  /etc/systemd/system/vane-research-gateway.socket
 systemctl daemon-reload
-systemctl enable vane-migrate.service vane-research-gateway.service \
-  vane-research-gateway.socket >/dev/null
-systemctl restart vane-migrate.service
+systemctl disable vane-migrate.service >/dev/null || true
 provision_native_v3_edit_recovery_runtime
 
 bootstrap_marker=/etc/vane/credentials/runtime_bootstrap_v1.complete
@@ -1242,6 +1811,9 @@ if [[ ! -f $bootstrap_marker ]]; then
   chmod 0600 /opt/vane/env/server.env.next
   mv -f /opt/vane/env/server.env.next /opt/vane/env/server.env
 
+  # From the first live gateway configuration mutation onward, every failure
+  # must restore the per-path snapshot captured before the migration gate.
+  gateway_recovery_required=true
   {
     printf 'VANE_GATEWAY_ALLOWED_UID=%s\n' "$vane_uid"
     printf '%s\n' 'VANE_GATEWAY_LLM_ROUTES_JSON='"'"'[{"provider":"deepseek","endpoint_id":"deepseek-compatible-primary","endpoint_generation":1,"credential_id":"llm-primary","credential_generation":1,"base_url":"https://api.deepseek.com/v1"}]'"'"''
@@ -1292,6 +1864,9 @@ chmod 0640 /opt/vane/env/server.env
 assert_restricted_server_environment_readonly
 assert_restricted_server_environment_readonly \
   /opt/vane/env/server.env.release-next
+# Existing bootstraps skip the creation block above, so arm recovery before
+# the first unconditional gateway metadata mutation as well.
+gateway_recovery_required=true
 chown vane-research-gateway:vane-research-gateway \
   /opt/vane/env/research-gateway.env \
   /etc/vane/credentials/gateway_db_url \
@@ -1321,8 +1896,45 @@ if [[ -L /run/vane-research-gateway || \
   exit 1
 fi
 install -d -o root -g root -m 0711 /run/vane-research-gateway
-systemctl enable --now vane-research-gateway.socket
-systemctl restart vane-research-gateway.service
+[[ -f /opt/vane/bin/vane-research-gateway.release-next &&
+   ! -L /opt/vane/bin/vane-research-gateway.release-next &&
+   -f /opt/vane/vane-research-gateway.service.release-next &&
+   ! -L /opt/vane/vane-research-gateway.service.release-next &&
+   -f /opt/vane/vane-research-gateway.socket.release-next &&
+   ! -L /opt/vane/vane-research-gateway.socket.release-next ]] || {
+  echo "research gateway promotion set is incomplete" >&2
+  exit 1
+}
+
+# Migration and bootstrap are complete. From the first availability-changing
+# operation until final deploy verification, every failure restores the
+# captured gateway contract; database migrations are intentionally forward-only.
+gateway_recovery_required=true
+systemctl stop vane-research-gateway.service || true
+systemctl stop vane-research-gateway.socket || true
+systemctl disable vane-research-gateway.service \
+  vane-research-gateway.socket >/dev/null || true
+install -m 0644 /opt/vane/vane-research-gateway.service.release-next \
+  /etc/systemd/system/vane-research-gateway.service.release-next
+install -m 0644 /opt/vane/vane-research-gateway.socket.release-next \
+  /etc/systemd/system/vane-research-gateway.socket.release-next
+mv -f -- /opt/vane/bin/vane-research-gateway.release-next \
+  /opt/vane/bin/vane-research-gateway
+mv -f -- /opt/vane/vane-research-gateway.service.release-next \
+  /opt/vane/vane-research-gateway.service
+mv -f -- /opt/vane/vane-research-gateway.socket.release-next \
+  /opt/vane/vane-research-gateway.socket
+mv -f -- /etc/systemd/system/vane-research-gateway.service.release-next \
+  /etc/systemd/system/vane-research-gateway.service
+mv -f -- /etc/systemd/system/vane-research-gateway.socket.release-next \
+  /etc/systemd/system/vane-research-gateway.socket
+systemctl daemon-reload
+systemctl reset-failed vane-research-gateway.service \
+  vane-research-gateway.socket || true
+systemctl enable vane-research-gateway.socket \
+  vane-research-gateway.service >/dev/null
+systemctl start vane-research-gateway.socket
+systemctl start vane-research-gateway.service
 gateway_exe=
 for attempt in {1..12}; do
   gateway_exe=
@@ -1530,3 +2142,4 @@ env -i PATH=/usr/bin:/bin \
   CREDENTIALS_DIRECTORY=/etc/vane/credentials \
   /opt/vane/bin/gate -env /opt/vane/env/server.env
 old_vane_recovery_required=false
+gateway_recovery_required=false
