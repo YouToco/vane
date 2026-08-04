@@ -222,13 +222,14 @@ func (f *researchV3CutoverJournalFake) RevokeResearchV3DeliveryAuthority(
 }
 
 type researchV3ScheduleRemoteFake struct {
-	schedule       *schedulepb.Schedule
-	token          int
-	updates        []*schedulepb.Schedule
-	lostAfterApply map[int]bool
-	requireRevoked *bool
-	requestReceipt map[string]bool
-	describeCalls  int
+	schedule         *schedulepb.Schedule
+	token            int
+	updates          []*schedulepb.Schedule
+	lostAfterApply   map[int]bool
+	requireRevoked   *bool
+	requestReceipt   map[string]bool
+	runningWorkflows []*commonpb.WorkflowExecution
+	describeCalls    int
 }
 
 func (f *researchV3ScheduleRemoteFake) Describe(
@@ -238,6 +239,10 @@ func (f *researchV3ScheduleRemoteFake) Describe(
 	return &workflowservice.DescribeScheduleResponse{
 		Schedule:      proto.Clone(f.schedule).(*schedulepb.Schedule),
 		ConflictToken: []byte{byte(f.token)},
+		Info: &schedulepb.ScheduleInfo{
+			RunningWorkflows: append([]*commonpb.WorkflowExecution(nil),
+				f.runningWorkflows...),
+		},
 	}, nil
 }
 
@@ -408,6 +413,65 @@ func TestResearchV3CutoverBindsPlanDigestAndReplaysSameKey(t *testing.T) {
 	if _, err := coordinator.CutoverWithPreflight(
 		t.Context(), scope, req, strings.Repeat("e", 64)); types.CodeOf(err) != types.CodeConflict || len(remote.updates) != updates {
 		t.Fatalf("replay digest drift err=%v updates=%d/%d", err, len(remote.updates), updates)
+	}
+}
+
+func TestResearchV3CutoverRevalidatesExternalPreflightBeforeJournal(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*researchV3ScheduleRemoteFake)
+	}{
+		{
+			name: "schedule drift",
+			mutate: func(remote *researchV3ScheduleRemoteFake) {
+				remote.schedule.Spec.CronString[0] = "0 10 * * 1"
+			},
+		},
+		{
+			name: "pause state drift",
+			mutate: func(remote *researchV3ScheduleRemoteFake) {
+				remote.schedule.State.Paused = true
+			},
+		},
+		{
+			name: "running workflow appeared",
+			mutate: func(remote *researchV3ScheduleRemoteFake) {
+				remote.runningWorkflows = []*commonpb.WorkflowExecution{{}}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			journal := researchV3CutoverJournalForTest()
+			remote := &researchV3ScheduleRemoteFake{
+				schedule: researchV3MondaySchedule(t),
+			}
+			coordinator := researchV3CutoverCoordinatorForTest(t, journal, remote)
+			req := researchV3CutoverRequest{
+				TaskID: "task-kimi", UserID: 42,
+				IdempotencyKey: "adversarial-revalidation-" + test.name,
+			}
+			scope := types.ResearchV3OperatorScope{
+				TenantID: journal.schedule.TenantID, UserID: journal.schedule.UserID,
+				TaskID: journal.schedule.ID, Status: journal.schedule.Status,
+				ExecutionMode: journal.schedule.ExecutionMode,
+				SpecJSON:      append([]byte(nil), journal.schedule.SpecJSON...),
+			}
+			inspection, err := coordinator.Preflight(t.Context(), scope, req)
+			if err != nil || !inspection.Ready || remote.describeCalls != 1 {
+				t.Fatalf("initial preflight=%+v describes=%d err=%v",
+					inspection, remote.describeCalls, err)
+			}
+			test.mutate(remote)
+			if _, err := coordinator.CutoverWithPreflight(
+				t.Context(), scope, req, inspection.PlanDigest,
+			); types.CodeOf(err) != types.CodeConflict {
+				t.Fatalf("drifted cutover error=%v, want conflict", err)
+			}
+			if journal.op.ID != 0 || len(remote.updates) != 0 || remote.describeCalls != 2 {
+				t.Fatalf("drift crossed preflight fence: operation=%d CAS=%d describes=%d",
+					journal.op.ID, len(remote.updates), remote.describeCalls)
+			}
+		})
 	}
 }
 

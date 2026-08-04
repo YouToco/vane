@@ -23,6 +23,9 @@ func TestMigration116KeepsRecoveryDiscoveryNarrowAndShadowOnly(t *testing.T) {
 	for _, required := range []string{
 		"RETURNS TABLE(task_id TEXT)",
 		"SECURITY DEFINER",
+		"GRANT SELECT (prepared_schedule_status)",
+		"REVOKE SELECT (prepared_schedule_status)",
+		"length(definition)-length(replace(definition,needle,''))<>",
 		"current_setting('role',true)<>'vane_app'",
 		"pg_has_role(session_user,'vane_app','MEMBER')",
 		"schedule.status IN ('active','paused')",
@@ -42,6 +45,7 @@ func TestMigration116KeepsRecoveryDiscoveryNarrowAndShadowOnly(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		"GRANT SELECT ON research_v3_delivery_authorities TO vane_app",
+		"strpos(replace(definition,needle,''),needle)>0",
 		"RETURNS TABLE(tenant_id",
 		"RETURNS TABLE(user_id",
 		"GRANT vane_research_v3_cutover_operator TO vane_server_runtime",
@@ -49,6 +53,142 @@ func TestMigration116KeepsRecoveryDiscoveryNarrowAndShadowOnly(t *testing.T) {
 		if strings.Contains(source, forbidden) {
 			t.Fatalf("migration 116 exposes forbidden authority %q", forbidden)
 		}
+	}
+}
+
+func TestMigration116VaneAppPreparedStatusPrivilegeIsSymmetricPostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	database, provider := newMigration116ScratchProvider(t, databaseURL)
+	if _, err := provider.UpTo(t.Context(), 116); err != nil {
+		t.Fatal(err)
+	}
+	var granted bool
+	if err := database.QueryRowContext(t.Context(), `SELECT has_column_privilege(
+		'vane_app','public.research_v3_prepared_definition_heads',
+		'prepared_schedule_status','SELECT')`).Scan(&granted); err != nil {
+		t.Fatal(err)
+	}
+	if !granted {
+		t.Fatal("vane_app cannot read migration 116 prepared status")
+	}
+	tx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(t.Context(), `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.QueryContext(t.Context(), `
+		SELECT prepared_schedule_status
+		  FROM research_v3_prepared_definition_heads
+		 LIMIT 0`)
+	if err != nil {
+		t.Fatalf("vane_app SELECT prepared status: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := provider.DownTo(t.Context(), 115); err != nil {
+		t.Fatal(err)
+	}
+	var residualPrivileges int
+	if err := database.QueryRowContext(t.Context(), `SELECT count(*)
+		FROM information_schema.column_privileges
+		WHERE table_schema='public'
+		  AND table_name='research_v3_prepared_definition_heads'
+		  AND column_name='prepared_schedule_status'
+		  AND grantee='vane_app'`).Scan(&residualPrivileges); err != nil {
+		t.Fatal(err)
+	}
+	if residualPrivileges != 0 {
+		t.Fatalf("migration 116 Down retained %d prepared-status grants",
+			residualPrivileges)
+	}
+}
+
+func TestMigration116RejectsDuplicateDynamicFunctionNeedlePostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	database, provider := newMigration116ScratchProvider(t, databaseURL)
+	if _, err := provider.UpTo(t.Context(), 115); err != nil {
+		t.Fatal(err)
+	}
+	const needle = "AND schedule.status='active'\n           AND head.execution_mode='discover_at_run'"
+	var definition string
+	if err := database.QueryRowContext(t.Context(), `SELECT pg_get_functiondef(
+		'public.admit_research_run_tool_step_cap_v1(bigint,bigint,integer)'::regprocedure)`,
+	).Scan(&definition); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(definition, needle) != 1 {
+		t.Fatalf("migration 115 admission needle count=%d",
+			strings.Count(definition, needle))
+	}
+	tampered := strings.Replace(definition, needle,
+		needle+"\n/*"+needle+"*/", 1)
+	if _, err := database.ExecContext(t.Context(), tampered); err != nil {
+		t.Fatalf("install duplicated admission needle: %v", err)
+	}
+	if _, err := provider.UpTo(t.Context(), 116); err == nil ||
+		!strings.Contains(err.Error(), "paused shadow admission patch is ambiguous") {
+		t.Fatalf("ambiguous dynamic function migration result: %v", err)
+	}
+	var version int64
+	if err := database.QueryRowContext(t.Context(),
+		`SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 115 {
+		t.Fatalf("ambiguous migration changed schema version to %d", version)
+	}
+}
+
+func TestMigration116DownRejectsDuplicateDynamicFunctionNeedlePostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	database, provider := newMigration116ScratchProvider(t, databaseURL)
+	if _, err := provider.UpTo(t.Context(), 116); err != nil {
+		t.Fatal(err)
+	}
+	const needle = "AND schedule.status IN ('active','paused')\n           AND head.prepared_schedule_status=schedule.status\n           AND head.execution_mode='discover_at_run'"
+	var definition string
+	if err := database.QueryRowContext(t.Context(), `SELECT pg_get_functiondef(
+		'public.admit_research_run_tool_step_cap_v1(bigint,bigint,integer)'::regprocedure)`,
+	).Scan(&definition); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(definition, needle) != 1 {
+		t.Fatalf("migration 116 admission needle count=%d",
+			strings.Count(definition, needle))
+	}
+	tampered := strings.Replace(definition, needle,
+		needle+"\n/*"+needle+"*/", 1)
+	if _, err := database.ExecContext(t.Context(), tampered); err != nil {
+		t.Fatalf("install duplicated rollback needle: %v", err)
+	}
+	if _, err := provider.DownTo(t.Context(), 115); err == nil ||
+		!strings.Contains(err.Error(), "paused shadow admission rollback is ambiguous") {
+		t.Fatalf("ambiguous dynamic function rollback result: %v", err)
+	}
+	var version int64
+	if err := database.QueryRowContext(t.Context(),
+		`SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 116 {
+		t.Fatalf("ambiguous rollback changed schema version to %d", version)
 	}
 }
 
@@ -267,4 +407,27 @@ func TestMigration116DownRejectsEnabledAuthorityAndCutoverAuditPostgres(t *testi
 	if version != 116 {
 		t.Fatalf("audit downgrade changed schema version to %d", version)
 	}
+}
+
+func newMigration116ScratchProvider(
+	t *testing.T, databaseURL string,
+) (*sql.DB, *goose.Provider) {
+	t.Helper()
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	database, err := sql.Open("pgx", scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, dir,
+		goose.WithAllowOutofOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return database, provider
 }

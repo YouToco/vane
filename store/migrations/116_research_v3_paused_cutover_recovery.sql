@@ -36,6 +36,12 @@ ALTER TABLE research_v3_prepared_definition_heads
     ADD CONSTRAINT ck_research_v3_prepared_head_status
         CHECK (prepared_schedule_status IN ('active','paused'));
 
+-- Migration 102 grants vane_app an explicit column allow-list rather than
+-- table-wide SELECT. New columns therefore need their own grant before any
+-- invoker-security read path can inspect the prepared status binding.
+GRANT SELECT (prepared_schedule_status)
+    ON research_v3_prepared_definition_heads TO vane_app;
+
 GRANT INSERT (original_schedule_status,preflight_digest)
     ON research_v3_cutover_operations TO vane_research_v3_cutover_operator;
 
@@ -57,8 +63,8 @@ BEGIN
         'public.authorize_research_run_effect_cap_v1(bigint)'::regprocedure
     ] LOOP
         definition := pg_get_functiondef(function_oid);
-        IF strpos(definition,needle)=0 OR
-           strpos(replace(definition,needle,''),needle)>0 THEN
+        IF length(definition)-length(replace(definition,needle,''))<>
+           length(needle) THEN
             RAISE EXCEPTION '116: paused shadow admission patch is ambiguous';
         END IF;
         EXECUTE replace(definition,needle,replacement);
@@ -68,8 +74,8 @@ BEGIN
     definition := pg_get_functiondef(function_oid);
     needle := '(is_shadow AND schedule_status<>''active'')';
     replacement := '(is_shadow AND (schedule_status NOT IN (''active'',''paused'') OR NOT EXISTS (SELECT 1 FROM public.research_v3_prepared_definition_heads status_head WHERE status_head.tenant_id=NEW.tenant_id AND status_head.user_id=NEW.user_id AND status_head.task_id=NEW.task_id AND status_head.prepared_schedule_status=schedule_status)))';
-    IF strpos(definition,needle)=0 OR
-       strpos(replace(definition,needle,''),needle)>0 THEN
+    IF length(definition)-length(replace(definition,needle,''))<>
+       length(needle) THEN
         RAISE EXCEPTION '116: paused shadow snapshot patch is ambiguous';
     END IF;
     EXECUTE replace(definition,needle,replacement);
@@ -78,8 +84,8 @@ BEGIN
     definition := pg_get_functiondef(function_oid);
     needle := E'AND operation.source_baseline_digest=NEW.source_baseline_digest\n           AND operation.phase=''prepared''';
     replacement := E'AND operation.source_baseline_digest=NEW.source_baseline_digest\n           AND operation.original_schedule_status=NEW.prepared_schedule_status\n           AND operation.phase=''prepared''';
-    IF strpos(definition,needle)=0 OR
-       strpos(replace(definition,needle,''),needle)>0 THEN
+    IF length(definition)-length(replace(definition,needle,''))<>
+       length(needle) THEN
         RAISE EXCEPTION '116: prepared status binding patch is ambiguous';
     END IF;
     EXECUTE replace(definition,needle,replacement);
@@ -191,8 +197,8 @@ BEGIN
         'public.authorize_research_run_effect_cap_v1(bigint)'::regprocedure
     ] LOOP
         definition := pg_get_functiondef(function_oid);
-        IF strpos(definition,needle)=0 OR
-           strpos(replace(definition,needle,''),needle)>0 THEN
+        IF length(definition)-length(replace(definition,needle,''))<>
+           length(needle) THEN
             RAISE EXCEPTION '116: paused shadow admission rollback is ambiguous';
         END IF;
         EXECUTE replace(definition,needle,replacement);
@@ -202,8 +208,8 @@ BEGIN
     definition := pg_get_functiondef(function_oid);
     needle := '(is_shadow AND (schedule_status NOT IN (''active'',''paused'') OR NOT EXISTS (SELECT 1 FROM public.research_v3_prepared_definition_heads status_head WHERE status_head.tenant_id=NEW.tenant_id AND status_head.user_id=NEW.user_id AND status_head.task_id=NEW.task_id AND status_head.prepared_schedule_status=schedule_status)))';
     replacement := '(is_shadow AND schedule_status<>''active'')';
-    IF strpos(definition,needle)=0 OR
-       strpos(replace(definition,needle,''),needle)>0 THEN
+    IF length(definition)-length(replace(definition,needle,''))<>
+       length(needle) THEN
         RAISE EXCEPTION '116: paused shadow snapshot rollback is ambiguous';
     END IF;
     EXECUTE replace(definition,needle,replacement);
@@ -212,8 +218,8 @@ BEGIN
     definition := pg_get_functiondef(function_oid);
     needle := E'AND operation.source_baseline_digest=NEW.source_baseline_digest\n           AND operation.original_schedule_status=NEW.prepared_schedule_status\n           AND operation.phase=''prepared''';
     replacement := E'AND operation.source_baseline_digest=NEW.source_baseline_digest\n           AND operation.phase=''prepared''';
-    IF strpos(definition,needle)=0 OR
-       strpos(replace(definition,needle,''),needle)>0 THEN
+    IF length(definition)-length(replace(definition,needle,''))<>
+       length(needle) THEN
         RAISE EXCEPTION '116: prepared status binding rollback is ambiguous';
     END IF;
     EXECUTE replace(definition,needle,replacement);
@@ -228,6 +234,8 @@ DROP TRIGGER protect_research_v3_cutover_scope_v2
 DROP FUNCTION protect_research_v3_cutover_scope_v2();
 REVOKE INSERT (original_schedule_status,preflight_digest)
     ON research_v3_cutover_operations FROM vane_research_v3_cutover_operator;
+REVOKE SELECT (prepared_schedule_status)
+    ON research_v3_prepared_definition_heads FROM vane_app;
 ALTER TABLE research_v3_cutover_operations
     DROP CONSTRAINT ck_research_v3_cutover_original_status,
     DROP CONSTRAINT ck_research_v3_cutover_preflight_digest,
