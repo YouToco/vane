@@ -379,16 +379,7 @@ func loadCurrentResearchDefinitionV3(
 }
 
 func isExactResearchV3ShadowWorkflowID(value string) bool {
-	const prefix = "research-v3-shadow-"
-	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+64 {
-		return false
-	}
-	for _, r := range value[len(prefix):] {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
-			return false
-		}
-	}
-	return true
+	return types.IsResearchV3ShadowWorkflowID(value)
 }
 
 func validateStoredResearchRunSnapshotV3(

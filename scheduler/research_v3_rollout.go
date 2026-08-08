@@ -256,5 +256,6 @@ func (r researchV3Rollout) shadowIDMatch(taskID string) bool {
 
 func researchShadowWorkflowID(taskID, idempotencyKey string) string {
 	digest := sha256.Sum256([]byte(taskID + "\x00" + idempotencyKey))
-	return fmt.Sprintf("research-v3-shadow-%s", hex.EncodeToString(digest[:]))
+	return fmt.Sprintf("%s%s", types.ResearchV3ShadowWorkflowIDPrefix,
+		hex.EncodeToString(digest[:]))
 }

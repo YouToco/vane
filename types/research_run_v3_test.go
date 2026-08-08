@@ -5,6 +5,26 @@ import (
 	"testing"
 )
 
+func TestResearchV3ShadowWorkflowIDIsExact(t *testing.T) {
+	valid := ResearchV3ShadowWorkflowIDPrefix + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: valid, want: true},
+		{value: ResearchV3ShadowWorkflowIDPrefix + strings.Repeat("0", 64), want: true},
+		{value: ResearchV3ShadowWorkflowIDPrefix + strings.Repeat("A", 64)},
+		{value: ResearchV3ShadowWorkflowIDPrefix + strings.Repeat("g", 64)},
+		{value: ResearchV3ShadowWorkflowIDPrefix + strings.Repeat("a", 63)},
+		{value: ResearchV3ShadowWorkflowIDPrefix + strings.Repeat("a", 65)},
+		{value: "scheduled-v3-" + strings.Repeat("a", 64)},
+	} {
+		if got := IsResearchV3ShadowWorkflowID(tc.value); got != tc.want {
+			t.Fatalf("IsResearchV3ShadowWorkflowID(%q)=%v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
 func TestResearchRunSnapshotRefV3SealsCutoffAndScope(t *testing.T) {
 	digest := strings.Repeat("a", 64)
 	identity := RunIdentity{
