@@ -94,7 +94,10 @@ func TestFetchRSS_AllDroppedIsAnError(t *testing.T) {
 // 连续 10 轮后还会把一个**完全健康**的源自动停用。所以判定必须发生在 lookback /
 // categories 之后，比较的是映射函数的入参与产出。
 func TestFetchRSS_LookbackFilteredAllIsNotAnError(t *testing.T) {
-	old := time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC1123Z)
+	// newTestFetcher pins its clock to testNow. Build the fixture from that
+	// same clock so the 30-day age cannot drift back inside the 7-day window
+	// as wall time advances.
+	old := testNow.Add(-30 * 24 * time.Hour).Format(time.RFC1123Z)
 	bodies := make([]string, 12)
 	for i := range bodies {
 		bodies[i] = fmt.Sprintf(

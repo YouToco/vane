@@ -641,6 +641,9 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		"runs-on: [self-hosted, Linux, vane-test]",
 		"permissions:\n  contents: read",
 		"persist-credentials: false",
+		"- 5432/tcp",
+		"${{ job.services.postgres.ports[5432] }}",
+		`--health-cmd "pg_isready -U vane -d vane_test"`,
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("source CI missing isolation guard %q", required)
@@ -653,6 +656,8 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		"VPS_",
 		"appleboy/",
 		"workflow_dispatch:",
+		"- 5432:5432",
+		"@localhost:5432/",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Errorf("source CI contains production capability %q", forbidden)
