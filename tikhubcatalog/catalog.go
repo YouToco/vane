@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/YouToco/vane/toolsearch"
 )
 
 //go:embed catalog.json
@@ -64,7 +66,7 @@ var (
 	agentByName  map[string]int
 	// platforms 平台名 → 端点数，供 search_endpoints 工具描述枚举可搜索范围。
 	platforms map[string]int
-	idx       *bm25Index
+	idx       *toolsearch.Index
 )
 
 // init 解析嵌入数据并建索引。catalog.json 是编译期常量（go:embed），解析失败
@@ -192,5 +194,5 @@ func Search(query, platform string, topK int) []Hit {
 	if topK <= 0 {
 		return nil
 	}
-	return idx.search(query, platform, topK)
+	return searchIndex(idx, query, platform, topK)
 }
