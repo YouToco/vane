@@ -996,11 +996,16 @@ func buildResearchHistoryManifestV3(
 		contextItem.researchHistoryManifestItemV3 = item
 		if payloadText != nil {
 			contextItem.PayloadText = *payloadText
+			// Retained V1 Briefs use a semantic artifact digest that is not the
+			// SHA-256 of their serialized payload. Legacy coverage therefore binds
+			// the immutable artifact digest and the visible-byte digest separately;
+			// exact V3 artifacts must bind both identities when fully visible.
 			if contextItem.ContextStoredSize < contextItem.ContextVisibleSize ||
 				!validResearchRunDigest(contextItem.ContextVisibleDigest) ||
 				researchRunSHA256([]byte(*payloadText)) != contextItem.ContextVisibleDigest ||
 				contextItem.ContextTruncated != (contextItem.ContextStoredSize > contextItem.ContextVisibleSize) ||
-				(!contextItem.ContextTruncated && contextItem.ContextVisibleDigest != item.Digest) {
+				(item.Coverage == "exact" && !contextItem.ContextTruncated &&
+					contextItem.ContextVisibleDigest != item.Digest) {
 				return nil, researchHistoryContextV3{}, researchRunIntegrityError()
 			}
 		} else if contextItem.ContextStoredSize != 0 || contextItem.ContextVisibleSize != 0 ||

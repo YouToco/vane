@@ -937,7 +937,7 @@ func TestResearchBriefSynthesisV3ReportsHistoryTruncation(t *testing.T) {
 		     tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,push_batch_id,
 		     schema_version,request_digest,payload_digest,payload,insight_count,generated_at
 		 ) VALUES ($1,$2,$3,9000000001,9000000002,9000000003,'vane.brief/v1',$4,
-		           encode(sha256(convert_to(repeat('x',33554432),'UTF8')),'hex'),
+		           $4,
 		           convert_to(repeat('x',33554432),'UTF8'),1,$5)
 		 RETURNING id`,
 		f.tenantID, f.userID, f.taskID, digest, cutoff.Add(-500*time.Millisecond)).Scan(&legacyBriefID); err != nil {
@@ -1023,7 +1023,8 @@ func TestResearchBriefSynthesisV3ReportsHistoryTruncation(t *testing.T) {
 	})
 	if err != nil || chunk.OffsetChars != 4096 || chunk.NextOffsetChars != 8192 ||
 		chunk.TotalChars != 32<<20 || chunk.TotalBytes != 32<<20 || chunk.Complete ||
-		chunk.Text != strings.Repeat("x", researchHistoryContextCharsV3) {
+		chunk.Text != strings.Repeat("x", researchHistoryContextCharsV3) ||
+		chunk.FullDigest != digest {
 		t.Fatalf("history continuation=%+v err=%v", chunk, err)
 	}
 }

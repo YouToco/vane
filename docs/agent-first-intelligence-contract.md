@@ -27,6 +27,12 @@ v1/v2 已封存到 `AgentToolEvidenceV1` 的历史结果保持原字节和原版
 
 `briefs` 只联合终态：V3 `finalized` 是 `truth_coverage=exact`；`ambiguous/failed` 只保留 `unavailable` 缺口，绝不猜测结论。大 Brief 与 Evidence 使用相同的 8,192 字符不可变窗口和签名 keyset 续读，不存在 64 KiB 单行导致的不可达尾部。投递连接必须同时匹配 brief、tenant、user、task、snapshot 与 plan 全坐标。
 
+V3 研究综合读取 retained V1 Brief 时，`brief_snapshots.payload_digest` 是旧协议的
+Brief 语义摘要，不保证等于序列化正文的 SHA-256。`coverage=legacy` 的历史项保留这个
+不可变 artifact digest，同时用独立的 `context_visible_digest` 校验模型实际看到的 UTF-8
+窗口；只有 `coverage=exact` 且正文未截断时，artifact digest 才必须同时等于完整正文摘要。
+任何 coverage 都不能跳过逐窗口摘要、长度、截断状态和 owner/task 范围校验。
+
 `feedbacks` 直接读取既有 canonical `feedbacks`，不复制成 Agent turn，也不创建专用反馈工具。`is_effective_attitude` 仅对 `interested/not_interested` 有值，并按当前画像 epoch 与 canonical supersession 规则确定；其他动作返回 null。旧 push-now 投递允许缺少 `task_ref/run_snapshot_id`，owner 仍可读取，定时 Agent 则由 exact-task fence 自动排除。`delivered_summary` 最多 2,000 字符，只用于把“刚才那条”关联回具体结论：migration 061 后已 sealed 的 canonical delivery 有不可变证据，旧/open delivery 仅是 `mixed` 的历史展示快照，不能宣称为 exact。Harness 会在通用查询返回前把该字段从可信反馈行删除，转成 historical public evidence sidecar；只有 Tools:nil 的公开摘要阶段能看到原文，最终无工具综合只看到来源绑定的降权摘要。数据集不返回内部 delivery ID、卡片 JSON 或原始网页正文。
 
 查询只接受列选择、参数化过滤、分组、固定聚合、排序、limit 与签名游标。单次只访问一个数据集；跨数据集问题由 Agent 发起多次只读查询，最后在无工具阶段综合。
