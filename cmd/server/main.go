@@ -644,7 +644,6 @@ func run() error {
 	// CreatePush path unreachable even if that guard regresses.
 	definitionEditController := task.NewDefinitionEditController(
 		st, definitionEditCoordinator,
-		agent.NewPlaybookTranslator(agentLLMClient, recorder),
 	)
 	var definitionEditToolController agent.DefinitionEditController
 	if cfg.Agent.DefinitionEditEnabled {

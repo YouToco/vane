@@ -1,11 +1,13 @@
 // 任务手册 P1（编译层）：把自然语言手册翻译成结构化抓取计划（fetch_plan）。
 //
-// 落点（docs/task-playbook-fetch-target-cutover.md）：手册正文变更时发**一次** LLM 调用
-// 翻译成计划，再经 fetchspec 校验。耐久 definition edit 把计划与手册冻结在同一版本；
-// 旧版独立手册工具仍可用下方 best-effort 胶水维护镜像。
+// 落点（docs/task-playbook-fetch-target-cutover.md）：
+// create_schedule / edit_task_definition 在存下手册正文后，各发**一次** LLM 调用把正文
+// 翻译成计划，经 fetchspec 校验后落库 schedule_playbooks.fetch_plan。运行时"按计划抓"
+// （Fetch 消费 fetch_plan）本轮**不接线**——编译层只做「翻译 + 校验 + 存 + 看」。
+// 打分/出卡的 M5 注入（§4）也不在本轮。
 //
-// best-effort 只适用于旧版独立手册工具：耐久 definition edit 中抓取计划已是运行权威，
-// 编译失败必须让整次编辑失败，绝不能出现“新手册配旧计划”的分叉。
+// best-effort 铁律：翻译/落库任何环节失败都只 slog、绝不影响主效果（调度已建、手册已存）。
+// 翻译是低频（仅建/改任务时各一次，决策 §10#6）且非功能性的增益，不值得为它回滚主效果。
 package agent
 
 import (
