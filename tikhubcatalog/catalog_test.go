@@ -1,6 +1,7 @@
 package tikhubcatalog
 
 import (
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -318,27 +319,27 @@ func TestPlatforms(t *testing.T) {
 	}
 }
 
-func TestTokenize(t *testing.T) {
-	cases := []struct {
-		in   string
-		want []string
+func TestSearch_RankingCompatibility(t *testing.T) {
+	for _, test := range []struct {
+		query string
+		want  []string
 	}{
-		{"fetch_post_detail", []string{"fetch", "post", "detail"}},
-		{"热榜数据", []string{"热榜", "榜数", "数据"}},
-		{"抖音Web端Hot榜", []string{"抖音", "web", "端", "hot", "榜"}},
-		{"", nil},
-		{"！！！", nil},
-	}
-	for _, c := range cases {
-		got := tokenize(c.in)
-		if len(got) != len(c.want) {
-			t.Errorf("tokenize(%q) = %v, want %v", c.in, got, c.want)
-			continue
+		{"抖音 热点 榜单", []string{"douyin_app_v3_fetch_hot_search_list", "douyin_creator_fetch_creator_material_center_related", "douyin_creator_fetch_creator_hot_spot_billboard", "douyin_billboard_fetch_hot_category_list", "weibo_web_v2_fetch_social_ranking"}},
+		{"douyin hot search board", []string{"douyin_app_v3_fetch_hot_search_list", "pipixia_app_fetch_hot_search_board_detail", "pipixia_app_fetch_hot_search_board_list", "kuaishou_app_fetch_hot_search_person", "kuaishou_web_fetch_kuaishou_hot_list_v2"}},
+		{"小红书 搜索 笔记", []string{"xiaohongshu_app_v2_get_image_note_detail", "xiaohongshu_app_v2_search_notes", "xiaohongshu_app_v2_get_video_note_detail", "xiaohongshu_app_v2_get_user_faved_notes", "xiaohongshu_app_v2_get_user_posted_notes"}},
+		{"tiktok user post video list", []string{"tiktok_app_v3_fetch_user_post_videos_v2", "tiktok_app_v3_fetch_user_post_videos_v3", "tiktok_web_fetch_post_comment", "tiktok_web_get_all_aweme_id", "tiktok_web_fetch_post_comment_reply"}},
+		{"知乎 热榜", []string{"zhihu_web_fetch_hot_list", "douyin_web_fetch_hot_search_result", "kuaishou_web_fetch_kuaishou_hot_list_v1", "kuaishou_web_fetch_kuaishou_hot_list_v2", "kuaishou_app_fetch_hot_board_categories"}},
+		{"微博 用户 主页", []string{"weibo_web_v2_fetch_user_recommend_timeline", "weibo_app_fetch_user_timeline", "weibo_web_fetch_user_posts", "toutiao_app_get_user_id", "linkedin_web_v2_get_user_posts"}},
+		{"bilibili 视频 详情", []string{"bilibili_web_fetch_one_video_v3", "bilibili_web_fetch_video_detail", "bilibili_web_fetch_one_video", "bilibili_web_fetch_one_video_v2", "bilibili_app_fetch_one_video"}},
+		{"youtube search video", []string{"youtube_web_search_video", "youtube_web_v2_get_shorts_search_v2", "youtube_web_get_video_info_v2", "youtube_web_v2_get_general_search", "youtube_web_get_relate_video"}},
+	} {
+		hits := Search(test.query, "", 5)
+		got := make([]string, len(hits))
+		for i := range hits {
+			got[i] = hits[i].Entry.Name
 		}
-		for i := range got {
-			if got[i] != c.want[i] {
-				t.Errorf("tokenize(%q)[%d] = %q, want %q", c.in, i, got[i], c.want[i])
-			}
+		if !reflect.DeepEqual(got, test.want) {
+			t.Errorf("Search(%q) = %#v, want %#v", test.query, got, test.want)
 		}
 	}
 }
