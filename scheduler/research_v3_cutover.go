@@ -743,14 +743,22 @@ func (c *researchV3CutoverCoordinator) resumeCutover(
 					"research V3 cutover lost its paused fence", types.ErrConflict)
 			} else {
 				current := op
-				op, err = c.journal.PromoteResearchV3PreparedDefinition(ctx, current)
-				if err != nil && types.CodeOf(err) == types.CodeConflict {
+				var promoted types.ResearchV3CutoverOperation
+				promoted, err = c.journal.PromoteResearchV3PreparedDefinition(ctx, current)
+				if err != nil && (types.CodeOf(err) == types.CodeConflict ||
+					errors.Is(err, types.ErrConflict)) {
 					op, err = c.recoverForwardStoreConflict(ctx, current, err)
 					if err != nil {
 						return types.ResearchV3CutoverOperation{}, err
 					}
 					continue
+				} else if err != nil {
+					// Store failures return a zero operation. Keep the exact task
+					// identity instead of masking the database error as a Temporal
+					// DescribeSchedule call with an empty schedule ID.
+					return types.ResearchV3CutoverOperation{}, err
 				}
+				op = promoted
 			}
 		case types.ResearchV3CutoverDefinitionPromoted:
 			if !observed.paused {

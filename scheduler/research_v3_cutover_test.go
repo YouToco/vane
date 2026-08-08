@@ -62,6 +62,7 @@ type researchV3CutoverJournalFake struct {
 	advanceConflict   types.ResearchV3CutoverPhase
 	advanceConcurrent types.ResearchV3CutoverPhase
 	promoteConcurrent bool
+	promoteErr        error
 	onBegin           func()
 	events            []string
 }
@@ -153,6 +154,9 @@ func (f *researchV3CutoverJournalFake) PromoteResearchV3PreparedDefinition(
 ) (types.ResearchV3CutoverOperation, error) {
 	if f.op.ID != op.ID || f.op.Phase != types.ResearchV3CutoverPaused {
 		return types.ResearchV3CutoverOperation{}, types.ErrConflict
+	}
+	if f.promoteErr != nil {
+		return types.ResearchV3CutoverOperation{}, f.promoteErr
 	}
 	f.op.Phase = types.ResearchV3CutoverDefinitionPromoted
 	f.events = append(f.events, "phase:"+string(f.op.Phase))
@@ -673,6 +677,27 @@ func TestResearchV3CutoverConcurrentResumeAdoptsAdvancedCheckpoint(t *testing.T)
 					remote.schedule.GetAction().GetStartWorkflow().GetWorkflowType().GetName())
 			}
 		})
+	}
+}
+
+func TestResearchV3CutoverReturnsDefinitionPromotionFailureWithoutLosingTaskIdentity(t *testing.T) {
+	want := errors.New("deferred definition integrity rejected promotion")
+	journal := researchV3CutoverJournalForTest()
+	journal.promoteErr = want
+	remote := &researchV3ScheduleRemoteFake{schedule: researchV3MondaySchedule(t)}
+	coordinator := researchV3CutoverCoordinatorForTest(t, journal, remote)
+
+	_, err := coordinator.Cutover(t.Context(), researchV3CutoverRequest{
+		TaskID: "task-kimi", UserID: 42, IdempotencyKey: "promotion-failure",
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("cutover error=%v, want promotion failure", err)
+	}
+	if remote.describeCalls != 4 {
+		t.Fatalf("describe calls=%d, want no empty-ID recovery read", remote.describeCalls)
+	}
+	if journal.op.TaskID != "task-kimi" || journal.op.Phase != types.ResearchV3CutoverPaused {
+		t.Fatalf("journal identity/phase changed: %+v", journal.op)
 	}
 }
 

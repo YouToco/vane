@@ -556,6 +556,90 @@ func TestResearchV3CutoverPromotesAndRestoresDefinitionHeadPostgres(t *testing.T
 	}
 }
 
+func TestResearchV3CutoverKeepsLegacySnapshotPinDormantAndReversiblePostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL is required")
+	}
+	fixture := newTaskRunSnapshotCutoverFixture(t)
+	st := fixture.base.st
+	useOwnerResearchRuntimeForTest(st)
+	ctx := t.Context()
+
+	policy := researchV3PreparePolicyForTest()
+	policy.TenantID = fixture.base.tenantID
+	policy.UserID = fixture.base.userID
+	policy.TaskID = fixture.taskID
+	policy.IdempotencyKey = "dormant-pin-prepare"
+	prepared, err := st.PrepareResearchV3Definition(ctx, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := researchV3CutoverParamsForTest(
+		fixture.base.tenantID, fixture.base.userID, fixture.taskID,
+		"dormant-pin-cutover", prepared.Target)
+	op, err := st.BeginResearchV3Cutover(ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err = st.AdvanceResearchV3Cutover(ctx, op,
+		types.ResearchV3CutoverPrepared, types.ResearchV3CutoverPauseRequested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err = st.AdvanceResearchV3Cutover(ctx, op,
+		types.ResearchV3CutoverPauseRequested, types.ResearchV3CutoverPaused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err = st.PromoteResearchV3PreparedDefinition(ctx, op)
+	if err != nil {
+		t.Fatalf("promote with dormant V2 pin: %v", err)
+	}
+	var mode, action string
+	var pointer int64
+	if err := st.pool.QueryRow(ctx, `SELECT s.execution_mode,
+		s.run_snapshot_cutover_event_id,e.action
+		FROM schedules s JOIN task_run_snapshot_v2_cutover_events e
+		  ON e.id=s.run_snapshot_cutover_event_id
+		WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3`,
+		fixture.base.tenantID, fixture.base.userID, fixture.taskID,
+	).Scan(&mode, &pointer, &action); err != nil {
+		t.Fatal(err)
+	}
+	if mode != string(types.ExecutionModeDiscoverAtRun) ||
+		pointer != fixture.eventID || action != "activate" {
+		t.Fatalf("promoted dormant pin mode=%s pointer=%d action=%s",
+			mode, pointer, action)
+	}
+
+	if err := st.RevokeResearchV3DeliveryAuthority(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	op, err = st.AdvanceResearchV3Cutover(ctx, op,
+		types.ResearchV3CutoverDefinitionPromoted,
+		types.ResearchV3CutoverRollbackPaused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.RestoreResearchV3OriginalDefinition(ctx, op); err != nil {
+		t.Fatalf("restore dormant V2 pin: %v", err)
+	}
+	if err := st.pool.QueryRow(ctx, `SELECT s.execution_mode,
+		s.run_snapshot_cutover_event_id,e.action
+		FROM schedules s JOIN task_run_snapshot_v2_cutover_events e
+		  ON e.id=s.run_snapshot_cutover_event_id
+		WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3`,
+		fixture.base.tenantID, fixture.base.userID, fixture.taskID,
+	).Scan(&mode, &pointer, &action); err != nil {
+		t.Fatal(err)
+	}
+	if mode != string(types.ExecutionModeCompiled) ||
+		pointer != fixture.eventID || action != "activate" {
+		t.Fatalf("restored active pin mode=%s pointer=%d action=%s",
+			mode, pointer, action)
+	}
+}
+
 func TestResearchV3PausedCutoverPreservesPausedSchedulePostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
 		t.Skip("DATABASE_URL is required")
