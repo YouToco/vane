@@ -94,7 +94,7 @@ func quotaShow(ctx context.Context, st *store.Store, tenantID int64) int {
 		// 这不是"没配置"，是一个会让该租户什么都用不了的状态——必须说清楚怎么修。
 		fmt.Printf("租户 %d **没有任何配额行**。\n", tenantID)
 		fmt.Println("缺行 = 无额度（不是无限额度），该租户的全部 LLM 调用都会被拒、推送会静默停摆。")
-		fmt.Println("修复：重启服务会自动 reconcile 补齐；或 useradmin quota set -bucket llm_tokens -per-day 2000000 <租户ID>")
+		fmt.Println("修复：重启服务会自动 reconcile 补齐；或 useradmin quota set -bucket llm_tokens -per-day 1000000000 <租户ID>")
 		return 1
 	}
 	fmt.Printf("租户 %d 的额度：\n", tenantID)
