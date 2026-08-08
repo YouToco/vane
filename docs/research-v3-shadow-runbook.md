@@ -69,6 +69,20 @@ go run ./cmd/researchshadow -task-id <schedule-id> -idempotency-key <stable-key>
 Workflow 结束，并从数据库重建 finalized Brief、snapshot 与零 delivery 的暗跑证据；只收到
 Temporal start receipt 不算成功。
 
+若综合阶段返回 `QUOTA_EXCEEDED`，先区分 Vane 内部 `llm_tokens` admission 与模型供应商
+账户余额。`admit_research_run_llm_spend_cap_v3` 拒绝表示冻结的 system/user prompt 加输出预算
+超过当前 tenant token bucket，不代表 Kimi、DeepSeek 等 API key 欠费。不得直接调大 quota
+掩盖异常上下文；先核对 `research_brief_syntheses.context_payload` 的字节数与组成。
+
+新写入的 `vane.research-synthesis-context/v3.2` 对每条成功 Tool Evidence 生成确定性 UTF-8
+前缀投影：总可见结果预算 32 KiB 字节，单条最多 8 KiB 字节，按成功步骤数均分。完整 Tool 结果仍留在
+`research_run_evidence.result_bytes`，由原始 `result_digest` 绑定；上下文另存模型实际看到的
+字节、大小、摘要与截断标志。数据库 migration 118 独立重算投影并拒绝伪造。历史 v3/v3.1
+上下文保持原字节回放，不允许新生产 writer 创建。
+
+migration 118 的 Down 在检测到任何 v3.2 综合记录时会拒绝执行；不得删除审计记录来强行降级。
+生产回滚应继续运行兼容 v3.2 的上一版应用并前向修复，或使用经独立审查的数据迁移方案。
+
 ## 技术验收
 
 1. Planner 仅依据当前任务手册与冻结工具目录生成计划。
@@ -82,7 +96,8 @@ Temporal start receipt 不算成功。
    而放松步骤投影的一致性。
    Prompt、correction 与 decoder 必须按快照冻结的 renderer 分派：历史 `v3` 原字节回放，
    `v3.1` 使用显式字段契约；未知版本 fail-closed。
-2. 每个 Tool 只有一个 first-writer provider effect，Evidence 保存的是模型实际可见结果。
+2. 每个 Tool 只有一个 first-writer provider effect，Evidence 保存完整的模型可见 Tool 结果；
+   综合模型只接收 v3.2 冻结投影，投影摘要必须能由数据库从完整 Evidence 独立重建。
 3. Brief 引用当前 Evidence，并按历史 Observation 做对比。
 4. 无重大更新时 Brief 为 quiet，且没有 delivery 记录、飞书消息或推送副作用。
 5. 原任务 ScheduleSpec、时区、Action 与 next run 在执行前后逐字一致。

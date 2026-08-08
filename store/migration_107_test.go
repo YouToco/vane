@@ -66,11 +66,10 @@ func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *tes
 
 	preparedFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, nil, "", "")
-	prepared, err := st.PrepareOrGetResearchBriefSynthesisV3(
-		t.Context(), researchBriefPrepareParamsV3(preparedFixture))
-	if err != nil || !prepared.FirstWriter ||
+	prepared := prepareLegacyResearchBriefSynthesisForMigrationTest(t, preparedFixture)
+	if !prepared.FirstWriter ||
 		prepared.Synthesis.Status != ResearchBriefSynthesisPreparedV3 {
-		t.Fatalf("legacy prepared=%+v err=%v", prepared, err)
+		t.Fatalf("legacy prepared=%+v", prepared)
 	}
 	pre108ShadowIdentity := preparedFixture.identity
 	pre108ShadowIdentity.TemporalWorkflowID =
@@ -122,10 +121,9 @@ func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *tes
 
 	spendingFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, nil, "", "")
-	spendingPrepared, err := st.PrepareOrGetResearchBriefSynthesisV3(
-		t.Context(), researchBriefPrepareParamsV3(spendingFixture))
-	if err != nil || !spendingPrepared.FirstWriter {
-		t.Fatalf("legacy spending prepare=%+v err=%v", spendingPrepared, err)
+	spendingPrepared := prepareLegacyResearchBriefSynthesisForMigrationTest(t, spendingFixture)
+	if !spendingPrepared.FirstWriter {
+		t.Fatalf("legacy spending prepare=%+v", spendingPrepared)
 	}
 	spendingHandle, spendingReservation := claimResearchBriefWithPendingReceiptV3(
 		t, spendingFixture, spendingPrepared.Synthesis)
@@ -428,7 +426,7 @@ func TestMigration107PartialAndUnknownBriefAdmissionPostgres(t *testing.T) {
 			if err := json.Unmarshal(synthesis.ContextPayload, &contextPayload); err != nil {
 				t.Fatal(err)
 			}
-			if contextPayload.SchemaVersion != researchSynthesisContextSchemaV31 ||
+			if contextPayload.SchemaVersion != researchSynthesisContextSchemaV32 ||
 				!equalResearchToolFailuresV31(
 					contextPayload.ToolFailures, manifest.ToolFailures) {
 				t.Fatalf("partial context=%+v failures=%+v",
@@ -520,7 +518,7 @@ func TestMigration107DatabaseRejectsForgedPartialCoverageDeliveryPostgres(t *tes
 		       finalized_at=clock_timestamp(),updated_at=clock_timestamp()
 		 WHERE id=$1`, synthesis.ID, legal)
 	if err == nil || !strings.Contains(err.Error(),
-		"107: partial-coverage Brief must be grounded unknown and quiet") {
+		"118: partial Brief must be unknown and quiet") {
 		t.Fatalf("database admitted forged partial delivery or wrong fence: %v", err)
 	}
 }

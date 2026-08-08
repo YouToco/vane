@@ -65,12 +65,12 @@ func TestMigration112DatabaseRejectsExternalOnlyAndDeliveryForgeryPostgres(t *te
 		{
 			name: "external-only citation", trustType: "external",
 			significance: "none", decision: "quiet", deliver: false,
-			want: "112: grounded partial Brief must cite official Evidence and stay quiet",
+			want: "118: grounded partial Brief must cite official Evidence and stay quiet",
 		},
 		{
 			name: "official citation with forged delivery", trustType: "official",
 			significance: "major", decision: "deliver", deliver: true,
-			want: "112: grounded partial Brief must cite official Evidence and stay quiet",
+			want: "118: grounded partial Brief must cite official Evidence and stay quiet",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -172,7 +172,7 @@ func TestMigration112DatabaseRejectsGroundedFrozenInputMutationPostgres(t *testi
 		       finalized_at=clock_timestamp(),updated_at=clock_timestamp()
 		 WHERE id=$1`, synthesis.ID, payload)
 	if err == nil || !strings.Contains(err.Error(),
-		"112: grounded partial Brief changed frozen inputs") {
+		"118: research Brief manifest shape is invalid") {
 		t.Fatalf("database admitted grounded frozen-input mutation: %v", err)
 	}
 }
@@ -428,10 +428,9 @@ func TestMigration112RetainsInFlightV31FinalizationPostgres(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := st.PrepareOrGetResearchBriefSynthesisV3(
-		t.Context(), researchBriefPrepareParamsV3(fixture))
-	if err != nil || !prepared.PartialCoverage {
-		t.Fatalf("pre-112 v3.1 prepare=%+v err=%v", prepared, err)
+	prepared := prepareLegacyResearchBriefSynthesisForMigrationTest(t, fixture)
+	if !prepared.PartialCoverage {
+		t.Fatalf("pre-112 v3.1 prepare=%+v", prepared)
 	}
 	payload, err := types.EncodeResearchBriefPayloadV3(types.ResearchBriefPayloadV3{
 		SchemaVersion: types.ResearchBriefPayloadSchemaV31,
