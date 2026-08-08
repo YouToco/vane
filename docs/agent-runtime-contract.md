@@ -271,10 +271,17 @@ V3 control Store 必须使用 `vane_server_runtime` 登录并默认进入受限 
 缺少投影、scope 不匹配、任务/租户/owner membership 非 active，均须在 snapshot、LLM 和 Tool
 调用前 fail-closed；server startup/ready Gate 必须证明投影可用且直接 quota 读取仍被拒绝。
 
-V3 planner/synthesis 使用独立的 `llm.research_model` 强模型路由，不能继承交互 Agent 的任意
-模型名；该模型必须存在当前有效的 `provider_price_rules`，否则付费准入 fail-closed。两阶段都
+V3 planner/synthesis/grounding verifier 使用独立的 `llm.research_model` 强模型路由，不能继承交互 Agent 的任意
+模型名；该模型必须存在当前有效的 `provider_price_rules`，否则付费准入 fail-closed。三个阶段都
 要求 provider thinking disabled：它们需要严格 canonical JSON，reasoning token 不得吞尽
 `max_tokens` 后留下空 completion。每个 run 仍冻结 exact model、route generation 与该开关。
+
+V3.3 synthesis 只产生 candidate Brief。独立、无 Tool 的 grounding verifier 只能读取该 candidate
+实际引用的冻结 Evidence/History、任务手册和覆盖缺口，逐条核验主体、产品、版本、时间、数值、
+状态和 significance 是否被引用内容直接蕴含。candidate、verifier prompt、独立 LLM reservation、
+provider receipt 和 verdict 都按 digest 不可变绑定。只有 `grounded` 才能 finalize；
+`unsupported` 必须原子写入 `citation_grounding_failed`，不修写、不投递。旧 V3/V3.1/V3.2
+snapshot 保持原字节回放，不补造 verifier 记录。
 
 Planner 输出的 canonical plan 先写入 append-only `research_run_plans`，Workflow 只接收
 `vane.research-run-plan-ref/v3`。每个外部 Tool 调用必须先在 `research_run_steps` 写入唯一

@@ -168,12 +168,21 @@ func researchRunLLMTraceV3(identity types.RunIdentity, snapshotID int64,
 }
 
 func researchRunLLMStagePolicyV3(seal runcontext.ResearchSnapshotSealV3,
-	stage string) (runtimepolicy.ResearchModelStageV3, bool, error) {
+	stage string, round int) (runtimepolicy.ResearchModelStageV3, bool, error) {
 	switch stage {
 	case ResearchRunLLMStagePlannerV3:
 		return seal.ResearchModel.Planner, true, nil
 	case ResearchRunLLMStageSynthesisV3:
-		return seal.ResearchModel.Synthesis, false, nil
+		if round == 0 {
+			return seal.ResearchModel.Synthesis, false, nil
+		}
+		if round == 1 && seal.ResearchModel.GroundingVerifier != nil &&
+			seal.ResearchModel.Synthesis.RendererVersion ==
+				runtimepolicy.ResearchSynthesisRendererVersionV33 {
+			return *seal.ResearchModel.GroundingVerifier, false, nil
+		}
+		return runtimepolicy.ResearchModelStageV3{}, false,
+			researchRunValidationError("research synthesis round is invalid")
 	default:
 		return runtimepolicy.ResearchModelStageV3{}, false,
 			researchRunValidationError("research model stage is invalid")
@@ -194,7 +203,7 @@ func validateResearchRunLLMBeginV3(params BeginResearchRunLLMSpendV3Params) erro
 			return researchRunValidationError("research planner subject is invalid")
 		}
 	} else if params.Stage == ResearchRunLLMStageSynthesisV3 {
-		if params.SubjectID <= 0 || params.RoundOrdinal != 0 {
+		if params.SubjectID <= 0 || params.RoundOrdinal > 1 {
 			return researchRunValidationError("research synthesis subject is invalid")
 		}
 	} else {
@@ -240,7 +249,8 @@ func (s *Store) BeginResearchRunLLMSpendV3(
 	if err != nil {
 		return ResearchRunLLMSpendReservationV3{}, err
 	}
-	stagePolicy, plannerStage, err := researchRunLLMStagePolicyV3(seal, params.Stage)
+	stagePolicy, plannerStage, err := researchRunLLMStagePolicyV3(
+		seal, params.Stage, params.RoundOrdinal)
 	if err != nil {
 		return ResearchRunLLMSpendReservationV3{}, err
 	}
@@ -294,11 +304,27 @@ func (s *Store) BeginResearchRunLLMSpendV3(
 		return ResearchRunLLMSpendReservationV3{},
 			researchRunDatabaseError("lock research model pricing", err)
 	}
+	// The current binary must keep retained round-0 runs operational during a
+	// rolling migration or historical schema replay. Pre-122 databases expose
+	// cap_v3 only; verifier round 1 stays fail-closed until cap_v4 exists.
+	var admissionV4Available bool
+	if err := tx.QueryRow(ctx, `SELECT to_regprocedure(
+		'admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
+	) IS NOT NULL`).Scan(&admissionV4Available); err != nil {
+		return ResearchRunLLMSpendReservationV3{},
+			researchRunDatabaseError("check research model admission capability", err)
+	}
+	admissionFunction := "admit_research_run_llm_spend_cap_v3"
+	if admissionV4Available {
+		admissionFunction = "admit_research_run_llm_spend_cap_v4"
+	} else if params.RoundOrdinal == 1 {
+		return ResearchRunLLMSpendReservationV3{}, researchRunConflictError()
+	}
 	var reservationID int64
 	var firstWriter bool
 	err = tx.QueryRow(ctx,
 		`SELECT out_reservation_id,out_first_writer
-		   FROM admit_research_run_llm_spend_cap_v3(
+		   FROM `+admissionFunction+`(
 		        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		params.Identity.TenantID, params.Identity.UserID, params.Identity.TaskID,
 		params.SnapshotRef.SnapshotID, params.Stage, params.RoundOrdinal,
@@ -448,7 +474,8 @@ func (s *Store) CommitResearchRunLLMReceiptV3(
 	if err != nil {
 		return ResearchRunLLMReceiptV3{}, err
 	}
-	stagePolicy, _, err := researchRunLLMStagePolicyV3(seal, reservation.Stage)
+	stagePolicy, _, err := researchRunLLMStagePolicyV3(
+		seal, reservation.Stage, reservation.RoundOrdinal)
 	if err != nil {
 		return ResearchRunLLMReceiptV3{}, err
 	}
