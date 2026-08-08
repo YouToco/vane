@@ -83,6 +83,10 @@ Temporal start receipt 不算成功。
 migration 118 的 Down 在检测到任何 v3.2 综合记录时会拒绝执行；不得删除审计记录来强行降级。
 生产回滚应继续运行兼容 v3.2 的上一版应用并前向修复，或使用经独立审查的数据迁移方案。
 
+综合模型的原始 completion 永久保留在 `llm_calls`。migration 119 的 receipt fence 只允许裸 JSON，
+或单一、精确、语言标记为 `json` 的三反引号代码围栏（无前后 prose、未知语言、嵌套围栏或重复键），再与 Go 生成的
+canonical Brief 做 JSON 语义绑定。不得为通过 receipt 而改写原始模型响应。
+
 ## 技术验收
 
 1. Planner 仅依据当前任务手册与冻结工具目录生成计划。
