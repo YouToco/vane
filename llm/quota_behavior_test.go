@@ -68,6 +68,31 @@ func quotaEnv(t *testing.T) (*store.Store, int64, int64) {
 	return st, u.ID, tn.ID
 }
 
+type quotaAttemptRecorderStore struct {
+	*store.Store
+	remaining int64
+	completed chan struct{}
+}
+
+func newQuotaAttemptRecorderStore(st *store.Store, attempts int64) *quotaAttemptRecorderStore {
+	return &quotaAttemptRecorderStore{
+		Store: st, remaining: attempts, completed: make(chan struct{}),
+	}
+}
+
+func (s *quotaAttemptRecorderStore) TryConsumeForUser(
+	ctx context.Context,
+	userID int64,
+	bucket store.QuotaBucket,
+	amount float64,
+) error {
+	err := s.Store.TryConsumeForUser(ctx, userID, bucket, amount)
+	if atomic.AddInt64(&s.remaining, -1) == 0 {
+		close(s.completed)
+	}
+	return err
+}
+
 // setBalance 把 llm_tokens 桶调到指定余额——只用公开 API：先取空、再按需退还。
 // 刻意不直接 UPDATE 表：那样测的是我对 schema 的记忆，而不是真实调用面。
 func setBalance(t *testing.T, st *store.Store, tenantID int64, want float64) {
@@ -262,7 +287,9 @@ func TestQuotaGate_OverestimateIsRefunded(t *testing.T) {
 // 而余额在所有对账落库后无论如何都会显示为负，看余额区分不出这两种实现。
 func TestQuotaGate_ConcurrentCallsCannotAllPass(t *testing.T) {
 	st, userID, tenantID := quotaEnv(t)
-	rec := NewRecorder(st)
+	const racers = 24
+	recorderStore := newQuotaAttemptRecorderStore(st, racers)
+	rec := &Recorder{st: recorderStore}
 
 	// 上游**阻塞**直到测试放行。这一点是本用例成立的前提：
 	// 若上游立刻返回，事后对账会把高估的部分马上退还，余额随即又够下一次——
@@ -280,10 +307,16 @@ func TestQuotaGate_ConcurrentCallsCannotAllPass(t *testing.T) {
 	t.Cleanup(srv.Close)
 	c := newTestClient(srv.URL, 32)
 
-	// 余额只够一次调用的估算（estimateTokens 对这个请求约为 1032）。
-	setBalance(t, st, tenantID, 1500)
+	// Make one reservation much larger than the default bucket's refill during
+	// this test. The production default is intentionally very high in the
+	// Agent-first development phase, so a wall-clock sleep with a ~1K estimate
+	// would legitimately refill enough quota for several calls.
+	maxTokens := 1_000_000
+	req := Request{System: "系统提示", User: "用户输入", MaxTokens: &maxTokens}
+	estimate := estimateTokens(
+		len([]rune(req.System))+len([]rune(req.User)), req.MaxTokens)
+	setBalance(t, st, tenantID, estimate*1.5)
 
-	const racers = 24
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for range racers {
@@ -293,19 +326,27 @@ func TestQuotaGate_ConcurrentCallsCannotAllPass(t *testing.T) {
 			<-start
 			_, _ = Do(context.Background(), c, rec,
 				CallMeta{TraceID: "t", SpanName: "score", UserID: &userID},
-				Request{System: "系统提示", User: "用户输入"})
+				req)
 		}()
 	}
 	close(start)
-	// 等所有 goroutine 都撞过闸门：被拒的立刻返回，放行的停在上游。
-	// 闸门是一次本地 DB 往返，300ms 足够 24 路全部走完。
-	time.Sleep(300 * time.Millisecond)
+	// Wait for every real database reservation attempt, rather than guessing a
+	// duration. Releasing the first request early would refund its conservative
+	// reservation and make later calls correctly pass, which does not exercise
+	// the in-flight mutual-exclusion invariant.
+	select {
+	case <-recorderStore.completed:
+	case <-time.After(10 * time.Second):
+		close(release)
+		wg.Wait()
+		t.Fatal("24 路并发调用未能在 10 秒内全部完成事前配额预留")
+	}
 	close(release)
 	wg.Wait()
 
-	// 余额 1500、单次估算约 1032：同一时刻最多只有 1 次能拿到额度。
-	// 给到 2 是留给补充速率的余量（每秒补 23 个），不必卡到极限。
-	if n := hits.Load(); n > 2 {
+	// The balance is 1.5 reservations, so while the first reservation remains
+	// in flight exactly one upstream request may be sent.
+	if n := hits.Load(); n > 1 {
 		t.Errorf("余额只够 1 次调用，%d 路并发却放行了 %d 次 —— "+
 			"事前预扣的量太小，并发调用互相看不见对方。这正是第一版"+
 			"（每次只预扣 1 个象征性令牌）实测超发 4.9 倍的机制", racers, n)
