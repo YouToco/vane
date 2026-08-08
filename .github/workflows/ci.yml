@@ -24,9 +24,12 @@ jobs:
           POSTGRES_USER: vane
           POSTGRES_PASSWORD: vane_test
         ports:
-          - 5432:5432
+          # Self-hosted runners may already have PostgreSQL on localhost:5432.
+          # Let Actions allocate a free host port and address this exact service
+          # through the job context instead of accidentally hitting the host DB.
+          - 5432/tcp
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U vane -d vane_test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -62,7 +65,7 @@ jobs:
         # Explicit goroutine concurrency inside tests remains race-covered.
         run: go test -race -p=1 -parallel=1 -timeout=40m -coverprofile=coverage.txt -covermode=atomic ./...
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports[5432] }}/vane_test?sslmode=disable
 
       - name: True Temporal termination with PostgreSQL recovery
         run: >-
@@ -70,7 +73,7 @@ jobs:
           -run TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges
           -count=1
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports[5432] }}/vane_test?sslmode=disable
 
       - name: Build
         run: |
