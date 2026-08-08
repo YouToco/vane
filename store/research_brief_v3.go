@@ -526,6 +526,13 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 			!bytes.Equal(grounding.CandidateBriefPayload, briefPayload) {
 			return types.ResearchBriefRefV3{}, researchRunConflictError()
 		}
+		verdict, verdictCanonical, err := types.DecodeResearchGroundingVerdictV1(
+			grounding.VerdictPayload)
+		if err != nil || verdict.Verdict != types.ResearchGroundingGroundedV1 ||
+			verdict.CandidateDigest != grounding.CandidateDigest ||
+			grounding.VerdictDigest != researchRunSHA256(verdictCanonical) {
+			return types.ResearchBriefRefV3{}, researchRunIntegrityError()
+		}
 	} else if params.GroundingVerificationID != 0 {
 		return types.ResearchBriefRefV3{}, researchRunConflictError()
 	}

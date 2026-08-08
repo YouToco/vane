@@ -74,16 +74,33 @@ func settleGroundingVerifierV1(
 ) ResearchBriefGroundingV1 {
 	t.Helper()
 	ensureResearchLLMPriceV3(t, f.st)
-	reservation, err := f.st.BeginResearchRunLLMSpendV3(t.Context(),
-		BeginResearchRunLLMSpendV3Params{
-			Identity: f.identity, SnapshotRef: f.snapshotRef,
-			Stage: ResearchRunLLMStageSynthesisV3, RoundOrdinal: 1,
-			SubjectID:    synthesis.ID,
-			SystemPrompt: "Verify the candidate against only its cited evidence.",
-			UserPrompt:   string(grounding.VerifierPrompt),
-		})
+	beginParams := BeginResearchRunLLMSpendV3Params{
+		Identity: f.identity, SnapshotRef: f.snapshotRef,
+		Stage: ResearchRunLLMStageSynthesisV3, RoundOrdinal: 1,
+		SubjectID:    synthesis.ID,
+		SystemPrompt: "Verify the candidate against only its cited evidence.",
+		UserPrompt:   string(grounding.VerifierPrompt),
+	}
+	reservation, err := f.st.BeginResearchRunLLMSpendV3(t.Context(), beginParams)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Simulate a process crash immediately after quota admission. Retrying the
+	// exact request must recover the one reservation without a second debit.
+	replay, err := f.st.BeginResearchRunLLMSpendV3(t.Context(), beginParams)
+	if err != nil || replay.ReservationID != reservation.ReservationID ||
+		replay.RequestDigest != reservation.RequestDigest || replay.FirstWriter {
+		t.Fatalf("verifier admission replay=%+v reservation=%+v err=%v",
+			replay, reservation, err)
+	}
+	var verifierReservations int
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM research_run_llm_spend_reservations
+		  WHERE run_snapshot_id=$1 AND stage='synthesis' AND round_ordinal=1`,
+		f.snapshotRef.SnapshotID).Scan(&verifierReservations); err != nil ||
+		verifierReservations != 1 {
+		t.Fatalf("verifier reservation replay count=%d err=%v",
+			verifierReservations, err)
 	}
 	issues := []types.ResearchGroundingIssueV1{}
 	if verdict == types.ResearchGroundingUnsupportedV1 {
@@ -241,5 +258,33 @@ func TestResearchBriefGroundingV1PostgresRejectsSemanticMismatchAndTampering(t *
 			BriefPayload:                        candidate, GroundingVerificationID: settled.ID,
 		}); err == nil {
 		t.Fatal("rejected grounding finalized a Brief")
+	}
+}
+
+func TestResearchBriefGroundingV1PostgresRejectsRetainedRenderer(t *testing.T) {
+	f := newResearchBriefFixtureV3(t, taskstate.NotificationThresholdMajorV3, true)
+	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, reservation := claimResearchBriefWithPendingReceiptV3(
+		t, f, prepared.Synthesis)
+	candidate := researchBriefPayloadV3(t, prepared.Synthesis,
+		types.ResearchBriefSignificanceMajorV3,
+		"OpenAI released GPT-5.6 according to the cited official page.")
+	settleResearchBriefReceiptV3(t, f, reservation, prepared.Synthesis, candidate)
+	if _, err := f.st.PrepareOrGetResearchBriefGroundingV1(t.Context(),
+		PrepareResearchBriefGroundingV1Params{
+			ClaimResearchBriefSynthesisV3Params: handle,
+			CandidateBriefPayload:               candidate,
+		}); err == nil {
+		t.Fatal("retained synthesis renderer admitted a V3.3 grounding record")
+	}
+	var rows int
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM research_brief_grounding_verifications
+		  WHERE run_snapshot_id=$1`, f.snapshotRef.SnapshotID).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("retained renderer grounding rows=%d err=%v", rows, err)
 	}
 }

@@ -314,23 +314,30 @@ func (s *Store) BeginResearchRunLLMSpendV3(
 		return ResearchRunLLMSpendReservationV3{},
 			researchRunDatabaseError("check research model admission capability", err)
 	}
-	admissionFunction := "admit_research_run_llm_spend_cap_v3"
-	if admissionV4Available {
-		admissionFunction = "admit_research_run_llm_spend_cap_v4"
-	} else if params.RoundOrdinal == 1 {
+	if !admissionV4Available && params.RoundOrdinal == 1 {
 		return ResearchRunLLMSpendReservationV3{}, researchRunConflictError()
 	}
 	var reservationID int64
 	var firstWriter bool
-	err = tx.QueryRow(ctx,
-		`SELECT out_reservation_id,out_first_writer
-		   FROM `+admissionFunction+`(
-		        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+	admissionArgs := []any{
 		params.Identity.TenantID, params.Identity.UserID, params.Identity.TaskID,
 		params.SnapshotRef.SnapshotID, params.Stage, params.RoundOrdinal,
 		researchRunLLMSubjectV3(params.Stage, params.SubjectID), attemptKey,
 		requestDigest, traceID, params.UserPrompt,
-	).Scan(&reservationID, &firstWriter)
+	}
+	if admissionV4Available {
+		err = tx.QueryRow(ctx,
+			`SELECT out_reservation_id,out_first_writer
+			   FROM admit_research_run_llm_spend_cap_v4(
+			        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			admissionArgs...).Scan(&reservationID, &firstWriter)
+	} else {
+		err = tx.QueryRow(ctx,
+			`SELECT out_reservation_id,out_first_writer
+			   FROM admit_research_run_llm_spend_cap_v3(
+			        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			admissionArgs...).Scan(&reservationID, &firstWriter)
+	}
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "P0001" {

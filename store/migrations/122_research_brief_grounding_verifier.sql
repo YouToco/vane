@@ -401,6 +401,8 @@ BEGIN
            AND grounding.status='prepared'
            AND brief.status='spending'
            AND grounding.verifier_prompt=convert_to(requested_user_prompt,'UTF8')
+           AND grounding.verifier_prompt_digest=
+               encode(sha256(convert_to(requested_user_prompt,'UTF8')),'hex')
     ) THEN
         RAISE EXCEPTION '122: verifier prompt differs from frozen candidate'
             USING ERRCODE='23514';

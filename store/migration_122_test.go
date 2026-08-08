@@ -28,6 +28,7 @@ func TestMigration122KeepsGroundingAuthorityNarrowAndFailClosed(t *testing.T) {
 		"research-synthesis.render/v3.3",
 		"grounding_verifier",
 		"grounding.verifier_prompt=convert_to(requested_user_prompt,'UTF8')",
+		"grounding.verifier_prompt_digest=",
 		"round_ordinal IN (0,1)",
 		"CREATE POLICY research_v3_scope",
 		"CREATE POLICY research_v3_capability_scope",

@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
 
@@ -124,6 +125,16 @@ func (s *Store) PrepareOrGetResearchBriefGroundingV1(
 		return PrepareResearchBriefGroundingV1Result{}, err
 	}
 	if synthesis.Status != ResearchBriefSynthesisSpendingV3 {
+		return PrepareResearchBriefGroundingV1Result{}, researchRunConflictError()
+	}
+	seal, err := loadAndValidateResearchBriefSnapshotV3(ctx, tx,
+		params.Identity, params.SnapshotRef)
+	if err != nil {
+		return PrepareResearchBriefGroundingV1Result{}, err
+	}
+	if seal.ResearchModel.Synthesis.RendererVersion !=
+		runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+		seal.ResearchModel.GroundingVerifier == nil {
 		return PrepareResearchBriefGroundingV1Result{}, researchRunConflictError()
 	}
 	receiptState, _, err := loadResearchBriefLLMReceiptStateV3(ctx, tx,
@@ -252,6 +263,17 @@ func (s *Store) SettleResearchBriefGroundingV1(
 	if synthesis.Status != ResearchBriefSynthesisSpendingV3 {
 		return ResearchBriefGroundingV1{}, researchRunConflictError()
 	}
+	seal, err := loadAndValidateResearchBriefSnapshotV3(ctx, tx,
+		params.Identity, params.SnapshotRef)
+	if err != nil {
+		return ResearchBriefGroundingV1{}, err
+	}
+	if seal.ResearchModel.Synthesis.RendererVersion !=
+		runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+		seal.ResearchModel.GroundingVerifier == nil {
+		return ResearchBriefGroundingV1{}, researchRunIntegrityError()
+	}
+	verifierPolicy := *seal.ResearchModel.GroundingVerifier
 	reservation, err := loadResearchRunLLMReservationByIDV3(ctx, tx,
 		params.Identity, params.SnapshotRef, params.VerifierLLMReservationID, false)
 	if err != nil {
@@ -259,7 +281,14 @@ func (s *Store) SettleResearchBriefGroundingV1(
 	}
 	if reservation.Stage != ResearchRunLLMStageSynthesisV3 ||
 		reservation.RoundOrdinal != 1 || reservation.SubjectID != params.SynthesisID ||
-		reservation.UserPromptDigest != row.VerifierPromptDigest {
+		reservation.UserPromptDigest != row.VerifierPromptDigest ||
+		reservation.SystemPromptDigest != researchRunSHA256(
+			[]byte(verifierPolicy.SystemPrompt)) ||
+		reservation.Model != verifierPolicy.Model ||
+		reservation.Temperature != float32(verifierPolicy.Temperature) ||
+		reservation.MaxTokens != verifierPolicy.MaxTokens ||
+		reservation.DisableThinking != verifierPolicy.DisableThinking ||
+		reservation.CountsAgainstPlannerBudget {
 		return ResearchBriefGroundingV1{}, researchRunIntegrityError()
 	}
 	receipt, settled, err := loadResearchRunLLMSettlementV3(ctx, tx, reservation)

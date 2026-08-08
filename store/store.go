@@ -240,16 +240,26 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		return fmt.Errorf("begin authority probe: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	var groundingRuntimeAvailable, admissionV4Available bool
+	var groundingRuntimeAvailable, admissionV4Available,
+		groundingImmutabilityTriggerAvailable bool
 	if err := tx.QueryRow(ctx, `SELECT
 		to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
 		to_regprocedure(
 		 'admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
-		) IS NOT NULL`,
-	).Scan(&groundingRuntimeAvailable, &admissionV4Available); err != nil {
+		) IS NOT NULL,
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		  WHERE trigger.tgrelid=to_regclass(
+		        'public.research_brief_grounding_verifications')
+		    AND trigger.tgname='protect_research_brief_grounding_verification_v1'
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
+		)`,
+	).Scan(&groundingRuntimeAvailable, &admissionV4Available,
+		&groundingImmutabilityTriggerAvailable); err != nil {
 		return fmt.Errorf("inspect grounding runtime schema: %w", err)
 	}
-	if groundingRuntimeAvailable != admissionV4Available {
+	if groundingRuntimeAvailable != admissionV4Available ||
+		groundingRuntimeAvailable != groundingImmutabilityTriggerAvailable {
 		return errors.New("grounding runtime schema is incomplete")
 	}
 	filterGroundingRelation := func(relations []string) []string {
