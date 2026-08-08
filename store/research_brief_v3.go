@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -25,7 +26,10 @@ const (
 	researchHistoryManifestSchemaV3   = "vane.research-history-manifest/v3"
 	researchSynthesisContextSchemaV3  = "vane.research-synthesis-context/v3"
 	researchSynthesisContextSchemaV31 = "vane.research-synthesis-context/v3.1"
+	researchSynthesisContextSchemaV32 = "vane.research-synthesis-context/v3.2"
 	researchSynthesisContextMaxV3     = 32 << 20
+	researchEvidenceContextBytesV32   = 32 << 10
+	researchEvidenceItemMaxBytesV32   = 8 << 10
 	researchHistoryContextCharsV3     = 4096
 )
 
@@ -326,12 +330,8 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 	if err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, err
 	}
-	contextSchema := researchSynthesisContextSchemaV3
-	if len(toolFailures) > 0 {
-		contextSchema = researchSynthesisContextSchemaV31
-	}
 	contextPayload, err := json.Marshal(researchSynthesisContextV3{
-		SchemaVersion: contextSchema,
+		SchemaVersion: researchSynthesisContextSchemaV32,
 		Definition: researchSynthesisDefinitionContextV3{
 			TaskName:     snapshotSeal.Payload.Definition.TaskName,
 			TaskManual:   snapshotSeal.Payload.Definition.TaskManual,
@@ -814,8 +814,7 @@ func buildResearchEvidenceManifestV3(
 		`SELECT evidence.id,evidence.step_ordinal,evidence.invocation_id,
 		        evidence.tool_name,evidence.request_digest,evidence.result_digest,
 		        evidence.original_size,evidence.truncated,evidence.trust_type,
-		        convert_from(evidence.result_bytes,'UTF8'),octet_length(evidence.result_bytes),
-		        octet_length(evidence.result_bytes),evidence.result_digest,false
+		        convert_from(evidence.result_bytes,'UTF8'),octet_length(evidence.result_bytes)
 		   FROM research_run_evidence evidence
 		   JOIN research_run_steps terminal
 		     ON terminal.tenant_id=evidence.tenant_id AND terminal.user_id=evidence.user_id
@@ -845,17 +844,13 @@ func buildResearchEvidenceManifestV3(
 		if err := rows.Scan(&item.EvidenceID, &item.Ordinal, &item.InvocationID,
 			&item.ToolName, &item.RequestDigest, &item.ResultDigest,
 			&item.OriginalSize, &item.Truncated, &item.TrustType,
-			&contextItem.SynthesisVisibleText, &contextItem.ContextStoredSize,
-			&contextItem.ContextVisibleSize, &contextItem.ContextVisibleDigest,
-			&contextItem.ContextTruncated); err != nil {
+			&contextItem.SynthesisVisibleText, &contextItem.ContextStoredSize); err != nil {
 			return nil, nil, nil, researchRunDatabaseError("scan research Brief Evidence", err)
 		}
 		items = append(items, item)
 		contextItem.researchEvidenceManifestItemV3 = item
-		if contextItem.ContextStoredSize < contextItem.ContextVisibleSize ||
-			!validResearchRunDigest(contextItem.ContextVisibleDigest) ||
-			researchRunSHA256([]byte(contextItem.SynthesisVisibleText)) != contextItem.ContextVisibleDigest ||
-			contextItem.ContextTruncated != (contextItem.ContextStoredSize > contextItem.ContextVisibleSize) {
+		if contextItem.ContextStoredSize != len(contextItem.SynthesisVisibleText) ||
+			researchRunSHA256([]byte(contextItem.SynthesisVisibleText)) != item.ResultDigest {
 			return nil, nil, nil, researchRunIntegrityError()
 		}
 		contextItems = append(contextItems, contextItem)
@@ -870,6 +865,9 @@ func buildResearchEvidenceManifestV3(
 				item.TrustType != "official") {
 			return nil, nil, nil, researchRunIntegrityError()
 		}
+	}
+	if err := projectResearchEvidenceContextV32(contextItems); err != nil {
+		return nil, nil, nil, err
 	}
 	failureRows, err := tx.Query(ctx,
 		`SELECT step_ordinal,invocation_id,tool_name,request_digest,phase,
@@ -939,6 +937,49 @@ func buildResearchEvidenceManifestV3(
 		return nil, nil, nil, researchRunIntegrityError()
 	}
 	return payload, contextItems, failures, nil
+}
+
+// projectResearchEvidenceContextV32 freezes a second, synthesis-only view of
+// immutable Tool Evidence. The full model-visible Tool result remains in
+// research_run_evidence and is bound by result_digest; synthesis receives a
+// deterministic UTF-8 prefix so every successful step keeps representation
+// without allowing one large result to consume the whole LLM context.
+func projectResearchEvidenceContextV32(items []researchEvidenceContextItemV3) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > 16 {
+		return researchRunIntegrityError()
+	}
+	itemLimit := researchEvidenceContextBytesV32 / len(items)
+	if itemLimit > researchEvidenceItemMaxBytesV32 {
+		itemLimit = researchEvidenceItemMaxBytesV32
+	}
+	for index := range items {
+		item := &items[index]
+		stored := item.SynthesisVisibleText
+		if item.ContextStoredSize != len(stored) || !utf8.ValidString(stored) {
+			return researchRunIntegrityError()
+		}
+		visible := projectResearchEvidenceTextV32(stored, itemLimit)
+		item.SynthesisVisibleText = visible
+		item.ContextVisibleSize = len(visible)
+		item.ContextVisibleDigest = researchRunSHA256([]byte(visible))
+		item.ContextTruncated = item.ContextStoredSize > item.ContextVisibleSize
+	}
+	return nil
+}
+
+func projectResearchEvidenceTextV32(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	const suffix = "…"
+	cut := limit - len(suffix)
+	for cut > 0 && !utf8.ValidString(value[:cut]) {
+		cut--
+	}
+	return value[:cut] + suffix
 }
 
 func buildResearchHistoryManifestV3(
@@ -1373,17 +1414,21 @@ func researchBriefSynthesisFrozenPayloadsValidV3(row ResearchBriefSynthesisV3) b
 
 func validResearchSynthesisContextVersionV3(version string, failures int) bool {
 	return (version == researchSynthesisContextSchemaV3 && failures == 0) ||
-		(version == researchSynthesisContextSchemaV31 && failures > 0)
+		(version == researchSynthesisContextSchemaV31 && failures > 0) ||
+		version == researchSynthesisContextSchemaV32
 }
 
 func researchBriefSynthesisPartialCoverageV31(
 	row ResearchBriefSynthesisV3,
 ) bool {
 	var contextPayload struct {
-		SchemaVersion string `json:"schema_version"`
+		SchemaVersion string                          `json:"schema_version"`
+		ToolFailures  []researchToolFailureContextV31 `json:"tool_failures"`
 	}
 	return json.Unmarshal(row.ContextPayload, &contextPayload) == nil &&
-		contextPayload.SchemaVersion == researchSynthesisContextSchemaV31
+		(contextPayload.SchemaVersion == researchSynthesisContextSchemaV31 ||
+			contextPayload.SchemaVersion == researchSynthesisContextSchemaV32) &&
+		len(contextPayload.ToolFailures) > 0
 }
 
 func validResearchEvidenceManifestVersionV3(version string, failures int) bool {

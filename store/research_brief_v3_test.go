@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -728,7 +729,7 @@ func TestResearchBriefSynthesisV31SealsTerminalFailureAsUnknownAndQuiet(t *testi
 		len(evidence.Items) != 0 || len(evidence.ToolFailures) != 1 ||
 		evidence.ToolFailures[0].Phase != string(ResearchRunStepFailedV3) ||
 		evidence.ToolFailures[0].ErrorCode != "provider_reported_failure" ||
-		context.SchemaVersion != researchSynthesisContextSchemaV31 ||
+		context.SchemaVersion != researchSynthesisContextSchemaV32 ||
 		!equalResearchToolFailuresV31(context.ToolFailures, evidence.ToolFailures) {
 		t.Fatalf("evidence=%+v context=%+v", evidence, context)
 	}
@@ -1254,6 +1255,9 @@ func TestResearchSynthesisContextV3WorstCaseEscapingFitsBudget(t *testing.T) {
 			ContextTruncated:     false,
 		}
 	}
+	if err := projectResearchEvidenceContextV32(evidence); err != nil {
+		t.Fatal(err)
+	}
 	historyItems := make([]researchHistoryContextItemV3, 20)
 	for index := range historyItems {
 		visible := strings.Repeat("\x01", researchHistoryContextCharsV3)
@@ -1270,7 +1274,7 @@ func TestResearchSynthesisContextV3WorstCaseEscapingFitsBudget(t *testing.T) {
 		}
 	}
 	payload, err := json.Marshal(researchSynthesisContextV3{
-		SchemaVersion: researchSynthesisContextSchemaV3,
+		SchemaVersion: researchSynthesisContextSchemaV32,
 		Definition: researchSynthesisDefinitionContextV3{
 			TaskName:   strings.Repeat("\x01", 16<<10),
 			TaskManual: strings.Repeat("\x01", 256<<10),
@@ -1297,7 +1301,7 @@ func TestResearchSynthesisContextV3WorstCaseEscapingFitsBudget(t *testing.T) {
 	}
 }
 
-func TestResearchBriefSynthesisV3KeepsMaxEvidenceExact(t *testing.T) {
+func TestResearchBriefSynthesisV32ProjectsMaxEvidenceAndRetainsDigest(t *testing.T) {
 	result := []byte(strings.Repeat("\x01", 256<<10))
 	f := newResearchBriefFixtureWithResultV3(t,
 		taskstate.NotificationThresholdMajorV3, true, result)
@@ -1314,11 +1318,47 @@ func TestResearchBriefSynthesisV3KeepsMaxEvidenceExact(t *testing.T) {
 		t.Fatalf("current Evidence=%d", len(synthesisContext.CurrentEvidence))
 	}
 	visible := synthesisContext.CurrentEvidence[0]
-	if visible.ContextTruncated || visible.ContextStoredSize != len(result) ||
-		visible.ContextVisibleSize != len(result) ||
-		visible.SynthesisVisibleText != string(result) ||
-		visible.ContextVisibleDigest != researchRunSHA256(result) {
-		t.Fatalf("max Evidence was not exact: %+v", visible)
+	if synthesisContext.SchemaVersion != researchSynthesisContextSchemaV32 ||
+		!visible.ContextTruncated || visible.ContextStoredSize != len(result) ||
+		visible.ContextVisibleSize > researchEvidenceItemMaxBytesV32 ||
+		visible.ContextVisibleSize != len(visible.SynthesisVisibleText) ||
+		visible.ContextVisibleDigest != researchRunSHA256([]byte(visible.SynthesisVisibleText)) ||
+		visible.ResultDigest != researchRunSHA256(result) ||
+		!strings.HasSuffix(visible.SynthesisVisibleText, "…") {
+		t.Fatalf("max Evidence projection is invalid: %+v", visible)
+	}
+}
+
+func TestResearchEvidenceProjectionV32BalancesAllStepsAtUTF8Boundaries(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	items := make([]researchEvidenceContextItemV3, 16)
+	for index := range items {
+		stored := strings.Repeat("证", 4096) + strconv.Itoa(index)
+		items[index] = researchEvidenceContextItemV3{
+			researchEvidenceManifestItemV3: researchEvidenceManifestItemV3{
+				EvidenceID: int64(index + 1), Ordinal: index,
+				InvocationID: "invocation-" + strconv.Itoa(index), ToolName: "read_page",
+				RequestDigest: digest, ResultDigest: researchRunSHA256([]byte(stored)),
+				OriginalSize: len(stored), TrustType: "external",
+			},
+			SynthesisVisibleText: stored, ContextStoredSize: len(stored),
+		}
+	}
+	if err := projectResearchEvidenceContextV32(items); err != nil {
+		t.Fatal(err)
+	}
+	totalVisible := 0
+	for index, item := range items {
+		if !item.ContextTruncated || !utf8.ValidString(item.SynthesisVisibleText) ||
+			item.ContextVisibleSize > researchEvidenceContextBytesV32/len(items) ||
+			item.ContextVisibleDigest != researchRunSHA256([]byte(item.SynthesisVisibleText)) ||
+			item.Ordinal != index {
+			t.Fatalf("item %d projection=%+v", index, item)
+		}
+		totalVisible += item.ContextVisibleSize
+	}
+	if totalVisible > researchEvidenceContextBytesV32 {
+		t.Fatalf("visible bytes=%d budget=%d", totalVisible, researchEvidenceContextBytesV32)
 	}
 }
 
