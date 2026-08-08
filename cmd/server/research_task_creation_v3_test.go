@@ -52,8 +52,23 @@ func TestOwnerAgentStartupRequiresPersistentResearchV3Runtime(t *testing.T) {
 }
 
 type fakeResearchV3AuthorityVerifier struct {
-	allowed map[string]string
-	calls   []types.RunIdentity
+	allowed       map[string]string
+	prepared      map[string]bool
+	preparedErr   error
+	calls         []types.RunIdentity
+	preparedCalls []types.RunIdentity
+}
+
+func (f *fakeResearchV3AuthorityVerifier) HasCurrentResearchApprovedDefinitionV3(
+	_ context.Context, tenantID, userID int64, taskID string,
+) (bool, error) {
+	f.preparedCalls = append(f.preparedCalls, types.RunIdentity{
+		TenantID: tenantID, UserID: userID, TaskID: taskID,
+	})
+	if f.preparedErr != nil {
+		return false, f.preparedErr
+	}
+	return f.prepared[taskID], nil
 }
 
 func (f *fakeResearchV3AuthorityVerifier) VerifyEnabledResearchV3ActionAuthorization(
@@ -75,7 +90,7 @@ func TestResearchV3RuntimeAdmissionUsesExactShadowOrPerTaskAuthority(t *testing.
 	cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID = "task-current-cutover"
 	verifier := &fakeResearchV3AuthorityVerifier{allowed: map[string]string{
 		"task-formal-a": "token-a", "task-formal-b": "token-b",
-	}}
+	}, prepared: map[string]bool{"task-shadow": true}}
 	base := types.RunIdentity{
 		TemporalWorkflowID: "workflow", TemporalRunID: "run",
 		RunKind:  types.RunSnapshotKindScheduled,
@@ -106,10 +121,72 @@ func TestResearchV3RuntimeAdmissionUsesExactShadowOrPerTaskAuthority(t *testing.
 	}
 	shadow := base
 	shadow.TaskID = "task-shadow"
+	shadow.TemporalWorkflowID = types.ResearchV3ShadowWorkflowIDPrefix +
+		strings.Repeat("a", 64)
 	if allowed, err := authorizeResearchV3Runtime(
 		context.Background(), cfg, verifier, shadow, "",
 	); err != nil || !allowed {
-		t.Fatalf("exact tokenless shadow rejected: allowed=%v err=%v", allowed, err)
+		t.Fatalf("prepared tokenless shadow rejected: allowed=%v err=%v", allowed, err)
+	}
+	if len(verifier.preparedCalls) != 1 ||
+		verifier.preparedCalls[0].TaskID != "task-shadow" {
+		t.Fatalf("prepared shadow verifier calls=%+v", verifier.preparedCalls)
+	}
+	failedVerifier := &fakeResearchV3AuthorityVerifier{
+		preparedErr: errors.New("database unavailable"),
+	}
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), cfg, failedVerifier, shadow, "",
+	); err == nil || allowed {
+		t.Fatal("shadow verifier failure did not fail closed")
+	}
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), cfg, nil, shadow, "",
+	); err == nil || allowed {
+		t.Fatal("nil shadow verifier did not fail closed")
+	}
+	unprepared := shadow
+	unprepared.TaskID = "task-unprepared"
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), cfg, verifier, unprepared, "",
+	); err != nil || allowed {
+		t.Fatal("unprepared tokenless shadow was admitted")
+	}
+	malformed := shadow
+	malformed.TemporalWorkflowID = "workflow"
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), cfg, verifier, malformed, "",
+	); err != nil || allowed {
+		t.Fatal("non-shadow tokenless workflow was admitted")
+	}
+	disabled := *cfg
+	disabled.Pipeline.ResearchV3RuntimeEnabled = false
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), &disabled, verifier, shadow, "",
+	); err != nil || allowed {
+		t.Fatal("disabled persistent runtime admitted a tokenless shadow")
+	}
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), &disabled, verifier, base, "token-a",
+	); err != nil || allowed {
+		t.Fatal("disabled persistent runtime admitted a formal token")
+	}
+	invalid := shadow
+	invalid.TenantID = 0
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), cfg, verifier, invalid, "",
+	); err != nil || allowed {
+		t.Fatal("invalid shadow identity was admitted")
+	}
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), nil, verifier, shadow, "",
+	); err != nil || allowed {
+		t.Fatal("nil config admitted a tokenless shadow")
+	}
+	if allowed, err := authorizeResearchV3Runtime(
+		context.Background(), cfg, nil, base, "token-a",
+	); err == nil || allowed {
+		t.Fatal("nil formal authority verifier did not fail closed")
 	}
 	shadow.TaskID = "task-current-cutover"
 	if allowed, err := authorizeResearchV3Runtime(

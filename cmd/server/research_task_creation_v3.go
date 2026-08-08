@@ -47,28 +47,39 @@ func shouldEnableResearchV3Delivery(cfg *config.Config) bool {
 		cfg.Pipeline.ResearchV3AuthorityCanaryScheduleID != "")
 }
 
-type researchV3ActionAuthorityVerifier interface {
+type researchV3RuntimeAdmissionVerifier interface {
 	VerifyEnabledResearchV3ActionAuthorization(
 		context.Context, int64, int64, string, string,
 	) error
+	HasCurrentResearchApprovedDefinitionV3(
+		context.Context, int64, int64, string,
+	) (bool, error)
 }
 
-// authorizeResearchV3Runtime preserves the exact-task, tokenless shadow lane.
+// authorizeResearchV3Runtime admits tokenless shadows from the strict Temporal
+// namespace only when the scoped Store confirms a current prepared V3 head.
 // Every formal Action is admitted only by its own enabled database authority;
-// a process-wide runtime flag or the currently selected cutover task is never
-// task authority.
+// process-wide canary selectors are never task authority.
 func authorizeResearchV3Runtime(
 	ctx context.Context,
 	cfg *config.Config,
-	verifier researchV3ActionAuthorityVerifier,
+	verifier researchV3RuntimeAdmissionVerifier,
 	identity types.RunIdentity,
 	authorityToken string,
 ) (bool, error) {
-	if cfg == nil || identity.TaskID == "" {
+	if cfg == nil || !cfg.Pipeline.ResearchV3RuntimeEnabled ||
+		identity.Validate() != nil {
 		return false, nil
 	}
 	if authorityToken == "" {
-		return identity.TaskID == cfg.Pipeline.ResearchV3ShadowCanaryScheduleID, nil
+		if !types.IsResearchV3ShadowWorkflowID(identity.TemporalWorkflowID) {
+			return false, nil
+		}
+		if verifier == nil {
+			return false, errors.New("research V3 shadow verifier is unavailable")
+		}
+		return verifier.HasCurrentResearchApprovedDefinitionV3(
+			ctx, identity.TenantID, identity.UserID, identity.TaskID)
 	}
 	if verifier == nil {
 		return false, errors.New("research V3 authority verifier is unavailable")

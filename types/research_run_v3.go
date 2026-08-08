@@ -10,6 +10,24 @@ import (
 	"time"
 )
 
+const ResearchV3ShadowWorkflowIDPrefix = "research-v3-shadow-"
+
+// IsResearchV3ShadowWorkflowID recognizes the only tokenless Research V3
+// workflow namespace. Admission still requires a current prepared definition
+// in the scoped Store; the name alone never grants task or delivery authority.
+func IsResearchV3ShadowWorkflowID(value string) bool {
+	if !strings.HasPrefix(value, ResearchV3ShadowWorkflowIDPrefix) ||
+		len(value) != len(ResearchV3ShadowWorkflowIDPrefix)+64 {
+		return false
+	}
+	for _, char := range value[len(ResearchV3ShadowWorkflowIDPrefix):] {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 const (
 	ResearchRunSnapshotRefSchemaV3 = "vane.research-run-snapshot-ref/v3"
 	ResearchRunPlanRefSchemaV3     = "vane.research-run-plan-ref/v3"

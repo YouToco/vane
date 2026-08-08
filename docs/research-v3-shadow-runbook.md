@@ -16,6 +16,10 @@ Research V3 shadow 是正式切流前的独立技术验证路径。它读取 del
 - Authority 配置本身不会修改任何 Action。普通创建、编辑、reconcile 也永远不读取它来切 V3；只有 `researchcutover` 的持久化 saga 可以替换 exact-task Action。
 - 切流后的每次启动 reconcile、日常手动运行和 Server runtime 都会在 tenant/user RLS 事务中把正式 Action 的身份与 token 哈希和同任务 `enabled` authority 实时比对；token 被替换、跨任务复用或 authority 已撤销时 fail-closed。reconcile 与手动运行只校验/执行，不改 Schedule spec、status 或 Action。
 - Shadow 使用独立 Workflow ID，不读取、不更新、不触发原 Schedule；原 cron、时区、Overlap、Action 和下次周一 09:00 执行时间均保持不变。
+- 长期 worker 对无 token 的 Activity 不读取进程级 shadow canary 作为授权；它只接受严格的
+  `research-v3-shadow-<64 lowercase hex>` Workflow ID，并在任何 policy、模型或网络副作用前
+  通过 tenant/user RLS 查询当前 prepared V3 head。真正创建 snapshot 时仍再次核验 exact
+  Workflow、run、prepared binding、任务状态和定义摘要。正式 Action 继续只接受逐任务数据库 token。
 - Scheduler 再核验任务 owner、`active|paused` 状态与 exact prepared
   `vane.task-approved-definition/v3` sidecar；不会回退读取正式 head。暂停任务的 shadow
   只在 prepared-shadow capability 分支放行，正式运行的暂停/手动运行规则不变。
