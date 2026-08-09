@@ -13,4 +13,5 @@ type ResearchV3DefinitionPrepareParams struct {
 	Notification   NotificationPolicyV3
 	Output         OutputPreferenceV3
 	PlannerBudget  types.PlannerBudget
+	ResearchScope  *ResearchScopeV3
 }

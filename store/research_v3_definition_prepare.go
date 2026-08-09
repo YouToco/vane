@@ -76,6 +76,7 @@ func (s *Store) PrepareResearchV3Definition(
 		TaskName: name, TaskManual: manual, SpecJSON: spec,
 		ExecutionMode: types.ExecutionModeDiscoverAtRun,
 		Notification:  p.Notification, Output: p.Output, PlannerBudget: p.PlannerBudget,
+		ResearchScope:      p.ResearchScope,
 		DeliveryPolicy:     taskstate.DeliveryPolicyOwnerFeishu,
 		TenantBudgetPolicy: taskstate.BudgetPolicyInheritTenantQuota,
 	})

@@ -49,6 +49,20 @@ type OutputPreferenceV3 struct {
 	IncludeEvidenceLinks bool             `json:"include_evidence_links"`
 }
 
+type ResearchScopeModeV3 string
+
+const (
+	ResearchScopeEventWindowV3 ResearchScopeModeV3 = "event_window"
+	ResearchScopeWeekSecondsV3 int64               = 7 * 24 * 60 * 60
+)
+
+// ResearchScopeV3 is optional owner-confirmed structured research authority.
+// A nil scope retains the historical task-manual-only behavior byte-for-byte.
+type ResearchScopeV3 struct {
+	Mode            ResearchScopeModeV3 `json:"mode"`
+	LookbackSeconds int64               `json:"lookback_seconds"`
+}
+
 // ApprovedDefinitionV3 freezes only the owner's durable research intent and
 // policies. The executable research plan is created independently for every
 // run from this manual and the frozen runtime capability catalog.
@@ -59,6 +73,7 @@ type ApprovedDefinitionV3 struct {
 	TaskID             string               `json:"task_id"`
 	TaskName           string               `json:"task_name"`
 	TaskManual         string               `json:"task_manual"`
+	ResearchScope      *ResearchScopeV3     `json:"research_scope,omitempty"`
 	SpecJSON           json.RawMessage      `json:"spec_json"`
 	ExecutionMode      types.ExecutionMode  `json:"execution_mode"`
 	Notification       NotificationPolicyV3 `json:"notification"`
@@ -74,6 +89,7 @@ type ApprovedDefinitionInputV3 struct {
 	TaskID             string
 	TaskName           string
 	TaskManual         string
+	ResearchScope      *ResearchScopeV3
 	SpecJSON           json.RawMessage
 	ExecutionMode      types.ExecutionMode
 	Notification       NotificationPolicyV3
@@ -100,7 +116,8 @@ func BuildApprovedDefinitionV3(input ApprovedDefinitionInputV3) (ApprovedDefinit
 		SchemaVersion: ApprovedDefinitionSchemaVersionV3,
 		TenantID:      input.TenantID, UserID: input.UserID, TaskID: input.TaskID,
 		TaskName: input.TaskName, TaskManual: input.TaskManual,
-		SpecJSON: input.SpecJSON, ExecutionMode: input.ExecutionMode,
+		ResearchScope: cloneResearchScopeV3(input.ResearchScope),
+		SpecJSON:      input.SpecJSON, ExecutionMode: input.ExecutionMode,
 		Notification: input.Notification, Output: input.Output,
 		PlannerBudget: input.PlannerBudget, DeliveryPolicy: input.DeliveryPolicy,
 		TenantBudgetPolicy: input.TenantBudgetPolicy,
@@ -179,6 +196,13 @@ func normalizeApprovedDefinitionV3(
 		!validMultilineText(definition.TaskManual, maxPlaybookBytes, false) {
 		return ApprovedDefinitionV3{}, invalidState("approved definition v3 text is invalid")
 	}
+	if definition.ResearchScope != nil {
+		if definition.ResearchScope.Mode != ResearchScopeEventWindowV3 ||
+			definition.ResearchScope.LookbackSeconds != ResearchScopeWeekSecondsV3 {
+			return ApprovedDefinitionV3{}, invalidState("approved definition v3 research scope is invalid")
+		}
+		definition.ResearchScope = cloneResearchScopeV3(definition.ResearchScope)
+	}
 	var err error
 	definition.SpecJSON, err = canonicalScheduleSpecV3(definition.SpecJSON)
 	if err != nil {
@@ -201,6 +225,14 @@ func normalizeApprovedDefinitionV3(
 		return ApprovedDefinitionV3{}, err
 	}
 	return definition, nil
+}
+
+func cloneResearchScopeV3(scope *ResearchScopeV3) *ResearchScopeV3 {
+	if scope == nil {
+		return nil
+	}
+	copy := *scope
+	return &copy
 }
 
 func canonicalScheduleSpecV3(payload json.RawMessage) (json.RawMessage, error) {
