@@ -326,6 +326,86 @@ $$;
 REVOKE ALL ON FUNCTION research_brief_candidate_valid_v125(BIGINT,BYTEA)
     FROM PUBLIC;
 
+-- Mirror NormalizeResearchGroundingVerdictV1 plus the Store's citation-bound
+-- issue check before a rejected verdict may authorize a paid correction.
+-- +goose StatementBegin
+CREATE FUNCTION research_grounding_verdict_valid_v125(
+    verdict_payload BYTEA,
+    candidate_payload BYTEA,
+    expected_verdict TEXT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+DECLARE
+    verdict_json JSONB;
+    candidate_json JSONB;
+BEGIN
+    IF expected_verdict NOT IN ('grounded','unsupported') OR
+       NOT (convert_from(verdict_payload,'UTF8')
+                IS JSON OBJECT WITH UNIQUE KEYS) THEN
+        RETURN false;
+    END IF;
+    verdict_json := convert_from(verdict_payload,'UTF8')::jsonb;
+    candidate_json := convert_from(candidate_payload,'UTF8')::jsonb;
+    IF (SELECT count(*) FROM jsonb_object_keys(verdict_json))<>4 OR
+       (verdict_json-ARRAY['schema_version','candidate_digest','verdict','issues'])<>
+           '{}'::jsonb OR
+       verdict_json->>'schema_version'<>'vane.research-grounding-verdict/v1' OR
+       verdict_json->>'candidate_digest'<>
+           encode(sha256(candidate_payload),'hex') OR
+       verdict_json->>'verdict'<>expected_verdict OR
+       jsonb_typeof(verdict_json->'issues') IS DISTINCT FROM 'array' OR
+       jsonb_array_length(verdict_json->'issues')>16 OR
+       ((expected_verdict='grounded') IS DISTINCT FROM
+            (jsonb_array_length(verdict_json->'issues')=0)) OR EXISTS (
+           SELECT 1 FROM jsonb_array_elements(verdict_json->'issues') issue
+            WHERE jsonb_typeof(issue) IS DISTINCT FROM 'object'
+               OR (SELECT count(*) FROM jsonb_object_keys(issue))<>4
+               OR (issue-ARRAY['field','claim','refs','reason'])<>'{}'::jsonb
+               OR jsonb_typeof(issue->'field') IS DISTINCT FROM 'string'
+               OR issue->>'field' NOT IN ('headline','summary','significance')
+               OR jsonb_typeof(issue->'claim') IS DISTINCT FROM 'string'
+               OR octet_length(issue->>'claim') NOT BETWEEN 1 AND 4096
+               OR btrim(issue->>'claim') IS DISTINCT FROM issue->>'claim'
+               OR jsonb_typeof(issue->'reason') IS DISTINCT FROM 'string'
+               OR octet_length(issue->>'reason') NOT BETWEEN 1 AND 4096
+               OR btrim(issue->>'reason') IS DISTINCT FROM issue->>'reason'
+               OR jsonb_typeof(issue->'refs') IS DISTINCT FROM 'array'
+               OR jsonb_array_length(issue->'refs')>64
+               OR EXISTS (
+                   SELECT 1 FROM jsonb_array_elements(issue->'refs') ref
+                    WHERE jsonb_typeof(ref) IS DISTINCT FROM 'object'
+                       OR (SELECT count(*) FROM jsonb_object_keys(ref))<>2
+                       OR (ref-ARRAY['kind','ref'])<>'{}'::jsonb
+                       OR jsonb_typeof(ref->'kind') IS DISTINCT FROM 'string'
+                       OR ref->>'kind' NOT IN ('current_evidence','history')
+                       OR jsonb_typeof(ref->'ref') IS DISTINCT FROM 'string'
+                       OR octet_length(ref->>'ref') NOT BETWEEN 1 AND 255
+                       OR btrim(ref->>'ref') IS DISTINCT FROM ref->>'ref'
+                       OR NOT EXISTS (
+                           SELECT 1 FROM jsonb_array_elements(
+                               candidate_json->'citations') citation
+                            WHERE citation=ref
+                       )
+               ) OR EXISTS (
+                   SELECT 1 FROM jsonb_array_elements(issue->'refs') ref
+                    GROUP BY ref->>'kind',ref->>'ref' HAVING count(*)>1
+               )
+       ) THEN
+        RETURN false;
+    END IF;
+    RETURN true;
+EXCEPTION WHEN OTHERS THEN
+    RETURN false;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_grounding_verdict_valid_v125(
+    BYTEA,BYTEA,TEXT) FROM PUBLIC;
+
 -- Rebuild the complete v1.2 grounding-verifier input from the frozen
 -- synthesis context and the exact candidate. JSONB equality intentionally
 -- ignores representation-only key order/whitespace while rejecting every
@@ -839,6 +919,10 @@ SELECT expected_status IN ('grounded','rejected') AND EXISTS (
        AND call.user_prompt=convert_from(grounding.verifier_prompt,'UTF8')
        AND public.research_brief_matches_synthesis_completion_v119(
                grounding.verdict_payload,call.completion)
+       AND public.research_grounding_verdict_valid_v125(
+               grounding.verdict_payload,grounding.candidate_brief_payload,
+               CASE expected_status
+                   WHEN 'grounded' THEN 'grounded' ELSE 'unsupported' END)
        AND jsonb_typeof(convert_from(grounding.verdict_payload,'UTF8')::jsonb)='object'
        AND convert_from(grounding.verdict_payload,'UTF8')::jsonb->>'schema_version'=
            'vane.research-grounding-verdict/v1'
@@ -1988,6 +2072,7 @@ DROP TRIGGER enforce_research_grounding_correction_insert_v125
 DROP FUNCTION enforce_research_grounding_correction_insert_v125();
 DROP FUNCTION research_expected_grounding_correction_prompt_v125(BIGINT);
 DROP FUNCTION research_grounding_has_exact_receipt_v125(BIGINT,TEXT);
+DROP FUNCTION research_grounding_verdict_valid_v125(BYTEA,BYTEA,TEXT);
 DROP TRIGGER enforce_research_grounding_insert_v125
     ON research_brief_grounding_verifications;
 DROP FUNCTION enforce_research_grounding_insert_v125();
