@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  store-race:
     runs-on: ubuntu-24.04
 
     services:
@@ -73,6 +73,44 @@ jobs:
           go-version: "1.26.5"
           cache-dependency-path: go.sum
 
+      - name: Run store race shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/storetestshard run \
+            --artifacts tmp/store-sharding \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports[5432] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable'
+
+  rest:
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: vane_test
+          POSTGRES_USER: vane
+          POSTGRES_PASSWORD: vane_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U vane -d vane_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: go.sum
+
       - name: Download dependencies
         run: go mod download
 
@@ -85,34 +123,17 @@ jobs:
       - name: Verify agent tool inventory
         run: go run ./cmd/agenttoolinventory -check
 
-      - name: Run store race shards
-        shell: bash
-        run: |
-          set -euo pipefail
-          go run ./cmd/storetestshard run \
-            --artifacts tmp/store-sharding \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable' \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports[5432] }}/vane_test?sslmode=disable' \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable'
-
       - name: Test remaining packages
         shell: bash
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports[5432] }}/vane_test?sslmode=disable
         run: |
           set -euo pipefail
           store_package="$(go list ./store)"
           mapfile -t packages < <(go list ./... | grep -Fvx "${store_package}")
           go test -race -p=1 -parallel=1 -covermode=atomic \
-            -coverprofile=tmp/store-sharding/non-store.coverage.out \
+            -coverprofile=non-store.coverage.out \
             "${packages[@]}"
-
-      - name: Merge coverage
-        run: >-
-          go run ./cmd/storetestshard merge-coverage
-          --output coverage.txt
-          tmp/store-sharding/store.coverage.out
-          tmp/store-sharding/non-store.coverage.out
 
       - name: True Temporal termination with PostgreSQL recovery
         run: >-
@@ -120,22 +141,16 @@ jobs:
           -run TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges
           -count=1
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports[5432] }}/vane_test?sslmode=disable
 
       - name: Build
         run: |
           go build -o bin/vane ./cmd/server
           go build -o bin/vane-research-prepare ./cmd/researchprepare
 
-      - name: Upload timing and coverage artifacts
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ci-timing-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            tmp/store-sharding/*.json
-            tmp/store-sharding/*.txt
-            tmp/store-sharding/*.out
-            coverage.txt
-          if-no-files-found: warn
-          retention-days: 14
+  test:
+    needs: [store-race, rest]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Confirm required CI jobs
+        run: echo "store race and remaining package gates passed"

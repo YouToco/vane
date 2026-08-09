@@ -638,10 +638,11 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 	}
 	workflow := strings.ReplaceAll(string(payload), "\r\n", "\n")
 	for _, required := range []string{
-		"runs-on: [self-hosted, Linux, vane-test]",
+		"runs-on: ubuntu-24.04",
 		"permissions:\n  contents: read",
 		"persist-credentials: false",
 		"- 5432/tcp",
+		"${{ job.services.postgres_0.ports[5432] }}",
 		"${{ job.services.postgres.ports[5432] }}",
 		`--health-cmd "pg_isready -U vane -d vane_test"`,
 	} {
@@ -650,6 +651,7 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
+		"self-hosted",
 		"vane-build",
 		"vane-deploy",
 		"vps-primary",
@@ -658,6 +660,7 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		"workflow_dispatch:",
 		"- 5432:5432",
 		"@localhost:5432/",
+		"actions/upload-artifact",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Errorf("source CI contains production capability %q", forbidden)
