@@ -182,16 +182,21 @@ Tool 接口签名由 M4 契约固定且工具实例是全局单例，per-message
 - 表结构对齐 OTel GenAI execute_tool 语义：tool_name / tool_kind（static /
   tikhub_search / tikhub_endpoint）/ error_type（低基数硬枚举）/ duration_ms /
   trace_id（与 llm_calls 同源，可 JOIN 回放整条消息链路）。
-- **元数据全量、内容截断**：arguments 全存（非法 JSON 降级为字符串保存——排查
-  恰恰需要看残缺原文）；result_preview 截 8K rune + result_size 存真实体量。
+- **元数据全量、内容截断**：一般工具 arguments 全存（非法 JSON 降级为字符串）；
+  `tool_search` 是安全例外，arguments 只存 query/platform SHA-256、字节数与 limit，
+  不保留可能含敏感意图的原文。result_preview 截 8K rune + result_size 存真实体量。
   上游响应可重取，不是本库资产，不入全文。
 - **入库前净化**（sanitizeForDB）：上游响应可能含非法 UTF-8（GBK 错误页/二进制残片）
   或 NUL，两者都会让 result_preview 的 TEXT 列与 messages 的 JSONB 列**整行插入失败**
   （Postgres 22021/22P05），Boss「每次调用必须有记录」被数据内容静默击穿、限额随之
   漏计。净化在 execRecorded 这唯一汇聚点做（result 同时流向会话消息与 result_preview，
   一处覆盖两 sink）：剔 NUL + 非法 UTF-8 换 U+FFFD；arguments 侧 normalizeArgsJSON 同办。
-- **检索留痕**（优化检索的唯一数据源）：retrieval_query + candidate_tools，
-  零命中也记。端点调用另记 endpoint_path + http_status。
+- **检索留痕**：`retrieval_query` 存有界 canonical `tool_search.audit/v1`，
+  包含 invalid/zero/success/error 状态、query/platform 摘要、不可变 catalog digest、
+  limit、candidate_count 与 truncated；`candidate_tools` 按排名存 `name\tscore=<float>`。
+  duration_ms 继续由 execRecorded 统一计时。truncated=true 明确表示请求的排名窗口
+  已填满或至少一条模型可见描述被 400 rune 上限裁剪。零命中也记。
+  端点调用另记 endpoint_path + http_status。
 - 记账纪律与 llm.Recorder 完全一致：同步写、失败只记日志，绝不放大成业务失败。
 
 ## §7 成本护栏（免确认的代价，Boss 拍板：双重限额）

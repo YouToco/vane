@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -59,6 +60,7 @@ type fakeEndpointCatalog struct {
 	searchErr    error
 	lastLimit    int
 	lastPlatform string
+	digest       string
 }
 
 func (f *fakeEndpointCatalog) SearchTools(_ string, platform string, limit int) ([]toolsearch.Match, error) {
@@ -88,6 +90,12 @@ func (f *fakeEndpointCatalog) PlatformCount(platform string) int {
 		return len(f.providers)
 	}
 	return 0
+}
+func (f *fakeEndpointCatalog) Digest() string {
+	if f.digest != "" {
+		return f.digest
+	}
+	return strings.Repeat("d", 64)
 }
 
 func newFakeCatalog(entries ...toolsearch.Entry) *fakeEndpointCatalog {
@@ -258,11 +266,28 @@ func TestToolSearchTool_ActivatesAndRecords(t *testing.T) {
 		}
 	}
 	// 检索留痕（契约 §6）：query 与候选进记账记录。
-	if !strings.Contains(rec.RetrievalQuery, "小红书 搜索 笔记") || !strings.Contains(rec.RetrievalQuery, "platform=xiaohongshu") {
-		t.Errorf("RetrievalQuery 留痕不符: %q", rec.RetrievalQuery)
+	var audit toolSearchAuditV1
+	if err := json.Unmarshal([]byte(rec.RetrievalQuery), &audit); err != nil {
+		t.Fatalf("tool_search audit 非法: %v: %q", err, rec.RetrievalQuery)
+	}
+	if audit.SchemaVersion != toolSearchAuditSchema || audit.Status != "success" ||
+		audit.QuerySHA256 != summarizedTextDigest("小红书 搜索 笔记") ||
+		audit.PlatformSHA256 != summarizedTextDigest("xiaohongshu") ||
+		audit.CatalogDigest != tikhubcatalog.AgentCatalogDigest() ||
+		audit.CandidateCount != len(state.activation.names) || !audit.Truncated {
+		t.Errorf("tool_search audit 留痕不符: %+v", audit)
+	}
+	if strings.Contains(rec.RetrievalQuery, "小红书") || strings.Contains(string(rec.Arguments), "小红书") {
+		t.Fatalf("完整 query 泄露进审计字段: retrieval=%q args=%s",
+			rec.RetrievalQuery, rec.Arguments)
 	}
 	if len(rec.CandidateTools) != len(state.activation.names) {
 		t.Errorf("候选留痕 %d 与激活数 %d 不符", len(rec.CandidateTools), len(state.activation.names))
+	}
+	for _, candidate := range rec.CandidateTools {
+		if !strings.Contains(candidate, "\tscore=") {
+			t.Errorf("候选缺稳定 score: %q", candidate)
+		}
 	}
 	// 平台过滤是硬约束。
 	for _, name := range state.activation.names {
@@ -288,6 +313,74 @@ func TestToolSearchTool_SelfCorrectMessages(t *testing.T) {
 	out, _ := tool.Execute(ctxWithRunState(state, nil), 1, json.RawMessage(`{"query":"视频","platform":"myspace"}`))
 	if !strings.Contains(out, "不在目录中") {
 		t.Errorf("未知平台应提示平台清单，实得 %q", out)
+	}
+}
+
+func TestToolSearchAudit_StatusesAreStableAndBounded(t *testing.T) {
+	definition := fakeToolDefinition("audit_tool", 0)
+	for _, tc := range []struct {
+		name          string
+		catalog       *fakeEndpointCatalog
+		args          json.RawMessage
+		wantStatus    string
+		wantError     string
+		wantTruncated bool
+	}{
+		{
+			name: "invalid", catalog: newFakeCatalog(definition),
+			args:       json.RawMessage(`{"query":"owner-secret","limit":null}`),
+			wantStatus: "invalid", wantError: types.ToolErrInvalidArgs,
+		},
+		{
+			name: "zero", catalog: newFakeCatalog(),
+			args:       json.RawMessage(`{"query":"owner-secret"}`),
+			wantStatus: "zero",
+		},
+		{
+			name: "error", catalog: &fakeEndpointCatalog{
+				definitions: map[string]toolsearch.Entry{},
+				providers:   map[string]tikhubcatalog.Entry{},
+				searchErr:   errors.New("catalog unavailable: secret-internal"),
+			},
+			args:       json.RawMessage(`{"query":"owner-secret"}`),
+			wantStatus: "error", wantError: types.ToolErrInternal,
+		},
+		{
+			name: "success", catalog: newFakeCatalog(definition),
+			args:       json.RawMessage(`{"query":"owner-secret","limit":1}`),
+			wantStatus: "success", wantTruncated: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
+			ep.catalog = tc.catalog
+			rec := &types.ToolCall{}
+			state := &toolRunState{activation: &activationState{}}
+			if _, err := ep.SearchTool().Execute(ctxWithRunState(state, rec), 1, tc.args); err != nil {
+				t.Fatal(err)
+			}
+			var audit toolSearchAuditV1
+			if err := json.Unmarshal([]byte(rec.RetrievalQuery), &audit); err != nil {
+				t.Fatalf("audit=%q err=%v", rec.RetrievalQuery, err)
+			}
+			if audit.Status != tc.wantStatus || audit.Truncated != tc.wantTruncated ||
+				audit.SchemaVersion != toolSearchAuditSchema ||
+				audit.CatalogDigest != tc.catalog.Digest() || rec.ErrorType != tc.wantError {
+				t.Fatalf("audit=%+v error_type=%q", audit, rec.ErrorType)
+			}
+			for _, persisted := range []string{
+				rec.RetrievalQuery, string(rec.Arguments), strings.Join(rec.CandidateTools, "\n"), rec.Error,
+			} {
+				if strings.Contains(persisted, "owner-secret") ||
+					strings.Contains(persisted, "secret-internal") {
+					t.Fatalf("审计泄露完整输入/错误: %q", persisted)
+				}
+			}
+			if len(rec.RetrievalQuery) > 1024 || len(rec.Arguments) > 512 || len(rec.CandidateTools) > 8 {
+				t.Fatalf("审计越界: retrieval=%d args=%d candidates=%d",
+					len(rec.RetrievalQuery), len(rec.Arguments), len(rec.CandidateTools))
+			}
+		})
 	}
 }
 
@@ -769,6 +862,14 @@ func TestHandleMessage_EndpointSearchInjectInvoke(t *testing.T) {
 	if search.ToolKind != types.ToolCallKindTikHubSearch || search.RetrievalQuery == "" || len(search.CandidateTools) == 0 {
 		t.Errorf("search 记账不符: %+v", search)
 	}
+	var persistedAudit toolSearchAuditV1
+	if err := json.Unmarshal([]byte(search.RetrievalQuery), &persistedAudit); err != nil ||
+		persistedAudit.Status != "success" || !persistedAudit.Truncated ||
+		persistedAudit.CatalogDigest != tikhubcatalog.AgentCatalogDigest() ||
+		search.DurationMs < 0 || search.ResultSize != len(search.ResultPreview) {
+		t.Errorf("search bounded audit 不符: audit=%+v receipt=%+v err=%v",
+			persistedAudit, search, err)
+	}
 	if endpoint.ToolKind != types.ToolCallKindTikHubEndpoint || endpoint.EndpointPath != entry.Path ||
 		endpoint.HTTPStatus == nil || *endpoint.HTTPStatus != 200 {
 		t.Errorf("endpoint 记账不符: %+v", endpoint)
@@ -1148,7 +1249,7 @@ func TestNew_SystemPromptEndpointNote(t *testing.T) {
 }
 
 func TestNewChecked_DeferredToolCollisionsAndSplitResolverFailClosed(t *testing.T) {
-	for _, name := range []string{"tool_search", "read_endpoint_result", "static_collision"} {
+	for _, name := range []string{"tool_search", "read_endpoint_result", "search_endpoints", "static_collision"} {
 		t.Run(name, func(t *testing.T) {
 			ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 1, 1)
 			ep.catalog = newFakeCatalog(fakeToolDefinition(name, 0))
@@ -1160,6 +1261,15 @@ func TestNewChecked_DeferredToolCollisionsAndSplitResolverFailClosed(t *testing.
 				t.Fatalf("deferred/static collision %q should fail startup", name)
 			}
 		})
+	}
+	if _, err := NewChecked(Deps{
+		Tools: testToolSpecs(&fakeTool{name: "search_endpoints"}),
+	}); err == nil || !strings.Contains(err.Error(), "retired") {
+		t.Fatalf("retired static search_endpoints should fail startup: %v", err)
+	}
+	retiredCatalog := newFakeCatalog(fakeToolDefinition("search_endpoints", 0))
+	if err := (&activationState{}).activateBatch(retiredCatalog, []string{"search_endpoints"}); err == nil || !strings.Contains(err.Error(), "retired") {
+		t.Fatalf("retired deferred search_endpoints should not activate: %v", err)
 	}
 
 	epOne := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 1, 1)

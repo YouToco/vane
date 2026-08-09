@@ -332,6 +332,9 @@ func NewChecked(d Deps) (*Loop, error) {
 		if _, exists := tools[spec.Name()]; exists {
 			return nil, fmt.Errorf("agent: duplicate tool name %q", spec.Name())
 		}
+		if spec.Name() == "search_endpoints" {
+			return nil, errors.New("agent: retired tool search_endpoints is forbidden")
+		}
 		tools[spec.Name()] = spec
 		defs = append(defs, spec.Definition)
 	}
@@ -348,9 +351,9 @@ func NewChecked(d Deps) (*Loop, error) {
 				return nil, fmt.Errorf("agent: static tool %q collides with a deferred tool", name)
 			}
 		}
-		for _, reserved := range []string{"tool_search", "read_endpoint_result"} {
+		for _, reserved := range []string{"tool_search", "read_endpoint_result", "search_endpoints"} {
 			if _, collision := d.Endpoints.catalog.AgentDefinition(reserved); collision {
-				return nil, fmt.Errorf("agent: deferred tool collides with reserved tool %q", reserved)
+				return nil, fmt.Errorf("agent: deferred catalog contains forbidden tool %q", reserved)
 			}
 		}
 		if spec, ok := tools["tool_search"]; ok {

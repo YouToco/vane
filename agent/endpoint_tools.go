@@ -18,10 +18,12 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -317,6 +319,7 @@ type endpointCatalog interface {
 	AgentLookup(name string) (tikhubcatalog.Entry, bool)
 	Platforms() []string
 	PlatformCount(platform string) int
+	Digest() string
 }
 
 type productionEndpointCatalog struct{}
@@ -334,6 +337,7 @@ func (productionEndpointCatalog) Platforms() []string { return tikhubcatalog.Pla
 func (productionEndpointCatalog) PlatformCount(platform string) int {
 	return tikhubcatalog.PlatformCount(platform)
 }
+func (productionEndpointCatalog) Digest() string { return tikhubcatalog.AgentCatalogDigest() }
 
 // EndpointTools 持有端点工具面的共享依赖，随 Deps 注入 Loop；nil 表示该能力
 // 未装配（tikhub key 缺失等），agent 退化为纯静态工具面，行为与本特性上线前一致。
@@ -485,6 +489,9 @@ func validatedActivationDefinitions(c endpointCatalog, names []string) ([]toolse
 	seen := make(map[string]struct{}, len(names))
 	totalSchemaBytes := 0
 	for _, name := range names {
+		if name == "search_endpoints" {
+			return nil, errors.New("tool_search: retired search_endpoints cannot be activated")
+		}
 		if name == "" || strings.TrimSpace(name) != name {
 			return nil, errors.New("tool_search: invalid activated tool name")
 		}
@@ -555,8 +562,126 @@ func (t *toolSearchTool) Parameters() json.RawMessage {
 func (t *toolSearchTool) Summarize(json.RawMessage) string { return "" }
 func (t *toolSearchTool) toolKind() types.ToolCallKind     { return types.ToolCallKindTikHubSearch }
 
+const toolSearchAuditSchema = "tool_search.audit/v1"
+
+type toolSearchAuditV1 struct {
+	SchemaVersion  string `json:"schema_version"`
+	Status         string `json:"status"`
+	QuerySHA256    string `json:"query_sha256,omitempty"`
+	QueryBytes     int    `json:"query_bytes"`
+	ArgumentBytes  int    `json:"argument_bytes"`
+	PlatformSHA256 string `json:"platform_sha256,omitempty"`
+	PlatformBytes  int    `json:"platform_bytes,omitempty"`
+	Limit          int    `json:"limit,omitempty"`
+	CatalogDigest  string `json:"catalog_digest,omitempty"`
+	CandidateCount int    `json:"candidate_count"`
+	Truncated      bool   `json:"truncated"`
+}
+
+type toolSearchArgumentSummaryV1 struct {
+	SchemaVersion  string `json:"schema_version"`
+	QuerySHA256    string `json:"query_sha256,omitempty"`
+	QueryBytes     int    `json:"query_bytes"`
+	ArgumentBytes  int    `json:"argument_bytes"`
+	PlatformSHA256 string `json:"platform_sha256,omitempty"`
+	PlatformBytes  int    `json:"platform_bytes,omitempty"`
+	Limit          int    `json:"limit,omitempty"`
+}
+
+// recordToolSearchAudit uses only the existing tool_calls receipt. Raw query
+// and platform text are replaced by SHA-256 summaries before persistence;
+// schemas, descriptions and provider routing never enter the audit fields.
+// Truncated means the requested rank window was full or at least one
+// model-facing description was clipped in the bounded search result.
+func (t *toolSearchTool) recordAudit(
+	ctx context.Context,
+	argumentBytes int,
+	query, platform string,
+	limit int,
+	status string,
+	truncated bool,
+	hits []toolsearch.Match,
+) {
+	rec := recFrom(ctx)
+	if rec == nil {
+		return
+	}
+	queryDigest := summarizedTextDigest(query)
+	platformDigest := summarizedTextDigest(platform)
+	catalogDigest := ""
+	if t != nil && t.ep != nil && t.ep.catalog != nil {
+		catalogDigest = t.ep.catalog.Digest()
+	}
+	audit := toolSearchAuditV1{
+		SchemaVersion: toolSearchAuditSchema,
+		Status:        status,
+		QuerySHA256:   queryDigest, QueryBytes: len(query),
+		ArgumentBytes:  argumentBytes,
+		PlatformSHA256: platformDigest, PlatformBytes: len(platform),
+		Limit: limit, CatalogDigest: catalogDigest,
+		CandidateCount: len(hits), Truncated: truncated,
+	}
+	auditRaw, err := json.Marshal(audit)
+	if err != nil {
+		return
+	}
+	argumentSummary, err := json.Marshal(toolSearchArgumentSummaryV1{
+		SchemaVersion: toolSearchAuditSchema,
+		QuerySHA256:   queryDigest, QueryBytes: len(query),
+		ArgumentBytes:  argumentBytes,
+		PlatformSHA256: platformDigest, PlatformBytes: len(platform),
+		Limit: limit,
+	})
+	if err != nil {
+		return
+	}
+	rec.Arguments = argumentSummary
+	rec.RetrievalQuery = string(auditRaw)
+	rec.CandidateTools = rec.CandidateTools[:0]
+	for _, hit := range hits {
+		rec.CandidateTools = append(rec.CandidateTools,
+			hit.Entry.Name+"\tscore="+strconv.FormatFloat(hit.Score, 'g', -1, 64))
+	}
+	switch status {
+	case "invalid":
+		rec.ErrorType = types.ToolErrInvalidArgs
+	case "error":
+		rec.ErrorType = types.ToolErrInternal
+	default:
+		rec.ErrorType = ""
+	}
+}
+
+func summarizedTextDigest(value string) string {
+	if value == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", digest)
+}
+
+func toolSearchResultTruncated(hits []toolsearch.Match, limit int) bool {
+	if limit > 0 && len(hits) == limit {
+		return true
+	}
+	for _, hit := range hits {
+		if utf8.RuneCountInString(hit.Entry.Description) > 400 {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *toolSearchTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+	argumentBytes := len(args)
+	query := ""
+	platform := ""
+	limit := 0
+	record := func(status string, hits []toolsearch.Match, truncated bool) {
+		t.recordAudit(ctx, argumentBytes, query, platform, limit, status, truncated, hits)
+	}
 	if t == nil || t.ep == nil || t.ep.inv == nil || t.ep.catalog == nil {
+		record("error", nil, false)
 		return "工具检索与调用能力未授权，本次已跳过", nil
 	}
 	var a struct {
@@ -565,34 +690,46 @@ func (t *toolSearchTool) Execute(ctx context.Context, _ int64, args json.RawMess
 		Limit    json.RawMessage `json:"limit,omitempty"`
 	}
 	if err := strictjson.DecodeExact(args, &a); err != nil {
+		record("invalid", nil, false)
 		return "参数不是合法 JSON，请修正后重试", nil
 	}
+	query = a.Query
+	platform = a.Platform
 	if len(a.Query) > maxToolSearchQueryBytes {
+		record("invalid", nil, false)
 		return fmt.Sprintf("query 超过 %d UTF-8 字节，请缩短后重试", maxToolSearchQueryBytes), nil
 	}
 	if len(a.Platform) > maxToolSearchPlatformBytes {
+		record("invalid", nil, false)
 		return fmt.Sprintf("platform 超过 %d UTF-8 字节", maxToolSearchPlatformBytes), nil
 	}
 	if !utf8.ValidString(a.Query) || !utf8.ValidString(a.Platform) {
+		record("invalid", nil, false)
 		return "query 和 platform 必须是合法 UTF-8 文本", nil
 	}
 	a.Query = strings.TrimSpace(a.Query)
+	query = a.Query
 	if a.Query == "" {
+		record("invalid", nil, false)
 		return "query 不能为空，请提供检索词（中英文均可）", nil
 	}
 	a.Platform = strings.ToLower(strings.TrimSpace(a.Platform))
-	limit := defaultToolSearchLimit
+	platform = a.Platform
+	limit = defaultToolSearchLimit
 	if len(a.Limit) != 0 {
 		if err := strictjson.DecodeExact(a.Limit, &limit); err != nil {
+			record("invalid", nil, false)
 			return "limit 必须是 1–8 的整数", nil
 		}
 	}
 	if limit < 1 || limit > defaultToolSearchLimit {
+		record("invalid", nil, false)
 		return fmt.Sprintf("limit 必须在 1–%d 之间", defaultToolSearchLimit), nil
 	}
 
 	hits, err := t.ep.catalog.SearchTools(a.Query, a.Platform, limit)
 	if err != nil {
+		record("error", nil, false)
 		return "工具目录检索失败，请缩短或调整检索词后重试", nil
 	}
 	if state := runStateFrom(ctx); state != nil {
@@ -601,19 +738,8 @@ func (t *toolSearchTool) Execute(ctx context.Context, _ int64, args json.RawMess
 		state.candidateSlots += limit
 	}
 
-	// 检索留痕（契约 §6）：无论命中与否都记 query 与候选——零命中的 query 正是
-	// 之后优化检索（换分词/加同义词/升级 embedding）最需要的样本。
-	if rec := recFrom(ctx); rec != nil {
-		rec.RetrievalQuery = a.Query
-		if a.Platform != "" {
-			rec.RetrievalQuery += " [platform=" + a.Platform + "]"
-		}
-		for _, h := range hits {
-			rec.CandidateTools = append(rec.CandidateTools, h.Entry.Name)
-		}
-	}
-
 	if len(hits) == 0 {
+		record("zero", nil, false)
 		msg := "没有检索到匹配端点。可尝试：换关键词（中英文均可）、去掉平台过滤"
 		if a.Platform != "" && t.ep.catalog.PlatformCount(a.Platform) == 0 {
 			msg = "平台 " + a.Platform + " 不在目录中。可用平台：" + strings.Join(t.ep.catalog.Platforms(), "、")
@@ -624,6 +750,7 @@ func (t *toolSearchTool) Execute(ctx context.Context, _ int64, args json.RawMess
 	state := runStateFrom(ctx)
 	if state != nil {
 		if state.activation == nil {
+			record("error", hits, toolSearchResultTruncated(hits, limit))
 			return "工具激活状态不可用，本次命中未注入", nil
 		}
 		names := make([]string, 0, len(hits))
@@ -632,10 +759,12 @@ func (t *toolSearchTool) Execute(ctx context.Context, _ int64, args json.RawMess
 		}
 		t.ep.pruneActivation(state.activation)
 		if err := state.activation.activateBatch(t.ep.catalog, names); err != nil {
+			record("error", hits, toolSearchResultTruncated(hits, limit))
 			return fmt.Sprintf("动态工具上限为 %d 个且 schema 总量不超过 %d 字节；本批已全部拒绝，请新建会话或缩小检索范围。",
 				maxActivatedEndpoints, maxDynamicSchemaBytes), nil
 		}
 	}
+	record("success", hits, toolSearchResultTruncated(hits, limit))
 	var b strings.Builder
 	fmt.Fprintf(&b, "检索到 %d 个工具", len(hits))
 	if state != nil {

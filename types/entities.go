@@ -301,24 +301,27 @@ type ToolCall struct {
 	// runs. It is carried separately from UserID because one user may belong to
 	// more than one tenant. Legacy calls leave it nil and retain the historical
 	// membership-derived attribution path.
-	TenantID       *int64          `json:"-"`
-	TraceID        string          `json:"trace_id"`
-	UserID         *int64          `json:"user_id,omitempty"`
-	SessionID      *int64          `json:"session_id,omitempty"` // 可空：后台恢复等无会话来源
-	ToolName       string          `json:"tool_name"`
-	ToolKind       ToolCallKind    `json:"tool_kind"`
-	Provider       string          `json:"provider"`              // kimi/deepseek/exa/tikhub；非计费工具为空
-	EndpointPath   string          `json:"endpoint_path"`         // 仅 tikhub_endpoint
-	Arguments      json.RawMessage `json:"arguments,omitempty"`   // 模型产出的参数原文
-	ResultPreview  string          `json:"result_preview"`        // 截断版结果（8K rune）
-	ResultSize     int             `json:"result_size"`           // 截断前字节数
-	HTTPStatus     *int            `json:"http_status,omitempty"` // 仅 tikhub_endpoint；非 HTTP 工具 NULL
-	ErrorType      string          `json:"error_type"`            // 低基数分类，成功为空串
-	Error          string          `json:"error"`                 // 详情，成功为空串
-	DurationMs     int             `json:"duration_ms"`
-	RetrievalQuery string          `json:"retrieval_query"`           // 仅 tikhub_search
-	CandidateTools []string        `json:"candidate_tools,omitempty"` // 仅 tikhub_search
-	CostUSD        *float64        `json:"cost_usd,omitempty"`        // 上游返回的花费（美元）；无计费信息时 nil
+	TenantID      *int64          `json:"-"`
+	TraceID       string          `json:"trace_id"`
+	UserID        *int64          `json:"user_id,omitempty"`
+	SessionID     *int64          `json:"session_id,omitempty"` // 可空：后台恢复等无会话来源
+	ToolName      string          `json:"tool_name"`
+	ToolKind      ToolCallKind    `json:"tool_kind"`
+	Provider      string          `json:"provider"`              // kimi/deepseek/exa/tikhub；非计费工具为空
+	EndpointPath  string          `json:"endpoint_path"`         // 仅 tikhub_endpoint
+	Arguments     json.RawMessage `json:"arguments,omitempty"`   // 模型产出的参数原文
+	ResultPreview string          `json:"result_preview"`        // 截断版结果（8K rune）
+	ResultSize    int             `json:"result_size"`           // 截断前字节数
+	HTTPStatus    *int            `json:"http_status,omitempty"` // 仅 tikhub_endpoint；非 HTTP 工具 NULL
+	ErrorType     string          `json:"error_type"`            // 低基数分类，成功为空串
+	Error         string          `json:"error"`                 // 详情，成功为空串
+	DurationMs    int             `json:"duration_ms"`
+	// tool_search stores a bounded canonical audit envelope here instead of
+	// the raw query; CandidateTools carries bounded "name\tscore=<float>"
+	// entries in rank order. Legacy tikhub_search rows may retain plain text.
+	RetrievalQuery string   `json:"retrieval_query"`
+	CandidateTools []string `json:"candidate_tools,omitempty"`
+	CostUSD        *float64 `json:"cost_usd,omitempty"` // 上游返回的花费（美元）；无计费信息时 nil
 	// UsageQuantity is the provider billing unit count: Exa search records the
 	// requested result count, contents records pages, and TikHub normally records
 	// one request. This keeps tier formulas data-driven for batched endpoints.
