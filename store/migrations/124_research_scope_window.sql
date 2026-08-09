@@ -29,6 +29,49 @@ $$;
 -- +goose StatementEnd
 REVOKE ALL ON FUNCTION research_scope_published_at_v1(TEXT) FROM PUBLIC;
 
+-- +goose StatementBegin
+CREATE FUNCTION research_scope_timestamp_ns_v124(value TEXT)
+RETURNS NUMERIC
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+DECLARE
+	parts TEXT[];
+	year_part INTEGER;
+	month_part INTEGER;
+	day_part INTEGER;
+	hour_part INTEGER;
+	minute_part INTEGER;
+	second_part INTEGER;
+	fraction_part NUMERIC;
+	offset_seconds INTEGER := 0;
+	offset_sign INTEGER := 1;
+BEGIN
+	parts := regexp_match(value,
+		'^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:[.]([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})$');
+	IF parts IS NULL THEN RETURN NULL; END IF;
+	year_part:=parts[1]::integer; month_part:=parts[2]::integer; day_part:=parts[3]::integer;
+	hour_part:=parts[4]::integer; minute_part:=parts[5]::integer; second_part:=parts[6]::integer;
+	IF hour_part>23 OR minute_part>59 OR second_part>59 THEN RETURN NULL; END IF;
+	PERFORM make_date(year_part,month_part,day_part);
+	fraction_part := coalesce(rpad(parts[7],9,'0'),'000000000')::numeric;
+	IF parts[8]<>'Z' THEN
+		IF substring(parts[8],2,2)::integer>23 OR substring(parts[8],5,2)::integer>59 THEN
+			RETURN NULL;
+		END IF;
+		offset_sign := CASE WHEN left(parts[8],1)='-' THEN -1 ELSE 1 END;
+		offset_seconds := offset_sign*(substring(parts[8],2,2)::integer*3600+
+			substring(parts[8],5,2)::integer*60);
+	END IF;
+	RETURN (((make_date(year_part,month_part,day_part)-DATE '1970-01-01')::numeric*86400+
+		hour_part*3600+minute_part*60+second_part-offset_seconds)*1000000000)+fraction_part;
+EXCEPTION WHEN OTHERS THEN RETURN NULL;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_scope_timestamp_ns_v124(TEXT) FROM PUBLIC;
+
 CREATE FUNCTION research_scope_json_string_v124(value TEXT)
 RETURNS TEXT
 LANGUAGE sql
@@ -56,7 +99,9 @@ DECLARE
     canonical_filtered TEXT := '[';
     separator TEXT := '';
     filtered_separator TEXT := '';
-    published TIMESTAMPTZ;
+    published_ns NUMERIC;
+	window_start_ns NUMERIC := extract(epoch FROM window_start)*1000000000;
+	window_end_ns NUMERIC := extract(epoch FROM window_end)*1000000000;
 BEGIN
     payload := convert_from(result_bytes,'UTF8')::jsonb;
     IF jsonb_typeof(payload)<>'array' THEN
@@ -83,8 +128,8 @@ BEGIN
             ',"text":'||public.research_scope_json_string_v124(document->>'text')||'}';
         canonical_full := canonical_full||separator||canonical_document;
         separator := ',';
-        published := public.research_scope_published_at_v1(document->>'published_at');
-        IF published>window_start AND published<=window_end THEN
+        published_ns := public.research_scope_timestamp_ns_v124(document->>'published_at');
+        IF published_ns>window_start_ns AND published_ns<=window_end_ns THEN
             canonical_filtered := canonical_filtered||filtered_separator||canonical_document;
             filtered_separator := ',';
         END IF;
@@ -229,6 +274,19 @@ BEGIN
         RAISE EXCEPTION '124: synthesis eligible Evidence projection differs'
             USING ERRCODE='23514';
     END IF;
+	IF NEW.status='finalized' AND EXISTS (
+		SELECT 1
+		  FROM jsonb_array_elements(
+		         convert_from(NEW.brief_payload,'UTF8')::jsonb->'citations') citation
+		 WHERE citation->>'kind'='current_evidence'
+		   AND (citation->>'ref' !~ '^[1-9][0-9]*$' OR NOT EXISTS (
+		       SELECT 1 FROM jsonb_array_elements(expected_ids) eligible_id
+		        WHERE eligible_id::text=citation->>'ref'
+		   ))
+	) THEN
+		RAISE EXCEPTION '124: final Brief cites ineligible scoped Evidence'
+			USING ERRCODE='23514';
+	END IF;
     RETURN NEW;
 END
 $$;
@@ -634,6 +692,7 @@ WHEN ((convert_from(NEW.context_payload,'UTF8')::jsonb->>'schema_version')
 EXECUTE FUNCTION reject_research_brief_synthesis_schema_v31();
 DROP FUNCTION filter_research_scope_evidence_v124(BYTEA,TIMESTAMPTZ,TIMESTAMPTZ);
 DROP FUNCTION research_scope_json_string_v124(TEXT);
+DROP FUNCTION research_scope_timestamp_ns_v124(TEXT);
 DROP FUNCTION research_scope_published_at_v1(TEXT);
 
 -- +goose StatementBegin

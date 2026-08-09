@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -9,6 +10,18 @@ import (
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
+
+func scopedResearchBriefFixtureV35(t *testing.T, result []byte) researchBriefFixtureV3 {
+	t.Helper()
+	scope := &taskstate.ResearchScopeV3{
+		Mode:            taskstate.ResearchScopeEventWindowV3,
+		LookbackSeconds: taskstate.ResearchScopeWeekSecondsV3,
+	}
+	st := tenantTestStore(t)
+	return newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true, result, "", "",
+		testResearchGroundingModelPolicyV1(t), scope, 0)
+}
 
 func testResearchWindowV33(t *testing.T) researchScopeWindowV33 {
 	t.Helper()
@@ -118,5 +131,142 @@ func TestValidateResearchBriefCitationsV33UsesEligibleContextIDs(t *testing.T) {
 	brief.Citations[0].Ref = "8"
 	if err := validateResearchBriefCitationsV3(brief, contextPayload, evidencePayload, historyPayload); err != nil {
 		t.Fatalf("eligible Evidence id rejected: %v", err)
+	}
+}
+
+func TestScopedResearchBriefV35FiltersFullEvidenceBeforeProjection(t *testing.T) {
+	now := time.Now().UTC()
+	result := []byte(canonicalWindowDocumentsV33(t,
+		researchWindowDocumentV33{Title: "outside", URL: "https://example.com/old", PublishedAt: now.Add(-8 * 24 * time.Hour).Format(time.RFC3339Nano), Text: strings.Repeat("old", 20<<10)},
+		researchWindowDocumentV33{Title: "inside <&>", URL: "https://example.com/new", PublishedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), Text: "eligible fact\u2028line"},
+		researchWindowDocumentV33{Title: "missing", URL: "https://example.com/missing", Text: "not eligible"},
+	))
+	f := scopedResearchBriefFixtureV35(t, result)
+	seal, err := f.st.LoadResearchRunSnapshotV3(t.Context(), f.identity, f.snapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seal.ResearchModel.Synthesis.RendererVersion != "research-synthesis.render/v3.5" {
+		t.Fatalf("renderer=%q", seal.ResearchModel.Synthesis.RendererVersion)
+	}
+	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var context researchSynthesisContextV3
+	if err := json.Unmarshal(prepared.Synthesis.ContextPayload, &context); err != nil {
+		t.Fatal(err)
+	}
+	if context.SchemaVersion != researchSynthesisContextSchemaV33 ||
+		context.ResearchScopeWindow == nil || len(context.CurrentEvidence) != 1 {
+		t.Fatalf("context=%+v", context)
+	}
+	visible := context.CurrentEvidence[0].SynthesisVisibleText
+	if strings.Contains(visible, "outside") || strings.Contains(visible, "missing") ||
+		!strings.Contains(visible, "inside") || !strings.Contains(visible, "eligible fact") {
+		t.Fatalf("visible scoped Evidence=%q", visible)
+	}
+	var manifest researchEvidenceManifestV3
+	if err := json.Unmarshal(prepared.Synthesis.EvidenceManifest, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Items) != 1 || manifest.Items[0].ResultDigest != researchRunSHA256(result) ||
+		context.CurrentEvidence[0].ResultDigest != manifest.Items[0].ResultDigest {
+		t.Fatalf("manifest=%+v context=%+v", manifest, context.CurrentEvidence)
+	}
+	tampered := context
+	tampered.CurrentEvidence[0].SynthesisVisibleText = "forged eligible fact"
+	tamperedPayload, err := json.Marshal(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.pool.Exec(t.Context(),
+		`UPDATE research_brief_syntheses SET context_payload=$2 WHERE id=$1`,
+		prepared.Synthesis.ID, tamperedPayload); err == nil {
+		t.Fatal("database admitted forged scoped visible Evidence")
+	}
+}
+
+func TestScopedResearchBriefV35RejectsExplicitlyTruncatedEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	result := []byte(canonicalWindowDocumentsV33(t,
+		researchWindowDocumentV33{Title: "inside", URL: "https://example.com/new", PublishedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), Text: "eligible"},
+	))
+	scope := &taskstate.ResearchScopeV3{Mode: taskstate.ResearchScopeEventWindowV3,
+		LookbackSeconds: taskstate.ResearchScopeWeekSecondsV3}
+	st := tenantTestStore(t)
+	f := newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true, result, "", "",
+		testResearchGroundingModelPolicyV1(t), scope, len(result)+1)
+	if _, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(f)); err == nil {
+		t.Fatalf("truncated scoped prepare err=%v", err)
+	}
+	var count int
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM research_brief_syntheses WHERE temporal_run_id=$1`,
+		f.identity.TemporalRunID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("truncated synthesis count=%d err=%v", count, err)
+	}
+}
+
+func TestScopedResearchBriefV35AllFilteredFailsBeforeSynthesisAndLLM(t *testing.T) {
+	now := time.Now().UTC()
+	result := []byte(canonicalWindowDocumentsV33(t,
+		researchWindowDocumentV33{Title: "outside", URL: "https://example.com/old", PublishedAt: now.Add(-8 * 24 * time.Hour).Format(time.RFC3339Nano), Text: "old"},
+		researchWindowDocumentV33{Title: "invalid", URL: "https://example.com/invalid", PublishedAt: "yesterday", Text: "invalid"},
+	))
+	f := scopedResearchBriefFixtureV35(t, result)
+	if _, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(f)); err == nil ||
+		!strings.Contains(err.Error(), "no eligible in-window Evidence") {
+		t.Fatalf("all-filtered prepare err=%v", err)
+	}
+	for table, query := range map[string]string{
+		"synthesis": `SELECT count(*) FROM research_brief_syntheses WHERE temporal_run_id=$1`,
+		"llm":       `SELECT count(*) FROM research_run_llm_spend_reservations WHERE run_snapshot_id=$1 AND stage='synthesis'`,
+	} {
+		var count int
+		argument := any(f.identity.TemporalRunID)
+		if table == "llm" {
+			argument = f.snapshotRef.SnapshotID
+		}
+		if err := f.st.pool.QueryRow(t.Context(), query, argument).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("%s count=%d err=%v", table, count, err)
+		}
+	}
+}
+
+func TestUnscopedResearchBriefPreservesV34V32ReplayBytes(t *testing.T) {
+	st := tenantTestStore(t)
+	f := newResearchBriefFixtureWithStoreWorkflowAndModelV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true, nil, "", "",
+		testResearchGroundingModelPolicyV1(t))
+	seal, err := f.st.LoadResearchRunSnapshotV3(t.Context(), f.identity, f.snapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seal.ResearchModel.Synthesis.RendererVersion != "research-synthesis.render/v3.4" {
+		t.Fatalf("renderer=%q", seal.ResearchModel.Synthesis.RendererVersion)
+	}
+	first, err := f.st.PrepareOrGetResearchBriefSynthesisV3(t.Context(), researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.st.PrepareOrGetResearchBriefSynthesisV3(t.Context(), researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Synthesis.ContextPayload, second.Synthesis.ContextPayload) ||
+		first.Synthesis.ContextDigest != second.Synthesis.ContextDigest {
+		t.Fatal("unscoped context replay changed bytes")
+	}
+	var context researchSynthesisContextV3
+	if err := json.Unmarshal(first.Synthesis.ContextPayload, &context); err != nil {
+		t.Fatal(err)
+	}
+	if context.SchemaVersion != researchSynthesisContextSchemaV32 || context.ResearchScopeWindow != nil {
+		t.Fatalf("unscoped context=%+v", context)
 	}
 }
