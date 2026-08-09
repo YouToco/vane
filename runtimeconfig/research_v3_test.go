@@ -72,7 +72,9 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		!strings.Contains(got.Model.GroundingVerifier.SystemPrompt, "主体、产品、版本") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "Sonnet 就不得写成 Opus") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "不得复用此前答案") ||
-		!strings.Contains(got.Model.Synthesis.SystemPrompt, "不在任务 window") {
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "history.history_through_utc") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "2026-07-28 不在窗口内") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "抓取时间不能代替事件时间") {
 		t.Fatalf("research model policy=%+v", got.Model)
 	}
 }
