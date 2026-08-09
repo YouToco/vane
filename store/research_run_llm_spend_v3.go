@@ -177,8 +177,10 @@ func researchRunLLMStagePolicyV3(seal runcontext.ResearchSnapshotSealV3,
 			return seal.ResearchModel.Synthesis, false, nil
 		}
 		if round == 1 && seal.ResearchModel.GroundingVerifier != nil &&
-			seal.ResearchModel.Synthesis.RendererVersion ==
-				runtimepolicy.ResearchSynthesisRendererVersionV33 {
+			(seal.ResearchModel.Synthesis.RendererVersion ==
+				runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+				seal.ResearchModel.Synthesis.RendererVersion ==
+					runtimepolicy.ResearchSynthesisRendererVersionV34) {
 			return *seal.ResearchModel.GroundingVerifier, false, nil
 		}
 		return runtimepolicy.ResearchModelStageV3{}, false,
@@ -304,17 +306,21 @@ func (s *Store) BeginResearchRunLLMSpendV3(
 		return ResearchRunLLMSpendReservationV3{},
 			researchRunDatabaseError("lock research model pricing", err)
 	}
-	// The current binary must keep retained round-0 runs operational during a
-	// rolling migration or historical schema replay. Pre-122 databases expose
-	// cap_v3 only; verifier round 1 stays fail-closed until cap_v4 exists.
-	var admissionV4Available bool
-	if err := tx.QueryRow(ctx, `SELECT to_regprocedure(
-		'admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
-	) IS NOT NULL`).Scan(&admissionV4Available); err != nil {
+	// Keep retained round-0 and v3.3 runs operational during a rolling migration
+	// or historical schema replay. V3.4 prefers cap_v5; verifier round 1 remains
+	// fail-closed when neither retained grounding admission path exists.
+	var admissionV5Available, admissionV4Available bool
+	if err := tx.QueryRow(ctx, `SELECT
+		to_regprocedure(
+		 'admit_research_run_llm_spend_cap_v5(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
+		) IS NOT NULL,
+		to_regprocedure(
+		 'admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
+		) IS NOT NULL`).Scan(&admissionV5Available, &admissionV4Available); err != nil {
 		return ResearchRunLLMSpendReservationV3{},
 			researchRunDatabaseError("check research model admission capability", err)
 	}
-	if !admissionV4Available && params.RoundOrdinal == 1 {
+	if !admissionV5Available && !admissionV4Available && params.RoundOrdinal == 1 {
 		return ResearchRunLLMSpendReservationV3{}, researchRunConflictError()
 	}
 	var reservationID int64
@@ -325,7 +331,13 @@ func (s *Store) BeginResearchRunLLMSpendV3(
 		researchRunLLMSubjectV3(params.Stage, params.SubjectID), attemptKey,
 		requestDigest, traceID, params.UserPrompt,
 	}
-	if admissionV4Available {
+	if admissionV5Available {
+		err = tx.QueryRow(ctx,
+			`SELECT out_reservation_id,out_first_writer
+			   FROM admit_research_run_llm_spend_cap_v5(
+			        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			admissionArgs...).Scan(&reservationID, &firstWriter)
+	} else if admissionV4Available {
 		err = tx.QueryRow(ctx,
 			`SELECT out_reservation_id,out_first_writer
 			   FROM admit_research_run_llm_spend_cap_v4(

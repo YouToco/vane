@@ -26,6 +26,7 @@ const (
 	ResearchSynthesisRendererVersionV31 = "research-synthesis.render/v3.1"
 	ResearchSynthesisRendererVersionV32 = "research-synthesis.render/v3.2"
 	ResearchSynthesisRendererVersionV33 = "research-synthesis.render/v3.3"
+	ResearchSynthesisRendererVersionV34 = "research-synthesis.render/v3.4"
 
 	ResearchGroundingVerifierRendererVersionV1  = "research-grounding-verifier.render/v1"
 	ResearchGroundingVerifierRendererVersionV11 = "research-grounding-verifier.render/v1.1"
@@ -52,7 +53,7 @@ type ResearchModelPolicyV3 struct {
 	Planner       ResearchModelStageV3 `json:"planner"`
 	Synthesis     ResearchModelStageV3 `json:"synthesis"`
 	// GroundingVerifier is optional so byte-frozen V3/V3.1/V3.2 snapshots remain
-	// decodable and replayable. New V3.3 snapshots must freeze this independent
+	// decodable and replayable. New V3.3+ snapshots must freeze this independent
 	// no-Tool adjudicator before a candidate Brief can become authoritative.
 	GroundingVerifier *ResearchModelStageV3 `json:"grounding_verifier,omitempty"`
 	QuotaBucket       string                `json:"quota_bucket"`
@@ -78,11 +79,13 @@ func (p ResearchModelPolicyV3) Validate() error {
 		(p.GroundingVerifier != nil &&
 			!validResearchModelStageV3(*p.GroundingVerifier,
 				ResearchModelStageGroundingVerifierV3)) ||
-		(p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV33 &&
+		((p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV33 ||
+			p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV34) &&
 			(p.GroundingVerifier == nil ||
 				!validResearchGroundingVerifierRendererVersion(
 					p.GroundingVerifier.RendererVersion))) ||
 		(p.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV33 &&
+			p.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV34 &&
 			p.GroundingVerifier != nil) {
 		return invalidPolicy("research model policy is invalid")
 	}

@@ -513,7 +513,9 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 		return types.ResearchBriefRefV3{}, err
 	}
 	requiresGrounding := seal.ResearchModel.Synthesis.RendererVersion ==
-		runtimepolicy.ResearchSynthesisRendererVersionV33
+		runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+		seal.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV34
 	if requiresGrounding {
 		grounding, found, err := loadResearchBriefGroundingV1(ctx, tx,
 			params.Identity, params.SnapshotRef.SnapshotID, params.SynthesisID)

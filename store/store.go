@@ -240,10 +240,13 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		return fmt.Errorf("begin authority probe: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	var groundingRuntimeAvailable, admissionV4Available,
+	var groundingRuntimeAvailable, admissionV5Available, admissionV4Available,
 		groundingImmutabilityTriggerAvailable bool
 	if err := tx.QueryRow(ctx, `SELECT
 		to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
+		to_regprocedure(
+		 'admit_research_run_llm_spend_cap_v5(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
+		) IS NOT NULL,
 		to_regprocedure(
 		 'admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
 		) IS NOT NULL,
@@ -254,11 +257,11 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		    AND trigger.tgname='protect_research_brief_grounding_verification_v1'
 		    AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
 		)`,
-	).Scan(&groundingRuntimeAvailable, &admissionV4Available,
+	).Scan(&groundingRuntimeAvailable, &admissionV5Available, &admissionV4Available,
 		&groundingImmutabilityTriggerAvailable); err != nil {
 		return fmt.Errorf("inspect grounding runtime schema: %w", err)
 	}
-	if groundingRuntimeAvailable != admissionV4Available ||
+	if groundingRuntimeAvailable != (admissionV5Available || admissionV4Available) ||
 		groundingRuntimeAvailable != groundingImmutabilityTriggerAvailable {
 		return errors.New("grounding runtime schema is incomplete")
 	}
@@ -278,7 +281,10 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 	runtimeScopedRelations := filterGroundingRelation(researchRuntimeScopedRelations)
 	admissionCapSignature := "admit_research_run_llm_spend_cap_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
 	admissionRawSignature := "admit_research_run_llm_spend_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
-	if admissionV4Available {
+	if admissionV5Available {
+		admissionCapSignature = "admit_research_run_llm_spend_cap_v5(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
+		admissionRawSignature = "admit_research_run_llm_spend_v5(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
+	} else if admissionV4Available {
 		admissionCapSignature = "admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
 		admissionRawSignature = "admit_research_run_llm_spend_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
 	}
@@ -549,6 +555,13 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		"authorize_research_run_effect_cap_v1(bigint)":                                              true,
 		"freeze_research_llm_gateway_request_v2(bigint,text,text,text)":                             true,
 		"load_research_run_bound_llm_call_v1(bigint,bigint)":                                        true,
+	}
+	// Migration 123 intentionally retains the capability-fenced v4 wrapper so
+	// the previously deployed v3.3 binary remains operational during rollout.
+	// Raw v4/v5 admission functions stay non-callable and are still rejected by
+	// the privilege probe above.
+	if admissionV5Available && admissionV4Available {
+		allowedDefiners["admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"] = true
 	}
 	const nativeScheduleMaturitySignature = "native_research_schedule_mature_v3_v1(bigint,bigint,text)"
 	nativeScheduleMaturityRequired, err := nativeResearchCreationSchemaV3Active(ctx, tx)

@@ -136,7 +136,9 @@ func (s *Store) PrepareOrGetResearchBriefGroundingV1(
 		return PrepareResearchBriefGroundingV1Result{}, err
 	}
 	if seal.ResearchModel.Synthesis.RendererVersion !=
-		runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+		runtimepolicy.ResearchSynthesisRendererVersionV33 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV34 ||
 		seal.ResearchModel.GroundingVerifier == nil {
 		return PrepareResearchBriefGroundingV1Result{}, researchRunConflictError()
 	}
@@ -273,7 +275,9 @@ func (s *Store) SettleResearchBriefGroundingV1(
 		return ResearchBriefGroundingV1{}, err
 	}
 	if seal.ResearchModel.Synthesis.RendererVersion !=
-		runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+		runtimepolicy.ResearchSynthesisRendererVersionV33 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV34 ||
 		seal.ResearchModel.GroundingVerifier == nil {
 		return ResearchBriefGroundingV1{}, researchRunIntegrityError()
 	}
