@@ -16,6 +16,8 @@ package tikhubcatalog
 
 import (
 	"strings"
+
+	"github.com/YouToco/vane/toolsearch"
 )
 
 // docText 拼接一个端点的可检索文本。各域直接连接：BM25F 分域加权对这个体量是
@@ -44,10 +46,21 @@ func explicitAdvancedAnalyticsQuery(query string) bool {
 	normalized := strings.ToLower(query)
 	for _, marker := range []string{
 		"广告", "投放", "店铺", "电商", "带货", "创作者分析", "达人分析",
-		"ads", "advertising", "shop", "commerce", "creator analytics",
-		"merchant", "douplus", "星图", "xingtu",
+		"星图",
 	} {
 		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	tokens := toolsearch.Tokenize(normalized)
+	for _, token := range tokens {
+		switch token {
+		case "ads", "advertising", "shop", "commerce", "merchant", "douplus", "xingtu":
+			return true
+		}
+	}
+	for i := 0; i+1 < len(tokens); i++ {
+		if tokens[i] == "creator" && tokens[i+1] == "analytics" {
 			return true
 		}
 	}

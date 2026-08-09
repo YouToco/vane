@@ -110,7 +110,7 @@ func Lookup(name string) (Entry, bool) {
 	if !ok {
 		return Entry{}, false
 	}
-	return entries[i], true
+	return cloneProviderEntry(entries[i]), true
 }
 
 // AgentLookup resolves only entries admitted to the model-callable discovery
@@ -120,7 +120,7 @@ func AgentLookup(name string) (Entry, bool) {
 	if !ok {
 		return Entry{}, false
 	}
-	return agentEntries[i], true
+	return cloneProviderEntry(agentEntries[i]), true
 }
 
 // AgentDefinition returns the complete provider-neutral model definition for
@@ -136,7 +136,11 @@ func Len() int { return len(entries) }
 // Entries returns a defensive copy of the model-callable discovery directory.
 // Provider routing and source-binding-only entries remain internal.
 func Entries() []Entry {
-	return append([]Entry(nil), agentEntries...)
+	out := make([]Entry, len(agentEntries))
+	for i, entry := range agentEntries {
+		out[i] = cloneProviderEntry(entry)
+	}
+	return out
 }
 
 // AgentLen returns the number of model-callable dynamic tools.
@@ -228,9 +232,54 @@ func Search(query, platform string, topK int) []Hit {
 		if !ok {
 			panic("tikhubcatalog: generic catalog returned unknown entry " + match.Entry.Name)
 		}
-		hits = append(hits, Hit{Entry: agentEntries[index], Score: match.Score})
+		hits = append(hits, Hit{Entry: cloneProviderEntry(agentEntries[index]), Score: match.Score})
 	}
 	return hits
+}
+
+func cloneProviderEntry(entry Entry) Entry {
+	entry.Params = append([]Param(nil), entry.Params...)
+	for i := range entry.Params {
+		parameter := &entry.Params[i]
+		parameter.Default = cloneProviderJSONValue(parameter.Default)
+		if parameter.Enum != nil {
+			rawEnum := parameter.Enum
+			parameter.Enum = make([]any, len(rawEnum))
+			for j, value := range rawEnum {
+				parameter.Enum[j] = cloneProviderJSONValue(value)
+			}
+		}
+	}
+	return entry
+}
+
+func cloneProviderJSONValue(value any) any {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = cloneProviderJSONValue(child)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			out[key] = cloneProviderJSONValue(child)
+		}
+		return out
+	case []string:
+		return append([]string(nil), typed...)
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for key, child := range typed {
+			out[key] = child
+		}
+		return out
+	case json.RawMessage:
+		return append(json.RawMessage(nil), typed...)
+	default:
+		return value
+	}
 }
 
 const maxModelSearchResults = 8

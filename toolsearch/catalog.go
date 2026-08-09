@@ -16,9 +16,15 @@ import (
 
 const (
 	maxCatalogEntries    = 4096
+	maxToolNameBytes     = 256
+	maxNamespaceBytes    = 256
+	maxDescriptionBytes  = 64 << 10
+	maxLabelsPerKind     = 64
+	maxLabelBytes        = 512
 	maxSchemaBytes       = 64 << 10
 	maxSchemaDepth       = 16
 	maxSchemaNodes       = 4096
+	maxCatalogMetaBytes  = 32 << 20
 	maxSearchDocBytes    = 64 << 10
 	maxSearchCorpusBytes = 16 << 20
 	maxSearchQueryBytes  = 512
@@ -80,11 +86,15 @@ func NewCatalogWithDocuments(entries []Entry, documents []Document) (*Catalog, e
 	searchText := make(map[string]string, len(documents))
 	totalBytes := 0
 	for i, document := range documents {
-		if document.ID == "" || strings.TrimSpace(document.ID) != document.ID {
+		if len(document.ID) == 0 || len(document.ID) > maxToolNameBytes ||
+			!utf8.ValidString(document.ID) || strings.TrimSpace(document.ID) != document.ID {
 			return nil, fmt.Errorf("toolsearch: invalid search document ID at index %d", i)
 		}
 		if _, duplicate := searchText[document.ID]; duplicate {
 			return nil, fmt.Errorf("toolsearch: duplicate search document ID %q", document.ID)
+		}
+		if len(document.Text) == 0 || len(document.Text) > maxSearchDocBytes {
+			return nil, fmt.Errorf("toolsearch: search metadata for %q must be 1..%d raw bytes", document.ID, maxSearchDocBytes)
 		}
 		if !utf8.ValidString(document.Text) {
 			return nil, fmt.Errorf("toolsearch: search metadata for %q is invalid UTF-8", document.ID)
@@ -92,9 +102,6 @@ func NewCatalogWithDocuments(entries []Entry, documents []Document) (*Catalog, e
 		normalized := strings.Join(strings.Fields(document.Text), " ")
 		if normalized == "" {
 			return nil, fmt.Errorf("toolsearch: empty search metadata for %q", document.ID)
-		}
-		if len(normalized) > maxSearchDocBytes {
-			return nil, fmt.Errorf("toolsearch: search metadata for %q exceeds %d bytes", document.ID, maxSearchDocBytes)
 		}
 		totalBytes += len(normalized)
 		if totalBytes > maxSearchCorpusBytes {
@@ -116,6 +123,7 @@ func newCatalog(entries []Entry, suppliedSearchText map[string]string) (*Catalog
 	canonical := make([]canonicalEntry, 0, len(entries))
 	byName := make(map[string]Entry, len(entries))
 	totalSearchBytes := 0
+	totalMetadataBytes := 0
 	for i, raw := range entries {
 		entry, schema, schemaTerms, err := normalizeEntry(raw)
 		if err != nil {
@@ -125,6 +133,10 @@ func newCatalog(entries []Entry, suppliedSearchText map[string]string) (*Catalog
 			return nil, fmt.Errorf("toolsearch: duplicate tool name %q", entry.Name)
 		}
 		entry.Parameters = append(json.RawMessage(nil), schema...)
+		totalMetadataBytes += entryMetadataBytes(entry)
+		if totalMetadataBytes > maxCatalogMetaBytes {
+			return nil, fmt.Errorf("toolsearch: catalog metadata exceeds %d bytes", maxCatalogMetaBytes)
+		}
 		byName[entry.Name] = cloneEntry(entry)
 		searchText := strings.Join([]string{
 			entry.Namespace,
@@ -299,15 +311,21 @@ func (r *Registry) Catalog() *Catalog {
 }
 
 func normalizeEntry(raw Entry) (Entry, json.RawMessage, []string, error) {
-	entry := cloneEntry(raw)
-	if entry.Name == "" || strings.TrimSpace(entry.Name) != entry.Name {
+	entry := raw
+	if len(entry.Name) == 0 || len(entry.Name) > maxToolNameBytes ||
+		!utf8.ValidString(entry.Name) || strings.TrimSpace(entry.Name) != entry.Name {
 		return Entry{}, nil, nil, errors.New("tool name is empty or not canonical")
 	}
-	if entry.Namespace == "" || strings.TrimSpace(entry.Namespace) != entry.Namespace {
+	if len(entry.Namespace) == 0 || len(entry.Namespace) > maxNamespaceBytes ||
+		!utf8.ValidString(entry.Namespace) || strings.TrimSpace(entry.Namespace) != entry.Namespace {
 		return Entry{}, nil, nil, fmt.Errorf("tool %q namespace is empty or not canonical", entry.Name)
 	}
-	if entry.Description == "" || strings.TrimSpace(entry.Description) != entry.Description {
+	if len(entry.Description) == 0 || len(entry.Description) > maxDescriptionBytes ||
+		!utf8.ValidString(entry.Description) || strings.TrimSpace(entry.Description) != entry.Description {
 		return Entry{}, nil, nil, fmt.Errorf("tool %q description is empty or not canonical", entry.Name)
+	}
+	if len(entry.Aliases) > maxLabelsPerKind || len(entry.Tags) > maxLabelsPerKind {
+		return Entry{}, nil, nil, fmt.Errorf("tool %q has too many aliases or tags", entry.Name)
 	}
 	if len(entry.Parameters) == 0 || len(entry.Parameters) > maxSchemaBytes || !utf8.Valid(entry.Parameters) {
 		return Entry{}, nil, nil, fmt.Errorf("tool %q schema must be 1..%d UTF-8 bytes", entry.Name, maxSchemaBytes)
@@ -328,9 +346,10 @@ func normalizeEntry(raw Entry) (Entry, json.RawMessage, []string, error) {
 	}
 	terms := make([]string, 0, 32)
 	nodes := 0
-	if err := collectSchemaTerms(schema, 0, &nodes, &terms); err != nil {
+	if err := validateSchemaTree(schema, 0, &nodes); err != nil {
 		return Entry{}, nil, nil, fmt.Errorf("tool %q schema: %w", entry.Name, err)
 	}
+	collectSchemaTerms(schema, &terms)
 	canonicalSchema, err := json.Marshal(schema)
 	if err != nil {
 		return Entry{}, nil, nil, fmt.Errorf("tool %q canonical schema: %w", entry.Name, err)
@@ -349,7 +368,8 @@ func normalizeEntry(raw Entry) (Entry, json.RawMessage, []string, error) {
 func normalizeLabels(values []string, kind string) ([]string, error) {
 	out := append([]string(nil), values...)
 	for i, value := range out {
-		if value == "" || strings.TrimSpace(value) != value {
+		if len(value) == 0 || len(value) > maxLabelBytes ||
+			!utf8.ValidString(value) || strings.TrimSpace(value) != value {
 			return nil, fmt.Errorf("%s %d is empty or not canonical", kind, i)
 		}
 	}
@@ -362,7 +382,18 @@ func normalizeLabels(values []string, kind string) ([]string, error) {
 	return out, nil
 }
 
-func collectSchemaTerms(value any, depth int, nodes *int, terms *[]string) error {
+func entryMetadataBytes(entry Entry) int {
+	total := len(entry.Namespace) + len(entry.Name) + len(entry.Description) + len(entry.Parameters)
+	for _, alias := range entry.Aliases {
+		total += len(alias)
+	}
+	for _, tag := range entry.Tags {
+		total += len(tag)
+	}
+	return total
+}
+
+func validateSchemaTree(value any, depth int, nodes *int) error {
 	if depth > maxSchemaDepth {
 		return fmt.Errorf("nesting exceeds %d", maxSchemaDepth)
 	}
@@ -372,48 +403,67 @@ func collectSchemaTerms(value any, depth int, nodes *int, terms *[]string) error
 	}
 	switch typed := value.(type) {
 	case map[string]any:
-		keys := make([]string, 0, len(typed))
-		for key := range typed {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			child := typed[key]
-			switch key {
-			case "title", "description":
-				if text, ok := child.(string); ok {
-					*terms = append(*terms, text)
-				}
-			case "enum", "const", "examples", "default":
-				appendScalarTerms(child, terms)
-			case "properties", "patternProperties", "$defs", "definitions":
-				if children, ok := child.(map[string]any); ok {
-					childKeys := make([]string, 0, len(children))
-					for childKey := range children {
-						childKeys = append(childKeys, childKey)
-					}
-					sort.Strings(childKeys)
-					for _, childKey := range childKeys {
-						*terms = append(*terms, childKey, strings.ReplaceAll(childKey, "_", " "))
-						if err := collectSchemaTerms(children[childKey], depth+1, nodes, terms); err != nil {
-							return err
-						}
-					}
-				}
-			case "items", "anyOf", "oneOf", "allOf", "additionalProperties":
-				if err := collectSchemaTerms(child, depth+1, nodes, terms); err != nil {
-					return err
-				}
+		for _, child := range typed {
+			if err := validateSchemaTree(child, depth+1, nodes); err != nil {
+				return err
 			}
 		}
 	case []any:
 		for _, child := range typed {
-			if err := collectSchemaTerms(child, depth+1, nodes, terms); err != nil {
+			if err := validateSchemaTree(child, depth+1, nodes); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func collectSchemaTerms(value any, terms *[]string) {
+	typed, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	keys := make([]string, 0, len(typed))
+	for key := range typed {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		child := typed[key]
+		switch key {
+		case "title", "description":
+			if text, ok := child.(string); ok {
+				*terms = append(*terms, text)
+			}
+		case "enum", "const", "examples", "default":
+			appendScalarTerms(child, terms)
+		case "properties", "patternProperties", "$defs", "definitions":
+			if children, ok := child.(map[string]any); ok {
+				childKeys := make([]string, 0, len(children))
+				for childKey := range children {
+					childKeys = append(childKeys, childKey)
+				}
+				sort.Strings(childKeys)
+				for _, childKey := range childKeys {
+					*terms = append(*terms, childKey, strings.ReplaceAll(childKey, "_", " "))
+					collectSchemaTerms(children[childKey], terms)
+				}
+			}
+		case "items", "anyOf", "oneOf", "allOf", "additionalProperties":
+			collectSchemaTermsFromStructure(child, terms)
+		}
+	}
+}
+
+func collectSchemaTermsFromStructure(value any, terms *[]string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		collectSchemaTerms(typed, terms)
+	case []any:
+		for _, child := range typed {
+			collectSchemaTermsFromStructure(child, terms)
+		}
+	}
 }
 
 func appendScalarTerms(value any, terms *[]string) {
@@ -427,6 +477,15 @@ func appendScalarTerms(value any, terms *[]string) {
 	case []any:
 		for _, child := range typed {
 			appendScalarTerms(child, terms)
+		}
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			appendScalarTerms(typed[key], terms)
 		}
 	}
 }

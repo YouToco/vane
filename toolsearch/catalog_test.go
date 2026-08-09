@@ -220,6 +220,7 @@ func TestCatalogRejectsInvalidMetadata(t *testing.T) {
 	}
 	tooDeep += `{"type":"string"}` + strings.Repeat("}", maxSchemaDepth+2) + `}}`
 	valid := Entry{Namespace: "web", Name: "read_page", Description: "Read page", Parameters: json.RawMessage(`{"type":"object","properties":{}}`)}
+	invalidUTF8 := string([]byte{0xff})
 	for _, test := range []struct {
 		name    string
 		entries []Entry
@@ -228,6 +229,16 @@ func TestCatalogRejectsInvalidMetadata(t *testing.T) {
 		{name: "empty namespace", entries: []Entry{{Name: "read", Description: "read", Parameters: valid.Parameters}}},
 		{name: "noncanonical name", entries: []Entry{{Namespace: "web", Name: " read", Description: "read", Parameters: valid.Parameters}}},
 		{name: "empty description", entries: []Entry{{Namespace: "web", Name: "read", Parameters: valid.Parameters}}},
+		{name: "invalid UTF-8 namespace", entries: []Entry{{Namespace: invalidUTF8, Name: "read", Description: "read", Parameters: valid.Parameters}}},
+		{name: "invalid UTF-8 name", entries: []Entry{{Namespace: "web", Name: invalidUTF8, Description: "read", Parameters: valid.Parameters}}},
+		{name: "invalid UTF-8 description", entries: []Entry{{Namespace: "web", Name: "read", Description: invalidUTF8, Parameters: valid.Parameters}}},
+		{name: "invalid UTF-8 alias", entries: []Entry{{Namespace: "web", Name: "read", Description: "read", Parameters: valid.Parameters, Aliases: []string{invalidUTF8}}}},
+		{name: "invalid UTF-8 tag", entries: []Entry{{Namespace: "web", Name: "read", Description: "read", Parameters: valid.Parameters, Tags: []string{invalidUTF8}}}},
+		{name: "oversize name", entries: []Entry{{Namespace: "web", Name: strings.Repeat("n", maxToolNameBytes+1), Description: "read", Parameters: valid.Parameters}}},
+		{name: "oversize namespace", entries: []Entry{{Namespace: strings.Repeat("n", maxNamespaceBytes+1), Name: "read", Description: "read", Parameters: valid.Parameters}}},
+		{name: "oversize description", entries: []Entry{{Namespace: "web", Name: "read", Description: strings.Repeat("d", maxDescriptionBytes+1), Parameters: valid.Parameters}}},
+		{name: "too many aliases", entries: []Entry{{Namespace: "web", Name: "read", Description: "read", Parameters: valid.Parameters, Aliases: make([]string, maxLabelsPerKind+1)}}},
+		{name: "oversize alias", entries: []Entry{{Namespace: "web", Name: "read", Description: "read", Parameters: valid.Parameters, Aliases: []string{strings.Repeat("a", maxLabelBytes+1)}}}},
 		{name: "invalid JSON", entries: []Entry{{Namespace: "web", Name: "read", Description: "read", Parameters: json.RawMessage(`{`)}}},
 		{name: "trailing JSON", entries: []Entry{{Namespace: "web", Name: "read", Description: "read", Parameters: json.RawMessage(`{} {}`)}}},
 		{name: "wrong root", entries: []Entry{{Namespace: "web", Name: "read", Description: "read", Parameters: json.RawMessage(`{"type":"array"}`)}}},
@@ -243,6 +254,128 @@ func TestCatalogRejectsInvalidMetadata(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCatalogRejectsHugeMetadataBeforeCustomDocumentProjection(t *testing.T) {
+	entry := catalogFixture()[0]
+	entry.Description = strings.Repeat("x", 100<<20)
+	if _, err := NewCatalogWithDocuments([]Entry{entry}, []Document{{ID: entry.Name, Text: "short valid document"}}); err == nil {
+		t.Fatal("100 MiB description bypassed metadata bounds through a short custom document")
+	}
+	entry = catalogFixture()[0]
+	if _, err := NewCatalogWithDocuments([]Entry{entry}, []Document{{
+		ID: entry.Name, Text: strings.Repeat(" ", maxSearchDocBytes+1),
+	}}); err == nil {
+		t.Fatal("oversize raw whitespace document reached normalization")
+	}
+}
+
+func TestCatalogRejectsOversizeCanonicalMetadataTotal(t *testing.T) {
+	t.Parallel()
+	description := strings.Repeat("d", maxDescriptionBytes)
+	count := maxCatalogMetaBytes/maxDescriptionBytes + 1
+	entries := make([]Entry, count)
+	for i := range entries {
+		entries[i] = Entry{
+			Namespace: "test", Name: "tool_" + strconv.Itoa(i), Description: description,
+			Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+		}
+	}
+	if _, err := NewCatalog(entries); err == nil {
+		t.Fatal("oversize canonical catalog metadata succeeded")
+	}
+}
+
+func TestCatalogRejectsInvalidUTF8BeforeDigestWithCustomDocuments(t *testing.T) {
+	t.Parallel()
+	left, err := json.Marshal(map[string]string{"description": string([]byte{0xff})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := json.Marshal(map[string]string{"description": string([]byte{0xfe})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(left) != string(right) {
+		t.Fatalf("mutation precondition changed: invalid UTF-8 encodings no longer collide: %s != %s", left, right)
+	}
+	for _, bad := range []byte{0xff, 0xfe} {
+		entry := catalogFixture()[0]
+		entry.Description = string([]byte{bad})
+		if _, err := NewCatalogWithDocuments([]Entry{entry}, []Document{{ID: entry.Name, Text: "valid search metadata"}}); err == nil {
+			t.Fatalf("invalid metadata byte 0x%x reached custom-document digest", bad)
+		}
+	}
+}
+
+func TestCatalogSchemaLimitsCoverOpaqueKeywordTrees(t *testing.T) {
+	t.Parallel()
+	base := Entry{Namespace: "web", Name: "read", Description: "read", Parameters: json.RawMessage(`{"type":"object"}`)}
+
+	deep := any("leaf")
+	for i := 0; i < maxSchemaDepth+1; i++ {
+		deep = map[string]any{"nested": deep}
+	}
+	base.Parameters = mustSchemaJSON(t, map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{"type": "object", "default": deep},
+		},
+	})
+	if _, err := NewCatalog([]Entry{base}); err == nil {
+		t.Fatal("deep default object bypassed schema depth limit")
+	}
+
+	many := make([]any, maxSchemaNodes)
+	for i := range many {
+		many[i] = i
+	}
+	base.Parameters = mustSchemaJSON(t, map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{"type": "array", "examples": many},
+		},
+	})
+	if _, err := NewCatalog([]Entry{base}); err == nil {
+		t.Fatal("large examples array bypassed schema node limit")
+	}
+}
+
+func TestCatalogIndexesOnlyScalarsFromNestedSchemaLiterals(t *testing.T) {
+	t.Parallel()
+	entry := catalogFixture()[0]
+	entry.Parameters = mustSchemaJSON(t, map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{
+				"type": "object",
+				"default": map[string]any{
+					"opaque_key_not_indexed": []any{"deep_default_needle"},
+				},
+			},
+		},
+	})
+	catalog, err := NewCatalog([]Entry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := catalog.Search("deep_default_needle", 1)
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("nested scalar Search() = %#v, err=%v", matches, err)
+	}
+	matches, err = catalog.Search("opaque_key_not_indexed", 1)
+	if err != nil || matches != nil {
+		t.Fatalf("nested object key entered search terms: %#v, err=%v", matches, err)
+	}
+}
+
+func mustSchemaJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func TestCatalogSearchBounds(t *testing.T) {

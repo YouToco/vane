@@ -18,19 +18,22 @@ func modelToolEntry(entry Entry) toolsearch.Entry {
 		Name:        entry.Name,
 		Description: modelToolDescription(entry),
 		Parameters:  modelParametersSchema(entry),
-		Tags:        []string{entry.Platform, entry.Tag},
+		Tags:        []string{entry.Platform},
 	}
 }
 
 func modelToolDescription(entry Entry) string {
-	description := publicModelText(entry.Summary)
-	if entry.Description != "" {
-		description += "\n" + truncateModelRunes(
-			publicModelText(entry.Description),
-			modelDescriptionMaxRunes,
-		)
+	parts := make([]string, 0, 3)
+	if summary := publicModelText(entry.Summary); summary != "" {
+		parts = append(parts, summary)
 	}
-	return description + "\n（社媒公开数据查询，可能计费，请按需调用）"
+	if entry.Description != "" {
+		if description := publicModelText(entry.Description); description != "" {
+			parts = append(parts, truncateModelRunes(description, modelDescriptionMaxRunes))
+		}
+	}
+	parts = append(parts, "（社媒公开数据查询，可能计费，请按需调用）")
+	return strings.Join(parts, "\n")
 }
 
 func publicModelText(value string) string {
@@ -47,9 +50,7 @@ func publicModelText(value string) string {
 			strings.Contains(lower, "[示例]") {
 			break
 		}
-		if strings.Contains(lower, "tikhub") ||
-			strings.Contains(lower, "cookie") ||
-			strings.Contains(lower, "/api/v") ||
+		if containsProviderTransport(lower) ||
 			strings.Contains(lower, "api priority") ||
 			strings.Contains(lower, "接口优先级") ||
 			strings.Contains(lower, "接口推荐") ||
@@ -91,12 +92,8 @@ func modelParametersSchema(entry Entry) json.RawMessage {
 		if len(parameter.Enum) > 0 {
 			publicEnum := make([]any, 0, len(parameter.Enum))
 			for _, value := range parameter.Enum {
-				if text, isString := value.(string); isString {
-					if text, ok := publicModelLiteral(text); ok {
-						publicEnum = append(publicEnum, text)
-					}
-				} else {
-					publicEnum = append(publicEnum, value)
+				if publicValue, ok := publicModelValue(value); ok {
+					publicEnum = append(publicEnum, publicValue)
 				}
 			}
 			if len(publicEnum) > 0 {
@@ -104,12 +101,8 @@ func modelParametersSchema(entry Entry) json.RawMessage {
 			}
 		}
 		if parameter.Default != nil {
-			if value, isString := parameter.Default.(string); isString {
-				if value, ok := publicModelLiteral(value); ok {
-					property["default"] = value
-				}
-			} else {
-				property["default"] = parameter.Default
+			if publicDefault, ok := publicModelValue(parameter.Default); ok {
+				property["default"] = publicDefault
 			}
 		}
 		properties[parameter.Name] = property
@@ -130,13 +123,104 @@ func modelParametersSchema(entry Entry) json.RawMessage {
 
 func publicModelLiteral(value string) (string, bool) {
 	lower := strings.ToLower(strings.TrimSpace(value))
-	if strings.Contains(lower, "tikhub") ||
-		strings.Contains(lower, "/api/v") ||
-		strings.Contains(lower, "request method") ||
-		strings.Contains(lower, "endpoint path") {
+	if containsProviderTransport(lower) {
 		return "", false
 	}
 	return value, true
+}
+
+func publicModelValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		return publicModelLiteral(typed)
+	case []any:
+		out := make([]any, 0, len(typed))
+		for _, child := range typed {
+			if publicChild, ok := publicModelValue(child); ok {
+				out = append(out, publicChild)
+			}
+		}
+		return out, true
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			if _, ok := publicModelLiteral(key); !ok {
+				continue
+			}
+			if publicChild, ok := publicModelValue(child); ok {
+				out[key] = publicChild
+			}
+		}
+		return out, true
+	case []string:
+		out := make([]any, 0, len(typed))
+		for _, child := range typed {
+			if publicChild, ok := publicModelLiteral(child); ok {
+				out = append(out, publicChild)
+			}
+		}
+		return out, true
+	case map[string]string:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			if _, ok := publicModelLiteral(key); !ok {
+				continue
+			}
+			if publicChild, ok := publicModelLiteral(child); ok {
+				out[key] = publicChild
+			}
+		}
+		return out, true
+	default:
+		return value, true
+	}
+}
+
+func containsProviderTransport(value string) bool {
+	normalized := strings.NewReplacer("_", " ", "-", " ").Replace(strings.ToLower(value))
+	for _, marker := range []string{
+		"tikhub", "cookie", "/api/",
+		"request method", "endpoint path", "请求方法", "接口路径",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return containsEndpointSlug(value)
+}
+
+func containsEndpointSlug(value string) bool {
+	value = strings.ToLower(value)
+	for start := 0; start < len(value); start++ {
+		if value[start] != '/' || start+1 >= len(value) {
+			continue
+		}
+		if start > 0 {
+			previous := value[start-1]
+			if previous == '_' || previous >= 'a' && previous <= 'z' || previous >= '0' && previous <= '9' {
+				continue
+			}
+		}
+		hasUnderscore := false
+		end := start + 1
+		for end < len(value) {
+			character := value[end]
+			if character == '_' {
+				hasUnderscore = true
+				end++
+				continue
+			}
+			if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+				end++
+				continue
+			}
+			break
+		}
+		if hasUnderscore && end > start+1 {
+			return true
+		}
+	}
+	return false
 }
 
 func truncateModelRunes(value string, max int) string {

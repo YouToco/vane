@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/YouToco/vane/toolsearch"
@@ -144,7 +145,7 @@ func TestAgentCatalogDigestAndOrderAreStable(t *testing.T) {
 	if rebuilt.Digest() != AgentCatalogDigest() {
 		t.Fatalf("input order changed digest: %s != %s", rebuilt.Digest(), AgentCatalogDigest())
 	}
-	const wantDigest = "9489a76cafbd0e18d6a408abcb8c59f28d4935409ad54018637106b19c24d8dc"
+	const wantDigest = "13d787acac3cce2cf30290173747258183004135064476069341f9d103cee31e"
 	if AgentCatalogDigest() != wantDigest {
 		t.Fatalf("agent catalog digest = %s, want %s", AgentCatalogDigest(), wantDigest)
 	}
@@ -231,11 +232,239 @@ func TestAgentDefinitionsExcludeProviderTransportMetadata(t *testing.T) {
 		if !ok {
 			t.Fatalf("eligible tool %q has no model definition", entry.Name)
 		}
-		visible := strings.ToLower(definition.Description + "\n" + string(definition.Parameters))
-		for _, forbidden := range []string{"tikhub", "cookie", "/api/v", "endpoint path", "request method"} {
-			if strings.Contains(visible, forbidden) {
-				t.Fatalf("model definition %q leaked %q", entry.Name, forbidden)
+		if definition.Namespace != "social/"+entry.Platform || definition.Name != entry.Name {
+			t.Fatalf("model identity %q drifted: namespace=%q name=%q", entry.Name, definition.Namespace, definition.Name)
+		}
+		if !reflect.DeepEqual(definition.Tags, []string{entry.Platform}) {
+			t.Fatalf("model definition %q leaked provider tag %q as %#v", entry.Name, entry.Tag, definition.Tags)
+		}
+		for _, visible := range append([]string{
+			definition.Namespace, definition.Name, definition.Description, string(definition.Parameters),
+		}, definition.Tags...) {
+			if containsProviderTransport(visible) {
+				t.Fatalf("model definition %q leaked provider transport metadata in %q", entry.Name, visible)
 			}
+		}
+	}
+}
+
+func TestModelDefinitionRecursivelyRemovesProviderPaths(t *testing.T) {
+	entry, ok := Lookup("weibo_web_v2_fetch_city_list")
+	if !ok {
+		t.Fatal("known Weibo city endpoint is missing")
+	}
+	entry.Description = "Endpoint path: /api/v1/weibo/web/v2/fetch_city_list\nSafe city mapping description"
+	entry.Params = append(entry.Params, Param{
+		Name: "options", Type: "object",
+		Desc: "Request method GET, endpoint path /api/v1/weibo/city",
+		Default: map[string]any{
+			"safe":          "city",
+			"endpoint_path": "/api/v1/weibo/city",
+			"nested":        []any{"region", "https://api.tikhub.io/api/v1/weibo/city"},
+		},
+		Enum: []any{map[string]any{
+			"safe":  "province",
+			"route": []any{"/api/v1/weibo/province", "district"},
+		}},
+	})
+	definition := modelToolEntry(entry)
+	visible := definition.Description + "\n" + strings.Join(definition.Tags, "\n") + "\n" + string(definition.Parameters)
+	if containsProviderTransport(visible) || strings.Contains(strings.ToLower(visible), strings.ToLower(entry.Tag)) {
+		t.Fatalf("Weibo city definition leaked provider metadata: %s", visible)
+	}
+	for _, retained := range []string{"Safe city mapping description", `"safe":"city"`, `"safe":"province"`, "district"} {
+		if !strings.Contains(visible, retained) {
+			t.Fatalf("recursive scrub removed safe business value %q: %s", retained, visible)
+		}
+	}
+}
+
+func TestKnownWeiboSearchDefinitionRemovesCityEndpointPaths(t *testing.T) {
+	definition, ok := AgentDefinition("weibo_web_v2_fetch_user_search")
+	if !ok {
+		t.Fatal("known Weibo user search definition is missing")
+	}
+	visible := definition.Description + "\n" + strings.Join(definition.Tags, "\n") + "\n" + string(definition.Parameters)
+	for _, forbidden := range []string{"/fetch_city_list", "/city_list", "Weibo-Web-V2-API"} {
+		if strings.Contains(strings.ToLower(visible), strings.ToLower(forbidden)) {
+			t.Fatalf("Weibo user search definition leaked %q: %s", forbidden, visible)
+		}
+	}
+}
+
+func TestModelDefinitionsPreservePublicBusinessURLFormats(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{name: "wechat_mp_v2_fetch_article_detail", want: "https://mp.weixin.qq.com/s/"},
+		{name: "youtube_web_get_channel_id_v2", want: "https://www.youtube.com/channel/"},
+	} {
+		definition, ok := AgentDefinition(test.name)
+		if !ok {
+			t.Fatalf("AgentDefinition(%q) is missing", test.name)
+		}
+		visible := definition.Description + "\n" + string(definition.Parameters)
+		if !strings.Contains(visible, test.want) {
+			t.Fatalf("AgentDefinition(%q) removed public business URL format %q: %s", test.name, test.want, visible)
+		}
+		if containsProviderTransport(test.want) {
+			t.Fatalf("public business URL %q classified as provider transport", test.want)
+		}
+	}
+}
+
+func TestProviderEntryAPIsReturnDeepCopies(t *testing.T) {
+	const defaultName = "douyin_billboard_fetch_hot_account_list"
+	getters := map[string]func() (Entry, bool){
+		"Lookup":      func() (Entry, bool) { return Lookup(defaultName) },
+		"AgentLookup": func() (Entry, bool) { return AgentLookup(defaultName) },
+		"Entries": func() (Entry, bool) {
+			for _, entry := range Entries() {
+				if entry.Name == defaultName {
+					return entry, true
+				}
+			}
+			return Entry{}, false
+		},
+		"Search": func() (Entry, bool) {
+			for _, hit := range Search("douyin billboard hot account list", "douyin", 50) {
+				if hit.Entry.Name == defaultName {
+					return hit.Entry, true
+				}
+			}
+			return Entry{}, false
+		},
+	}
+	for name, getter := range getters {
+		entry, ok := getter()
+		if !ok {
+			t.Fatalf("%s did not return %s", name, defaultName)
+		}
+		if !mutateProviderEntryForTest(&entry) {
+			t.Fatalf("fixture %s has no compound default", entry.Name)
+		}
+		again, ok := getter()
+		if !ok {
+			t.Fatalf("%s lost %s after caller mutation", name, defaultName)
+		}
+		assertProviderEntryUnmutated(t, name, again)
+	}
+
+	const enumName = "douyin_index_fetch_brand_cycles"
+	enumEntry, ok := Lookup(enumName)
+	if !ok {
+		t.Fatalf("enum fixture %s is unavailable", enumName)
+	}
+	enumIndex := -1
+	for i := range enumEntry.Params {
+		if len(enumEntry.Params[i].Enum) > 0 {
+			enumIndex = i
+			break
+		}
+	}
+	if enumIndex < 0 {
+		t.Fatalf("enum fixture %s has no enum", enumName)
+	}
+	enumEntry.Params[enumIndex].Enum[0] = "mutated"
+	again, ok := Lookup(enumName)
+	if !ok || again.Params[enumIndex].Enum[0] == "mutated" {
+		t.Fatal("Param.Enum mutation polluted the provider catalog")
+	}
+}
+
+func TestProviderEntryCopiesAreConcurrentMutationSafe(t *testing.T) {
+	const name = "douyin_billboard_fetch_hot_account_list"
+	var wait sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for j := 0; j < 50; j++ {
+				entry, ok := Lookup(name)
+				if !ok {
+					t.Errorf("Lookup(%q) failed", name)
+					return
+				}
+				if !mutateProviderEntryForTest(&entry) {
+					t.Errorf("fixture %s has no compound default", entry.Name)
+					return
+				}
+				entry, ok = AgentLookup(name)
+				if !ok {
+					t.Errorf("AgentLookup(%q) failed", name)
+					return
+				}
+				if !mutateProviderEntryForTest(&entry) {
+					t.Errorf("fixture %s has no compound default", entry.Name)
+					return
+				}
+				found := false
+				for _, candidate := range Entries() {
+					if candidate.Name == name {
+						found = mutateProviderEntryForTest(&candidate)
+						break
+					}
+				}
+				if !found {
+					t.Errorf("Entries() did not return mutable fixture %s", name)
+					return
+				}
+				found = false
+				for _, hit := range Search("douyin billboard hot account list", "douyin", 50) {
+					if hit.Entry.Name == name {
+						found = mutateProviderEntryForTest(&hit.Entry)
+						break
+					}
+				}
+				if !found {
+					t.Errorf("Search() did not return mutable fixture %s", name)
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	entry, ok := Lookup(name)
+	if !ok {
+		t.Fatal("provider entry disappeared")
+	}
+	assertProviderEntryUnmutated(t, "concurrent APIs", entry)
+}
+
+func mutateProviderEntryForTest(entry *Entry) bool {
+	if len(entry.Params) == 0 {
+		return false
+	}
+	entry.Params[0].Name = "mutated"
+	for i := range entry.Params {
+		object, ok := entry.Params[i].Default.(map[string]any)
+		if ok {
+			object["mutated"] = true
+			return true
+		}
+		values, ok := entry.Params[i].Default.([]any)
+		if ok && len(values) > 0 {
+			values[0] = "mutated"
+			return true
+		}
+	}
+	return false
+}
+
+func assertProviderEntryUnmutated(t *testing.T, source string, entry Entry) {
+	t.Helper()
+	if len(entry.Params) == 0 || entry.Params[0].Name == "mutated" {
+		t.Fatalf("%s returned polluted Params", source)
+	}
+	for _, parameter := range entry.Params {
+		object, ok := parameter.Default.(map[string]any)
+		if ok && object["mutated"] == true {
+			t.Fatalf("%s returned polluted compound Default", source)
+		}
+		values, ok := parameter.Default.([]any)
+		if ok && len(values) > 0 && values[0] == "mutated" {
+			t.Fatalf("%s returned polluted compound Default", source)
 		}
 	}
 }
@@ -455,6 +684,21 @@ func TestSearchToolsAdvancedAnalyticsPolicy(t *testing.T) {
 	}
 	if !foundAdvanced {
 		t.Fatal("explicit advanced analytics query did not return an advanced tool")
+	}
+}
+
+func TestExplicitAdvancedAnalyticsQueryUsesTokenBoundaries(t *testing.T) {
+	for _, query := range []string{"threads latest posts", "photoshop creator tutorial"} {
+		if explicitAdvancedAnalyticsQuery(query) {
+			t.Fatalf("query %q falsely enabled advanced analytics", query)
+		}
+	}
+	for _, query := range []string{
+		"ads performance", "shop trends", "creator analytics report", "广告 投放", "douplus", "xingtu",
+	} {
+		if !explicitAdvancedAnalyticsQuery(query) {
+			t.Fatalf("query %q did not enable explicit advanced analytics", query)
+		}
 	}
 }
 
