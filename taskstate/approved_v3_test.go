@@ -70,6 +70,31 @@ func TestApprovedDefinitionV3RoundTripContainsOnlyDurableResearchIntent(t *testi
 	}
 }
 
+func TestApprovedDefinitionV3OptionalResearchScopePreservesAbsentBytes(t *testing.T) {
+	input := validApprovedDefinitionInputV3()
+	retained, err := BuildApprovedDefinitionV3(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedBytes, _ := EncodeApprovedDefinitionV3(retained)
+	if strings.Contains(string(retainedBytes), "research_scope") {
+		t.Fatalf("absent scope changed retained bytes: %s", retainedBytes)
+	}
+	input.ResearchScope = &ResearchScopeV3{Mode: ResearchScopeEventWindowV3, LookbackSeconds: ResearchScopeWeekSecondsV3}
+	scoped, err := BuildApprovedDefinitionV3(input)
+	if err != nil || scoped.ResearchScope == nil {
+		t.Fatalf("scoped definition=%+v err=%v", scoped, err)
+	}
+	scopedBytes, _ := EncodeApprovedDefinitionV3(scoped)
+	if !strings.Contains(string(scopedBytes), `"research_scope":{"mode":"event_window","lookback_seconds":604800}`) {
+		t.Fatalf("scope bytes=%s", scopedBytes)
+	}
+	input.ResearchScope.LookbackSeconds--
+	if _, err := BuildApprovedDefinitionV3(input); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("unsupported lookback error=%v", err)
+	}
+}
+
 func TestApprovedDefinitionV3FailsClosed(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -35,7 +35,7 @@ func prepareLegacyResearchBriefSynthesisForMigrationTest(
 		t.Fatal(err)
 	}
 	evidencePayload, evidenceContext, toolFailures, err :=
-		buildResearchEvidenceManifestV3(ctx, tx, f.identity, f.planRef)
+		buildResearchEvidenceManifestV3(ctx, tx, f.identity, f.planRef, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

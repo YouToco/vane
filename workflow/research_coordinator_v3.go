@@ -385,7 +385,9 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 		seal.ResearchModel.Synthesis.RendererVersion !=
 			runtimepolicy.ResearchSynthesisRendererVersionV33 &&
 		seal.ResearchModel.Synthesis.RendererVersion !=
-			runtimepolicy.ResearchSynthesisRendererVersionV34 {
+			runtimepolicy.ResearchSynthesisRendererVersionV34 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV35 {
 		return ResearchBriefRefV3{}, types.NewAppError(types.CodeConflict,
 			"frozen research synthesis renderer cannot express partial coverage",
 			types.ErrConflict)
@@ -462,7 +464,9 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 	if seal.ResearchModel.Synthesis.RendererVersion ==
 		runtimepolicy.ResearchSynthesisRendererVersionV33 ||
 		seal.ResearchModel.Synthesis.RendererVersion ==
-			runtimepolicy.ResearchSynthesisRendererVersionV34 {
+			runtimepolicy.ResearchSynthesisRendererVersionV34 ||
+		seal.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV35 {
 		if seal.ResearchModel.GroundingVerifier == nil {
 			return ResearchBriefRefV3{}, researchCoordinatorValidationV3(
 				"research grounding verifier is unavailable")
@@ -724,7 +728,8 @@ func decodeResearchBriefCompletionV3(
 	case runtimepolicy.ResearchSynthesisRendererVersionV31,
 		runtimepolicy.ResearchSynthesisRendererVersionV32,
 		runtimepolicy.ResearchSynthesisRendererVersionV33,
-		runtimepolicy.ResearchSynthesisRendererVersionV34:
+		runtimepolicy.ResearchSynthesisRendererVersionV34,
+		runtimepolicy.ResearchSynthesisRendererVersionV35:
 		normalized, err := normalizeResearchBriefCompletionV31(raw)
 		if err != nil {
 			return types.ResearchBriefPayloadV3{}, nil,
@@ -732,7 +737,8 @@ func decodeResearchBriefCompletionV3(
 		}
 		if rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV32 ||
 			rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV33 ||
-			rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV34 {
+			rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV34 ||
+			rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV35 {
 			normalized, err = normalizeNumericCurrentEvidenceRefsV32(normalized)
 			if err != nil {
 				return types.ResearchBriefPayloadV3{}, nil,
