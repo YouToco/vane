@@ -367,7 +367,7 @@ var intelligenceCatalog = map[IntelligenceDataset]intelligenceDatasetSpec{
 		                       'list_schedules','create_schedule','remove_schedule',
 		                       'run_task_now','view_profile','update_profile',
 		                       'view_task_playbook','view_task_latest_run',
-		                       'edit_task_definition','search_endpoints'
+		                       'edit_task_definition','search_endpoints','tool_search'
 		                   ) THEN 'local' ELSE 'external' END,
 		              'legacy_preview'::text,c.created_at
 		         FROM tool_calls c

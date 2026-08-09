@@ -23,7 +23,7 @@ var staticTools = []staticTool{
 	{"update_profile", "首次填写画像", "画像字段", "owner 写入", "始终", "语义授权后直接执行", "启用"},
 	{"web_search", "搜索公开网页", "query、结果数、域名", "外部只读/可能计费", "始终", "无", "条件启用"},
 	{"read_page", "读取公开页面", "url", "外部只读/可能计费", "始终", "无", "条件启用"},
-	{"search_endpoints", "搜索社媒查询工具", "query、platform", "本地目录激活", "始终", "无", "条件启用"},
+	{"tool_search", "搜索授权后的社媒查询工具", "query、platform、limit", "本地目录激活", "始终", "无", "条件启用"},
 	{"read_endpoint_result", "续读本轮结果句柄", "handle、path、offset、limit", "外部结果本地续读", "产生句柄后", "无", "条件启用"},
 }
 
@@ -64,7 +64,7 @@ func render() []byte {
 	}
 	b.WriteString("\nProduction owner chat has one Agent-first surface. Removed model contracts include the eight narrow task/profile tools, account source/subscription tools, confirmation/proposal tools, `push_now`, `update_schedule`, `edit_task_playbook`, and `set_task_strictness`.\n\n")
 	b.WriteString("## Dynamic social research tools\n\n")
-	fmt.Fprintf(&b, "%d read-only catalog tools are discovered lazily through `search_endpoints`; schemas are not placed in the first model request.\n\n", tikhubcatalog.AgentLen())
+	fmt.Fprintf(&b, "%d read-only catalog tools are discovered lazily through `tool_search`; schemas are not placed in the first model request.\n\n", tikhubcatalog.AgentLen())
 	b.WriteString("| Tool | Platform | Capability | Parameters | Risk | Exposure | Execution | Production |\n")
 	b.WriteString("|---|---|---|---|---|---|---|---|\n")
 	entries := tikhubcatalog.Entries()

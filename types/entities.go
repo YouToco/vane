@@ -264,7 +264,7 @@ type ToolCallKind string
 
 const (
 	ToolCallKindStatic         ToolCallKind = "static"          // 静态白名单任务工具
-	ToolCallKindTikHubSearch   ToolCallKind = "tikhub_search"   // search_endpoints 检索元工具
+	ToolCallKindTikHubSearch   ToolCallKind = "tikhub_search"   // tool_search 检索元工具
 	ToolCallKindTikHubEndpoint ToolCallKind = "tikhub_endpoint" // 动态注入的 TikHub 端点工具（按次计费面）
 	// ToolCallKindBindingFetch 绑定引擎（调度面）的上游调用：list/enrich/probe 每次
 	// 计费调用一行（endpoint-binding-contract.md §5）。compiled 调度明确记录冻结的

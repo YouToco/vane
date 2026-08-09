@@ -77,15 +77,14 @@ content_items；某端点若证明适合长期任务抓取，走 capabilitycatal
 - **升级 embedding 的决策依据是数据不是感觉**：tool_calls 的 retrieval_query +
   candidate_tools 留痕（§6）攒够样本后再评估召回质量。
 
-## §3 工具面（search_endpoints + 动态端点工具）
+## §3 工具面（tool_search + 动态端点工具）
 
-- `search_endpoints`（静态白名单成员，读工具）：`{query, platform?}` → top-5 端点，
-  返回文本含端点名/方法路径/摘要/参数表，并把命中端点**激活**进会话。
+- `tool_search`（静态白名单成员，读工具）：`{query, platform?, limit?}`，
+  query 最多 512 UTF-8 字节，limit 1–8/默认 8；返回 provider-neutral 的名称/命名空间/
+  说明，并把命中工具的完整 canonical schema 在下一模型轮**激活**。
   零命中给自纠指引；未知平台给平台清单。
-- 动态端点工具：按 catalog Entry 即时构造，Parameters 从注册表参数生成 JSON
-  schema（enum/default/required 齐全；未知类型退化 string——schema 是给模型的提示，
-  权威校验在 Execute 参数校验 + 上游 422）。注入描述 = summary + description 截
-  300 rune + 计费提醒（600 全文只出现在检索结果文本里，不随每轮请求重复发送）。
+- 动态端点工具：模型声明逐字节来自 `tikhubcatalog.AgentDefinition`；
+  执行时再以同名 `AgentLookup` 取供应商路由，复用现有 invoker/授权/限额。
 - **端点工具全部只读**：查询不改系统状态，只进入公开研究工具面；
   推论：不能创建任务、修改任务手册或写入内部抓取目标。
 - system prompt 仅在装配了端点工具面时追加能力说明段（可搜索平台清单 + 计费/
@@ -140,10 +139,8 @@ content_items；某端点若证明适合长期任务抓取，走 capabilitycatal
 ### §4.1 激活集
 - 会话新增 `activated_tools JSONB`（migration 015）：激活的端点名数组，随会话
   持久化——TTL（30min）内跨消息有效，进程重启不丢；新会话从空集开始。
-- 上限 14【2026-07-18 修订，原 15】：静态面已增至 15（13 业务工具 +
-  search_endpoints + read_endpoint_result，§3.5），15 + 14 = 29 < 30（业内在场
-  工具数安全线）；原「静态 10」算术早已失真。再加静态工具须先降本上限。满员 FIFO
-  逐出最早激活者，检索结果文本明示被逐出的端点（重新检索即恢复）。
+- 上限 16 个工具且 canonical parameter schema 合计不超过 64 KiB。重复命中
+  去重；新批次越界时整批 fail-closed，不逐出旧工具、不部分激活。
 
 ### §4.2 白名单语义（M4 契约 §10 的扩展）
 可调用面 = 静态工具 ∪ **会话已激活端点**。两个硬规则：
@@ -210,7 +207,7 @@ Tool 接口签名由 M4 契约固定且工具实例是全局单例，per-message
 
 ## §8 装配与降级
 
-`fetch.tikhub_api_key` 未配置 → EndpointTools 不装配（nil）：无 search_endpoints
+`fetch.tikhub_api_key` 未配置 → EndpointTools 不装配（nil）：无 tool_search
 工具、无 system prompt 说明段、动态解析关闭，agent 工具面与本特性上线前逐字节一致。
 nil 的 ToolCallRecorder 全程安全（测试免装配）。
 

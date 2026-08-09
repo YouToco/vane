@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/tikhubcatalog"
 	"github.com/YouToco/vane/tikhubinvoke"
+	"github.com/YouToco/vane/toolsearch"
 	"github.com/YouToco/vane/types"
 )
 
@@ -48,6 +50,75 @@ func (f *fakeInvoker) Invoke(_ context.Context, entry tikhubcatalog.Entry, param
 type fakeCounter struct {
 	n   int
 	err error
+}
+
+type fakeEndpointCatalog struct {
+	definitions  map[string]toolsearch.Entry
+	providers    map[string]tikhubcatalog.Entry
+	matches      []toolsearch.Match
+	searchErr    error
+	lastLimit    int
+	lastPlatform string
+}
+
+func (f *fakeEndpointCatalog) SearchTools(_ string, platform string, limit int) ([]toolsearch.Match, error) {
+	f.lastLimit = limit
+	f.lastPlatform = platform
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
+	out := append([]toolsearch.Match(nil), f.matches...)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+func (f *fakeEndpointCatalog) AgentDefinition(name string) (toolsearch.Entry, bool) {
+	entry, ok := f.definitions[name]
+	entry.Parameters = append(json.RawMessage(nil), entry.Parameters...)
+	return entry, ok
+}
+func (f *fakeEndpointCatalog) AgentLookup(name string) (tikhubcatalog.Entry, bool) {
+	entry, ok := f.providers[name]
+	return entry, ok
+}
+func (*fakeEndpointCatalog) Platforms() []string { return []string{"test"} }
+func (f *fakeEndpointCatalog) PlatformCount(platform string) int {
+	if platform == "test" {
+		return len(f.providers)
+	}
+	return 0
+}
+
+func newFakeCatalog(entries ...toolsearch.Entry) *fakeEndpointCatalog {
+	f := &fakeEndpointCatalog{
+		definitions: make(map[string]toolsearch.Entry, len(entries)),
+		providers:   make(map[string]tikhubcatalog.Entry, len(entries)),
+		matches:     make([]toolsearch.Match, 0, len(entries)),
+	}
+	for _, entry := range entries {
+		f.definitions[entry.Name] = entry
+		f.providers[entry.Name] = tikhubcatalog.Entry{Name: entry.Name, Platform: "test"}
+		f.matches = append(f.matches, toolsearch.Match{Entry: entry})
+	}
+	return f
+}
+
+func fakeToolDefinition(name string, paddingBytes int) toolsearch.Entry {
+	description := strings.Repeat("x", paddingBytes)
+	schema, err := json.Marshal(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{"type": "string", "description": description},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return toolsearch.Entry{
+		Namespace: "social/test", Name: name,
+		Description: "test tool " + name, Parameters: schema,
+	}
 }
 
 func (f *fakeCounter) CountTikHubEndpointCallsSince(context.Context, time.Time) (int, error) {
@@ -92,36 +163,38 @@ func ctxWithRunState(state *toolRunState, rec *types.ToolCall) context.Context {
 // activationState
 // ============================================================
 
-func TestActivationState_ActivateOrderDedupEvict(t *testing.T) {
+func TestActivationState_ActivateOrderDedupAndFailClosedLimit(t *testing.T) {
 	a := &activationState{}
+	catalog := productionEndpointCatalog{}
+	entries := tikhubcatalog.Entries()
+	if len(entries) < maxActivatedEndpoints+1 {
+		t.Fatalf("测试目录过小: %d", len(entries))
+	}
 	for i := 0; i < maxActivatedEndpoints; i++ {
-		if ev := a.activate(fmt.Sprintf("ep_%02d", i)); ev != "" {
-			t.Fatalf("未满员不应逐出，实得 %q", ev)
+		if err := a.activateBatch(catalog, []string{entries[i].Name}); err != nil {
+			t.Fatalf("未满员不应拒绝: %v", err)
 		}
 	}
-	// 重复激活：不动位置、不逐出。
-	if ev := a.activate("ep_03"); ev != "" {
-		t.Fatalf("重复激活不应逐出，实得 %q", ev)
+	// 重复激活：不动位置、不增加名额。
+	if err := a.activateBatch(catalog, []string{entries[3].Name, entries[3].Name}); err != nil {
+		t.Fatalf("重复激活不应拒绝: %v", err)
 	}
-	if a.names[3] != "ep_03" {
+	if a.names[3] != entries[3].Name {
 		t.Fatalf("重复激活不应改变位置，实际 names[3]=%q", a.names[3])
 	}
-	// 满员：FIFO 逐出最早的 ep_00。
-	if ev := a.activate("ep_new"); ev != "ep_00" {
-		t.Fatalf("满员应逐出 ep_00，实得 %q", ev)
+	// 满员：新批次整体拒绝，旧前缀原字节不变。
+	before := append([]string(nil), a.names...)
+	if err := a.activateBatch(catalog, []string{entries[maxActivatedEndpoints].Name}); err == nil {
+		t.Fatal("满员后应 fail-closed")
 	}
-	if len(a.names) != maxActivatedEndpoints {
-		t.Fatalf("激活集应保持上限 %d，实际 %d", maxActivatedEndpoints, len(a.names))
-	}
-	if !a.contains("ep_new") || a.contains("ep_00") {
-		t.Fatal("逐出/加入结果不符")
+	if fmt.Sprint(a.names) != fmt.Sprint(before) {
+		t.Fatalf("超限拒绝后状态被改写: before=%v after=%v", before, a.names)
 	}
 }
 
 func TestActivationState_EncodeDecodeRoundTrip(t *testing.T) {
 	a := &activationState{}
-	a.activate("ep_b")
-	a.activate("ep_a")
+	a.names = []string{"ep_b", "ep_a"}
 	got := decodeActivation(a.encode())
 	if len(got.names) != 2 || got.names[0] != "ep_b" || got.names[1] != "ep_a" {
 		t.Fatalf("round-trip 应保序，实际 %v", got.names)
@@ -133,10 +206,25 @@ func TestActivationState_EncodeDecodeRoundTrip(t *testing.T) {
 	if got := decodeActivation(json.RawMessage(`{broken`)); len(got.names) != 0 {
 		t.Fatalf("损坏 JSON 应自愈为空集，实际 %v", got.names)
 	}
+	if got := decodeActivation(json.RawMessage(`["a","a"]`)); len(got.names) != 0 {
+		t.Fatalf("持久化重复名应 fail-closed，实际 %v", got.names)
+	}
+	tooMany := make([]string, maxActivatedEndpoints+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("tool_%02d", i)
+	}
+	raw, err := json.Marshal(tooMany)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeActivation(raw); len(got.names) != 0 {
+		t.Fatalf("持久化超过 %d 个工具应 fail-closed，实际 %v",
+			maxActivatedEndpoints, got.names)
+	}
 }
 
 // ============================================================
-// search_endpoints
+// tool_search
 // ============================================================
 
 func newTestEndpointTools(
@@ -149,7 +237,7 @@ func newTestEndpointTools(
 	return NewEndpointTools(inv, counter, dailyCap, 1_000_000)
 }
 
-func TestSearchEndpointsTool_ActivatesAndRecords(t *testing.T) {
+func TestToolSearchTool_ActivatesAndRecords(t *testing.T) {
 	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
 	tool := ep.SearchTool()
 
@@ -161,7 +249,7 @@ func TestSearchEndpointsTool_ActivatesAndRecords(t *testing.T) {
 		t.Fatalf("Execute 意外报错: %v", err)
 	}
 	if len(state.activation.names) == 0 {
-		t.Fatal("检索命中后应激活端点")
+		t.Fatalf("检索命中后应激活端点: %s", out)
 	}
 	// 激活的端点必须逐个出现在结果文本里（模型靠文本知道有什么可调）。
 	for _, name := range state.activation.names {
@@ -185,7 +273,7 @@ func TestSearchEndpointsTool_ActivatesAndRecords(t *testing.T) {
 	}
 }
 
-func TestSearchEndpointsTool_SelfCorrectMessages(t *testing.T) {
+func TestToolSearchTool_SelfCorrectMessages(t *testing.T) {
 	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
 	tool := ep.SearchTool()
 	state := &toolRunState{activation: &activationState{}}
@@ -203,9 +291,153 @@ func TestSearchEndpointsTool_SelfCorrectMessages(t *testing.T) {
 	}
 }
 
-// TestSearchEndpointsTool_NoRunStateStillSearches：ctx 无运行状态（防御路径）时
+func TestToolSearch_StrictBoundedArgumentsAndDefaultLimit(t *testing.T) {
+	definition := fakeToolDefinition("test_search", 0)
+	catalog := newFakeCatalog(definition)
+	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
+	ep.catalog = catalog
+	tool := ep.SearchTool()
+
+	state := &toolRunState{activation: &activationState{}}
+	if out, _ := tool.Execute(ctxWithRunState(state, nil), 1,
+		json.RawMessage(`{"query":"posts"}`)); !strings.Contains(out, definition.Name) {
+		t.Fatalf("默认检索未命中: %q", out)
+	}
+	if catalog.lastLimit != 8 {
+		t.Fatalf("缺省 limit=%d, want 8", catalog.lastLimit)
+	}
+	if out, _ := tool.Execute(ctxWithRunState(state, nil), 1,
+		json.RawMessage(`{"query":"posts","platform":" TEST ","limit":1}`)); !strings.Contains(out, definition.Name) {
+		t.Fatalf("显式 limit 检索未命中: %q", out)
+	}
+	if catalog.lastLimit != 1 || catalog.lastPlatform != "test" {
+		t.Fatalf("catalog args limit=%d platform=%q", catalog.lastLimit, catalog.lastPlatform)
+	}
+
+	tooLong, _ := json.Marshal(map[string]string{"query": strings.Repeat("a", 513)})
+	invalidUTF8 := append([]byte(`{"query":"`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	for _, tc := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{"unknown", json.RawMessage(`{"query":"x","other":1}`)},
+		{"wrong_query_type", json.RawMessage(`{"query":1}`)},
+		{"invalid_utf8", invalidUTF8},
+		{"oversize", tooLong},
+		{"limit_zero", json.RawMessage(`{"query":"x","limit":0}`)},
+		{"limit_nine", json.RawMessage(`{"query":"x","limit":9}`)},
+		{"limit_type", json.RawMessage(`{"query":"x","limit":"8"}`)},
+		{"limit_null", json.RawMessage(`{"query":"x","limit":null}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := append([]string(nil), state.activation.names...)
+			out, err := tool.Execute(ctxWithRunState(state, nil), 1, tc.raw)
+			if err != nil || out == "" {
+				t.Fatalf("err=%v out=%q", err, out)
+			}
+			if fmt.Sprint(before) != fmt.Sprint(state.activation.names) {
+				t.Fatalf("非法参数改写了 activation: %v -> %v", before, state.activation.names)
+			}
+		})
+	}
+}
+
+func TestToolSearch_ActivationCapsAreAtomic(t *testing.T) {
+	t.Run("schema_bytes", func(t *testing.T) {
+		first := fakeToolDefinition("large_one", 33<<10)
+		second := fakeToolDefinition("large_two", 33<<10)
+		catalog := newFakeCatalog(first, second)
+		ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
+		ep.catalog = catalog
+		state := &toolRunState{activation: &activationState{}}
+		out, err := ep.SearchTool().Execute(ctxWithRunState(state, nil), 1,
+			json.RawMessage(`{"query":"large"}`))
+		if err != nil || !strings.Contains(out, "全部拒绝") {
+			t.Fatalf("err=%v out=%q", err, out)
+		}
+		if len(state.activation.names) != 0 {
+			t.Fatalf("64KiB 超限后不得部分激活: %v", state.activation.names)
+		}
+	})
+
+	t.Run("count_and_duplicates", func(t *testing.T) {
+		definitions := make([]toolsearch.Entry, 0, maxActivatedEndpoints+1)
+		for i := 0; i < maxActivatedEndpoints+1; i++ {
+			definitions = append(definitions, fakeToolDefinition(fmt.Sprintf("tool_%02d", i), 0))
+		}
+		catalog := newFakeCatalog(definitions...)
+		state := &activationState{}
+		firstBatch := make([]string, 0, maxActivatedEndpoints)
+		for _, definition := range definitions[:maxActivatedEndpoints] {
+			firstBatch = append(firstBatch, definition.Name, definition.Name)
+		}
+		if err := state.activateBatch(catalog, firstBatch); err != nil {
+			t.Fatal(err)
+		}
+		if len(state.names) != maxActivatedEndpoints {
+			t.Fatalf("重复命中未去重: %d", len(state.names))
+		}
+		before := append([]string(nil), state.names...)
+		if err := state.activateBatch(catalog, []string{definitions[maxActivatedEndpoints].Name}); err == nil {
+			t.Fatal("17th tool should fail closed")
+		}
+		if fmt.Sprint(before) != fmt.Sprint(state.names) {
+			t.Fatalf("超限批次改写状态: %v", state.names)
+		}
+	})
+}
+
+func TestToolSearch_MissingInvokerCannotAdvertiseOrActivate(t *testing.T) {
+	ep := NewEndpointTools(nil, &fakeCounter{}, 200, 1_000_000)
+	if _, err := NewChecked(Deps{
+		Tools: BuildTools2Static(ep), Endpoints: ep,
+	}); err == nil || !strings.Contains(err.Error(), "authorized endpoint invoker") {
+		t.Fatalf("缺少授权 invoker 时应启动失败: %v", err)
+	}
+	state := &toolRunState{activation: &activationState{names: []string{testEndpoint(t).Name}}}
+	out, err := ep.SearchTool().Execute(ctxWithRunState(state, nil), 1,
+		json.RawMessage(`{"query":"posts"}`))
+	if err != nil || !strings.Contains(out, "未授权") {
+		t.Fatalf("err=%v out=%q", err, out)
+	}
+	if defs := ep.Defs(state.activation); len(defs) != 0 {
+		t.Fatalf("缺 invoker 时不得声明动态工具: %+v", defs)
+	}
+	if _, ok := ep.Resolve(testEndpoint(t).Name, state.activation); ok {
+		t.Fatal("缺 invoker 时不得解析动态工具")
+	}
+}
+
+func TestDynamicDefinitionsRevalidateCurrentCatalogEveryRound(t *testing.T) {
+	first := fakeToolDefinition("mutable_tool", 0)
+	catalog := newFakeCatalog(first)
+	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
+	ep.catalog = catalog
+	state := &activationState{names: []string{first.Name}}
+	if defs := ep.Defs(state); len(defs) != 1 ||
+		!bytes.Equal(defs[0].Parameters, first.Parameters) {
+		t.Fatalf("initial defs=%+v", defs)
+	}
+
+	changed := fakeToolDefinition(first.Name, 32)
+	catalog.definitions[first.Name] = changed
+	if defs := ep.Defs(state); len(defs) != 1 ||
+		!bytes.Equal(defs[0].Parameters, changed.Parameters) {
+		t.Fatalf("未从当前 catalog 重验 schema: %+v", defs)
+	}
+	delete(catalog.providers, first.Name)
+	if defs := ep.Defs(state); len(defs) != 0 {
+		t.Fatalf("调用路由撤权后仍在声明: %+v", defs)
+	}
+	if len(state.names) != 0 {
+		t.Fatalf("调用路由撤权后 stale activation 未剪掉: %v", state.names)
+	}
+}
+
+// TestToolSearchTool_NoRunStateStillSearches：ctx 无运行状态（防御路径）时
 // 检索照常返回，只是无法激活——不 panic 是底线。
-func TestSearchEndpointsTool_NoRunStateStillSearches(t *testing.T) {
+func TestToolSearchTool_NoRunStateStillSearches(t *testing.T) {
 	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
 	out, err := ep.SearchTool().Execute(context.Background(), 1, json.RawMessage(`{"query":"抖音 热榜"}`))
 	if err != nil || out == "" {
@@ -402,14 +634,18 @@ func TestResolveAndDefs_WhitelistSemantics(t *testing.T) {
 	if _, ok := ep.Resolve(entry.Name, nil); ok {
 		t.Fatal("nil 激活集不应解析")
 	}
-	// 已激活但注册表没有（re-gen 下线）：不解析、Defs 同步跳过。
+	// 已激活但注册表没有（re-gen 下线）：逐轮重验后剪掉 stale 名称，
+	// 其他仍在当前目录+调用路由的名称可继续使用。
 	ghost := &activationState{names: []string{"ghost_endpoint", entry.Name}}
 	if _, ok := ep.Resolve("ghost_endpoint", ghost); ok {
 		t.Fatal("注册表已下线的端点不应解析")
 	}
 	defs := ep.Defs(ghost)
 	if len(defs) != 1 || defs[0].Name != entry.Name {
-		t.Fatalf("Defs 应只含在册端点，实得 %+v", defs)
+		t.Fatalf("Defs 应剪掉 stale authority 并保留当前有效声明，实得 %+v", defs)
+	}
+	if len(ghost.names) != 1 || ghost.names[0] != entry.Name {
+		t.Fatalf("stale activation 未被剪掉: %v", ghost.names)
 	}
 	// 声明形态：参数 schema 合法 JSON 且必填齐全。
 	var schema struct {
@@ -447,7 +683,7 @@ func TestHandleMessage_EndpointSearchInjectInvoke(t *testing.T) {
 
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
 		// 轮 1：模型检索端点。
-		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "search_endpoints",
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "tool_search",
 			Arguments: `{"query":"小红书 搜索 笔记","platform":"xiaohongshu"}`}}, FinishReason: "tool_calls"},
 		// 轮 2：模型调用已激活端点。
 		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: entry.Name,
@@ -480,17 +716,27 @@ func TestHandleMessage_EndpointSearchInjectInvoke(t *testing.T) {
 		t.Fatalf("应 3 次模型调用，实得 %d", len(chat.requests))
 	}
 	if n := len(chat.requests[0].Tools); n != 1 {
-		t.Fatalf("轮 1 应只带静态 search_endpoints 声明，实得 %d 个", n)
+		t.Fatalf("轮 1 应只带静态 tool_search 声明，实得 %d 个", n)
 	}
 	r2names := map[string]bool{}
+	var injected llm.ToolDef
 	for _, d := range chat.requests[1].Tools {
 		r2names[d.Name] = true
+		if d.Name == entry.Name {
+			injected = d
+		}
 	}
 	if !r2names[entry.Name] {
 		t.Fatalf("轮 2 应含已激活端点 %s 的声明，实得 %v", entry.Name, r2names)
 	}
+	canonical, ok := tikhubcatalog.AgentDefinition(entry.Name)
+	if !ok || injected.Description != canonical.Description ||
+		!bytes.Equal(injected.Parameters, canonical.Parameters) {
+		t.Fatalf("注入声明不是 AgentDefinition 原字节: injected=%+v canonical=%+v",
+			injected, canonical)
+	}
 	// 静态声明必须仍在最前（前缀稳定纪律）。
-	if chat.requests[1].Tools[0].Name != "search_endpoints" {
+	if chat.requests[1].Tools[0].Name != "tool_search" {
 		t.Errorf("静态声明应在动态声明之前，实际首位 %s", chat.requests[1].Tools[0].Name)
 	}
 
@@ -545,7 +791,7 @@ func TestHandleMessage_TaintedEndpointKeepsReadOnlyResearchAndCurrentCache(t *te
 	ep.inv = &fakeInvoker{body: largeBody}
 
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
-		{ToolCalls: []llm.ToolCall{{ID: "search", Name: "search_endpoints",
+		{ToolCalls: []llm.ToolCall{{ID: "search", Name: "tool_search",
 			Arguments: `{"query":"小红书 搜索 笔记"}`}}, FinishReason: "tool_calls"},
 		{ToolCalls: []llm.ToolCall{{ID: "endpoint", Name: entry.Name,
 			Arguments: `{"keyword":"AI"}`}}, FinishReason: "tool_calls"},
@@ -640,12 +886,12 @@ func TestHandleMessage_SearchAndUnactivatedEndpointSameBatchAreBothRejected(t *t
 		// 端点在预扫描时尚未激活；若先执行 search 再顺序 Resolve，旧实现会让
 		// 同批付费调用穿透。整批必须零执行。
 		{ToolCalls: []llm.ToolCall{
-			{ID: "search-batch", Name: "search_endpoints", Arguments: searchArgs},
+			{ID: "search-batch", Name: "tool_search", Arguments: searchArgs},
 			{ID: "endpoint-batch", Name: entry.Name, Arguments: endpointArgs},
 		}, FinishReason: "tool_calls"},
 		// 按固定回执要求拆成两轮后才允许各自执行。
 		{ToolCalls: []llm.ToolCall{{
-			ID: "search-only", Name: "search_endpoints", Arguments: searchArgs,
+			ID: "search-only", Name: "tool_search", Arguments: searchArgs,
 		}}, FinishReason: "tool_calls"},
 		{ToolCalls: []llm.ToolCall{{
 			ID: "endpoint-only", Name: entry.Name, Arguments: endpointArgs,
@@ -675,8 +921,8 @@ func TestHandleMessage_SearchAndUnactivatedEndpointSameBatchAreBothRejected(t *t
 	if len(chat.requests) != 4 {
 		t.Fatalf("期望批拒+检索+端点+收敛共 4 次请求，实得 %d", len(chat.requests))
 	}
-	if defs := chat.requests[1].Tools; len(defs) != 1 || defs[0].Name != "search_endpoints" {
-		t.Fatalf("整批拒绝后 activation 必须仍为空，第二轮只能声明 search_endpoints，实得 %+v", defs)
+	if defs := chat.requests[1].Tools; len(defs) != 1 || defs[0].Name != "tool_search" {
+		t.Fatalf("整批拒绝后 activation 必须仍为空，第二轮只能声明 tool_search，实得 %+v", defs)
 	}
 	replies := map[string]string{}
 	for _, m := range chat.requests[1].Messages {
@@ -691,7 +937,7 @@ func TestHandleMessage_SearchAndUnactivatedEndpointSameBatchAreBothRejected(t *t
 	}
 }
 
-// BuildTools2Static 测试装配：只装 search_endpoints（其余静态工具与本特性无关）。
+// BuildTools2Static 测试装配：只装 tool_search（其余静态工具与本特性无关）。
 func BuildTools2Static(ep *EndpointTools) []ToolSpec {
 	return []ToolSpec{ep.SearchTool()}
 }
@@ -733,7 +979,7 @@ func TestExecRecorded_SanitizesNonUTF8AndNUL(t *testing.T) {
 	entry := testEndpoint(t)
 
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
-		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "search_endpoints", Arguments: `{"query":"小红书 搜索 笔记"}`}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "tool_search", Arguments: `{"query":"小红书 搜索 笔记"}`}}, FinishReason: "tool_calls"},
 		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: entry.Name, Arguments: `{"keyword":"x"}`}}, FinishReason: "tool_calls"},
 		{Content: "done", FinishReason: "stop"},
 	}}
@@ -777,10 +1023,10 @@ func TestExecRecorded_SanitizesNonUTF8AndNUL(t *testing.T) {
 	}
 }
 
-// TestSearchEndpoints_ResultIncludesDescription：检索结果文本含端点 description
+// TestToolSearch_ResultIncludesDescription：检索结果文本含端点 description
 // 全文（对抗审查 MEDIUM 漂移缺陷）——注入的工具定义只保留 300 rune 摘要，其前提
 // 是「更全说明已在检索结果给过」，必须真给。
-func TestSearchEndpoints_ResultIncludesDescription(t *testing.T) {
+func TestToolSearch_ResultIncludesDescription(t *testing.T) {
 	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
 	// 找一个 description 明显长于 summary 的端点做断言。
 	hits := tikhubcatalog.Search("小红书 搜索 笔记", "xiaohongshu", 5)
@@ -850,7 +1096,7 @@ func TestHandleMessage_ActivationPersistsAcrossMessages(t *testing.T) {
 
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
 		// 消息 1：检索 → 收敛。
-		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "search_endpoints",
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "tool_search",
 			Arguments: `{"query":"小红书 搜索 笔记"}`}}, FinishReason: "tool_calls"},
 		{Content: "找到了几个接口", FinishReason: "stop"},
 		// 消息 2：直接调用（无需再检索）。
@@ -890,12 +1136,58 @@ func TestHandleMessage_ActivationPersistsAcrossMessages(t *testing.T) {
 // 未装配时不注入（没有工具却教模型用只会制造拒绝循环）。
 func TestNew_SystemPromptEndpointNote(t *testing.T) {
 	fs := newFakeStore()
-	with := New(Deps{Store: fs, Profiles: fs, Endpoints: newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 1, 1)})
-	if !strings.Contains(with.sys, "search_endpoints") {
+	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 1, 1)
+	with := New(Deps{Store: fs, Profiles: fs, Tools: BuildTools2Static(ep), Endpoints: ep})
+	if !strings.Contains(with.sys, "tool_search") {
 		t.Error("装配时 system prompt 应含端点检索说明")
 	}
-	without := New(Deps{Store: fs, Profiles: fs})
-	if strings.Contains(without.sys, "search_endpoints") {
-		t.Error("未装配时 system prompt 不应提端点检索")
+	without := New(Deps{Store: fs, Profiles: fs, Endpoints: ep})
+	if strings.Contains(without.sys, "tool_search") {
+		t.Error("未注册 tool_search 时 system prompt 不应广告端点检索")
+	}
+}
+
+func TestNewChecked_DeferredToolCollisionsAndSplitResolverFailClosed(t *testing.T) {
+	for _, name := range []string{"tool_search", "read_endpoint_result", "static_collision"} {
+		t.Run(name, func(t *testing.T) {
+			ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 1, 1)
+			ep.catalog = newFakeCatalog(fakeToolDefinition(name, 0))
+			tools := BuildTools2Static(ep)
+			if name == "static_collision" {
+				tools = append(tools, testToolSpecs(&fakeTool{name: name})...)
+			}
+			if _, err := NewChecked(Deps{Tools: tools, Endpoints: ep}); err == nil {
+				t.Fatalf("deferred/static collision %q should fail startup", name)
+			}
+		})
+	}
+
+	epOne := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 1, 1)
+	epTwo := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 1, 1)
+	if _, err := NewChecked(Deps{
+		Tools: BuildTools2Static(epOne), Endpoints: epTwo,
+	}); err == nil || !strings.Contains(err.Error(), "split") {
+		t.Fatalf("split tool_search/resolver should fail startup: %v", err)
+	}
+}
+
+func TestToolSearch_OwnerOnlyAndLegacyNameAbsent(t *testing.T) {
+	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 1, 1)
+	public := BuildPublicResearchTools(ep, nil)
+	a2aTools, err := FilterAuthorizedTools(public, AuthorizationA2AReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a2aTools) != 0 {
+		t.Fatalf("A2A must remain tool-free, got %+v", a2aTools)
+	}
+	loop := New(Deps{Tools: BuildTools2Static(ep), Endpoints: ep})
+	state := &toolRunState{activation: &activationState{}}
+	if _, ok := loop.resolveTool("search_endpoints", state); ok {
+		t.Fatal("retired search_endpoints must not resolve")
+	}
+	defs := loop.requestTools(state)
+	if len(defs) != 1 || defs[0].Name != "tool_search" {
+		t.Fatalf("initial inventory=%+v, want only tool_search", defs)
 	}
 }

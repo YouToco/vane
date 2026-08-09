@@ -1,16 +1,16 @@
 // TikHub 端点注册表的 agent 工具面（端点注册表契约 §3/§4/§7）：
 //
-//   - search_endpoints 检索元工具：在 tikhubcatalog 的 Agent 安全子目录上 BM25 检索，
+//   - tool_search 检索元工具：在已授权的通用 toolsearch 目录上检索，
 //     命中的端点**激活**进会话（动态注入为一等 FC 工具，业内 Tool Search /
 //     retrieve-then-inject 模式，Boss 拍板 2026-07-18 选注入而非通用转发）。
-//   - endpointTool 动态端点工具：按 catalog Entry 即时构造，参数 schema 从注册表
-//     生成，Execute 走 tikhubinvoke 通用调用器，结果原文（截断）回给模型阅读。
+//   - endpointTool 动态端点工具：模型声明原字节来自 AgentDefinition，
+//     Execute 按同名 AgentLookup 路由到现有 tikhubinvoke，结果原文（截断）回给模型。
 //
 // 三条硬边界：
 //   - 端点工具按本地 ToolPolicy 声明网络读取、计费与 taint；
 //     因此它们永远不进 task_creation_operations，ExecuteAction 路径只需静态白名单。
 //   - 白名单语义（M4 契约 §10）扩展为「静态工具 ∪ 会话已激活端点」：模型编造的
-//     端点名（哪怕真在注册表里）只要没被本会话 search_endpoints 激活过，一律拒绝——
+//     端点名（哪怕真在注册表里）只要没被本会话 tool_search 激活过，一律拒绝——
 //     激活集是显式审计过的调用面，跳过检索直呼端点名是绕过检索留痕的旁门。
 //   - 免确认的调用受滚动 24h EndpointDailyCap 与 Agent 统一单消息隐藏熔断器保护。
 package agent
@@ -26,26 +26,23 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/tikhubcatalog"
 	"github.com/YouToco/vane/tikhubinvoke"
+	"github.com/YouToco/vane/toolsearch"
 	"github.com/YouToco/vane/types"
 )
 
 const (
-	// maxActivatedEndpoints 会话内同时激活（注入 FC tools 数组）的端点上限。
-	// 在场工具数安全线是 30（RAG-MCP 压测 <30 成功率 >90%）：**再加静态工具前
-	// 必须先降本上限**（TestToolCountBudget 是账单，别信任何注释里的手算——
-	// 上一版注释就把基数写错了一个）。账目沿革：2026-07-18 read_endpoint_result
-	// 入列 15→14（13 基础 + 2 端点工具 + 14 激活 = 29 顶线）；2026-07-19
-	// set_task_strictness 入列（任务门槛档位拍板）14→13：14 基础 + 2 端点工具
-	// + 13 激活 = 29 压线内；2026-07-20 web_search/read_page 入列（Exa ad-hoc
-	// 工具对拍板）13→11：16 基础 + 2 端点工具 + 11 激活 = 29 压线内
-	// （基础/端点工具均计入 Owner catalog）。
-	maxActivatedEndpoints = 11
-	// searchTopK 每次检索返回并激活的端点数（Anthropic Tool Search 默认值同为 5）。
-	searchTopK = 5
+	// 动态工具是单会话权限：名额和 schema 字节必须同时满足。
+	// 新命中批次以全或无方式加入，超限不逐出旧工具也不部分激活。
+	maxActivatedEndpoints      = 16
+	maxDynamicSchemaBytes      = 64 << 10
+	defaultToolSearchLimit     = 8
+	maxToolSearchQueryBytes    = 512
+	maxToolSearchPlatformBytes = 64
 	// 端点结果的内联上限**不再是常量**：由 agent 模型声明的上下文窗口派生
 	// （llm.DeriveInlineLimits，OpenClaw 同款分档 + 窗口 30% 封顶），随
 	// EndpointTools 注入。写死过一次的教训见 llm/context.go 头注——6000 rune
@@ -54,10 +51,6 @@ const (
 	// endpointResultFallbackRunes 仅用于装配缺失时的兜底（NewEndpointTools 收到
 	// 非法窗口值），不参与正常路径。
 	endpointResultFallbackRunes = 16000
-	// endpointDefDescMaxRunes 动态工具 Description 的截断上限。激活的每个工具
-	// 定义每轮都随请求发送，600 rune 全文 ×15 个会持续吃预算；检索结果文本里
-	// 已给过更全的说明，注入定义只保留摘要级描述。
-	endpointDefDescMaxRunes = 300
 	// dailyCapWindow 每日限额的滚动窗口。用滚动 24h 而非自然日：语义简单无时区
 	// 争议，且「过去 24h 花了多少」比「今天零点以来」更贴近成本节流的本意。
 	dailyCapWindow = 24 * time.Hour
@@ -127,6 +120,7 @@ type toolRunState struct {
 	clarificationCount int
 	candidateSearches  int
 	candidateHits      int
+	candidateSlots     int
 	// groundedBrief confines a trusted internal Brief/report follow-up to the
 	// exact supplied artifact. It has no tool surface at declaration or
 	// execution time, so source text can inform an answer but can never trigger
@@ -218,10 +212,9 @@ func recFrom(ctx context.Context) *types.ToolCall {
 	return r
 }
 
-// activationState 会话的激活端点集合。顺序即注入顺序：append-only + FIFO 逐出，
-// 存量前缀在会话内恒稳定——DeepSeek 前缀缓存按最长公共前缀命中，尾部追加不作废
-// 已缓存的前段（端点注册表契约 §4）。saveSession 每次全量写回（会话行本就每条
-// 消息覆盖写，无需增量脏标记）。
+// activationState 会话的激活端点集合。顺序即注入顺序：只在尾部追加，
+// 存量前缀在会话内恒稳定。超过名额/schema 预算时整批拒绝，不逐出已激活工具；
+// 否则模型可通过反复检索无声改写旧轮工具权限。saveSession 每次全量写回。
 type activationState struct {
 	names []string
 }
@@ -234,6 +227,22 @@ func decodeActivation(raw json.RawMessage) *activationState {
 		return a
 	}
 	if err := json.Unmarshal(raw, &a.names); err != nil {
+		a.names = nil
+		return a
+	}
+	seen := make(map[string]struct{}, len(a.names))
+	for _, name := range a.names {
+		if name == "" || strings.TrimSpace(name) != name || len(name) > 255 {
+			a.names = nil
+			return a
+		}
+		if _, duplicate := seen[name]; duplicate {
+			a.names = nil
+			return a
+		}
+		seen[name] = struct{}{}
+	}
+	if len(a.names) > maxActivatedEndpoints {
 		a.names = nil
 	}
 	return a
@@ -259,19 +268,29 @@ func (a *activationState) contains(name string) bool {
 	return false
 }
 
-// activate 把端点加入激活集。已在集合中不动位置（保前缀稳定）；满员时 FIFO
-// 逐出最早激活的端点并返回其名（调用方在检索结果里明示，被逐出的端点再调用
-// 会收到白名单拒绝 + 重新检索即可恢复）。
-func (a *activationState) activate(name string) (evicted string) {
-	if a.contains(name) {
-		return ""
+// activateBatch 把命中工具去重后原子加入激活集。验证基于将在下一轮
+// 真正注入的 AgentDefinition，因此计数、字节预算与模型可见 schema 同源。
+func (a *activationState) activateBatch(c endpointCatalog, names []string) error {
+	if a == nil {
+		return errors.New("tool_search: activation state is unavailable")
 	}
-	if len(a.names) >= maxActivatedEndpoints {
-		evicted = a.names[0]
-		a.names = append(a.names[:0], a.names[1:]...)
+	prospective := append([]string(nil), a.names...)
+	seen := make(map[string]struct{}, len(prospective)+len(names))
+	for _, name := range prospective {
+		seen[name] = struct{}{}
 	}
-	a.names = append(a.names, name)
-	return evicted
+	for _, name := range names {
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		prospective = append(prospective, name)
+	}
+	if _, err := validatedActivationDefinitions(c, prospective); err != nil {
+		return err
+	}
+	a.names = prospective
+	return nil
 }
 
 // ============================================================
@@ -290,10 +309,37 @@ type endpointInvoker interface {
 	Invoke(ctx context.Context, entry tikhubcatalog.Entry, params map[string]any) (*tikhubinvoke.Result, error)
 }
 
+// endpointCatalog 把通用模型目录与供应商路由表收窄成 Agent 所需的边界。
+// 生产实现始终是 tikhubcatalog；测试可用小目录精确覆盖 64KiB 门槛。
+type endpointCatalog interface {
+	SearchTools(query, platform string, limit int) ([]toolsearch.Match, error)
+	AgentDefinition(name string) (toolsearch.Entry, bool)
+	AgentLookup(name string) (tikhubcatalog.Entry, bool)
+	Platforms() []string
+	PlatformCount(platform string) int
+}
+
+type productionEndpointCatalog struct{}
+
+func (productionEndpointCatalog) SearchTools(query, platform string, limit int) ([]toolsearch.Match, error) {
+	return tikhubcatalog.SearchTools(query, platform, limit)
+}
+func (productionEndpointCatalog) AgentDefinition(name string) (toolsearch.Entry, bool) {
+	return tikhubcatalog.AgentDefinition(name)
+}
+func (productionEndpointCatalog) AgentLookup(name string) (tikhubcatalog.Entry, bool) {
+	return tikhubcatalog.AgentLookup(name)
+}
+func (productionEndpointCatalog) Platforms() []string { return tikhubcatalog.Platforms() }
+func (productionEndpointCatalog) PlatformCount(platform string) int {
+	return tikhubcatalog.PlatformCount(platform)
+}
+
 // EndpointTools 持有端点工具面的共享依赖，随 Deps 注入 Loop；nil 表示该能力
 // 未装配（tikhub key 缺失等），agent 退化为纯静态工具面，行为与本特性上线前一致。
 type EndpointTools struct {
 	inv      endpointInvoker
+	catalog  endpointCatalog
 	counter  endpointCallCounter
 	dailyCap int
 	results  *resultCache // 大结果缓存（契约 §3.5：截断句柄 + read_endpoint_result 取回）
@@ -322,17 +368,17 @@ func NewEndpointTools(
 			MinPerCall: endpointResultFallbackRunes / 4,
 		}
 	}
-	return &EndpointTools{inv: inv, counter: counter, dailyCap: dailyCap,
+	return &EndpointTools{inv: inv, catalog: productionEndpointCatalog{}, counter: counter, dailyCap: dailyCap,
 		results: newResultCache(), limits: limits}
 }
 
 // SearchTool 返回检索元工具（进静态白名单）。检索会修改
 // 本消息 activation，但现有调用与预算仍完全由工具自身管理。
 func (e *EndpointTools) SearchTool() ToolSpec {
-	return newToolSpec(&searchEndpointsTool{ep: e}, withToolSurface(ownerPolicy(
+	return newToolSpec(&toolSearchTool{ep: e}, withToolSurface(ownerPolicy(
 		Effects(EffectActivationWrite),
 		BudgetNone),
-		ExposureIntent, IntentSocialResearch, ResultTrustLocal, false))
+		ExposureAlways, IntentSocialResearch, ResultTrustLocal, false))
 }
 
 // ReadResultTool 返回大结果取回工具（进静态白名单；契约 §3.5）。
@@ -350,228 +396,209 @@ func (e *EndpointTools) ReadResultTool() ToolSpec {
 // 注册表里存在但未激活 → 不解析（见文件头注第二条硬边界）；
 // 已激活但注册表已无此端点（re-gen 下线）→ 不解析，模型收到标准"工具不存在"自纠文案。
 func (e *EndpointTools) Resolve(name string, act *activationState) (ToolSpec, bool) {
-	if act == nil || !act.contains(name) {
+	if e == nil || e.inv == nil || act == nil || !act.contains(name) {
 		return ToolSpec{}, false
 	}
-	entry, ok := tikhubcatalog.AgentLookup(name)
+	e.pruneActivation(act)
+	if !act.contains(name) {
+		return ToolSpec{}, false
+	}
+	definitions, err := validatedActivationDefinitions(e.catalog, act.names)
+	if err != nil {
+		return ToolSpec{}, false
+	}
+	var definition toolsearch.Entry
+	for _, candidate := range definitions {
+		if candidate.Name == name {
+			definition = candidate
+			break
+		}
+	}
+	if definition.Name == "" {
+		return ToolSpec{}, false
+	}
+	entry, ok := e.catalog.AgentLookup(name)
 	if !ok {
 		return ToolSpec{}, false
 	}
-	return newToolSpec(&endpointTool{ep: e, entry: entry}, withToolSurface(ownerPolicy(
+	return newToolSpec(&endpointTool{ep: e, entry: entry, definition: definition}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
 		BudgetToolManaged),
 		ExposureContext, IntentSocialResearch, ResultTrustExternal, false)), true
 }
 
-func isRegisteredEndpoint(name string) bool {
-	_, ok := tikhubcatalog.AgentLookup(name)
-	return ok
-}
-
 // Defs 渲染激活端点的 FC 工具声明，顺序 = 激活顺序（前缀稳定性见 activationState）。
 func (e *EndpointTools) Defs(act *activationState) []llm.ToolDef {
-	if act == nil || len(act.names) == 0 {
+	if e == nil || e.inv == nil || act == nil || len(act.names) == 0 {
 		return nil
 	}
-	defs := make([]llm.ToolDef, 0, len(act.names))
-	for _, name := range act.names {
-		entry, ok := tikhubcatalog.AgentLookup(name)
-		if !ok {
-			continue // 注册表下线的端点不再注入；Resolve 同步拒绝，两处口径一致
-		}
-		spec := newToolSpec(&endpointTool{ep: e, entry: entry}, withToolSurface(ownerPolicy(
-			Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-			BudgetToolManaged),
-			ExposureContext, IntentSocialResearch, ResultTrustExternal, false))
-		defs = append(defs, spec.Definition)
+	e.pruneActivation(act)
+	definitions, err := validatedActivationDefinitions(e.catalog, act.names)
+	if err != nil {
+		return nil
+	}
+	defs := make([]llm.ToolDef, 0, len(definitions))
+	for _, definition := range definitions {
+		defs = append(defs, llm.ToolDef{
+			Name:        definition.Name,
+			Description: definition.Description,
+			Parameters:  append(json.RawMessage(nil), definition.Parameters...),
+		})
 	}
 	return defs
 }
 
-// endpointDefDescription 动态工具的注入描述：摘要 + 截断说明 + 计费提醒。
-func endpointDefDescription(entry tikhubcatalog.Entry) string {
-	desc := publicEndpointText(entry.Summary)
-	if entry.Description != "" {
-		desc += "\n" + truncateRunes(
-			publicEndpointText(entry.Description),
-			endpointDefDescMaxRunes,
-		)
+// pruneActivation removes names whose current model definition or invocation
+// route has disappeared. It runs before every declaration and resolution, so
+// a catalog/policy revocation takes effect without trusting persisted session
+// names. An aggregate budget violation clears the whole set rather than
+// choosing an attacker-controlled subset.
+func (e *EndpointTools) pruneActivation(act *activationState) {
+	if e == nil || e.catalog == nil || act == nil || len(act.names) == 0 {
+		return
 	}
-	return desc + "\n（社媒公开数据查询，可能计费，请按需调用）"
-}
-
-func publicEndpointText(value string) string {
-	lines := strings.Split(value, "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		lower := strings.ToLower(strings.TrimSpace(line))
-		if lower == "" {
+	retained := make([]string, 0, len(act.names))
+	totalSchemaBytes := 0
+	for _, name := range act.names {
+		definitions, err := validatedActivationDefinitions(e.catalog, []string{name})
+		if err != nil {
 			continue
 		}
-		// Catalog examples are transport-oriented and often consume most of the
-		// schema budget. They are not needed to choose or call the business tool;
-		// stop before the example section so truncation cannot accidentally turn
-		// "[Example]" into the provider-looking fragment "[Exa…".
-		if strings.Contains(lower, "[example]") ||
-			strings.Contains(lower, "### example") ||
-			strings.Contains(lower, "### 示例") ||
-			strings.Contains(lower, "[示例]") {
-			break
+		totalSchemaBytes += len(definitions[0].Parameters)
+		if len(retained)+1 > maxActivatedEndpoints || totalSchemaBytes > maxDynamicSchemaBytes {
+			act.names = nil
+			return
 		}
-		if strings.Contains(lower, "tikhub") ||
-			strings.Contains(lower, "cookie") ||
-			strings.Contains(lower, "/api/v") ||
-			strings.Contains(lower, "api priority") ||
-			strings.Contains(lower, "接口优先级") ||
-			strings.Contains(lower, "接口推荐") ||
-			strings.Contains(lower, "本接口") ||
-			strings.Contains(lower, "request method") ||
-			strings.Contains(lower, "请求方法") ||
-			strings.Contains(lower, "endpoint path") ||
-			strings.Contains(lower, "接口路径") {
-			continue
-		}
-		out = append(out, strings.TrimSpace(line))
+		retained = append(retained, name)
 	}
-	return strings.Join(out, "\n")
+	act.names = retained
 }
 
-// endpointParamsSchema 从注册表参数生成 FC JSON schema。类型映射保守：注册表的
-// 归一化类型（gen/schemaType）能直映射的直映射，未知类型退化 string——schema 只是
-// 给模型的提示，权威校验在 Execute 的 validateEndpointArgs + 上游 422。
-func endpointParamsSchema(entry tikhubcatalog.Entry) json.RawMessage {
-	props := make(map[string]any, len(entry.Params))
-	var required []string
-	for _, p := range entry.Params {
-		prop := map[string]any{}
-		switch {
-		case p.Type == "integer" || p.Type == "number" || p.Type == "boolean" || p.Type == "object":
-			prop["type"] = p.Type
-		case strings.HasPrefix(p.Type, "array:"):
-			item := strings.TrimPrefix(p.Type, "array:")
-			switch item {
-			case "integer", "number", "boolean", "object":
-			default:
-				item = "string"
-			}
-			prop["type"] = "array"
-			prop["items"] = map[string]any{"type": item}
-		default:
-			prop["type"] = "string"
-		}
-		if p.Desc != "" {
-			prop["description"] = publicEndpointText(p.Desc)
-		}
-		if len(p.Enum) > 0 {
-			publicEnum := make([]any, 0, len(p.Enum))
-			for _, value := range p.Enum {
-				if text, isString := value.(string); isString {
-					if text, ok := publicEndpointLiteral(text); ok {
-						publicEnum = append(publicEnum, text)
-					}
-				} else {
-					publicEnum = append(publicEnum, value)
-				}
-			}
-			if len(publicEnum) > 0 {
-				prop["enum"] = publicEnum
-			}
-		}
-		if p.Default != nil {
-			if value, isString := p.Default.(string); isString {
-				if value, ok := publicEndpointLiteral(value); ok {
-					prop["default"] = value
-				}
-			} else {
-				prop["default"] = p.Default
-			}
-		}
-		props[p.Name] = prop
-		if p.Required {
-			required = append(required, p.Name)
-		}
+func validatedActivationDefinitions(c endpointCatalog, names []string) ([]toolsearch.Entry, error) {
+	if c == nil {
+		return nil, errors.New("tool_search: catalog is unavailable")
 	}
-	schema := map[string]any{"type": "object", "properties": props}
-	if len(required) > 0 {
-		schema["required"] = required
+	if len(names) > maxActivatedEndpoints {
+		return nil, fmt.Errorf("tool_search: dynamic tool count exceeds %d", maxActivatedEndpoints)
 	}
-	raw, err := json.Marshal(schema)
-	if err != nil {
-		// props 全部由基本类型拼成，Marshal 不可能失败；防御性兜底为空参 schema。
-		return json.RawMessage(emptyParamsSchema)
+	definitions := make([]toolsearch.Entry, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	totalSchemaBytes := 0
+	for _, name := range names {
+		if name == "" || strings.TrimSpace(name) != name {
+			return nil, errors.New("tool_search: invalid activated tool name")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, errors.New("tool_search: duplicate activated tool name")
+		}
+		seen[name] = struct{}{}
+		definition, ok := c.AgentDefinition(name)
+		if !ok || definition.Name != name || definition.Description == "" ||
+			len(definition.Parameters) == 0 || !json.Valid(definition.Parameters) {
+			return nil, fmt.Errorf("tool_search: invalid model definition for %q", name)
+		}
+		providerEntry, ok := c.AgentLookup(name)
+		if !ok || providerEntry.Name != name {
+			return nil, fmt.Errorf("tool_search: invocation route missing for %q", name)
+		}
+		totalSchemaBytes += len(definition.Parameters)
+		if totalSchemaBytes > maxDynamicSchemaBytes {
+			return nil, fmt.Errorf("tool_search: dynamic schemas exceed %d bytes", maxDynamicSchemaBytes)
+		}
+		definitions = append(definitions, definition)
 	}
-	return raw
-}
-
-func publicEndpointLiteral(value string) (string, bool) {
-	lower := strings.ToLower(strings.TrimSpace(value))
-	if strings.Contains(lower, "tikhub") ||
-		strings.Contains(lower, "/api/v") ||
-		strings.Contains(lower, "request method") ||
-		strings.Contains(lower, "endpoint path") {
-		return "", false
-	}
-	return value, true
+	return definitions, nil
 }
 
 // endpointSystemNote 注入 system prompt 的能力说明（仅 Endpoints 装配时，loop.New）。
 // 官方最佳实践：system prompt 写明「可搜索的工具类别」，模型才会主动想到去搜。
-func endpointSystemNote() string {
+func endpointSystemNote(e *EndpointTools) string {
+	platforms := tikhubcatalog.Platforms()
+	if e != nil && e.catalog != nil {
+		platforms = e.catalog.Platforms()
+	}
 	return "\n\n[社媒数据查询]\n用户想查询/调研社媒平台的内容、账号、评论、热榜等一次性问题时，" +
-		"先用 search_endpoints 搜索可用的社媒查询工具（覆盖内容、账号、搜索、热榜、评论、趋势和公开分析；平台：" +
-		strings.Join(tikhubcatalog.Platforms(), "、") + "），命中的具体能力会成为你可直接调用的工具。" +
+		"先用 tool_search 搜索可用的社媒查询工具（覆盖内容、账号、搜索、热榜、评论、趋势和公开分析；平台：" +
+		strings.Join(platforms, "、") + "），命中的具体能力会在下一轮成为可直接调用的工具。" +
 		"检索不到就换关键词（中英文都可）或加 platform 过滤再试。端点可能按次计费且受滚动 24 小时成本护栏约束；" +
 		"用户要的是**持续追新**时不要用端点查询，改用 manage_tasks 创建任务。"
 }
 
 // ============================================================
-// search_endpoints：检索元工具（静态白名单成员，读工具免确认）
+// tool_search：检索元工具（静态白名单成员，读工具免确认）
 // ============================================================
 
-type searchEndpointsTool struct {
+type toolSearchTool struct {
 	ep *EndpointTools
 }
 
-const searchEndpointsSchema = `{
+const toolSearchSchema = `{
   "type": "object",
   "properties": {
-    "query": {"type": "string", "description": "检索词，中英文均可（如\"抖音 热榜\"、\"tiktok user videos\"）。检索覆盖端点名/描述/参数说明"},
-    "platform": {"type": "string", "description": "可选：平台过滤（douyin/tiktok/xiaohongshu/weibo/bilibili/zhihu/kuaishou/youtube/instagram/twitter 等）"}
+    "query": {"type": "string", "description": "检索词，中英文均可，最多 512 UTF-8 字节"},
+    "platform": {"type": "string", "description": "可选的平台硬过滤（如 douyin/tiktok/xiaohongshu/weibo/youtube）"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 8, "default": 8, "description": "返回并激活的最大工具数"}
   },
-  "required": ["query"]
+  "required": ["query"],
+  "additionalProperties": false
 }`
 
-func (t *searchEndpointsTool) Name() string { return "search_endpoints" }
-func (t *searchEndpointsTool) Description() string {
-	return "搜索可用的社媒查询工具。支持 " +
-		strings.Join(tikhubcatalog.Platforms(), "、") +
-		" 等平台的内容、账号、搜索、热榜、评论、趋势与公开分析；返回最相关的 " +
-		fmt.Sprint(searchTopK) +
-		" 个具体工具并立即启用。适用于一次性查询；持续追新请创建任务。"
+func (t *toolSearchTool) Name() string { return "tool_search" }
+func (t *toolSearchTool) Description() string {
+	return "搜索已授权的可调用工具。当前支持 " +
+		strings.Join(t.ep.catalog.Platforms(), "、") +
+		" 等社媒平台；命中后完整参数 schema 会在下一轮注入。适用于一次性查询；持续追新请创建任务。"
 }
-func (t *searchEndpointsTool) Parameters() json.RawMessage {
-	return json.RawMessage(searchEndpointsSchema)
+func (t *toolSearchTool) Parameters() json.RawMessage {
+	return json.RawMessage(toolSearchSchema)
 }
-func (t *searchEndpointsTool) Summarize(json.RawMessage) string { return "" }
-func (t *searchEndpointsTool) toolKind() types.ToolCallKind     { return types.ToolCallKindTikHubSearch }
+func (t *toolSearchTool) Summarize(json.RawMessage) string { return "" }
+func (t *toolSearchTool) toolKind() types.ToolCallKind     { return types.ToolCallKindTikHubSearch }
 
-func (t *searchEndpointsTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
-	var a struct {
-		Query    string `json:"query"`
-		Platform string `json:"platform"`
+func (t *toolSearchTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+	if t == nil || t.ep == nil || t.ep.inv == nil || t.ep.catalog == nil {
+		return "工具检索与调用能力未授权，本次已跳过", nil
 	}
-	if err := json.Unmarshal(args, &a); err != nil {
+	var a struct {
+		Query    string          `json:"query"`
+		Platform string          `json:"platform,omitempty"`
+		Limit    json.RawMessage `json:"limit,omitempty"`
+	}
+	if err := strictjson.DecodeExact(args, &a); err != nil {
 		return "参数不是合法 JSON，请修正后重试", nil
+	}
+	if len(a.Query) > maxToolSearchQueryBytes {
+		return fmt.Sprintf("query 超过 %d UTF-8 字节，请缩短后重试", maxToolSearchQueryBytes), nil
+	}
+	if len(a.Platform) > maxToolSearchPlatformBytes {
+		return fmt.Sprintf("platform 超过 %d UTF-8 字节", maxToolSearchPlatformBytes), nil
+	}
+	if !utf8.ValidString(a.Query) || !utf8.ValidString(a.Platform) {
+		return "query 和 platform 必须是合法 UTF-8 文本", nil
 	}
 	a.Query = strings.TrimSpace(a.Query)
 	if a.Query == "" {
 		return "query 不能为空，请提供检索词（中英文均可）", nil
 	}
+	a.Platform = strings.ToLower(strings.TrimSpace(a.Platform))
+	limit := defaultToolSearchLimit
+	if len(a.Limit) != 0 {
+		if err := strictjson.DecodeExact(a.Limit, &limit); err != nil {
+			return "limit 必须是 1–8 的整数", nil
+		}
+	}
+	if limit < 1 || limit > defaultToolSearchLimit {
+		return fmt.Sprintf("limit 必须在 1–%d 之间", defaultToolSearchLimit), nil
+	}
 
-	hits := tikhubcatalog.Search(a.Query, a.Platform, searchTopK)
+	hits, err := t.ep.catalog.SearchTools(a.Query, a.Platform, limit)
+	if err != nil {
+		return "工具目录检索失败，请缩短或调整检索词后重试", nil
+	}
 	if state := runStateFrom(ctx); state != nil {
 		state.candidateSearches++
 		state.candidateHits += len(hits)
+		state.candidateSlots += limit
 	}
 
 	// 检索留痕（契约 §6）：无论命中与否都记 query 与候选——零命中的 query 正是
@@ -588,55 +615,37 @@ func (t *searchEndpointsTool) Execute(ctx context.Context, _ int64, args json.Ra
 
 	if len(hits) == 0 {
 		msg := "没有检索到匹配端点。可尝试：换关键词（中英文均可）、去掉平台过滤"
-		if a.Platform != "" && tikhubcatalog.PlatformCount(strings.ToLower(strings.TrimSpace(a.Platform))) == 0 {
-			msg = "平台 " + a.Platform + " 不在目录中。可用平台：" + strings.Join(tikhubcatalog.Platforms(), "、")
+		if a.Platform != "" && t.ep.catalog.PlatformCount(a.Platform) == 0 {
+			msg = "平台 " + a.Platform + " 不在目录中。可用平台：" + strings.Join(t.ep.catalog.Platforms(), "、")
 		}
 		return msg, nil
 	}
 
 	state := runStateFrom(ctx)
-	var b strings.Builder
-	fmt.Fprintf(&b, "检索到 %d 个端点", len(hits))
 	if state != nil {
-		b.WriteString("（已注入，可直接作为工具调用）")
+		if state.activation == nil {
+			return "工具激活状态不可用，本次命中未注入", nil
+		}
+		names := make([]string, 0, len(hits))
+		for _, hit := range hits {
+			names = append(names, hit.Entry.Name)
+		}
+		t.ep.pruneActivation(state.activation)
+		if err := state.activation.activateBatch(t.ep.catalog, names); err != nil {
+			return fmt.Sprintf("动态工具上限为 %d 个且 schema 总量不超过 %d 字节；本批已全部拒绝，请新建会话或缩小检索范围。",
+				maxActivatedEndpoints, maxDynamicSchemaBytes), nil
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "检索到 %d 个工具", len(hits))
+	if state != nil {
+		b.WriteString("（已注入，下一轮可直接调用）")
 	}
 	b.WriteString("：\n")
-	var evicted []string
 	for _, h := range hits {
-		e := h.Entry
-		fmt.Fprintf(&b, "\n## %s\n%s %s [%s]\n%s\n", e.Name, e.Method, e.Path, e.Platform, e.Summary)
-		// description 全文（gen 已截 600 rune）只在检索结果里给一次（对抗审查 MEDIUM
-		// 漂移缺陷）：注入的工具定义只保留 300 rune 摘要以省每轮预算，其"更全的说明已在
-		// 检索结果给过"的前提，正靠这里成立。summary 已单独一行，description 与其重复
-		// 时省略，不刷屏。
-		if d := strings.TrimSpace(e.Description); d != "" && d != strings.TrimSpace(e.Summary) {
-			b.WriteString(d + "\n")
-		}
-		if len(e.Params) > 0 {
-			b.WriteString("参数：")
-			for i, p := range e.Params {
-				if i > 0 {
-					b.WriteString("；")
-				}
-				b.WriteString(p.Name)
-				if p.Required {
-					b.WriteString("(必填)")
-				}
-				if p.Desc != "" {
-					b.WriteString(" " + truncateRunes(p.Desc, 80))
-				}
-			}
-			b.WriteString("\n")
-		}
-		if state != nil {
-			if ev := state.activation.activate(e.Name); ev != "" {
-				evicted = append(evicted, ev)
-			}
-		}
-	}
-	if len(evicted) > 0 {
-		fmt.Fprintf(&b, "\n（注入槽位已满，移除了较早注入的：%s——需要时重新检索即可恢复）",
-			strings.Join(evicted, "、"))
+		definition := h.Entry
+		fmt.Fprintf(&b, "\n## %s [%s]\n%s\n", definition.Name,
+			definition.Namespace, truncateRunes(definition.Description, 400))
 	}
 	return b.String(), nil
 }
@@ -646,14 +655,15 @@ func (t *searchEndpointsTool) Execute(ctx context.Context, _ int64, args json.Ra
 // ============================================================
 
 type endpointTool struct {
-	ep    *EndpointTools
-	entry tikhubcatalog.Entry
+	ep         *EndpointTools
+	entry      tikhubcatalog.Entry
+	definition toolsearch.Entry
 }
 
-func (t *endpointTool) Name() string        { return t.entry.Name }
-func (t *endpointTool) Description() string { return endpointDefDescription(t.entry) }
+func (t *endpointTool) Name() string        { return t.definition.Name }
+func (t *endpointTool) Description() string { return t.definition.Description }
 func (t *endpointTool) Parameters() json.RawMessage {
-	return endpointParamsSchema(t.entry)
+	return append(json.RawMessage(nil), t.definition.Parameters...)
 }
 func (t *endpointTool) untrustedResult() bool            { return true }
 func (t *endpointTool) Summarize(json.RawMessage) string { return "" }

@@ -3,6 +3,7 @@ package agentledger
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -55,6 +56,26 @@ func TestBuildAndProjectLatestSessionSnapshot(t *testing.T) {
 	}
 	if gotDigest != wantDigest {
 		t.Fatalf("latest snapshot digest=%s want=%s", gotDigest, wantDigest)
+	}
+}
+
+func TestBuildProjectionSnapshotRejectsMoreThanSixteenActivatedTools(t *testing.T) {
+	tools := make([]string, 17)
+	for i := range tools {
+		tools[i] = fmt.Sprintf("tool_%02d", i)
+	}
+	raw, err := json.Marshal(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = BuildProjectionSnapshotBatch(ProjectionSnapshotInput{
+		Scope:          Scope{TenantID: 1, UserID: 2, SessionID: 3},
+		TurnID:         "turn-too-many-tools",
+		Messages:       json.RawMessage("[]"),
+		ActivatedTools: raw,
+	})
+	if !errors.Is(err, ErrInvalidProjection) {
+		t.Fatalf("17 activated tools error=%v, want ErrInvalidProjection", err)
 	}
 }
 

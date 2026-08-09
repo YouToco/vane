@@ -149,8 +149,8 @@ func TestSummarizeJSONStructure(t *testing.T) {
 }
 
 // TestToolCountBudget 钉死在场工具数安全线（契约 §4.1）：静态面 + 激活上限 < 30。
-// read_endpoint_result 入列时把 maxActivatedEndpoints 15→14 换来的预算，谁再加
-// 静态工具谁负责重算这笔账——本测试就是那张账单。
+// 当前 owner 静态面精简后允许 16 个动态工具；谁再加静态工具谁负责
+// 重算这笔账——本测试就是那张账单。
 func TestToolCountBudget(t *testing.T) {
 	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
 	// 按生产满配计数（endpoints + exa 都非 nil）：任一为 nil 会把静态面算小，
