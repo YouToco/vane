@@ -143,7 +143,9 @@ func (s *Store) PrepareOrGetResearchBriefGroundingV1(
 		seal.ResearchModel.Synthesis.RendererVersion !=
 			runtimepolicy.ResearchSynthesisRendererVersionV34 &&
 		seal.ResearchModel.Synthesis.RendererVersion !=
-			runtimepolicy.ResearchSynthesisRendererVersionV35 ||
+			runtimepolicy.ResearchSynthesisRendererVersionV35 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV36 ||
 		seal.ResearchModel.GroundingVerifier == nil {
 		return PrepareResearchBriefGroundingV1Result{}, researchRunConflictError()
 	}
@@ -285,7 +287,9 @@ func (s *Store) SettleResearchBriefGroundingV1(
 		seal.ResearchModel.Synthesis.RendererVersion !=
 			runtimepolicy.ResearchSynthesisRendererVersionV34 &&
 		seal.ResearchModel.Synthesis.RendererVersion !=
-			runtimepolicy.ResearchSynthesisRendererVersionV35 ||
+			runtimepolicy.ResearchSynthesisRendererVersionV35 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV36 ||
 		seal.ResearchModel.GroundingVerifier == nil {
 		return ResearchBriefGroundingV1{}, researchRunIntegrityError()
 	}
@@ -331,7 +335,9 @@ func (s *Store) SettleResearchBriefGroundingV1(
 		return ResearchBriefGroundingV1{},
 			researchRunDatabaseError("settle research grounding verification", err)
 	}
-	if wantStatus == ResearchBriefGroundingRejectedV1 {
+	if wantStatus == ResearchBriefGroundingRejectedV1 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV36 {
 		result, err := tx.Exec(ctx,
 			`UPDATE research_brief_syntheses
 			    SET status='failed',delivery_required=false,

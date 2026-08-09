@@ -58,6 +58,7 @@ var researchRuntimeRelations = []string{
 	"research_run_evidence",
 	"research_brief_syntheses",
 	"research_brief_grounding_verifications",
+	"research_brief_grounding_corrections",
 	"research_run_step_spend_reservations",
 	"research_run_step_spend_settlements",
 	"research_run_llm_spend_reservations",
@@ -79,6 +80,7 @@ var researchRuntimeScopedRelations = []string{
 	"research_run_evidence",
 	"research_brief_syntheses",
 	"research_brief_grounding_verifications",
+	"research_brief_grounding_corrections",
 	"research_run_step_spend_reservations",
 	"research_run_step_spend_settlements",
 	"research_run_llm_spend_reservations",
@@ -240,10 +242,16 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		return fmt.Errorf("begin authority probe: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	var groundingRuntimeAvailable, admissionV5Available, admissionV4Available,
-		groundingImmutabilityTriggerAvailable bool
+	var groundingRuntimeAvailable, correctionRuntimeAvailable,
+		admissionV6Available, admissionV5Available, admissionV4Available,
+		groundingImmutabilityTriggerAvailable,
+		correctionImmutabilityTriggerAvailable bool
 	if err := tx.QueryRow(ctx, `SELECT
 		to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
+		to_regclass('public.research_brief_grounding_corrections') IS NOT NULL,
+		to_regprocedure(
+		 'admit_research_run_llm_spend_cap_v6(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
+		) IS NOT NULL,
 		to_regprocedure(
 		 'admit_research_run_llm_spend_cap_v5(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
 		) IS NOT NULL,
@@ -256,24 +264,40 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		        'public.research_brief_grounding_verifications')
 		    AND trigger.tgname='protect_research_brief_grounding_verification_v1'
 		    AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
+		),
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		  WHERE trigger.tgrelid=to_regclass(
+		        'public.research_brief_grounding_corrections')
+		    AND trigger.tgname='protect_research_brief_grounding_correction_v1'
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
 		)`,
-	).Scan(&groundingRuntimeAvailable, &admissionV5Available, &admissionV4Available,
-		&groundingImmutabilityTriggerAvailable); err != nil {
+	).Scan(&groundingRuntimeAvailable, &correctionRuntimeAvailable,
+		&admissionV6Available, &admissionV5Available, &admissionV4Available,
+		&groundingImmutabilityTriggerAvailable,
+		&correctionImmutabilityTriggerAvailable); err != nil {
 		return fmt.Errorf("inspect grounding runtime schema: %w", err)
 	}
-	if groundingRuntimeAvailable != (admissionV5Available || admissionV4Available) ||
+	if groundingRuntimeAvailable != (admissionV6Available || admissionV5Available || admissionV4Available) ||
 		groundingRuntimeAvailable != groundingImmutabilityTriggerAvailable {
 		return errors.New("grounding runtime schema is incomplete")
 	}
+	if correctionRuntimeAvailable != admissionV6Available ||
+		correctionRuntimeAvailable != correctionImmutabilityTriggerAvailable {
+		return errors.New("grounding correction runtime schema is incomplete")
+	}
 	filterGroundingRelation := func(relations []string) []string {
-		if groundingRuntimeAvailable {
-			return relations
-		}
-		filtered := make([]string, 0, len(relations)-1)
+		filtered := make([]string, 0, len(relations))
 		for _, relation := range relations {
-			if relation != "research_brief_grounding_verifications" {
-				filtered = append(filtered, relation)
+			if relation == "research_brief_grounding_verifications" &&
+				!groundingRuntimeAvailable {
+				continue
 			}
+			if relation == "research_brief_grounding_corrections" &&
+				!correctionRuntimeAvailable {
+				continue
+			}
+			filtered = append(filtered, relation)
 		}
 		return filtered
 	}
@@ -281,7 +305,10 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 	runtimeScopedRelations := filterGroundingRelation(researchRuntimeScopedRelations)
 	admissionCapSignature := "admit_research_run_llm_spend_cap_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
 	admissionRawSignature := "admit_research_run_llm_spend_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
-	if admissionV5Available {
+	if admissionV6Available {
+		admissionCapSignature = "admit_research_run_llm_spend_cap_v6(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
+		admissionRawSignature = "admit_research_run_llm_spend_v6(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
+	} else if admissionV5Available {
 		admissionCapSignature = "admit_research_run_llm_spend_cap_v5(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
 		admissionRawSignature = "admit_research_run_llm_spend_v5(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
 	} else if admissionV4Available {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -18,10 +19,17 @@ func scopedResearchBriefFixtureV35(t *testing.T, result []byte) researchBriefFix
 		Mode:            taskstate.ResearchScopeEventWindowV3,
 		LookbackSeconds: taskstate.ResearchScopeWeekSecondsV3,
 	}
+	model := testResearchGroundingModelPolicyV1(t)
+	model.GroundingVerifier.RendererVersion =
+		runtimepolicy.ResearchGroundingVerifierRendererVersionV12
+	model, err := runtimepolicy.BuildResearchModelPolicyV3(model)
+	if err != nil {
+		t.Fatal(err)
+	}
 	st := tenantTestStore(t)
 	return newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, result, "", "",
-		testResearchGroundingModelPolicyV1(t), scope, 0, nil)
+		model, scope, 0, nil)
 }
 
 func testResearchWindowV33(t *testing.T) researchScopeWindowV33 {
@@ -147,7 +155,8 @@ func TestScopedResearchBriefV35FiltersFullEvidenceBeforeProjection(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seal.ResearchModel.Synthesis.RendererVersion != "research-synthesis.render/v3.5" {
+	if seal.ResearchModel.Synthesis.RendererVersion != "research-synthesis.render/v3.6" ||
+		seal.ResearchModel.GroundingCorrector == nil {
 		t.Fatalf("renderer=%q", seal.ResearchModel.Synthesis.RendererVersion)
 	}
 	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(

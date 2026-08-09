@@ -182,7 +182,19 @@ func researchRunLLMStagePolicyV3(seal runcontext.ResearchSnapshotSealV3,
 				seal.ResearchModel.Synthesis.RendererVersion ==
 					runtimepolicy.ResearchSynthesisRendererVersionV34 ||
 				seal.ResearchModel.Synthesis.RendererVersion ==
-					runtimepolicy.ResearchSynthesisRendererVersionV35) {
+					runtimepolicy.ResearchSynthesisRendererVersionV35 ||
+				seal.ResearchModel.Synthesis.RendererVersion ==
+					runtimepolicy.ResearchSynthesisRendererVersionV36) {
+			return *seal.ResearchModel.GroundingVerifier, false, nil
+		}
+		if round == 2 && seal.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV36 &&
+			seal.ResearchModel.GroundingCorrector != nil {
+			return *seal.ResearchModel.GroundingCorrector, false, nil
+		}
+		if round == 3 && seal.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV36 &&
+			seal.ResearchModel.GroundingVerifier != nil {
 			return *seal.ResearchModel.GroundingVerifier, false, nil
 		}
 		return runtimepolicy.ResearchModelStageV3{}, false,
@@ -207,7 +219,7 @@ func validateResearchRunLLMBeginV3(params BeginResearchRunLLMSpendV3Params) erro
 			return researchRunValidationError("research planner subject is invalid")
 		}
 	} else if params.Stage == ResearchRunLLMStageSynthesisV3 {
-		if params.SubjectID <= 0 || params.RoundOrdinal > 1 {
+		if params.SubjectID <= 0 || params.RoundOrdinal > 3 {
 			return researchRunValidationError("research synthesis subject is invalid")
 		}
 	} else {
@@ -311,18 +323,26 @@ func (s *Store) BeginResearchRunLLMSpendV3(
 	// Keep retained round-0 and v3.3 runs operational during a rolling migration
 	// or historical schema replay. V3.4 prefers cap_v5; verifier round 1 remains
 	// fail-closed when neither retained grounding admission path exists.
-	var admissionV5Available, admissionV4Available bool
+	var admissionV6Available, admissionV5Available, admissionV4Available bool
 	if err := tx.QueryRow(ctx, `SELECT
+		to_regprocedure(
+		 'admit_research_run_llm_spend_cap_v6(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
+		) IS NOT NULL,
 		to_regprocedure(
 		 'admit_research_run_llm_spend_cap_v5(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
 		) IS NOT NULL,
 		to_regprocedure(
 		 'admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
-		) IS NOT NULL`).Scan(&admissionV5Available, &admissionV4Available); err != nil {
+		) IS NOT NULL`).Scan(&admissionV6Available, &admissionV5Available,
+		&admissionV4Available); err != nil {
 		return ResearchRunLLMSpendReservationV3{},
 			researchRunDatabaseError("check research model admission capability", err)
 	}
-	if !admissionV5Available && !admissionV4Available && params.RoundOrdinal == 1 {
+	if !admissionV6Available && params.RoundOrdinal >= 2 {
+		return ResearchRunLLMSpendReservationV3{}, researchRunConflictError()
+	}
+	if !admissionV6Available && !admissionV5Available &&
+		!admissionV4Available && params.RoundOrdinal == 1 {
 		return ResearchRunLLMSpendReservationV3{}, researchRunConflictError()
 	}
 	var reservationID int64
@@ -333,7 +353,13 @@ func (s *Store) BeginResearchRunLLMSpendV3(
 		researchRunLLMSubjectV3(params.Stage, params.SubjectID), attemptKey,
 		requestDigest, traceID, params.UserPrompt,
 	}
-	if admissionV5Available {
+	if admissionV6Available {
+		err = tx.QueryRow(ctx,
+			`SELECT out_reservation_id,out_first_writer
+			   FROM admit_research_run_llm_spend_cap_v6(
+			        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			admissionArgs...).Scan(&reservationID, &firstWriter)
+	} else if admissionV5Available {
 		err = tx.QueryRow(ctx,
 			`SELECT out_reservation_id,out_first_writer
 			   FROM admit_research_run_llm_spend_cap_v5(

@@ -108,6 +108,8 @@ var wantTables = []string{
 	"research_brief_syntheses",
 	// 122 independent, immutable claim-to-citation grounding verdict.
 	"research_brief_grounding_verifications",
+	// 125 one immutable correction plus one final independent verdict.
+	"research_brief_grounding_corrections",
 	"research_brief_deliveries",
 	"research_v3_delivery_authorities",
 	"research_v3_cutover_operations",
