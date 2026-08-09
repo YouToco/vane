@@ -169,6 +169,13 @@ that every issue `refs` value is an array of citation objects containing only
 strings are invalid. This closes a production ambiguity without reinterpreting
 an already-frozen prompt or provider receipt.
 
+Synthesis must not force one update for every organization named by a task
+manual. A current claim is eligible only when its organization, product/model
+name, version, date, number, price and status appear verbatim in at least one
+cited in-window evidence item. It may not substitute a related proper noun
+(for example, turn Sonnet evidence into an Opus claim), reuse a previous
+answer, or promote an out-of-window article into the current interval.
+
 ## External-fact authority
 
 Model weights are not a current truth source for mutable external facts.
