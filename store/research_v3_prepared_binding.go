@@ -169,6 +169,7 @@ func loadPreparedResearchV3BindingTx(ctx context.Context, q interface {
 		Notification: definition.Notification, Output: definition.Output,
 		PlannerBudget: definition.PlannerBudget, DeliveryPolicy: definition.DeliveryPolicy,
 		TenantBudgetPolicy: definition.TenantBudgetPolicy,
+		ResearchScope:      definition.ResearchScope,
 	})
 	rebuiltPayload, rebuiltErr := taskstate.EncodeApprovedDefinitionV3(rebuilt)
 	strictness := types.DefaultStrictness

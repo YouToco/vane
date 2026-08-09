@@ -1,33 +1,9 @@
--- 124: owner-confirmed event-window synthesis projection and v3.5 admission.
+-- 124: manual-bound operator-attested event-window projection and v3.5 admission.
 -- +goose Up
 
 SELECT pg_advisory_xact_lock(6215335020355474248);
 LOCK TABLE task_run_snapshots,research_run_evidence,research_brief_syntheses,
            research_run_llm_spend_reservations IN ACCESS EXCLUSIVE MODE;
-
--- +goose StatementBegin
-CREATE FUNCTION research_scope_published_at_v1(value TEXT)
-RETURNS TIMESTAMPTZ
-LANGUAGE plpgsql
-IMMUTABLE
-SET search_path=pg_catalog,public,pg_temp
-AS $$
-BEGIN
-    IF value IS NULL OR value='' THEN
-        RETURN NULL;
-    END IF;
-	-- Match Go time.RFC3339Nano admission. PostgreSQL otherwise accepts
-	-- ambiguous local timestamps and many non-canonical date spellings.
-	IF value !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$' THEN
-		RETURN NULL;
-	END IF;
-    RETURN value::timestamptz;
-EXCEPTION WHEN OTHERS THEN
-    RETURN NULL;
-END
-$$;
--- +goose StatementEnd
-REVOKE ALL ON FUNCTION research_scope_published_at_v1(TEXT) FROM PUBLIC;
 
 -- +goose StatementBegin
 CREATE FUNCTION research_scope_timestamp_ns_v124(value TEXT)
@@ -85,8 +61,8 @@ REVOKE ALL ON FUNCTION research_scope_json_string_v124(TEXT) FROM PUBLIC;
 -- +goose StatementBegin
 CREATE FUNCTION filter_research_scope_evidence_v124(
     result_bytes BYTEA,
-    window_start TIMESTAMPTZ,
-    window_end TIMESTAMPTZ
+    window_start_ns NUMERIC,
+    window_end_ns NUMERIC
 ) RETURNS TEXT
 LANGUAGE plpgsql IMMUTABLE STRICT
 SET search_path=pg_catalog,public,pg_temp
@@ -100,8 +76,6 @@ DECLARE
     separator TEXT := '';
     filtered_separator TEXT := '';
     published_ns NUMERIC;
-	window_start_ns NUMERIC := extract(epoch FROM window_start)*1000000000;
-	window_end_ns NUMERIC := extract(epoch FROM window_end)*1000000000;
 BEGIN
     payload := convert_from(result_bytes,'UTF8')::jsonb;
     IF jsonb_typeof(payload)<>'array' THEN
@@ -145,8 +119,342 @@ EXCEPTION WHEN character_not_in_repertoire OR untranslatable_character OR invali
 END
 $$;
 -- +goose StatementEnd
-REVOKE ALL ON FUNCTION filter_research_scope_evidence_v124(BYTEA,TIMESTAMPTZ,TIMESTAMPTZ)
+REVOKE ALL ON FUNCTION filter_research_scope_evidence_v124(BYTEA,NUMERIC,NUMERIC)
     FROM PUBLIC;
+
+-- +goose StatementBegin
+CREATE FUNCTION enforce_research_brief_synthesis_admission_v33()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+DECLARE
+    evidence_json JSONB;
+    history_json JSONB;
+    context_json JSONB;
+    brief_json JSONB;
+    snapshot_json JSONB;
+    expected_evidence JSONB;
+    expected_evidence_context JSONB;
+    expected_failures JSONB;
+    expected_history JSONB;
+    expected_history_context JSONB;
+    expected_history_manifest JSONB;
+    expected_context JSONB;
+    expected_definition_context JSONB;
+    expected_steps INTEGER;
+    history_candidate_count BIGINT;
+    history_returned_count INTEGER;
+    history_continuation JSONB;
+    history_cutoff TEXT;
+    expected_request_digest TEXT;
+    failure_count INTEGER;
+BEGIN
+    IF NEW.tenant_id IS DISTINCT FROM
+           NULLIF(current_setting('app.tenant_id',true),'')::bigint OR
+       NEW.user_id IS DISTINCT FROM
+           NULLIF(current_setting('app.user_id',true),'')::bigint THEN
+        RAISE EXCEPTION '118: research Brief scope differs from session';
+    END IF;
+    SELECT jsonb_array_length(convert_from(plan.plan_payload,'UTF8')::jsonb->'steps')
+      INTO expected_steps
+      FROM public.research_run_plans plan
+      JOIN public.task_run_snapshots snapshot
+        ON snapshot.id=plan.run_snapshot_id
+       AND snapshot.tenant_id=plan.tenant_id
+       AND snapshot.user_id=plan.user_id
+       AND snapshot.task_id=plan.task_id
+       AND snapshot.temporal_workflow_id=plan.temporal_workflow_id
+       AND snapshot.temporal_run_id=plan.temporal_run_id
+     WHERE plan.id=NEW.plan_id
+       AND plan.tenant_id=NEW.tenant_id AND plan.user_id=NEW.user_id
+       AND plan.task_id=NEW.task_id AND plan.run_snapshot_id=NEW.run_snapshot_id
+       AND plan.temporal_workflow_id=NEW.temporal_workflow_id
+       AND plan.temporal_run_id=NEW.temporal_run_id
+       AND plan.definition_digest=NEW.definition_digest
+       AND plan.plan_digest=NEW.plan_digest
+       AND snapshot.reference_schema_version='vane.research-run-snapshot-ref/v3'
+       AND snapshot.definition_digest=NEW.definition_digest;
+    IF expected_steps IS NULL OR expected_steps<=0 OR expected_steps>16 THEN
+        RAISE EXCEPTION '118: research Brief parent scope differs';
+    END IF;
+
+    context_json := convert_from(NEW.context_payload,'UTF8')::jsonb;
+    evidence_json := convert_from(NEW.evidence_manifest,'UTF8')::jsonb;
+    history_json := convert_from(NEW.history_manifest,'UTF8')::jsonb;
+    SELECT convert_from(snapshot.payload,'UTF8')::jsonb
+      INTO snapshot_json
+      FROM public.task_run_snapshots snapshot
+     WHERE snapshot.id=NEW.run_snapshot_id
+       AND snapshot.tenant_id=NEW.tenant_id AND snapshot.user_id=NEW.user_id
+       AND snapshot.task_id=NEW.task_id;
+    history_cutoff := snapshot_json->>'history_through_utc';
+    expected_definition_context := jsonb_build_object(
+        'task_name',snapshot_json#>>'{definition,task_name}',
+        'task_manual',snapshot_json#>>'{definition,task_manual}',
+        'output',snapshot_json#>'{definition,output}',
+        'notification',snapshot_json#>'{definition,notification}'
+    );
+    expected_request_digest := encode(sha256(convert_to(concat_ws(E'\n',
+        'vane.research-brief-synthesis/v3',NEW.run_snapshot_id::text,NEW.plan_id::text,
+        NEW.definition_digest,NEW.plan_digest,NEW.notification_threshold,
+        NEW.context_digest,NEW.evidence_digest,NEW.history_digest
+    ),'UTF8')),'hex');
+    failure_count := CASE
+        WHEN jsonb_typeof(evidence_json->'tool_failures')='array'
+        THEN jsonb_array_length(evidence_json->'tool_failures') ELSE 0 END;
+    IF jsonb_typeof(context_json)<>'object' OR
+       context_json->>'schema_version'<>'vane.research-synthesis-context/v3.3' OR
+       context_json->'definition' IS DISTINCT FROM expected_definition_context OR
+       NEW.notification_threshold IS DISTINCT FROM
+           snapshot_json#>>'{definition,notification,minimum_significance}' OR
+       NEW.request_digest IS DISTINCT FROM expected_request_digest OR
+       jsonb_typeof(evidence_json->'items')<>'array' OR
+       ((failure_count=0) IS DISTINCT FROM
+           (evidence_json->>'schema_version'='vane.research-evidence-manifest/v3')) OR
+       ((failure_count>0) IS DISTINCT FROM
+           (evidence_json->>'schema_version'='vane.research-evidence-manifest/v3.1')) OR
+       jsonb_array_length(evidence_json->'items')+failure_count<>expected_steps OR
+       ((failure_count=0) IS DISTINCT FROM NOT (context_json?'tool_failures')) OR
+       ((failure_count>0) AND
+           jsonb_typeof(context_json->'tool_failures')<>'array') OR
+       history_json->>'schema_version'<>'vane.research-history-manifest/v3' OR
+       history_json->>'history_through_utc' IS DISTINCT FROM history_cutoff OR
+       jsonb_typeof(history_json->'items')<>'array' OR
+       jsonb_array_length(history_json->'items')>20 THEN
+        RAISE EXCEPTION '118: research Brief manifest shape is invalid';
+    END IF;
+
+    IF TG_OP='INSERT' THEN
+    WITH evidence_rows AS (
+        SELECT evidence.*
+          FROM public.research_run_evidence evidence
+          JOIN public.research_run_steps terminal
+            ON terminal.tenant_id=evidence.tenant_id
+           AND terminal.user_id=evidence.user_id
+           AND terminal.task_id=evidence.task_id
+           AND terminal.plan_id=evidence.plan_id
+           AND terminal.temporal_run_id=evidence.temporal_run_id
+           AND terminal.plan_digest=evidence.plan_digest
+           AND terminal.step_ordinal=evidence.step_ordinal
+           AND terminal.phase='completed'
+           AND terminal.invocation_id=evidence.invocation_id
+           AND terminal.tool_name=evidence.tool_name
+           AND terminal.request_digest=evidence.request_digest
+           AND terminal.result_digest=evidence.result_digest
+         WHERE evidence.tenant_id=NEW.tenant_id AND evidence.user_id=NEW.user_id
+           AND evidence.task_id=NEW.task_id AND evidence.plan_id=NEW.plan_id
+           AND evidence.temporal_run_id=NEW.temporal_run_id
+           AND evidence.plan_digest=NEW.plan_digest
+    )
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+               'evidence_id',evidence.id,'ordinal',evidence.step_ordinal,
+               'invocation_id',evidence.invocation_id,'tool_name',evidence.tool_name,
+               'request_digest',evidence.request_digest,'result_digest',evidence.result_digest,
+               'original_size',evidence.original_size,'truncated',evidence.truncated,
+               'trust_type',evidence.trust_type
+           ) ORDER BY evidence.step_ordinal),'[]'::jsonb)
+      INTO expected_evidence
+      FROM evidence_rows evidence;
+    -- The companion v124 scope trigger independently recomputes every byte
+    -- of this filtered projection from full immutable result_bytes.
+    expected_evidence_context := context_json->'current_evidence';
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+               'ordinal',terminal.step_ordinal,
+               'invocation_id',terminal.invocation_id,
+               'tool_name',terminal.tool_name,
+               'request_digest',terminal.request_digest,
+               'phase',terminal.phase,
+               'error_code',terminal.error_code,
+               'cost_micro_usd',terminal.cost_micro_usd
+           ) ORDER BY terminal.step_ordinal),'[]'::jsonb)
+      INTO expected_failures
+      FROM public.research_run_steps terminal
+     WHERE terminal.tenant_id=NEW.tenant_id AND terminal.user_id=NEW.user_id
+       AND terminal.task_id=NEW.task_id AND terminal.plan_id=NEW.plan_id
+       AND terminal.temporal_run_id=NEW.temporal_run_id
+       AND terminal.plan_digest=NEW.plan_digest
+       AND terminal.phase IN ('failed','indeterminate');
+    IF evidence_json IS DISTINCT FROM
+       (jsonb_build_object(
+           'schema_version',CASE WHEN jsonb_array_length(expected_failures)=0
+               THEN 'vane.research-evidence-manifest/v3'
+               ELSE 'vane.research-evidence-manifest/v3.1' END,
+           'items',expected_evidence) ||
+        CASE WHEN jsonb_array_length(expected_failures)=0 THEN '{}'::jsonb
+             ELSE jsonb_build_object('tool_failures',expected_failures) END) OR
+       jsonb_array_length(expected_evidence)+jsonb_array_length(expected_failures)<>
+           expected_steps OR
+       context_json->'current_evidence' IS DISTINCT FROM expected_evidence_context OR
+       (CASE WHEN jsonb_array_length(expected_failures)=0 THEN NOT (context_json?'tool_failures')
+             ELSE context_json->'tool_failures' IS NOT DISTINCT FROM expected_failures END)
+           IS DISTINCT FROM true THEN
+        RAISE EXCEPTION '118: research Brief projection is not exact terminal Tool outcomes';
+    END IF;
+
+    WITH shaped AS (
+        SELECT kind,record_id,generated_at,candidate_count,
+               jsonb_build_object(
+                   'kind',kind,'record_id',record_id,'run_snapshot_id',run_snapshot_id,
+                   'generated_at',to_char(generated_at AT TIME ZONE 'UTC',
+                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                   'digest',digest,'coverage',coverage
+               ) AS manifest_item,
+               jsonb_strip_nulls(jsonb_build_object(
+                   'kind',kind,'record_id',record_id,'run_snapshot_id',run_snapshot_id,
+                   'generated_at',to_char(generated_at AT TIME ZONE 'UTC',
+                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                   'digest',digest,'coverage',coverage,
+                   'payload_text',payload_text,'gap_reason',gap_reason,
+                   'context_stored_size',context_stored_size,
+                   'context_visible_size',context_visible_size,
+                   'context_visible_digest',context_visible_digest,
+                   'context_truncated',context_truncated
+               )) AS context_item
+          FROM public.read_research_history_v3(
+              NEW.tenant_id,NEW.user_id,NEW.task_id,NEW.run_snapshot_id,NEW.plan_id)
+    )
+    SELECT coalesce(jsonb_agg(manifest_item ORDER BY generated_at DESC,kind,record_id DESC),'[]'::jsonb),
+           coalesce(jsonb_agg(context_item ORDER BY generated_at DESC,kind,record_id DESC),'[]'::jsonb),
+           coalesce(max(candidate_count),0),count(*)::integer
+      INTO expected_history,expected_history_context,history_candidate_count,history_returned_count
+      FROM shaped;
+    history_continuation := CASE WHEN history_candidate_count>history_returned_count THEN
+        jsonb_build_object(
+            'generated_at',expected_history->-1->>'generated_at',
+            'kind',expected_history->-1->>'kind',
+            'record_id',expected_history->-1->>'record_id'
+        ) ELSE NULL END;
+    expected_history_manifest := jsonb_build_object(
+        'schema_version','vane.research-history-manifest/v3',
+        'history_through_utc',history_cutoff,
+        'candidate_count',history_candidate_count,
+        'returned_count',history_returned_count,
+        'truncated',history_candidate_count>history_returned_count,
+        'items',expected_history
+    ) || CASE WHEN history_continuation IS NULL THEN '{}'::jsonb
+              ELSE jsonb_build_object('continuation',history_continuation) END;
+    expected_context := jsonb_build_object(
+        'schema_version','vane.research-synthesis-context/v3.3',
+        'research_scope_window',context_json->'research_scope_window',
+        'definition',expected_definition_context,
+        'current_evidence',expected_evidence_context,
+        'history',jsonb_build_object(
+            'history_through_utc',history_cutoff,
+            'candidate_count',history_candidate_count,
+            'returned_count',history_returned_count,
+            'truncated',history_candidate_count>history_returned_count,
+            'items',expected_history_context
+        ) || CASE WHEN history_continuation IS NULL THEN '{}'::jsonb
+                  ELSE jsonb_build_object('continuation',history_continuation) END
+    ) || CASE WHEN jsonb_array_length(expected_failures)=0 THEN '{}'::jsonb
+              ELSE jsonb_build_object('tool_failures',expected_failures) END;
+    IF history_json IS DISTINCT FROM expected_history_manifest OR
+       context_json IS DISTINCT FROM expected_context THEN
+        RAISE EXCEPTION '118: research Brief history is not exact same-owner history';
+    END IF;
+    ELSE
+        expected_evidence := evidence_json->'items';
+		expected_evidence_context := context_json->'current_evidence';
+        expected_failures := coalesce(evidence_json->'tool_failures','[]'::jsonb);
+        expected_history := history_json->'items';
+    END IF;
+
+    IF NEW.status='finalized' THEN
+        brief_json := convert_from(NEW.brief_payload,'UTF8')::jsonb;
+        failure_count := jsonb_array_length(expected_failures);
+        IF jsonb_typeof(brief_json) IS DISTINCT FROM 'object' OR
+           jsonb_typeof(brief_json->'headline') IS DISTINCT FROM 'string' OR
+           octet_length(brief_json->>'headline') NOT BETWEEN 1 AND 1024 OR
+           btrim(brief_json->>'headline') IS DISTINCT FROM brief_json->>'headline' OR
+           jsonb_typeof(brief_json->'summary') IS DISTINCT FROM 'string' OR
+           octet_length(brief_json->>'summary') NOT BETWEEN 1 AND 65536 OR
+           btrim(brief_json->>'summary') IS DISTINCT FROM brief_json->>'summary' OR
+           jsonb_typeof(brief_json->'citations') IS DISTINCT FROM 'array' OR
+           jsonb_array_length(brief_json->'citations')>64 OR
+           NEW.brief_digest IS DISTINCT FROM encode(sha256(NEW.brief_payload),'hex') OR
+           EXISTS (
+               SELECT 1 FROM jsonb_array_elements(brief_json->'citations') citation
+                WHERE jsonb_typeof(citation) IS DISTINCT FROM 'object'
+                   OR (SELECT count(*) FROM jsonb_object_keys(citation))<>2
+                   OR (citation-ARRAY['kind','ref'])<>'{}'::jsonb
+                   OR jsonb_typeof(citation->'kind') IS DISTINCT FROM 'string'
+                   OR jsonb_typeof(citation->'ref') IS DISTINCT FROM 'string'
+                   OR octet_length(citation->>'ref') NOT BETWEEN 1 AND 255
+                   OR btrim(citation->>'ref') IS DISTINCT FROM citation->>'ref'
+                   OR (citation->>'kind'='current_evidence' AND
+                       (citation->>'ref' !~ '^[1-9][0-9]*$' OR NOT EXISTS (
+                           SELECT 1 FROM jsonb_array_elements(expected_evidence_context) item
+                            WHERE item->>'evidence_id'=citation->>'ref')))
+                   OR (citation->>'kind'='history' AND NOT EXISTS (
+                           SELECT 1 FROM jsonb_array_elements(expected_history) item
+                            WHERE item->>'record_id'=citation->>'ref'))
+                   OR ((citation->>'kind') IS DISTINCT FROM 'current_evidence' AND
+                       (citation->>'kind') IS DISTINCT FROM 'history')
+           ) OR EXISTS (
+               SELECT 1 FROM jsonb_array_elements(brief_json->'citations') citation
+                GROUP BY citation->>'kind',citation->>'ref' HAVING count(*)>1
+           ) THEN
+            RAISE EXCEPTION '118: research Brief payload is not grounded in frozen Evidence';
+        END IF;
+
+        IF failure_count=0 THEN
+            IF (SELECT count(*) FROM jsonb_object_keys(brief_json))<>5 OR
+               (brief_json-ARRAY['schema_version','headline','summary','significance','citations'])<>'{}'::jsonb OR
+               brief_json->>'schema_version' IS DISTINCT FROM 'vane.research-brief/v3' OR
+               brief_json->>'significance' IS DISTINCT FROM NEW.significance OR
+               jsonb_array_length(brief_json->'citations')<1 OR NOT EXISTS (
+                   SELECT 1 FROM jsonb_array_elements(brief_json->'citations') citation
+                    WHERE citation->>'kind'='current_evidence'
+               ) THEN
+                RAISE EXCEPTION '118: complete Brief must cite current Evidence';
+            END IF;
+        ELSIF brief_json->>'schema_version'='vane.research-brief/v3.1' THEN
+            IF (SELECT count(*) FROM jsonb_object_keys(brief_json))<>6 OR
+               (brief_json-ARRAY['schema_version','assessment','headline','summary','significance','citations'])<>'{}'::jsonb OR
+               brief_json->>'assessment' IS DISTINCT FROM 'unknown' OR
+               brief_json->>'significance' IS DISTINCT FROM 'none' OR
+               NEW.significance IS DISTINCT FROM 'none' OR NEW.decision IS DISTINCT FROM 'quiet' OR
+               NEW.delivery_required IS DISTINCT FROM false THEN
+                RAISE EXCEPTION '118: partial Brief must be unknown and quiet';
+            END IF;
+        ELSIF brief_json->>'schema_version'='vane.research-brief/v3.2' THEN
+            IF (SELECT count(*) FROM jsonb_object_keys(brief_json))<>6 OR
+               (brief_json-ARRAY['schema_version','assessment','headline','summary','significance','citations'])<>'{}'::jsonb OR
+               brief_json->>'assessment' IS DISTINCT FROM 'grounded' OR
+               brief_json->>'significance' IS DISTINCT FROM 'none' OR
+               NEW.significance IS DISTINCT FROM 'none' OR NEW.decision IS DISTINCT FROM 'quiet' OR
+               NEW.delivery_required IS DISTINCT FROM false OR
+               jsonb_array_length(brief_json->'citations')<1 OR NOT EXISTS (
+                   SELECT 1
+                     FROM jsonb_array_elements(brief_json->'citations') citation
+                     JOIN jsonb_array_elements(expected_evidence_context) item
+                       ON citation->>'kind'='current_evidence'
+                      AND citation->>'ref'=item->>'evidence_id'
+                    WHERE item->>'trust_type'='official'
+                      AND item->>'tool_name'='web_product_status'
+               ) THEN
+                RAISE EXCEPTION '118: grounded partial Brief must cite official Evidence and stay quiet';
+            END IF;
+        ELSE
+            RAISE EXCEPTION '118: partial Brief schema is invalid';
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_research_brief_synthesis_admission_v33()
+    FROM PUBLIC;
+
+CREATE TRIGGER research_brief_synthesis_admission_v33
+BEFORE INSERT OR UPDATE ON research_brief_syntheses
+FOR EACH ROW
+WHEN ((convert_from(NEW.context_payload,'UTF8')::jsonb->>'schema_version') =
+      'vane.research-synthesis-context/v3.3')
+EXECUTE FUNCTION enforce_research_brief_synthesis_admission_v33();
+
 
 -- +goose StatementBegin
 CREATE FUNCTION enforce_research_scope_window_v33()
@@ -158,8 +466,8 @@ AS $$
 DECLARE
     snapshot_json JSONB;
     context_json JSONB;
-    cutoff TIMESTAMPTZ;
-    window_start TIMESTAMPTZ;
+	cutoff_ns NUMERIC;
+	window_start_ns NUMERIC;
     expected_ids JSONB;
     actual_ids JSONB;
 	expected_evidence_context JSONB;
@@ -185,21 +493,49 @@ BEGIN
         END IF;
         RETURN NEW;
     END IF;
-    IF snapshot_json #>> '{definition,research_scope,mode}' <> 'event_window' OR
-       (snapshot_json #>> '{definition,research_scope,lookback_seconds}')::bigint <> 604800 THEN
+	IF jsonb_typeof(snapshot_json#>'{definition,research_scope}') IS DISTINCT FROM 'object' OR
+	   (SELECT count(*) FROM jsonb_object_keys(snapshot_json#>'{definition,research_scope}'))<>3 OR
+	   ((snapshot_json#>'{definition,research_scope}')-
+	       ARRAY['mode','lookback_seconds','task_manual_digest'])<>'{}'::jsonb OR
+	   jsonb_typeof(snapshot_json#>'{definition,research_scope,mode}') IS DISTINCT FROM 'string' OR
+	   jsonb_typeof(snapshot_json#>'{definition,research_scope,lookback_seconds}') IS DISTINCT FROM 'number' OR
+	   jsonb_typeof(snapshot_json#>'{definition,research_scope,task_manual_digest}') IS DISTINCT FROM 'string' OR
+	   snapshot_json #>> '{definition,research_scope,mode}' IS DISTINCT FROM 'event_window' OR
+	   (snapshot_json #>> '{definition,research_scope,lookback_seconds}')::bigint IS DISTINCT FROM 604800 OR
+	   jsonb_typeof(snapshot_json#>'{definition,task_manual}') IS DISTINCT FROM 'string' OR
+	   octet_length(snapshot_json#>>'{definition,task_manual}')<1 OR
+	   snapshot_json #>> '{definition,research_scope,task_manual_digest}' !~ '^[0-9a-f]{64}$' OR
+	   snapshot_json #>> '{definition,research_scope,task_manual_digest}' IS DISTINCT FROM
+	       encode(sha256(convert_to(snapshot_json#>>'{definition,task_manual}','UTF8')),'hex') THEN
         RAISE EXCEPTION '124: v3.5 snapshot lacks exact owner scope'
             USING ERRCODE='23514';
     END IF;
-    cutoff := (snapshot_json->>'history_through_utc')::timestamptz;
-    window_start := cutoff-make_interval(secs=>604800);
+	cutoff_ns := public.research_scope_timestamp_ns_v124(
+		snapshot_json->>'history_through_utc');
+	window_start_ns := cutoff_ns-604800000000000;
     context_json := convert_from(NEW.context_payload,'UTF8')::jsonb;
     IF context_json->>'schema_version' <> 'vane.research-synthesis-context/v3.3' OR
+	   cutoff_ns IS NULL OR
+	   jsonb_typeof(context_json->'research_scope_window') IS DISTINCT FROM 'object' OR
+	   (SELECT count(*) FROM jsonb_object_keys(context_json->'research_scope_window'))<>5 OR
+	   ((context_json->'research_scope_window')-
+	       ARRAY['mode','lookback_seconds','start_utc','end_utc','boundary'])<>'{}'::jsonb OR
+	   jsonb_typeof(context_json#>'{research_scope_window,mode}') IS DISTINCT FROM 'string' OR
+	   jsonb_typeof(context_json#>'{research_scope_window,lookback_seconds}') IS DISTINCT FROM 'number' OR
+	   jsonb_typeof(context_json#>'{research_scope_window,start_utc}') IS DISTINCT FROM 'string' OR
+	   jsonb_typeof(context_json#>'{research_scope_window,end_utc}') IS DISTINCT FROM 'string' OR
+	   jsonb_typeof(context_json#>'{research_scope_window,boundary}') IS DISTINCT FROM 'string' OR
        context_json #>> '{research_scope_window,mode}' <> 'event_window' OR
        (context_json #>> '{research_scope_window,lookback_seconds}')::bigint <> 604800 OR
        context_json #>> '{research_scope_window,boundary}' <> '(start,end]' OR
-       (context_json #>> '{research_scope_window,start_utc}')::timestamptz <> window_start OR
-       (context_json #>> '{research_scope_window,end_utc}')::timestamptz <> cutoff OR
-       context_json #>> '{history,history_through_utc}' <>
+	   public.research_scope_timestamp_ns_v124(
+	       context_json #>> '{research_scope_window,start_utc}') IS DISTINCT FROM window_start_ns OR
+	   public.research_scope_timestamp_ns_v124(
+	       context_json #>> '{research_scope_window,end_utc}') IS DISTINCT FROM cutoff_ns OR
+	   context_json #>> '{research_scope_window,end_utc}' IS DISTINCT FROM
+	       snapshot_json->>'history_through_utc' OR
+	   context_json #>> '{research_scope_window,start_utc}' !~ 'Z$' OR
+	   context_json #>> '{history,history_through_utc}' IS DISTINCT FROM
            snapshot_json->>'history_through_utc' THEN
         RAISE EXCEPTION '124: synthesis window differs from frozen owner scope'
             USING ERRCODE='23514';
@@ -220,7 +556,7 @@ BEGIN
     WITH filtered AS (
         SELECT evidence.*,
                public.filter_research_scope_evidence_v124(
-                   evidence.result_bytes,window_start,cutoff) AS filtered_text
+                   evidence.result_bytes,window_start_ns,cutoff_ns) AS filtered_text
           FROM public.research_run_evidence evidence
          WHERE evidence.tenant_id=NEW.tenant_id AND evidence.user_id=NEW.user_id
            AND evidence.task_id=NEW.task_id AND evidence.plan_id=NEW.plan_id
@@ -243,7 +579,7 @@ BEGIN
     WITH filtered AS (
         SELECT evidence.*,
                public.filter_research_scope_evidence_v124(
-                   evidence.result_bytes,window_start,cutoff) AS filtered_text
+                   evidence.result_bytes,window_start_ns,cutoff_ns) AS filtered_text
           FROM public.research_run_evidence evidence
          WHERE evidence.tenant_id=NEW.tenant_id AND evidence.user_id=NEW.user_id
            AND evidence.task_id=NEW.task_id AND evidence.plan_id=NEW.plan_id
@@ -678,6 +1014,8 @@ $$;
 
 DROP TRIGGER research_scope_window_v33 ON research_brief_syntheses;
 DROP FUNCTION enforce_research_scope_window_v33();
+DROP TRIGGER research_brief_synthesis_admission_v33 ON research_brief_syntheses;
+DROP FUNCTION enforce_research_brief_synthesis_admission_v33();
 DROP TRIGGER research_brief_synthesis_reject_unknown_v31
     ON research_brief_syntheses;
 CREATE TRIGGER research_brief_synthesis_reject_unknown_v31
@@ -690,10 +1028,9 @@ WHEN ((convert_from(NEW.context_payload,'UTF8')::jsonb->>'schema_version')
               'vane.research-synthesis-context/v3.1',
               'vane.research-synthesis-context/v3.2'))
 EXECUTE FUNCTION reject_research_brief_synthesis_schema_v31();
-DROP FUNCTION filter_research_scope_evidence_v124(BYTEA,TIMESTAMPTZ,TIMESTAMPTZ);
+DROP FUNCTION filter_research_scope_evidence_v124(BYTEA,NUMERIC,NUMERIC);
 DROP FUNCTION research_scope_json_string_v124(TEXT);
 DROP FUNCTION research_scope_timestamp_ns_v124(TEXT);
-DROP FUNCTION research_scope_published_at_v1(TEXT);
 
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION enforce_research_run_llm_spend_reservation_v2()

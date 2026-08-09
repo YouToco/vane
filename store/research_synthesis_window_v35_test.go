@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func scopedResearchBriefFixtureV35(t *testing.T, result []byte) researchBriefFix
 	st := tenantTestStore(t)
 	return newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, result, "", "",
-		testResearchGroundingModelPolicyV1(t), scope, 0)
+		testResearchGroundingModelPolicyV1(t), scope, 0, nil)
 }
 
 func testResearchWindowV33(t *testing.T) researchScopeWindowV33 {
@@ -186,6 +187,60 @@ func TestScopedResearchBriefV35FiltersFullEvidenceBeforeProjection(t *testing.T)
 		prepared.Synthesis.ID, tamperedPayload); err == nil {
 		t.Fatal("database admitted forged scoped visible Evidence")
 	}
+	for _, boundary := range []string{"start", "end"} {
+		t.Run("reject "+boundary+" plus 1ns", func(t *testing.T) {
+			changed := context
+			window := *context.ResearchScopeWindow
+			value := window.StartUTC
+			if boundary == "end" {
+				value = window.EndUTC
+			}
+			parsed, err := time.Parse(time.RFC3339Nano, value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if boundary == "start" {
+				window.StartUTC = parsed.Add(time.Nanosecond).Format(time.RFC3339Nano)
+			} else {
+				window.EndUTC = parsed.Add(time.Nanosecond).Format(time.RFC3339Nano)
+			}
+			changed.ResearchScopeWindow = &window
+			payload, err := json.Marshal(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.st.pool.Exec(t.Context(),
+				`UPDATE research_brief_syntheses SET context_payload=$2 WHERE id=$1`,
+				prepared.Synthesis.ID, payload); err == nil {
+				t.Fatalf("database admitted %s+1ns window", boundary)
+			}
+		})
+	}
+	var withExtra map[string]any
+	if err := json.Unmarshal(prepared.Synthesis.ContextPayload, &withExtra); err != nil {
+		t.Fatal(err)
+	}
+	withExtra["research_scope_window"].(map[string]any)["untrusted"] = true
+	extraPayload, err := json.Marshal(withExtra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.pool.Exec(t.Context(),
+		`UPDATE research_brief_syntheses SET context_payload=$2 WHERE id=$1`,
+		prepared.Synthesis.ID, extraPayload); err == nil {
+		t.Fatal("database admitted extra research_scope_window key")
+	}
+	delete(withExtra["research_scope_window"].(map[string]any), "untrusted")
+	withExtra["research_scope_window"].(map[string]any)["lookback_seconds"] = "604800"
+	stringLookback, err := json.Marshal(withExtra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.pool.Exec(t.Context(),
+		`UPDATE research_brief_syntheses SET context_payload=$2 WHERE id=$1`,
+		prepared.Synthesis.ID, stringLookback); err == nil {
+		t.Fatal("database admitted string research_scope_window lookback")
+	}
 }
 
 func TestScopedResearchBriefV35RejectsExplicitlyTruncatedEvidence(t *testing.T) {
@@ -198,7 +253,7 @@ func TestScopedResearchBriefV35RejectsExplicitlyTruncatedEvidence(t *testing.T) 
 	st := tenantTestStore(t)
 	f := newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, result, "", "",
-		testResearchGroundingModelPolicyV1(t), scope, len(result)+1)
+		testResearchGroundingModelPolicyV1(t), scope, len(result)+1, nil)
 	if _, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
 		t.Context(), researchBriefPrepareParamsV3(f)); err == nil {
 		t.Fatalf("truncated scoped prepare err=%v", err)
@@ -268,5 +323,186 @@ func TestUnscopedResearchBriefPreservesV34V32ReplayBytes(t *testing.T) {
 	}
 	if context.SchemaVersion != researchSynthesisContextSchemaV32 || context.ResearchScopeWindow != nil {
 		t.Fatalf("unscoped context=%+v", context)
+	}
+}
+
+func TestScopedResearchBriefV35GroundedFinalizationPostgres(t *testing.T) {
+	now := time.Now().UTC()
+	f := scopedResearchBriefFixtureV35(t, []byte(canonicalWindowDocumentsV33(t,
+		researchWindowDocumentV33{Title: "inside", URL: "https://example.com/in",
+			PublishedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), Text: "eligible"},
+	)))
+	synthesis, handle, candidate, grounding := prepareGroundingCandidateV1(t, f)
+	settled := settleGroundingVerifierV1(t, f, synthesis, handle, grounding,
+		types.ResearchGroundingGroundedV1)
+	ref, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
+		FinalizeResearchBriefSynthesisV3Params{
+			ClaimResearchBriefSynthesisV3Params: handle,
+			BriefPayload:                        candidate, GroundingVerificationID: settled.ID,
+		})
+	if err != nil || !ref.DeliveryRequired {
+		t.Fatalf("scoped finalization ref=%+v err=%v", ref, err)
+	}
+}
+
+func TestScopedResearchBriefV35DatabaseRejectsFilteredCitationMutation(t *testing.T) {
+	now := time.Now().UTC()
+	oldResult := []byte(canonicalWindowDocumentsV33(t, researchWindowDocumentV33{
+		Title: "filtered", URL: "https://example.com/old",
+		PublishedAt: now.Add(-8 * 24 * time.Hour).Format(time.RFC3339Nano), Text: "old"},
+	))
+	eligibleResult := []byte(canonicalWindowDocumentsV33(t, researchWindowDocumentV33{
+		Title: "eligible", URL: "https://example.com/new",
+		PublishedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), Text: "new"},
+	))
+	scope := &taskstate.ResearchScopeV3{Mode: taskstate.ResearchScopeEventWindowV3,
+		LookbackSeconds: taskstate.ResearchScopeWeekSecondsV3}
+	st := tenantTestStore(t)
+	f := newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true, oldResult, "", "",
+		testResearchGroundingModelPolicyV1(t), scope, 0, eligibleResult)
+	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest researchEvidenceManifestV3
+	var context researchSynthesisContextV3
+	if err := json.Unmarshal(prepared.Synthesis.EvidenceManifest, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(prepared.Synthesis.ContextPayload, &context); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Items) != 2 || len(context.CurrentEvidence) != 1 ||
+		manifest.Items[0].EvidenceID == context.CurrentEvidence[0].EvidenceID {
+		t.Fatalf("manifest=%+v context=%+v", manifest.Items, context.CurrentEvidence)
+	}
+	eligibleID := context.CurrentEvidence[0].EvidenceID
+	filteredID := manifest.Items[0].EvidenceID
+	encodeCandidate := func(ref int64) []byte {
+		payload, err := types.EncodeResearchBriefPayloadV3(types.ResearchBriefPayloadV3{
+			SchemaVersion: types.ResearchBriefPayloadSchemaV3,
+			Headline:      "eligible change", Summary: "eligible evidence only",
+			Significance: types.ResearchBriefSignificanceMajorV3,
+			Citations: []types.ResearchBriefCitationV3{{
+				Kind: types.ResearchBriefCitationCurrentEvidenceV3,
+				Ref:  strconv.FormatInt(ref, 10),
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+	eligiblePayload := encodeCandidate(eligibleID)
+	handle, reservation := claimResearchBriefWithPendingReceiptV3(t, f, prepared.Synthesis)
+	settleResearchBriefReceiptV3(t, f, reservation, prepared.Synthesis, eligiblePayload)
+	grounding, err := f.st.PrepareOrGetResearchBriefGroundingV1(t.Context(),
+		PrepareResearchBriefGroundingV1Params{
+			ClaimResearchBriefSynthesisV3Params: handle,
+			CandidateBriefPayload:               eligiblePayload,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	settled := settleGroundingVerifierV1(t, f, prepared.Synthesis, handle,
+		grounding.Grounding, types.ResearchGroundingGroundedV1)
+	if _, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
+		FinalizeResearchBriefSynthesisV3Params{
+			ClaimResearchBriefSynthesisV3Params: handle, BriefPayload: eligiblePayload,
+			GroundingVerificationID: settled.ID,
+		}); err != nil {
+		t.Fatalf("eligible citation did not finalize: %v", err)
+	}
+	tx, err := f.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	if _, err := tx.Exec(t.Context(), `ALTER TABLE research_brief_syntheses DISABLE TRIGGER USER;
+		ALTER TABLE research_brief_syntheses ENABLE TRIGGER research_scope_window_v33`); err != nil {
+		t.Fatal(err)
+	}
+	eligibleDigest := researchRunSHA256(eligiblePayload)
+	if _, err := tx.Exec(t.Context(), `UPDATE research_brief_syntheses
+		SET brief_payload=$2,brief_digest=$3 WHERE id=$1`, prepared.Synthesis.ID,
+		eligiblePayload, eligibleDigest); err != nil {
+		t.Fatalf("scope trigger rejected eligible finalized citation: %v", err)
+	}
+	filteredPayload := encodeCandidate(filteredID)
+	if _, err := tx.Exec(t.Context(), `UPDATE research_brief_syntheses
+		SET brief_payload=$2,brief_digest=$3 WHERE id=$1`, prepared.Synthesis.ID,
+		filteredPayload, researchRunSHA256(filteredPayload)); err == nil ||
+		!strings.Contains(err.Error(), "final Brief cites ineligible scoped Evidence") {
+		t.Fatalf("filtered finalized citation mutation err=%v", err)
+	}
+}
+
+func TestScopedResearchBriefV35DatabaseRejectsScopeSnapshotTampering(t *testing.T) {
+	now := time.Now().UTC()
+	f := scopedResearchBriefFixtureV35(t, []byte(canonicalWindowDocumentsV33(t,
+		researchWindowDocumentV33{Title: "inside", URL: "https://example.com/in",
+			PublishedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), Text: "eligible"},
+	)))
+	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
+		t.Context(), researchBriefPrepareParamsV3(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozen []byte
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT payload FROM task_run_snapshots WHERE id=$1`, f.snapshotRef.SnapshotID).Scan(&frozen); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]func(map[string]any){
+		"missing mode": func(snapshot map[string]any) {
+			delete(snapshot["definition"].(map[string]any)["research_scope"].(map[string]any), "mode")
+		},
+		"string lookback": func(snapshot map[string]any) {
+			snapshot["definition"].(map[string]any)["research_scope"].(map[string]any)["lookback_seconds"] = "604800"
+		},
+		"missing manual": func(snapshot map[string]any) {
+			delete(snapshot["definition"].(map[string]any), "task_manual")
+		},
+		"missing digest": func(snapshot map[string]any) {
+			delete(snapshot["definition"].(map[string]any)["research_scope"].(map[string]any), "task_manual_digest")
+		},
+		"tampered manual": func(snapshot map[string]any) {
+			snapshot["definition"].(map[string]any)["task_manual"] = "different manual"
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			var snapshot map[string]any
+			if err := json.Unmarshal(frozen, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			mutate(snapshot)
+			payload, err := json.Marshal(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := f.st.pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(t.Context()) }()
+			if _, err := tx.Exec(t.Context(), `ALTER TABLE task_run_snapshots DISABLE TRIGGER USER;
+				ALTER TABLE research_brief_syntheses DISABLE TRIGGER USER;
+				ALTER TABLE research_brief_syntheses ENABLE TRIGGER research_scope_window_v33`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(t.Context(),
+				`UPDATE task_run_snapshots SET payload=$2 WHERE id=$1`,
+				f.snapshotRef.SnapshotID, payload); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(t.Context(),
+				`UPDATE research_brief_syntheses SET context_payload=context_payload WHERE id=$1`,
+				prepared.Synthesis.ID); err == nil {
+				t.Fatal("database admitted tampered scoped snapshot")
+			}
+		})
 	}
 }

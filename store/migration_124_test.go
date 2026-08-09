@@ -22,16 +22,21 @@ func TestMigration124ScopesV35ProjectionAndPreservesV34Admission(t *testing.T) {
 	for _, required := range []string{
 		"'research-synthesis.render/v3.5'",
 		"'vane.research-synthesis-context/v3.3'",
-		"#>> '{definition,research_scope,mode}' <> 'event_window'",
+		"#>> '{definition,research_scope,mode}' IS DISTINCT FROM 'event_window'",
 		"lookback_seconds}')::bigint <> 604800",
 		"'(start,end]'",
-		"Match Go time.RFC3339Nano admission",
+		"regexp_match(value",
 		"evidence.truncated",
 		"convert_from(evidence.result_bytes,'UTF8')::jsonb",
-		"research_scope_published_at_v1",
+		"research_scope_timestamp_ns_v124",
 		"published_ns>window_start_ns AND published_ns<=window_end_ns",
 		"project_research_evidence_context_v118",
 		"context_json->'current_evidence' IS DISTINCT FROM expected_evidence_context",
+		"enforce_research_brief_synthesis_admission_v33",
+		"NULLIF(current_setting('app.tenant_id',true),'')::bigint",
+		"118: research Brief parent scope differs",
+		"118: research Brief history is not exact same-owner history",
+		"118: research Brief payload is not grounded in frozen Evidence",
 		"actual_ids IS DISTINCT FROM expected_ids",
 		"expected_ids='[]'::jsonb",
 		"DROP TRIGGER research_scope_window_v33",
@@ -51,6 +56,9 @@ func TestMigration124SQLProjectionBoundaryAndDateParityPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required for migration 124 integration tests")
+	}
+	if err := Migrate(t.Context(), databaseURL); err != nil {
+		t.Fatal(err)
 	}
 	database, err := sql.Open("pgx", databaseURL)
 	if err != nil {
@@ -74,7 +82,9 @@ func TestMigration124SQLProjectionBoundaryAndDateParityPostgres(t *testing.T) {
 	}
 	var filtered string
 	if err := database.QueryRowContext(t.Context(),
-		`SELECT filter_research_scope_evidence_v124($1,$2,$3)`, full, start, end,
+		`SELECT filter_research_scope_evidence_v124(
+			$1::bytea,research_scope_timestamp_ns_v124($2),research_scope_timestamp_ns_v124($3))`,
+		full, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano),
 	).Scan(&filtered); err != nil {
 		t.Fatal(err)
 	}
@@ -114,14 +124,31 @@ func TestMigration124EmptyDownPostgres(t *testing.T) {
 	if _, err := provider.DownTo(t.Context(), 123); err != nil {
 		t.Fatal(err)
 	}
-	var helperExists bool
-	if err := database.QueryRowContext(t.Context(),
-		`SELECT to_regprocedure('filter_research_scope_evidence_v124(bytea,timestamp with time zone,timestamp with time zone)') IS NOT NULL`,
-	).Scan(&helperExists); err != nil {
+	var v33Admission, scopeFunction, nsHelper, jsonHelper, filterHelper bool
+	var v33Trigger, scopeTrigger bool
+	var restoredReservation string
+	if err := database.QueryRowContext(t.Context(), `SELECT
+		to_regprocedure('enforce_research_brief_synthesis_admission_v33()') IS NOT NULL,
+		to_regprocedure('enforce_research_scope_window_v33()') IS NOT NULL,
+		to_regprocedure('research_scope_timestamp_ns_v124(text)') IS NOT NULL,
+		to_regprocedure('research_scope_json_string_v124(text)') IS NOT NULL,
+		to_regprocedure('filter_research_scope_evidence_v124(bytea,numeric,numeric)') IS NOT NULL,
+		EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='research_brief_synthesis_admission_v33'),
+		EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='research_scope_window_v33'),
+		pg_get_functiondef('enforce_research_run_llm_spend_reservation_v2()'::regprocedure)`,
+	).Scan(&v33Admission, &scopeFunction, &nsHelper, &jsonHelper, &filterHelper,
+		&v33Trigger, &scopeTrigger, &restoredReservation); err != nil {
 		t.Fatal(err)
 	}
-	if helperExists {
-		t.Fatal("migration 124 helper survived empty downgrade")
+	if v33Admission || scopeFunction || nsHelper || jsonHelper || filterHelper ||
+		v33Trigger || scopeTrigger {
+		t.Fatalf("124 objects survived Down: %v %v %v %v %v %v %v",
+			v33Admission, scopeFunction, nsHelper, jsonHelper, filterHelper, v33Trigger, scopeTrigger)
+	}
+	if !strings.Contains(restoredReservation, "research-synthesis.render/v3.3") ||
+		!strings.Contains(restoredReservation, "research-synthesis.render/v3.4") ||
+		strings.Contains(restoredReservation, "research-synthesis.render/v3.5") {
+		t.Fatal("Down did not restore exact v123 verifier admission")
 	}
 }
 

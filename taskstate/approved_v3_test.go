@@ -86,8 +86,13 @@ func TestApprovedDefinitionV3OptionalResearchScopePreservesAbsentBytes(t *testin
 		t.Fatalf("scoped definition=%+v err=%v", scoped, err)
 	}
 	scopedBytes, _ := EncodeApprovedDefinitionV3(scoped)
-	if !strings.Contains(string(scopedBytes), `"research_scope":{"mode":"event_window","lookback_seconds":604800}`) {
+	if !strings.Contains(string(scopedBytes), `"research_scope":{"mode":"event_window","lookback_seconds":604800,"task_manual_digest":"`) ||
+		len(scoped.ResearchScope.TaskManualDigest) != 64 {
 		t.Fatalf("scope bytes=%s", scopedBytes)
+	}
+	scoped.ResearchScope.TaskManualDigest = strings.Repeat("0", 64)
+	if scoped.Validate() == nil {
+		t.Fatal("research scope accepted a different task manual digest")
 	}
 	input.ResearchScope.LookbackSeconds--
 	if _, err := BuildApprovedDefinitionV3(input); !errors.Is(err, ErrInvalidState) {

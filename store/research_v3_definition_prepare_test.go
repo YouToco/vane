@@ -415,6 +415,10 @@ func TestResearchV3CutoverBeginRejectsDriftAfterSuccessfulShadowPostgres(t *test
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	p := researchV3PreparePolicyForTest()
 	p.TenantID, p.UserID, p.TaskID, p.IdempotencyKey = tenantID, userID, taskID, "shadow-then-drift"
+	p.ResearchScope = &taskstate.ResearchScopeV3{
+		Mode:            taskstate.ResearchScopeEventWindowV3,
+		LookbackSeconds: taskstate.ResearchScopeWeekSecondsV3,
+	}
 	prepared, err := st.PrepareResearchV3Definition(t.Context(), p)
 	if err != nil {
 		t.Fatal(err)
@@ -424,7 +428,7 @@ func TestResearchV3CutoverBeginRejectsDriftAfterSuccessfulShadowPostgres(t *test
 		TenantID: tenantID, UserID: userID, TaskID: taskID}
 	if _, err := st.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
 		testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
-		testResearchModelPolicyStoreV3(t)); err != nil {
+		testResearchGroundingModelPolicyV1(t)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.pool.Exec(t.Context(), `UPDATE schedule_playbooks

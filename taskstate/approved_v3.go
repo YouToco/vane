@@ -56,11 +56,12 @@ const (
 	ResearchScopeWeekSecondsV3 int64               = 7 * 24 * 60 * 60
 )
 
-// ResearchScopeV3 is optional owner-confirmed structured research authority.
-// A nil scope retains the historical task-manual-only behavior byte-for-byte.
+// ResearchScopeV3 is an operator-attested structured projection bound to the
+// exact owner-approved task manual. A nil scope retains historical bytes.
 type ResearchScopeV3 struct {
-	Mode            ResearchScopeModeV3 `json:"mode"`
-	LookbackSeconds int64               `json:"lookback_seconds"`
+	Mode             ResearchScopeModeV3 `json:"mode"`
+	LookbackSeconds  int64               `json:"lookback_seconds"`
+	TaskManualDigest string              `json:"task_manual_digest"`
 }
 
 // ApprovedDefinitionV3 freezes only the owner's durable research intent and
@@ -112,11 +113,16 @@ type scheduleSpecV3Wire struct {
 }
 
 func BuildApprovedDefinitionV3(input ApprovedDefinitionInputV3) (ApprovedDefinitionV3, error) {
+	scope := cloneResearchScopeV3(input.ResearchScope)
+	if scope != nil {
+		sum := sha256.Sum256([]byte(input.TaskManual))
+		scope.TaskManualDigest = hex.EncodeToString(sum[:])
+	}
 	definition, err := normalizeApprovedDefinitionV3(ApprovedDefinitionV3{
 		SchemaVersion: ApprovedDefinitionSchemaVersionV3,
 		TenantID:      input.TenantID, UserID: input.UserID, TaskID: input.TaskID,
 		TaskName: input.TaskName, TaskManual: input.TaskManual,
-		ResearchScope: cloneResearchScopeV3(input.ResearchScope),
+		ResearchScope: scope,
 		SpecJSON:      input.SpecJSON, ExecutionMode: input.ExecutionMode,
 		Notification: input.Notification, Output: input.Output,
 		PlannerBudget: input.PlannerBudget, DeliveryPolicy: input.DeliveryPolicy,
@@ -197,8 +203,10 @@ func normalizeApprovedDefinitionV3(
 		return ApprovedDefinitionV3{}, invalidState("approved definition v3 text is invalid")
 	}
 	if definition.ResearchScope != nil {
+		manualSum := sha256.Sum256([]byte(definition.TaskManual))
 		if definition.ResearchScope.Mode != ResearchScopeEventWindowV3 ||
-			definition.ResearchScope.LookbackSeconds != ResearchScopeWeekSecondsV3 {
+			definition.ResearchScope.LookbackSeconds != ResearchScopeWeekSecondsV3 ||
+			definition.ResearchScope.TaskManualDigest != hex.EncodeToString(manualSum[:]) {
 			return ApprovedDefinitionV3{}, invalidState("approved definition v3 research scope is invalid")
 		}
 		definition.ResearchScope = cloneResearchScopeV3(definition.ResearchScope)

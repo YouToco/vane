@@ -105,7 +105,7 @@ func WithExplicitEventWindowV35(retained ResearchModelPolicyV3) (ResearchModelPo
 	}
 	scoped := retained
 	scoped.Synthesis.RendererVersion = ResearchSynthesisRendererVersionV35
-	scoped.Synthesis.SystemPrompt += " research_scope_window 是 owner-confirmed 且由 Store 从冻结时钟计算的唯一事件窗口；current_evidence 中的 web 文档已经按该窗口确定性筛选，不得补回未出现的文档或引用不在 current_evidence 中的证据。"
+	scoped.Synthesis.SystemPrompt += " research_scope_window 是绑定 exact owner-approved task manual 的 operator-attested projection，且由 Store 从冻结时钟计算为唯一事件窗口；current_evidence 中的 web 文档已经按该窗口确定性筛选，不得补回未出现的文档或引用不在 current_evidence 中的证据。"
 	return BuildResearchModelPolicyV3(scoped)
 }
 

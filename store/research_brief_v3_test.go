@@ -79,14 +79,14 @@ func newResearchBriefFixtureWithStoreWorkflowAndModelV3(
 ) researchBriefFixtureV3 {
 	return newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 		t, st, threshold, completeEvidence, evidenceResult, authorityToken,
-		workflowID, modelPolicy, nil, 0)
+		workflowID, modelPolicy, nil, 0, nil)
 }
 
 func newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 	t *testing.T, st *Store, threshold taskstate.NotificationThresholdV3,
 	completeEvidence bool, evidenceResult []byte, authorityToken, workflowID string,
 	modelPolicy runtimepolicy.ResearchModelPolicyV3, scope *taskstate.ResearchScopeV3,
-	evidenceOriginalSize int,
+	evidenceOriginalSize int, extraEvidenceResult []byte,
 ) researchBriefFixtureV3 {
 	t.Helper()
 	useOwnerResearchRuntimeForTest(st)
@@ -234,11 +234,17 @@ func newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 		}
 	}
 	arguments := json.RawMessage(`{"query":"Kimi membership pricing"}`)
+	steps := []runcontext.ResearchPlanStepV3{{
+		InvocationID: "search-official", ToolName: "web_search", Arguments: arguments,
+	}}
+	if extraEvidenceResult != nil {
+		steps = append(steps, runcontext.ResearchPlanStepV3{
+			InvocationID: "search-secondary", ToolName: "web_search", Arguments: arguments,
+		})
+	}
 	plan, err := runcontext.BuildResearchExecutionPlanV3(
 		definitionDigest, snapshotRef.CapabilityCatalogDigest, snapshotRef.ToolPolicyDigest,
-		[]runcontext.ResearchPlanStepV3{{
-			InvocationID: "search-official", ToolName: "web_search", Arguments: arguments,
-		}}, func(_ string, raw json.RawMessage) (json.RawMessage, error) { return raw, nil })
+		steps, func(_ string, raw json.RawMessage) (json.RawMessage, error) { return raw, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,6 +276,23 @@ func newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 					planRef, 0, started.InvocationID), 100),
 		}); err != nil {
 			t.Fatal(err)
+		}
+		if extraEvidenceResult != nil {
+			second, err := st.BeginResearchRunStepV3(ctx, identity,
+				snapshotRef.SnapshotID, planRef, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.CommitResearchRunStepEvidenceV3(ctx, CommitResearchRunStepEvidenceV3Params{
+				Identity: identity, RunSnapshotID: snapshotRef.SnapshotID, PlanRef: planRef,
+				Ordinal: 1, Result: extraEvidenceResult, OriginalSize: len(extraEvidenceResult),
+				TrustType: "external", CostMicroUSD: 100,
+				ProviderCall: researchProviderCallV3ForTest(
+					researchExecutionTraceV3ForTest(t, identity, snapshotRef.SnapshotID,
+						planRef, 1, second.InvocationID), 100),
+			}); err != nil {
+				t.Fatal(err)
+			}
 		}
 	} else if started.StepID <= 0 {
 		t.Fatal("research step did not start")

@@ -125,11 +125,16 @@ func claimResearchBriefWithPendingReceiptV3(
 ) (ClaimResearchBriefSynthesisV3Params, ResearchRunLLMSpendReservationV3) {
 	t.Helper()
 	ensureResearchLLMPriceV3(t, fixture.st)
+	seal, err := fixture.st.LoadResearchRunSnapshotV3(
+		t.Context(), fixture.identity, fixture.snapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
 	reservation, err := fixture.st.BeginResearchRunLLMSpendV3(t.Context(),
 		BeginResearchRunLLMSpendV3Params{
 			Identity: fixture.identity, SnapshotRef: fixture.snapshotRef,
 			Stage: ResearchRunLLMStageSynthesisV3, SubjectID: synthesis.ID,
-			SystemPrompt: "Synthesize without Tools.",
+			SystemPrompt: seal.ResearchModel.Synthesis.SystemPrompt,
 			UserPrompt:   string(synthesis.ContextPayload),
 		})
 	if err != nil {
@@ -155,8 +160,13 @@ func settleResearchBriefReceiptV3(
 	briefPayload []byte,
 ) ResearchRunLLMReceiptV3 {
 	t.Helper()
+	seal, err := fixture.st.LoadResearchRunSnapshotV3(
+		t.Context(), fixture.identity, fixture.snapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
 	call := researchLLMCallForTestV3(fixture.identity, fixture.snapshotRef,
-		reservation, "Synthesize without Tools.", string(synthesis.ContextPayload))
+		reservation, seal.ResearchModel.Synthesis.SystemPrompt, string(synthesis.ContextPayload))
 	call.Completion = string(briefPayload)
 	call.PromptTokens, call.CompletionTokens = 1, 1
 	receipt, _, err := commitResearchRunLLMReceiptForTestV3(t, fixture.st,

@@ -92,6 +92,10 @@ func BuildResearchV3DefinitionEditTarget(
 		return taskstate.ApprovedDefinitionV3{}, errors.New(
 			"task: native V3 edit scope differs from the exact base")
 	}
+	if base.ResearchScope != nil && in.TaskManual != base.TaskManual {
+		return taskstate.ApprovedDefinitionV3{}, errors.New(
+			"task: scoped V3 task manual changed; explicit operator prepare is required")
+	}
 	target, err := taskstate.BuildApprovedDefinitionV3(
 		taskstate.ApprovedDefinitionInputV3{
 			TenantID: in.TenantID, UserID: in.UserID, TaskID: in.TaskID,
@@ -101,6 +105,7 @@ func BuildResearchV3DefinitionEditTarget(
 			PlannerBudget:      base.PlannerBudget,
 			DeliveryPolicy:     base.DeliveryPolicy,
 			TenantBudgetPolicy: base.TenantBudgetPolicy,
+			ResearchScope:      base.ResearchScope,
 		},
 	)
 	if err != nil {
