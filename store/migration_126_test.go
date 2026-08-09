@@ -30,6 +30,7 @@ func TestMigration126FreezesPlannerToolSearchAuthority(t *testing.T) {
 		"enforce_research_planner_search_receipt_v126",
 		"protect_research_planner_search_receipt_v126",
 		"research_plan_matches_planner_completion_v126",
+		"enforce_research_run_plan_llm_receipt_v126",
 		"planner_llm_spend_reservation_id",
 		"settlement.outcome='completed'",
 		"call.research_run_llm_spend_reservation_id=reservation.id",
@@ -51,6 +52,7 @@ func TestMigration126FreezesPlannerToolSearchAuthority(t *testing.T) {
 		"research_planner_tool_search_receipts",
 		"enforce_research_planner_search_receipt_v126",
 		"research_plan_matches_planner_completion_v126",
+		"enforce_research_run_plan_llm_receipt_v126",
 		"trigger.tgenabled='O'",
 	} {
 		if !bytes.Contains(storeSource, []byte(required)) {
@@ -150,19 +152,29 @@ func TestMigration126EmptyDownRestoresV125Postgres(t *testing.T) {
 	if _, err := provider.DownTo(t.Context(), 125); err != nil {
 		t.Fatal(err)
 	}
-	var clean, retained bool
+	var clean, retained, triggerRestored bool
 	if err := db.QueryRowContext(t.Context(), `
 		SELECT to_regclass('public.research_planner_tool_search_receipts') IS NULL
 		   AND to_regprocedure(
 		       'public.research_planner_search_canonical_v126(bytea)') IS NULL
 		   AND to_regprocedure(
-		       'public.research_plan_matches_planner_completion_v126(bytea,text)') IS NULL,
+		       'public.research_plan_matches_planner_completion_v126(bytea,text)') IS NULL
+		   AND to_regprocedure(
+		       'public.enforce_research_run_plan_llm_receipt_v126()') IS NULL,
 		       to_regprocedure(
-		       'public.research_plan_matches_planner_completion_v1(bytea,text)') IS NOT NULL
-	`).Scan(&clean, &retained); err != nil {
+		       'public.research_plan_matches_planner_completion_v1(bytea,text)') IS NOT NULL,
+		       EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_trigger trigger
+		         JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
+		          WHERE trigger.tgrelid='public.research_run_plans'::regclass
+		            AND trigger.tgname='research_run_plan_llm_receipt_v1'
+		            AND function.proname='enforce_research_run_plan_llm_receipt_v1'
+		            AND trigger.tgenabled='O')
+	`).Scan(&clean, &retained, &triggerRestored); err != nil {
 		t.Fatal(err)
 	}
-	if !clean || !retained {
-		t.Fatalf("migration 126 Down clean=%v retained_v104=%v", clean, retained)
+	if !clean || !retained || !triggerRestored {
+		t.Fatalf("migration 126 Down clean=%v retained_v104=%v trigger_restored=%v",
+			clean, retained, triggerRestored)
 	}
 }

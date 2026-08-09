@@ -278,8 +278,14 @@ $$;
 REVOKE ALL ON FUNCTION research_plan_matches_planner_completion_v126(BYTEA,TEXT)
     FROM PUBLIC;
 
+-- Rebind the retained trigger name to a versioned function.  The old v104
+-- function remains byte-for-byte available for Down; runtime startup can now
+-- prove that the v126 admission function, rather than merely its helper, is
+-- the active database authority.
+DROP TRIGGER research_run_plan_llm_receipt_v1 ON research_run_plans;
+
 -- +goose StatementBegin
-CREATE OR REPLACE FUNCTION enforce_research_run_plan_llm_receipt_v1()
+CREATE FUNCTION enforce_research_run_plan_llm_receipt_v126()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -368,6 +374,10 @@ BEGIN
 END
 $$;
 -- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_research_run_plan_llm_receipt_v126() FROM PUBLIC;
+CREATE TRIGGER research_run_plan_llm_receipt_v1
+BEFORE INSERT ON research_run_plans
+FOR EACH ROW EXECUTE FUNCTION enforce_research_run_plan_llm_receipt_v126();
 
 GRANT SELECT ON research_planner_tool_search_receipts
     TO vane_app,vane_research_v3_executor;
@@ -434,55 +444,13 @@ BEGIN
     END IF;
 END $$;
 
--- Restore migration 104's retained-plan admission.
--- +goose StatementBegin
-CREATE OR REPLACE FUNCTION enforce_research_run_plan_llm_receipt_v1()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path=pg_catalog,public,pg_temp
-AS $$
-BEGIN
-    IF TG_OP<>'INSERT' OR NEW.planner_llm_spend_reservation_id IS NULL THEN
-        RAISE EXCEPTION '092: new research Plan requires an immutable planner receipt'
-            USING ERRCODE='23514';
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-          FROM public.research_run_llm_spend_reservations reservation
-          JOIN public.research_run_llm_spend_settlements settlement
-            ON settlement.reservation_id=reservation.id
-           AND settlement.tenant_id=reservation.tenant_id
-           AND settlement.user_id=reservation.user_id
-           AND settlement.task_id=reservation.task_id
-           AND settlement.run_snapshot_id=reservation.run_snapshot_id
-           AND settlement.stage=reservation.stage
-           AND settlement.round_ordinal=reservation.round_ordinal
-          JOIN public.llm_calls call ON call.id=settlement.llm_call_id
-         WHERE reservation.id=NEW.planner_llm_spend_reservation_id
-           AND reservation.tenant_id=NEW.tenant_id
-           AND reservation.user_id=NEW.user_id
-           AND reservation.task_id=NEW.task_id
-           AND reservation.run_snapshot_id=NEW.run_snapshot_id
-           AND reservation.stage='planner'
-           AND reservation.subject_id=0
-           AND settlement.attempted AND settlement.usage_known
-           AND NOT settlement.definitely_zero_usage
-           AND settlement.outcome='completed' AND settlement.error_code=''
-           AND call.research_run_llm_spend_reservation_id=reservation.id
-           AND call.tenant_id=NEW.tenant_id AND call.user_id=NEW.user_id
-           AND call.run_snapshot_id=NEW.run_snapshot_id
-           AND call.span_name='research_planner' AND call.error=''
-           AND public.research_plan_matches_planner_completion_v1(
-                   NEW.plan_payload,call.completion)
-    ) THEN
-        RAISE EXCEPTION '104: research Plan differs from its planner response projection'
-            USING ERRCODE='23514';
-    END IF;
-    RETURN NEW;
-END
-$$;
--- +goose StatementEnd
+-- Restore migration 104's retained trigger binding without rewriting its
+-- function body.
+DROP TRIGGER research_run_plan_llm_receipt_v1 ON research_run_plans;
+DROP FUNCTION enforce_research_run_plan_llm_receipt_v126();
+CREATE TRIGGER research_run_plan_llm_receipt_v1
+BEFORE INSERT ON research_run_plans
+FOR EACH ROW EXECUTE FUNCTION enforce_research_run_plan_llm_receipt_v1();
 
 DROP FUNCTION research_plan_matches_planner_completion_v126(BYTEA,TEXT);
 DROP TRIGGER protect_research_planner_search_receipt_v126
