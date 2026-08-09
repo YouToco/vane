@@ -45,6 +45,7 @@ func TestMigration125FreezesOneCorrectionAndOneReverification(t *testing.T) {
 		"research_brief_matches_completion_v125",
 		"research_brief_candidate_valid_v125",
 		"research_grounding_verdict_valid_v125",
+		"research_text_is_go_trimmed_v125",
 		"grounding.id,'rejected'",
 		"grounding.id,'grounded'",
 		"correction.corrected_brief_payload=NEW.brief_payload",
@@ -93,6 +94,7 @@ func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 	var groundingReceiptHelper, correctionReceiptHelper bool
 	var expectedPromptHelper, expectedVerifierHelper, citationSubsetHelper bool
 	var briefCompletionHelper, briefCandidateHelper, groundingVerdictHelper bool
+	var goTrimHelper bool
 	var correctionInsertTrigger, groundingInsertTrigger bool
 	var scopeTriggerFunction, reservationTriggerFunction string
 	if err := database.QueryRowContext(t.Context(), `SELECT
@@ -128,6 +130,9 @@ func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 		to_regprocedure(
 		 'research_grounding_verdict_valid_v125(bytea,bytea,text)'
 		) IS NOT NULL,
+		to_regprocedure(
+		 'research_text_is_go_trimmed_v125(text)'
+		) IS NOT NULL,
 		EXISTS (SELECT 1 FROM pg_trigger
 		         WHERE tgname='enforce_research_grounding_correction_insert_v125'),
 		EXISTS (SELECT 1 FROM pg_trigger
@@ -142,6 +147,7 @@ func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 		&admissionV6, &groundingReceiptHelper, &correctionReceiptHelper,
 		&expectedPromptHelper, &expectedVerifierHelper, &citationSubsetHelper,
 		&briefCompletionHelper, &briefCandidateHelper, &groundingVerdictHelper,
+		&goTrimHelper,
 		&correctionInsertTrigger, &groundingInsertTrigger,
 		&scopeTriggerFunction,
 		&reservationTriggerFunction); err != nil {
@@ -151,14 +157,15 @@ func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 		groundingReceiptHelper || correctionReceiptHelper || expectedPromptHelper ||
 		expectedVerifierHelper || citationSubsetHelper || correctionInsertTrigger ||
 		briefCompletionHelper || briefCandidateHelper || groundingVerdictHelper ||
+		goTrimHelper ||
 		groundingInsertTrigger ||
 		scopeTriggerFunction != "enforce_research_scope_window_v33" ||
 		reservationTriggerFunction != "enforce_research_run_llm_spend_reservation_v2" {
-		t.Fatalf("Down mismatch table=%v correction_trigger=%v final_trigger=%v v6=%v grounding_receipt=%v correction_receipt=%v expected_prompt=%v expected_verifier=%v citation_subset=%v completion_helper=%v candidate_helper=%v verdict_helper=%v correction_insert=%v grounding_insert=%v scope=%s reservation=%s",
+		t.Fatalf("Down mismatch table=%v correction_trigger=%v final_trigger=%v v6=%v grounding_receipt=%v correction_receipt=%v expected_prompt=%v expected_verifier=%v citation_subset=%v completion_helper=%v candidate_helper=%v verdict_helper=%v go_trim=%v correction_insert=%v grounding_insert=%v scope=%s reservation=%s",
 			correctionTable, correctionTrigger, finalizationTrigger, admissionV6,
 			groundingReceiptHelper, correctionReceiptHelper, expectedPromptHelper,
 			expectedVerifierHelper, citationSubsetHelper, briefCompletionHelper,
-			briefCandidateHelper, groundingVerdictHelper,
+			briefCandidateHelper, groundingVerdictHelper, goTrimHelper,
 			correctionInsertTrigger,
 			groundingInsertTrigger, scopeTriggerFunction, reservationTriggerFunction)
 	}

@@ -217,6 +217,17 @@ $$;
 REVOKE ALL ON FUNCTION research_brief_matches_completion_v125(BYTEA,TEXT)
     FROM PUBLIC;
 
+-- strings.TrimSpace uses Unicode White_Space, not PostgreSQL btrim's default
+-- U+0020-only set. Keep paid DB admission at least as strict as Go.
+CREATE FUNCTION research_text_is_go_trimmed_v125(value TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SET search_path=pg_catalog,public,pg_temp
+RETURN btrim(value,U&'\0009\000a\000b\000c\000d\0020\0085\00a0\1680\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200a\2028\2029\202f\205f\3000')=value;
+REVOKE ALL ON FUNCTION research_text_is_go_trimmed_v125(TEXT) FROM PUBLIC;
+
 -- Mirror the frozen v3.6 Brief contract before any verifier round can spend.
 -- The candidate must also cite only records present in the exact synthesis
 -- context and follow the complete/partial coverage schema selected by Store.
@@ -247,10 +258,10 @@ BEGIN
     IF context_json IS NULL OR jsonb_typeof(brief_json) IS DISTINCT FROM 'object' OR
        jsonb_typeof(brief_json->'headline') IS DISTINCT FROM 'string' OR
        octet_length(brief_json->>'headline') NOT BETWEEN 1 AND 1024 OR
-       btrim(brief_json->>'headline') IS DISTINCT FROM brief_json->>'headline' OR
+       NOT public.research_text_is_go_trimmed_v125(brief_json->>'headline') OR
        jsonb_typeof(brief_json->'summary') IS DISTINCT FROM 'string' OR
        octet_length(brief_json->>'summary') NOT BETWEEN 1 AND 65536 OR
-       btrim(brief_json->>'summary') IS DISTINCT FROM brief_json->>'summary' OR
+       NOT public.research_text_is_go_trimmed_v125(brief_json->>'summary') OR
        jsonb_typeof(brief_json->'significance') IS DISTINCT FROM 'string' OR
        brief_json->>'significance' NOT IN ('none','qualified','major') OR
        jsonb_typeof(brief_json->'citations') IS DISTINCT FROM 'array' OR
@@ -262,7 +273,7 @@ BEGIN
                OR jsonb_typeof(citation->'kind') IS DISTINCT FROM 'string'
                OR jsonb_typeof(citation->'ref') IS DISTINCT FROM 'string'
                OR octet_length(citation->>'ref') NOT BETWEEN 1 AND 255
-               OR btrim(citation->>'ref') IS DISTINCT FROM citation->>'ref'
+               OR NOT public.research_text_is_go_trimmed_v125(citation->>'ref')
                OR (citation->>'kind'='current_evidence' AND (
                    citation->>'ref' !~ '^[1-9][0-9]*$' OR NOT EXISTS (
                        SELECT 1 FROM jsonb_array_elements(
@@ -369,10 +380,10 @@ BEGIN
                OR issue->>'field' NOT IN ('headline','summary','significance')
                OR jsonb_typeof(issue->'claim') IS DISTINCT FROM 'string'
                OR octet_length(issue->>'claim') NOT BETWEEN 1 AND 4096
-               OR btrim(issue->>'claim') IS DISTINCT FROM issue->>'claim'
+               OR NOT public.research_text_is_go_trimmed_v125(issue->>'claim')
                OR jsonb_typeof(issue->'reason') IS DISTINCT FROM 'string'
                OR octet_length(issue->>'reason') NOT BETWEEN 1 AND 4096
-               OR btrim(issue->>'reason') IS DISTINCT FROM issue->>'reason'
+               OR NOT public.research_text_is_go_trimmed_v125(issue->>'reason')
                OR jsonb_typeof(issue->'refs') IS DISTINCT FROM 'array'
                OR jsonb_array_length(issue->'refs')>64
                OR EXISTS (
@@ -384,7 +395,7 @@ BEGIN
                        OR ref->>'kind' NOT IN ('current_evidence','history')
                        OR jsonb_typeof(ref->'ref') IS DISTINCT FROM 'string'
                        OR octet_length(ref->>'ref') NOT BETWEEN 1 AND 255
-                       OR btrim(ref->>'ref') IS DISTINCT FROM ref->>'ref'
+                       OR NOT public.research_text_is_go_trimmed_v125(ref->>'ref')
                        OR NOT EXISTS (
                            SELECT 1 FROM jsonb_array_elements(
                                candidate_json->'citations') citation
@@ -2082,6 +2093,7 @@ DROP FUNCTION protect_research_brief_grounding_correction_v1();
 DROP FUNCTION research_expected_grounding_verifier_prompt_v125(
     BIGINT,BYTEA,TEXT);
 DROP FUNCTION research_brief_candidate_valid_v125(BIGINT,BYTEA);
+DROP FUNCTION research_text_is_go_trimmed_v125(TEXT);
 DROP FUNCTION research_brief_matches_completion_v125(BYTEA,TEXT);
 DROP FUNCTION research_grounding_correction_citations_subset_v125(BYTEA,BYTEA);
 
