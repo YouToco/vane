@@ -19,6 +19,16 @@ func scopedResearchBriefFixtureV35(t *testing.T, result []byte) researchBriefFix
 		Mode:            taskstate.ResearchScopeEventWindowV3,
 		LookbackSeconds: taskstate.ResearchScopeWeekSecondsV3,
 	}
+	st := tenantTestStore(t)
+	return newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true, result, "", "",
+		testScopedResearchGroundingModelPolicyV36Base(t), scope, 0, nil)
+}
+
+func testScopedResearchGroundingModelPolicyV36Base(
+	t *testing.T,
+) runtimepolicy.ResearchModelPolicyV3 {
+	t.Helper()
 	model := testResearchGroundingModelPolicyV1(t)
 	model.GroundingVerifier.RendererVersion =
 		runtimepolicy.ResearchGroundingVerifierRendererVersionV12
@@ -26,10 +36,7 @@ func scopedResearchBriefFixtureV35(t *testing.T, result []byte) researchBriefFix
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := tenantTestStore(t)
-	return newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
-		t, st, taskstate.NotificationThresholdMajorV3, true, result, "", "",
-		model, scope, 0, nil)
+	return model
 }
 
 func testResearchWindowV33(t *testing.T) researchScopeWindowV33 {
@@ -262,7 +269,7 @@ func TestScopedResearchBriefV35RejectsExplicitlyTruncatedEvidence(t *testing.T) 
 	st := tenantTestStore(t)
 	f := newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, result, "", "",
-		testResearchGroundingModelPolicyV1(t), scope, len(result)+1, nil)
+		testScopedResearchGroundingModelPolicyV36Base(t), scope, len(result)+1, nil)
 	if _, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
 		t.Context(), researchBriefPrepareParamsV3(f)); err == nil {
 		t.Fatalf("truncated scoped prepare err=%v", err)
@@ -369,7 +376,7 @@ func TestScopedResearchBriefV35DatabaseRejectsFilteredCitationMutation(t *testin
 	st := tenantTestStore(t)
 	f := newResearchBriefFixtureWithStoreWorkflowModelAndScopeV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, oldResult, "", "",
-		testResearchGroundingModelPolicyV1(t), scope, 0, eligibleResult)
+		testScopedResearchGroundingModelPolicyV36Base(t), scope, 0, eligibleResult)
 	prepared, err := f.st.PrepareOrGetResearchBriefSynthesisV3(
 		t.Context(), researchBriefPrepareParamsV3(f))
 	if err != nil {
