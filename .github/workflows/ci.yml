@@ -103,7 +103,7 @@ jobs:
           set -euo pipefail
           store_package="$(go list ./store)"
           mapfile -t packages < <(go list ./... | grep -Fvx "${store_package}")
-          go test -race -covermode=atomic \
+          go test -race -p=1 -parallel=1 -covermode=atomic \
             -coverprofile=tmp/store-sharding/non-store.coverage.out \
             "${packages[@]}"
 
