@@ -988,13 +988,17 @@ $$;
 -- +goose Down
 
 SELECT pg_advisory_xact_lock(6215335020355474248);
-LOCK TABLE task_run_snapshots,research_brief_syntheses,
+LOCK TABLE task_approved_definition_versions,task_run_snapshots,research_brief_syntheses,
            research_run_llm_spend_reservations IN ACCESS EXCLUSIVE MODE;
 
 -- +goose StatementBegin
 DO $$
 BEGIN
     IF EXISTS (
+		SELECT 1 FROM public.task_approved_definition_versions definition
+		 WHERE definition.schema_version='vane.task-approved-definition/v3'
+		   AND convert_from(definition.payload,'UTF8')::jsonb?'research_scope'
+	) OR EXISTS (
         SELECT 1 FROM public.task_run_snapshots snapshot
          WHERE snapshot.reference_schema_version='vane.research-run-snapshot-ref/v3'
            AND convert_from(snapshot.payload,'UTF8')::jsonb
@@ -1005,7 +1009,7 @@ BEGIN
          WHERE convert_from(synthesis.context_payload,'UTF8')::jsonb
                    ->>'schema_version'='vane.research-synthesis-context/v3.3'
     ) THEN
-        RAISE EXCEPTION '124: v3.5 snapshot or v3.3 synthesis history exists'
+		RAISE EXCEPTION '124: scoped definition, v3.5 snapshot, or v3.3 synthesis history exists'
             USING ERRCODE='55000';
     END IF;
 END

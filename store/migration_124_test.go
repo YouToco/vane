@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/taskstate"
 	"github.com/pressly/goose/v3"
 )
 
@@ -180,7 +181,43 @@ func TestMigration124RetainedV35RefusesDownPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(t.Context(), 123); err == nil ||
-		!strings.Contains(err.Error(), "v3.5 snapshot or v3.3 synthesis history exists") {
+		!strings.Contains(err.Error(), "scoped definition, v3.5 snapshot, or v3.3 synthesis history exists") {
 		t.Fatalf("retained v3.5 downgrade err=%v", err)
+	}
+}
+
+func TestMigration124PreparedScopedDefinitionRefusesDownPostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required for migration 124 integration tests")
+	}
+	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
+	policy := researchV3PreparePolicyForTest()
+	policy.TenantID, policy.UserID, policy.TaskID = tenantID, userID, taskID
+	policy.IdempotencyKey = "migration-124-scope-down"
+	policy.ResearchScope = &taskstate.ResearchScopeV3{
+		Mode:            taskstate.ResearchScopeEventWindowV3,
+		LookbackSeconds: taskstate.ResearchScopeWeekSecondsV3,
+	}
+	if _, err := st.PrepareResearchV3Definition(t.Context(), policy); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, dir,
+		goose.WithAllowOutofOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(t.Context(), 123); err == nil ||
+		!strings.Contains(err.Error(), "scoped definition, v3.5 snapshot, or v3.3 synthesis history exists") {
+		t.Fatalf("prepared scoped definition downgrade err=%v", err)
 	}
 }
