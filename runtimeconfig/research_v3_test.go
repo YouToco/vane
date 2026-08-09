@@ -48,7 +48,7 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		got.Model.Synthesis.Model != "strong-research-model" ||
 		got.Model.GroundingVerifier == nil ||
 		got.Model.GroundingVerifier.Model != "strong-research-model" ||
-		got.Model.Planner.RendererVersion != runtimepolicy.ResearchPlannerRendererVersionV32 ||
+		got.Model.Planner.RendererVersion != runtimepolicy.ResearchPlannerRendererVersionV33 ||
 		got.Model.Synthesis.RendererVersion != runtimepolicy.ResearchSynthesisRendererVersionV34 ||
 		got.Model.GroundingVerifier.RendererVersion !=
 			runtimepolicy.ResearchGroundingVerifierRendererVersionV12 ||

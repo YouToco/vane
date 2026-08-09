@@ -128,5 +128,9 @@ func BuildResearchRuntimeV3(input CurrentCompiledV1Input) (ResearchRuntimeV3, er
 	if err != nil {
 		return ResearchRuntimeV3{}, err
 	}
+	modelPolicy, err = runtimepolicy.WithPlannerToolSearchV33(modelPolicy)
+	if err != nil {
+		return ResearchRuntimeV3{}, err
+	}
 	return ResearchRuntimeV3{Bundle: bundle, Tools: toolPolicy, Model: modelPolicy}, nil
 }

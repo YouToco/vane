@@ -59,6 +59,7 @@ var researchRuntimeRelations = []string{
 	"research_brief_syntheses",
 	"research_brief_grounding_verifications",
 	"research_brief_grounding_corrections",
+	"research_planner_tool_search_receipts",
 	"research_run_step_spend_reservations",
 	"research_run_step_spend_settlements",
 	"research_run_llm_spend_reservations",
@@ -81,6 +82,7 @@ var researchRuntimeScopedRelations = []string{
 	"research_brief_syntheses",
 	"research_brief_grounding_verifications",
 	"research_brief_grounding_corrections",
+	"research_planner_tool_search_receipts",
 	"research_run_step_spend_reservations",
 	"research_run_step_spend_settlements",
 	"research_run_llm_spend_reservations",
@@ -248,7 +250,10 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		correctionImmutabilityTriggerAvailable,
 		groundingInsertTriggerAvailable, correctionInsertTriggerAvailable,
 		groundingFinalizationTriggerAvailable, scopeWindowTriggerV36Available,
-		spendReservationTriggerV3Available bool
+		spendReservationTriggerV3Available,
+		plannerSearchRuntimeAvailable, plannerSearchTriggerAvailable,
+		plannerSearchImmutabilityTriggerAvailable,
+		plannerSearchPlanHelperAvailable bool
 	if err := tx.QueryRow(ctx, `SELECT
 		to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
 		to_regclass('public.research_brief_grounding_corrections') IS NOT NULL,
@@ -328,13 +333,41 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		    AND function.proname='enforce_research_run_llm_spend_reservation_v3'
 		    AND function.pronamespace='public'::regnamespace
 		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
-		)`,
+		),
+		to_regclass('public.research_planner_tool_search_receipts') IS NOT NULL,
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
+		  WHERE trigger.tgrelid=to_regclass(
+		        'public.research_planner_tool_search_receipts')
+		    AND trigger.tgname='enforce_research_planner_search_receipt_v126'
+		    AND function.proname='enforce_research_planner_search_receipt_v126'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
+		),
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
+		  WHERE trigger.tgrelid=to_regclass(
+		        'public.research_planner_tool_search_receipts')
+		    AND trigger.tgname='protect_research_planner_search_receipt_v126'
+		    AND function.proname='protect_research_planner_search_receipt_v126'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
+		),
+		to_regprocedure(
+		 'public.research_plan_matches_planner_completion_v126(bytea,text)'
+		) IS NOT NULL
+		`,
 	).Scan(&groundingRuntimeAvailable, &correctionRuntimeAvailable,
 		&admissionV6Available, &admissionV5Available, &admissionV4Available,
 		&groundingImmutabilityTriggerAvailable,
 		&correctionImmutabilityTriggerAvailable, &groundingInsertTriggerAvailable,
 		&correctionInsertTriggerAvailable, &groundingFinalizationTriggerAvailable,
-		&scopeWindowTriggerV36Available, &spendReservationTriggerV3Available); err != nil {
+		&scopeWindowTriggerV36Available, &spendReservationTriggerV3Available,
+		&plannerSearchRuntimeAvailable, &plannerSearchTriggerAvailable,
+		&plannerSearchImmutabilityTriggerAvailable,
+		&plannerSearchPlanHelperAvailable); err != nil {
 		return fmt.Errorf("inspect grounding runtime schema: %w", err)
 	}
 	if groundingRuntimeAvailable != (admissionV6Available || admissionV5Available || admissionV4Available) ||
@@ -349,6 +382,11 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		admissionV6Available != scopeWindowTriggerV36Available ||
 		admissionV6Available != spendReservationTriggerV3Available {
 		return errors.New("grounding correction runtime schema is incomplete")
+	}
+	if !plannerSearchRuntimeAvailable || !plannerSearchTriggerAvailable ||
+		!plannerSearchImmutabilityTriggerAvailable ||
+		!plannerSearchPlanHelperAvailable {
+		return errors.New("planner tool search runtime schema is incomplete")
 	}
 	filterGroundingRelation := func(relations []string) []string {
 		filtered := make([]string, 0, len(relations))

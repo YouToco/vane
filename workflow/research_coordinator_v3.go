@@ -84,6 +84,15 @@ type researchGatewayCallerV3 interface {
 	Execute(context.Context, researchgateway.ExecuteRequestV1) (researchgateway.ExecuteResponseV1, error)
 }
 
+type researchPlannerToolSearchStoreV1 interface {
+	CreateOrGetResearchPlannerToolSearchReceiptV1(context.Context,
+		storepkg.CreateOrGetResearchPlannerToolSearchReceiptV1Params) (
+		runcontext.ResearchPlannerToolSearchReceiptV1, error)
+	LoadResearchPlannerToolSearchReceiptsV1(context.Context, types.RunIdentity,
+		types.ResearchRunSnapshotRefV3) (
+		[]runcontext.ResearchPlannerToolSearchReceiptV1, error)
+}
+
 type researchExecutorV3 interface {
 	ExecuteOnceV3(context.Context, fetcher.ResearchExecutionRequestV3) fetcher.ResearchExecutionReceiptV3
 }
@@ -195,20 +204,62 @@ func (r *ProductionResearchRuntimeV3) Plan(
 	if err := validateResearchSnapshotSealForCoordinatorV3(seal, snapshot); err != nil {
 		return types.ResearchRunPlanRefV3{}, err
 	}
-	userPrompt, err := buildResearchPlannerPromptV3(seal)
-	if err != nil {
-		return types.ResearchRunPlanRefV3{}, err
+	var plan runcontext.ResearchExecutionPlanV3
+	var reservation storepkg.ResearchRunLLMSpendReservationV3
+	execute := func(ctx context.Context, round int, roundPrompt string) (
+		storepkg.ResearchRunLLMReceiptV3,
+		storepkg.ResearchRunLLMSpendReservationV3, error,
+	) {
+		return r.executeLLMStageV3(ctx, identity, snapshot,
+			storepkg.ResearchRunLLMStagePlannerV3, round, 0,
+			seal.ResearchModel.Planner.SystemPrompt, roundPrompt)
 	}
-	plan, reservation, err := executeResearchPlannerRoundsV3(
-		ctx, snapshot, seal, userPrompt,
-		func(ctx context.Context, round int, roundPrompt string) (
-			storepkg.ResearchRunLLMReceiptV3,
-			storepkg.ResearchRunLLMSpendReservationV3, error,
-		) {
-			return r.executeLLMStageV3(ctx, identity, snapshot,
-				storepkg.ResearchRunLLMStagePlannerV3, round, 0,
-				seal.ResearchModel.Planner.SystemPrompt, roundPrompt)
-		})
+	if seal.ResearchModel.Planner.RendererVersion ==
+		runtimepolicy.ResearchPlannerRendererVersionV33 {
+		searchStore, ok := r.store.(researchPlannerToolSearchStoreV1)
+		if !ok {
+			return types.ResearchRunPlanRefV3{}, researchCoordinatorValidationV3(
+				"research planner tool search receipt store is unavailable")
+		}
+		preloaded, loadErr := searchStore.LoadResearchPlannerToolSearchReceiptsV1(
+			ctx, identity, snapshot)
+		if loadErr != nil {
+			return types.ResearchRunPlanRefV3{}, loadErr
+		}
+		preloadedByRound := make(map[int]runcontext.ResearchPlannerToolSearchReceiptV1,
+			len(preloaded))
+		for _, receipt := range preloaded {
+			preloadedByRound[receipt.RoundOrdinal] = receipt
+		}
+		plan, reservation, err = executeResearchPlannerToolSearchRoundsV33(
+			ctx, snapshot, seal, execute,
+			func(ctx context.Context,
+				reservation storepkg.ResearchRunLLMSpendReservationV3,
+				receipt runcontext.ResearchPlannerToolSearchReceiptV1,
+			) (runcontext.ResearchPlannerToolSearchReceiptV1, error) {
+				if existing, found := preloadedByRound[receipt.RoundOrdinal]; found {
+					existingBytes, _ := runcontext.EncodeResearchPlannerToolSearchReceiptV1(existing)
+					candidateBytes, _ := runcontext.EncodeResearchPlannerToolSearchReceiptV1(receipt)
+					if !bytes.Equal(existingBytes, candidateBytes) {
+						return runcontext.ResearchPlannerToolSearchReceiptV1{},
+							researchCoordinatorValidationV3("research planner replay search receipt differs")
+					}
+				}
+				return searchStore.CreateOrGetResearchPlannerToolSearchReceiptV1(ctx,
+					storepkg.CreateOrGetResearchPlannerToolSearchReceiptV1Params{
+						Identity: identity, SnapshotRef: snapshot,
+						PlannerLLMReservationID: reservation.ReservationID,
+						Receipt:                 receipt,
+					})
+			})
+	} else {
+		userPrompt, promptErr := buildResearchPlannerPromptV3(seal)
+		if promptErr != nil {
+			return types.ResearchRunPlanRefV3{}, promptErr
+		}
+		plan, reservation, err = executeResearchPlannerRoundsV3(
+			ctx, snapshot, seal, userPrompt, execute)
+	}
 	if err != nil {
 		return types.ResearchRunPlanRefV3{}, err
 	}
@@ -1089,6 +1140,8 @@ func buildResearchPlannerPromptV3(seal runcontext.ResearchSnapshotSealV3) (strin
 	case runtimepolicy.ResearchPlannerRendererVersionV31,
 		runtimepolicy.ResearchPlannerRendererVersionV32:
 		return buildResearchPlannerPromptV31(seal)
+	case runtimepolicy.ResearchPlannerRendererVersionV33:
+		return buildResearchPlannerPromptV33(seal, nil)
 	default:
 		return "", researchCoordinatorValidationV3(
 			"research planner renderer is unavailable")
@@ -1177,6 +1230,8 @@ func buildResearchPlannerCorrectionPromptV3(
 	case runtimepolicy.ResearchPlannerRendererVersionV31,
 		runtimepolicy.ResearchPlannerRendererVersionV32:
 		instruction = "The previous response failed the exact field contract. Return only one JSON object matching response_contract; do not add or rename fields."
+	case runtimepolicy.ResearchPlannerRendererVersionV33:
+		instruction = "The previous response failed the exact action contract. Return one JSON object matching response_contract: either a bounded tool_search request or a final plan using only loaded_tools."
 	default:
 		return "", researchCoordinatorValidationV3(
 			"research planner renderer is unavailable")

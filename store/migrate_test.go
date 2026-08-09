@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 125
+const latestMigrationVersion int64 = 126
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -110,6 +110,8 @@ var wantTables = []string{
 	"research_brief_grounding_verifications",
 	// 125 one immutable correction plus one final independent verdict.
 	"research_brief_grounding_corrections",
+	// 126 immutable planner tool-search receipts and loaded-tool admission.
+	"research_planner_tool_search_receipts",
 	"research_brief_deliveries",
 	"research_v3_delivery_authorities",
 	"research_v3_cutover_operations",
