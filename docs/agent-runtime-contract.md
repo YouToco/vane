@@ -288,6 +288,8 @@ Verifier 运行失败码用于后台诊断，不改变静默投递门槛：`grou
 `invalid_grounding_output` 表示 provider 完成但 verdict 不符合严格协议。三者都禁止 finalize 和
 delivery；grounding 账本保留 `prepared`，准确表示没有形成证据蕴含裁决，而 synthesis 终态保存
 失败原因。只有模型实际返回 `unsupported` 才写 `rejected`，不得用合成 verdict 混淆两者。
+`invalid_grounding_binding` 表示 verdict 本身可解析，但与候选摘要、候选引用或冻结 reservation
+不一致；该错误不可通过重放同一 provider completion 修复，因此直接终止 synthesis，仍不投递。
 
 Planner 输出的 canonical plan 先写入 append-only `research_run_plans`，Workflow 只接收
 `vane.research-run-plan-ref/v3`。每个外部 Tool 调用必须先在 `research_run_steps` 写入唯一

@@ -524,6 +524,20 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 				VerdictPayload:                      verdictCanonical,
 			})
 		if err != nil {
+			// A transient database/transport failure may have committed and must
+			// replay. A deterministic binding/integrity rejection can never be
+			// repaired by retrying the same immutable provider completion, so seal
+			// the synthesis failed instead of leaving it spending forever.
+			if !types.IsRetryable(err) {
+				if _, failErr := r.store.FailResearchBriefSynthesisV3(ctx,
+					storepkg.FailResearchBriefSynthesisV3Params{
+						ClaimResearchBriefSynthesisV3Params: claimParams,
+						Status:                              storepkg.ResearchBriefSynthesisFailedV3,
+						FailureCode:                         "invalid_grounding_binding",
+					}); failErr != nil {
+					return ResearchBriefRefV3{}, failErr
+				}
+			}
 			return ResearchBriefRefV3{}, err
 		}
 		if verdict.Verdict != types.ResearchGroundingGroundedV1 ||
