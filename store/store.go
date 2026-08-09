@@ -245,7 +245,10 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 	var groundingRuntimeAvailable, correctionRuntimeAvailable,
 		admissionV6Available, admissionV5Available, admissionV4Available,
 		groundingImmutabilityTriggerAvailable,
-		correctionImmutabilityTriggerAvailable bool
+		correctionImmutabilityTriggerAvailable,
+		groundingInsertTriggerAvailable, correctionInsertTriggerAvailable,
+		groundingFinalizationTriggerAvailable, scopeWindowTriggerV36Available,
+		spendReservationTriggerV3Available bool
 	if err := tx.QueryRow(ctx, `SELECT
 		to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
 		to_regclass('public.research_brief_grounding_corrections') IS NOT NULL,
@@ -260,22 +263,78 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		) IS NOT NULL,
 		EXISTS (
 		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
 		  WHERE trigger.tgrelid=to_regclass(
 		        'public.research_brief_grounding_verifications')
 		    AND trigger.tgname='protect_research_brief_grounding_verification_v1'
-		    AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
+		    AND function.proname='protect_research_brief_grounding_verification_v1'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
 		),
 		EXISTS (
 		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
 		  WHERE trigger.tgrelid=to_regclass(
 		        'public.research_brief_grounding_corrections')
 		    AND trigger.tgname='protect_research_brief_grounding_correction_v1'
-		    AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
+		    AND function.proname='protect_research_brief_grounding_correction_v1'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
+		),
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
+		  WHERE trigger.tgrelid=to_regclass(
+		        'public.research_brief_grounding_verifications')
+		    AND trigger.tgname='enforce_research_grounding_insert_v125'
+		    AND function.proname='enforce_research_grounding_insert_v125'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
+		),
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
+		  WHERE trigger.tgrelid=to_regclass(
+		        'public.research_brief_grounding_corrections')
+		    AND trigger.tgname='enforce_research_grounding_correction_insert_v125'
+		    AND function.proname='enforce_research_grounding_correction_insert_v125'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
+		),
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
+		  WHERE trigger.tgrelid=to_regclass('public.research_brief_syntheses')
+		    AND trigger.tgname='research_brief_grounding_finalization_v36'
+		    AND function.proname='enforce_research_grounding_finalization_v36'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
+		),
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
+		  WHERE trigger.tgrelid=to_regclass('public.research_brief_syntheses')
+		    AND trigger.tgname='research_scope_window_v33'
+		    AND function.proname='enforce_research_scope_window_v36'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
+		),
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		 JOIN pg_catalog.pg_proc function ON function.oid=trigger.tgfoid
+		  WHERE trigger.tgrelid=to_regclass(
+		        'public.research_run_llm_spend_reservations')
+		    AND trigger.tgname='research_run_llm_spend_reservation_v1'
+		    AND function.proname='enforce_research_run_llm_spend_reservation_v3'
+		    AND function.pronamespace='public'::regnamespace
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled='O'
 		)`,
 	).Scan(&groundingRuntimeAvailable, &correctionRuntimeAvailable,
 		&admissionV6Available, &admissionV5Available, &admissionV4Available,
 		&groundingImmutabilityTriggerAvailable,
-		&correctionImmutabilityTriggerAvailable); err != nil {
+		&correctionImmutabilityTriggerAvailable, &groundingInsertTriggerAvailable,
+		&correctionInsertTriggerAvailable, &groundingFinalizationTriggerAvailable,
+		&scopeWindowTriggerV36Available, &spendReservationTriggerV3Available); err != nil {
 		return fmt.Errorf("inspect grounding runtime schema: %w", err)
 	}
 	if groundingRuntimeAvailable != (admissionV6Available || admissionV5Available || admissionV4Available) ||
@@ -283,7 +342,12 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		return errors.New("grounding runtime schema is incomplete")
 	}
 	if correctionRuntimeAvailable != admissionV6Available ||
-		correctionRuntimeAvailable != correctionImmutabilityTriggerAvailable {
+		correctionRuntimeAvailable != correctionImmutabilityTriggerAvailable ||
+		admissionV6Available != groundingInsertTriggerAvailable ||
+		admissionV6Available != correctionInsertTriggerAvailable ||
+		admissionV6Available != groundingFinalizationTriggerAvailable ||
+		admissionV6Available != scopeWindowTriggerV36Available ||
+		admissionV6Available != spendReservationTriggerV3Available {
 		return errors.New("grounding correction runtime schema is incomplete")
 	}
 	filterGroundingRelation := func(relations []string) []string {

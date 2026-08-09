@@ -63,6 +63,31 @@ func TestMigration125FreezesOneCorrectionAndOneReverification(t *testing.T) {
 	}
 }
 
+func TestResearchRuntimeProbeRequiresEveryV125AuthorityTrigger(t *testing.T) {
+	payload, err := os.ReadFile("store.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(payload)
+	for _, required := range []string{
+		"enforce_research_grounding_insert_v125",
+		"enforce_research_grounding_correction_insert_v125",
+		"research_brief_grounding_finalization_v36",
+		"enforce_research_grounding_finalization_v36",
+		"enforce_research_scope_window_v36",
+		"enforce_research_run_llm_spend_reservation_v3",
+		"trigger.tgenabled='O'",
+		"function.pronamespace='public'::regnamespace",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("research runtime probe lost v125 authority %q", required)
+		}
+	}
+	if strings.Contains(source, "trigger.tgenabled<>'D'") {
+		t.Fatal("research runtime probe accepts REPLICA-only authority triggers")
+	}
+}
+
 func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
