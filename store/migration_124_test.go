@@ -24,7 +24,7 @@ func TestMigration124ScopesV35ProjectionAndPreservesV34Admission(t *testing.T) {
 		"'research-synthesis.render/v3.5'",
 		"'vane.research-synthesis-context/v3.3'",
 		"#>> '{definition,research_scope,mode}' IS DISTINCT FROM 'event_window'",
-		"lookback_seconds}')::bigint <> 604800",
+		"lookback_seconds}')::bigint IS DISTINCT FROM 604800",
 		"'(start,end]'",
 		"regexp_match(value",
 		"evidence.truncated",
@@ -41,7 +41,7 @@ func TestMigration124ScopesV35ProjectionAndPreservesV34Admission(t *testing.T) {
 		"actual_ids IS DISTINCT FROM expected_ids",
 		"expected_ids='[]'::jsonb",
 		"DROP TRIGGER research_scope_window_v33",
-		"v3.5 snapshot or v3.3 synthesis history exists",
+		"scoped definition, v3.5 snapshot, or v3.3 synthesis history exists",
 	} {
 		if !strings.Contains(sql, required) {
 			t.Fatalf("migration 124 lost guard %q", required)
