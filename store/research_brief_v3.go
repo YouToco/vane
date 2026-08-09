@@ -345,7 +345,9 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 	contextSchema := researchSynthesisContextSchemaV32
 	var scopeWindow *researchScopeWindowV33
 	if snapshotSeal.Payload.ResearchModel.Synthesis.RendererVersion ==
-		runtimepolicy.ResearchSynthesisRendererVersionV35 {
+		runtimepolicy.ResearchSynthesisRendererVersionV35 ||
+		snapshotSeal.Payload.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV36 {
 		contextSchema = researchSynthesisContextSchemaV33
 		scopeWindow, err = buildResearchScopeWindowV33(
 			snapshotSeal.Payload.Definition, params.SnapshotRef.HistoryThroughUTC)
