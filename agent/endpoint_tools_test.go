@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/agentcontext"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/tikhubcatalog"
 	"github.com/YouToco/vane/tikhubinvoke"
@@ -381,6 +382,70 @@ func TestToolSearchAudit_StatusesAreStableAndBounded(t *testing.T) {
 					len(rec.RetrievalQuery), len(rec.Arguments), len(rec.CandidateTools))
 			}
 		})
+	}
+}
+
+func TestToolSearchUnknownPlatformDoesNotPersistRawInput(t *testing.T) {
+	const secret = "owner-secret"
+	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
+	ep.catalog = newFakeCatalog()
+	writer := &fakeAgentEvidenceWriter{}
+	loop := New(Deps{
+		Tools:      ownerTestTools(ep.SearchTool()),
+		Endpoints:  ep,
+		Evidence:   writer,
+		OwnerAgent: true,
+		MaxTurns:   2,
+	})
+	calls := 0
+	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+		calls++
+		if calls == 1 {
+			return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID: "private-search", Name: "tool_search",
+				Arguments: `{"query":"` + secret + `","platform":"` + secret + `"}`,
+			}}}, nil
+		}
+		return &llm.ChatResponse{Content: "没有匹配的公开工具。"}, nil
+	}
+	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
+		traceID: "trace-private-search", userID: 42,
+		scope: agentcontext.Scope{TenantID: 7, UserID: 42, SessionID: 9},
+	})
+	state := &toolRunState{
+		activation: &activationState{}, ownerRequest: "检索可用工具",
+		intents: IntentSocialResearch, agentFirstEnabled: true,
+		successfulCalls: map[string]struct{}{}, failedCalls: map[string]int{},
+	}
+	sessionID := int64(9)
+	outcome, messages, _, err := loop.converse(ctx, 42, &sessionID,
+		[]llm.ChatMessage{{Role: "user", Content: state.ownerRequest}}, "", state)
+	if err != nil || outcome.Reply == "" || len(writer.record.ToolEvidence) != 1 {
+		t.Fatalf("outcome=%+v messages=%d evidence=%+v err=%v",
+			outcome, len(messages), writer.record.ToolEvidence, err)
+	}
+	evidence := writer.record.ToolEvidence[0]
+	if !strings.Contains(string(evidence.Result), "指定平台不在目录") {
+		t.Fatalf("zero-hit result should be stable and generic: %q", evidence.Result)
+	}
+	persisted := []string{
+		string(evidence.Arguments),
+		string(evidence.ToolCall.Arguments),
+		evidence.ToolCall.RetrievalQuery,
+		strings.Join(evidence.ToolCall.CandidateTools, "\n"),
+		evidence.ToolCall.Error,
+		evidence.ToolCall.ResultPreview,
+		string(evidence.Result),
+	}
+	for _, value := range persisted {
+		if strings.Contains(value, secret) {
+			t.Fatalf("raw tool_search input entered a persisted sink: %q", value)
+		}
+	}
+	for _, message := range messages {
+		if message.Role == "tool" && strings.Contains(message.Content, secret) {
+			t.Fatalf("raw tool_search input entered model-visible Result: %+v", message)
+		}
 	}
 }
 

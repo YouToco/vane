@@ -742,7 +742,7 @@ func (t *toolSearchTool) Execute(ctx context.Context, _ int64, args json.RawMess
 		record("zero", nil, false)
 		msg := "没有检索到匹配端点。可尝试：换关键词（中英文均可）、去掉平台过滤"
 		if a.Platform != "" && t.ep.catalog.PlatformCount(a.Platform) == 0 {
-			msg = "平台 " + a.Platform + " 不在目录中。可用平台：" + strings.Join(t.ep.catalog.Platforms(), "、")
+			msg = "指定平台不在目录中。可用平台：" + strings.Join(t.ep.catalog.Platforms(), "、")
 		}
 		return msg, nil
 	}
