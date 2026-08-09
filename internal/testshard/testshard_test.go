@@ -74,7 +74,7 @@ func TestBuildTimingSeedCanonicalAndExact(t *testing.T) {
 		`{"Action":"pass","Test":"TestBravo/sub","Elapsed":99}`,
 		`{"Action":"pass","Test":"TestBravo","Elapsed":2.5}`,
 		`{"Action":"output","Test":"TestAlpha"}`,
-		`{"Action":"pass","Test":"TestAlpha","Elapsed":1.25}`,
+		`{"Action":"pass","Test":"TestAlpha","Elapsed":0}`,
 	}, "\n")
 	first, summary, err := BuildTimingSeed(expected, []io.Reader{strings.NewReader(input)})
 	if err != nil {
@@ -88,7 +88,8 @@ func TestBuildTimingSeedCanonicalAndExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(first) != string(second) || summary != secondSummary ||
-		summary.TestCount != 2 || summary.TerminalEvents != 2 || len(summary.SHA256) != 64 {
+		summary.TestCount != 2 || summary.TerminalEvents != 2 ||
+		summary.ZeroDurationTests != 1 || len(summary.SHA256) != 64 {
 		t.Fatalf("seed=%q summary=%+v second=%q second_summary=%+v",
 			first, summary, second, secondSummary)
 	}
@@ -97,7 +98,7 @@ func TestBuildTimingSeedCanonicalAndExact(t *testing.T) {
 		t.Fatalf("seed is not canonical top-level terminal JSONL: %s", first)
 	}
 	timings, err := ParseTimings(bytes.NewReader(first))
-	if err != nil || timings["TestAlpha"] != 1.25 || timings["TestBravo"] != 2.5 {
+	if err != nil || timings["TestAlpha"] != 0.001 || timings["TestBravo"] != 2.5 || len(timings) != 2 {
 		t.Fatalf("timings=%v err=%v", timings, err)
 	}
 }
@@ -118,9 +119,9 @@ func TestBuildTimingSeedRejectsMissingDuplicateUnexpectedAndInvalidElapsed(t *te
 			`{"Action":"pass","Test":"TestB","Elapsed":1}`,
 			`{"Action":"pass","Test":"TestC","Elapsed":1}`,
 		}, "\n")},
-		{name: "invalid_elapsed", input: strings.Join([]string{
+		{name: "negative_elapsed", input: strings.Join([]string{
 			`{"Action":"pass","Test":"TestA","Elapsed":1}`,
-			`{"Action":"pass","Test":"TestB","Elapsed":0}`,
+			`{"Action":"pass","Test":"TestB","Elapsed":-0.001}`,
 		}, "\n")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

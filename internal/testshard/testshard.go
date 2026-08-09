@@ -39,10 +39,11 @@ type testEvent struct {
 }
 
 type TimingSeedSummary struct {
-	Version        int    `json:"version"`
-	TestCount      int    `json:"test_count"`
-	TerminalEvents int    `json:"terminal_events"`
-	SHA256         string `json:"sha256"`
+	Version           int    `json:"version"`
+	TestCount         int    `json:"test_count"`
+	TerminalEvents    int    `json:"terminal_events"`
+	ZeroDurationTests int    `json:"zero_duration_tests"`
+	SHA256            string `json:"sha256"`
 }
 
 func ParseTestList(r io.Reader) ([]string, error) {
@@ -120,6 +121,7 @@ func BuildTimingSeed(expected []string, readers []io.Reader) ([]byte, TimingSeed
 		wantSet[name] = struct{}{}
 	}
 	events := make(map[string]testEvent, len(want))
+	zeroDurationTests := 0
 	for inputIndex, reader := range readers {
 		scanner := bufio.NewScanner(reader)
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -141,10 +143,14 @@ func BuildTimingSeed(expected []string, readers []io.Reader) ([]byte, TimingSeed
 					"unexpected top-level terminal test %s", event.Test,
 				)
 			}
-			if event.Elapsed <= 0 {
+			if event.Elapsed < 0 {
 				return nil, TimingSeedSummary{}, fmt.Errorf(
-					"top-level terminal test %s has non-positive elapsed time", event.Test,
+					"top-level terminal test %s has negative elapsed time", event.Test,
 				)
+			}
+			if event.Elapsed == 0 {
+				event.Elapsed = 0.001
+				zeroDurationTests++
 			}
 			if _, duplicate := events[event.Test]; duplicate {
 				return nil, TimingSeedSummary{}, fmt.Errorf(
@@ -182,10 +188,11 @@ func BuildTimingSeed(expected []string, readers []io.Reader) ([]byte, TimingSeed
 	seed := output.Bytes()
 	digest := sha256.Sum256(seed)
 	return append([]byte(nil), seed...), TimingSeedSummary{
-		Version:        1,
-		TestCount:      len(want),
-		TerminalEvents: len(events),
-		SHA256:         fmt.Sprintf("%x", digest),
+		Version:           1,
+		TestCount:         len(want),
+		TerminalEvents:    len(events),
+		ZeroDurationTests: zeroDurationTests,
+		SHA256:            fmt.Sprintf("%x", digest),
 	}, nil
 }
 

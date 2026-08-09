@@ -18,8 +18,9 @@ jobs:
     name: Generate stable timing seed
     runs-on: ubuntu-24.04
     outputs:
+      seed_gzip_base64: ${{ steps.seed_digest.outputs.seed_gzip_base64 }}
+      seed_payload_bytes: ${{ steps.seed_digest.outputs.seed_payload_bytes }}
       seed_sha256: ${{ steps.seed_digest.outputs.seed_sha256 }}
-      test_list_sha256: ${{ steps.seed_digest.outputs.test_list_sha256 }}
       source_commit: ${{ steps.seed_digest.outputs.source_commit }}
 
     services:
@@ -108,47 +109,38 @@ jobs:
             .test_count == 880 and .historical_timings == 0 and
             (.shards | length) == 3
           ' tmp/store-seed/store-shard-plan.json
-          cp tmp/store-seed/store-tests.list.txt tmp/store-timing-seed/store-tests.list.txt
-          printf '%s\n' "${GITHUB_SHA}" > tmp/store-timing-seed/source-commit.txt
           go run ./cmd/storetestshard timing-seed \
-            --tests tmp/store-timing-seed/store-tests.list.txt \
+            --tests tmp/store-seed/store-tests.list.txt \
             --output tmp/store-timing-seed/store.timings.jsonl \
             --manifest tmp/store-timing-seed/store.timings.manifest.json \
             tmp/store-seed/store.test.json
-          (
-            cd tmp/store-timing-seed
-            sha256sum \
-              store.timings.jsonl \
-              store-tests.list.txt \
-              source-commit.txt > store-timing-seed.sha256
-            sha256sum --check store-timing-seed.sha256
-          )
           seed_digest="$(sha256sum tmp/store-timing-seed/store.timings.jsonl | cut -d' ' -f1)"
-          test_list_digest="$(sha256sum tmp/store-timing-seed/store-tests.list.txt | cut -d' ' -f1)"
+          gzip -n -9 -c tmp/store-timing-seed/store.timings.jsonl > tmp/store-timing-seed/store.timings.jsonl.gz
+          seed_gzip_base64="$(base64 -w0 tmp/store-timing-seed/store.timings.jsonl.gz)"
+          seed_payload_bytes="${#seed_gzip_base64}"
+          (( seed_payload_bytes > 0 && seed_payload_bytes <= 262144 ))
+          echo "seed_gzip_base64=${seed_gzip_base64}" >> "${GITHUB_OUTPUT}"
+          echo "seed_payload_bytes=${seed_payload_bytes}" >> "${GITHUB_OUTPUT}"
           echo "seed_sha256=${seed_digest}" >> "${GITHUB_OUTPUT}"
-          echo "test_list_sha256=${test_list_digest}" >> "${GITHUB_OUTPUT}"
           echo "source_commit=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
           jq -e --arg digest "${seed_digest}" \
             '.version == 1 and .test_count == 880 and
-             .terminal_events == 880 and .sha256 == $digest' \
+             .terminal_events == 880 and .zero_duration_tests >= 0 and
+             .sha256 == $digest' \
             tmp/store-timing-seed/store.timings.manifest.json
 
-      - name: Upload timing seed
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: store-race-timing-seed-${{ github.run_id }}-${{ github.run_attempt }}
-          path: tmp/store-timing-seed/
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload stable seed evidence
+      - name: Print canonical seed evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: store-race-seed-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: tmp/store-seed/
-          if-no-files-found: warn
-          retention-days: 14
+        shell: bash
+        run: |
+          set -euo pipefail
+          for evidence in \
+            tmp/store-seed/store-shard-status.json \
+            tmp/store-seed/store-shard-plan.json \
+            tmp/store-timing-seed/store.timings.manifest.json; do
+            [[ -f "${evidence}" ]] || continue
+            jq -cS . "${evidence}"
+          done
 
   lpt:
     name: Historical LPT repeat ${{ matrix.repeat }}
@@ -215,35 +207,24 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Download timing seed
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: store-race-timing-seed-${{ github.run_id }}-${{ github.run_attempt }}
-          path: tmp/store-timing-seed
-
-      - name: Revalidate timing seed
+      - name: Decode and revalidate timing seed
         shell: bash
+        env:
+          SEED_GZIP_BASE64: ${{ needs.seed.outputs.seed_gzip_base64 }}
         run: |
           set -euo pipefail
-          (
-            cd tmp/store-timing-seed
-            sha256sum --check store-timing-seed.sha256
-          )
           [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]]
+          [[ "${{ needs.seed.outputs.source_commit }}" == "${GITHUB_SHA}" ]]
+          payload_bytes="${#SEED_GZIP_BASE64}"
+          [[ "${payload_bytes}" == "${{ needs.seed.outputs.seed_payload_bytes }}" ]]
+          (( payload_bytes > 0 && payload_bytes <= 262144 ))
+          mkdir -p tmp/store-timing-seed
+          printf '%s' "${SEED_GZIP_BASE64}" | base64 --decode > tmp/store-timing-seed/store.timings.jsonl.gz
+          gzip --test tmp/store-timing-seed/store.timings.jsonl.gz
+          gzip --decompress --stdout tmp/store-timing-seed/store.timings.jsonl.gz > tmp/store-timing-seed/store.timings.jsonl
           seed_digest="$(sha256sum tmp/store-timing-seed/store.timings.jsonl | cut -d' ' -f1)"
-          test_list_digest="$(sha256sum tmp/store-timing-seed/store-tests.list.txt | cut -d' ' -f1)"
-          source_commit="$(tr -d '\n' < tmp/store-timing-seed/source-commit.txt)"
           [[ "${seed_digest}" == "${{ needs.seed.outputs.seed_sha256 }}" ]]
-          [[ "${test_list_digest}" == "${{ needs.seed.outputs.test_list_sha256 }}" ]]
-          [[ "${source_commit}" == "${GITHUB_SHA}" ]]
-          [[ "${source_commit}" == "${{ needs.seed.outputs.source_commit }}" ]]
-          jq -e --arg digest "${seed_digest}" \
-            '.version == 1 and .test_count == 880 and
-             .terminal_events == 880 and .sha256 == $digest' \
-            tmp/store-timing-seed/store.timings.manifest.json
-          go run ./cmd/storetestshard timing-seed \
-            --tests tmp/store-timing-seed/store-tests.list.txt \
-            tmp/store-timing-seed/store.timings.jsonl
+          [[ "$(wc -l < tmp/store-timing-seed/store.timings.jsonl | tr -d ' ')" == "880" ]]
 
       - name: Run historical LPT store race shards
         shell: bash
@@ -274,11 +255,14 @@ jobs:
             (.shards | length) == 3
           ' tmp/store-lpt-${{ matrix.repeat }}/store-shard-plan.json
 
-      - name: Upload LPT evidence
+      - name: Print canonical LPT evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: store-race-lpt-${{ github.run_id }}-${{ github.run_attempt }}-repeat-${{ matrix.repeat }}
-          path: tmp/store-lpt-${{ matrix.repeat }}/
-          if-no-files-found: warn
-          retention-days: 14
+        shell: bash
+        run: |
+          set -euo pipefail
+          for evidence in \
+            tmp/store-lpt-${{ matrix.repeat }}/store-shard-status.json \
+            tmp/store-lpt-${{ matrix.repeat }}/store-shard-plan.json; do
+            [[ -f "${evidence}" ]] || continue
+            jq -cS . "${evidence}"
+          done

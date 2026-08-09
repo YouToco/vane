@@ -1,8 +1,8 @@
 # Store race test sharding experiment
 
-This experiment keeps `.github/workflows/ci.yml` unchanged until it is measured on
-the `vane-test` runner. Run the opt-in **Store race sharding experiment** workflow
-with `workflow_dispatch`.
+This experiment keeps `.github/workflows/ci.yml` unchanged while it is measured
+on GitHub-hosted Ubuntu runners. Run the opt-in **Store race sharding experiment**
+workflow with `workflow_dispatch`.
 
 The manual workflow is a store-only, two-stage performance experiment. It does
 not replace or alter `.github/workflows/ci.yml`, its package set, PostgreSQL 18
@@ -27,18 +27,19 @@ The seed job:
 7. projects the verified combined stream to sorted top-level terminal JSONL;
 8. proves the seed and authoritative test list are exactly one-to-one, records
    the reviewed 880-test baseline, records the seed SHA-256 and exact checkout
-   commit, and uploads all authority files under one checksum manifest.
+   commit, then transmits the deterministic gzip+base64 seed as a bounded job
+   output. Zero-second terminal events are projected to a deterministic 1 ms
+   floor and counted in the seed summary; negative durations remain invalid.
 
 Five fixed matrix jobs then run on independent GitHub-hosted runners, each with
-three fresh PostgreSQL 18 service containers. Every job downloads the same
-run-scoped seed artifact, rechecks the SHA-256 and exact test-list projection,
-requires the downloaded source commit to equal both `github.sha` and the seed
-job output, and invokes `storetestshard run --timings`. A successful repeat must
-report `historical-lpt`, exactly 880 expected/observed/historical tests, zero
-duplicate/missing tests, three per-shard wall measurements, and identical
-coverage block sets.
-Each repeat uploads its status, plan, manifests, top-level event stream, shard
-JSONL, and coverage profiles under a run/attempt/repeat-unique artifact name.
+three fresh PostgreSQL 18 service containers. Every job decodes the same seed
+job output, rechecks its bounded payload size, gzip integrity, SHA-256, source
+commit and `github.sha`, and invokes `storetestshard run --timings`. The run's
+own compiled test list must close as exactly 880 expected, observed, and
+historically timed tests with zero duplicates/missing tests, three per-shard
+wall measurements, and identical coverage block sets. Canonical sorted status,
+plan and seed-summary JSON are printed to the workflow log; no Actions artifact
+storage is used.
 
 Historical longest-processing-time balancing remains available to local or
 other explicit callers that first provide the timing file inside the checkout:
@@ -61,9 +62,7 @@ runner show:
 sharded p95 wall time <= 0.60 * baseline p95 wall time
 ```
 
-The uploaded artifacts contain the authoritative list, shard manifests and plan,
-per-shard JSON, merged top-level JSON, per-shard coverage, merged store coverage,
-the canonical timing seed, and integrity/timing status. The runner writes
+The runner writes
 `store-shard-status.json` on best effort after setup even when build, listing,
 shard execution, integrity verification, or coverage merge fails; `phase`,
 `error`, `failed_shards`, wall timings, and `exit_code` identify the stopping
@@ -75,9 +74,8 @@ allocated, distinct host ports, so jobs from other repositories cannot collide
 with fixed 5432/5433/5434 bindings. GitHub Actions fails the job before test
 execution if a service cannot become healthy.
 
-Artifact upload/download steps are pinned to immutable official action SHAs.
-The workflow has only `contents: read`, receives no secrets, and runs only on
-GitHub-hosted Ubuntu 24.04 runners.
+The workflow has only `contents: read`, receives no secrets, uses no artifact
+upload/download actions, and runs only on GitHub-hosted Ubuntu 24.04 runners.
 
 ## Local benchmark decision (2026-07-27)
 
