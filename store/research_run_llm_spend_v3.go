@@ -177,8 +177,10 @@ func researchRunLLMStagePolicyV3(seal runcontext.ResearchSnapshotSealV3,
 			return seal.ResearchModel.Synthesis, false, nil
 		}
 		if round == 1 && seal.ResearchModel.GroundingVerifier != nil &&
-			seal.ResearchModel.Synthesis.RendererVersion ==
-				runtimepolicy.ResearchSynthesisRendererVersionV33 {
+			(seal.ResearchModel.Synthesis.RendererVersion ==
+				runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+				seal.ResearchModel.Synthesis.RendererVersion ==
+					runtimepolicy.ResearchSynthesisRendererVersionV34) {
 			return *seal.ResearchModel.GroundingVerifier, false, nil
 		}
 		return runtimepolicy.ResearchModelStageV3{}, false,

@@ -383,7 +383,9 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 		seal.ResearchModel.Synthesis.RendererVersion !=
 			runtimepolicy.ResearchSynthesisRendererVersionV32 &&
 		seal.ResearchModel.Synthesis.RendererVersion !=
-			runtimepolicy.ResearchSynthesisRendererVersionV33 {
+			runtimepolicy.ResearchSynthesisRendererVersionV33 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV34 {
 		return ResearchBriefRefV3{}, types.NewAppError(types.CodeConflict,
 			"frozen research synthesis renderer cannot express partial coverage",
 			types.ErrConflict)
@@ -458,7 +460,9 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 	}
 	groundingID := int64(0)
 	if seal.ResearchModel.Synthesis.RendererVersion ==
-		runtimepolicy.ResearchSynthesisRendererVersionV33 {
+		runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+		seal.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV34 {
 		if seal.ResearchModel.GroundingVerifier == nil {
 			return ResearchBriefRefV3{}, researchCoordinatorValidationV3(
 				"research grounding verifier is unavailable")
@@ -719,14 +723,16 @@ func decodeResearchBriefCompletionV3(
 		return types.DecodeResearchBriefPayloadV3(raw)
 	case runtimepolicy.ResearchSynthesisRendererVersionV31,
 		runtimepolicy.ResearchSynthesisRendererVersionV32,
-		runtimepolicy.ResearchSynthesisRendererVersionV33:
+		runtimepolicy.ResearchSynthesisRendererVersionV33,
+		runtimepolicy.ResearchSynthesisRendererVersionV34:
 		normalized, err := normalizeResearchBriefCompletionV31(raw)
 		if err != nil {
 			return types.ResearchBriefPayloadV3{}, nil,
 				researchCoordinatorValidationV3("research Brief model output is invalid")
 		}
 		if rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV32 ||
-			rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV33 {
+			rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+			rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV34 {
 			normalized, err = normalizeNumericCurrentEvidenceRefsV32(normalized)
 			if err != nil {
 				return types.ResearchBriefPayloadV3{}, nil,

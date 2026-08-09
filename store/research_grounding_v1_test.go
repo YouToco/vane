@@ -13,7 +13,7 @@ import (
 func testResearchGroundingModelPolicyV1(t *testing.T) runtimepolicy.ResearchModelPolicyV3 {
 	t.Helper()
 	policy := testResearchModelPolicyStoreV3(t)
-	policy.Synthesis.RendererVersion = runtimepolicy.ResearchSynthesisRendererVersionV33
+	policy.Synthesis.RendererVersion = runtimepolicy.ResearchSynthesisRendererVersionV34
 	policy.GroundingVerifier = &runtimepolicy.ResearchModelStageV3{
 		Stage: runtimepolicy.ResearchModelStageGroundingVerifierV3,
 		Model: "strong-model", MaxTokens: 4096, DisableThinking: true,

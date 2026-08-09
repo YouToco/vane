@@ -49,7 +49,7 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		got.Model.GroundingVerifier == nil ||
 		got.Model.GroundingVerifier.Model != "strong-research-model" ||
 		got.Model.Planner.RendererVersion != runtimepolicy.ResearchPlannerRendererVersionV32 ||
-		got.Model.Synthesis.RendererVersion != runtimepolicy.ResearchSynthesisRendererVersionV33 ||
+		got.Model.Synthesis.RendererVersion != runtimepolicy.ResearchSynthesisRendererVersionV34 ||
 		got.Model.GroundingVerifier.RendererVersion !=
 			runtimepolicy.ResearchGroundingVerifierRendererVersionV11 ||
 		!got.Model.Planner.DisableThinking || !got.Model.Synthesis.DisableThinking ||
@@ -74,7 +74,10 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "不得复用此前答案") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "history.history_through_utc") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "2026-07-28 不在窗口内") ||
-		!strings.Contains(got.Model.Synthesis.SystemPrompt, "抓取时间不能代替事件时间") {
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "抓取时间不能代替事件时间") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "否定性或穷举性覆盖结论") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "搜索未命中") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "不得在 headline 或 summary 提及未覆盖主体") {
 		t.Fatalf("research model policy=%+v", got.Model)
 	}
 }
