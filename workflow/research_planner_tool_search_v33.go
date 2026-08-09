@@ -53,6 +53,7 @@ type researchPlannerResponseContractV33 struct {
 	SearchFields         []string `json:"tool_search_fields"`
 	FinalFields          []string `json:"final_fields"`
 	RequiredStepFields   []string `json:"required_step_fields"`
+	MinSteps             int      `json:"min_steps"`
 	MaxSteps             int      `json:"max_steps"`
 	LoadedToolRule       string   `json:"loaded_tool_rule"`
 	ExtraFieldsAllowed   bool     `json:"extra_fields_allowed"`
@@ -134,7 +135,9 @@ func decodeResearchPlannerDecisionV33(
 		}
 	case researchPlannerActionFinalV33:
 		expected = []string{"action", "schema_version", "steps"}
-		if decision.ToolSearch != nil || len(decision.Steps) == 0 || len(decision.Steps) > maxToolCalls {
+		if decision.ToolSearch != nil ||
+			len(decision.Steps) < minimumResearchPlannerStepsV33(maxToolCalls) ||
+			len(decision.Steps) > maxToolCalls {
 			return researchPlannerDecisionV33{}, researchCoordinatorValidationV3("research planner final decision is invalid")
 		}
 	default:
@@ -161,6 +164,13 @@ func equalResearchPlannerStringsV33(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func minimumResearchPlannerStepsV33(maxToolCalls int) int {
+	if maxToolCalls >= 2 {
+		return 2
+	}
+	return 1
 }
 
 func buildResearchPlannerPromptV33(
@@ -219,6 +229,7 @@ func buildResearchPlannerPromptV33(
 			SearchFields:         []string{"schema_version", "action", "tool_search"},
 			FinalFields:          []string{"schema_version", "action", "steps"},
 			RequiredStepFields:   []string{"invocation_id", "tool_name", "arguments"},
+			MinSteps:             minimumResearchPlannerStepsV33(seal.Payload.PlannerBudget.MaxToolCalls),
 			MaxSteps:             seal.Payload.PlannerBudget.MaxToolCalls,
 			LoadedToolRule:       "final steps[].tool_name must exactly equal a loaded_tools[].name",
 			ExtraFieldsAllowed:   false, SingleJSONObject: true,

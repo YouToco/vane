@@ -294,6 +294,7 @@ AS $$
 DECLARE
     planner_renderer TEXT;
     final_round INTEGER;
+    max_tool_calls INTEGER;
     completion_text TEXT;
 BEGIN
     IF TG_OP<>'INSERT' OR NEW.planner_llm_spend_reservation_id IS NULL THEN
@@ -302,8 +303,11 @@ BEGIN
     END IF;
     SELECT convert_from(snapshot.payload,'UTF8')::jsonb #>>
                '{research_model,planner,renderer_version}',
-           reservation.round_ordinal,call.completion
-      INTO planner_renderer,final_round,completion_text
+           reservation.round_ordinal,
+           (convert_from(snapshot.payload,'UTF8')::jsonb #>>
+               '{planner_budget,max_tool_calls}')::integer,
+           call.completion
+      INTO planner_renderer,final_round,max_tool_calls,completion_text
       FROM public.task_run_snapshots snapshot
       JOIN public.research_run_llm_spend_reservations reservation
         ON reservation.id=NEW.planner_llm_spend_reservation_id
@@ -343,7 +347,10 @@ BEGIN
         RETURN NEW;
     END IF;
     IF NOT public.research_plan_matches_planner_completion_v126(
-            NEW.plan_payload,completion_text) OR NOT EXISTS (
+            NEW.plan_payload,completion_text) OR max_tool_calls IS NULL OR
+       jsonb_array_length(completion_text::jsonb->'steps') NOT BETWEEN
+           CASE WHEN max_tool_calls>=2 THEN 2 ELSE 1 END AND max_tool_calls OR
+       NOT EXISTS (
         SELECT 1 FROM public.research_planner_tool_search_receipts receipt
          WHERE receipt.tenant_id=NEW.tenant_id AND receipt.user_id=NEW.user_id
            AND receipt.task_id=NEW.task_id AND receipt.run_snapshot_id=NEW.run_snapshot_id

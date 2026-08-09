@@ -42,7 +42,7 @@ func plannerToolSearchSealV33(t *testing.T) (
 func TestResearchPlannerToolSearchV33SearchThenFinalIsRecoverySafe(t *testing.T) {
 	snapshot, seal := plannerToolSearchSealV33(t)
 	searchCompletion := `{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"official web release","limit":1}}`
-	finalCompletion := `{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"OpenAI official release"}}]}`
+	finalCompletion := `{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"search-official","tool_name":"web_search","arguments":{"query":"OpenAI official release"}},{"invocation_id":"search-confirmation","tool_name":"web_search","arguments":{"query":"OpenAI official confirmation"}}]}`
 	settled := map[int]storepkg.ResearchRunLLMReceiptV3{}
 	providerCalls := 0
 	execute := func(_ context.Context, round int, prompt string) (
@@ -91,7 +91,7 @@ func TestResearchPlannerToolSearchV33SearchThenFinalIsRecoverySafe(t *testing.T)
 	for attempt := 0; attempt < 2; attempt++ {
 		plan, reservation, err := executeResearchPlannerToolSearchRoundsV33(
 			t.Context(), snapshot, seal, execute, persist)
-		if err != nil || len(plan.Steps) != 1 || plan.Steps[0].ToolName != "web_search" ||
+		if err != nil || len(plan.Steps) != 2 || plan.Steps[0].ToolName != "web_search" ||
 			reservation.ReservationID != 2 {
 			t.Fatalf("attempt=%d plan=%+v reservation=%+v err=%v", attempt, plan, reservation, err)
 		}
@@ -131,7 +131,7 @@ func TestResearchPlannerToolSearchV33RejectsGuessedOrMalformedTool(t *testing.T)
 func TestDecodeResearchPlannerDecisionV33ExactActionShapes(t *testing.T) {
 	valid := []string{
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"中文 工具","limit":8}}`,
-		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"one","tool_name":"web_search","arguments":{"query":"x"}}]}`,
+		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"one","tool_name":"web_search","arguments":{"query":"x"}},{"invocation_id":"two","tool_name":"web_search","arguments":{"query":"y"}}]}`,
 	}
 	for _, raw := range valid {
 		if _, err := decodeResearchPlannerDecisionV33([]byte(raw), 2); err != nil {
@@ -142,6 +142,7 @@ func TestDecodeResearchPlannerDecisionV33ExactActionShapes(t *testing.T) {
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"x","limit":9}}`,
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":" x","limit":1}}`,
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[],"extra":true}`,
+		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"one","tool_name":"web_search","arguments":{"query":"x"}}]}`,
 		`{"schema_version":"bad","schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[]}`,
 	} {
 		if _, err := decodeResearchPlannerDecisionV33([]byte(raw), 2); err == nil {

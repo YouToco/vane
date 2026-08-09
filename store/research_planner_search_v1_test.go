@@ -118,16 +118,49 @@ func TestResearchPlannerToolSearchReceiptV1BindsSearchAndFinalPlanPostgres(t *te
 		t.Fatal("database admitted an unknown search result")
 	}
 
-	steps := []runcontext.ResearchPlanStepV3{{
-		InvocationID: "official-search", ToolName: "web_search",
-		Arguments: json.RawMessage(`{"query":"OpenAI official release"}`),
-	}}
+	steps := []runcontext.ResearchPlanStepV3{
+		{
+			InvocationID: "official-search", ToolName: "web_search",
+			Arguments: json.RawMessage(`{"query":"OpenAI official release"}`),
+		},
+		{
+			InvocationID: "official-confirmation", ToolName: "web_search",
+			Arguments: json.RawMessage(`{"query":"OpenAI official confirmation"}`),
+		},
+	}
 	plan, err := runcontext.BuildResearchExecutionPlanV3(
 		f.snapshotRef.DefinitionDigest, f.snapshotRef.CapabilityCatalogDigest,
 		f.snapshotRef.ToolPolicyDigest, steps,
 		acquisitiontool.CanonicalizeToolArgumentsV1)
 	if err != nil {
 		t.Fatal(err)
+	}
+	oneStepPlan, err := runcontext.BuildResearchExecutionPlanV3(
+		f.snapshotRef.DefinitionDigest, f.snapshotRef.CapabilityCatalogDigest,
+		f.snapshotRef.ToolPolicyDigest, plan.Steps[:1],
+		acquisitiontool.CanonicalizeToolArgumentsV1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oneStepPayload, err := json.Marshal(struct {
+		SchemaVersion string                          `json:"schema_version"`
+		Action        string                          `json:"action"`
+		Steps         []runcontext.ResearchPlanStepV3 `json:"steps"`
+	}{
+		SchemaVersion: "vane.research-planner-output/v3.3",
+		Action:        "final", Steps: oneStepPlan.Steps,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oneStepReservation := settlePlanner(2, "under-grounded final", string(oneStepPayload))
+	if _, err := f.store.CreateOrGetResearchRunPlanV3(t.Context(),
+		CreateOrGetResearchRunPlanV3Params{
+			Identity: f.identity, RunSnapshotID: f.snapshotRef.SnapshotID,
+			PlannerLLMReservationID: oneStepReservation.ReservationID,
+			Plan:                    oneStepPlan,
+		}); err == nil {
+		t.Fatal("database admitted a v3.3 final plan below the retained two-step floor")
 	}
 	finalPayload, err := json.Marshal(struct {
 		SchemaVersion string                          `json:"schema_version"`
@@ -140,14 +173,14 @@ func TestResearchPlannerToolSearchReceiptV1BindsSearchAndFinalPlanPostgres(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	finalReservation := settlePlanner(2, "finalize loaded tools", string(finalPayload))
+	finalReservation := settlePlanner(3, "finalize loaded tools", string(finalPayload))
 	ref, err := f.store.CreateOrGetResearchRunPlanV3(t.Context(),
 		CreateOrGetResearchRunPlanV3Params{
 			Identity: f.identity, RunSnapshotID: f.snapshotRef.SnapshotID,
 			PlannerLLMReservationID: finalReservation.ReservationID,
 			Plan:                    plan,
 		})
-	if err != nil || ref.PlanID <= 0 || ref.StepCount != 1 {
+	if err != nil || ref.PlanID <= 0 || ref.StepCount != 2 {
 		t.Fatalf("plan=%+v err=%v", ref, err)
 	}
 }
