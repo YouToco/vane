@@ -175,6 +175,12 @@ name, version, date, number, price and status appear verbatim in at least one
 cited in-window evidence item. It may not substitute a related proper noun
 (for example, turn Sonnet evidence into an Opus claim), reuse a previous
 answer, or promote an out-of-window article into the current interval.
+`history.history_through_utc` is the Store-frozen run clock for synthesis and
+the only authority for resolving relative task-manual windows such as “the
+past week” or “yesterday”. The model must derive an explicit UTC boundary
+before selecting facts; fetch time cannot stand in for an article's published
+or event time, and an item whose event time cannot be proven in-window is
+omitted.
 
 ## External-fact authority
 
