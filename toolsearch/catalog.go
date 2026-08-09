@@ -15,12 +15,14 @@ import (
 )
 
 const (
-	maxCatalogEntries   = 4096
-	maxSchemaBytes      = 64 << 10
-	maxSchemaDepth      = 16
-	maxSchemaNodes      = 4096
-	maxSearchQueryBytes = 512
-	maxSearchResults    = 8
+	maxCatalogEntries    = 4096
+	maxSchemaBytes       = 64 << 10
+	maxSchemaDepth       = 16
+	maxSchemaNodes       = 4096
+	maxSearchDocBytes    = 64 << 10
+	maxSearchCorpusBytes = 16 << 20
+	maxSearchQueryBytes  = 512
+	maxSearchResults     = 8
 )
 
 // Entry is one deferred tool after the caller has applied the trusted local
@@ -57,11 +59,53 @@ type canonicalEntry struct {
 	Parameters  json.RawMessage `json:"parameters"`
 	Aliases     []string        `json:"aliases,omitempty"`
 	Tags        []string        `json:"tags,omitempty"`
+	SearchText  string          `json:"search_text"`
 }
 
 // NewCatalog validates and indexes a complete already-authorized snapshot.
 // Input order does not affect its digest or search ranking.
 func NewCatalog(entries []Entry) (*Catalog, error) {
+	return newCatalog(entries, nil)
+}
+
+// NewCatalogWithDocuments validates and indexes a complete already-authorized
+// snapshot using caller-supplied search documents. Documents must have exactly
+// one ID for every entry; their normalized text is bound into the catalog
+// digest. This keeps provider-specific ranking compatibility without exposing
+// provider metadata in the model-facing Entry or indexing excluded tools.
+func NewCatalogWithDocuments(entries []Entry, documents []Document) (*Catalog, error) {
+	if len(documents) > maxCatalogEntries {
+		return nil, fmt.Errorf("toolsearch: search corpus has %d documents, maximum is %d", len(documents), maxCatalogEntries)
+	}
+	searchText := make(map[string]string, len(documents))
+	totalBytes := 0
+	for i, document := range documents {
+		if document.ID == "" || strings.TrimSpace(document.ID) != document.ID {
+			return nil, fmt.Errorf("toolsearch: invalid search document ID at index %d", i)
+		}
+		if _, duplicate := searchText[document.ID]; duplicate {
+			return nil, fmt.Errorf("toolsearch: duplicate search document ID %q", document.ID)
+		}
+		if !utf8.ValidString(document.Text) {
+			return nil, fmt.Errorf("toolsearch: search metadata for %q is invalid UTF-8", document.ID)
+		}
+		normalized := strings.Join(strings.Fields(document.Text), " ")
+		if normalized == "" {
+			return nil, fmt.Errorf("toolsearch: empty search metadata for %q", document.ID)
+		}
+		if len(normalized) > maxSearchDocBytes {
+			return nil, fmt.Errorf("toolsearch: search metadata for %q exceeds %d bytes", document.ID, maxSearchDocBytes)
+		}
+		totalBytes += len(normalized)
+		if totalBytes > maxSearchCorpusBytes {
+			return nil, fmt.Errorf("toolsearch: search corpus exceeds %d bytes", maxSearchCorpusBytes)
+		}
+		searchText[document.ID] = normalized
+	}
+	return newCatalog(entries, searchText)
+}
+
+func newCatalog(entries []Entry, suppliedSearchText map[string]string) (*Catalog, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("toolsearch: catalog is empty")
 	}
@@ -71,7 +115,7 @@ func NewCatalog(entries []Entry) (*Catalog, error) {
 
 	canonical := make([]canonicalEntry, 0, len(entries))
 	byName := make(map[string]Entry, len(entries))
-	termsByName := make(map[string][]string, len(entries))
+	totalSearchBytes := 0
 	for i, raw := range entries {
 		entry, schema, schemaTerms, err := normalizeEntry(raw)
 		if err != nil {
@@ -82,18 +126,6 @@ func NewCatalog(entries []Entry) (*Catalog, error) {
 		}
 		entry.Parameters = append(json.RawMessage(nil), schema...)
 		byName[entry.Name] = cloneEntry(entry)
-		termsByName[entry.Name] = append([]string(nil), schemaTerms...)
-		canonical = append(canonical, canonicalEntry{
-			Namespace: entry.Namespace, Name: entry.Name,
-			Description: entry.Description, Parameters: schema,
-			Aliases: entry.Aliases, Tags: entry.Tags,
-		})
-	}
-	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Name < canonical[j].Name })
-
-	documents := make([]Document, 0, len(canonical))
-	for _, item := range canonical {
-		entry := byName[item.Name]
 		searchText := strings.Join([]string{
 			entry.Namespace,
 			entry.Name,
@@ -101,9 +133,42 @@ func NewCatalog(entries []Entry) (*Catalog, error) {
 			entry.Description,
 			strings.Join(entry.Aliases, " "),
 			strings.Join(entry.Tags, " "),
-			strings.Join(termsByName[item.Name], " "),
+			strings.Join(schemaTerms, " "),
 		}, " ")
-		documents = append(documents, Document{ID: entry.Name, Text: searchText})
+		if suppliedSearchText != nil {
+			var found bool
+			searchText, found = suppliedSearchText[entry.Name]
+			if !found {
+				return nil, fmt.Errorf("toolsearch: missing search document for %q", entry.Name)
+			}
+		}
+		if !utf8.ValidString(searchText) || len(searchText) > maxSearchDocBytes {
+			return nil, fmt.Errorf("toolsearch: search metadata for %q must be valid UTF-8 and at most %d bytes", entry.Name, maxSearchDocBytes)
+		}
+		totalSearchBytes += len(searchText)
+		if totalSearchBytes > maxSearchCorpusBytes {
+			return nil, fmt.Errorf("toolsearch: search corpus exceeds %d bytes", maxSearchCorpusBytes)
+		}
+		canonical = append(canonical, canonicalEntry{
+			Namespace: entry.Namespace, Name: entry.Name,
+			Description: entry.Description, Parameters: schema,
+			Aliases: entry.Aliases, Tags: entry.Tags,
+			SearchText: searchText,
+		})
+	}
+	if suppliedSearchText != nil && len(suppliedSearchText) != len(byName) {
+		for name := range suppliedSearchText {
+			if _, exists := byName[name]; !exists {
+				return nil, fmt.Errorf("toolsearch: search document references unknown tool %q", name)
+			}
+		}
+		return nil, errors.New("toolsearch: search document count does not match catalog")
+	}
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Name < canonical[j].Name })
+
+	documents := make([]Document, 0, len(canonical))
+	for _, item := range canonical {
+		documents = append(documents, Document{ID: item.Name, Text: item.SearchText})
 	}
 	index, err := New(documents)
 	if err != nil {
@@ -129,8 +194,39 @@ func (c *Catalog) Digest() string {
 	return c.digest
 }
 
+// Lookup returns the complete model-facing definition for one authorized tool.
+// The returned value is a defensive copy. Unknown names fail closed.
+func (c *Catalog) Lookup(name string) (Entry, bool) {
+	if c == nil {
+		return Entry{}, false
+	}
+	entry, ok := c.entries[name]
+	if !ok {
+		return Entry{}, false
+	}
+	return cloneEntry(entry), true
+}
+
 // Search returns one to eight authorized hits with complete schemas.
 func (c *Catalog) Search(query string, limit int) ([]Match, error) {
+	if limit < 1 || limit > maxSearchResults {
+		return nil, fmt.Errorf("toolsearch: limit must be between 1 and %d", maxSearchResults)
+	}
+	return c.searchFiltered(query, limit, nil)
+}
+
+// SearchFiltered ranks the complete authorized catalog, then returns entries
+// accepted by filter. The filter implements retrieval policy, not
+// authorization: excluded tools must never be supplied to NewCatalog. Entry
+// values passed to filter and returned to callers are defensive copies.
+func (c *Catalog) SearchFiltered(query string, limit int, filter func(Entry) bool) ([]Match, error) {
+	if limit < 1 || limit > maxCatalogEntries {
+		return nil, fmt.Errorf("toolsearch: filtered limit must be between 1 and %d", maxCatalogEntries)
+	}
+	return c.searchFiltered(query, limit, filter)
+}
+
+func (c *Catalog) searchFiltered(query string, limit int, filter func(Entry) bool) ([]Match, error) {
 	if c == nil || c.index == nil {
 		return nil, errors.New("toolsearch: catalog is unavailable")
 	}
@@ -141,20 +237,23 @@ func (c *Catalog) Search(query string, limit int) ([]Match, error) {
 	if len(query) > maxSearchQueryBytes || !utf8.ValidString(query) {
 		return nil, fmt.Errorf("toolsearch: query exceeds %d UTF-8 bytes", maxSearchQueryBytes)
 	}
-	if limit < 1 || limit > maxSearchResults {
-		return nil, fmt.Errorf("toolsearch: limit must be between 1 and %d", maxSearchResults)
-	}
-	hits := c.index.Search(query, limit)
+	hits := c.index.Search(query, len(c.entries))
 	if len(hits) == 0 {
 		return nil, nil
 	}
-	matches := make([]Match, 0, len(hits))
+	matches := make([]Match, 0, limit)
 	for _, hit := range hits {
 		entry, ok := c.entries[hit.ID]
 		if !ok {
 			return nil, fmt.Errorf("toolsearch: index references unknown tool %q", hit.ID)
 		}
+		if filter != nil && !filter(cloneEntry(entry)) {
+			continue
+		}
 		matches = append(matches, Match{Score: hit.Score, Entry: cloneEntry(entry)})
+		if len(matches) == limit {
+			break
+		}
 	}
 	return matches, nil
 }
@@ -181,8 +280,15 @@ func (r *Registry) Rebuild(entries []Entry) error {
 	if err != nil {
 		return err
 	}
-	r.current.Store(catalog)
-	return nil
+	for {
+		current := r.current.Load()
+		if current != nil && current.digest == catalog.digest {
+			return nil
+		}
+		if r.current.CompareAndSwap(current, catalog) {
+			return nil
+		}
+	}
 }
 
 func (r *Registry) Catalog() *Catalog {

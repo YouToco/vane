@@ -16,8 +16,6 @@ package tikhubcatalog
 
 import (
 	"strings"
-
-	"github.com/YouToco/vane/toolsearch"
 )
 
 // docText 拼接一个端点的可检索文本。各域直接连接：BM25F 分域加权对这个体量是
@@ -40,45 +38,6 @@ func docText(e Entry) string {
 		b.WriteString(p.Desc)
 	}
 	return b.String()
-}
-
-func buildIndex(entries []Entry) *toolsearch.Index {
-	documents := make([]toolsearch.Document, len(entries))
-	for i, entry := range entries {
-		documents[i] = toolsearch.Document{ID: entry.Name, Text: docText(entry)}
-	}
-	index, err := toolsearch.New(documents)
-	if err != nil {
-		panic("tikhubcatalog: build BM25 index: " + err.Error())
-	}
-	return index
-}
-
-func searchIndex(index *toolsearch.Index, query, platform string, topK int) []Hit {
-	platform = strings.ToLower(strings.TrimSpace(platform))
-	allowAdvanced := explicitAdvancedAnalyticsQuery(query)
-	ranked := index.Search(query, len(agentEntries))
-	if len(ranked) == 0 {
-		return nil
-	}
-	hits := make([]Hit, 0, len(ranked))
-	for _, rankedHit := range ranked {
-		doc, exists := agentByName[rankedHit.ID]
-		if !exists {
-			panic("tikhubcatalog: BM25 index returned unknown entry " + rankedHit.ID)
-		}
-		if platform != "" && agentEntries[doc].Platform != platform {
-			continue
-		}
-		if advancedAnalyticsEntry(agentEntries[doc]) && !allowAdvanced {
-			continue
-		}
-		hits = append(hits, Hit{Entry: agentEntries[doc], Score: rankedHit.Score})
-		if len(hits) == topK {
-			break
-		}
-	}
-	return hits
 }
 
 func explicitAdvancedAnalyticsQuery(query string) bool {

@@ -3,6 +3,7 @@ package toolsearch
 import (
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -103,6 +104,87 @@ func TestCatalogDigestIsCanonical(t *testing.T) {
 	}
 }
 
+func TestCatalogWithDocumentsBindsStableSearchCorpus(t *testing.T) {
+	t.Parallel()
+	entries := catalogFixture()
+	left, err := NewCatalogWithDocuments(entries, []Document{
+		{ID: entries[0].Name, Text: "  legacy   creator ranking  "},
+		{ID: entries[1].Name, Text: "legacy product ranking"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := NewCatalogWithDocuments([]Entry{entries[1], entries[0]}, []Document{
+		{ID: entries[1].Name, Text: "legacy product ranking"},
+		{ID: entries[0].Name, Text: "legacy creator ranking"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left.Digest() != right.Digest() {
+		t.Fatalf("equivalent custom catalogs have different digests: %s != %s", left.Digest(), right.Digest())
+	}
+	matches, err := left.Search("legacy creator", 2)
+	if err != nil || len(matches) != 2 || matches[0].Entry.Name != entries[0].Name {
+		t.Fatalf("custom search = %#v, err=%v", matches, err)
+	}
+	changed, err := NewCatalogWithDocuments(entries, []Document{
+		{ID: entries[0].Name, Text: "changed creator ranking"},
+		{ID: entries[1].Name, Text: "legacy product ranking"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Digest() == left.Digest() {
+		t.Fatal("search corpus change did not change catalog digest")
+	}
+
+	for _, documents := range [][]Document{
+		{{ID: entries[0].Name, Text: "missing second"}},
+		{{ID: entries[0].Name, Text: "first"}, {ID: entries[0].Name, Text: "duplicate"}},
+		{{ID: entries[0].Name, Text: "first"}, {ID: "unknown", Text: "unknown"}},
+		{{ID: entries[0].Name, Text: string([]byte{0xff})}, {ID: entries[1].Name, Text: "valid"}},
+		{{ID: entries[0].Name, Text: strings.Repeat("x", maxSearchDocBytes+1)}, {ID: entries[1].Name, Text: "valid"}},
+	} {
+		if _, err := NewCatalogWithDocuments(entries, documents); err == nil {
+			t.Fatalf("NewCatalogWithDocuments(%#v) succeeded, want error", documents)
+		}
+	}
+}
+
+func TestCatalogWithDocumentsRejectsOversizeCorpus(t *testing.T) {
+	t.Parallel()
+	if _, err := NewCatalogWithDocuments(catalogFixture(), make([]Document, maxCatalogEntries+1)); err == nil {
+		t.Fatal("oversize document count succeeded, want error")
+	}
+	documentText := strings.Repeat("x", maxSearchDocBytes)
+	documents := make([]Document, maxSearchCorpusBytes/maxSearchDocBytes+1)
+	for i := range documents {
+		documents[i] = Document{ID: "tool_" + strconv.Itoa(i), Text: documentText}
+	}
+	if _, err := NewCatalogWithDocuments(catalogFixture(), documents); err == nil {
+		t.Fatal("oversize search corpus succeeded, want error")
+	}
+}
+
+func TestCatalogSearchFilteredPreservesGlobalRanking(t *testing.T) {
+	t.Parallel()
+	entries := catalogFixture()
+	catalog, err := NewCatalogWithDocuments(entries, []Document{
+		{ID: entries[0].Name, Text: "shared shared creator"},
+		{ID: entries[1].Name, Text: "shared product"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := catalog.SearchFiltered("shared", 1, func(entry Entry) bool {
+		return entry.Name == entries[1].Name
+	})
+	if err != nil || len(matches) != 1 || matches[0].Entry.Name != entries[1].Name {
+		t.Fatalf("filtered search = %#v, err=%v", matches, err)
+	}
+}
+
 func TestCatalogDefensiveCopies(t *testing.T) {
 	t.Parallel()
 	entries := catalogFixture()
@@ -194,6 +276,14 @@ func TestRegistryPublishesOnlyCompleteCatalogs(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := registry.Catalog()
+	equivalent := catalogFixture()
+	equivalent[0], equivalent[1] = equivalent[1], equivalent[0]
+	if err := registry.Rebuild(equivalent); err != nil {
+		t.Fatal(err)
+	}
+	if registry.Catalog() != before {
+		t.Fatal("equivalent rebuild published a new catalog pointer")
+	}
 	if err := registry.Rebuild([]Entry{{Name: "broken"}}); err == nil {
 		t.Fatal("invalid rebuild succeeded")
 	}
@@ -226,5 +316,39 @@ func TestRegistryPublishesOnlyCompleteCatalogs(t *testing.T) {
 	wait.Wait()
 	if registry.Catalog() == before || registry.Catalog().Digest() == before.Digest() {
 		t.Fatal("valid rebuild did not publish new catalog")
+	}
+}
+
+func TestRegistryConcurrentEquivalentRebuildReusesPublishedPointer(t *testing.T) {
+	t.Parallel()
+	registry, err := NewRegistry(catalogFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := append(catalogFixture(), Entry{
+		Namespace: "news", Name: "search_press_releases", Description: "Search official press releases",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	})
+	const writers = 16
+	var wait sync.WaitGroup
+	wait.Add(writers)
+	for i := 0; i < writers; i++ {
+		go func() {
+			defer wait.Done()
+			if rebuildErr := registry.Rebuild(next); rebuildErr != nil {
+				t.Errorf("Rebuild() error = %v", rebuildErr)
+			}
+		}()
+	}
+	wait.Wait()
+	published := registry.Catalog()
+	if published == nil {
+		t.Fatal("concurrent rebuild published nil")
+	}
+	if err := registry.Rebuild(next); err != nil {
+		t.Fatal(err)
+	}
+	if registry.Catalog() != published {
+		t.Fatal("same digest did not reuse concurrently published catalog pointer")
 	}
 }

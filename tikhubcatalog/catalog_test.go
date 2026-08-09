@@ -1,10 +1,13 @@
 package tikhubcatalog
 
 import (
+	"encoding/json"
 	"reflect"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/YouToco/vane/toolsearch"
 )
 
 // fcNameRe 是 FC 工具名约束（DeepSeek/OpenAI 兼容面，与 gen 的硬校验同一正则）。
@@ -13,10 +16,11 @@ var fcNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 // TestInvariant_CatalogWellFormed 锁死嵌入数据的结构不变量：init 里的 panic 分支
 // 生产不可达的前提就是本测试在 CI 拦住损坏的 catalog.json。
 func TestInvariant_CatalogWellFormed(t *testing.T) {
-	if Len() < 850 {
-		// 全量收录（排除平台管理类）应有 ~1000 端点：数量骤降说明 re-gen 时
-		// 排除清单误伤或上游 spec 大幅缩水，都需要人工确认而不是静默接受。
-		t.Fatalf("注册表仅 %d 个端点，疑似生成损坏", Len())
+	// The reviewed upstream snapshot had 995 entries. Commit 1630f82 removed
+	// 14 credential/encryption capabilities from even the trusted internal
+	// registry, leaving 981. The stricter model directory admits 883.
+	if Len() != 981 || AgentLen() != 883 {
+		t.Fatalf("catalog cardinality drifted: internal=%d want 981, agent=%d want 883", Len(), AgentLen())
 	}
 	seen := make(map[string]bool, Len())
 	for _, e := range entries {
@@ -87,9 +91,6 @@ func TestInvariant_ExcludedEndpointsAbsent(t *testing.T) {
 }
 
 func TestInvariant_CredentialAndRemoteMutationCapabilitiesAbsent(t *testing.T) {
-	if AgentLen() < 850 || AgentLen() >= Len() {
-		t.Fatalf("Agent 目录数量异常: agent=%d internal=%d", AgentLen(), Len())
-	}
 	for _, e := range Entries() {
 		normalized := strings.ToLower(e.Name)
 		for _, marker := range []string{
@@ -123,6 +124,117 @@ func TestInvariant_CredentialAndRemoteMutationCapabilitiesAbsent(t *testing.T) {
 				name == "password" ||
 				name == "signature" {
 				t.Errorf("%s: forbidden credential parameter %s", e.Name, param.Name)
+			}
+		}
+	}
+}
+
+func TestAgentCatalogDigestAndOrderAreStable(t *testing.T) {
+	modelEntries := make([]toolsearch.Entry, 0, len(agentEntries))
+	documents := make([]toolsearch.Document, 0, len(agentEntries))
+	for i := len(agentEntries) - 1; i >= 0; i-- {
+		entry := agentEntries[i]
+		modelEntries = append(modelEntries, modelToolEntry(entry))
+		documents = append(documents, toolsearch.Document{ID: entry.Name, Text: docText(entry)})
+	}
+	rebuilt, err := toolsearch.NewCatalogWithDocuments(modelEntries, documents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.Digest() != AgentCatalogDigest() {
+		t.Fatalf("input order changed digest: %s != %s", rebuilt.Digest(), AgentCatalogDigest())
+	}
+	const wantDigest = "9489a76cafbd0e18d6a408abcb8c59f28d4935409ad54018637106b19c24d8dc"
+	if AgentCatalogDigest() != wantDigest {
+		t.Fatalf("agent catalog digest = %s, want %s", AgentCatalogDigest(), wantDigest)
+	}
+	for _, query := range []string{"抖音 热点 榜单", "youtube search video", "小红书 搜索 笔记"} {
+		got, err := agentCatalog.Search(query, 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := rebuilt.Search(query, 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("reordered catalog changed Search(%q): %#v != %#v", query, got, want)
+		}
+	}
+}
+
+func TestAgentCatalogIndexesOnlyEligibleDirectory(t *testing.T) {
+	documents := make([]toolsearch.Document, len(agentEntries))
+	for i, entry := range agentEntries {
+		documents[i] = toolsearch.Document{ID: entry.Name, Text: docText(entry)}
+	}
+	authorizedOnly, err := toolsearch.New(documents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{"video detail", "用户 主页", "search notes"} {
+		want := authorizedOnly.Search(query, 8)
+		got, err := agentCatalog.SearchFiltered(query, 8, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("Search(%q) length = %d, want %d", query, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Entry.Name != want[i].ID || got[i].Score != want[i].Score {
+				t.Fatalf("Search(%q)[%d] = %s/%v, want %s/%v", query, i,
+					got[i].Entry.Name, got[i].Score, want[i].ID, want[i].Score)
+			}
+		}
+	}
+}
+
+func TestAgentDefinitionIsAuthorizedCompleteAndDefensive(t *testing.T) {
+	const name = "xiaohongshu_app_v2_search_notes"
+	definition, ok := AgentDefinition(name)
+	if !ok {
+		t.Fatalf("AgentDefinition(%q) not found", name)
+	}
+	if definition.Name != name || definition.Namespace != "social/xiaohongshu" || definition.Description == "" {
+		t.Fatalf("AgentDefinition(%q) = %#v", name, definition)
+	}
+	var schema struct {
+		Type       string                     `json:"type"`
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(definition.Parameters, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if schema.Type != "object" || len(schema.Properties) == 0 || schema.Properties["keyword"] == nil {
+		t.Fatalf("model schema is incomplete: %s", definition.Parameters)
+	}
+	definition.Parameters[0] = '!'
+	again, ok := AgentDefinition(name)
+	if !ok || again.Parameters[0] != '{' {
+		t.Fatal("AgentDefinition returned mutable catalog storage")
+	}
+
+	for _, excluded := range []string{
+		"xiaohongshu_web_v3_fetch_note_detail",
+		"douyin_web_fetch_douyin_web_guest_cookie",
+	} {
+		if _, ok := AgentDefinition(excluded); ok {
+			t.Fatalf("excluded tool %q has a model definition", excluded)
+		}
+	}
+}
+
+func TestAgentDefinitionsExcludeProviderTransportMetadata(t *testing.T) {
+	for _, entry := range agentEntries {
+		definition, ok := AgentDefinition(entry.Name)
+		if !ok {
+			t.Fatalf("eligible tool %q has no model definition", entry.Name)
+		}
+		visible := strings.ToLower(definition.Description + "\n" + string(definition.Parameters))
+		for _, forbidden := range []string{"tikhub", "cookie", "/api/v", "endpoint path", "request method"} {
+			if strings.Contains(visible, forbidden) {
+				t.Fatalf("model definition %q leaked %q", entry.Name, forbidden)
 			}
 		}
 	}
@@ -286,6 +398,90 @@ func TestSearch_Determinism(t *testing.T) {
 	}
 }
 
+func TestSearchToolsReturnsCompleteDefinitionsWithLegacyRanking(t *testing.T) {
+	for _, test := range []struct {
+		query    string
+		platform string
+	}{
+		{query: "抖音 热点 榜单"},
+		{query: "tiktok user post video list", platform: "tiktok"},
+		{query: "youtube search video", platform: "youtube"},
+	} {
+		matches, err := SearchTools(test.query, test.platform, 5)
+		if err != nil {
+			t.Fatalf("SearchTools(%q): %v", test.query, err)
+		}
+		legacy := Search(test.query, test.platform, 5)
+		if len(matches) != len(legacy) {
+			t.Fatalf("SearchTools(%q) returned %d, legacy returned %d", test.query, len(matches), len(legacy))
+		}
+		for i := range matches {
+			if matches[i].Entry.Name != legacy[i].Entry.Name || matches[i].Score != legacy[i].Score {
+				t.Fatalf("SearchTools(%q)[%d] = %s/%v, legacy = %s/%v", test.query, i,
+					matches[i].Entry.Name, matches[i].Score, legacy[i].Entry.Name, legacy[i].Score)
+			}
+			if len(matches[i].Entry.Parameters) == 0 {
+				t.Fatalf("SearchTools(%q)[%d] omitted schema", test.query, i)
+			}
+			definition, ok := AgentDefinition(matches[i].Entry.Name)
+			if !ok || !reflect.DeepEqual(matches[i].Entry, definition) {
+				t.Fatalf("SearchTools(%q)[%d] definition differs from exact activation lookup", test.query, i)
+			}
+			provider, ok := AgentLookup(matches[i].Entry.Name)
+			if !ok || test.platform != "" && provider.Platform != test.platform {
+				t.Fatalf("SearchTools(%q)[%d] violated platform policy: %+v", test.query, i, provider)
+			}
+		}
+	}
+}
+
+func TestSearchToolsAdvancedAnalyticsPolicy(t *testing.T) {
+	for _, match := range mustSearchTools(t, "video creator list", "douyin", 8) {
+		entry, ok := AgentLookup(match.Entry.Name)
+		if !ok {
+			t.Fatalf("unknown match %q", match.Entry.Name)
+		}
+		if advancedAnalyticsEntry(entry) {
+			t.Fatalf("generic query exposed advanced analytics tool %q", entry.Name)
+		}
+	}
+	foundAdvanced := false
+	for _, match := range mustSearchTools(t, "douplus 投放 creator analytics", "douyin", 8) {
+		entry, ok := AgentLookup(match.Entry.Name)
+		if ok && advancedAnalyticsEntry(entry) {
+			foundAdvanced = true
+			break
+		}
+	}
+	if !foundAdvanced {
+		t.Fatal("explicit advanced analytics query did not return an advanced tool")
+	}
+}
+
+func mustSearchTools(t *testing.T, query, platform string, limit int) []toolsearch.Match {
+	t.Helper()
+	matches, err := SearchTools(query, platform, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return matches
+}
+
+func TestSearchToolsBounds(t *testing.T) {
+	for _, test := range []struct {
+		query string
+		limit int
+	}{
+		{query: "", limit: 5},
+		{query: "video", limit: 0},
+		{query: "video", limit: maxModelSearchResults + 1},
+	} {
+		if _, err := SearchTools(test.query, "", test.limit); err == nil {
+			t.Fatalf("SearchTools(%q, %d) succeeded, want error", test.query, test.limit)
+		}
+	}
+}
+
 func TestSearch_EdgeCases(t *testing.T) {
 	if got := Search("", "", 5); got != nil {
 		t.Errorf("空查询应返回 nil，实际 %d 条", len(got))
@@ -340,6 +536,15 @@ func TestSearch_RankingCompatibility(t *testing.T) {
 		}
 		if !reflect.DeepEqual(got, test.want) {
 			t.Errorf("Search(%q) = %#v, want %#v", test.query, got, test.want)
+		}
+	}
+}
+
+func BenchmarkSearchToolsTop5(b *testing.B) {
+	for b.Loop() {
+		matches, err := SearchTools("小红书 搜索 笔记", "xiaohongshu", 5)
+		if err != nil || len(matches) != 5 {
+			b.Fatalf("SearchTools() = %d matches, err=%v", len(matches), err)
 		}
 	}
 }
