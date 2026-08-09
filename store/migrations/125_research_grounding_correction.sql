@@ -236,7 +236,8 @@ BEGIN
     IF snapshot_json IS NULL THEN
         RAISE EXCEPTION '125: synthesis snapshot scope differs' USING ERRCODE='23514';
     END IF;
-    IF snapshot_json #>> '{research_model,synthesis,renderer_version}' NOT IN (
+    IF snapshot_json #>> '{research_model,synthesis,renderer_version}' IS NULL OR
+       snapshot_json #>> '{research_model,synthesis,renderer_version}' NOT IN (
        'research-synthesis.render/v3.5','research-synthesis.render/v3.6') THEN
         IF snapshot_json #> '{definition,research_scope}' IS NOT NULL OR
            convert_from(NEW.context_payload,'UTF8')::jsonb->>'schema_version' =
@@ -693,7 +694,7 @@ DECLARE
     selected_pricing_rule_id BIGINT;
     admitted_id BIGINT;
 BEGIN
-    IF requested_stage<>'synthesis' OR requested_round_ordinal NOT IN (2,3) THEN
+    IF requested_stage<>'synthesis' OR requested_round_ordinal NOT IN (1,2,3) THEN
         RETURN QUERY SELECT * FROM public.admit_research_run_llm_spend_v5(
             requested_tenant_id,requested_user_id,requested_task_id,
             requested_run_snapshot_id,requested_stage,requested_round_ordinal,
@@ -731,7 +732,18 @@ BEGIN
        AND snapshot.task_id=requested_task_id
        AND snapshot.reference_schema_version='vane.research-run-snapshot-ref/v3'
      FOR UPDATE;
+	IF requested_round_ordinal=1 AND snapshot_json IS NOT NULL AND
+	   snapshot_json #>> '{research_model,synthesis,renderer_version}' IS DISTINCT FROM
+	       'research-synthesis.render/v3.6' THEN
+		RETURN QUERY SELECT * FROM public.admit_research_run_llm_spend_v5(
+			requested_tenant_id,requested_user_id,requested_task_id,
+			requested_run_snapshot_id,requested_stage,requested_round_ordinal,
+			requested_subject_id,requested_attempt_key,requested_request_digest,
+			requested_trace_id,requested_user_prompt);
+		RETURN;
+	END IF;
     stage_key := CASE requested_round_ordinal
+		WHEN 1 THEN 'grounding_verifier'
         WHEN 2 THEN 'grounding_corrector'
         WHEN 3 THEN 'grounding_verifier'
         ELSE NULL
@@ -739,6 +751,21 @@ BEGIN
     IF snapshot_json IS NULL OR stage_key IS NULL OR
        snapshot_json #>> '{research_model,synthesis,renderer_version}' IS DISTINCT FROM
            'research-synthesis.render/v3.6' OR
+	   (requested_round_ordinal=1 AND NOT EXISTS (
+		   SELECT 1
+		     FROM public.research_brief_grounding_verifications grounding
+		     JOIN public.research_brief_syntheses brief
+		       ON brief.id=grounding.synthesis_id
+		    WHERE grounding.synthesis_id=requested_subject_id
+		      AND grounding.tenant_id=requested_tenant_id
+		      AND grounding.user_id=requested_user_id
+		      AND grounding.task_id=requested_task_id
+		      AND grounding.run_snapshot_id=requested_run_snapshot_id
+		      AND grounding.status='prepared' AND brief.status='spending'
+		      AND grounding.verifier_prompt=convert_to(requested_user_prompt,'UTF8')
+		      AND grounding.verifier_prompt_digest=
+		          encode(sha256(convert_to(requested_user_prompt,'UTF8')),'hex')
+	   )) OR
        (requested_round_ordinal=2 AND NOT EXISTS (
            SELECT 1
              FROM public.research_brief_grounding_corrections correction
