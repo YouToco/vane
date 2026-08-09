@@ -556,6 +556,13 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		"freeze_research_llm_gateway_request_v2(bigint,text,text,text)":                             true,
 		"load_research_run_bound_llm_call_v1(bigint,bigint)":                                        true,
 	}
+	// Migration 123 intentionally retains the capability-fenced v4 wrapper so
+	// the previously deployed v3.3 binary remains operational during rollout.
+	// Raw v4/v5 admission functions stay non-callable and are still rejected by
+	// the privilege probe above.
+	if admissionV5Available && admissionV4Available {
+		allowedDefiners["admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"] = true
+	}
 	const nativeScheduleMaturitySignature = "native_research_schedule_mature_v3_v1(bigint,bigint,text)"
 	nativeScheduleMaturityRequired, err := nativeResearchCreationSchemaV3Active(ctx, tx)
 	if err != nil {
