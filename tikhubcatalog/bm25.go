@@ -42,53 +42,25 @@ func docText(e Entry) string {
 	return b.String()
 }
 
-func buildIndex(entries []Entry) *toolsearch.Index {
-	documents := make([]toolsearch.Document, len(entries))
-	for i, entry := range entries {
-		documents[i] = toolsearch.Document{ID: entry.Name, Text: docText(entry)}
-	}
-	index, err := toolsearch.New(documents)
-	if err != nil {
-		panic("tikhubcatalog: build BM25 index: " + err.Error())
-	}
-	return index
-}
-
-func searchIndex(index *toolsearch.Index, query, platform string, topK int) []Hit {
-	platform = strings.ToLower(strings.TrimSpace(platform))
-	allowAdvanced := explicitAdvancedAnalyticsQuery(query)
-	ranked := index.Search(query, len(agentEntries))
-	if len(ranked) == 0 {
-		return nil
-	}
-	hits := make([]Hit, 0, len(ranked))
-	for _, rankedHit := range ranked {
-		doc, exists := agentByName[rankedHit.ID]
-		if !exists {
-			panic("tikhubcatalog: BM25 index returned unknown entry " + rankedHit.ID)
-		}
-		if platform != "" && agentEntries[doc].Platform != platform {
-			continue
-		}
-		if advancedAnalyticsEntry(agentEntries[doc]) && !allowAdvanced {
-			continue
-		}
-		hits = append(hits, Hit{Entry: agentEntries[doc], Score: rankedHit.Score})
-		if len(hits) == topK {
-			break
-		}
-	}
-	return hits
-}
-
 func explicitAdvancedAnalyticsQuery(query string) bool {
 	normalized := strings.ToLower(query)
 	for _, marker := range []string{
 		"广告", "投放", "店铺", "电商", "带货", "创作者分析", "达人分析",
-		"ads", "advertising", "shop", "commerce", "creator analytics",
-		"merchant", "douplus", "星图", "xingtu",
+		"星图",
 	} {
 		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	tokens := toolsearch.Tokenize(normalized)
+	for _, token := range tokens {
+		switch token {
+		case "ads", "advertising", "shop", "commerce", "merchant", "douplus", "xingtu":
+			return true
+		}
+	}
+	for i := 0; i+1 < len(tokens); i++ {
+		if tokens[i] == "creator" && tokens[i+1] == "analytics" {
 			return true
 		}
 	}

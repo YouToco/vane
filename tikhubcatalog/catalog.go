@@ -66,7 +66,9 @@ var (
 	agentByName  map[string]int
 	// platforms 平台名 → 端点数，供 search_endpoints 工具描述枚举可搜索范围。
 	platforms map[string]int
-	idx       *toolsearch.Index
+	// agentCatalog contains only the post-agentEligible, provider-neutral
+	// model directory. Excluded internal names never enter its BM25 corpus.
+	agentCatalog *toolsearch.Catalog
 )
 
 // init 解析嵌入数据并建索引。catalog.json 是编译期常量（go:embed），解析失败
@@ -79,6 +81,8 @@ func init() {
 	byName = make(map[string]int, len(entries))
 	agentByName = make(map[string]int, len(entries))
 	platforms = make(map[string]int)
+	modelEntries := make([]toolsearch.Entry, 0, len(entries))
+	searchDocuments := make([]toolsearch.Document, 0, len(entries))
 	for i, e := range entries {
 		if _, dup := byName[e.Name]; dup {
 			panic(fmt.Sprintf("tikhubcatalog: 端点名重复 %q（catalog.json 损坏，请重新生成）", e.Name))
@@ -90,8 +94,14 @@ func init() {
 		agentByName[e.Name] = len(agentEntries)
 		agentEntries = append(agentEntries, e)
 		platforms[e.Platform]++
+		modelEntries = append(modelEntries, modelToolEntry(e))
+		searchDocuments = append(searchDocuments, toolsearch.Document{ID: e.Name, Text: docText(e)})
 	}
-	idx = buildIndex(agentEntries)
+	var err error
+	agentCatalog, err = toolsearch.NewCatalogWithDocuments(modelEntries, searchDocuments)
+	if err != nil {
+		panic("tikhubcatalog: build authorized tool catalog: " + err.Error())
+	}
 }
 
 // Lookup 按工具名取端点。ok=false 表示注册表里没有这个端点。
@@ -100,7 +110,7 @@ func Lookup(name string) (Entry, bool) {
 	if !ok {
 		return Entry{}, false
 	}
-	return entries[i], true
+	return cloneProviderEntry(entries[i]), true
 }
 
 // AgentLookup resolves only entries admitted to the model-callable discovery
@@ -110,7 +120,14 @@ func AgentLookup(name string) (Entry, bool) {
 	if !ok {
 		return Entry{}, false
 	}
-	return agentEntries[i], true
+	return cloneProviderEntry(agentEntries[i]), true
+}
+
+// AgentDefinition returns the complete provider-neutral model definition for
+// one authorized dynamic tool. Unknown and source-binding-only names fail
+// closed. The returned schema and labels are defensive copies.
+func AgentDefinition(name string) (toolsearch.Entry, bool) {
+	return agentCatalog.Lookup(name)
 }
 
 // Len 返回注册表端点总数。
@@ -119,11 +136,19 @@ func Len() int { return len(entries) }
 // Entries returns a defensive copy of the model-callable discovery directory.
 // Provider routing and source-binding-only entries remain internal.
 func Entries() []Entry {
-	return append([]Entry(nil), agentEntries...)
+	out := make([]Entry, len(agentEntries))
+	for i, entry := range agentEntries {
+		out[i] = cloneProviderEntry(entry)
+	}
+	return out
 }
 
 // AgentLen returns the number of model-callable dynamic tools.
 func AgentLen() int { return len(agentEntries) }
+
+// AgentCatalogDigest identifies the normalized authorized model directory and
+// its compatibility search corpus.
+func AgentCatalogDigest() string { return agentCatalog.Digest() }
 
 // Platforms 返回全部平台名（字典序），供工具描述与参数校验枚举。
 func Platforms() []string {
@@ -194,5 +219,93 @@ func Search(query, platform string, topK int) []Hit {
 	if topK <= 0 {
 		return nil
 	}
-	return searchIndex(idx, query, platform, topK)
+	if topK > AgentLen() {
+		topK = AgentLen()
+	}
+	matches, err := searchTools(query, platform, topK)
+	if err != nil {
+		return nil
+	}
+	hits := make([]Hit, 0, len(matches))
+	for _, match := range matches {
+		index, ok := agentByName[match.Entry.Name]
+		if !ok {
+			panic("tikhubcatalog: generic catalog returned unknown entry " + match.Entry.Name)
+		}
+		hits = append(hits, Hit{Entry: cloneProviderEntry(agentEntries[index]), Score: match.Score})
+	}
+	return hits
+}
+
+func cloneProviderEntry(entry Entry) Entry {
+	entry.Params = append([]Param(nil), entry.Params...)
+	for i := range entry.Params {
+		parameter := &entry.Params[i]
+		parameter.Default = cloneProviderJSONValue(parameter.Default)
+		if parameter.Enum != nil {
+			rawEnum := parameter.Enum
+			parameter.Enum = make([]any, len(rawEnum))
+			for j, value := range rawEnum {
+				parameter.Enum[j] = cloneProviderJSONValue(value)
+			}
+		}
+	}
+	return entry
+}
+
+func cloneProviderJSONValue(value any) any {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = cloneProviderJSONValue(child)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			out[key] = cloneProviderJSONValue(child)
+		}
+		return out
+	case []string:
+		return append([]string(nil), typed...)
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for key, child := range typed {
+			out[key] = child
+		}
+		return out
+	case json.RawMessage:
+		return append(json.RawMessage(nil), typed...)
+	default:
+		return value
+	}
+}
+
+const maxModelSearchResults = 8
+
+// SearchTools searches the authorized provider-neutral directory and returns
+// complete model-facing definitions, including canonical parameter schemas.
+// Platform and advanced-analytics policies are identical to legacy Search.
+func SearchTools(query, platform string, limit int) ([]toolsearch.Match, error) {
+	if limit < 1 || limit > maxModelSearchResults {
+		return nil, fmt.Errorf("tikhubcatalog: limit must be between 1 and %d", maxModelSearchResults)
+	}
+	return searchTools(query, platform, limit)
+}
+
+func searchTools(query, platform string, limit int) ([]toolsearch.Match, error) {
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	allowAdvanced := explicitAdvancedAnalyticsQuery(query)
+	return agentCatalog.SearchFiltered(query, limit, func(tool toolsearch.Entry) bool {
+		index, ok := agentByName[tool.Name]
+		if !ok {
+			panic("tikhubcatalog: generic catalog filter saw unknown entry " + tool.Name)
+		}
+		providerEntry := agentEntries[index]
+		if platform != "" && providerEntry.Platform != platform {
+			return false
+		}
+		return !advancedAnalyticsEntry(providerEntry) || allowAdvanced
+	})
 }
