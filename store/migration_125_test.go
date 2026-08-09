@@ -35,6 +35,17 @@ func TestMigration125FreezesOneCorrectionAndOneReverification(t *testing.T) {
 		"research-synthesis.render/v3.6",
 		"grounding_corrector",
 		"research_brief_grounding_finalization_v36",
+		"research_grounding_has_exact_receipt_v125",
+		"research_expected_grounding_correction_prompt_v125",
+		"research_expected_grounding_verifier_prompt_v125",
+		"enforce_research_grounding_insert_v125",
+		"enforce_research_grounding_correction_insert_v125",
+		"research_correction_has_exact_candidate_receipt_v125",
+		"research_grounding_correction_citations_subset_v125",
+		"research_brief_matches_completion_v125",
+		"research_brief_candidate_valid_v125",
+		"grounding.id,'rejected'",
+		"grounding.id,'grounded'",
 		"correction.corrected_brief_payload=NEW.brief_payload",
 		"final corrected research Brief differs from its completed correction receipt",
 		"reservation.round_ordinal=2",
@@ -78,6 +89,10 @@ func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	var correctionTable, correctionTrigger, finalizationTrigger, admissionV6 bool
+	var groundingReceiptHelper, correctionReceiptHelper bool
+	var expectedPromptHelper, expectedVerifierHelper, citationSubsetHelper bool
+	var briefCompletionHelper, briefCandidateHelper bool
+	var correctionInsertTrigger, groundingInsertTrigger bool
 	var scopeTriggerFunction, reservationTriggerFunction string
 	if err := database.QueryRowContext(t.Context(), `SELECT
 		to_regclass('public.research_brief_grounding_corrections') IS NOT NULL,
@@ -88,6 +103,31 @@ func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 		to_regprocedure(
 		 'admit_research_run_llm_spend_cap_v6(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
 		) IS NOT NULL,
+		to_regprocedure(
+		 'research_grounding_has_exact_receipt_v125(bigint,text)'
+		) IS NOT NULL,
+		to_regprocedure(
+		 'research_correction_has_exact_candidate_receipt_v125(bigint)'
+		) IS NOT NULL,
+		to_regprocedure(
+		 'research_expected_grounding_correction_prompt_v125(bigint)'
+		) IS NOT NULL,
+		to_regprocedure(
+		 'research_expected_grounding_verifier_prompt_v125(bigint,bytea,text)'
+		) IS NOT NULL,
+		to_regprocedure(
+		 'research_grounding_correction_citations_subset_v125(bytea,bytea)'
+		) IS NOT NULL,
+		to_regprocedure(
+		 'research_brief_matches_completion_v125(bytea,text)'
+		) IS NOT NULL,
+		to_regprocedure(
+		 'research_brief_candidate_valid_v125(bigint,bytea)'
+		) IS NOT NULL,
+		EXISTS (SELECT 1 FROM pg_trigger
+		         WHERE tgname='enforce_research_grounding_correction_insert_v125'),
+		EXISTS (SELECT 1 FROM pg_trigger
+		         WHERE tgname='enforce_research_grounding_insert_v125'),
 		(SELECT proname FROM pg_trigger trigger
 		 JOIN pg_proc function ON function.oid=trigger.tgfoid
 		 WHERE trigger.tgname='research_scope_window_v33'),
@@ -95,14 +135,26 @@ func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 		 JOIN pg_proc function ON function.oid=trigger.tgfoid
 		 WHERE trigger.tgname='research_run_llm_spend_reservation_v1')`,
 	).Scan(&correctionTable, &correctionTrigger, &finalizationTrigger,
-		&admissionV6, &scopeTriggerFunction, &reservationTriggerFunction); err != nil {
+		&admissionV6, &groundingReceiptHelper, &correctionReceiptHelper,
+		&expectedPromptHelper, &expectedVerifierHelper, &citationSubsetHelper,
+		&briefCompletionHelper, &briefCandidateHelper,
+		&correctionInsertTrigger, &groundingInsertTrigger,
+		&scopeTriggerFunction,
+		&reservationTriggerFunction); err != nil {
 		t.Fatal(err)
 	}
 	if correctionTable || correctionTrigger || finalizationTrigger || admissionV6 ||
+		groundingReceiptHelper || correctionReceiptHelper || expectedPromptHelper ||
+		expectedVerifierHelper || citationSubsetHelper || correctionInsertTrigger ||
+		briefCompletionHelper || briefCandidateHelper || groundingInsertTrigger ||
 		scopeTriggerFunction != "enforce_research_scope_window_v33" ||
 		reservationTriggerFunction != "enforce_research_run_llm_spend_reservation_v2" {
-		t.Fatalf("Down mismatch table=%v correction_trigger=%v final_trigger=%v v6=%v scope=%s reservation=%s",
+		t.Fatalf("Down mismatch table=%v correction_trigger=%v final_trigger=%v v6=%v grounding_receipt=%v correction_receipt=%v expected_prompt=%v expected_verifier=%v citation_subset=%v completion_helper=%v candidate_helper=%v correction_insert=%v grounding_insert=%v scope=%s reservation=%s",
 			correctionTable, correctionTrigger, finalizationTrigger, admissionV6,
-			scopeTriggerFunction, reservationTriggerFunction)
+			groundingReceiptHelper, correctionReceiptHelper, expectedPromptHelper,
+			expectedVerifierHelper, citationSubsetHelper, briefCompletionHelper,
+			briefCandidateHelper,
+			correctionInsertTrigger,
+			groundingInsertTrigger, scopeTriggerFunction, reservationTriggerFunction)
 	}
 }

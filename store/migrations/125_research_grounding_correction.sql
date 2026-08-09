@@ -105,10 +105,393 @@ CREATE INDEX idx_research_grounding_correction_scope
     ON research_brief_grounding_corrections
        (tenant_id,user_id,task_id,run_snapshot_id,id);
 
+-- The corrected candidate may delete citations but can never create authority
+-- that the original synthesis candidate did not cite.
+-- +goose StatementBegin
+CREATE FUNCTION research_grounding_correction_citations_subset_v125(
+    original_payload BYTEA,
+    corrected_payload BYTEA
+) RETURNS BOOLEAN
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+WITH original AS (
+    SELECT convert_from(original_payload,'UTF8')::jsonb->'citations' AS citations
+), corrected AS (
+    SELECT convert_from(corrected_payload,'UTF8')::jsonb->'citations' AS citations
+)
+SELECT jsonb_typeof(original.citations)='array' AND
+       jsonb_typeof(corrected.citations)='array' AND
+       NOT EXISTS (
+           SELECT 1
+             FROM jsonb_array_elements(corrected.citations) citation
+            WHERE NOT EXISTS (
+                SELECT 1
+                  FROM jsonb_array_elements(original.citations) allowed
+                 WHERE allowed=citation
+            )
+       )
+  FROM original,corrected
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_grounding_correction_citations_subset_v125(
+    BYTEA,BYTEA) FROM PUBLIC;
+
+-- v3.6 retains the frozen v3.2 representation repair for positive decimal
+-- current_evidence refs emitted as JSON numbers. All other completion and
+-- duplicate-key rules remain the v119 fail-closed projection.
+-- +goose StatementBegin
+CREATE FUNCTION research_brief_matches_completion_v125(
+    brief_payload BYTEA,
+    provider_completion TEXT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+DECLARE
+    brief_text TEXT;
+    normalized TEXT;
+    remainder TEXT;
+    completion_json JSONB;
+    normalized_citations JSONB;
+BEGIN
+    IF public.research_brief_matches_synthesis_completion_v119(
+            brief_payload,provider_completion) THEN
+        RETURN true;
+    END IF;
+    brief_text := convert_from(brief_payload,'UTF8');
+    normalized := btrim(provider_completion,E' \t\r\n\v\f');
+    IF octet_length(normalized)<2 OR octet_length(normalized)>262144 THEN
+        RETURN false;
+    END IF;
+    IF left(normalized,3)='```' THEN
+        IF left(normalized,9)=E'```json\r\n' THEN
+            remainder := substring(normalized FROM 10);
+        ELSIF left(normalized,8)=E'```json\n' THEN
+            remainder := substring(normalized FROM 9);
+        ELSE
+            RETURN false;
+        END IF;
+        IF right(remainder,3)<>'```' THEN RETURN false; END IF;
+        remainder := left(remainder,length(remainder)-3);
+        IF right(remainder,2)=E'\r\n' THEN
+            remainder := left(remainder,length(remainder)-2);
+        ELSIF right(remainder,1)=E'\n' THEN
+            remainder := left(remainder,length(remainder)-1);
+        ELSE
+            RETURN false;
+        END IF;
+        normalized := btrim(remainder,E' \t\r\n\v\f');
+        IF octet_length(normalized)<2 OR position('```' IN normalized)>0 THEN
+            RETURN false;
+        END IF;
+    END IF;
+    IF NOT (brief_text IS JSON OBJECT WITH UNIQUE KEYS) OR
+       NOT (normalized IS JSON OBJECT WITH UNIQUE KEYS) THEN
+        RETURN false;
+    END IF;
+    completion_json := normalized::jsonb;
+    IF jsonb_typeof(completion_json->'citations') IS DISTINCT FROM 'array' THEN
+        RETURN false;
+    END IF;
+    SELECT coalesce(jsonb_agg(CASE
+        WHEN citation->>'kind'='current_evidence' AND
+             jsonb_typeof(citation->'ref')='number' AND
+             citation->>'ref' ~ '^[1-9][0-9]*$'
+        THEN jsonb_set(citation,'{ref}',to_jsonb(citation->>'ref'))
+        ELSE citation END ORDER BY ordinal),'[]'::jsonb)
+      INTO normalized_citations
+      FROM jsonb_array_elements(completion_json->'citations')
+           WITH ORDINALITY item(citation,ordinal);
+    completion_json := jsonb_set(completion_json,'{citations}',normalized_citations);
+    RETURN brief_text::jsonb=completion_json;
+EXCEPTION WHEN OTHERS THEN
+    RETURN false;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_brief_matches_completion_v125(BYTEA,TEXT)
+    FROM PUBLIC;
+
+-- Mirror the frozen v3.6 Brief contract before any verifier round can spend.
+-- The candidate must also cite only records present in the exact synthesis
+-- context and follow the complete/partial coverage schema selected by Store.
+-- +goose StatementBegin
+CREATE FUNCTION research_brief_candidate_valid_v125(
+    synthesis_id BIGINT,
+    candidate_payload BYTEA
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+DECLARE
+    brief_json JSONB;
+    context_json JSONB;
+    failure_count INTEGER;
+BEGIN
+    IF NOT (convert_from(candidate_payload,'UTF8')
+                IS JSON OBJECT WITH UNIQUE KEYS) THEN
+        RETURN false;
+    END IF;
+    brief_json := convert_from(candidate_payload,'UTF8')::jsonb;
+    SELECT convert_from(brief.context_payload,'UTF8')::jsonb
+      INTO context_json
+      FROM public.research_brief_syntheses brief
+     WHERE brief.id=synthesis_id;
+    IF context_json IS NULL OR jsonb_typeof(brief_json) IS DISTINCT FROM 'object' OR
+       jsonb_typeof(brief_json->'headline') IS DISTINCT FROM 'string' OR
+       octet_length(brief_json->>'headline') NOT BETWEEN 1 AND 1024 OR
+       btrim(brief_json->>'headline') IS DISTINCT FROM brief_json->>'headline' OR
+       jsonb_typeof(brief_json->'summary') IS DISTINCT FROM 'string' OR
+       octet_length(brief_json->>'summary') NOT BETWEEN 1 AND 65536 OR
+       btrim(brief_json->>'summary') IS DISTINCT FROM brief_json->>'summary' OR
+       jsonb_typeof(brief_json->'significance') IS DISTINCT FROM 'string' OR
+       brief_json->>'significance' NOT IN ('none','qualified','major') OR
+       jsonb_typeof(brief_json->'citations') IS DISTINCT FROM 'array' OR
+       jsonb_array_length(brief_json->'citations')>64 OR EXISTS (
+           SELECT 1 FROM jsonb_array_elements(brief_json->'citations') citation
+            WHERE jsonb_typeof(citation) IS DISTINCT FROM 'object'
+               OR (SELECT count(*) FROM jsonb_object_keys(citation))<>2
+               OR (citation-ARRAY['kind','ref'])<>'{}'::jsonb
+               OR jsonb_typeof(citation->'kind') IS DISTINCT FROM 'string'
+               OR jsonb_typeof(citation->'ref') IS DISTINCT FROM 'string'
+               OR octet_length(citation->>'ref') NOT BETWEEN 1 AND 255
+               OR btrim(citation->>'ref') IS DISTINCT FROM citation->>'ref'
+               OR (citation->>'kind'='current_evidence' AND (
+                   citation->>'ref' !~ '^[1-9][0-9]*$' OR NOT EXISTS (
+                       SELECT 1 FROM jsonb_array_elements(
+                           context_json->'current_evidence') item
+                        WHERE item->>'evidence_id'=citation->>'ref'
+                   )))
+               OR (citation->>'kind'='history' AND NOT EXISTS (
+                   SELECT 1 FROM jsonb_array_elements(
+                       context_json#>'{history,items}') item
+                    WHERE item->>'record_id'=citation->>'ref'
+               ))
+               OR citation->>'kind' NOT IN ('current_evidence','history')
+       ) OR EXISTS (
+           SELECT 1 FROM jsonb_array_elements(brief_json->'citations') citation
+            GROUP BY citation->>'kind',citation->>'ref' HAVING count(*)>1
+       ) THEN
+        RETURN false;
+    END IF;
+    failure_count := CASE
+        WHEN jsonb_typeof(context_json->'tool_failures')='array'
+        THEN jsonb_array_length(context_json->'tool_failures') ELSE 0 END;
+    IF failure_count=0 THEN
+        RETURN (SELECT count(*) FROM jsonb_object_keys(brief_json))=5 AND
+            (brief_json-ARRAY['schema_version','headline','summary',
+                              'significance','citations'])='{}'::jsonb AND
+            brief_json->>'schema_version'='vane.research-brief/v3' AND
+            jsonb_array_length(brief_json->'citations') BETWEEN 1 AND 64 AND
+            EXISTS (SELECT 1 FROM jsonb_array_elements(brief_json->'citations') citation
+                     WHERE citation->>'kind'='current_evidence');
+    END IF;
+    IF brief_json->>'schema_version'='vane.research-brief/v3.1' THEN
+        RETURN (SELECT count(*) FROM jsonb_object_keys(brief_json))=6 AND
+            (brief_json-ARRAY['schema_version','assessment','headline','summary',
+                              'significance','citations'])='{}'::jsonb AND
+            brief_json->>'assessment'='unknown' AND
+            brief_json->>'significance'='none';
+    END IF;
+    IF brief_json->>'schema_version'='vane.research-brief/v3.2' THEN
+        RETURN (SELECT count(*) FROM jsonb_object_keys(brief_json))=6 AND
+            (brief_json-ARRAY['schema_version','assessment','headline','summary',
+                              'significance','citations'])='{}'::jsonb AND
+            brief_json->>'assessment'='grounded' AND
+            brief_json->>'significance'='none' AND
+            jsonb_array_length(brief_json->'citations') BETWEEN 1 AND 64 AND
+            EXISTS (
+                SELECT 1
+                  FROM jsonb_array_elements(brief_json->'citations') citation
+                  JOIN jsonb_array_elements(context_json->'current_evidence') item
+                    ON citation->>'kind'='current_evidence'
+                   AND citation->>'ref'=item->>'evidence_id'
+                 WHERE item->>'trust_type'='official'
+                   AND item->>'tool_name'='web_product_status'
+            );
+    END IF;
+    RETURN false;
+EXCEPTION WHEN OTHERS THEN
+    RETURN false;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_brief_candidate_valid_v125(BIGINT,BYTEA)
+    FROM PUBLIC;
+
+-- Rebuild the complete v1.2 grounding-verifier input from the frozen
+-- synthesis context and the exact candidate. JSONB equality intentionally
+-- ignores representation-only key order/whitespace while rejecting every
+-- semantic change, including evidence or response-contract substitutions.
+-- +goose StatementBegin
+CREATE FUNCTION research_expected_grounding_verifier_prompt_v125(
+    synthesis_id BIGINT,
+    candidate_payload BYTEA,
+    candidate_digest TEXT
+) RETURNS JSONB
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+WITH source AS (
+    SELECT convert_from(brief.context_payload,'UTF8')::jsonb AS context_json,
+           convert_from(candidate_payload,'UTF8')::jsonb AS candidate_json
+      FROM public.research_brief_syntheses brief
+     WHERE brief.id=synthesis_id
+       AND public.research_brief_candidate_valid_v125(
+               brief.id,candidate_payload)
+), cited AS (
+    SELECT coalesce(jsonb_agg(
+        CASE citation->>'kind'
+        WHEN 'current_evidence' THEN (
+            SELECT jsonb_strip_nulls(jsonb_build_object(
+                'kind','current_evidence','ref',citation->>'ref',
+                'tool_name',nullif(item->>'tool_name',''),
+                'trust_type',nullif(item->>'trust_type',''),
+                'synthesis_visible_text',nullif(item->>'synthesis_visible_text',''),
+                'context_truncated',item->'context_truncated'))
+              FROM jsonb_array_elements(source.context_json->'current_evidence') item
+             WHERE item->>'evidence_id'=citation->>'ref'
+        )
+        WHEN 'history' THEN (
+            SELECT jsonb_strip_nulls(jsonb_build_object(
+                'kind','history','ref',citation->>'ref',
+                'generated_at',nullif(item->>'generated_at',''),
+                'coverage',nullif(item->>'coverage',''),
+                'payload_text',nullif(item->>'payload_text',''),
+                'context_truncated',item->'context_truncated'))
+              FROM jsonb_array_elements(source.context_json#>'{history,items}') item
+             WHERE item->>'record_id'=citation->>'ref'
+        )
+        ELSE NULL END ORDER BY ordinal)
+            FILTER (WHERE citation IS NOT NULL), '[]'::jsonb) AS items,
+        source.context_json,source.candidate_json
+      FROM source
+      LEFT JOIN LATERAL jsonb_array_elements(source.candidate_json->'citations')
+           WITH ORDINALITY AS candidate(citation,ordinal) ON true
+     GROUP BY source.context_json,source.candidate_json
+)
+SELECT jsonb_build_object(
+    'schema_version','vane.research-grounding-check-input/v1.1',
+    'candidate_digest',candidate_digest,
+    'task_manual',cited.context_json#>>'{definition,task_manual}',
+    'history_through_utc',cited.context_json#>>'{history,history_through_utc}',
+    'candidate_brief',cited.candidate_json,
+    'cited_evidence',cited.items,
+    'tool_failures',coalesce(cited.context_json->'tool_failures','null'::jsonb),
+    'response_contract',jsonb_build_object(
+        'schema_version_literal','vane.research-grounding-verdict/v1',
+        'required_top_level_fields',
+            '["schema_version","candidate_digest","verdict","issues"]'::jsonb,
+        'verdict_values','["grounded","unsupported"]'::jsonb,
+        'grounded_issues_rule','issues must be []',
+        'unsupported_issues_rule','issues must contain every unsupported claim',
+        'issue_fields','["field","claim","refs","reason"]'::jsonb,
+        'issue_refs_item_fields','["kind","ref"]'::jsonb,
+        'issue_refs_kind_values','["current_evidence","history"]'::jsonb,
+        'issue_refs_rule','refs must be a JSON array of citation objects copied exactly from candidate_brief.citations; each object must contain only kind and ref, never a bare string; use [] when no candidate citation supports the claim',
+        'single_canonical_json',true
+    )
+)
+  FROM cited
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_expected_grounding_verifier_prompt_v125(
+    BIGINT,BYTEA,TEXT) FROM PUBLIC;
+
+-- v3.6 cannot buy or retain a grounding verdict for an arbitrary candidate or
+-- verifier prompt. Bind INSERT to the completed round-0 synthesis receipt and
+-- the exact semantic projection of the frozen synthesis context.
+-- +goose StatementBegin
+CREATE FUNCTION enforce_research_grounding_insert_v125()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+DECLARE
+    renderer TEXT;
+BEGIN
+    SELECT convert_from(snapshot.payload,'UTF8')::jsonb
+               #>> '{research_model,synthesis,renderer_version}'
+      INTO renderer
+      FROM public.task_run_snapshots snapshot
+     WHERE snapshot.id=NEW.run_snapshot_id
+       AND snapshot.tenant_id=NEW.tenant_id
+       AND snapshot.user_id=NEW.user_id
+       AND snapshot.task_id=NEW.task_id;
+    IF renderer IS DISTINCT FROM 'research-synthesis.render/v3.6' THEN
+        RETURN NEW;
+    END IF;
+    IF NOT public.research_brief_candidate_valid_v125(
+               NEW.synthesis_id,NEW.candidate_brief_payload) OR
+       NOT (convert_from(NEW.verifier_prompt,'UTF8')
+                IS JSON OBJECT WITH UNIQUE KEYS) OR
+       convert_from(NEW.verifier_prompt,'UTF8')::jsonb IS DISTINCT FROM
+           public.research_expected_grounding_verifier_prompt_v125(
+               NEW.synthesis_id,NEW.candidate_brief_payload,
+               NEW.candidate_digest) OR NOT EXISTS (
+        SELECT 1
+          FROM public.research_brief_syntheses brief
+          JOIN public.research_run_llm_spend_reservations reservation
+            ON reservation.id=brief.synthesis_llm_spend_reservation_id
+           AND reservation.tenant_id=brief.tenant_id
+           AND reservation.user_id=brief.user_id
+           AND reservation.task_id=brief.task_id
+           AND reservation.run_snapshot_id=brief.run_snapshot_id
+          JOIN public.research_run_llm_spend_settlements settlement
+            ON settlement.reservation_id=reservation.id
+           AND settlement.tenant_id=reservation.tenant_id
+           AND settlement.user_id=reservation.user_id
+           AND settlement.task_id=reservation.task_id
+           AND settlement.run_snapshot_id=reservation.run_snapshot_id
+           AND settlement.stage=reservation.stage
+           AND settlement.round_ordinal=reservation.round_ordinal
+          JOIN public.llm_calls call ON call.id=settlement.llm_call_id
+         WHERE brief.id=NEW.synthesis_id
+           AND brief.tenant_id=NEW.tenant_id
+           AND brief.user_id=NEW.user_id
+           AND brief.task_id=NEW.task_id
+           AND brief.run_snapshot_id=NEW.run_snapshot_id
+           AND brief.plan_id=NEW.plan_id
+           AND brief.status='spending'
+           AND reservation.stage='synthesis' AND reservation.round_ordinal=0
+           AND reservation.subject_id=brief.id
+           AND settlement.attempted AND settlement.usage_known
+           AND NOT settlement.definitely_zero_usage
+           AND settlement.outcome='completed' AND settlement.error_code=''
+           AND call.research_run_llm_spend_reservation_id=reservation.id
+           AND call.tenant_id=brief.tenant_id AND call.user_id=brief.user_id
+           AND call.run_snapshot_id=brief.run_snapshot_id
+           AND call.span_name='research_synthesis' AND call.error=''
+           AND public.research_brief_matches_completion_v125(
+                   NEW.candidate_brief_payload,call.completion)
+    ) THEN
+        RAISE EXCEPTION '125: v3.6 grounding input differs from synthesis authority'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_research_grounding_insert_v125() FROM PUBLIC;
+CREATE TRIGGER enforce_research_grounding_insert_v125
+BEFORE INSERT ON research_brief_grounding_verifications
+FOR EACH ROW EXECUTE FUNCTION enforce_research_grounding_insert_v125();
+
 -- +goose StatementBegin
 CREATE FUNCTION protect_research_brief_grounding_correction_v1()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp
 AS $$
 BEGIN
@@ -126,6 +509,19 @@ BEGIN
         RAISE EXCEPTION '125: research grounding correction identity is immutable';
     END IF;
     IF OLD.status='prepared' AND NEW.status='corrected' THEN
+        IF NOT public.research_grounding_correction_citations_subset_v125(
+                (SELECT grounding.candidate_brief_payload
+                   FROM public.research_brief_grounding_verifications grounding
+                  WHERE grounding.id=NEW.grounding_verification_id),
+                NEW.corrected_brief_payload) OR
+           NOT (convert_from(NEW.verifier_prompt,'UTF8')
+                    IS JSON OBJECT WITH UNIQUE KEYS) OR
+           convert_from(NEW.verifier_prompt,'UTF8')::jsonb IS DISTINCT FROM
+                public.research_expected_grounding_verifier_prompt_v125(
+                    NEW.synthesis_id,NEW.corrected_brief_payload,
+                    NEW.corrected_brief_digest) THEN
+            RAISE EXCEPTION '125: corrected candidate authority differs';
+        END IF;
         NEW.corrected_at := clock_timestamp();
         RETURN NEW;
     END IF;
@@ -388,6 +784,242 @@ CREATE TRIGGER research_scope_window_v33
 BEFORE INSERT OR UPDATE ON research_brief_syntheses
 FOR EACH ROW EXECUTE FUNCTION enforce_research_scope_window_v36();
 
+-- Recompute the immutable round-1 verifier authority from its exact admitted
+-- reservation, completed settlement, provider receipt, frozen prompt, and
+-- canonical verdict artifact. Both direct and corrected finalization call this
+-- helper, so a forged grounding status can never authorize a Brief.
+-- +goose StatementBegin
+CREATE FUNCTION research_grounding_has_exact_receipt_v125(
+    grounding_id BIGINT,
+    expected_status TEXT
+) RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+SELECT expected_status IN ('grounded','rejected') AND EXISTS (
+    SELECT 1
+      FROM public.research_brief_grounding_verifications grounding
+      JOIN public.research_run_llm_spend_reservations reservation
+        ON reservation.id=grounding.verifier_llm_spend_reservation_id
+       AND reservation.tenant_id=grounding.tenant_id
+       AND reservation.user_id=grounding.user_id
+       AND reservation.task_id=grounding.task_id
+       AND reservation.run_snapshot_id=grounding.run_snapshot_id
+      JOIN public.research_run_llm_spend_settlements settlement
+        ON settlement.reservation_id=reservation.id
+       AND settlement.tenant_id=reservation.tenant_id
+       AND settlement.user_id=reservation.user_id
+       AND settlement.task_id=reservation.task_id
+       AND settlement.run_snapshot_id=reservation.run_snapshot_id
+       AND settlement.stage=reservation.stage
+       AND settlement.round_ordinal=reservation.round_ordinal
+      JOIN public.llm_calls call ON call.id=settlement.llm_call_id
+     WHERE grounding.id=grounding_id
+       AND grounding.status=expected_status
+       AND grounding.verdict_digest=encode(sha256(grounding.verdict_payload),'hex')
+       AND reservation.stage='synthesis' AND reservation.round_ordinal=1
+       AND reservation.subject_id=grounding.synthesis_id
+       AND reservation.user_prompt_digest=grounding.verifier_prompt_digest
+       AND convert_from(grounding.verifier_prompt,'UTF8')
+               IS JSON OBJECT WITH UNIQUE KEYS
+       AND convert_from(grounding.verifier_prompt,'UTF8')::jsonb=
+           public.research_expected_grounding_verifier_prompt_v125(
+               grounding.synthesis_id,grounding.candidate_brief_payload,
+               grounding.candidate_digest)
+       AND settlement.attempted AND settlement.usage_known
+       AND NOT settlement.definitely_zero_usage
+       AND settlement.outcome='completed' AND settlement.error_code=''
+       AND call.research_run_llm_spend_reservation_id=reservation.id
+       AND call.tenant_id=grounding.tenant_id
+       AND call.user_id=grounding.user_id
+       AND call.run_snapshot_id=grounding.run_snapshot_id
+       AND call.span_name='research_synthesis' AND call.error=''
+       AND call.user_prompt=convert_from(grounding.verifier_prompt,'UTF8')
+       AND public.research_brief_matches_synthesis_completion_v119(
+               grounding.verdict_payload,call.completion)
+       AND jsonb_typeof(convert_from(grounding.verdict_payload,'UTF8')::jsonb)='object'
+       AND convert_from(grounding.verdict_payload,'UTF8')::jsonb->>'schema_version'=
+           'vane.research-grounding-verdict/v1'
+       AND convert_from(grounding.verdict_payload,'UTF8')::jsonb->>'candidate_digest'=
+           grounding.candidate_digest
+       AND convert_from(grounding.verdict_payload,'UTF8')::jsonb->>'verdict'=
+           CASE expected_status WHEN 'grounded' THEN 'grounded' ELSE 'unsupported' END
+       AND jsonb_typeof(convert_from(grounding.verdict_payload,'UTF8')::jsonb->'issues')=
+           'array'
+       AND CASE expected_status
+           WHEN 'grounded' THEN
+               jsonb_array_length(
+                   convert_from(grounding.verdict_payload,'UTF8')::jsonb->'issues')=0
+           ELSE jsonb_array_length(
+                   convert_from(grounding.verdict_payload,'UTF8')::jsonb->'issues')
+                    BETWEEN 1 AND 16
+           END
+)
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_grounding_has_exact_receipt_v125(BIGINT,TEXT)
+    FROM PUBLIC;
+
+-- Rebuild the exact Go json.Marshal byte sequence from the immutable rejected
+-- round-1 grounding record. The only interpolated scalar is a checked hex
+-- digest; nested inputs are already canonical Store artifacts.
+-- +goose StatementBegin
+CREATE FUNCTION research_expected_grounding_correction_prompt_v125(
+    grounding_id BIGINT
+) RETURNS BYTEA
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+SELECT CASE
+       WHEN public.research_grounding_has_exact_receipt_v125(grounding.id,'rejected')
+       THEN convert_to(
+           '{"schema_version":"vane.research-grounding-correction-input/v1",' ||
+           '"original_candidate_digest":"' || grounding.candidate_digest || '",' ||
+           '"initial_grounding_input":' ||
+               convert_from(grounding.verifier_prompt,'UTF8') || ',' ||
+           '"initial_verdict":' ||
+               convert_from(grounding.verdict_payload,'UTF8') || ',' ||
+           '"response_contract":{' ||
+               '"output_schema":"one canonical vane.research-brief/v3, v3.1, or v3.2 JSON object as permitted by the frozen evidence coverage",' ||
+               '"canonical_json_only":true,' ||
+               '"citation_rule":"citations must be a subset of the original candidate citations; never add a ref",' ||
+               '"correction_rule":"resolve every initial_verdict issue by deleting or narrowing unsupported claims; never introduce a new factual claim"}}',
+           'UTF8')
+       ELSE NULL
+       END
+  FROM public.research_brief_grounding_verifications grounding
+ WHERE grounding.id=grounding_id
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_expected_grounding_correction_prompt_v125(BIGINT)
+    FROM PUBLIC;
+
+-- +goose StatementBegin
+CREATE FUNCTION enforce_research_grounding_correction_insert_v125()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    IF NEW.correction_prompt IS DISTINCT FROM
+           public.research_expected_grounding_correction_prompt_v125(
+               NEW.grounding_verification_id) OR NOT EXISTS (
+        SELECT 1
+          FROM public.research_brief_grounding_verifications grounding
+          JOIN public.research_brief_syntheses brief
+            ON brief.id=grounding.synthesis_id
+           AND brief.tenant_id=grounding.tenant_id
+           AND brief.user_id=grounding.user_id
+           AND brief.task_id=grounding.task_id
+           AND brief.run_snapshot_id=grounding.run_snapshot_id
+           AND brief.plan_id=grounding.plan_id
+          JOIN public.task_run_snapshots snapshot
+            ON snapshot.id=grounding.run_snapshot_id
+           AND snapshot.tenant_id=grounding.tenant_id
+           AND snapshot.user_id=grounding.user_id
+           AND snapshot.task_id=grounding.task_id
+         WHERE grounding.id=NEW.grounding_verification_id
+           AND grounding.tenant_id=NEW.tenant_id
+           AND grounding.user_id=NEW.user_id
+           AND grounding.task_id=NEW.task_id
+           AND grounding.run_snapshot_id=NEW.run_snapshot_id
+           AND grounding.plan_id=NEW.plan_id
+           AND grounding.synthesis_id=NEW.synthesis_id
+           AND grounding.status='rejected'
+           AND brief.status='spending'
+           AND convert_from(snapshot.payload,'UTF8')::jsonb
+                 #>> '{research_model,synthesis,renderer_version}'=
+               'research-synthesis.render/v3.6'
+    ) THEN
+        RAISE EXCEPTION '125: grounding correction prompt differs from rejected authority'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_research_grounding_correction_insert_v125()
+    FROM PUBLIC;
+CREATE TRIGGER enforce_research_grounding_correction_insert_v125
+BEFORE INSERT ON research_brief_grounding_corrections
+FOR EACH ROW EXECUTE FUNCTION enforce_research_grounding_correction_insert_v125();
+
+-- Round 3 is payable only after round 2 has a completed exact receipt whose
+-- normalized Brief is the immutable corrected candidate. This helper also
+-- rechecks the deterministic correction prompt and citation non-expansion.
+-- +goose StatementBegin
+CREATE FUNCTION research_correction_has_exact_candidate_receipt_v125(
+    correction_id BIGINT
+) RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+SELECT EXISTS (
+    SELECT 1
+      FROM public.research_brief_grounding_corrections correction
+      JOIN public.research_brief_grounding_verifications grounding
+        ON grounding.id=correction.grounding_verification_id
+       AND grounding.tenant_id=correction.tenant_id
+       AND grounding.user_id=correction.user_id
+       AND grounding.task_id=correction.task_id
+       AND grounding.run_snapshot_id=correction.run_snapshot_id
+       AND grounding.plan_id=correction.plan_id
+       AND grounding.synthesis_id=correction.synthesis_id
+      JOIN public.research_run_llm_spend_reservations reservation
+        ON reservation.id=correction.corrector_llm_spend_reservation_id
+       AND reservation.tenant_id=correction.tenant_id
+       AND reservation.user_id=correction.user_id
+       AND reservation.task_id=correction.task_id
+       AND reservation.run_snapshot_id=correction.run_snapshot_id
+      JOIN public.research_run_llm_spend_settlements settlement
+        ON settlement.reservation_id=reservation.id
+       AND settlement.tenant_id=reservation.tenant_id
+       AND settlement.user_id=reservation.user_id
+       AND settlement.task_id=reservation.task_id
+       AND settlement.run_snapshot_id=reservation.run_snapshot_id
+       AND settlement.stage=reservation.stage
+       AND settlement.round_ordinal=reservation.round_ordinal
+      JOIN public.llm_calls call ON call.id=settlement.llm_call_id
+     WHERE correction.id=correction_id
+       AND correction.status IN ('corrected','grounded','rejected')
+       AND correction.correction_prompt=
+           public.research_expected_grounding_correction_prompt_v125(grounding.id)
+       AND public.research_grounding_correction_citations_subset_v125(
+               grounding.candidate_brief_payload,
+               correction.corrected_brief_payload)
+       AND convert_from(correction.verifier_prompt,'UTF8')
+               IS JSON OBJECT WITH UNIQUE KEYS
+       AND convert_from(correction.verifier_prompt,'UTF8')::jsonb=
+           public.research_expected_grounding_verifier_prompt_v125(
+               correction.synthesis_id,correction.corrected_brief_payload,
+               correction.corrected_brief_digest)
+       AND reservation.stage='synthesis' AND reservation.round_ordinal=2
+       AND reservation.subject_id=correction.synthesis_id
+       AND reservation.user_prompt_digest=correction.correction_prompt_digest
+       AND settlement.attempted AND settlement.usage_known
+       AND NOT settlement.definitely_zero_usage
+       AND settlement.outcome='completed' AND settlement.error_code=''
+       AND call.research_run_llm_spend_reservation_id=reservation.id
+       AND call.tenant_id=correction.tenant_id
+       AND call.user_id=correction.user_id
+       AND call.run_snapshot_id=correction.run_snapshot_id
+       AND call.span_name='research_synthesis' AND call.error=''
+       AND call.user_prompt=convert_from(correction.correction_prompt,'UTF8')
+       AND public.research_brief_matches_completion_v125(
+               correction.corrected_brief_payload,call.completion)
+)
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION research_correction_has_exact_candidate_receipt_v125(BIGINT)
+    FROM PUBLIC;
+
 -- Retain the v119 round-0 receipt fence byte-for-byte for every historical
 -- path. A v3.6 correction may instead bind the final canonical Brief to the
 -- exact completed round-2 receipt that produced the immutable corrected row.
@@ -456,8 +1088,20 @@ BEGIN
            AND call.tenant_id=NEW.tenant_id AND call.user_id=NEW.user_id
            AND call.run_snapshot_id=NEW.run_snapshot_id
            AND call.span_name='research_synthesis' AND call.error=''
-           AND public.research_brief_matches_synthesis_completion_v119(
-                   NEW.brief_payload,call.completion)
+           AND (
+               public.research_brief_matches_synthesis_completion_v119(
+                   NEW.brief_payload,call.completion) OR (
+               public.research_brief_matches_completion_v125(
+                   NEW.brief_payload,call.completion) AND EXISTS (
+                   SELECT 1 FROM public.task_run_snapshots snapshot
+                    WHERE snapshot.id=NEW.run_snapshot_id
+                      AND snapshot.tenant_id=NEW.tenant_id
+                      AND snapshot.user_id=NEW.user_id
+                      AND snapshot.task_id=NEW.task_id
+                      AND convert_from(snapshot.payload,'UTF8')::jsonb
+                            #>> '{research_model,synthesis,renderer_version}'=
+                          'research-synthesis.render/v3.6'
+               )))
     ) AND NOT EXISTS (
         SELECT 1
           FROM public.task_run_snapshots snapshot
@@ -499,9 +1143,16 @@ BEGIN
            AND grounding.plan_id=NEW.plan_id
            AND grounding.synthesis_id=NEW.id
            AND grounding.status='rejected'
+           AND public.research_grounding_has_exact_receipt_v125(
+                   grounding.id,'rejected')
            AND correction.status='grounded'
+           AND public.research_correction_has_exact_candidate_receipt_v125(
+                   correction.id)
            AND correction.corrected_brief_payload=NEW.brief_payload
            AND correction.corrected_brief_digest=NEW.brief_digest
+           AND public.research_grounding_correction_citations_subset_v125(
+                   grounding.candidate_brief_payload,
+                   correction.corrected_brief_payload)
            AND reservation.stage='synthesis' AND reservation.round_ordinal=2
            AND reservation.subject_id=NEW.id
            AND reservation.user_prompt_digest=correction.correction_prompt_digest
@@ -513,7 +1164,7 @@ BEGIN
            AND call.run_snapshot_id=NEW.run_snapshot_id
            AND call.span_name='research_synthesis' AND call.error=''
            AND call.user_prompt=convert_from(correction.correction_prompt,'UTF8')
-           AND public.research_brief_matches_synthesis_completion_v119(
+           AND public.research_brief_matches_completion_v125(
                    NEW.brief_payload,call.completion)
     ) THEN
         RAISE EXCEPTION '125: final corrected research Brief differs from its completed correction receipt'
@@ -559,6 +1210,8 @@ BEGIN
            AND grounding.plan_id=NEW.plan_id
            AND grounding.synthesis_id=NEW.id
            AND grounding.status='grounded'
+           AND public.research_grounding_has_exact_receipt_v125(
+                   grounding.id,'grounded')
            AND grounding.candidate_brief_payload=NEW.brief_payload
            AND grounding.candidate_digest=NEW.brief_digest
            AND grounding.verdict_digest=encode(sha256(grounding.verdict_payload),'hex')
@@ -626,9 +1279,16 @@ BEGIN
            AND grounding.plan_id=NEW.plan_id
            AND grounding.synthesis_id=NEW.id
            AND grounding.status='rejected'
+           AND public.research_grounding_has_exact_receipt_v125(
+                   grounding.id,'rejected')
            AND correction.status='grounded'
+           AND public.research_correction_has_exact_candidate_receipt_v125(
+                   correction.id)
            AND correction.corrected_brief_payload=NEW.brief_payload
            AND correction.corrected_brief_digest=NEW.brief_digest
+           AND public.research_grounding_correction_citations_subset_v125(
+                   grounding.candidate_brief_payload,
+                   correction.corrected_brief_payload)
            AND corrector_reservation.stage='synthesis'
            AND corrector_reservation.round_ordinal=2
            AND corrector_reservation.subject_id=NEW.id
@@ -647,7 +1307,7 @@ BEGIN
            AND corrector_call.error=''
            AND corrector_call.user_prompt=
                convert_from(correction.correction_prompt,'UTF8')
-           AND public.research_brief_matches_synthesis_completion_v119(
+           AND public.research_brief_matches_completion_v125(
                    correction.corrected_brief_payload,corrector_call.completion)
            AND verifier_reservation.stage='synthesis'
            AND verifier_reservation.round_ordinal=3
@@ -801,12 +1461,20 @@ BEGIN
             SELECT 1 FROM public.research_brief_grounding_corrections correction
             JOIN public.research_brief_grounding_verifications grounding
               ON grounding.id=correction.grounding_verification_id
+             AND grounding.tenant_id=correction.tenant_id
+             AND grounding.user_id=correction.user_id
+             AND grounding.task_id=correction.task_id
+             AND grounding.run_snapshot_id=correction.run_snapshot_id
+             AND grounding.plan_id=correction.plan_id
+             AND grounding.synthesis_id=correction.synthesis_id
              WHERE correction.synthesis_id=NEW.subject_id
                AND correction.tenant_id=NEW.tenant_id
                AND correction.user_id=NEW.user_id
                AND correction.task_id=NEW.task_id
                AND correction.run_snapshot_id=NEW.run_snapshot_id
                AND correction.status='prepared' AND grounding.status='rejected'
+               AND public.research_grounding_has_exact_receipt_v125(
+                       grounding.id,'rejected')
         )) OR (NEW.round_ordinal=3 AND NOT EXISTS (
             SELECT 1 FROM public.research_brief_grounding_corrections correction
              WHERE correction.synthesis_id=NEW.subject_id
@@ -815,6 +1483,8 @@ BEGIN
                AND correction.task_id=NEW.task_id
                AND correction.run_snapshot_id=NEW.run_snapshot_id
                AND correction.status='corrected'
+               AND public.research_correction_has_exact_candidate_receipt_v125(
+                       correction.id)
         )) THEN
             RAISE EXCEPTION '125: synthesis reservation subject differs'
                 USING ERRCODE='23514';
@@ -980,6 +1650,12 @@ BEGIN
              FROM public.research_brief_grounding_corrections correction
              JOIN public.research_brief_grounding_verifications grounding
                ON grounding.id=correction.grounding_verification_id
+              AND grounding.tenant_id=correction.tenant_id
+              AND grounding.user_id=correction.user_id
+              AND grounding.task_id=correction.task_id
+              AND grounding.run_snapshot_id=correction.run_snapshot_id
+              AND grounding.plan_id=correction.plan_id
+              AND grounding.synthesis_id=correction.synthesis_id
              JOIN public.research_brief_syntheses brief
                ON brief.id=correction.synthesis_id
             WHERE correction.synthesis_id=requested_subject_id
@@ -988,6 +1664,8 @@ BEGIN
               AND correction.task_id=requested_task_id
               AND correction.run_snapshot_id=requested_run_snapshot_id
               AND correction.status='prepared' AND grounding.status='rejected'
+              AND public.research_grounding_has_exact_receipt_v125(
+                      grounding.id,'rejected')
               AND brief.status='spending'
               AND correction.correction_prompt=convert_to(requested_user_prompt,'UTF8')
               AND correction.correction_prompt_digest=
@@ -1003,6 +1681,8 @@ BEGIN
               AND correction.task_id=requested_task_id
               AND correction.run_snapshot_id=requested_run_snapshot_id
               AND correction.status='corrected' AND brief.status='spending'
+              AND public.research_correction_has_exact_candidate_receipt_v125(
+                      correction.id)
               AND correction.verifier_prompt=convert_to(requested_user_prompt,'UTF8')
               AND correction.verifier_prompt_digest=
                   encode(sha256(convert_to(requested_user_prompt,'UTF8')),'hex')
@@ -1302,13 +1982,28 @@ $$;
 -- +goose StatementEnd
 REVOKE ALL ON FUNCTION enforce_research_brief_llm_receipt_v1() FROM PUBLIC;
 
+DROP FUNCTION research_correction_has_exact_candidate_receipt_v125(BIGINT);
+DROP TRIGGER enforce_research_grounding_correction_insert_v125
+    ON research_brief_grounding_corrections;
+DROP FUNCTION enforce_research_grounding_correction_insert_v125();
+DROP FUNCTION research_expected_grounding_correction_prompt_v125(BIGINT);
+DROP FUNCTION research_grounding_has_exact_receipt_v125(BIGINT,TEXT);
+DROP TRIGGER enforce_research_grounding_insert_v125
+    ON research_brief_grounding_verifications;
+DROP FUNCTION enforce_research_grounding_insert_v125();
+DROP TRIGGER protect_research_brief_grounding_correction_v1
+    ON research_brief_grounding_corrections;
+DROP FUNCTION protect_research_brief_grounding_correction_v1();
+DROP FUNCTION research_expected_grounding_verifier_prompt_v125(
+    BIGINT,BYTEA,TEXT);
+DROP FUNCTION research_brief_candidate_valid_v125(BIGINT,BYTEA);
+DROP FUNCTION research_brief_matches_completion_v125(BYTEA,TEXT);
+DROP FUNCTION research_grounding_correction_citations_subset_v125(BYTEA,BYTEA);
+
 DROP TRIGGER research_scope_window_v33 ON research_brief_syntheses;
 CREATE TRIGGER research_scope_window_v33
 BEFORE INSERT OR UPDATE ON research_brief_syntheses
 FOR EACH ROW EXECUTE FUNCTION enforce_research_scope_window_v33();
 DROP FUNCTION enforce_research_scope_window_v36();
 
-DROP TRIGGER protect_research_brief_grounding_correction_v1
-    ON research_brief_grounding_corrections;
-DROP FUNCTION protect_research_brief_grounding_correction_v1();
 DROP TABLE research_brief_grounding_corrections;
