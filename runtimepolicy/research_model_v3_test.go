@@ -158,3 +158,50 @@ func TestResearchModelPolicyGroundedRenderersRequireFrozenIndependentVerifier(t 
 		t.Fatal("legacy synthesis renderer accepted an unused verifier policy")
 	}
 }
+
+func TestWithExplicitEventWindowV36FreezesOneCorrector(t *testing.T) {
+	policy := researchModelPolicyForTest(t)
+	policy.Synthesis.RendererVersion = ResearchSynthesisRendererVersionV34
+	policy.GroundingVerifier = &ResearchModelStageV3{
+		Stage: ResearchModelStageGroundingVerifierV3, Model: "strong-model",
+		MaxTokens: 4096, DisableThinking: true,
+		SystemPrompt:    "Independently verify every claim against cited evidence.",
+		RendererVersion: ResearchGroundingVerifierRendererVersionV12,
+	}
+	retained, err := BuildResearchModelPolicyV3(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := WithExplicitEventWindowV36(retained)
+	if err != nil || scoped.Synthesis.RendererVersion !=
+		ResearchSynthesisRendererVersionV36 || scoped.GroundingCorrector == nil {
+		t.Fatalf("scoped=%+v err=%v", scoped, err)
+	}
+	if scoped.GroundingCorrector.Stage != ResearchModelStageGroundingCorrectorV3 ||
+		scoped.GroundingCorrector.RendererVersion !=
+			ResearchGroundingCorrectorRendererVersionV1 ||
+		scoped.GroundingCorrector.Temperature != 0 {
+		t.Fatalf("corrector=%+v", scoped.GroundingCorrector)
+	}
+	if retained.GroundingCorrector != nil ||
+		retained.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV34 {
+		t.Fatalf("retained policy mutated: %+v", retained)
+	}
+
+	broken := scoped
+	broken.GroundingCorrector = nil
+	if _, err := BuildResearchModelPolicyV3(broken); err == nil {
+		t.Fatal("v3.6 accepted without corrector")
+	}
+	broken = scoped
+	broken.GroundingVerifier = nil
+	if _, err := BuildResearchModelPolicyV3(broken); err == nil {
+		t.Fatal("v3.6 accepted a corrector without verifier")
+	}
+	broken = retained
+	corrector := scoped.GroundingCorrector
+	broken.GroundingCorrector = corrector
+	if _, err := BuildResearchModelPolicyV3(broken); err == nil {
+		t.Fatal("retained v3.4 accepted unused corrector")
+	}
+}

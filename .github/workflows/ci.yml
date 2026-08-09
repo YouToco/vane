@@ -77,11 +77,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          status=0
           go run ./cmd/storetestshard run \
             --artifacts tmp/store-sharding \
             --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable' \
             --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports[5432] }}/vane_test?sslmode=disable' \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable'
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable' || status=$?
+          if (( status != 0 )); then
+            for log in tmp/store-sharding/store-shard-*.test.json; do
+              [[ -f "${log}" ]] || continue
+              echo "::group::$(basename "${log}") failures"
+              mapfile -t failed_tests < <(
+                jq -r 'select(.Action == "fail" and .Test != null) | .Test' "${log}" |
+                  sort -u
+              )
+              if (( ${#failed_tests[@]} == 0 )); then
+                jq -r 'select(.Action == "output") | .Output' "${log}" | tail -n 300
+              else
+                for failed_test in "${failed_tests[@]}"; do
+                  printf '\nFAIL %s\n' "${failed_test}"
+                  jq -r --arg test "${failed_test}" \
+                    'select(.Action == "output" and .Test == $test) | .Output' "${log}"
+                done
+              fi
+              echo "::endgroup::"
+            done
+          fi
+          exit "${status}"
 
   rest:
     runs-on: ubuntu-24.04

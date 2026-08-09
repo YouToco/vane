@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -31,6 +33,25 @@ type coordinatorStoreFakeV3 struct {
 		storepkg.PrepareResearchBriefSynthesisV3Result, error)
 	beginLLMSpend func(context.Context, storepkg.BeginResearchRunLLMSpendV3Params) (
 		storepkg.ResearchRunLLMSpendReservationV3, error)
+	claimBrief func(context.Context, storepkg.ClaimResearchBriefSynthesisV3Params) (
+		storepkg.ClaimResearchBriefSynthesisV3Result, error)
+	loadLLMReceipt func(context.Context, types.RunIdentity,
+		types.ResearchRunSnapshotRefV3, string, int) (storepkg.ResearchRunLLMReceiptV3, bool, error)
+	prepareGrounding func(context.Context, storepkg.PrepareResearchBriefGroundingV1Params) (
+		storepkg.PrepareResearchBriefGroundingV1Result, error)
+	settleGrounding func(context.Context, storepkg.SettleResearchBriefGroundingV1Params) (
+		storepkg.ResearchBriefGroundingV1, error)
+	prepareCorrection func(context.Context,
+		storepkg.PrepareResearchBriefGroundingCorrectionV1Params) (
+		storepkg.PrepareResearchBriefGroundingCorrectionV1Result, error)
+	settleCorrectionCandidate func(context.Context,
+		storepkg.SettleResearchBriefGroundingCorrectionCandidateV1Params) (
+		storepkg.ResearchBriefGroundingCorrectionV1, error)
+	settleCorrectionVerification func(context.Context,
+		storepkg.SettleResearchBriefGroundingCorrectionVerificationV1Params) (
+		storepkg.ResearchBriefGroundingCorrectionV1, error)
+	finalizeBrief func(context.Context, storepkg.FinalizeResearchBriefSynthesisV3Params) (
+		types.ResearchBriefRefV3, error)
 }
 
 func (f *coordinatorStoreFakeV3) LoadResearchRunSnapshotV3(
@@ -49,6 +70,55 @@ func (f *coordinatorStoreFakeV3) BeginResearchRunLLMSpendV3(
 	ctx context.Context, params storepkg.BeginResearchRunLLMSpendV3Params,
 ) (storepkg.ResearchRunLLMSpendReservationV3, error) {
 	return f.beginLLMSpend(ctx, params)
+}
+
+func (f *coordinatorStoreFakeV3) ClaimResearchBriefSynthesisV3(
+	ctx context.Context, params storepkg.ClaimResearchBriefSynthesisV3Params,
+) (storepkg.ClaimResearchBriefSynthesisV3Result, error) {
+	return f.claimBrief(ctx, params)
+}
+
+func (f *coordinatorStoreFakeV3) LoadResearchRunLLMReceiptV3(
+	ctx context.Context, identity types.RunIdentity,
+	snapshot types.ResearchRunSnapshotRefV3, stage string, round int,
+) (storepkg.ResearchRunLLMReceiptV3, bool, error) {
+	return f.loadLLMReceipt(ctx, identity, snapshot, stage, round)
+}
+
+func (f *coordinatorStoreFakeV3) PrepareOrGetResearchBriefGroundingV1(
+	ctx context.Context, params storepkg.PrepareResearchBriefGroundingV1Params,
+) (storepkg.PrepareResearchBriefGroundingV1Result, error) {
+	return f.prepareGrounding(ctx, params)
+}
+
+func (f *coordinatorStoreFakeV3) SettleResearchBriefGroundingV1(
+	ctx context.Context, params storepkg.SettleResearchBriefGroundingV1Params,
+) (storepkg.ResearchBriefGroundingV1, error) {
+	return f.settleGrounding(ctx, params)
+}
+
+func (f *coordinatorStoreFakeV3) PrepareOrGetResearchBriefGroundingCorrectionV1(
+	ctx context.Context, params storepkg.PrepareResearchBriefGroundingCorrectionV1Params,
+) (storepkg.PrepareResearchBriefGroundingCorrectionV1Result, error) {
+	return f.prepareCorrection(ctx, params)
+}
+
+func (f *coordinatorStoreFakeV3) SettleResearchBriefGroundingCorrectionCandidateV1(
+	ctx context.Context, params storepkg.SettleResearchBriefGroundingCorrectionCandidateV1Params,
+) (storepkg.ResearchBriefGroundingCorrectionV1, error) {
+	return f.settleCorrectionCandidate(ctx, params)
+}
+
+func (f *coordinatorStoreFakeV3) SettleResearchBriefGroundingCorrectionVerificationV1(
+	ctx context.Context, params storepkg.SettleResearchBriefGroundingCorrectionVerificationV1Params,
+) (storepkg.ResearchBriefGroundingCorrectionV1, error) {
+	return f.settleCorrectionVerification(ctx, params)
+}
+
+func (f *coordinatorStoreFakeV3) FinalizeResearchBriefSynthesisV3(
+	ctx context.Context, params storepkg.FinalizeResearchBriefSynthesisV3Params,
+) (types.ResearchBriefRefV3, error) {
+	return f.finalizeBrief(ctx, params)
 }
 
 func (f *coordinatorStoreFakeV3) CreateOrGetResearchRunSnapshotWithAuthorityV3(
@@ -371,6 +441,229 @@ func TestProductionResearchRuntimeV3LegacySynthesisRendererRejectsPartialCoverag
 	}
 }
 
+func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *testing.T) {
+	identity, snapshot, plan, _ := researchBridgeFixtureV3(t)
+	tools := coordinatorResearchToolsV3(t)
+	retained := coordinatorResearchModelV3(t)
+	retained.Synthesis.RendererVersion = runtimepolicy.ResearchSynthesisRendererVersionV34
+	verifier := retained.Synthesis
+	verifier.Stage = runtimepolicy.ResearchModelStageGroundingVerifierV3
+	verifier.Temperature = 0
+	verifier.SystemPrompt = "Verify only cited evidence."
+	verifier.RendererVersion = runtimepolicy.ResearchGroundingVerifierRendererVersionV12
+	retained.GroundingVerifier = &verifier
+	retained, err := runtimepolicy.BuildResearchModelPolicyV3(retained)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := runtimepolicy.WithExplicitEventWindowV36(retained)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := runcontext.ResearchSnapshotSealV3{
+		DefinitionDigest: snapshot.DefinitionDigest,
+		PolicyDigests: types.RuntimePolicyDigests{
+			CapabilityCatalogDigest: snapshot.CapabilityCatalogDigest,
+		},
+		ResearchToolPolicyDigest:  snapshot.ToolPolicyDigest,
+		ResearchModelPolicyDigest: snapshot.ModelPolicyDigest,
+		PayloadDigest:             snapshot.PayloadDigest,
+		Payload: runcontext.ResearchSnapshotPayloadV3{
+			TenantID: identity.TenantID, UserID: identity.UserID,
+			TaskID: identity.TaskID, TemporalWorkflowID: identity.TemporalWorkflowID,
+			TemporalRunID: identity.TemporalRunID, PlannerBudget: snapshot.PlannerBudget,
+		},
+		ResearchTools: tools, ResearchModel: model,
+	}
+	citation := types.ResearchBriefCitationV3{
+		Kind: types.ResearchBriefCitationCurrentEvidenceV3, Ref: "1",
+	}
+	initial, err := json.Marshal(types.ResearchBriefPayloadV3{
+		SchemaVersion: types.ResearchBriefPayloadSchemaV3,
+		Headline:      "Initial claim", Summary: "An unsupported dated claim.",
+		Significance: types.ResearchBriefSignificanceMajorV3,
+		Citations:    []types.ResearchBriefCitationV3{citation},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrected, err := json.Marshal(types.ResearchBriefPayloadV3{
+		SchemaVersion: types.ResearchBriefPayloadSchemaV3,
+		Headline:      "Corrected claim", Summary: "The cited page reports a release.",
+		Significance: types.ResearchBriefSignificanceMajorV3,
+		Citations:    []types.ResearchBriefCitationV3{citation},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := func(payload []byte) string {
+		sum := sha256.Sum256(payload)
+		return hex.EncodeToString(sum[:])
+	}
+	initialDigest := digest(initial)
+	correctedDigest := digest(corrected)
+	firstVerdict, err := json.Marshal(types.ResearchGroundingVerdictPayloadV1{
+		SchemaVersion:   types.ResearchGroundingVerdictSchemaV1,
+		CandidateDigest: initialDigest, Verdict: types.ResearchGroundingUnsupportedV1,
+		Issues: []types.ResearchGroundingIssueV1{{
+			Field: "summary", Claim: "An unsupported dated claim.",
+			Refs:   []types.ResearchBriefCitationV3{citation},
+			Reason: "The citation does not establish the event date.",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalVerdict, err := json.Marshal(types.ResearchGroundingVerdictPayloadV1{
+		SchemaVersion:   types.ResearchGroundingVerdictSchemaV1,
+		CandidateDigest: correctedDigest, Verdict: types.ResearchGroundingGroundedV1,
+		Issues: []types.ResearchGroundingIssueV1{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completions := map[int][]byte{0: initial, 1: firstVerdict, 2: corrected, 3: finalVerdict}
+	reservations := make(map[int]storepkg.ResearchRunLLMSpendReservationV3)
+	prompts := make(map[int][2]string)
+	var rounds []int
+	const synthesisID int64 = 91
+	store := &coordinatorStoreFakeV3{
+		prepareBrief: func(context.Context, storepkg.PrepareResearchBriefSynthesisV3Params) (
+			storepkg.PrepareResearchBriefSynthesisV3Result, error,
+		) {
+			return storepkg.PrepareResearchBriefSynthesisV3Result{
+				FirstWriter: true,
+				Synthesis: storepkg.ResearchBriefSynthesisV3{
+					ID: synthesisID, Status: storepkg.ResearchBriefSynthesisPreparedV3,
+					RequestDigest: strings.Repeat("3", 64), ContextPayload: []byte(`{"context":"frozen"}`),
+				},
+			}, nil
+		},
+		loadSnapshot: func(context.Context, types.RunIdentity,
+			types.ResearchRunSnapshotRefV3) (runcontext.ResearchSnapshotSealV3, error) {
+			return seal, nil
+		},
+		beginLLMSpend: func(_ context.Context, params storepkg.BeginResearchRunLLMSpendV3Params) (
+			storepkg.ResearchRunLLMSpendReservationV3, error,
+		) {
+			rounds = append(rounds, params.RoundOrdinal)
+			reservation := storepkg.ResearchRunLLMSpendReservationV3{
+				ReservationID: int64(100 + params.RoundOrdinal), Stage: params.Stage,
+				RoundOrdinal: params.RoundOrdinal, SubjectID: params.SubjectID,
+				RequestDigest: strings.Repeat(string(rune('a'+params.RoundOrdinal)), 64),
+			}
+			reservations[params.RoundOrdinal] = reservation
+			prompts[params.RoundOrdinal] = [2]string{params.SystemPrompt, params.UserPrompt}
+			return reservation, nil
+		},
+		claimBrief: func(context.Context, storepkg.ClaimResearchBriefSynthesisV3Params) (
+			storepkg.ClaimResearchBriefSynthesisV3Result, error,
+		) {
+			return storepkg.ClaimResearchBriefSynthesisV3Result{
+				Claimed: true,
+				Synthesis: storepkg.ResearchBriefSynthesisV3{
+					ID: synthesisID, Status: storepkg.ResearchBriefSynthesisSpendingV3,
+				},
+			}, nil
+		},
+		loadLLMReceipt: func(_ context.Context, _ types.RunIdentity,
+			_ types.ResearchRunSnapshotRefV3, _ string, round int,
+		) (storepkg.ResearchRunLLMReceiptV3, bool, error) {
+			reservation, found := reservations[round]
+			if !found {
+				return storepkg.ResearchRunLLMReceiptV3{}, false, nil
+			}
+			prompt := prompts[round]
+			return storepkg.ResearchRunLLMReceiptV3{
+				Reservation: reservation, Settled: true, LLMCallID: int64(200 + round),
+				Attempted: true, UsageKnown: true, Outcome: storepkg.ResearchRunLLMCompletedV3,
+				Call: types.LLMCall{SystemPrompt: prompt[0], UserPrompt: prompt[1],
+					Completion: string(completions[round])},
+			}, true, nil
+		},
+		prepareGrounding: func(_ context.Context, params storepkg.PrepareResearchBriefGroundingV1Params) (
+			storepkg.PrepareResearchBriefGroundingV1Result, error,
+		) {
+			if !reflect.DeepEqual(params.CandidateBriefPayload, initial) {
+				t.Fatalf("initial candidate=%s", params.CandidateBriefPayload)
+			}
+			return storepkg.PrepareResearchBriefGroundingV1Result{
+				FirstWriter: true, Grounding: storepkg.ResearchBriefGroundingV1{
+					ID: 501, Status: storepkg.ResearchBriefGroundingPreparedV1,
+					CandidateBriefPayload: initial, CandidateDigest: initialDigest,
+					VerifierPrompt: []byte(`{"verify":"initial"}`),
+				},
+			}, nil
+		},
+		settleGrounding: func(_ context.Context, params storepkg.SettleResearchBriefGroundingV1Params) (
+			storepkg.ResearchBriefGroundingV1, error,
+		) {
+			return storepkg.ResearchBriefGroundingV1{
+				ID: 501, Status: storepkg.ResearchBriefGroundingRejectedV1,
+				CandidateBriefPayload: initial, CandidateDigest: initialDigest,
+				VerifierPrompt: []byte(`{"verify":"initial"}`), VerdictPayload: params.VerdictPayload,
+			}, nil
+		},
+		prepareCorrection: func(context.Context,
+			storepkg.PrepareResearchBriefGroundingCorrectionV1Params,
+		) (storepkg.PrepareResearchBriefGroundingCorrectionV1Result, error) {
+			return storepkg.PrepareResearchBriefGroundingCorrectionV1Result{
+				FirstWriter: true, Correction: storepkg.ResearchBriefGroundingCorrectionV1{
+					ID: 601, Status: storepkg.ResearchBriefGroundingCorrectionPreparedV1,
+					CorrectionPrompt: []byte(`{"correct":"once"}`),
+				},
+			}, nil
+		},
+		settleCorrectionCandidate: func(_ context.Context,
+			params storepkg.SettleResearchBriefGroundingCorrectionCandidateV1Params,
+		) (storepkg.ResearchBriefGroundingCorrectionV1, error) {
+			if !reflect.DeepEqual(params.CorrectedBriefPayload, corrected) {
+				t.Fatalf("corrected candidate=%s", params.CorrectedBriefPayload)
+			}
+			return storepkg.ResearchBriefGroundingCorrectionV1{
+				ID: 601, Status: storepkg.ResearchBriefGroundingCorrectionCorrectedV1,
+				CorrectedBriefPayload: corrected, CorrectedBriefDigest: correctedDigest,
+				VerifierPrompt: []byte(`{"verify":"corrected"}`),
+			}, nil
+		},
+		settleCorrectionVerification: func(_ context.Context,
+			params storepkg.SettleResearchBriefGroundingCorrectionVerificationV1Params,
+		) (storepkg.ResearchBriefGroundingCorrectionV1, error) {
+			return storepkg.ResearchBriefGroundingCorrectionV1{
+				ID: 601, Status: storepkg.ResearchBriefGroundingCorrectionGroundedV1,
+				CorrectedBriefPayload: corrected, CorrectedBriefDigest: correctedDigest,
+				VerifierPrompt: []byte(`{"verify":"corrected"}`), VerdictPayload: params.VerdictPayload,
+			}, nil
+		},
+		finalizeBrief: func(_ context.Context, params storepkg.FinalizeResearchBriefSynthesisV3Params) (
+			types.ResearchBriefRefV3, error,
+		) {
+			if params.GroundingVerificationID != 501 || params.GroundingCorrectionID != 601 ||
+				!reflect.DeepEqual(params.BriefPayload, corrected) {
+				t.Fatalf("finalization params=%+v", params)
+			}
+			return types.ResearchBriefRefV3{BriefID: 701}, nil
+		},
+	}
+	runtime, err := NewProductionResearchRuntimeV3(
+		store, coordinatorGatewayFakeV3{}, &coordinatorExecutorFakeV3{},
+		func(context.Context, types.RunIdentity) (
+			runtimepolicy.BundleV1, runtimepolicy.ResearchToolPolicyV3,
+			runtimepolicy.ResearchModelPolicyV3, error,
+		) {
+			return runtimepolicy.BundleV1{}, runtimepolicy.ResearchToolPolicyV3{},
+				runtimepolicy.ResearchModelPolicyV3{}, nil
+		}, func(context.Context, types.RunIdentity, string) (bool, error) { return true, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err := runtime.Synthesize(t.Context(), identity, snapshot, plan, "trace")
+	if err != nil || brief.BriefID != 701 || !reflect.DeepEqual(rounds, []int{0, 1, 2, 3}) {
+		t.Fatalf("brief=%+v rounds=%v err=%v", brief, rounds, err)
+	}
+}
+
 func TestProductionResearchRuntimeV3UnauthorizedPrepareHasNoDependenciesOrEffects(t *testing.T) {
 	identity, _, _, _ := researchBridgeFixtureV3(t)
 	policyCalls, storeCalls := 0, 0
@@ -539,6 +832,13 @@ func TestDecodeResearchBriefCompletionV3CanonicalizesOnlyCurrentRenderer(t *test
 	if err != nil || payload.Assessment != types.ResearchBriefAssessmentGroundedV31 ||
 		!reflect.DeepEqual(gotCanonical, grounded) {
 		t.Fatalf("v3.4 candidate payload=%+v canonical=%s err=%v",
+			payload, gotCanonical, err)
+	}
+	payload, gotCanonical, err = decodeResearchBriefCompletionV3(
+		grounded, runtimepolicy.ResearchSynthesisRendererVersionV36)
+	if err != nil || payload.Assessment != types.ResearchBriefAssessmentGroundedV31 ||
+		!reflect.DeepEqual(gotCanonical, grounded) {
+		t.Fatalf("v3.6 candidate payload=%+v canonical=%s err=%v",
 			payload, gotCanonical, err)
 	}
 	if _, _, err := decodeResearchBriefCompletionV3(

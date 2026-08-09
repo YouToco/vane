@@ -120,6 +120,7 @@ type FinalizeResearchBriefSynthesisV3Params struct {
 	ClaimResearchBriefSynthesisV3Params
 	BriefPayload            []byte
 	GroundingVerificationID int64
+	GroundingCorrectionID   int64
 }
 
 type FailResearchBriefSynthesisV3Params struct {
@@ -344,7 +345,9 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 	contextSchema := researchSynthesisContextSchemaV32
 	var scopeWindow *researchScopeWindowV33
 	if snapshotSeal.Payload.ResearchModel.Synthesis.RendererVersion ==
-		runtimepolicy.ResearchSynthesisRendererVersionV35 {
+		runtimepolicy.ResearchSynthesisRendererVersionV35 ||
+		snapshotSeal.Payload.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV36 {
 		contextSchema = researchSynthesisContextSchemaV33
 		scopeWindow, err = buildResearchScopeWindowV33(
 			snapshotSeal.Payload.Definition, params.SnapshotRef.HistoryThroughUTC)
@@ -553,27 +556,58 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 		seal.ResearchModel.Synthesis.RendererVersion ==
 			runtimepolicy.ResearchSynthesisRendererVersionV34 ||
 		seal.ResearchModel.Synthesis.RendererVersion ==
-			runtimepolicy.ResearchSynthesisRendererVersionV35
+			runtimepolicy.ResearchSynthesisRendererVersionV35 ||
+		seal.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV36
 	if requiresGrounding {
 		grounding, found, err := loadResearchBriefGroundingV1(ctx, tx,
 			params.Identity, params.SnapshotRef.SnapshotID, params.SynthesisID)
 		if err != nil {
 			return types.ResearchBriefRefV3{}, err
 		}
-		if !found || grounding.ID != params.GroundingVerificationID ||
-			grounding.Status != ResearchBriefGroundingGroundedV1 ||
-			grounding.CandidateDigest != briefDigest ||
-			!bytes.Equal(grounding.CandidateBriefPayload, briefPayload) {
+		if !found || grounding.ID != params.GroundingVerificationID {
 			return types.ResearchBriefRefV3{}, researchRunConflictError()
 		}
-		verdict, verdictCanonical, err := types.DecodeResearchGroundingVerdictV1(
-			grounding.VerdictPayload)
-		if err != nil || verdict.Verdict != types.ResearchGroundingGroundedV1 ||
-			verdict.CandidateDigest != grounding.CandidateDigest ||
-			grounding.VerdictDigest != researchRunSHA256(verdictCanonical) {
-			return types.ResearchBriefRefV3{}, researchRunIntegrityError()
+		if grounding.Status == ResearchBriefGroundingGroundedV1 {
+			if params.GroundingCorrectionID != 0 ||
+				grounding.CandidateDigest != briefDigest ||
+				!bytes.Equal(grounding.CandidateBriefPayload, briefPayload) {
+				return types.ResearchBriefRefV3{}, researchRunConflictError()
+			}
+			verdict, verdictCanonical, err := types.DecodeResearchGroundingVerdictV1(
+				grounding.VerdictPayload)
+			if err != nil || verdict.Verdict != types.ResearchGroundingGroundedV1 ||
+				verdict.CandidateDigest != grounding.CandidateDigest ||
+				grounding.VerdictDigest != researchRunSHA256(verdictCanonical) {
+				return types.ResearchBriefRefV3{}, researchRunIntegrityError()
+			}
+		} else if seal.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV36 &&
+			grounding.Status == ResearchBriefGroundingRejectedV1 {
+			correction, found, err := loadResearchBriefGroundingCorrectionV1(
+				ctx, tx, params.Identity, params.SnapshotRef.SnapshotID,
+				params.SynthesisID)
+			if err != nil {
+				return types.ResearchBriefRefV3{}, err
+			}
+			if !found || correction.ID != params.GroundingCorrectionID ||
+				correction.GroundingVerificationID != grounding.ID ||
+				correction.Status != ResearchBriefGroundingCorrectionGroundedV1 ||
+				correction.CorrectedBriefDigest != briefDigest ||
+				!bytes.Equal(correction.CorrectedBriefPayload, briefPayload) {
+				return types.ResearchBriefRefV3{}, researchRunConflictError()
+			}
+			verdict, verdictCanonical, err := types.DecodeResearchGroundingVerdictV1(
+				correction.VerdictPayload)
+			if err != nil || verdict.Verdict != types.ResearchGroundingGroundedV1 ||
+				verdict.CandidateDigest != correction.CorrectedBriefDigest ||
+				correction.VerdictDigest != researchRunSHA256(verdictCanonical) {
+				return types.ResearchBriefRefV3{}, researchRunIntegrityError()
+			}
+		} else {
+			return types.ResearchBriefRefV3{}, researchRunConflictError()
 		}
-	} else if params.GroundingVerificationID != 0 {
+	} else if params.GroundingVerificationID != 0 || params.GroundingCorrectionID != 0 {
 		return types.ResearchBriefRefV3{}, researchRunConflictError()
 	}
 	receiptState, _, err := loadResearchBriefLLMReceiptStateV3(ctx, tx,

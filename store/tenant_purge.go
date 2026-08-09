@@ -156,8 +156,9 @@ var purgeOrder = []purgeStep{
 	// and immutable reservation, while a reservation binds its started step.
 	// Preserve the complete 090 child-first chain even while those two tables
 	// remain optional across a reversible migration rollout.
-	// Grounding records bind both the candidate synthesis and verifier LLM
-	// reservation, so explicit tenant erasure removes them before either parent.
+	// Correction records are children of the first grounding verdict, synthesis,
+	// and two reservations, so they lead the complete child-first chain.
+	{"research_brief_grounding_corrections", "tenant_id = $1"},
 	{"research_brief_grounding_verifications", "tenant_id = $1"},
 	{"research_run_llm_spend_settlements", "tenant_id = $1"},
 	{"llm_calls", "tenant_id = $1"},
@@ -289,33 +290,34 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
 	}
 	var (
-		canonicalBriefStagesAvailable      bool
-		profileEpochsAvailable             bool
-		profileEpochFencesAvailable        bool
-		profileCheckpointsAvailable        bool
-		profileEpochEventsAvailable        bool
-		profileEpochReceiptsAvailable      bool
-		profileActivitiesAvailable         bool
-		executiveReceiptsAvailable         bool
-		executiveArtifactsAvailable        bool
-		reportSettingsAvailable            bool
-		periodicIntentsAvailable           bool
-		periodicReceiptsAvailable          bool
-		periodicReportsAvailable           bool
-		periodicDeliveriesAvailable        bool
-		researchBriefsAvailable            bool
-		researchGroundingAvailable         bool
-		researchEvidenceAvailable          bool
-		researchLLMSettlementsAvailable    bool
-		researchLLMReservationsAvailable   bool
-		researchSpendSettlementsAvailable  bool
-		researchSpendReservationsAvailable bool
-		researchRunCapabilitiesAvailable   bool
-		researchBriefDeliveriesAvailable   bool
-		researchV3AuthoritiesAvailable     bool
-		researchV3CutoversAvailable        bool
-		researchV3PrepareHeadsAvailable    bool
-		researchV3PrepareOpsAvailable      bool
+		canonicalBriefStagesAvailable        bool
+		profileEpochsAvailable               bool
+		profileEpochFencesAvailable          bool
+		profileCheckpointsAvailable          bool
+		profileEpochEventsAvailable          bool
+		profileEpochReceiptsAvailable        bool
+		profileActivitiesAvailable           bool
+		executiveReceiptsAvailable           bool
+		executiveArtifactsAvailable          bool
+		reportSettingsAvailable              bool
+		periodicIntentsAvailable             bool
+		periodicReceiptsAvailable            bool
+		periodicReportsAvailable             bool
+		periodicDeliveriesAvailable          bool
+		researchBriefsAvailable              bool
+		researchGroundingAvailable           bool
+		researchGroundingCorrectionAvailable bool
+		researchEvidenceAvailable            bool
+		researchLLMSettlementsAvailable      bool
+		researchLLMReservationsAvailable     bool
+		researchSpendSettlementsAvailable    bool
+		researchSpendReservationsAvailable   bool
+		researchRunCapabilitiesAvailable     bool
+		researchBriefDeliveriesAvailable     bool
+		researchV3AuthoritiesAvailable       bool
+		researchV3CutoversAvailable          bool
+		researchV3PrepareHeadsAvailable      bool
+		researchV3PrepareOpsAvailable        bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -334,6 +336,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.periodic_report_deliveries') IS NOT NULL,
 		        to_regclass('public.research_brief_syntheses') IS NOT NULL,
 		        to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
+		        to_regclass('public.research_brief_grounding_corrections') IS NOT NULL,
 		        to_regclass('public.research_run_evidence') IS NOT NULL,
 		        to_regclass('public.research_run_llm_spend_settlements') IS NOT NULL,
 		        to_regclass('public.research_run_llm_spend_reservations') IS NOT NULL,
@@ -362,6 +365,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&periodicDeliveriesAvailable,
 		&researchBriefsAvailable,
 		&researchGroundingAvailable,
+		&researchGroundingCorrectionAvailable,
 		&researchEvidenceAvailable,
 		&researchLLMSettlementsAvailable,
 		&researchLLMReservationsAvailable,
@@ -394,6 +398,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"periodic_report_deliveries":                periodicDeliveriesAvailable,
 		"research_brief_syntheses":                  researchBriefsAvailable,
 		"research_brief_grounding_verifications":    researchGroundingAvailable,
+		"research_brief_grounding_corrections":      researchGroundingCorrectionAvailable,
 		"research_run_evidence":                     researchEvidenceAvailable,
 		"research_run_llm_spend_settlements":        researchLLMSettlementsAvailable,
 		"research_run_llm_spend_reservations":       researchLLMReservationsAvailable,

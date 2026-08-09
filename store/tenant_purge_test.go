@@ -137,6 +137,27 @@ func TestInvariant_ResearchGroundingPurgesBeforeBothBoundParents(t *testing.T) {
 	}
 }
 
+func TestInvariant_ResearchGroundingCorrectionPurgesBeforeAllBoundParents(t *testing.T) {
+	positions := map[string]int{}
+	for index, step := range purgeOrder {
+		positions[step.table] = index
+	}
+	child, ok := positions["research_brief_grounding_corrections"]
+	if !ok {
+		t.Fatal("research_brief_grounding_corrections missing from purgeOrder")
+	}
+	for _, parent := range []string{
+		"research_brief_grounding_verifications", "research_brief_syntheses",
+		"research_run_llm_spend_reservations",
+	} {
+		parentPosition, exists := positions[parent]
+		if !exists || child >= parentPosition {
+			t.Fatalf("research grounding correction position=%d must precede %s position=%d",
+				child, parent, parentPosition)
+		}
+	}
+}
+
 func TestInvariant_ResearchSpendPurgesInForeignKeyOrder(t *testing.T) {
 	positions := map[string]int{}
 	for index, step := range purgeOrder {

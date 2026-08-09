@@ -428,7 +428,7 @@ func TestResearchV3CutoverBeginRejectsDriftAfterSuccessfulShadowPostgres(t *test
 		TenantID: tenantID, UserID: userID, TaskID: taskID}
 	if _, err := st.CreateOrGetResearchRunSnapshotV3(t.Context(), identity,
 		testCompiledRunPolicyV1(t), testResearchToolPolicyStoreV3(t),
-		testResearchGroundingModelPolicyV1(t)); err != nil {
+		testScopedResearchGroundingModelPolicyV36Base(t)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.pool.Exec(t.Context(), `UPDATE schedule_playbooks

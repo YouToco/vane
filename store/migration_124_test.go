@@ -153,7 +153,7 @@ func TestMigration124EmptyDownPostgres(t *testing.T) {
 	}
 }
 
-func TestMigration124RetainedV35RefusesDownPostgres(t *testing.T) {
+func TestMigration125RetainedV36RefusesDownPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required for migration 124 integration tests")
@@ -180,9 +180,9 @@ func TestMigration124RetainedV35RefusesDownPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.DownTo(t.Context(), 123); err == nil ||
-		!strings.Contains(err.Error(), "scoped definition, v3.5 snapshot, or v3.3 synthesis history exists") {
-		t.Fatalf("retained v3.5 downgrade err=%v", err)
+	if _, err := provider.DownTo(t.Context(), 124); err == nil ||
+		!strings.Contains(err.Error(), "v3.6 correction history exists") {
+		t.Fatalf("retained v3.6 downgrade err=%v", err)
 	}
 }
 

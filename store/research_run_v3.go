@@ -118,7 +118,7 @@ func (s *Store) CreateOrGetResearchRunSnapshotWithAuthorityV3(
 		return types.ResearchRunSnapshotRefV3{}, err
 	}
 	if definition.ResearchScope != nil {
-		researchModel, err = runtimepolicy.WithExplicitEventWindowV35(researchModel)
+		researchModel, err = runtimepolicy.WithExplicitEventWindowV36(researchModel)
 		if err != nil {
 			return types.ResearchRunSnapshotRefV3{}, researchRunValidationError(
 				"scoped research model policy is invalid")
