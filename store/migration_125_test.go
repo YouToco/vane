@@ -34,8 +34,12 @@ func TestMigration125FreezesOneCorrectionAndOneReverification(t *testing.T) {
 		"correction.verifier_prompt=convert_to(requested_user_prompt,'UTF8')",
 		"research-synthesis.render/v3.6",
 		"grounding_corrector",
-		"enforce_research_grounding_finalization_v36",
+		"research_brief_grounding_finalization_v36",
 		"correction.corrected_brief_payload=NEW.brief_payload",
+		"final corrected research Brief differs from its completed correction receipt",
+		"reservation.round_ordinal=2",
+		"verifier_reservation.round_ordinal=3",
+		"correction.verdict_payload,verifier_call.completion",
 		"v3.6 correction history exists",
 		"FOR EACH ROW EXECUTE FUNCTION enforce_research_scope_window_v33()",
 		"FOR EACH ROW EXECUTE FUNCTION enforce_research_run_llm_spend_reservation_v2()",
@@ -80,7 +84,7 @@ func TestMigration125EmptyDownRestoresV124Postgres(t *testing.T) {
 		EXISTS (SELECT 1 FROM pg_trigger
 		         WHERE tgname='protect_research_brief_grounding_correction_v1'),
 		EXISTS (SELECT 1 FROM pg_trigger
-		         WHERE tgname='research_grounding_finalization_v36'),
+		         WHERE tgname='research_brief_grounding_finalization_v36'),
 		to_regprocedure(
 		 'admit_research_run_llm_spend_cap_v6(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
 		) IS NOT NULL,

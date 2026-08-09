@@ -388,6 +388,143 @@ CREATE TRIGGER research_scope_window_v33
 BEFORE INSERT OR UPDATE ON research_brief_syntheses
 FOR EACH ROW EXECUTE FUNCTION enforce_research_scope_window_v36();
 
+-- Retain the v119 round-0 receipt fence byte-for-byte for every historical
+-- path. A v3.6 correction may instead bind the final canonical Brief to the
+-- exact completed round-2 receipt that produced the immutable corrected row.
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION enforce_research_brief_llm_receipt_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    IF TG_OP='INSERT' THEN
+        IF NEW.synthesis_llm_spend_reservation_id IS NOT NULL THEN
+            RAISE EXCEPTION '092: prepared research Brief cannot pre-bind model spend'
+                USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.synthesis_llm_spend_reservation_id IS NULL AND
+       NEW.synthesis_llm_spend_reservation_id IS NOT NULL THEN
+        IF OLD.status<>'prepared' OR NEW.status<>'spending' OR NOT EXISTS (
+            SELECT 1
+              FROM public.research_run_llm_spend_reservations reservation
+             WHERE reservation.id=NEW.synthesis_llm_spend_reservation_id
+               AND reservation.tenant_id=NEW.tenant_id
+               AND reservation.user_id=NEW.user_id
+               AND reservation.task_id=NEW.task_id
+               AND reservation.run_snapshot_id=NEW.run_snapshot_id
+               AND reservation.stage='synthesis'
+               AND reservation.round_ordinal=0
+               AND reservation.subject_id=NEW.id
+        ) THEN
+            RAISE EXCEPTION '092: research Brief spend binding differs from synthesis subject'
+                USING ERRCODE='23514';
+        END IF;
+    ELSIF NEW.synthesis_llm_spend_reservation_id IS DISTINCT FROM
+          OLD.synthesis_llm_spend_reservation_id THEN
+        RAISE EXCEPTION '092: research Brief model spend binding is immutable'
+            USING ERRCODE='23514';
+    END IF;
+
+    IF NEW.status='finalized' AND NOT EXISTS (
+        SELECT 1
+          FROM public.research_run_llm_spend_reservations reservation
+          JOIN public.research_run_llm_spend_settlements settlement
+            ON settlement.reservation_id=reservation.id
+           AND settlement.tenant_id=reservation.tenant_id
+           AND settlement.user_id=reservation.user_id
+           AND settlement.task_id=reservation.task_id
+           AND settlement.run_snapshot_id=reservation.run_snapshot_id
+           AND settlement.stage=reservation.stage
+           AND settlement.round_ordinal=reservation.round_ordinal
+          JOIN public.llm_calls call ON call.id=settlement.llm_call_id
+         WHERE reservation.id=NEW.synthesis_llm_spend_reservation_id
+           AND reservation.tenant_id=NEW.tenant_id
+           AND reservation.user_id=NEW.user_id
+           AND reservation.task_id=NEW.task_id
+           AND reservation.run_snapshot_id=NEW.run_snapshot_id
+           AND reservation.stage='synthesis' AND reservation.round_ordinal=0
+           AND reservation.subject_id=NEW.id
+           AND settlement.attempted AND settlement.usage_known
+           AND NOT settlement.definitely_zero_usage
+           AND settlement.outcome='completed' AND settlement.error_code=''
+           AND call.research_run_llm_spend_reservation_id=reservation.id
+           AND call.tenant_id=NEW.tenant_id AND call.user_id=NEW.user_id
+           AND call.run_snapshot_id=NEW.run_snapshot_id
+           AND call.span_name='research_synthesis' AND call.error=''
+           AND public.research_brief_matches_synthesis_completion_v119(
+                   NEW.brief_payload,call.completion)
+    ) AND NOT EXISTS (
+        SELECT 1
+          FROM public.task_run_snapshots snapshot
+          JOIN public.research_brief_grounding_verifications grounding
+            ON grounding.run_snapshot_id=snapshot.id
+           AND grounding.tenant_id=snapshot.tenant_id
+           AND grounding.user_id=snapshot.user_id
+           AND grounding.task_id=snapshot.task_id
+          JOIN public.research_brief_grounding_corrections correction
+            ON correction.grounding_verification_id=grounding.id
+           AND correction.tenant_id=grounding.tenant_id
+           AND correction.user_id=grounding.user_id
+           AND correction.task_id=grounding.task_id
+           AND correction.run_snapshot_id=grounding.run_snapshot_id
+           AND correction.plan_id=grounding.plan_id
+           AND correction.synthesis_id=grounding.synthesis_id
+          JOIN public.research_run_llm_spend_reservations reservation
+            ON reservation.id=correction.corrector_llm_spend_reservation_id
+           AND reservation.tenant_id=correction.tenant_id
+           AND reservation.user_id=correction.user_id
+           AND reservation.task_id=correction.task_id
+           AND reservation.run_snapshot_id=correction.run_snapshot_id
+          JOIN public.research_run_llm_spend_settlements settlement
+            ON settlement.reservation_id=reservation.id
+           AND settlement.tenant_id=reservation.tenant_id
+           AND settlement.user_id=reservation.user_id
+           AND settlement.task_id=reservation.task_id
+           AND settlement.run_snapshot_id=reservation.run_snapshot_id
+           AND settlement.stage=reservation.stage
+           AND settlement.round_ordinal=reservation.round_ordinal
+          JOIN public.llm_calls call ON call.id=settlement.llm_call_id
+         WHERE snapshot.id=NEW.run_snapshot_id
+           AND snapshot.tenant_id=NEW.tenant_id
+           AND snapshot.user_id=NEW.user_id
+           AND snapshot.task_id=NEW.task_id
+           AND convert_from(snapshot.payload,'UTF8')::jsonb
+                 #>> '{research_model,synthesis,renderer_version}'=
+               'research-synthesis.render/v3.6'
+           AND grounding.plan_id=NEW.plan_id
+           AND grounding.synthesis_id=NEW.id
+           AND grounding.status='rejected'
+           AND correction.status='grounded'
+           AND correction.corrected_brief_payload=NEW.brief_payload
+           AND correction.corrected_brief_digest=NEW.brief_digest
+           AND reservation.stage='synthesis' AND reservation.round_ordinal=2
+           AND reservation.subject_id=NEW.id
+           AND reservation.user_prompt_digest=correction.correction_prompt_digest
+           AND settlement.attempted AND settlement.usage_known
+           AND NOT settlement.definitely_zero_usage
+           AND settlement.outcome='completed' AND settlement.error_code=''
+           AND call.research_run_llm_spend_reservation_id=reservation.id
+           AND call.tenant_id=NEW.tenant_id AND call.user_id=NEW.user_id
+           AND call.run_snapshot_id=NEW.run_snapshot_id
+           AND call.span_name='research_synthesis' AND call.error=''
+           AND call.user_prompt=convert_from(correction.correction_prompt,'UTF8')
+           AND public.research_brief_matches_synthesis_completion_v119(
+                   NEW.brief_payload,call.completion)
+    ) THEN
+        RAISE EXCEPTION '125: final corrected research Brief differs from its completed correction receipt'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_research_brief_llm_receipt_v1() FROM PUBLIC;
+
 -- DB finalization is independently bound to either the first grounded verdict
 -- or the one corrected candidate plus its final grounded verdict.
 -- +goose StatementBegin
@@ -450,6 +587,38 @@ BEGIN
            AND correction.run_snapshot_id=grounding.run_snapshot_id
            AND correction.plan_id=grounding.plan_id
            AND correction.synthesis_id=grounding.synthesis_id
+          JOIN public.research_run_llm_spend_reservations corrector_reservation
+            ON corrector_reservation.id=correction.corrector_llm_spend_reservation_id
+           AND corrector_reservation.tenant_id=correction.tenant_id
+           AND corrector_reservation.user_id=correction.user_id
+           AND corrector_reservation.task_id=correction.task_id
+           AND corrector_reservation.run_snapshot_id=correction.run_snapshot_id
+          JOIN public.research_run_llm_spend_settlements corrector_settlement
+            ON corrector_settlement.reservation_id=corrector_reservation.id
+           AND corrector_settlement.tenant_id=corrector_reservation.tenant_id
+           AND corrector_settlement.user_id=corrector_reservation.user_id
+           AND corrector_settlement.task_id=corrector_reservation.task_id
+           AND corrector_settlement.run_snapshot_id=corrector_reservation.run_snapshot_id
+           AND corrector_settlement.stage=corrector_reservation.stage
+           AND corrector_settlement.round_ordinal=corrector_reservation.round_ordinal
+          JOIN public.llm_calls corrector_call
+            ON corrector_call.id=corrector_settlement.llm_call_id
+          JOIN public.research_run_llm_spend_reservations verifier_reservation
+            ON verifier_reservation.id=correction.verifier_llm_spend_reservation_id
+           AND verifier_reservation.tenant_id=correction.tenant_id
+           AND verifier_reservation.user_id=correction.user_id
+           AND verifier_reservation.task_id=correction.task_id
+           AND verifier_reservation.run_snapshot_id=correction.run_snapshot_id
+          JOIN public.research_run_llm_spend_settlements verifier_settlement
+            ON verifier_settlement.reservation_id=verifier_reservation.id
+           AND verifier_settlement.tenant_id=verifier_reservation.tenant_id
+           AND verifier_settlement.user_id=verifier_reservation.user_id
+           AND verifier_settlement.task_id=verifier_reservation.task_id
+           AND verifier_settlement.run_snapshot_id=verifier_reservation.run_snapshot_id
+           AND verifier_settlement.stage=verifier_reservation.stage
+           AND verifier_settlement.round_ordinal=verifier_reservation.round_ordinal
+          JOIN public.llm_calls verifier_call
+            ON verifier_call.id=verifier_settlement.llm_call_id
          WHERE grounding.tenant_id=NEW.tenant_id
            AND grounding.user_id=NEW.user_id
            AND grounding.task_id=NEW.task_id
@@ -460,6 +629,46 @@ BEGIN
            AND correction.status='grounded'
            AND correction.corrected_brief_payload=NEW.brief_payload
            AND correction.corrected_brief_digest=NEW.brief_digest
+           AND corrector_reservation.stage='synthesis'
+           AND corrector_reservation.round_ordinal=2
+           AND corrector_reservation.subject_id=NEW.id
+           AND corrector_reservation.user_prompt_digest=
+               correction.correction_prompt_digest
+           AND corrector_settlement.attempted AND corrector_settlement.usage_known
+           AND NOT corrector_settlement.definitely_zero_usage
+           AND corrector_settlement.outcome='completed'
+           AND corrector_settlement.error_code=''
+           AND corrector_call.research_run_llm_spend_reservation_id=
+               corrector_reservation.id
+           AND corrector_call.tenant_id=NEW.tenant_id
+           AND corrector_call.user_id=NEW.user_id
+           AND corrector_call.run_snapshot_id=NEW.run_snapshot_id
+           AND corrector_call.span_name='research_synthesis'
+           AND corrector_call.error=''
+           AND corrector_call.user_prompt=
+               convert_from(correction.correction_prompt,'UTF8')
+           AND public.research_brief_matches_synthesis_completion_v119(
+                   correction.corrected_brief_payload,corrector_call.completion)
+           AND verifier_reservation.stage='synthesis'
+           AND verifier_reservation.round_ordinal=3
+           AND verifier_reservation.subject_id=NEW.id
+           AND verifier_reservation.user_prompt_digest=
+               correction.verifier_prompt_digest
+           AND verifier_settlement.attempted AND verifier_settlement.usage_known
+           AND NOT verifier_settlement.definitely_zero_usage
+           AND verifier_settlement.outcome='completed'
+           AND verifier_settlement.error_code=''
+           AND verifier_call.research_run_llm_spend_reservation_id=
+               verifier_reservation.id
+           AND verifier_call.tenant_id=NEW.tenant_id
+           AND verifier_call.user_id=NEW.user_id
+           AND verifier_call.run_snapshot_id=NEW.run_snapshot_id
+           AND verifier_call.span_name='research_synthesis'
+           AND verifier_call.error=''
+           AND verifier_call.user_prompt=
+               convert_from(correction.verifier_prompt,'UTF8')
+           AND public.research_brief_matches_synthesis_completion_v119(
+                   correction.verdict_payload,verifier_call.completion)
            AND correction.verdict_digest=encode(sha256(correction.verdict_payload),'hex')
            AND convert_from(correction.verdict_payload,'UTF8')=
                '{"schema_version":"vane.research-grounding-verdict/v1",' ||
@@ -481,7 +690,7 @@ END
 $$;
 -- +goose StatementEnd
 REVOKE ALL ON FUNCTION enforce_research_grounding_finalization_v36() FROM PUBLIC;
-CREATE TRIGGER research_grounding_finalization_v36
+CREATE TRIGGER research_brief_grounding_finalization_v36
 BEFORE INSERT OR UPDATE ON research_brief_syntheses
 FOR EACH ROW EXECUTE FUNCTION enforce_research_grounding_finalization_v36();
 
@@ -1011,8 +1220,87 @@ ALTER TABLE research_run_llm_spend_reservations
          round_ordinal IN (0,1))
     );
 
-DROP TRIGGER research_grounding_finalization_v36 ON research_brief_syntheses;
+DROP TRIGGER research_brief_grounding_finalization_v36 ON research_brief_syntheses;
 DROP FUNCTION enforce_research_grounding_finalization_v36();
+
+-- Restore migration 119's round-0-only receipt admission before removing the
+-- correction relation referenced by the v125 replacement.
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION enforce_research_brief_llm_receipt_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    IF TG_OP='INSERT' THEN
+        IF NEW.synthesis_llm_spend_reservation_id IS NOT NULL THEN
+            RAISE EXCEPTION '092: prepared research Brief cannot pre-bind model spend'
+                USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.synthesis_llm_spend_reservation_id IS NULL AND
+       NEW.synthesis_llm_spend_reservation_id IS NOT NULL THEN
+        IF OLD.status<>'prepared' OR NEW.status<>'spending' OR NOT EXISTS (
+            SELECT 1
+              FROM public.research_run_llm_spend_reservations reservation
+             WHERE reservation.id=NEW.synthesis_llm_spend_reservation_id
+               AND reservation.tenant_id=NEW.tenant_id
+               AND reservation.user_id=NEW.user_id
+               AND reservation.task_id=NEW.task_id
+               AND reservation.run_snapshot_id=NEW.run_snapshot_id
+               AND reservation.stage='synthesis'
+               AND reservation.round_ordinal=0
+               AND reservation.subject_id=NEW.id
+        ) THEN
+            RAISE EXCEPTION '092: research Brief spend binding differs from synthesis subject'
+                USING ERRCODE='23514';
+        END IF;
+    ELSIF NEW.synthesis_llm_spend_reservation_id IS DISTINCT FROM
+          OLD.synthesis_llm_spend_reservation_id THEN
+        RAISE EXCEPTION '092: research Brief model spend binding is immutable'
+            USING ERRCODE='23514';
+    END IF;
+
+    IF NEW.status='finalized' AND NOT EXISTS (
+        SELECT 1
+          FROM public.research_run_llm_spend_reservations reservation
+          JOIN public.research_run_llm_spend_settlements settlement
+            ON settlement.reservation_id=reservation.id
+           AND settlement.tenant_id=reservation.tenant_id
+           AND settlement.user_id=reservation.user_id
+           AND settlement.task_id=reservation.task_id
+           AND settlement.run_snapshot_id=reservation.run_snapshot_id
+           AND settlement.stage=reservation.stage
+           AND settlement.round_ordinal=reservation.round_ordinal
+          JOIN public.llm_calls call ON call.id=settlement.llm_call_id
+         WHERE reservation.id=NEW.synthesis_llm_spend_reservation_id
+           AND reservation.tenant_id=NEW.tenant_id
+           AND reservation.user_id=NEW.user_id
+           AND reservation.task_id=NEW.task_id
+           AND reservation.run_snapshot_id=NEW.run_snapshot_id
+           AND reservation.stage='synthesis' AND reservation.round_ordinal=0
+           AND reservation.subject_id=NEW.id
+           AND settlement.attempted AND settlement.usage_known
+           AND NOT settlement.definitely_zero_usage
+           AND settlement.outcome='completed' AND settlement.error_code=''
+           AND call.research_run_llm_spend_reservation_id=reservation.id
+           AND call.tenant_id=NEW.tenant_id AND call.user_id=NEW.user_id
+           AND call.run_snapshot_id=NEW.run_snapshot_id
+           AND call.span_name='research_synthesis' AND call.error=''
+           AND public.research_brief_matches_synthesis_completion_v119(
+                   NEW.brief_payload,call.completion)
+    ) THEN
+        RAISE EXCEPTION '119: final research Brief differs from its synthesis response projection'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_research_brief_llm_receipt_v1() FROM PUBLIC;
 
 DROP TRIGGER research_scope_window_v33 ON research_brief_syntheses;
 CREATE TRIGGER research_scope_window_v33
