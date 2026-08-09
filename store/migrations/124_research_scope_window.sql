@@ -483,7 +483,7 @@ BEGIN
     IF snapshot_json IS NULL THEN
         RAISE EXCEPTION '124: synthesis snapshot scope differs' USING ERRCODE='23514';
     END IF;
-    IF snapshot_json #>> '{research_model,synthesis,renderer_version}' <>
+    IF snapshot_json #>> '{research_model,synthesis,renderer_version}' IS DISTINCT FROM
        'research-synthesis.render/v3.5' THEN
         IF snapshot_json #> '{definition,research_scope}' IS NOT NULL OR
            convert_from(NEW.context_payload,'UTF8')::jsonb->>'schema_version' =

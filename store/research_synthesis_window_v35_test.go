@@ -456,6 +456,9 @@ func TestScopedResearchBriefV35DatabaseRejectsScopeSnapshotTampering(t *testing.
 		t.Fatal(err)
 	}
 	tests := map[string]func(map[string]any){
+		"missing renderer": func(snapshot map[string]any) {
+			delete(snapshot["research_model"].(map[string]any)["synthesis"].(map[string]any), "renderer_version")
+		},
 		"missing mode": func(snapshot map[string]any) {
 			delete(snapshot["definition"].(map[string]any)["research_scope"].(map[string]any), "mode")
 		},
