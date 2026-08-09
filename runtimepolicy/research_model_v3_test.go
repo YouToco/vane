@@ -104,7 +104,19 @@ func TestResearchModelPolicyV33RequiresFrozenIndependentVerifier(t *testing.T) {
 		decoded.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV33 {
 		t.Fatalf("decoded=%+v err=%v", decoded, err)
 	}
+	verifier.RendererVersion = ResearchGroundingVerifierRendererVersionV11
+	policy.GroundingVerifier = &verifier
+	if _, err := BuildResearchModelPolicyV3(policy); err != nil {
+		t.Fatalf("v1.1 verifier renderer rejected: %v", err)
+	}
+	verifier.RendererVersion = "research-grounding-verifier.render/future"
+	policy.GroundingVerifier = &verifier
+	if _, err := BuildResearchModelPolicyV3(policy); err == nil {
+		t.Fatal("unknown verifier renderer accepted")
+	}
 
+	verifier.RendererVersion = ResearchGroundingVerifierRendererVersionV1
+	policy.GroundingVerifier = &verifier
 	policy.Synthesis.RendererVersion = ResearchSynthesisRendererVersionV32
 	if _, err := BuildResearchModelPolicyV3(policy); err == nil {
 		t.Fatal("legacy synthesis renderer accepted an unused verifier policy")

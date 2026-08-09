@@ -27,7 +27,8 @@ const (
 	ResearchSynthesisRendererVersionV32 = "research-synthesis.render/v3.2"
 	ResearchSynthesisRendererVersionV33 = "research-synthesis.render/v3.3"
 
-	ResearchGroundingVerifierRendererVersionV1 = "research-grounding-verifier.render/v1"
+	ResearchGroundingVerifierRendererVersionV1  = "research-grounding-verifier.render/v1"
+	ResearchGroundingVerifierRendererVersionV11 = "research-grounding-verifier.render/v1.1"
 )
 
 type ResearchModelStageV3 struct {
@@ -79,13 +80,18 @@ func (p ResearchModelPolicyV3) Validate() error {
 				ResearchModelStageGroundingVerifierV3)) ||
 		(p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV33 &&
 			(p.GroundingVerifier == nil ||
-				p.GroundingVerifier.RendererVersion !=
-					ResearchGroundingVerifierRendererVersionV1)) ||
+				!validResearchGroundingVerifierRendererVersion(
+					p.GroundingVerifier.RendererVersion))) ||
 		(p.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV33 &&
 			p.GroundingVerifier != nil) {
 		return invalidPolicy("research model policy is invalid")
 	}
 	return nil
+}
+
+func validResearchGroundingVerifierRendererVersion(version string) bool {
+	return version == ResearchGroundingVerifierRendererVersionV1 ||
+		version == ResearchGroundingVerifierRendererVersionV11
 }
 
 func (p ResearchModelPolicyV3) MarshalJSON() ([]byte, error) {

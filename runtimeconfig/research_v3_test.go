@@ -51,7 +51,7 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		got.Model.Planner.RendererVersion != runtimepolicy.ResearchPlannerRendererVersionV32 ||
 		got.Model.Synthesis.RendererVersion != runtimepolicy.ResearchSynthesisRendererVersionV33 ||
 		got.Model.GroundingVerifier.RendererVersion !=
-			runtimepolicy.ResearchGroundingVerifierRendererVersionV1 ||
+			runtimepolicy.ResearchGroundingVerifierRendererVersionV11 ||
 		!got.Model.Planner.DisableThinking || !got.Model.Synthesis.DisableThinking ||
 		!got.Model.GroundingVerifier.DisableThinking ||
 		!strings.Contains(got.Model.Planner.SystemPrompt, "至少两条互补证据路径") ||

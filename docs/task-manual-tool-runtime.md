@@ -162,6 +162,13 @@ has its own quota-backed LLM reservation and exact provider receipt. Only a
 does not ask the same model to repair its own answer. Retained V3/V3.1/V3.2
 snapshots continue to replay with their frozen pre-verifier behavior.
 
+The verifier response contract is renderer-versioned. The retained `v1`
+renderer replays its original bytes. New snapshots use `v1.1`, which states
+that every issue `refs` value is an array of citation objects containing only
+`kind` and `ref`, copied exactly from `candidate_brief.citations`; bare ref
+strings are invalid. This closes a production ambiguity without reinterpreting
+an already-frozen prompt or provider receipt.
+
 ## External-fact authority
 
 Model weights are not a current truth source for mutable external facts.

@@ -80,6 +80,9 @@ type researchGroundingResponseContractV1 struct {
 	GroundedIssuesRule     string   `json:"grounded_issues_rule"`
 	UnsupportedIssuesRule  string   `json:"unsupported_issues_rule"`
 	IssueFields            []string `json:"issue_fields"`
+	IssueRefsItemFields    []string `json:"issue_refs_item_fields,omitempty"`
+	IssueRefsKindValues    []string `json:"issue_refs_kind_values,omitempty"`
+	IssueRefsRule          string   `json:"issue_refs_rule,omitempty"`
 	SingleCanonicalJSON    bool     `json:"single_canonical_json"`
 }
 
@@ -154,7 +157,8 @@ func (s *Store) PrepareOrGetResearchBriefGroundingV1(
 	}
 	candidateDigest := researchRunSHA256(canonical)
 	prompt, err := buildResearchGroundingPromptV1(
-		brief, canonical, candidateDigest, synthesis.ContextPayload)
+		brief, canonical, candidateDigest, synthesis.ContextPayload,
+		seal.ResearchModel.GroundingVerifier.RendererVersion)
 	if err != nil {
 		return PrepareResearchBriefGroundingV1Result{}, err
 	}
@@ -357,8 +361,12 @@ func groundingVerdictRefsBoundToCandidateV1(
 
 func buildResearchGroundingPromptV1(
 	brief types.ResearchBriefPayloadV3, canonical []byte, candidateDigest string,
-	contextPayload []byte,
+	contextPayload []byte, rendererVersion string,
 ) ([]byte, error) {
+	if rendererVersion != runtimepolicy.ResearchGroundingVerifierRendererVersionV1 &&
+		rendererVersion != runtimepolicy.ResearchGroundingVerifierRendererVersionV11 {
+		return nil, researchRunIntegrityError()
+	}
 	var synthesis researchSynthesisContextV3
 	if json.Unmarshal(contextPayload, &synthesis) != nil ||
 		!validResearchSynthesisContextVersionV3(synthesis.SchemaVersion, len(synthesis.ToolFailures)) {
@@ -399,21 +407,30 @@ func buildResearchGroundingPromptV1(
 			return nil, researchRunIntegrityError()
 		}
 	}
+	responseContract := researchGroundingResponseContractV1{
+		SchemaVersionLiteral:   types.ResearchGroundingVerdictSchemaV1,
+		RequiredTopLevelFields: []string{"schema_version", "candidate_digest", "verdict", "issues"},
+		VerdictValues:          []string{"grounded", "unsupported"},
+		GroundedIssuesRule:     "issues must be []",
+		UnsupportedIssuesRule:  "issues must contain every unsupported claim",
+		IssueFields:            []string{"field", "claim", "refs", "reason"},
+		SingleCanonicalJSON:    true,
+	}
+	if rendererVersion == runtimepolicy.ResearchGroundingVerifierRendererVersionV11 {
+		responseContract.IssueRefsItemFields = []string{"kind", "ref"}
+		responseContract.IssueRefsKindValues = []string{
+			string(types.ResearchBriefCitationCurrentEvidenceV3),
+			string(types.ResearchBriefCitationHistoryV3),
+		}
+		responseContract.IssueRefsRule = "refs must be a JSON array of citation objects copied exactly from candidate_brief.citations; each object must contain only kind and ref, never a bare string; use [] when no candidate citation supports the claim"
+	}
 	prompt, err := json.Marshal(researchGroundingInputV1{
 		SchemaVersion: researchGroundingInputSchemaV1, CandidateDigest: candidateDigest,
 		TaskManual:     synthesis.Definition.TaskManual,
 		CandidateBrief: append(json.RawMessage(nil), canonical...), CitedEvidence: items,
 		ToolFailures: append([]researchToolFailureContextV31(nil),
 			synthesis.ToolFailures...),
-		ResponseContract: researchGroundingResponseContractV1{
-			SchemaVersionLiteral:   types.ResearchGroundingVerdictSchemaV1,
-			RequiredTopLevelFields: []string{"schema_version", "candidate_digest", "verdict", "issues"},
-			VerdictValues:          []string{"grounded", "unsupported"},
-			GroundedIssuesRule:     "issues must be []",
-			UnsupportedIssuesRule:  "issues must contain every unsupported claim",
-			IssueFields:            []string{"field", "claim", "refs", "reason"},
-			SingleCanonicalJSON:    true,
-		},
+		ResponseContract: responseContract,
 	})
 	if err != nil || len(prompt) < 2 || len(prompt) > researchRunLLMMaxPromptBytesV3 {
 		return nil, researchRunValidationError("research grounding prompt exceeds its budget")

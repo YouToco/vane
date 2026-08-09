@@ -36,6 +36,22 @@ func newResearchGroundingFixtureV1(t *testing.T) researchBriefFixtureV3 {
 		"", "", testResearchGroundingModelPolicyV1(t))
 }
 
+func newResearchGroundingFixtureV11(t *testing.T) researchBriefFixtureV3 {
+	t.Helper()
+	policy := testResearchGroundingModelPolicyV1(t)
+	policy.GroundingVerifier.RendererVersion =
+		runtimepolicy.ResearchGroundingVerifierRendererVersionV11
+	policy, err := runtimepolicy.BuildResearchModelPolicyV3(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := tenantTestStore(t)
+	return newResearchBriefFixtureWithStoreWorkflowAndModelV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true,
+		[]byte(`{"title":"OpenAI release","text":"OpenAI released GPT-5.6.","url":"https://openai.com/index/gpt-5-6/"}`),
+		"", "", policy)
+}
+
 func prepareGroundingCandidateV1(t *testing.T, f researchBriefFixtureV3) (
 	ResearchBriefSynthesisV3, ClaimResearchBriefSynthesisV3Params, []byte,
 	ResearchBriefGroundingV1,
@@ -166,6 +182,9 @@ func TestResearchBriefGroundingV1PostgresGatesFinalization(t *testing.T) {
 		!strings.Contains(string(grounding.VerifierPrompt), grounding.CandidateDigest) {
 		t.Fatalf("verifier prompt is not candidate/evidence bound: %s", grounding.VerifierPrompt)
 	}
+	if strings.Contains(string(grounding.VerifierPrompt), `"issue_refs_item_fields"`) {
+		t.Fatalf("frozen v1 verifier prompt changed: %s", grounding.VerifierPrompt)
+	}
 	if _, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
 		FinalizeResearchBriefSynthesisV3Params{
 			ClaimResearchBriefSynthesisV3Params: handle,
@@ -216,6 +235,21 @@ func TestResearchBriefGroundingV1PostgresGatesFinalization(t *testing.T) {
 		// The synthesis is terminal; preparing a new verification must not be a
 		// side door even though the immutable record remains queryable.
 		t.Fatal("terminal Brief admitted a new grounding preparation")
+	}
+}
+
+func TestResearchBriefGroundingV11ExplainsCitationObjectContract(t *testing.T) {
+	f := newResearchGroundingFixtureV11(t)
+	_, _, _, grounding := prepareGroundingCandidateV1(t, f)
+	prompt := string(grounding.VerifierPrompt)
+	for _, want := range []string{
+		`"issue_refs_item_fields":["kind","ref"]`,
+		`"issue_refs_kind_values":["current_evidence","history"]`,
+		`never a bare string`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("v1.1 verifier prompt missing %q: %s", want, prompt)
+		}
 	}
 }
 
