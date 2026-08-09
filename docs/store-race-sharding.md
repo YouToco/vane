@@ -26,14 +26,17 @@ The seed job:
    summing their atomic counters;
 7. projects the verified combined stream to sorted top-level terminal JSONL;
 8. proves the seed and authoritative test list are exactly one-to-one, records
-   the seed SHA-256, and uploads both with a checksum manifest.
+   the reviewed 880-test baseline, records the seed SHA-256 and exact checkout
+   commit, and uploads all authority files under one checksum manifest.
 
 Five fixed matrix jobs then run on independent GitHub-hosted runners, each with
 three fresh PostgreSQL 18 service containers. Every job downloads the same
 run-scoped seed artifact, rechecks the SHA-256 and exact test-list projection,
-and invokes `storetestshard run --timings`. A successful repeat must report
-`historical-lpt`, full timing coverage, expected=observed, zero duplicate/missing
-tests, three per-shard wall measurements, and identical coverage block sets.
+requires the downloaded source commit to equal both `github.sha` and the seed
+job output, and invokes `storetestshard run --timings`. A successful repeat must
+report `historical-lpt`, exactly 880 expected/observed/historical tests, zero
+duplicate/missing tests, three per-shard wall measurements, and identical
+coverage block sets.
 Each repeat uploads its status, plan, manifests, top-level event stream, shard
 JSONL, and coverage profiles under a run/attempt/repeat-unique artifact name.
 

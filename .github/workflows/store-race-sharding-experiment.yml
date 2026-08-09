@@ -20,6 +20,7 @@ jobs:
     outputs:
       seed_sha256: ${{ steps.seed_digest.outputs.seed_sha256 }}
       test_list_sha256: ${{ steps.seed_digest.outputs.test_list_sha256 }}
+      source_commit: ${{ steps.seed_digest.outputs.source_commit }}
 
     services:
       postgres_0:
@@ -93,7 +94,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tmp/store-timing-seed
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]]
+          jq -e '
+            .exit_code == 0 and .phase == "complete" and
+            .strategy == "stable-fnv1a" and .timing_input_status == "not_provided" and
+            .expected_tests == 880 and .observed_tests == 880 and
+            .historical_timing_tests == 0 and
+            .duplicate_tests == 0 and .missing_tests == 0 and
+            (.shard_seconds | length) == 3
+          ' tmp/store-seed/store-shard-status.json
+          jq -e '
+            .strategy == "stable-fnv1a" and
+            .test_count == 880 and .historical_timings == 0 and
+            (.shards | length) == 3
+          ' tmp/store-seed/store-shard-plan.json
           cp tmp/store-seed/store-tests.list.txt tmp/store-timing-seed/store-tests.list.txt
+          printf '%s\n' "${GITHUB_SHA}" > tmp/store-timing-seed/source-commit.txt
           go run ./cmd/storetestshard timing-seed \
             --tests tmp/store-timing-seed/store-tests.list.txt \
             --output tmp/store-timing-seed/store.timings.jsonl \
@@ -101,16 +117,20 @@ jobs:
             tmp/store-seed/store.test.json
           (
             cd tmp/store-timing-seed
-            sha256sum store.timings.jsonl store-tests.list.txt > store-timing-seed.sha256
+            sha256sum \
+              store.timings.jsonl \
+              store-tests.list.txt \
+              source-commit.txt > store-timing-seed.sha256
             sha256sum --check store-timing-seed.sha256
           )
           seed_digest="$(sha256sum tmp/store-timing-seed/store.timings.jsonl | cut -d' ' -f1)"
           test_list_digest="$(sha256sum tmp/store-timing-seed/store-tests.list.txt | cut -d' ' -f1)"
           echo "seed_sha256=${seed_digest}" >> "${GITHUB_OUTPUT}"
           echo "test_list_sha256=${test_list_digest}" >> "${GITHUB_OUTPUT}"
+          echo "source_commit=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
           jq -e --arg digest "${seed_digest}" \
-            '.version == 1 and .test_count > 0 and
-             .terminal_events == .test_count and .sha256 == $digest' \
+            '.version == 1 and .test_count == 880 and
+             .terminal_events == 880 and .sha256 == $digest' \
             tmp/store-timing-seed/store.timings.manifest.json
 
       - name: Upload timing seed
@@ -209,13 +229,17 @@ jobs:
             cd tmp/store-timing-seed
             sha256sum --check store-timing-seed.sha256
           )
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]]
           seed_digest="$(sha256sum tmp/store-timing-seed/store.timings.jsonl | cut -d' ' -f1)"
           test_list_digest="$(sha256sum tmp/store-timing-seed/store-tests.list.txt | cut -d' ' -f1)"
+          source_commit="$(tr -d '\n' < tmp/store-timing-seed/source-commit.txt)"
           [[ "${seed_digest}" == "${{ needs.seed.outputs.seed_sha256 }}" ]]
           [[ "${test_list_digest}" == "${{ needs.seed.outputs.test_list_sha256 }}" ]]
+          [[ "${source_commit}" == "${GITHUB_SHA}" ]]
+          [[ "${source_commit}" == "${{ needs.seed.outputs.source_commit }}" ]]
           jq -e --arg digest "${seed_digest}" \
-            '.version == 1 and .test_count > 0 and
-             .terminal_events == .test_count and .sha256 == $digest' \
+            '.version == 1 and .test_count == 880 and
+             .terminal_events == 880 and .sha256 == $digest' \
             tmp/store-timing-seed/store.timings.manifest.json
           go run ./cmd/storetestshard timing-seed \
             --tests tmp/store-timing-seed/store-tests.list.txt \
@@ -239,14 +263,14 @@ jobs:
           jq -e '
             .exit_code == 0 and .phase == "complete" and
             .strategy == "historical-lpt" and .timing_input_status == "loaded" and
-            .expected_tests > 0 and .historical_timing_tests == .expected_tests and
-            .observed_tests == .expected_tests and
+            .expected_tests == 880 and .historical_timing_tests == 880 and
+            .observed_tests == 880 and
             .duplicate_tests == 0 and .missing_tests == 0 and
             (.shard_seconds | length) == 3
           ' tmp/store-lpt-${{ matrix.repeat }}/store-shard-status.json
           jq -e '
             .strategy == "historical-lpt" and
-            .historical_timings == .test_count and
+            .test_count == 880 and .historical_timings == 880 and
             (.shards | length) == 3
           ' tmp/store-lpt-${{ matrix.repeat }}/store-shard-plan.json
 
