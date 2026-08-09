@@ -1292,13 +1292,13 @@ func TestWebSearchPublicEvidenceURLsAreInvocationLocal(t *testing.T) {
 }
 
 func TestTaintHidesAndRejectsActivationWrite(t *testing.T) {
-	endpoints := NewEndpointTools(nil, nil, 0, 0)
+	endpoints := NewEndpointTools(&fakeInvoker{}, nil, 0, 0)
 	search := endpoints.SearchTool()
 	state := &toolRunState{
 		activation: &activationState{}, untrustedExternalResult: true,
 		intents: IntentSocialResearch,
 	}
-	loop := New(Deps{Tools: []ToolSpec{search}})
+	loop := New(Deps{Tools: []ToolSpec{search}, Endpoints: endpoints})
 	if defs := loop.requestTools(state); len(defs) != 0 ||
 		canDeclareAfterUntrusted(state, search) ||
 		canRunAfterUntrusted(state, search, json.RawMessage(`{"query":"x"}`)) {

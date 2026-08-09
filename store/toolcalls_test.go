@@ -78,7 +78,7 @@ func TestToolCalls_InsertAndCount(t *testing.T) {
 
 	// search 记录带候选数组。
 	if _, err := st.InsertToolCall(ctx, &types.ToolCall{
-		ToolName: "search_endpoints", ToolKind: types.ToolCallKindTikHubSearch,
+		ToolName: "tool_search", ToolKind: types.ToolCallKindTikHubSearch,
 		RetrievalQuery: "小红书 搜索", CandidateTools: []string{"a", "b"},
 	}); err != nil {
 		t.Fatalf("search 记录写入失败: %v", err)

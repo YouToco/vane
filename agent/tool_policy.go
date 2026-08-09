@@ -139,7 +139,7 @@ func Intents(values ...ToolIntent) ToolIntent {
 func (i ToolIntent) HasAny(other ToolIntent) bool { return i&other != 0 }
 
 // ResultTrust describes the data returned to the model. It is not inferred
-// from network access: search_endpoints reads a local catalog, while
+// from network access: tool_search reads a local catalog, while
 // read_endpoint_result returns cached but externally sourced text.
 type ResultTrust uint8
 

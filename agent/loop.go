@@ -332,8 +332,36 @@ func NewChecked(d Deps) (*Loop, error) {
 		if _, exists := tools[spec.Name()]; exists {
 			return nil, fmt.Errorf("agent: duplicate tool name %q", spec.Name())
 		}
+		if spec.Name() == "search_endpoints" {
+			return nil, errors.New("agent: retired tool search_endpoints is forbidden")
+		}
 		tools[spec.Name()] = spec
 		defs = append(defs, spec.Definition)
+	}
+	if _, hasToolSearch := tools["tool_search"]; hasToolSearch &&
+		(d.Endpoints == nil || d.Endpoints.inv == nil) {
+		return nil, errors.New("agent: tool_search requires an authorized endpoint invoker")
+	}
+	if d.Endpoints != nil {
+		if d.Endpoints.catalog == nil {
+			return nil, errors.New("agent: endpoint tool catalog is unavailable")
+		}
+		for name := range tools {
+			if _, collision := d.Endpoints.catalog.AgentDefinition(name); collision {
+				return nil, fmt.Errorf("agent: static tool %q collides with a deferred tool", name)
+			}
+		}
+		for _, reserved := range []string{"tool_search", "read_endpoint_result", "search_endpoints"} {
+			if _, collision := d.Endpoints.catalog.AgentDefinition(reserved); collision {
+				return nil, fmt.Errorf("agent: deferred catalog contains forbidden tool %q", reserved)
+			}
+		}
+		if spec, ok := tools["tool_search"]; ok {
+			search, typeOK := spec.Tool.(*toolSearchTool)
+			if !typeOK || search.ep != d.Endpoints {
+				return nil, errors.New("agent: tool_search and dynamic endpoint resolver are split")
+			}
+		}
 	}
 	if ownerAgent {
 		if d.Evidence == nil {
@@ -362,10 +390,12 @@ func NewChecked(d Deps) (*Loop, error) {
 	}
 	agentFirstSys := sys
 	if d.Endpoints != nil {
-		// 能力说明只在真装配了端点工具面时注入：没有 search_endpoints 工具却教模型
+		// 能力说明只在真装配了端点工具面时注入：没有 tool_search 工具却教模型
 		// 去用它，只会制造白名单拒绝循环。
-		sys += endpointSystemNote()
-		agentFirstSys += endpointSystemNote()
+		if _, ok := tools["tool_search"]; ok {
+			sys += endpointSystemNote(d.Endpoints)
+			agentFirstSys += endpointSystemNote(d.Endpoints)
+		}
 	}
 	if _, ok := tools["web_search"]; ok {
 		// 同 endpointSystemNote 原则：Exa ad-hoc 工具对（web_search/read_page）是条件
@@ -972,7 +1002,7 @@ func (l *Loop) converse(
 		request := llm.ChatRequest{
 			Model:    l.model,
 			Messages: withSystem(system, requestMessages, profileHint, renderProfile),
-			// 每轮现算工具面：静态声明 + 会话已激活端点声明（search_endpoints 本轮
+			// 每轮现算工具面：静态声明 + 会话已激活端点声明（tool_search 本轮
 			// 激活的端点，下一轮就出现在这里——检索后注入的核心闭环）。
 			Tools:     tools,
 			MaxTokens: iptr(replyMaxTokens),
@@ -1506,9 +1536,9 @@ func observeAgentRunState(state *toolRunState) {
 		return
 	}
 	hitRate := float64(0)
-	if state.candidateSearches > 0 {
+	if state.candidateSlots > 0 {
 		hitRate = float64(state.candidateHits) /
-			float64(state.candidateSearches*searchTopK)
+			float64(state.candidateSlots)
 	}
 	slog.Info("agent turn metrics",
 		"tool_chain_depth", state.toolExecutions,
@@ -1840,7 +1870,7 @@ func (l *Loop) batchMayProduceExternalResult(calls []llm.ToolCall, state *toolRu
 	for _, tc := range calls {
 		spec, ok := l.resolveTool(tc.Name, state)
 		if !ok {
-			// search_endpoints cannot activate and execute a newly discovered
+			// tool_search cannot activate and execute a newly discovered
 			// schema in the same model batch. Requiring the next FC turn keeps
 			// resolution deterministic.
 			return true
@@ -2569,7 +2599,7 @@ func isFixedSafeToolReply(name, reply string) bool {
 // 只有由本地受信数据构造的当前工具回执进入稳定历史。
 func isStableTrustedHistoryTool(name string) bool {
 	switch name {
-	case "search_endpoints", "query_my_intelligence":
+	case "tool_search", "query_my_intelligence":
 		return true
 	default:
 		return false

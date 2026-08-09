@@ -383,12 +383,11 @@ func TestUnifiedLoopFuseReservesToolFreePartialSynthesis(t *testing.T) {
 }
 
 func TestDynamicDescriptionsHideProviderAndTransport(t *testing.T) {
-	entry := tikhubcatalog.Entry{
-		Summary: "Search public posts",
-		Description: "TikHub internal\nRequest Method: GET\n" +
-			"Endpoint Path: /api/v1/private\nPurpose: search posts",
+	definition, ok := tikhubcatalog.AgentDefinition("xiaohongshu_app_v2_search_notes")
+	if !ok {
+		t.Fatal("missing authorized model definition")
 	}
-	got := strings.ToLower(endpointDefDescription(entry))
+	got := strings.ToLower(definition.Description)
 	for _, forbidden := range []string{"tikhub", "/api/v1", "request method", "endpoint path"} {
 		if strings.Contains(got, forbidden) {
 			t.Fatalf("description leaked %q: %s", forbidden, got)
@@ -405,8 +404,12 @@ func TestProductionToolSchemasHideProvidersAndTransport(t *testing.T) {
 			spec.Description(), string(spec.Parameters()))
 	}
 	for _, entry := range tikhubcatalog.Entries() {
+		definition, ok := tikhubcatalog.AgentDefinition(entry.Name)
+		if !ok {
+			t.Fatalf("catalog entry %s missing model definition", entry.Name)
+		}
 		assertPublicToolSurface(t, entry.Name,
-			endpointDefDescription(entry), string(endpointParamsSchema(entry)))
+			definition.Description, string(definition.Parameters))
 	}
 }
 

@@ -98,7 +98,7 @@ func TestAssistantChatCardMatchesToollessPublicSurface(t *testing.T) {
 	text := string(encoded)
 	for _, forbidden := range []string{
 		"可查询本服务的订阅信源", "每天的推送计划是几点", "我现在订了哪些信源",
-		"web_search", "read_page", "search_endpoints",
+		"web_search", "read_page", "tool_search", "search_endpoints",
 	} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("assistant.chat card advertises unavailable capability %q: %s",

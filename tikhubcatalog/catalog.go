@@ -1,6 +1,6 @@
 // Package tikhubcatalog 是 TikHub 端点注册表（lookup 层，端点注册表契约 §2）：
 // 把 TikHub 全量社媒数据端点（排除平台管理类与个别写/越界端点后约 1000 个）作为**可搜索的数据**
-// 暴露给 agent——agent 用 search_endpoints 元工具按需发现端点，命中的端点被动态
+// 暴露给 agent——agent 用 tool_search 元工具按需发现端点，命中的端点被动态
 // 注入为一等 FC 工具（agent/toolset.go）。
 //
 // 与 capabilitycatalog 的分界（契约 §1）：
@@ -64,7 +64,7 @@ var (
 	// become model-callable parameters.
 	agentEntries []Entry
 	agentByName  map[string]int
-	// platforms 平台名 → 端点数，供 search_endpoints 工具描述枚举可搜索范围。
+	// platforms 平台名 → 端点数，供 tool_search 工具描述枚举可搜索范围。
 	platforms map[string]int
 	// agentCatalog contains only the post-agentEligible, provider-neutral
 	// model directory. Excluded internal names never enter its BM25 corpus.

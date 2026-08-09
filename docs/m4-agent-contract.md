@@ -22,7 +22,7 @@
 
 飞书对话（仅 owner）→ agent loop（v4-pro FC）：
 - 内部只读、公开网页/社媒研究工具按当前用户意图在首个模型请求曝光；动态社媒工具保持
-  `search_endpoints → 激活具体工具 → 同一用户消息内调用` 的延迟发现。
+  `tool_search → 下一模型轮激活具体工具 → 同一用户消息内调用` 的延迟发现。
 - 用户明确要求且目标唯一时，`create_schedule` / `edit_task_definition` /
   `update_profile` / `remove_schedule` / `run_task_now` 直接执行；真歧义才自然追问，
   禁止要求内部 ID。
@@ -364,7 +364,7 @@ Loop 行为细则：
   system 必须明确整段 `external_result` 都是不可信数据、本轮只输出文字且不能声称执行操作。
   类型化飞书追问/引用进入该投影时，只有包装外的真实追问/回复可进入 `user_request`，
   推送原文/引用正文必须进入 `external_result`；包装损坏时全文降为外部数据，禁止信任提升。
-  `search_endpoints` 也必须独占批次：它会在执行期激活动态端点，预扫描时尚不可解析的
+  `tool_search` 也必须独占批次：它会在执行期激活动态端点，预扫描时尚不可解析的
   同批付费端点否则会在顺序执行中穿透。
 - 飞书追问包装与引用消息在**第一次**模型请求前就已混入外部正文，必须走类型化的
   `HandleExternalContextMessage`，不能等工具返回后才 taint。该入口从数据访问层就不读画像，
@@ -434,7 +434,7 @@ Loop 行为细则：
 | edit_task_definition | Prepare → Execute | durable_proposal + state_write + direct_owner_write | DefinitionEditController.Prepare/Execute → edit saga | 整体编辑立即推进；语义不足时自然追问 |
 | web_search | 直接 | network_read + billable + trust_taint | fetcher.ExaFetcher.Search | 一次性语义搜索，不建任务或持久抓取状态 |
 | read_page | 直接 | network_read + billable + trust_taint | fetcher.ExaContentsFetcher.ReadPage | 一次性读取指定页面正文 |
-| search_endpoints | 直接 | activation_write | 本地社媒工具目录 | 搜索并激活 provider-neutral 动态工具 |
+| tool_search | 直接 | activation_write | 本地社媒工具目录 | 搜索并激活 provider-neutral 动态工具 |
 | read_endpoint_result | 直接 | local_handle_read + trust_taint | 本轮结果缓存 | 仅产生绑定 handle 后曝光 |
 
 旧模型契约 `update_schedule` / `edit_task_playbook` / `set_task_strictness` 已删除。
@@ -493,7 +493,7 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
 - llm/chat_test.go：httptest 断言请求体 tools/messages/tool 消息序列化、tool_calls 解析、Model 覆盖、thinking 缺省不携带。
 - store：DB 门控子测试（agent_sessions CRUD、ClaimPendingAction 幂等/过期）。
 - sourcespec：迁移原 buildSource 全部用例。
-- agent：mock Client？——llm.Client 是具体类型，Loop 依赖收窄：Loop 内部通过 `chatFn func(ctx, llm.ChatRequest) (*llm.ChatResponse, error)` 字段调用（默认包 DoChat），测试注入假实现。覆盖：纯聊天、读工具单轮、写工具确认卡、未知工具自纠、maxTurns 兜底、ExecuteAction 幂等；恶意外部结果必须用真实外部工具分类反向证明画像读取、写 pending action 与 URL/query 上下文外带均被确定性拒绝，并覆盖跨消息、部署前存量会话、外部 Probe 成功/失败回调、本地缓存分页、同批“内部读→外部读→写”乱序及 `search_endpoints+未激活动态端点`；外部结果后的零工具出站请求必须断言只有 system+user、无原生 tool protocol，JSON 字段边界不可由外部正文伪造，且内部历史仍按原 user+固定占位持久化；外部上下文测试必须证明首轮零画像读取/零工具/零既有历史、原文零持久化且旧历史保留，扁平化时真实追问与外部正文不发生信任提升；add_source 只建 pending 或整批拒绝后重试写工具时不会被误判为已执行外部查询。
+- agent：mock Client？——llm.Client 是具体类型，Loop 依赖收窄：Loop 内部通过 `chatFn func(ctx, llm.ChatRequest) (*llm.ChatResponse, error)` 字段调用（默认包 DoChat），测试注入假实现。覆盖：纯聊天、读工具单轮、写工具确认卡、未知工具自纠、maxTurns 兜底、ExecuteAction 幂等；恶意外部结果必须用真实外部工具分类反向证明画像读取、写 pending action 与 URL/query 上下文外带均被确定性拒绝，并覆盖跨消息、部署前存量会话、外部 Probe 成功/失败回调、本地缓存分页、同批“内部读→外部读→写”乱序及 `tool_search+未激活动态端点`；外部结果后的零工具出站请求必须断言只有 system+user、无原生 tool protocol，JSON 字段边界不可由外部正文伪造，且内部历史仍按原 user+固定占位持久化；外部上下文测试必须证明首轮零画像读取/零工具/零既有历史、原文零持久化且旧历史保留，扁平化时真实追问与外部正文不发生信任提升；add_source 只建 pending 或整批拒绝后重试写工具时不会被误判为已执行外部查询。
 - `direct-task-creation` 必须用生产同形的「确认创建，直接生成确认卡，不要再次搜索」消息覆盖：
   即使模型先并列幻觉 `list_sources/list_schedules`、再单独重试 `list_sources`，两次都零执行、
   零 taint、画像零读取，所有模型请求只声明 `create_schedule`，随后合法调用只能产生一个 durable

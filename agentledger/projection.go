@@ -580,6 +580,12 @@ func decodeActivatedTools(raw json.RawMessage) ([]string, error) {
 }
 
 func decodeActivatedToolsFromSlice(values []string) ([]string, error) {
+	// Keep the durable projection decoder aligned with the interactive Agent's
+	// per-session dynamic-tool authority. A forged event must not preserve more
+	// tools than the runtime can ever activate.
+	if len(values) > 16 {
+		return nil, invalidProjection("activated tools exceed the session limit")
+	}
 	seen := make(map[string]struct{}, len(values))
 	for _, value := range values {
 		if value == "" || len(value) > 255 || strings.TrimSpace(value) != value {
