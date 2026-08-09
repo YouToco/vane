@@ -237,10 +237,3 @@ jobs:
         run: |
           go build -o bin/vane ./cmd/server
           go build -o bin/vane-research-prepare ./cmd/researchprepare
-
-  test:
-    needs: [store-race, rest]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Confirm required CI jobs
-        run: echo "store race and remaining package gates passed"
