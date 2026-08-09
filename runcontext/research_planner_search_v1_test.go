@@ -45,13 +45,15 @@ func TestResearchPlannerToolSearchReceiptV1RejectsAuthorityMutations(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	mutations := []ResearchPlannerToolSearchReceiptV1{base, base, base, base, base, base}
+	mutations := []ResearchPlannerToolSearchReceiptV1{base, base, base, base, base, base, base, base}
 	mutations[0].CatalogDigest = "bad"
 	mutations[1].Query = " official status"
 	mutations[2].Limit = 9
 	mutations[3].Matches = append(mutations[3].Matches, mutations[3].Matches[0])
 	mutations[4].Matches[0].SchemaDigest = strings.Repeat("c", 63)
 	mutations[5].Matches[0].Score = "1.25000000"
+	mutations[6].Query = "official\x00status"
+	mutations[7].Matches[0].Name = "web\x00search"
 	for index, mutation := range mutations {
 		if mutation.Validate() == nil {
 			t.Fatalf("mutation %d crossed receipt validation", index)

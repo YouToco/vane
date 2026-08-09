@@ -141,6 +141,7 @@ func TestDecodeResearchPlannerDecisionV33ExactActionShapes(t *testing.T) {
 	for _, raw := range []string{
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"x","limit":9}}`,
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":" x","limit":1}}`,
+		"{\"schema_version\":\"vane.research-planner-output/v3.3\",\"action\":\"tool_search\",\"tool_search\":{\"query\":\"x\\u0000y\",\"limit\":1}}",
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[],"extra":true}`,
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"one","tool_name":"web_search","arguments":{"query":"x"}}]}`,
 		`{"schema_version":"bad","schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[]}`,

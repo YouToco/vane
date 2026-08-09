@@ -129,6 +129,7 @@ func decodeResearchPlannerDecisionV33(
 		if decision.ToolSearch == nil || decision.Steps != nil ||
 			decision.ToolSearch.Query == "" || len(decision.ToolSearch.Query) > 512 ||
 			!utf8.ValidString(decision.ToolSearch.Query) ||
+			strings.IndexByte(decision.ToolSearch.Query, 0) >= 0 ||
 			strings.TrimSpace(decision.ToolSearch.Query) != decision.ToolSearch.Query ||
 			decision.ToolSearch.Limit < 1 || decision.ToolSearch.Limit > 8 {
 			return researchPlannerDecisionV33{}, researchCoordinatorValidationV3("research planner tool search request is invalid")

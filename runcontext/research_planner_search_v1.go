@@ -75,6 +75,7 @@ func (r ResearchPlannerToolSearchReceiptV1) Validate() error {
 		!validResearchPlannerDigestV1(r.CatalogDigest) ||
 		r.Query == "" || len(r.Query) > maxResearchPlannerSearchQueryBytes ||
 		!utf8.ValidString(r.Query) || strings.TrimSpace(r.Query) != r.Query ||
+		strings.IndexByte(r.Query, 0) >= 0 ||
 		r.Limit < 1 || r.Limit > maxResearchPlannerSearchMatches ||
 		r.Matches == nil || len(r.Matches) > r.Limit {
 		return invalidResearchPlan("planner tool search receipt is invalid")
@@ -83,6 +84,7 @@ func (r ResearchPlannerToolSearchReceiptV1) Validate() error {
 	for _, match := range r.Matches {
 		if match.Name == "" || len(match.Name) > 255 ||
 			!utf8.ValidString(match.Name) || strings.TrimSpace(match.Name) != match.Name ||
+			strings.IndexByte(match.Name, 0) >= 0 ||
 			!validResearchPlannerDigestV1(match.SchemaDigest) {
 			return invalidResearchPlan("planner tool search match is invalid")
 		}
