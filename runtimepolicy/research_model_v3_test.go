@@ -109,6 +109,11 @@ func TestResearchModelPolicyGroundedRenderersRequireFrozenIndependentVerifier(t 
 	if _, err := BuildResearchModelPolicyV3(policy); err != nil {
 		t.Fatalf("v1.1 verifier renderer rejected: %v", err)
 	}
+	verifier.RendererVersion = ResearchGroundingVerifierRendererVersionV12
+	policy.GroundingVerifier = &verifier
+	if _, err := BuildResearchModelPolicyV3(policy); err != nil {
+		t.Fatalf("v1.2 verifier renderer rejected: %v", err)
+	}
 	policy.Synthesis.RendererVersion = ResearchSynthesisRendererVersionV33
 	if _, err := BuildResearchModelPolicyV3(policy); err != nil {
 		t.Fatalf("retained v3.3 synthesis renderer rejected: %v", err)

@@ -30,6 +30,7 @@ const (
 
 	ResearchGroundingVerifierRendererVersionV1  = "research-grounding-verifier.render/v1"
 	ResearchGroundingVerifierRendererVersionV11 = "research-grounding-verifier.render/v1.1"
+	ResearchGroundingVerifierRendererVersionV12 = "research-grounding-verifier.render/v1.2"
 )
 
 type ResearchModelStageV3 struct {
@@ -94,7 +95,8 @@ func (p ResearchModelPolicyV3) Validate() error {
 
 func validResearchGroundingVerifierRendererVersion(version string) bool {
 	return version == ResearchGroundingVerifierRendererVersionV1 ||
-		version == ResearchGroundingVerifierRendererVersionV11
+		version == ResearchGroundingVerifierRendererVersionV11 ||
+		version == ResearchGroundingVerifierRendererVersionV12
 }
 
 func (p ResearchModelPolicyV3) MarshalJSON() ([]byte, error) {

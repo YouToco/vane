@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -15,6 +16,7 @@ import (
 
 const (
 	researchGroundingInputSchemaV1  = "vane.research-grounding-check-input/v1"
+	researchGroundingInputSchemaV11 = "vane.research-grounding-check-input/v1.1"
 	researchGroundingRecordSchemaV1 = "vane.research-grounding-verification/v1"
 )
 
@@ -87,13 +89,14 @@ type researchGroundingResponseContractV1 struct {
 }
 
 type researchGroundingInputV1 struct {
-	SchemaVersion    string                              `json:"schema_version"`
-	CandidateDigest  string                              `json:"candidate_digest"`
-	TaskManual       string                              `json:"task_manual"`
-	CandidateBrief   json.RawMessage                     `json:"candidate_brief"`
-	CitedEvidence    []researchGroundingEvidenceInputV1  `json:"cited_evidence"`
-	ToolFailures     []researchToolFailureContextV31     `json:"tool_failures"`
-	ResponseContract researchGroundingResponseContractV1 `json:"response_contract"`
+	SchemaVersion     string                              `json:"schema_version"`
+	CandidateDigest   string                              `json:"candidate_digest"`
+	TaskManual        string                              `json:"task_manual"`
+	HistoryThroughUTC string                              `json:"history_through_utc,omitempty"`
+	CandidateBrief    json.RawMessage                     `json:"candidate_brief"`
+	CitedEvidence     []researchGroundingEvidenceInputV1  `json:"cited_evidence"`
+	ToolFailures      []researchToolFailureContextV31     `json:"tool_failures"`
+	ResponseContract  researchGroundingResponseContractV1 `json:"response_contract"`
 }
 
 func (s *Store) PrepareOrGetResearchBriefGroundingV1(
@@ -368,7 +371,8 @@ func buildResearchGroundingPromptV1(
 	contextPayload []byte, rendererVersion string,
 ) ([]byte, error) {
 	if rendererVersion != runtimepolicy.ResearchGroundingVerifierRendererVersionV1 &&
-		rendererVersion != runtimepolicy.ResearchGroundingVerifierRendererVersionV11 {
+		rendererVersion != runtimepolicy.ResearchGroundingVerifierRendererVersionV11 &&
+		rendererVersion != runtimepolicy.ResearchGroundingVerifierRendererVersionV12 {
 		return nil, researchRunIntegrityError()
 	}
 	var synthesis researchSynthesisContextV3
@@ -420,7 +424,8 @@ func buildResearchGroundingPromptV1(
 		IssueFields:            []string{"field", "claim", "refs", "reason"},
 		SingleCanonicalJSON:    true,
 	}
-	if rendererVersion == runtimepolicy.ResearchGroundingVerifierRendererVersionV11 {
+	if rendererVersion == runtimepolicy.ResearchGroundingVerifierRendererVersionV11 ||
+		rendererVersion == runtimepolicy.ResearchGroundingVerifierRendererVersionV12 {
 		responseContract.IssueRefsItemFields = []string{"kind", "ref"}
 		responseContract.IssueRefsKindValues = []string{
 			string(types.ResearchBriefCitationCurrentEvidenceV3),
@@ -428,9 +433,18 @@ func buildResearchGroundingPromptV1(
 		}
 		responseContract.IssueRefsRule = "refs must be a JSON array of citation objects copied exactly from candidate_brief.citations; each object must contain only kind and ref, never a bare string; use [] when no candidate citation supports the claim"
 	}
+	inputSchema := researchGroundingInputSchemaV1
+	historyThroughUTC := ""
+	if rendererVersion == runtimepolicy.ResearchGroundingVerifierRendererVersionV12 {
+		inputSchema = researchGroundingInputSchemaV11
+		historyThroughUTC = synthesis.History.HistoryThroughUTC
+		if _, err := time.Parse(time.RFC3339Nano, historyThroughUTC); err != nil {
+			return nil, researchRunIntegrityError()
+		}
+	}
 	prompt, err := json.Marshal(researchGroundingInputV1{
-		SchemaVersion: researchGroundingInputSchemaV1, CandidateDigest: candidateDigest,
-		TaskManual:     synthesis.Definition.TaskManual,
+		SchemaVersion: inputSchema, CandidateDigest: candidateDigest,
+		TaskManual: synthesis.Definition.TaskManual, HistoryThroughUTC: historyThroughUTC,
 		CandidateBrief: append(json.RawMessage(nil), canonical...), CitedEvidence: items,
 		ToolFailures: append([]researchToolFailureContextV31(nil),
 			synthesis.ToolFailures...),
