@@ -52,6 +52,22 @@ func newResearchGroundingFixtureV11(t *testing.T) researchBriefFixtureV3 {
 		"", "", policy)
 }
 
+func newResearchGroundingFixtureV12(t *testing.T) researchBriefFixtureV3 {
+	t.Helper()
+	policy := testResearchGroundingModelPolicyV1(t)
+	policy.GroundingVerifier.RendererVersion =
+		runtimepolicy.ResearchGroundingVerifierRendererVersionV12
+	policy, err := runtimepolicy.BuildResearchModelPolicyV3(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := tenantTestStore(t)
+	return newResearchBriefFixtureWithStoreWorkflowAndModelV3(
+		t, st, taskstate.NotificationThresholdMajorV3, true,
+		[]byte(`{"title":"OpenAI release","text":"OpenAI released GPT-5.6.","url":"https://openai.com/index/gpt-5-6/"}`),
+		"", "", policy)
+}
+
 func prepareGroundingCandidateV1(t *testing.T, f researchBriefFixtureV3) (
 	ResearchBriefSynthesisV3, ClaimResearchBriefSynthesisV3Params, []byte,
 	ResearchBriefGroundingV1,
@@ -185,6 +201,9 @@ func TestResearchBriefGroundingV1PostgresGatesFinalization(t *testing.T) {
 	if strings.Contains(string(grounding.VerifierPrompt), `"issue_refs_item_fields"`) {
 		t.Fatalf("frozen v1 verifier prompt changed: %s", grounding.VerifierPrompt)
 	}
+	if strings.Contains(string(grounding.VerifierPrompt), `"history_through_utc"`) {
+		t.Fatalf("frozen v1 verifier prompt changed: %s", grounding.VerifierPrompt)
+	}
 	if _, err := f.st.FinalizeResearchBriefSynthesisV3(t.Context(),
 		FinalizeResearchBriefSynthesisV3Params{
 			ClaimResearchBriefSynthesisV3Params: handle,
@@ -250,6 +269,45 @@ func TestResearchBriefGroundingV11ExplainsCitationObjectContract(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("v1.1 verifier prompt missing %q: %s", want, prompt)
 		}
+	}
+	if strings.Contains(prompt, `"history_through_utc"`) {
+		t.Fatalf("frozen v1.1 verifier prompt changed: %s", prompt)
+	}
+}
+
+func TestResearchBriefGroundingV12BindsFrozenRunClock(t *testing.T) {
+	f := newResearchGroundingFixtureV12(t)
+	synthesis, _, _, grounding := prepareGroundingCandidateV1(t, f)
+	prompt := string(grounding.VerifierPrompt)
+	for _, want := range []string{
+		`"schema_version":"vane.research-grounding-check-input/v1.1"`,
+		`"history_through_utc":"` + f.snapshotRef.HistoryThroughUTC + `"`,
+		`"issue_refs_item_fields":["kind","ref"]`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("v1.2 verifier prompt missing %q: %s", want, prompt)
+		}
+	}
+
+	var context researchSynthesisContextV3
+	if err := json.Unmarshal(synthesis.ContextPayload, &context); err != nil {
+		t.Fatal(err)
+	}
+	context.History.HistoryThroughUTC = "not-a-frozen-clock"
+	malformedContext, err := json.Marshal(context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, canonical, err := types.DecodeResearchBriefPayloadV3(
+		grounding.CandidateBriefPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildResearchGroundingPromptV1(
+		brief, canonical, grounding.CandidateDigest, malformedContext,
+		runtimepolicy.ResearchGroundingVerifierRendererVersionV12,
+	); err == nil {
+		t.Fatal("v1.2 verifier accepted an invalid frozen run clock")
 	}
 }
 
