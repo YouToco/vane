@@ -64,6 +64,10 @@ type researchRuntimeStoreV3 interface {
 		storepkg.PrepareResearchBriefSynthesisV3Params) (storepkg.PrepareResearchBriefSynthesisV3Result, error)
 	ClaimResearchBriefSynthesisV3(context.Context,
 		storepkg.ClaimResearchBriefSynthesisV3Params) (storepkg.ClaimResearchBriefSynthesisV3Result, error)
+	PrepareOrGetResearchBriefGroundingV1(context.Context,
+		storepkg.PrepareResearchBriefGroundingV1Params) (storepkg.PrepareResearchBriefGroundingV1Result, error)
+	SettleResearchBriefGroundingV1(context.Context,
+		storepkg.SettleResearchBriefGroundingV1Params) (storepkg.ResearchBriefGroundingV1, error)
 	FinalizeResearchBriefSynthesisV3(context.Context,
 		storepkg.FinalizeResearchBriefSynthesisV3Params) (types.ResearchBriefRefV3, error)
 	FailResearchBriefSynthesisV3(context.Context,
@@ -377,7 +381,9 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 		seal.ResearchModel.Synthesis.RendererVersion !=
 			runtimepolicy.ResearchSynthesisRendererVersionV31 &&
 		seal.ResearchModel.Synthesis.RendererVersion !=
-			runtimepolicy.ResearchSynthesisRendererVersionV32 {
+			runtimepolicy.ResearchSynthesisRendererVersionV32 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV33 {
 		return ResearchBriefRefV3{}, types.NewAppError(types.CodeConflict,
 			"frozen research synthesis renderer cannot express partial coverage",
 			types.ErrConflict)
@@ -450,10 +456,102 @@ func (r *ProductionResearchRuntimeV3) Synthesize(
 		}
 		return ResearchBriefRefV3{}, decodeErr
 	}
+	groundingID := int64(0)
+	if seal.ResearchModel.Synthesis.RendererVersion ==
+		runtimepolicy.ResearchSynthesisRendererVersionV33 {
+		if seal.ResearchModel.GroundingVerifier == nil {
+			return ResearchBriefRefV3{}, researchCoordinatorValidationV3(
+				"research grounding verifier is unavailable")
+		}
+		preparedGrounding, err := r.store.PrepareOrGetResearchBriefGroundingV1(ctx,
+			storepkg.PrepareResearchBriefGroundingV1Params{
+				ClaimResearchBriefSynthesisV3Params: claimParams,
+				CandidateBriefPayload:               canonical,
+			})
+		if err != nil {
+			return ResearchBriefRefV3{}, err
+		}
+		if preparedGrounding.Grounding.Status ==
+			storepkg.ResearchBriefGroundingRejectedV1 {
+			return ResearchBriefRefV3{}, types.NewAppError(types.CodeValidation,
+				"research Brief citation grounding was rejected", types.ErrValidation)
+		}
+		verifier := *seal.ResearchModel.GroundingVerifier
+		verificationReceipt, verificationReservation, err := r.executeLLMStageV3(
+			ctx, identity, snapshot, storepkg.ResearchRunLLMStageSynthesisV3, 1,
+			prepared.Synthesis.ID, verifier.SystemPrompt,
+			string(preparedGrounding.Grounding.VerifierPrompt))
+		if err != nil {
+			if settled, found, loadErr := r.store.LoadResearchRunLLMReceiptV3(
+				ctx, identity, snapshot, storepkg.ResearchRunLLMStageSynthesisV3, 1,
+			); loadErr == nil && found && settled.Settled &&
+				settled.Outcome != storepkg.ResearchRunLLMCompletedV3 {
+				status := storepkg.ResearchBriefSynthesisFailedV3
+				failureCode := "grounding_model_failed"
+				if settled.Outcome == storepkg.ResearchRunLLMIndeterminateV3 {
+					status = storepkg.ResearchBriefSynthesisAmbiguousV3
+					failureCode = "grounding_model_outcome_indeterminate"
+				}
+				if _, failErr := r.store.FailResearchBriefSynthesisV3(ctx,
+					storepkg.FailResearchBriefSynthesisV3Params{
+						ClaimResearchBriefSynthesisV3Params: claimParams,
+						Status:                              status, FailureCode: failureCode,
+					}); failErr != nil {
+					return ResearchBriefRefV3{}, failErr
+				}
+			}
+			return ResearchBriefRefV3{}, err
+		}
+		verdict, verdictCanonical, err := types.NormalizeResearchGroundingVerdictV1(
+			[]byte(verificationReceipt.Call.Completion))
+		if err != nil {
+			_, failErr := r.store.FailResearchBriefSynthesisV3(ctx,
+				storepkg.FailResearchBriefSynthesisV3Params{
+					ClaimResearchBriefSynthesisV3Params: claimParams,
+					Status:                              storepkg.ResearchBriefSynthesisFailedV3,
+					FailureCode:                         "invalid_grounding_output",
+				})
+			if failErr != nil {
+				return ResearchBriefRefV3{}, failErr
+			}
+			return ResearchBriefRefV3{}, err
+		}
+		settledGrounding, err := r.store.SettleResearchBriefGroundingV1(ctx,
+			storepkg.SettleResearchBriefGroundingV1Params{
+				ClaimResearchBriefSynthesisV3Params: claimParams,
+				GroundingID:                         preparedGrounding.Grounding.ID,
+				VerifierLLMReservationID:            verificationReservation.ReservationID,
+				VerdictPayload:                      verdictCanonical,
+			})
+		if err != nil {
+			// A transient database/transport failure may have committed and must
+			// replay. A deterministic binding/integrity rejection can never be
+			// repaired by retrying the same immutable provider completion, so seal
+			// the synthesis failed instead of leaving it spending forever.
+			if !types.IsRetryable(err) {
+				if _, failErr := r.store.FailResearchBriefSynthesisV3(ctx,
+					storepkg.FailResearchBriefSynthesisV3Params{
+						ClaimResearchBriefSynthesisV3Params: claimParams,
+						Status:                              storepkg.ResearchBriefSynthesisFailedV3,
+						FailureCode:                         "invalid_grounding_binding",
+					}); failErr != nil {
+					return ResearchBriefRefV3{}, failErr
+				}
+			}
+			return ResearchBriefRefV3{}, err
+		}
+		if verdict.Verdict != types.ResearchGroundingGroundedV1 ||
+			settledGrounding.Status != storepkg.ResearchBriefGroundingGroundedV1 {
+			return ResearchBriefRefV3{}, types.NewAppError(types.CodeValidation,
+				"research Brief citation grounding was rejected", types.ErrValidation)
+		}
+		groundingID = settledGrounding.ID
+	}
 	return r.store.FinalizeResearchBriefSynthesisV3(ctx,
 		storepkg.FinalizeResearchBriefSynthesisV3Params{
 			ClaimResearchBriefSynthesisV3Params: claimParams,
 			BriefPayload:                        canonical,
+			GroundingVerificationID:             groundingID,
 		})
 }
 
@@ -620,13 +718,15 @@ func decodeResearchBriefCompletionV3(
 	case runtimepolicy.ResearchSynthesisRendererVersionV3:
 		return types.DecodeResearchBriefPayloadV3(raw)
 	case runtimepolicy.ResearchSynthesisRendererVersionV31,
-		runtimepolicy.ResearchSynthesisRendererVersionV32:
+		runtimepolicy.ResearchSynthesisRendererVersionV32,
+		runtimepolicy.ResearchSynthesisRendererVersionV33:
 		normalized, err := normalizeResearchBriefCompletionV31(raw)
 		if err != nil {
 			return types.ResearchBriefPayloadV3{}, nil,
 				researchCoordinatorValidationV3("research Brief model output is invalid")
 		}
-		if rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV32 {
+		if rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV32 ||
+			rendererVersion == runtimepolicy.ResearchSynthesisRendererVersionV33 {
 			normalized, err = normalizeNumericCurrentEvidenceRefsV32(normalized)
 			if err != nil {
 				return types.ResearchBriefPayloadV3{}, nil,

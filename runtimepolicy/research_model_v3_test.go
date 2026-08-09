@@ -76,3 +76,37 @@ func TestResearchModelPolicyV3RejectsUnknownAndUnretainedRoutes(t *testing.T) {
 		t.Fatal("unretained model route accepted")
 	}
 }
+
+func TestResearchModelPolicyV33RequiresFrozenIndependentVerifier(t *testing.T) {
+	policy := researchModelPolicyForTest(t)
+	policy.Synthesis.RendererVersion = ResearchSynthesisRendererVersionV33
+	if _, err := BuildResearchModelPolicyV3(policy); err == nil {
+		t.Fatal("v3.3 synthesis accepted without a frozen verifier")
+	}
+	verifier := ResearchModelStageV3{
+		Stage: ResearchModelStageGroundingVerifierV3, Model: "strong-model",
+		Temperature: 0, MaxTokens: 4096, DisableThinking: true,
+		SystemPrompt:    "Independently verify every claim against cited evidence.",
+		RendererVersion: ResearchGroundingVerifierRendererVersionV1,
+	}
+	policy.GroundingVerifier = &verifier
+	built, err := BuildResearchModelPolicyV3(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := EncodeResearchModelPolicyV3(built)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeResearchModelPolicyV3(payload)
+	if err != nil || decoded.GroundingVerifier == nil ||
+		*decoded.GroundingVerifier != verifier ||
+		decoded.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV33 {
+		t.Fatalf("decoded=%+v err=%v", decoded, err)
+	}
+
+	policy.Synthesis.RendererVersion = ResearchSynthesisRendererVersionV32
+	if _, err := BuildResearchModelPolicyV3(policy); err == nil {
+		t.Fatal("legacy synthesis renderer accepted an unused verifier policy")
+	}
+}

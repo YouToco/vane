@@ -14,8 +14,9 @@ import (
 const ResearchModelPolicySchemaVersionV3 = "vane.runtime-research-model-policy/v3"
 
 const (
-	ResearchModelStagePlannerV3   = "research_planner"
-	ResearchModelStageSynthesisV3 = "research_synthesis"
+	ResearchModelStagePlannerV3           = "research_planner"
+	ResearchModelStageSynthesisV3         = "research_synthesis"
+	ResearchModelStageGroundingVerifierV3 = "research_grounding_verifier"
 
 	ResearchPlannerRendererVersionV3  = "research-planner.render/v3"
 	ResearchPlannerRendererVersionV31 = "research-planner.render/v3.1"
@@ -24,6 +25,9 @@ const (
 	ResearchSynthesisRendererVersionV3  = "research-synthesis.render/v3"
 	ResearchSynthesisRendererVersionV31 = "research-synthesis.render/v3.1"
 	ResearchSynthesisRendererVersionV32 = "research-synthesis.render/v3.2"
+	ResearchSynthesisRendererVersionV33 = "research-synthesis.render/v3.3"
+
+	ResearchGroundingVerifierRendererVersionV1 = "research-grounding-verifier.render/v1"
 )
 
 type ResearchModelStageV3 struct {
@@ -46,7 +50,11 @@ type ResearchModelPolicyV3 struct {
 	CredentialRef CredentialRefV1      `json:"credential_ref"`
 	Planner       ResearchModelStageV3 `json:"planner"`
 	Synthesis     ResearchModelStageV3 `json:"synthesis"`
-	QuotaBucket   string               `json:"quota_bucket"`
+	// GroundingVerifier is optional so byte-frozen V3/V3.1/V3.2 snapshots remain
+	// decodable and replayable. New V3.3 snapshots must freeze this independent
+	// no-Tool adjudicator before a candidate Brief can become authoritative.
+	GroundingVerifier *ResearchModelStageV3 `json:"grounding_verifier,omitempty"`
+	QuotaBucket       string                `json:"quota_bucket"`
 }
 
 type researchModelPolicyV3Wire ResearchModelPolicyV3
@@ -65,7 +73,16 @@ func (p ResearchModelPolicyV3) Validate() error {
 		p.CredentialRef.validateFor(CredentialIDLLMPrimaryV1) != nil ||
 		p.QuotaBucket != "llm_tokens" ||
 		!validResearchModelStageV3(p.Planner, ResearchModelStagePlannerV3) ||
-		!validResearchModelStageV3(p.Synthesis, ResearchModelStageSynthesisV3) {
+		!validResearchModelStageV3(p.Synthesis, ResearchModelStageSynthesisV3) ||
+		(p.GroundingVerifier != nil &&
+			!validResearchModelStageV3(*p.GroundingVerifier,
+				ResearchModelStageGroundingVerifierV3)) ||
+		(p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV33 &&
+			(p.GroundingVerifier == nil ||
+				p.GroundingVerifier.RendererVersion !=
+					ResearchGroundingVerifierRendererVersionV1)) ||
+		(p.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV33 &&
+			p.GroundingVerifier != nil) {
 		return invalidPolicy("research model policy is invalid")
 	}
 	return nil

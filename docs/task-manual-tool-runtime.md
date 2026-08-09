@@ -14,7 +14,7 @@ sealed Tool calls
     ↓ scheduled run
 run snapshot
     ↓ authorized tool execution
-evidence and delivery
+evidence → candidate Brief → independent citation verifier → delivery gate
 ```
 
 There is no Source product entity, source collection, source catalog,
@@ -143,6 +143,24 @@ still forces `significance=none`. All v3.2 partial-coverage Briefs are
 deterministically quiet even when grounded. This prevents a general page extractor
 failure from relabeling a successful structured official status as unavailable
 without weakening the no-evidence/no-push boundary.
+
+### Independent citation grounding
+
+Research synthesis output is a candidate, not an authoritative Brief. Current
+V3.3 runs freeze a separate no-Tool grounding verifier that receives only the
+candidate, the exact evidence references used by that candidate, the task
+manual and recorded coverage failures. It must check every externally
+verifiable claim for subject, product, version, date, number and status
+entailment. Related content, another page from the same organization, or an
+uncited result cannot support a claim.
+
+The candidate and verifier prompt are immutable and digest-bound. The verifier
+has its own quota-backed LLM reservation and exact provider receipt. Only a
+`grounded` verdict matching the candidate digest permits finalization; an
+`unsupported` verdict atomically fails synthesis with
+`citation_grounding_failed` and can never reach delivery. This first contract
+does not ask the same model to repair its own answer. Retained V3/V3.1/V3.2
+snapshots continue to replay with their frozen pre-verifier behavior.
 
 ## External-fact authority
 

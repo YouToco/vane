@@ -527,6 +527,13 @@ func TestDecodeResearchBriefCompletionV3CanonicalizesOnlyCurrentRenderer(t *test
 		t.Fatalf("grounded Brief payload=%+v canonical=%s err=%v",
 			payload, gotCanonical, err)
 	}
+	payload, gotCanonical, err = decodeResearchBriefCompletionV3(
+		grounded, runtimepolicy.ResearchSynthesisRendererVersionV33)
+	if err != nil || payload.Assessment != types.ResearchBriefAssessmentGroundedV31 ||
+		!reflect.DeepEqual(gotCanonical, grounded) {
+		t.Fatalf("v3.3 candidate payload=%+v canonical=%s err=%v",
+			payload, gotCanonical, err)
+	}
 	if _, _, err := decodeResearchBriefCompletionV3(
 		grounded, runtimepolicy.ResearchSynthesisRendererVersionV31); err == nil {
 		t.Fatal("retained v3.1 renderer accepted a v3.2 grounded completion")

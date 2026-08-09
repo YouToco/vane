@@ -57,6 +57,7 @@ var researchRuntimeRelations = []string{
 	"research_run_steps",
 	"research_run_evidence",
 	"research_brief_syntheses",
+	"research_brief_grounding_verifications",
 	"research_run_step_spend_reservations",
 	"research_run_step_spend_settlements",
 	"research_run_llm_spend_reservations",
@@ -77,6 +78,7 @@ var researchRuntimeScopedRelations = []string{
 	"research_run_steps",
 	"research_run_evidence",
 	"research_brief_syntheses",
+	"research_brief_grounding_verifications",
 	"research_run_step_spend_reservations",
 	"research_run_step_spend_settlements",
 	"research_run_llm_spend_reservations",
@@ -238,6 +240,48 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		return fmt.Errorf("begin authority probe: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var groundingRuntimeAvailable, admissionV4Available,
+		groundingImmutabilityTriggerAvailable bool
+	if err := tx.QueryRow(ctx, `SELECT
+		to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
+		to_regprocedure(
+		 'admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)'
+		) IS NOT NULL,
+		EXISTS (
+		 SELECT 1 FROM pg_catalog.pg_trigger trigger
+		  WHERE trigger.tgrelid=to_regclass(
+		        'public.research_brief_grounding_verifications')
+		    AND trigger.tgname='protect_research_brief_grounding_verification_v1'
+		    AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
+		)`,
+	).Scan(&groundingRuntimeAvailable, &admissionV4Available,
+		&groundingImmutabilityTriggerAvailable); err != nil {
+		return fmt.Errorf("inspect grounding runtime schema: %w", err)
+	}
+	if groundingRuntimeAvailable != admissionV4Available ||
+		groundingRuntimeAvailable != groundingImmutabilityTriggerAvailable {
+		return errors.New("grounding runtime schema is incomplete")
+	}
+	filterGroundingRelation := func(relations []string) []string {
+		if groundingRuntimeAvailable {
+			return relations
+		}
+		filtered := make([]string, 0, len(relations)-1)
+		for _, relation := range relations {
+			if relation != "research_brief_grounding_verifications" {
+				filtered = append(filtered, relation)
+			}
+		}
+		return filtered
+	}
+	runtimeRelations := filterGroundingRelation(researchRuntimeRelations)
+	runtimeScopedRelations := filterGroundingRelation(researchRuntimeScopedRelations)
+	admissionCapSignature := "admit_research_run_llm_spend_cap_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
+	admissionRawSignature := "admit_research_run_llm_spend_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
+	if admissionV4Available {
+		admissionCapSignature = "admit_research_run_llm_spend_cap_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
+		admissionRawSignature = "admit_research_run_llm_spend_v4(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
+	}
 
 	var sessionUser string
 	var canLogin, superuser, bypassRLS, createDB, createRole, replication, inherit bool
@@ -289,7 +333,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		   JOIN pg_catalog.pg_roles owner ON owner.oid=class.relowner
 		  WHERE namespace.nspname='public' AND class.relname=ANY($1::text[])
 		    AND owner.rolname=session_user
-		  ORDER BY class.relname`, researchRuntimeRelations)
+		  ORDER BY class.relname`, runtimeRelations)
 	if err != nil {
 		return fmt.Errorf("inspect runtime ownership: %w", err)
 	}
@@ -339,7 +383,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		  WHERE namespace.nspname='public' AND class.relname=ANY($1::text[])
 		    AND class.relrowsecurity AND policy.polname='research_v3_scope'
 		    AND policy.polpermissive=false AND role.rolname=$2
-		  ORDER BY class.relname`, researchRuntimeScopedRelations,
+		  ORDER BY class.relname`, runtimeScopedRelations,
 		researchRuntimeCapabilityRole)
 	if err != nil {
 		return fmt.Errorf("inspect research capability RLS: %w", err)
@@ -358,7 +402,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		return fmt.Errorf("iterate research capability RLS: %w", err)
 	}
 	policyRows.Close()
-	if len(scoped) != len(researchRuntimeScopedRelations) {
+	if len(scoped) != len(runtimeScopedRelations) {
 		return fmt.Errorf("research capability RLS coverage is incomplete: %v", scoped)
 	}
 	capabilityPolicyRows, err := tx.Query(ctx,
@@ -371,7 +415,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		    AND class.relrowsecurity
 		    AND policy.polname='research_v3_capability_scope'
 		    AND policy.polpermissive=false AND role.rolname=$2
-		  ORDER BY class.relname`, researchRuntimeScopedRelations,
+		  ORDER BY class.relname`, runtimeScopedRelations,
 		researchRuntimeCapabilityRole)
 	if err != nil {
 		return fmt.Errorf("inspect per-run capability RLS: %w", err)
@@ -390,7 +434,7 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		return fmt.Errorf("iterate per-run capability RLS: %w", err)
 	}
 	capabilityPolicyRows.Close()
-	if len(capabilityScoped) != len(researchRuntimeScopedRelations) {
+	if len(capabilityScoped) != len(runtimeScopedRelations) {
 		return fmt.Errorf("per-run capability RLS coverage is incomplete: %v",
 			capabilityScoped)
 	}
@@ -444,12 +488,8 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		      WHERE namespace.nspname='public' AND class.relname=ANY($1::text[])
 		        AND class.relowner=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user)
 		    ),
-		    has_function_privilege(current_user,
-		      'admit_research_run_llm_spend_cap_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)',
-		      'EXECUTE'),
-		    has_function_privilege(current_user,
-		      'admit_research_run_llm_spend_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)',
-		      'EXECUTE'),
+		    has_function_privilege(current_user,$2::text,'EXECUTE'),
+		    has_function_privilege(current_user,$3::text,'EXECUTE'),
 		    has_function_privilege(current_user,
 		      'settle_research_run_llm_spend_v3(bigint,bigint,text,bigint,bigint,text,text,text,text,integer,integer,integer,integer,integer,integer,boolean,real,integer,boolean,text,boolean,boolean,boolean,text,text)',
 		      'EXECUTE'),
@@ -475,7 +515,8 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		    has_sequence_privilege(current_user,
 		      'research_run_step_spend_reservations_id_seq','USAGE') OR
 		    has_sequence_privilege(current_user,
-		      'research_run_step_spend_reservations_id_seq','SELECT')`, researchRuntimeRelations,
+		      'research_run_step_spend_reservations_id_seq','SELECT')`, runtimeRelations,
+		admissionCapSignature, admissionRawSignature,
 	).Scan(&hasDelete, &hasTruncate, &canMutateTenant, &canMutateMembership,
 		&canMutateTool, &canReadPricing, &canMutatePricing, &ownsProtectedRelation,
 		&canAdmitLLMSpend, &canAdmitRawLLMSpend, &canSettleLLMSpend,
@@ -497,17 +538,17 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		return fmt.Errorf("research capability %q retains destructive privileges", activeRole)
 	}
 	allowedDefiners := map[string]bool{
-		"current_research_run_capability_v1()":                                                                   true,
-		"research_run_capability_allows_v1(bigint,bigint,text,bigint,text)":                                      true,
-		"require_research_run_capability_v1(bigint,text,bigint,bigint,text,text,text)":                           true,
-		"authorize_research_manual_task_run_cap_v1(bigint,bigint,text,text)":                                     true,
-		"admit_research_run_llm_spend_cap_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)": true,
-		"read_research_history_cap_v3(bigint,bigint,text,bigint,bigint)":                                         true,
-		"read_research_history_content_cap_v3(bigint,bigint,text,bigint,text,text,integer,integer)":              true,
-		"admit_research_run_tool_step_cap_v1(bigint,bigint,integer)":                                             true,
-		"authorize_research_run_effect_cap_v1(bigint)":                                                           true,
-		"freeze_research_llm_gateway_request_v2(bigint,text,text,text)":                                          true,
-		"load_research_run_bound_llm_call_v1(bigint,bigint)":                                                     true,
+		"current_research_run_capability_v1()":                                         true,
+		"research_run_capability_allows_v1(bigint,bigint,text,bigint,text)":            true,
+		"require_research_run_capability_v1(bigint,text,bigint,bigint,text,text,text)": true,
+		"authorize_research_manual_task_run_cap_v1(bigint,bigint,text,text)":           true,
+		admissionCapSignature: true,
+		"read_research_history_cap_v3(bigint,bigint,text,bigint,bigint)":                            true,
+		"read_research_history_content_cap_v3(bigint,bigint,text,bigint,text,text,integer,integer)": true,
+		"admit_research_run_tool_step_cap_v1(bigint,bigint,integer)":                                true,
+		"authorize_research_run_effect_cap_v1(bigint)":                                              true,
+		"freeze_research_llm_gateway_request_v2(bigint,text,text,text)":                             true,
+		"load_research_run_bound_llm_call_v1(bigint,bigint)":                                        true,
 	}
 	const nativeScheduleMaturitySignature = "native_research_schedule_mature_v3_v1(bigint,bigint,text)"
 	nativeScheduleMaturityRequired, err := nativeResearchCreationSchemaV3Active(ctx, tx)

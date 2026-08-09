@@ -156,6 +156,9 @@ var purgeOrder = []purgeStep{
 	// and immutable reservation, while a reservation binds its started step.
 	// Preserve the complete 090 child-first chain even while those two tables
 	// remain optional across a reversible migration rollout.
+	// Grounding records bind both the candidate synthesis and verifier LLM
+	// reservation, so explicit tenant erasure removes them before either parent.
+	{"research_brief_grounding_verifications", "tenant_id = $1"},
 	{"research_run_llm_spend_settlements", "tenant_id = $1"},
 	{"llm_calls", "tenant_id = $1"},
 	{"research_run_llm_spend_reservations", "tenant_id = $1"},
@@ -301,6 +304,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		periodicReportsAvailable           bool
 		periodicDeliveriesAvailable        bool
 		researchBriefsAvailable            bool
+		researchGroundingAvailable         bool
 		researchEvidenceAvailable          bool
 		researchLLMSettlementsAvailable    bool
 		researchLLMReservationsAvailable   bool
@@ -329,6 +333,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.periodic_brief_reports') IS NOT NULL,
 		        to_regclass('public.periodic_report_deliveries') IS NOT NULL,
 		        to_regclass('public.research_brief_syntheses') IS NOT NULL,
+		        to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
 		        to_regclass('public.research_run_evidence') IS NOT NULL,
 		        to_regclass('public.research_run_llm_spend_settlements') IS NOT NULL,
 		        to_regclass('public.research_run_llm_spend_reservations') IS NOT NULL,
@@ -356,6 +361,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&periodicReportsAvailable,
 		&periodicDeliveriesAvailable,
 		&researchBriefsAvailable,
+		&researchGroundingAvailable,
 		&researchEvidenceAvailable,
 		&researchLLMSettlementsAvailable,
 		&researchLLMReservationsAvailable,
@@ -387,6 +393,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"periodic_brief_reports":                    periodicReportsAvailable,
 		"periodic_report_deliveries":                periodicDeliveriesAvailable,
 		"research_brief_syntheses":                  researchBriefsAvailable,
+		"research_brief_grounding_verifications":    researchGroundingAvailable,
 		"research_run_evidence":                     researchEvidenceAvailable,
 		"research_run_llm_spend_settlements":        researchLLMSettlementsAvailable,
 		"research_run_llm_spend_reservations":       researchLLMReservationsAvailable,

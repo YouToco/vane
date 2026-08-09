@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/runcontext"
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -115,7 +116,8 @@ type ClaimResearchBriefSynthesisV3Result struct {
 
 type FinalizeResearchBriefSynthesisV3Params struct {
 	ClaimResearchBriefSynthesisV3Params
-	BriefPayload []byte
+	BriefPayload            []byte
+	GroundingVerificationID int64
 }
 
 type FailResearchBriefSynthesisV3Params struct {
@@ -503,6 +505,35 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 	}
 	if row.SynthesisLLMReservationID == nil ||
 		*row.SynthesisLLMReservationID != params.SynthesisLLMReservationID {
+		return types.ResearchBriefRefV3{}, researchRunConflictError()
+	}
+	seal, err := loadAndValidateResearchBriefSnapshotV3(ctx, tx,
+		params.Identity, params.SnapshotRef)
+	if err != nil {
+		return types.ResearchBriefRefV3{}, err
+	}
+	requiresGrounding := seal.ResearchModel.Synthesis.RendererVersion ==
+		runtimepolicy.ResearchSynthesisRendererVersionV33
+	if requiresGrounding {
+		grounding, found, err := loadResearchBriefGroundingV1(ctx, tx,
+			params.Identity, params.SnapshotRef.SnapshotID, params.SynthesisID)
+		if err != nil {
+			return types.ResearchBriefRefV3{}, err
+		}
+		if !found || grounding.ID != params.GroundingVerificationID ||
+			grounding.Status != ResearchBriefGroundingGroundedV1 ||
+			grounding.CandidateDigest != briefDigest ||
+			!bytes.Equal(grounding.CandidateBriefPayload, briefPayload) {
+			return types.ResearchBriefRefV3{}, researchRunConflictError()
+		}
+		verdict, verdictCanonical, err := types.DecodeResearchGroundingVerdictV1(
+			grounding.VerdictPayload)
+		if err != nil || verdict.Verdict != types.ResearchGroundingGroundedV1 ||
+			verdict.CandidateDigest != grounding.CandidateDigest ||
+			grounding.VerdictDigest != researchRunSHA256(verdictCanonical) {
+			return types.ResearchBriefRefV3{}, researchRunIntegrityError()
+		}
+	} else if params.GroundingVerificationID != 0 {
 		return types.ResearchBriefRefV3{}, researchRunConflictError()
 	}
 	receiptState, _, err := loadResearchBriefLLMReceiptStateV3(ctx, tx,
