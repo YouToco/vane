@@ -424,6 +424,10 @@ BEGIN
            AND grounding.candidate_brief_payload=NEW.brief_payload
            AND grounding.candidate_digest=NEW.brief_digest
            AND grounding.verdict_digest=encode(sha256(grounding.verdict_payload),'hex')
+           AND convert_from(grounding.verdict_payload,'UTF8')=
+               '{"schema_version":"vane.research-grounding-verdict/v1",' ||
+               '"candidate_digest":"' || grounding.candidate_digest || '",' ||
+               '"verdict":"grounded","issues":[]}'
            AND jsonb_typeof(convert_from(grounding.verdict_payload,'UTF8')::jsonb)='object'
            AND convert_from(grounding.verdict_payload,'UTF8')::jsonb->>'schema_version'=
                'vane.research-grounding-verdict/v1'
@@ -456,6 +460,10 @@ BEGIN
            AND correction.corrected_brief_payload=NEW.brief_payload
            AND correction.corrected_brief_digest=NEW.brief_digest
            AND correction.verdict_digest=encode(sha256(correction.verdict_payload),'hex')
+           AND convert_from(correction.verdict_payload,'UTF8')=
+               '{"schema_version":"vane.research-grounding-verdict/v1",' ||
+               '"candidate_digest":"' || correction.corrected_brief_digest || '",' ||
+               '"verdict":"grounded","issues":[]}'
            AND jsonb_typeof(convert_from(correction.verdict_payload,'UTF8')::jsonb)='object'
            AND convert_from(correction.verdict_payload,'UTF8')::jsonb->>'schema_version'=
                'vane.research-grounding-verdict/v1'

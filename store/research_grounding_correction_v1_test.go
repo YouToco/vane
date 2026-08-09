@@ -107,6 +107,31 @@ func TestResearchGroundingCorrectionV1PostgresAllowsExactlyOneRepairAndReverific
 	if err != nil || correction.Status != ResearchBriefGroundingCorrectionCorrectedV1 {
 		t.Fatalf("correction=%+v err=%v", correction, err)
 	}
+	forgedTx, err := f.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := forgedTx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true)`,
+		fmtInt64V3(f.tenantID), fmtInt64V3(f.userID)); err != nil {
+		_ = forgedTx.Rollback(t.Context())
+		t.Fatal(err)
+	}
+	if _, err := forgedTx.Exec(t.Context(), `SET LOCAL ROLE vane_app`); err != nil {
+		_ = forgedTx.Rollback(t.Context())
+		t.Fatal(err)
+	}
+	if _, err := forgedTx.Exec(t.Context(),
+		`UPDATE research_brief_syntheses
+		    SET status='finalized',significance='major',decision='deliver',
+		        delivery_required=true,brief_payload=$2,brief_digest=$3
+		  WHERE id=$1`, synthesis.ID, corrected,
+		researchRunSHA256(corrected)); err == nil ||
+		!strings.Contains(err.Error(), "lacks exact grounded authority") {
+		_ = forgedTx.Rollback(t.Context())
+		t.Fatalf("database admitted unverified correction: %v", err)
+	}
+	_ = forgedTx.Rollback(t.Context())
 
 	verifier := *seal.ResearchModel.GroundingVerifier
 	verifierReservation, err := f.st.BeginResearchRunLLMSpendV3(t.Context(),

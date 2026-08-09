@@ -101,7 +101,7 @@ func (p ResearchModelPolicyV3) Validate() error {
 				!validResearchGroundingVerifierRendererVersion(
 					p.GroundingVerifier.RendererVersion))) ||
 		(p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV36 &&
-			(p.GroundingCorrector == nil ||
+			(p.GroundingVerifier == nil || p.GroundingCorrector == nil ||
 				p.GroundingVerifier.RendererVersion !=
 					ResearchGroundingVerifierRendererVersionV12)) ||
 		(p.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV36 &&

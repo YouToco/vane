@@ -193,6 +193,11 @@ func TestWithExplicitEventWindowV36FreezesOneCorrector(t *testing.T) {
 	if _, err := BuildResearchModelPolicyV3(broken); err == nil {
 		t.Fatal("v3.6 accepted without corrector")
 	}
+	broken = scoped
+	broken.GroundingVerifier = nil
+	if _, err := BuildResearchModelPolicyV3(broken); err == nil {
+		t.Fatal("v3.6 accepted a corrector without verifier")
+	}
 	broken = retained
 	corrector := scoped.GroundingCorrector
 	broken.GroundingCorrector = corrector
