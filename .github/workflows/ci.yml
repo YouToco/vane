@@ -73,6 +73,37 @@ jobs:
           go-version: "1.26.5"
           cache-dependency-path: go.sum
 
+      - name: Select trusted store timing cache
+        id: store-timing-key
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          trusted_sha=""
+          case "${EVENT_NAME}" in
+            pull_request)
+              trusted_sha="${PULL_REQUEST_BASE_SHA}"
+              ;;
+            push)
+              trusted_sha="${PUSH_BEFORE_SHA}"
+              ;;
+          esac
+          if [[ "${trusted_sha}" =~ ^[0-9a-f]{40}$ ]] &&
+             [[ "${trusted_sha}" != "0000000000000000000000000000000000000000" ]]; then
+            echo "key=store-race-timings-v1-${trusted_sha}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Restore trusted store timings
+        if: steps.store-timing-key.outputs.key != ''
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: tmp/store-timing-cache
+          key: ${{ steps.store-timing-key.outputs.key }}
+          fail-on-cache-miss: false
+
       - name: Run store race shards
         shell: bash
         run: |
@@ -80,6 +111,7 @@ jobs:
           status=0
           go run ./cmd/storetestshard run \
             --artifacts tmp/store-sharding \
+            --timings tmp/store-timing-cache/store.timings.jsonl \
             --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable' \
             --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports[5432] }}/vane_test?sslmode=disable' \
             --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable' || status=$?
@@ -104,6 +136,36 @@ jobs:
             done
           fi
           exit "${status}"
+
+      - name: Build current main store timing seed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tmp/store-timing-cache-next
+          go run ./cmd/storetestshard timing-seed \
+            --tests tmp/store-sharding/store-tests.list.txt \
+            --output tmp/store-timing-cache-next/store.timings.jsonl \
+            --manifest tmp/store-timing-cache-next/store.timings.manifest.json \
+            tmp/store-sharding/store-shard-0.test.json \
+            tmp/store-sharding/store-shard-1.test.json \
+            tmp/store-sharding/store-shard-2.test.json
+          jq -e \
+            --argjson expected "$(jq -r '.expected_tests' tmp/store-sharding/store-shard-status.json)" \
+            '.version == 1 and .test_count == $expected and
+             .terminal_events == $expected and
+             (.zero_duration_tests | type == "number")' \
+            tmp/store-timing-cache-next/store.timings.manifest.json >/dev/null
+          go run ./cmd/storetestshard timing-seed \
+            --tests tmp/store-sharding/store-tests.list.txt \
+            tmp/store-timing-cache-next/store.timings.jsonl >/dev/null
+
+      - name: Save current main store timings
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: tmp/store-timing-cache-next
+          key: store-race-timings-v1-${{ github.sha }}
 
   rest:
     runs-on: ubuntu-24.04
