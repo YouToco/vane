@@ -1,9 +1,35 @@
 package runtimepolicy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 )
+
+func TestResearchModelPolicyV34RetainedCanonicalGolden(t *testing.T) {
+	policy := researchModelPolicyForTest(t)
+	policy.Synthesis.RendererVersion = ResearchSynthesisRendererVersionV34
+	policy.GroundingVerifier = &ResearchModelStageV3{
+		Stage: ResearchModelStageGroundingVerifierV3, Model: "strong-model",
+		MaxTokens: 4096, DisableThinking: true,
+		SystemPrompt:    "Independently verify every claim against cited evidence.",
+		RendererVersion: ResearchGroundingVerifierRendererVersionV12,
+	}
+	built, err := BuildResearchModelPolicyV3(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := EncodeResearchModelPolicyV3(built)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	const retainedDigest = "747064d87c5edc24e45e7ffe185e7f2f607d6322162aeb8ae64f3cd0cafaa766"
+	if got := hex.EncodeToString(sum[:]); got != retainedDigest {
+		t.Fatalf("retained v3.4 canonical digest=%s", got)
+	}
+}
 
 func researchModelPolicyForTest(t *testing.T) ResearchModelPolicyV3 {
 	t.Helper()

@@ -141,7 +141,9 @@ func (s *Store) PrepareOrGetResearchBriefGroundingV1(
 	if seal.ResearchModel.Synthesis.RendererVersion !=
 		runtimepolicy.ResearchSynthesisRendererVersionV33 &&
 		seal.ResearchModel.Synthesis.RendererVersion !=
-			runtimepolicy.ResearchSynthesisRendererVersionV34 ||
+			runtimepolicy.ResearchSynthesisRendererVersionV34 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV35 ||
 		seal.ResearchModel.GroundingVerifier == nil {
 		return PrepareResearchBriefGroundingV1Result{}, researchRunConflictError()
 	}
@@ -157,7 +159,8 @@ func (s *Store) PrepareOrGetResearchBriefGroundingV1(
 		return PrepareResearchBriefGroundingV1Result{}, err
 	}
 	if err := validateResearchBriefCitationsV3(
-		brief, synthesis.EvidenceManifest, synthesis.HistoryManifest); err != nil {
+		brief, synthesis.ContextPayload, synthesis.EvidenceManifest,
+		synthesis.HistoryManifest); err != nil {
 		return PrepareResearchBriefGroundingV1Result{}, err
 	}
 	candidateDigest := researchRunSHA256(canonical)
@@ -280,7 +283,9 @@ func (s *Store) SettleResearchBriefGroundingV1(
 	if seal.ResearchModel.Synthesis.RendererVersion !=
 		runtimepolicy.ResearchSynthesisRendererVersionV33 &&
 		seal.ResearchModel.Synthesis.RendererVersion !=
-			runtimepolicy.ResearchSynthesisRendererVersionV34 ||
+			runtimepolicy.ResearchSynthesisRendererVersionV34 &&
+		seal.ResearchModel.Synthesis.RendererVersion !=
+			runtimepolicy.ResearchSynthesisRendererVersionV35 ||
 		seal.ResearchModel.GroundingVerifier == nil {
 		return ResearchBriefGroundingV1{}, researchRunIntegrityError()
 	}
@@ -377,7 +382,8 @@ func buildResearchGroundingPromptV1(
 	}
 	var synthesis researchSynthesisContextV3
 	if json.Unmarshal(contextPayload, &synthesis) != nil ||
-		!validResearchSynthesisContextVersionV3(synthesis.SchemaVersion, len(synthesis.ToolFailures)) {
+		!validResearchSynthesisContextVersionV3(synthesis.SchemaVersion, len(synthesis.ToolFailures)) ||
+		!validResearchSynthesisContextWindowV33(synthesis) {
 		return nil, researchRunIntegrityError()
 	}
 	current := make(map[string]researchEvidenceContextItemV3, len(synthesis.CurrentEvidence))

@@ -29,6 +29,7 @@ type policyV3 struct {
 	Notification  taskstate.NotificationPolicyV3 `json:"notification"`
 	Output        taskstate.OutputPreferenceV3   `json:"output"`
 	PlannerBudget types.PlannerBudget            `json:"planner_budget"`
+	ResearchScope *taskstate.ResearchScopeV3     `json:"research_scope,omitempty"`
 }
 
 func main() {
@@ -73,6 +74,7 @@ func run(arguments []string) error {
 			TenantID: scope.TenantID, UserID: scope.UserID, TaskID: a.taskID,
 			IdempotencyKey: a.idempotencyKey, Notification: policy.Notification,
 			Output: policy.Output, PlannerBudget: policy.PlannerBudget,
+			ResearchScope: policy.ResearchScope,
 		})
 	} else {
 		op, err = st.RollbackResearchV3DefinitionPrepare(

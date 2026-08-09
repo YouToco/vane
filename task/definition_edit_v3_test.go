@@ -85,6 +85,41 @@ func TestBuildResearchV3DefinitionEditTargetReplacesCompleteOwnerSurfaceOnly(
 	}
 }
 
+func TestBuildResearchV3DefinitionEditTargetRequiresReprepareForScopedManualChange(t *testing.T) {
+	base, err := taskstate.BuildApprovedDefinitionV3(taskstate.ApprovedDefinitionInputV3{
+		TenantID: 7, UserID: 42, TaskID: "scoped-edit", TaskName: "scope",
+		TaskManual:    "exact approved manual",
+		SpecJSON:      json.RawMessage(`{"every_seconds":7200,"tz":"UTC"}`),
+		ExecutionMode: types.ExecutionModeDiscoverAtRun,
+		Notification: taskstate.NotificationPolicyV3{
+			MinimumSignificance: taskstate.NotificationThresholdMajorV3, SuppressEmpty: true,
+		},
+		Output: taskstate.OutputPreferenceV3{Language: taskstate.OutputLanguageZhCNV3,
+			Format: taskstate.OutputFormatExecutiveBriefV3, IncludeEvidenceLinks: true},
+		PlannerBudget: types.PlannerBudget{MaxPlannerRounds: 4, MaxToolCalls: 8,
+			MaxTokens: 4096, MaxCostMicroUSD: 10000, DurationMs: 60000},
+		DeliveryPolicy:     taskstate.DeliveryPolicyOwnerFeishu,
+		TenantBudgetPolicy: taskstate.BudgetPolicyInheritTenantQuota,
+		ResearchScope: &taskstate.ResearchScopeV3{Mode: taskstate.ResearchScopeEventWindowV3,
+			LookbackSeconds: taskstate.ResearchScopeWeekSecondsV3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := ResearchV3DefinitionEditInput{TenantID: 7, UserID: 42, TaskID: "scoped-edit",
+		TaskName: "renamed", TaskManual: base.TaskManual, SpecJSON: base.SpecJSON,
+		Notification: base.Notification, Output: base.Output}
+	unchanged, err := BuildResearchV3DefinitionEditTarget(base, input)
+	if err != nil || !reflect.DeepEqual(unchanged.ResearchScope, base.ResearchScope) {
+		t.Fatalf("non-manual edit lost scope: scope=%+v err=%v", unchanged.ResearchScope, err)
+	}
+	input.TaskManual = "changed manual"
+	if _, err := BuildResearchV3DefinitionEditTarget(base, input); err == nil ||
+		!strings.Contains(err.Error(), "explicit operator prepare") {
+		t.Fatalf("scoped manual edit err=%v", err)
+	}
+}
+
 type researchV3RecoveryRestartStoreTest struct {
 	ResearchTaskDefinitionEditStoreV3
 	queue       []*types.TaskDefinitionEditOperation

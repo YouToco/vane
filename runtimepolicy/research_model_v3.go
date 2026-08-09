@@ -27,6 +27,7 @@ const (
 	ResearchSynthesisRendererVersionV32 = "research-synthesis.render/v3.2"
 	ResearchSynthesisRendererVersionV33 = "research-synthesis.render/v3.3"
 	ResearchSynthesisRendererVersionV34 = "research-synthesis.render/v3.4"
+	ResearchSynthesisRendererVersionV35 = "research-synthesis.render/v3.5"
 
 	ResearchGroundingVerifierRendererVersionV1  = "research-grounding-verifier.render/v1"
 	ResearchGroundingVerifierRendererVersionV11 = "research-grounding-verifier.render/v1.1"
@@ -81,16 +82,31 @@ func (p ResearchModelPolicyV3) Validate() error {
 			!validResearchModelStageV3(*p.GroundingVerifier,
 				ResearchModelStageGroundingVerifierV3)) ||
 		((p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV33 ||
-			p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV34) &&
+			p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV34 ||
+			p.Synthesis.RendererVersion == ResearchSynthesisRendererVersionV35) &&
 			(p.GroundingVerifier == nil ||
 				!validResearchGroundingVerifierRendererVersion(
 					p.GroundingVerifier.RendererVersion))) ||
 		(p.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV33 &&
 			p.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV34 &&
+			p.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV35 &&
 			p.GroundingVerifier != nil) {
 		return invalidPolicy("research model policy is invalid")
 	}
 	return nil
+}
+
+// WithExplicitEventWindowV35 derives the scoped synthesis protocol without
+// mutating the retained v3.4 policy used by definitions that lack owner scope.
+func WithExplicitEventWindowV35(retained ResearchModelPolicyV3) (ResearchModelPolicyV3, error) {
+	if retained.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV34 ||
+		retained.GroundingVerifier == nil {
+		return ResearchModelPolicyV3{}, invalidPolicy("retained research model policy cannot be scoped")
+	}
+	scoped := retained
+	scoped.Synthesis.RendererVersion = ResearchSynthesisRendererVersionV35
+	scoped.Synthesis.SystemPrompt += " research_scope_window 是绑定 exact owner-approved task manual 的 operator-attested projection，且由 Store 从冻结时钟计算为唯一事件窗口；current_evidence 中的 web 文档已经按该窗口确定性筛选，不得补回未出现的文档或引用不在 current_evidence 中的证据。"
+	return BuildResearchModelPolicyV3(scoped)
 }
 
 func validResearchGroundingVerifierRendererVersion(version string) bool {

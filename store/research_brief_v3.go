@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
@@ -28,6 +29,7 @@ const (
 	researchSynthesisContextSchemaV3  = "vane.research-synthesis-context/v3"
 	researchSynthesisContextSchemaV31 = "vane.research-synthesis-context/v3.1"
 	researchSynthesisContextSchemaV32 = "vane.research-synthesis-context/v3.2"
+	researchSynthesisContextSchemaV33 = "vane.research-synthesis-context/v3.3"
 	researchSynthesisContextMaxV3     = 32 << 20
 	researchEvidenceContextBytesV32   = 32 << 10
 	researchEvidenceItemMaxBytesV32   = 8 << 10
@@ -242,11 +244,28 @@ type researchSynthesisDefinitionContextV3 struct {
 }
 
 type researchSynthesisContextV3 struct {
-	SchemaVersion   string                               `json:"schema_version"`
-	Definition      researchSynthesisDefinitionContextV3 `json:"definition"`
-	CurrentEvidence []researchEvidenceContextItemV3      `json:"current_evidence"`
-	ToolFailures    []researchToolFailureContextV31      `json:"tool_failures,omitempty"`
-	History         researchHistoryContextV3             `json:"history"`
+	SchemaVersion       string                               `json:"schema_version"`
+	ResearchScopeWindow *researchScopeWindowV33              `json:"research_scope_window,omitempty"`
+	Definition          researchSynthesisDefinitionContextV3 `json:"definition"`
+	CurrentEvidence     []researchEvidenceContextItemV3      `json:"current_evidence"`
+	ToolFailures        []researchToolFailureContextV31      `json:"tool_failures,omitempty"`
+	History             researchHistoryContextV3             `json:"history"`
+}
+
+type researchScopeWindowV33 struct {
+	Mode            taskstate.ResearchScopeModeV3 `json:"mode"`
+	LookbackSeconds int64                         `json:"lookback_seconds"`
+	StartUTC        string                        `json:"start_utc"`
+	EndUTC          string                        `json:"end_utc"`
+	Boundary        string                        `json:"boundary"`
+}
+
+type researchWindowDocumentV33 struct {
+	Title       string `json:"title"`
+	URL         string `json:"url"`
+	PublishedAt string `json:"published_at,omitempty"`
+	Author      string `json:"author,omitempty"`
+	Text        string `json:"text"`
 }
 
 type researchBriefRequestDigestV3 struct {
@@ -322,10 +341,27 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 			Synthesis: existing, PartialCoverage: researchBriefSynthesisPartialCoverageV31(existing),
 		}, nil
 	}
+	contextSchema := researchSynthesisContextSchemaV32
+	var scopeWindow *researchScopeWindowV33
+	if snapshotSeal.Payload.ResearchModel.Synthesis.RendererVersion ==
+		runtimepolicy.ResearchSynthesisRendererVersionV35 {
+		contextSchema = researchSynthesisContextSchemaV33
+		scopeWindow, err = buildResearchScopeWindowV33(
+			snapshotSeal.Payload.Definition, params.SnapshotRef.HistoryThroughUTC)
+		if err != nil {
+			return PrepareResearchBriefSynthesisV3Result{}, err
+		}
+	} else if snapshotSeal.Payload.Definition.ResearchScope != nil {
+		return PrepareResearchBriefSynthesisV3Result{}, researchRunIntegrityError()
+	}
 	evidencePayload, evidenceContext, toolFailures, err :=
-		buildResearchEvidenceManifestV3(ctx, tx, params.Identity, params.PlanRef)
+		buildResearchEvidenceManifestV3(ctx, tx, params.Identity, params.PlanRef, scopeWindow)
 	if err != nil {
 		return PrepareResearchBriefSynthesisV3Result{}, err
+	}
+	if scopeWindow != nil && len(evidenceContext) == 0 {
+		return PrepareResearchBriefSynthesisV3Result{}, researchRunValidationError(
+			"research synthesis has no eligible in-window Evidence")
 	}
 	historyPayload, historyContext, err := buildResearchHistoryManifestV3(ctx, tx, params.Identity,
 		params.SnapshotRef, params.PlanRef.PlanID)
@@ -333,7 +369,7 @@ func (s *Store) PrepareOrGetResearchBriefSynthesisV3(
 		return PrepareResearchBriefSynthesisV3Result{}, err
 	}
 	contextPayload, err := json.Marshal(researchSynthesisContextV3{
-		SchemaVersion: researchSynthesisContextSchemaV32,
+		SchemaVersion: contextSchema, ResearchScopeWindow: scopeWindow,
 		Definition: researchSynthesisDefinitionContextV3{
 			TaskName:     snapshotSeal.Payload.Definition.TaskName,
 			TaskManual:   snapshotSeal.Payload.Definition.TaskManual,
@@ -515,7 +551,9 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 	requiresGrounding := seal.ResearchModel.Synthesis.RendererVersion ==
 		runtimepolicy.ResearchSynthesisRendererVersionV33 ||
 		seal.ResearchModel.Synthesis.RendererVersion ==
-			runtimepolicy.ResearchSynthesisRendererVersionV34
+			runtimepolicy.ResearchSynthesisRendererVersionV34 ||
+		seal.ResearchModel.Synthesis.RendererVersion ==
+			runtimepolicy.ResearchSynthesisRendererVersionV35
 	if requiresGrounding {
 		grounding, found, err := loadResearchBriefGroundingV1(ctx, tx,
 			params.Identity, params.SnapshotRef.SnapshotID, params.SynthesisID)
@@ -567,7 +605,8 @@ func (s *Store) FinalizeResearchBriefSynthesisV3(
 		brief, row.EvidenceManifest); err != nil {
 		return types.ResearchBriefRefV3{}, err
 	}
-	if err := validateResearchBriefCitationsV3(brief, row.EvidenceManifest, row.HistoryManifest); err != nil {
+	if err := validateResearchBriefCitationsV3(brief, row.ContextPayload,
+		row.EvidenceManifest, row.HistoryManifest); err != nil {
 		return types.ResearchBriefRefV3{}, err
 	}
 	decision, deliveryRequired, err := researchBriefNotificationDecisionV3(
@@ -841,7 +880,7 @@ func loadAndValidateResearchBriefSnapshotV3(
 
 func buildResearchEvidenceManifestV3(
 	ctx context.Context, tx pgx.Tx, identity types.RunIdentity,
-	planRef types.ResearchRunPlanRefV3,
+	planRef types.ResearchRunPlanRefV3, scopeWindow *researchScopeWindowV33,
 ) ([]byte, []researchEvidenceContextItemV3, []researchToolFailureContextV31, error) {
 	rows, err := tx.Query(ctx,
 		`SELECT evidence.id,evidence.step_ordinal,evidence.invocation_id,
@@ -885,6 +924,21 @@ func buildResearchEvidenceManifestV3(
 		if contextItem.ContextStoredSize != len(contextItem.SynthesisVisibleText) ||
 			researchRunSHA256([]byte(contextItem.SynthesisVisibleText)) != item.ResultDigest {
 			return nil, nil, nil, researchRunIntegrityError()
+		}
+		if scopeWindow != nil {
+			if item.Truncated {
+				return nil, nil, nil, researchRunIntegrityError()
+			}
+			filtered, eligible, err := projectResearchWindowEvidenceV33(
+				item.ToolName, contextItem.SynthesisVisibleText, *scopeWindow)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if !eligible {
+				continue
+			}
+			contextItem.SynthesisVisibleText = filtered
+			contextItem.ContextStoredSize = len(filtered)
 		}
 		contextItems = append(contextItems, contextItem)
 	}
@@ -970,6 +1024,70 @@ func buildResearchEvidenceManifestV3(
 		return nil, nil, nil, researchRunIntegrityError()
 	}
 	return payload, contextItems, failures, nil
+}
+
+func buildResearchScopeWindowV33(
+	definition taskstate.ApprovedDefinitionV3, cutoffText string,
+) (*researchScopeWindowV33, error) {
+	if definition.ResearchScope == nil ||
+		definition.ResearchScope.Mode != taskstate.ResearchScopeEventWindowV3 ||
+		definition.ResearchScope.LookbackSeconds != taskstate.ResearchScopeWeekSecondsV3 {
+		return nil, researchRunIntegrityError()
+	}
+	cutoff, err := time.Parse(time.RFC3339Nano, cutoffText)
+	if err != nil {
+		return nil, researchRunIntegrityError()
+	}
+	return &researchScopeWindowV33{
+		Mode:            definition.ResearchScope.Mode,
+		LookbackSeconds: definition.ResearchScope.LookbackSeconds,
+		StartUTC: cutoff.Add(-time.Duration(definition.ResearchScope.LookbackSeconds) * time.Second).
+			UTC().Format(time.RFC3339Nano),
+		EndUTC: cutoff.UTC().Format(time.RFC3339Nano), Boundary: "(start,end]",
+	}, nil
+}
+
+func projectResearchWindowEvidenceV33(
+	toolName, full string, window researchScopeWindowV33,
+) (string, bool, error) {
+	if toolName != "web_search" && toolName != "web_contents" {
+		return "", false, nil
+	}
+	start, startErr := time.Parse(time.RFC3339Nano, window.StartUTC)
+	end, endErr := time.Parse(time.RFC3339Nano, window.EndUTC)
+	if startErr != nil || endErr != nil || !start.Before(end) ||
+		window.Boundary != "(start,end]" {
+		return "", false, researchRunIntegrityError()
+	}
+	var documents []researchWindowDocumentV33
+	if err := strictjson.DecodeExact([]byte(full), &documents); err != nil {
+		return "", false, researchRunIntegrityError()
+	}
+	canonical, err := json.Marshal(documents)
+	if err != nil || !bytes.Equal(canonical, []byte(full)) {
+		return "", false, researchRunIntegrityError()
+	}
+	eligible := make([]researchWindowDocumentV33, 0, len(documents))
+	for _, document := range documents {
+		if document.PublishedAt == "" {
+			continue
+		}
+		published, err := time.Parse(time.RFC3339Nano, document.PublishedAt)
+		if err != nil {
+			continue
+		}
+		if published.After(start) && !published.After(end) {
+			eligible = append(eligible, document)
+		}
+	}
+	if len(eligible) == 0 {
+		return "", false, nil
+	}
+	filtered, err := json.Marshal(eligible)
+	if err != nil {
+		return "", false, researchRunIntegrityError()
+	}
+	return string(filtered), true, nil
 }
 
 // projectResearchEvidenceContextV32 freezes a second, synthesis-only view of
@@ -1146,7 +1264,7 @@ func researchBriefNotificationDecisionV3(
 }
 
 func validateResearchBriefCitationsV3(
-	brief types.ResearchBriefPayloadV3, evidencePayload, historyPayload []byte,
+	brief types.ResearchBriefPayloadV3, contextPayload, evidencePayload, historyPayload []byte,
 ) error {
 	var evidence researchEvidenceManifestV3
 	var history researchHistoryManifestV3
@@ -1158,8 +1276,18 @@ func validateResearchBriefCitationsV3(
 		return researchRunIntegrityError()
 	}
 	evidenceRefs := make(map[string]struct{}, len(evidence.Items))
-	for _, item := range evidence.Items {
-		evidenceRefs[strconv.FormatInt(item.EvidenceID, 10)] = struct{}{}
+	var synthesis researchSynthesisContextV3
+	if json.Unmarshal(contextPayload, &synthesis) != nil {
+		return researchRunIntegrityError()
+	}
+	if synthesis.SchemaVersion == researchSynthesisContextSchemaV33 {
+		for _, item := range synthesis.CurrentEvidence {
+			evidenceRefs[strconv.FormatInt(item.EvidenceID, 10)] = struct{}{}
+		}
+	} else {
+		for _, item := range evidence.Items {
+			evidenceRefs[strconv.FormatInt(item.EvidenceID, 10)] = struct{}{}
+		}
 	}
 	historyRefs := make(map[string]struct{}, len(history.Items))
 	for _, item := range history.Items {
@@ -1427,13 +1555,15 @@ func researchBriefSynthesisFrozenPayloadsValidV3(row ResearchBriefSynthesisV3) b
 	if json.Unmarshal(row.ContextPayload, &contextPayload) != nil ||
 		!validResearchSynthesisContextVersionV3(
 			contextPayload.SchemaVersion, len(contextPayload.ToolFailures)) ||
+		!validResearchSynthesisContextWindowV33(contextPayload) ||
 		json.Unmarshal(row.EvidenceManifest, &evidence) != nil ||
 		!validResearchEvidenceManifestVersionV3(
 			evidence.SchemaVersion, len(evidence.ToolFailures)) ||
 		json.Unmarshal(row.HistoryManifest, &history) != nil ||
 		history.SchemaVersion != researchHistoryManifestSchemaV3 ||
 		!equalResearchToolFailuresV31(
-			contextPayload.ToolFailures, evidence.ToolFailures) {
+			contextPayload.ToolFailures, evidence.ToolFailures) ||
+		!researchSynthesisEvidenceBindingValidV33(contextPayload, evidence) {
 		return false
 	}
 	canonicalContext, contextErr := json.Marshal(contextPayload)
@@ -1445,10 +1575,64 @@ func researchBriefSynthesisFrozenPayloadsValidV3(row ResearchBriefSynthesisV3) b
 		bytes.Equal(canonicalHistory, row.HistoryManifest)
 }
 
+func researchSynthesisEvidenceBindingValidV33(
+	context researchSynthesisContextV3, evidence researchEvidenceManifestV3,
+) bool {
+	if context.SchemaVersion != researchSynthesisContextSchemaV33 {
+		return true
+	}
+	manifest := make(map[int64]researchEvidenceManifestItemV3, len(evidence.Items))
+	for _, item := range evidence.Items {
+		if item.EvidenceID <= 0 {
+			return false
+		}
+		if _, exists := manifest[item.EvidenceID]; exists {
+			return false
+		}
+		manifest[item.EvidenceID] = item
+	}
+	seen := make(map[int64]struct{}, len(context.CurrentEvidence))
+	for _, item := range context.CurrentEvidence {
+		full, exists := manifest[item.EvidenceID]
+		if !exists || full != item.researchEvidenceManifestItemV3 || full.Truncated {
+			return false
+		}
+		if _, duplicate := seen[item.EvidenceID]; duplicate {
+			return false
+		}
+		seen[item.EvidenceID] = struct{}{}
+		if item.ContextStoredSize < item.ContextVisibleSize ||
+			item.ContextVisibleSize != len(item.SynthesisVisibleText) ||
+			item.ContextVisibleDigest != researchRunSHA256([]byte(item.SynthesisVisibleText)) ||
+			item.ContextTruncated != (item.ContextStoredSize > item.ContextVisibleSize) {
+			return false
+		}
+	}
+	return len(context.CurrentEvidence) > 0
+}
+
 func validResearchSynthesisContextVersionV3(version string, failures int) bool {
 	return (version == researchSynthesisContextSchemaV3 && failures == 0) ||
 		(version == researchSynthesisContextSchemaV31 && failures > 0) ||
-		version == researchSynthesisContextSchemaV32
+		version == researchSynthesisContextSchemaV32 ||
+		version == researchSynthesisContextSchemaV33
+}
+
+func validResearchSynthesisContextWindowV33(context researchSynthesisContextV3) bool {
+	if context.SchemaVersion != researchSynthesisContextSchemaV33 {
+		return context.ResearchScopeWindow == nil
+	}
+	window := context.ResearchScopeWindow
+	if window == nil || window.Mode != taskstate.ResearchScopeEventWindowV3 ||
+		window.LookbackSeconds != taskstate.ResearchScopeWeekSecondsV3 ||
+		window.Boundary != "(start,end]" {
+		return false
+	}
+	start, startErr := time.Parse(time.RFC3339Nano, window.StartUTC)
+	end, endErr := time.Parse(time.RFC3339Nano, window.EndUTC)
+	return startErr == nil && endErr == nil && start.Before(end) &&
+		end.Sub(start) == time.Duration(window.LookbackSeconds)*time.Second &&
+		context.History.HistoryThroughUTC == window.EndUTC
 }
 
 func researchBriefSynthesisPartialCoverageV31(
