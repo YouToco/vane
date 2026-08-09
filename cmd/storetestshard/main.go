@@ -32,19 +32,26 @@ func (values *stringList) Set(value string) error {
 }
 
 type runStatus struct {
-	ExitCode              int     `json:"exit_code"`
-	Phase                 string  `json:"phase"`
-	Error                 string  `json:"error,omitempty"`
-	FailedShards          []int   `json:"failed_shards,omitempty"`
-	Strategy              string  `json:"strategy"`
-	ExpectedTests         int     `json:"expected_tests"`
-	ObservedTests         int     `json:"observed_tests"`
-	DuplicateTests        int     `json:"duplicate_tests"`
-	MissingTests          int     `json:"missing_tests"`
-	BuildSeconds          float64 `json:"build_seconds"`
-	ShardWallSeconds      float64 `json:"shard_wall_seconds"`
-	TotalSeconds          float64 `json:"total_seconds"`
-	HistoricalTimingTests int     `json:"historical_timing_tests"`
+	ExitCode              int       `json:"exit_code"`
+	Phase                 string    `json:"phase"`
+	Error                 string    `json:"error,omitempty"`
+	FailedShards          []int     `json:"failed_shards,omitempty"`
+	Strategy              string    `json:"strategy"`
+	ExpectedTests         int       `json:"expected_tests"`
+	ObservedTests         int       `json:"observed_tests"`
+	DuplicateTests        int       `json:"duplicate_tests"`
+	MissingTests          int       `json:"missing_tests"`
+	BuildSeconds          float64   `json:"build_seconds"`
+	ShardWallSeconds      float64   `json:"shard_wall_seconds"`
+	ShardSeconds          []float64 `json:"shard_seconds,omitempty"`
+	TotalSeconds          float64   `json:"total_seconds"`
+	HistoricalTimingTests int       `json:"historical_timing_tests"`
+	TimingInputStatus     string    `json:"timing_input_status"`
+}
+
+type timingInput struct {
+	timings map[string]float64
+	status  string
 }
 
 type shardResult struct {
@@ -55,12 +62,14 @@ type shardResult struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal(errors.New("usage: storetestshard <run|merge-coverage> [options]"))
+		fatal(errors.New("usage: storetestshard <run|timing-seed|merge-coverage> [options]"))
 	}
 	var err error
 	switch os.Args[1] {
 	case "run":
 		err = run(os.Args[2:])
+	case "timing-seed":
+		err = timingSeed(os.Args[2:])
 	case "merge-coverage":
 		err = mergeCoverage(os.Args[2:])
 	default:
@@ -93,7 +102,10 @@ func run(args []string) (runErr error) {
 
 	started := time.Now()
 	phase := "setup"
-	status := runStatus{}
+	status := runStatus{TimingInputStatus: "not_provided"}
+	if *timingPath != "" {
+		status.TimingInputStatus = "pending"
+	}
 	var buildElapsed time.Duration
 	var shardElapsed time.Duration
 	var failedShards []int
@@ -176,28 +188,14 @@ func run(args []string) (runErr error) {
 	}
 	status.ExpectedTests = len(tests)
 
-	timings := map[string]float64(nil)
-	if *timingPath != "" {
-		resolvedTimingPath, err := resolveRepoRelativeFile(repo, *timingPath)
-		if err != nil {
-			return fmt.Errorf("resolve timing artifact: %w", err)
-		}
-		timingFile, err := os.Open(resolvedTimingPath)
-		if err != nil {
-			return fmt.Errorf("open timing artifact: %w", err)
-		}
-		timings, err = testshard.ParseTimings(timingFile)
-		closeErr := timingFile.Close()
-		if err != nil {
-			return err
-		}
-		if closeErr != nil {
-			return closeErr
-		}
+	timing, err := loadOptionalTimings(repo, *timingPath)
+	if err != nil {
+		return err
 	}
+	status.TimingInputStatus = timing.status
 
 	phase = "plan"
-	plan, err := testshard.BuildPlan(tests, timings, len(databaseURLs))
+	plan, err := testshard.BuildPlan(tests, timing.timings, len(databaseURLs))
 	if err != nil {
 		return err
 	}
@@ -231,8 +229,10 @@ func run(args []string) (runErr error) {
 	close(results)
 	shardElapsed = time.Since(shardStarted)
 	var shardErrors []error
+	status.ShardSeconds = make([]float64, len(plan.Shards))
 	for result := range results {
 		fmt.Printf("store shard %d finished in %.3fs\n", result.index, result.elapsed.Seconds())
+		status.ShardSeconds[result.index] = roundSeconds(result.elapsed)
 		if result.err != nil {
 			failedShards = append(failedShards, result.index)
 			shardErrors = append(shardErrors, result.err)
@@ -289,6 +289,117 @@ func run(args []string) (runErr error) {
 		roundSeconds(shardElapsed),
 	)
 	return nil
+}
+
+func timingSeed(args []string) error {
+	flags := flag.NewFlagSet("timing-seed", flag.ContinueOnError)
+	repoDir := flags.String("repo", ".", "repository root")
+	testListPath := flags.String("tests", "", "authoritative top-level test list")
+	outputPath := flags.String("output", "", "optional canonical timing seed JSONL output")
+	manifestPath := flags.String("manifest", "", "optional timing seed summary JSON output")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *testListPath == "" {
+		return errors.New("--tests is required")
+	}
+	if len(flags.Args()) == 0 {
+		return errors.New("at least one timing JSONL input is required")
+	}
+	repo, err := filepath.Abs(*repoDir)
+	if err != nil {
+		return err
+	}
+	repo, err = filepath.EvalSymlinks(repo)
+	if err != nil {
+		return fmt.Errorf("resolve repository root: %w", err)
+	}
+	resolvedTests, err := resolveRepoRelativeFile(repo, *testListPath)
+	if err != nil {
+		return fmt.Errorf("resolve test list: %w", err)
+	}
+	testList, err := os.Open(resolvedTests)
+	if err != nil {
+		return fmt.Errorf("open test list: %w", err)
+	}
+	tests, parseErr := testshard.ParseTestList(testList)
+	closeErr := testList.Close()
+	if err := errors.Join(parseErr, closeErr); err != nil {
+		return err
+	}
+
+	readers := make([]io.Reader, 0, len(flags.Args()))
+	files := make([]*os.File, 0, len(flags.Args()))
+	for _, path := range flags.Args() {
+		resolved, err := resolveRepoRelativeFile(repo, path)
+		if err != nil {
+			_ = closeFiles(files)
+			return fmt.Errorf("resolve timing input: %w", err)
+		}
+		file, err := os.Open(resolved)
+		if err != nil {
+			_ = closeFiles(files)
+			return fmt.Errorf("open timing input: %w", err)
+		}
+		files = append(files, file)
+		readers = append(readers, file)
+	}
+	seed, summary, buildErr := testshard.BuildTimingSeed(tests, readers)
+	closeInputsErr := closeFiles(files)
+	if err := errors.Join(buildErr, closeInputsErr); err != nil {
+		return err
+	}
+	if *outputPath != "" {
+		resolved, err := resolveRepoRelativeOutput(repo, *outputPath)
+		if err != nil {
+			return fmt.Errorf("resolve timing seed output: %w", err)
+		}
+		if err := os.WriteFile(resolved, seed, 0o644); err != nil {
+			return fmt.Errorf("write timing seed: %w", err)
+		}
+	}
+	if *manifestPath != "" {
+		resolved, err := resolveRepoRelativeOutput(repo, *manifestPath)
+		if err != nil {
+			return fmt.Errorf("resolve timing seed manifest: %w", err)
+		}
+		if err := writeJSON(resolved, summary); err != nil {
+			return fmt.Errorf("write timing seed manifest: %w", err)
+		}
+	}
+	return json.NewEncoder(os.Stdout).Encode(summary)
+}
+
+func loadOptionalTimings(repo, path string) (timingInput, error) {
+	if path == "" {
+		return timingInput{status: "not_provided"}, nil
+	}
+	resolved, err := resolveRepoRelativeFile(repo, path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(os.Stderr, "timing input missing; using stable FNV-1a fallback")
+			return timingInput{status: "missing_fallback"}, nil
+		}
+		return timingInput{}, fmt.Errorf("resolve timing artifact: %w", err)
+	}
+	file, err := os.Open(resolved)
+	if err != nil {
+		return timingInput{}, fmt.Errorf("open timing artifact: %w", err)
+	}
+	timings, parseErr := testshard.ParseTimings(file)
+	closeErr := file.Close()
+	if closeErr != nil {
+		return timingInput{}, closeErr
+	}
+	if parseErr != nil {
+		fmt.Fprintln(os.Stderr, "timing input corrupt; using stable FNV-1a fallback")
+		return timingInput{status: "corrupt_fallback"}, nil
+	}
+	if len(timings) == 0 {
+		fmt.Fprintln(os.Stderr, "timing input empty; using stable FNV-1a fallback")
+		return timingInput{status: "empty_fallback"}, nil
+	}
+	return timingInput{timings: timings, status: "loaded"}, nil
 }
 
 func runShard(
@@ -476,18 +587,8 @@ func observationStats(expected []string, observed [][]string) (
 }
 
 func resolveRepoRelativeFile(repo, path string) (string, error) {
-	if path == "" {
-		return "", errors.New("path is empty")
-	}
-	if filepath.IsAbs(path) || filepath.VolumeName(path) != "" {
-		return "", fmt.Errorf("path must be repository-relative: %q", path)
-	}
-	for _, part := range strings.FieldsFunc(path, func(r rune) bool {
-		return r == '/' || r == '\\'
-	}) {
-		if part == ".." {
-			return "", fmt.Errorf("path must not contain parent traversal: %q", path)
-		}
+	if err := validateRepoRelativePath(path); err != nil {
+		return "", err
 	}
 
 	resolvedRepo, err := filepath.EvalSymlinks(repo)
@@ -515,6 +616,61 @@ func resolveRepoRelativeFile(repo, path string) (string, error) {
 		return "", fmt.Errorf("path is not a regular file: %q", path)
 	}
 	return resolvedPath, nil
+}
+
+func resolveRepoRelativeOutput(repo, path string) (string, error) {
+	if err := validateRepoRelativePath(path); err != nil {
+		return "", err
+	}
+	resolvedRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository root: %w", err)
+	}
+	joined := filepath.Join(resolvedRepo, filepath.Clean(path))
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(joined))
+	if err != nil {
+		return "", err
+	}
+	resolvedPath := filepath.Join(resolvedParent, filepath.Base(joined))
+	if err := requirePathInsideRepo(resolvedRepo, resolvedPath, path); err != nil {
+		return "", err
+	}
+	if info, err := os.Lstat(resolvedPath); err == nil {
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("output path is not a regular file: %q", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	return resolvedPath, nil
+}
+
+func validateRepoRelativePath(path string) error {
+	if path == "" {
+		return errors.New("path is empty")
+	}
+	if filepath.IsAbs(path) || filepath.VolumeName(path) != "" {
+		return fmt.Errorf("path must be repository-relative: %q", path)
+	}
+	for _, part := range strings.FieldsFunc(path, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if part == ".." {
+			return fmt.Errorf("path must not contain parent traversal: %q", path)
+		}
+	}
+	return nil
+}
+
+func requirePathInsideRepo(repo, resolvedPath, suppliedPath string) error {
+	relative, err := filepath.Rel(repo, resolvedPath)
+	if err != nil {
+		return err
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("resolved path escapes repository: %q", suppliedPath)
+	}
+	return nil
 }
 
 func roundSeconds(duration time.Duration) float64 {

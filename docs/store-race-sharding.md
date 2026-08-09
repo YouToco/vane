@@ -4,7 +4,17 @@ This experiment keeps `.github/workflows/ci.yml` unchanged until it is measured 
 the `vane-test` runner. Run the opt-in **Store race sharding experiment** workflow
 with `workflow_dispatch`.
 
-The runner:
+The manual workflow is a store-only, two-stage performance experiment. It does
+not replace or alter `.github/workflows/ci.yml`, its package set, PostgreSQL 18
+isolation, race/coverage flags, Temporal gate, vet, inventory, build, or trusted
+deployment. Dispatch the experiment on its branch with:
+
+```text
+gh workflow run store-race-sharding-experiment.yml \
+  --ref codex/ci-store-lpt-20260809
+```
+
+The seed job:
 
 1. builds one race-enabled, atomic-coverage `store.test` binary;
 2. obtains the authoritative top-level test list from that binary;
@@ -14,12 +24,18 @@ The runner:
 5. proves the observed top-level tests exactly match the manifests;
 6. requires the three coverage profiles to contain identical block sets before
    summing their atomic counters;
-7. runs every non-store package with the normal race and coverage flags, then
-   merges its coverage with the store profile.
+7. projects the verified combined stream to sorted top-level terminal JSONL;
+8. proves the seed and authoritative test list are exactly one-to-one, records
+   the seed SHA-256, and uploads both with a checksum manifest.
 
-The manual workflow always uses the stable FNV-1a hash of the test name. A fresh
-checkout has no honest historical timing artifact, so the workflow does not
-offer a timing-path input and does not download unverified state.
+Five fixed matrix jobs then run on independent GitHub-hosted runners, each with
+three fresh PostgreSQL 18 service containers. Every job downloads the same
+run-scoped seed artifact, rechecks the SHA-256 and exact test-list projection,
+and invokes `storetestshard run --timings`. A successful repeat must report
+`historical-lpt`, full timing coverage, expected=observed, zero duplicate/missing
+tests, three per-shard wall measurements, and identical coverage block sets.
+Each repeat uploads its status, plan, manifests, top-level event stream, shard
+JSONL, and coverage profiles under a run/attempt/repeat-unique artifact name.
 
 Historical longest-processing-time balancing remains available to local or
 other explicit callers that first provide the timing file inside the checkout:
@@ -29,9 +45,11 @@ go run ./cmd/storetestshard run ... --timings tmp/prior-store.test.json
 ```
 
 `--timings` accepts only a repository-relative regular file whose resolved path
-remains inside the repository; absolute paths, parent traversal, and symlink
-escapes are rejected. Tests absent from supplied history use the median known
-duration.
+remains inside the repository; absolute paths, parent traversal, symlink
+escapes, permission failures, and other authority failures remain hard errors.
+An omitted, ordinarily missing, corrupt, or empty timing data file safely falls
+back to stable FNV-1a and records `timing_input_status` in the run status. Tests
+absent from otherwise valid history use the median known duration.
 
 Do not replace the default CI test step until repeated measurements on the same
 runner show:
@@ -40,9 +58,9 @@ runner show:
 sharded p95 wall time <= 0.60 * baseline p95 wall time
 ```
 
-The uploaded artifact contains the authoritative list, shard manifests and plan,
-per-shard JSON, merged JSON, per-shard coverage, merged store coverage, final
-coverage, and the integrity/timing status. The runner writes
+The uploaded artifacts contain the authoritative list, shard manifests and plan,
+per-shard JSON, merged top-level JSON, per-shard coverage, merged store coverage,
+the canonical timing seed, and integrity/timing status. The runner writes
 `store-shard-status.json` on best effort after setup even when build, listing,
 shard execution, integrity verification, or coverage merge fails; `phase`,
 `error`, `failed_shards`, wall timings, and `exit_code` identify the stopping
@@ -54,10 +72,9 @@ allocated, distinct host ports, so jobs from other repositories cannot collide
 with fixed 5432/5433/5434 bindings. GitHub Actions fails the job before test
 execution if a service cannot become healthy.
 
-The artifact uploader is pinned to official `actions/upload-artifact` v7.0.1
-(Node.js 24). The self-hosted runner must be at least version 2.327.1; confirming
-that runner prerequisite is part of the manual experiment and another reason the
-workflow is not a default gate.
+Artifact upload/download steps are pinned to immutable official action SHAs.
+The workflow has only `contents: read`, receives no secrets, and runs only on
+GitHub-hosted Ubuntu 24.04 runners.
 
 ## Local benchmark decision (2026-07-27)
 

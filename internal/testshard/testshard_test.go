@@ -67,6 +67,73 @@ func TestParseTimingsUsesOnlyTopLevelTerminalEvents(t *testing.T) {
 	}
 }
 
+func TestBuildTimingSeedCanonicalAndExact(t *testing.T) {
+	expected := []string{"TestBravo", "TestAlpha"}
+	input := strings.Join([]string{
+		`{"Action":"run","Test":"TestBravo"}`,
+		`{"Action":"pass","Test":"TestBravo/sub","Elapsed":99}`,
+		`{"Action":"pass","Test":"TestBravo","Elapsed":2.5}`,
+		`{"Action":"output","Test":"TestAlpha"}`,
+		`{"Action":"pass","Test":"TestAlpha","Elapsed":1.25}`,
+	}, "\n")
+	first, summary, err := BuildTimingSeed(expected, []io.Reader{strings.NewReader(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondSummary, err := BuildTimingSeed(
+		[]string{"TestAlpha", "TestBravo"},
+		[]io.Reader{strings.NewReader(input)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) || summary != secondSummary ||
+		summary.TestCount != 2 || summary.TerminalEvents != 2 || len(summary.SHA256) != 64 {
+		t.Fatalf("seed=%q summary=%+v second=%q second_summary=%+v",
+			first, summary, second, secondSummary)
+	}
+	if strings.Contains(string(first), "/sub") ||
+		!strings.HasPrefix(string(first), `{"Action":"pass","Test":"TestAlpha"`) {
+		t.Fatalf("seed is not canonical top-level terminal JSONL: %s", first)
+	}
+	timings, err := ParseTimings(bytes.NewReader(first))
+	if err != nil || timings["TestAlpha"] != 1.25 || timings["TestBravo"] != 2.5 {
+		t.Fatalf("timings=%v err=%v", timings, err)
+	}
+}
+
+func TestBuildTimingSeedRejectsMissingDuplicateUnexpectedAndInvalidElapsed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{name: "missing", input: `{"Action":"pass","Test":"TestA","Elapsed":1}`},
+		{name: "duplicate", input: strings.Join([]string{
+			`{"Action":"pass","Test":"TestA","Elapsed":1}`,
+			`{"Action":"pass","Test":"TestA","Elapsed":2}`,
+			`{"Action":"pass","Test":"TestB","Elapsed":1}`,
+		}, "\n")},
+		{name: "unexpected", input: strings.Join([]string{
+			`{"Action":"pass","Test":"TestA","Elapsed":1}`,
+			`{"Action":"pass","Test":"TestB","Elapsed":1}`,
+			`{"Action":"pass","Test":"TestC","Elapsed":1}`,
+		}, "\n")},
+		{name: "invalid_elapsed", input: strings.Join([]string{
+			`{"Action":"pass","Test":"TestA","Elapsed":1}`,
+			`{"Action":"pass","Test":"TestB","Elapsed":0}`,
+		}, "\n")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := BuildTimingSeed(
+				[]string{"TestA", "TestB"},
+				[]io.Reader{strings.NewReader(tc.input)},
+			); err == nil {
+				t.Fatal("invalid timing seed was accepted")
+			}
+		})
+	}
+}
+
 func TestParseTestListRejectsNonTestRunnables(t *testing.T) {
 	for _, runnable := range []string{
 		"BenchmarkStore",

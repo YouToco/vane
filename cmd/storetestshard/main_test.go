@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/YouToco/vane/internal/testshard"
 )
 
 func TestFinalizeRunStatusRecordsFailure(t *testing.T) {
@@ -97,5 +99,96 @@ func TestResolveRepoRelativeFileRejectsResolvedEscape(t *testing.T) {
 		filepath.Join("outside", "store.json"),
 	); err == nil {
 		t.Fatal("symlink escape was accepted")
+	}
+}
+
+func TestLoadOptionalTimingsFallsBackOnlyForMissingCorruptAndEmpty(t *testing.T) {
+	repo := t.TempDir()
+	for name, contents := range map[string]string{
+		"corrupt.jsonl": "not-json\n",
+		"empty.jsonl":   "",
+		"valid.jsonl":   `{"Action":"pass","Test":"TestA","Elapsed":1.5}` + "\n",
+	} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		path       string
+		wantStatus string
+		wantTiming float64
+	}{
+		{path: "", wantStatus: "not_provided"},
+		{path: "missing.jsonl", wantStatus: "missing_fallback"},
+		{path: "corrupt.jsonl", wantStatus: "corrupt_fallback"},
+		{path: "empty.jsonl", wantStatus: "empty_fallback"},
+		{path: "valid.jsonl", wantStatus: "loaded", wantTiming: 1.5},
+	} {
+		t.Run(tc.wantStatus, func(t *testing.T) {
+			got, err := loadOptionalTimings(repo, tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.status != tc.wantStatus || got.timings["TestA"] != tc.wantTiming {
+				t.Fatalf("timing input=%+v", got)
+			}
+			if tc.wantStatus != "loaded" {
+				plan, err := testshard.BuildPlan(
+					[]string{"TestA", "TestB", "TestC"}, got.timings, 2,
+				)
+				if err != nil || plan.Strategy != "stable-fnv1a" {
+					t.Fatalf("fallback plan=%+v err=%v", plan, err)
+				}
+			}
+		})
+	}
+	if _, err := loadOptionalTimings(repo, "../untrusted.jsonl"); err == nil {
+		t.Fatal("path authority failure fell back instead of failing closed")
+	}
+}
+
+func TestTimingSeedCommandGeneratesAndRevalidatesCanonicalJSONL(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, "artifacts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repo, "tests.txt"),
+		[]byte("TestBravo\nTestAlpha\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	raw := strings.Join([]string{
+		`{"Action":"run","Test":"TestAlpha"}`,
+		`{"Action":"pass","Test":"TestAlpha","Elapsed":1}`,
+		`{"Action":"pass","Test":"TestBravo","Elapsed":2}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(repo, "raw.jsonl"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := timingSeed([]string{
+		"--repo", repo,
+		"--tests", "tests.txt",
+		"--output", "artifacts/store.timings.jsonl",
+		"--manifest", "artifacts/store.timings.manifest.json",
+		"raw.jsonl",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := timingSeed([]string{
+		"--repo", repo,
+		"--tests", "tests.txt",
+		"artifacts/store.timings.jsonl",
+	}); err != nil {
+		t.Fatalf("generated seed did not revalidate: %v", err)
+	}
+	seed, err := os.ReadFile(filepath.Join(repo, "artifacts", "store.timings.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(seed), "\n") != 2 ||
+		!strings.HasPrefix(string(seed), `{"Action":"pass","Test":"TestAlpha"`) {
+		t.Fatalf("canonical seed=%q", seed)
 	}
 }

@@ -2,6 +2,8 @@ package testshard
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +36,13 @@ type testEvent struct {
 	Action  string  `json:"Action"`
 	Test    string  `json:"Test"`
 	Elapsed float64 `json:"Elapsed"`
+}
+
+type TimingSeedSummary struct {
+	Version        int    `json:"version"`
+	TestCount      int    `json:"test_count"`
+	TerminalEvents int    `json:"terminal_events"`
+	SHA256         string `json:"sha256"`
 }
 
 func ParseTestList(r io.Reader) ([]string, error) {
@@ -93,6 +102,91 @@ func ParseTimings(r io.Reader) (map[string]float64, error) {
 		result[name] = total / float64(counts[name])
 	}
 	return result, nil
+}
+
+// BuildTimingSeed projects one or more go test -json streams to a canonical,
+// sorted top-level terminal JSONL seed. Every authoritative test must have
+// exactly one terminal event; subtests, package events and output are omitted.
+func BuildTimingSeed(expected []string, readers []io.Reader) ([]byte, TimingSeedSummary, error) {
+	want, err := normalizeTests(expected)
+	if err != nil {
+		return nil, TimingSeedSummary{}, err
+	}
+	if len(readers) == 0 {
+		return nil, TimingSeedSummary{}, errors.New("timing seed requires at least one input")
+	}
+	wantSet := make(map[string]struct{}, len(want))
+	for _, name := range want {
+		wantSet[name] = struct{}{}
+	}
+	events := make(map[string]testEvent, len(want))
+	for inputIndex, reader := range readers {
+		scanner := bufio.NewScanner(reader)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		line := 0
+		for scanner.Scan() {
+			line++
+			var event testEvent
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				return nil, TimingSeedSummary{}, fmt.Errorf(
+					"parse timing seed input %d line %d: %w", inputIndex, line, err,
+				)
+			}
+			if !isTopLevelTest(event.Test) ||
+				(event.Action != "pass" && event.Action != "fail" && event.Action != "skip") {
+				continue
+			}
+			if _, ok := wantSet[event.Test]; !ok {
+				return nil, TimingSeedSummary{}, fmt.Errorf(
+					"unexpected top-level terminal test %s", event.Test,
+				)
+			}
+			if event.Elapsed <= 0 {
+				return nil, TimingSeedSummary{}, fmt.Errorf(
+					"top-level terminal test %s has non-positive elapsed time", event.Test,
+				)
+			}
+			if _, duplicate := events[event.Test]; duplicate {
+				return nil, TimingSeedSummary{}, fmt.Errorf(
+					"duplicate top-level terminal test %s", event.Test,
+				)
+			}
+			events[event.Test] = event
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, TimingSeedSummary{}, fmt.Errorf(
+				"read timing seed input %d: %w", inputIndex, err,
+			)
+		}
+	}
+	if len(events) != len(want) {
+		missing := make([]string, 0, len(want)-len(events))
+		for _, name := range want {
+			if _, ok := events[name]; !ok {
+				missing = append(missing, name)
+			}
+		}
+		return nil, TimingSeedSummary{}, fmt.Errorf(
+			"timing seed terminal events %d do not match %d tests; missing=%s",
+			len(events), len(want), strings.Join(missing, ","),
+		)
+	}
+	var output bytes.Buffer
+	encoder := json.NewEncoder(&output)
+	encoder.SetEscapeHTML(false)
+	for _, name := range want {
+		if err := encoder.Encode(events[name]); err != nil {
+			return nil, TimingSeedSummary{}, err
+		}
+	}
+	seed := output.Bytes()
+	digest := sha256.Sum256(seed)
+	return append([]byte(nil), seed...), TimingSeedSummary{
+		Version:        1,
+		TestCount:      len(want),
+		TerminalEvents: len(events),
+		SHA256:         fmt.Sprintf("%x", digest),
+	}, nil
 }
 
 func BuildPlan(tests []string, timings map[string]float64, shardCount int) (Plan, error) {
