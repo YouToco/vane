@@ -638,12 +638,13 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 	}
 	workflow := strings.ReplaceAll(string(payload), "\r\n", "\n")
 	for _, required := range []string{
-		"runs-on: ubuntu-24.04",
+		"runs-on: [self-hosted, Linux, ARM64]",
 		"permissions:\n  contents: read",
 		"persist-credentials: false",
+		"cache: false",
 		"- 5432/tcp",
-		"${{ job.services.postgres_0.ports[5432] }}",
-		"${{ job.services.postgres.ports[5432] }}",
+		"${{ job.services.postgres_0.ports['5432'] }}",
+		"${{ job.services.postgres.ports['5432'] }}",
 		`--health-cmd "pg_isready -U vane -d vane_test"`,
 	} {
 		if !strings.Contains(workflow, required) {
@@ -651,7 +652,6 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"self-hosted",
 		"vane-build",
 		"vane-deploy",
 		"vps-primary",
