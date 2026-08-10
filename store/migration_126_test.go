@@ -177,4 +177,18 @@ func TestMigration126EmptyDownRestoresV125Postgres(t *testing.T) {
 		t.Fatalf("migration 126 Down clean=%v retained_v104=%v trigger_restored=%v",
 			clean, retained, triggerRestored)
 	}
+	rolledBackStore, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rolledBackStore.Close)
+	var tenantID int64
+	if err := rolledBackStore.pool.QueryRow(t.Context(), `
+		INSERT INTO tenants (status,plan) VALUES ('active','free') RETURNING id`,
+	).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rolledBackStore.PurgeTenant(t.Context(), tenantID, false); err != nil {
+		t.Fatalf("current binary cannot purge after 126 rollback: %v", err)
+	}
 }

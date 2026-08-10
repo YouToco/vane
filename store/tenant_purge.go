@@ -312,6 +312,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		researchBriefsAvailable              bool
 		researchGroundingAvailable           bool
 		researchGroundingCorrectionAvailable bool
+		researchPlannerSearchAvailable       bool
 		researchEvidenceAvailable            bool
 		researchLLMSettlementsAvailable      bool
 		researchLLMReservationsAvailable     bool
@@ -342,6 +343,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.research_brief_syntheses') IS NOT NULL,
 		        to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
 		        to_regclass('public.research_brief_grounding_corrections') IS NOT NULL,
+		        to_regclass('public.research_planner_tool_search_receipts') IS NOT NULL,
 		        to_regclass('public.research_run_evidence') IS NOT NULL,
 		        to_regclass('public.research_run_llm_spend_settlements') IS NOT NULL,
 		        to_regclass('public.research_run_llm_spend_reservations') IS NOT NULL,
@@ -371,6 +373,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&researchBriefsAvailable,
 		&researchGroundingAvailable,
 		&researchGroundingCorrectionAvailable,
+		&researchPlannerSearchAvailable,
 		&researchEvidenceAvailable,
 		&researchLLMSettlementsAvailable,
 		&researchLLMReservationsAvailable,
@@ -404,6 +407,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"research_brief_syntheses":                  researchBriefsAvailable,
 		"research_brief_grounding_verifications":    researchGroundingAvailable,
 		"research_brief_grounding_corrections":      researchGroundingCorrectionAvailable,
+		"research_planner_tool_search_receipts":     researchPlannerSearchAvailable,
 		"research_run_evidence":                     researchEvidenceAvailable,
 		"research_run_llm_spend_settlements":        researchLLMSettlementsAvailable,
 		"research_run_llm_spend_reservations":       researchLLMReservationsAvailable,
