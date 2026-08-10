@@ -651,6 +651,10 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 			t.Errorf("source CI missing isolation guard %q", required)
 		}
 	}
+	if got := strings.Count(workflow,
+		"          path: tmp/store-timing-cache\n"); got != 2 {
+		t.Errorf("source CI timing cache restore/save paths=%d, want 2", got)
+	}
 	for _, forbidden := range []string{
 		"vane-build",
 		"vane-deploy",
@@ -661,6 +665,7 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		"- 5432:5432",
 		"@localhost:5432/",
 		"actions/upload-artifact",
+		"store-timing-cache-next",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Errorf("source CI contains production capability %q", forbidden)
