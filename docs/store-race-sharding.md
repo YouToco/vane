@@ -27,6 +27,13 @@ empty, or incomplete timing data falls back to stable FNV-1a assignment and is
 reported in `store-shard-status.json`. Cache restore, seed construction, and
 cache save are best-effort and cannot turn a correct test run red.
 
+The cache restore and save steps deliberately declare the same
+`tmp/store-timing-cache` path. GitHub includes the declared path in the cache
+version fingerprint, so using a different staging directory for save creates a
+valid-looking exact key that can never be restored. Main run `31364677761`
+bootstrapped the first same-path seed for commit `c27d018` after this boundary
+was corrected.
+
 The same historical balancing remains available to explicit callers that
 provide the timing file inside the checkout:
 
