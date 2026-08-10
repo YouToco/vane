@@ -147,11 +147,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p tmp/store-timing-cache-next
+          # actions/cache includes the declared path in its version fingerprint.
+          # Restore and save must therefore use this exact same directory.
+          mkdir -p tmp/store-timing-cache
           go run ./cmd/storetestshard timing-seed \
             --tests tmp/store-sharding/store-tests.list.txt \
-            --output tmp/store-timing-cache-next/store.timings.jsonl \
-            --manifest tmp/store-timing-cache-next/store.timings.manifest.json \
+            --output tmp/store-timing-cache/store.timings.jsonl \
+            --manifest tmp/store-timing-cache/store.timings.manifest.json \
             tmp/store-sharding/store-shard-0.test.json \
             tmp/store-sharding/store-shard-1.test.json \
             tmp/store-sharding/store-shard-2.test.json
@@ -160,10 +162,10 @@ jobs:
             '.version == 1 and .test_count == $expected and
              .terminal_events == $expected and
              (.zero_duration_tests | type == "number")' \
-            tmp/store-timing-cache-next/store.timings.manifest.json >/dev/null
+            tmp/store-timing-cache/store.timings.manifest.json >/dev/null
           go run ./cmd/storetestshard timing-seed \
             --tests tmp/store-sharding/store-tests.list.txt \
-            tmp/store-timing-cache-next/store.timings.jsonl >/dev/null
+            tmp/store-timing-cache/store.timings.jsonl >/dev/null
 
       - name: Save current main store timings
         if: >-
@@ -172,7 +174,7 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: tmp/store-timing-cache-next
+          path: tmp/store-timing-cache
           key: store-race-timings-v1-${{ github.sha }}
 
   rest:
