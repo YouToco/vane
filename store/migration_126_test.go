@@ -86,7 +86,7 @@ func TestMigration126CanonicalReceiptParityPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	receipt, err := runcontext.BuildResearchPlannerToolSearchReceiptV1(
-		1, strings.Repeat("a", 64), "official <release> & status\u2028", 2,
+		1, strings.Repeat("a", 64), "official <release> \u2028 & status", 2,
 		[]runcontext.ResearchPlannerToolSearchMatchV1{{
 			Name: "web_search", SchemaDigest: strings.Repeat("b", 64),
 			Score: "1.250000000",

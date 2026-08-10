@@ -117,7 +117,7 @@ BEGIN
         ',"matches":['||matches_text||']}';
     RETURN convert_to(canonical,'UTF8');
 EXCEPTION WHEN OTHERS THEN RETURN NULL;
-END
+END;
 $$;
 -- +goose StatementEnd
 REVOKE ALL ON FUNCTION research_planner_search_canonical_v126(BYTEA) FROM PUBLIC;
@@ -211,7 +211,7 @@ BEGIN
             USING ERRCODE='23514';
     END IF;
     RETURN NEW;
-END
+END;
 $$;
 -- +goose StatementEnd
 REVOKE ALL ON FUNCTION enforce_research_planner_search_receipt_v126() FROM PUBLIC;
@@ -228,7 +228,7 @@ AS $$
 BEGIN
     RAISE EXCEPTION '126: planner tool search receipt is immutable'
         USING ERRCODE='23514';
-END
+END;
 $$;
 -- +goose StatementEnd
 REVOKE ALL ON FUNCTION protect_research_planner_search_receipt_v126() FROM PUBLIC;
@@ -349,7 +349,7 @@ BEGIN
     IF NOT public.research_plan_matches_planner_completion_v126(
             NEW.plan_payload,completion_text) OR max_tool_calls IS NULL OR
        jsonb_array_length(completion_text::jsonb->'steps') NOT BETWEEN
-           CASE WHEN max_tool_calls>=2 THEN 2 ELSE 1 END AND max_tool_calls OR
+           (CASE WHEN max_tool_calls>=2 THEN 2 ELSE 1 END) AND max_tool_calls OR
        NOT EXISTS (
         SELECT 1 FROM public.research_planner_tool_search_receipts receipt
          WHERE receipt.tenant_id=NEW.tenant_id AND receipt.user_id=NEW.user_id
@@ -378,7 +378,7 @@ BEGIN
             USING ERRCODE='23514';
     END IF;
     RETURN NEW;
-END
+END;
 $$;
 -- +goose StatementEnd
 REVOKE ALL ON FUNCTION enforce_research_run_plan_llm_receipt_v126() FROM PUBLIC;
@@ -438,6 +438,7 @@ LOCK TABLE task_run_snapshots,research_run_plans,
            research_run_llm_spend_settlements,llm_calls
     IN ACCESS EXCLUSIVE MODE;
 
+-- +goose StatementBegin
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM research_planner_tool_search_receipts) OR EXISTS (
@@ -450,6 +451,7 @@ BEGIN
         RAISE EXCEPTION '126: v3.3 planner history exists';
     END IF;
 END $$;
+-- +goose StatementEnd
 
 -- Restore migration 104's retained trigger binding without rewriting its
 -- function body.
