@@ -1,63 +1,68 @@
-# Store race test sharding experiment
+# Store race test sharding
 
-This experiment keeps `.github/workflows/ci.yml` unchanged until it is measured on
-the `vane-test` runner. Run the opt-in **Store race sharding experiment** workflow
-with `workflow_dispatch`.
+The default `.github/workflows/ci.yml` runs the migration-heavy `store` race
+suite as three concurrent manifests, each backed by a fresh PostgreSQL 18
+service. The separate `rest` job retains the remaining package race tests,
+Temporal recovery gate, vet, inventory check, vulnerability scan, and builds.
+Both jobs target the repository-scoped Linux/ARM64 Mac test runner; production
+build and deployment identities remain outside this source workflow.
 
-The runner:
+`storetestshard run`:
 
 1. builds one race-enabled, atomic-coverage `store.test` binary;
 2. obtains the authoritative top-level test list from that binary;
 3. assigns every test to exactly one of three PostgreSQL 18 instances;
 4. runs the three manifests concurrently and records `go test -json` compatible
    output through `go tool test2json`;
-5. proves the observed top-level tests exactly match the manifests;
+5. proves the observed top-level tests exactly match the manifests; and
 6. requires the three coverage profiles to contain identical block sets before
-   summing their atomic counters;
-7. runs every non-store package with the normal race and coverage flags, then
-   merges its coverage with the store profile.
+   summing their atomic counters.
 
-The manual workflow always uses the stable FNV-1a hash of the test name. A fresh
-checkout has no honest historical timing artifact, so the workflow does not
-offer a timing-path input and does not download unverified state.
+After a successful `main` run, CI projects its verified terminal events to a
+canonical timing seed and saves the small seed under an exact commit key. A PR
+may restore only its exact trusted base SHA; a push may restore only the
+previous main SHA. Historical longest-processing-time balancing is used only
+when every current top-level test has authoritative timing. Missing, corrupt,
+empty, or incomplete timing data falls back to stable FNV-1a assignment and is
+reported in `store-shard-status.json`. Cache restore, seed construction, and
+cache save are best-effort and cannot turn a correct test run red.
 
-Historical longest-processing-time balancing remains available to local or
-other explicit callers that first provide the timing file inside the checkout:
+The same historical balancing remains available to explicit callers that
+provide the timing file inside the checkout:
 
 ```text
 go run ./cmd/storetestshard run ... --timings tmp/prior-store.test.json
 ```
 
 `--timings` accepts only a repository-relative regular file whose resolved path
-remains inside the repository; absolute paths, parent traversal, and symlink
-escapes are rejected. Tests absent from supplied history use the median known
-duration.
+remains inside the repository; absolute paths, parent traversal, symlink
+escapes, permission failures, and other authority failures remain hard errors.
+An omitted, ordinarily missing, corrupt, empty, or incomplete timing data file
+safely falls back to stable FNV-1a and records `timing_input_status` in the run
+status.
 
-Do not replace the default CI test step until repeated measurements on the same
-runner show:
-
-```text
-sharded p95 wall time <= 0.60 * baseline p95 wall time
-```
-
-The uploaded artifact contains the authoritative list, shard manifests and plan,
-per-shard JSON, merged JSON, per-shard coverage, merged store coverage, final
-coverage, and the integrity/timing status. The runner writes
+The runner writes
 `store-shard-status.json` on best effort after setup even when build, listing,
 shard execution, integrity verification, or coverage merge fails; `phase`,
 `error`, `failed_shards`, wall timings, and `exit_code` identify the stopping
 point.
 
-Repository-scoped workflow concurrency serializes manual experiments from this
-repository. Service containers publish PostgreSQL 5432 to three dynamically
-allocated, distinct host ports, so jobs from other repositories cannot collide
-with fixed 5432/5433/5434 bindings. GitHub Actions fails the job before test
-execution if a service cannot become healthy.
+Service containers publish PostgreSQL 5432 to dynamically allocated, distinct
+host ports, so jobs cannot collide with a host database or fixed ports. GitHub
+Actions fails the job before test execution if a service cannot become healthy.
+The workflow has only `contents: read`, receives no secrets, uses no artifact
+upload/download actions, and disables `setup-go` remote caching because the
+persistent test runner already reuses its local Go caches.
 
-The artifact uploader is pinned to official `actions/upload-artifact` v7.0.1
-(Node.js 24). The self-hosted runner must be at least version 2.327.1; confirming
-that runner prerequisite is part of the manual experiment and another reason the
-workflow is not a default gate.
+The earlier six-job hosted experiment workflow was deleted after measurement;
+it is not a retained dispatch or cost surface. Hosted run `31331916553` proved
+880/880 exact tests in every repetition and reduced the median shard wall from
+874.036 seconds to 840.479 seconds (3.84%). That did not meet the original 40%
+experimental improvement target. On 2026-08-09, after GitHub-hosted billing
+blocked further jobs, the owner explicitly chose the isolated Mac test runner
+and retained the bounded LPT optimization with deterministic FNV fallback. This
+is an operating-cost decision, not a claim that historical LPT achieved the
+original experimental speed threshold.
 
 ## Local benchmark decision (2026-07-27)
 
@@ -100,8 +105,7 @@ invalid for performance comparison:
 - the 383.477-second historical-LPT smoke overlapped UI typecheck, test, and
   build work.
 
-Because the threshold failed locally, repeat-run p95 is absent, memory and CPU
-costs increased, and the actual Linux/ARM64 `vane-test` runner has not been
-measured, this workflow remains manual. Do not wire it into the default
-`.github/workflows/ci.yml` test gate without a new same-runner benchmark and an
-explicit decision.
+This historical Windows result did not justify promotion on performance alone.
+The later hosted measurement and the explicit 2026-08-09 operating-cost
+decision above supersede its old "manual only" recommendation; the integrity
+checks and stable fallback remain mandatory in default CI.

@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   store-race:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, ARM64]
 
     services:
       postgres_0:
@@ -71,7 +71,41 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "1.26.5"
-          cache-dependency-path: go.sum
+          # The persistent Mac runner already reuses its local Go caches.
+          # Avoid uploading/restoring the much larger setup-go cache remotely.
+          cache: false
+
+      - name: Select trusted store timing cache
+        id: store-timing-key
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          trusted_sha=""
+          case "${EVENT_NAME}" in
+            pull_request)
+              trusted_sha="${PULL_REQUEST_BASE_SHA}"
+              ;;
+            push)
+              trusted_sha="${PUSH_BEFORE_SHA}"
+              ;;
+          esac
+          if [[ "${trusted_sha}" =~ ^[0-9a-f]{40}$ ]] &&
+             [[ "${trusted_sha}" != "0000000000000000000000000000000000000000" ]]; then
+            echo "key=store-race-timings-v1-${trusted_sha}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Restore trusted store timings
+        if: steps.store-timing-key.outputs.key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: tmp/store-timing-cache
+          key: ${{ steps.store-timing-key.outputs.key }}
+          fail-on-cache-miss: false
 
       - name: Run store race shards
         shell: bash
@@ -80,9 +114,10 @@ jobs:
           status=0
           go run ./cmd/storetestshard run \
             --artifacts tmp/store-sharding \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable' \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports[5432] }}/vane_test?sslmode=disable' \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable' || status=$?
+            --timings tmp/store-timing-cache/store.timings.jsonl \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports['5432'] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports['5432'] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports['5432'] }}/vane_test?sslmode=disable' || status=$?
           if (( status != 0 )); then
             for log in tmp/store-sharding/store-shard-*.test.json; do
               [[ -f "${log}" ]] || continue
@@ -105,8 +140,43 @@ jobs:
           fi
           exit "${status}"
 
+      - name: Build current main store timing seed
+        id: store-timing-seed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tmp/store-timing-cache-next
+          go run ./cmd/storetestshard timing-seed \
+            --tests tmp/store-sharding/store-tests.list.txt \
+            --output tmp/store-timing-cache-next/store.timings.jsonl \
+            --manifest tmp/store-timing-cache-next/store.timings.manifest.json \
+            tmp/store-sharding/store-shard-0.test.json \
+            tmp/store-sharding/store-shard-1.test.json \
+            tmp/store-sharding/store-shard-2.test.json
+          jq -e \
+            --argjson expected "$(jq -r '.expected_tests' tmp/store-sharding/store-shard-status.json)" \
+            '.version == 1 and .test_count == $expected and
+             .terminal_events == $expected and
+             (.zero_duration_tests | type == "number")' \
+            tmp/store-timing-cache-next/store.timings.manifest.json >/dev/null
+          go run ./cmd/storetestshard timing-seed \
+            --tests tmp/store-sharding/store-tests.list.txt \
+            tmp/store-timing-cache-next/store.timings.jsonl >/dev/null
+
+      - name: Save current main store timings
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.store-timing-seed.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: tmp/store-timing-cache-next
+          key: store-race-timings-v1-${{ github.sha }}
+
   rest:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, ARM64]
 
     services:
       postgres:
@@ -131,7 +201,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "1.26.5"
-          cache-dependency-path: go.sum
+          cache: false
 
       - name: Download dependencies
         run: go mod download
@@ -148,7 +218,7 @@ jobs:
       - name: Test remaining packages
         shell: bash
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports[5432] }}/vane_test?sslmode=disable
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports['5432'] }}/vane_test?sslmode=disable
         run: |
           set -euo pipefail
           store_package="$(go list ./store)"
@@ -163,16 +233,9 @@ jobs:
           -run TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges
           -count=1
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports[5432] }}/vane_test?sslmode=disable
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports['5432'] }}/vane_test?sslmode=disable
 
       - name: Build
         run: |
           go build -o bin/vane ./cmd/server
           go build -o bin/vane-research-prepare ./cmd/researchprepare
-
-  test:
-    needs: [store-race, rest]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Confirm required CI jobs
-        run: echo "store race and remaining package gates passed"
