@@ -160,6 +160,10 @@ var purgeOrder = []purgeStep{
 	// and two reservations, so they lead the complete child-first chain.
 	{"research_brief_grounding_corrections", "tenant_id = $1"},
 	{"research_brief_grounding_verifications", "tenant_id = $1"},
+	// Planner search receipts bind both the immutable run snapshot and their
+	// exact paid planner reservation. Count them before either parent; the
+	// tenant-root cascade remains their only delete authority.
+	{"research_planner_tool_search_receipts", "tenant_id = $1"},
 	{"research_run_llm_spend_settlements", "tenant_id = $1"},
 	{"llm_calls", "tenant_id = $1"},
 	{"research_run_llm_spend_reservations", "tenant_id = $1"},
@@ -220,15 +224,16 @@ var purgeOrder = []purgeStep{
 // in purgeOrder so schema coverage and reporting remain complete, but the
 // tenant root FK cascade is their sole delete authority.
 var tenantCascadePurgeTables = map[string]struct{}{
-	"llm_calls":                            {},
-	"research_run_llm_spend_settlements":   {},
-	"research_run_llm_spend_reservations":  {},
-	"tool_calls":                           {},
-	"research_run_step_spend_reservations": {},
-	"research_run_steps":                   {},
-	"research_run_plans":                   {},
-	"research_run_capabilities":            {},
-	"task_run_snapshots":                   {},
+	"llm_calls":                             {},
+	"research_run_llm_spend_settlements":    {},
+	"research_run_llm_spend_reservations":   {},
+	"research_planner_tool_search_receipts": {},
+	"tool_calls":                            {},
+	"research_run_step_spend_reservations":  {},
+	"research_run_steps":                    {},
+	"research_run_plans":                    {},
+	"research_run_capabilities":             {},
+	"task_run_snapshots":                    {},
 	// A cutover event is referenced by immutable snapshots that are themselves
 	// deleted only by the tenant root cascade. Count both parents for the purge
 	// report, then let the same root delete remove them atomically; deleting the

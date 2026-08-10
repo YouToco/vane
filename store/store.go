@@ -394,13 +394,13 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 		admissionV6Available != spendReservationTriggerV3Available {
 		return errors.New("grounding correction runtime schema is incomplete")
 	}
-	if !plannerSearchRuntimeAvailable || !plannerSearchTriggerAvailable ||
-		!plannerSearchImmutabilityTriggerAvailable ||
-		!plannerSearchPlanHelperAvailable ||
-		!plannerSearchPlanTriggerAvailable {
+	if plannerSearchRuntimeAvailable != plannerSearchTriggerAvailable ||
+		plannerSearchRuntimeAvailable != plannerSearchImmutabilityTriggerAvailable ||
+		plannerSearchRuntimeAvailable != plannerSearchPlanHelperAvailable ||
+		plannerSearchRuntimeAvailable != plannerSearchPlanTriggerAvailable {
 		return errors.New("planner tool search runtime schema is incomplete")
 	}
-	filterGroundingRelation := func(relations []string) []string {
+	filterOptionalResearchRelation := func(relations []string) []string {
 		filtered := make([]string, 0, len(relations))
 		for _, relation := range relations {
 			if relation == "research_brief_grounding_verifications" &&
@@ -411,12 +411,16 @@ func validateResearchRuntimeConnection(ctx context.Context, conn *pgx.Conn) erro
 				!correctionRuntimeAvailable {
 				continue
 			}
+			if relation == "research_planner_tool_search_receipts" &&
+				!plannerSearchRuntimeAvailable {
+				continue
+			}
 			filtered = append(filtered, relation)
 		}
 		return filtered
 	}
-	runtimeRelations := filterGroundingRelation(researchRuntimeRelations)
-	runtimeScopedRelations := filterGroundingRelation(researchRuntimeScopedRelations)
+	runtimeRelations := filterOptionalResearchRelation(researchRuntimeRelations)
+	runtimeScopedRelations := filterOptionalResearchRelation(researchRuntimeScopedRelations)
 	admissionCapSignature := "admit_research_run_llm_spend_cap_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
 	admissionRawSignature := "admit_research_run_llm_spend_v3(bigint,bigint,text,bigint,text,integer,bigint,text,text,text,text)"
 	if admissionV6Available {

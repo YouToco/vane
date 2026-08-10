@@ -202,7 +202,8 @@ BEGIN
            AND jsonb_typeof(call.completion::jsonb->'tool_search')='object'
            AND (SELECT count(*) FROM jsonb_object_keys(
                     call.completion::jsonb->'tool_search'))=2
-           AND (call.completion::jsonb->'tool_search'-ARRAY['query','limit'])='{}'::jsonb
+           AND (((call.completion::jsonb)->'tool_search')-
+                ARRAY['query','limit'])='{}'::jsonb
            AND call.completion::jsonb #>> '{tool_search,query}'=receipt_json->>'query'
            AND jsonb_typeof(call.completion::jsonb #> '{tool_search,limit}')='number'
            AND call.completion::jsonb #>> '{tool_search,limit}'=receipt_json->>'limit'
@@ -226,6 +227,15 @@ LANGUAGE plpgsql
 SET search_path=pg_catalog,public,pg_temp
 AS $$
 BEGIN
+    IF TG_OP='DELETE' THEN
+        IF pg_trigger_depth()<=1 OR EXISTS (
+            SELECT 1 FROM public.tenants tenant WHERE tenant.id=OLD.tenant_id
+        ) THEN
+            RAISE EXCEPTION '126: planner tool search receipt is immutable'
+                USING ERRCODE='23514';
+        END IF;
+        RETURN OLD;
+    END IF;
     RAISE EXCEPTION '126: planner tool search receipt is immutable'
         USING ERRCODE='23514';
 END;
