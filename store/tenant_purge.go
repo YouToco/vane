@@ -160,6 +160,10 @@ var purgeOrder = []purgeStep{
 	// and two reservations, so they lead the complete child-first chain.
 	{"research_brief_grounding_corrections", "tenant_id = $1"},
 	{"research_brief_grounding_verifications", "tenant_id = $1"},
+	// Planner search receipts bind both the immutable run snapshot and their
+	// exact paid planner reservation. Count them before either parent; the
+	// tenant-root cascade remains their only delete authority.
+	{"research_planner_tool_search_receipts", "tenant_id = $1"},
 	{"research_run_llm_spend_settlements", "tenant_id = $1"},
 	{"llm_calls", "tenant_id = $1"},
 	{"research_run_llm_spend_reservations", "tenant_id = $1"},
@@ -220,15 +224,16 @@ var purgeOrder = []purgeStep{
 // in purgeOrder so schema coverage and reporting remain complete, but the
 // tenant root FK cascade is their sole delete authority.
 var tenantCascadePurgeTables = map[string]struct{}{
-	"llm_calls":                            {},
-	"research_run_llm_spend_settlements":   {},
-	"research_run_llm_spend_reservations":  {},
-	"tool_calls":                           {},
-	"research_run_step_spend_reservations": {},
-	"research_run_steps":                   {},
-	"research_run_plans":                   {},
-	"research_run_capabilities":            {},
-	"task_run_snapshots":                   {},
+	"llm_calls":                             {},
+	"research_run_llm_spend_settlements":    {},
+	"research_run_llm_spend_reservations":   {},
+	"research_planner_tool_search_receipts": {},
+	"tool_calls":                            {},
+	"research_run_step_spend_reservations":  {},
+	"research_run_steps":                    {},
+	"research_run_plans":                    {},
+	"research_run_capabilities":             {},
+	"task_run_snapshots":                    {},
 	// A cutover event is referenced by immutable snapshots that are themselves
 	// deleted only by the tenant root cascade. Count both parents for the purge
 	// report, then let the same root delete remove them atomically; deleting the
@@ -307,6 +312,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		researchBriefsAvailable              bool
 		researchGroundingAvailable           bool
 		researchGroundingCorrectionAvailable bool
+		researchPlannerSearchAvailable       bool
 		researchEvidenceAvailable            bool
 		researchLLMSettlementsAvailable      bool
 		researchLLMReservationsAvailable     bool
@@ -337,6 +343,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.research_brief_syntheses') IS NOT NULL,
 		        to_regclass('public.research_brief_grounding_verifications') IS NOT NULL,
 		        to_regclass('public.research_brief_grounding_corrections') IS NOT NULL,
+		        to_regclass('public.research_planner_tool_search_receipts') IS NOT NULL,
 		        to_regclass('public.research_run_evidence') IS NOT NULL,
 		        to_regclass('public.research_run_llm_spend_settlements') IS NOT NULL,
 		        to_regclass('public.research_run_llm_spend_reservations') IS NOT NULL,
@@ -366,6 +373,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&researchBriefsAvailable,
 		&researchGroundingAvailable,
 		&researchGroundingCorrectionAvailable,
+		&researchPlannerSearchAvailable,
 		&researchEvidenceAvailable,
 		&researchLLMSettlementsAvailable,
 		&researchLLMReservationsAvailable,
@@ -399,6 +407,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"research_brief_syntheses":                  researchBriefsAvailable,
 		"research_brief_grounding_verifications":    researchGroundingAvailable,
 		"research_brief_grounding_corrections":      researchGroundingCorrectionAvailable,
+		"research_planner_tool_search_receipts":     researchPlannerSearchAvailable,
 		"research_run_evidence":                     researchEvidenceAvailable,
 		"research_run_llm_spend_settlements":        researchLLMSettlementsAvailable,
 		"research_run_llm_spend_reservations":       researchLLMReservationsAvailable,
