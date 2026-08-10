@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   store-race:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, ARM64]
 
     services:
       postgres_0:
@@ -71,7 +71,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "1.26.5"
-          cache-dependency-path: go.sum
+          # The persistent Mac runner already reuses its local Go caches.
+          # Avoid uploading/restoring the much larger setup-go cache remotely.
+          cache: false
 
       - name: Select trusted store timing cache
         id: store-timing-key
@@ -113,9 +115,9 @@ jobs:
           go run ./cmd/storetestshard run \
             --artifacts tmp/store-sharding \
             --timings tmp/store-timing-cache/store.timings.jsonl \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable' \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports[5432] }}/vane_test?sslmode=disable' \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable' || status=$?
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports['5432'] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports['5432'] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports['5432'] }}/vane_test?sslmode=disable' || status=$?
           if (( status != 0 )); then
             for log in tmp/store-sharding/store-shard-*.test.json; do
               [[ -f "${log}" ]] || continue
@@ -174,7 +176,7 @@ jobs:
           key: store-race-timings-v1-${{ github.sha }}
 
   rest:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, ARM64]
 
     services:
       postgres:
@@ -199,7 +201,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "1.26.5"
-          cache-dependency-path: go.sum
+          cache: false
 
       - name: Download dependencies
         run: go mod download
@@ -216,7 +218,7 @@ jobs:
       - name: Test remaining packages
         shell: bash
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports[5432] }}/vane_test?sslmode=disable
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports['5432'] }}/vane_test?sslmode=disable
         run: |
           set -euo pipefail
           store_package="$(go list ./store)"
@@ -231,7 +233,7 @@ jobs:
           -run TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges
           -count=1
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports[5432] }}/vane_test?sslmode=disable
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres.ports['5432'] }}/vane_test?sslmode=disable
 
       - name: Build
         run: |
