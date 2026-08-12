@@ -111,9 +111,10 @@ func buildResearchPlannerCatalogV33(
 }
 
 func decodeResearchPlannerDecisionV33(
-	raw []byte, maxToolCalls int,
+	raw []byte, maxToolCalls, maxSearchQueryBytes int,
 ) (researchPlannerDecisionV33, error) {
-	if len(raw) < 2 || len(raw) > 256<<10 || maxToolCalls <= 0 || maxToolCalls > 16 {
+	if len(raw) < 2 || len(raw) > 256<<10 || maxToolCalls <= 0 || maxToolCalls > 16 ||
+		maxSearchQueryBytes <= 0 || maxSearchQueryBytes > 512 {
 		return researchPlannerDecisionV33{}, researchCoordinatorValidationV3("research planner decision is invalid")
 	}
 	var fields map[string]json.RawMessage
@@ -127,7 +128,8 @@ func decodeResearchPlannerDecisionV33(
 	case researchPlannerActionSearchV33:
 		expected = []string{"action", "schema_version", "tool_search"}
 		if decision.ToolSearch == nil || decision.Steps != nil ||
-			decision.ToolSearch.Query == "" || len(decision.ToolSearch.Query) > 512 ||
+			decision.ToolSearch.Query == "" ||
+			len(decision.ToolSearch.Query) > maxSearchQueryBytes ||
 			!utf8.ValidString(decision.ToolSearch.Query) ||
 			strings.IndexByte(decision.ToolSearch.Query, 0) >= 0 ||
 			strings.TrimSpace(decision.ToolSearch.Query) != decision.ToolSearch.Query ||
@@ -179,7 +181,9 @@ func buildResearchPlannerPromptV33(
 	receipts []runcontext.ResearchPlannerToolSearchReceiptV1,
 ) (string, error) {
 	compactLoadedTools := seal.ResearchModel.Planner.SystemPrompt ==
-		runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools
+		runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools ||
+		seal.ResearchModel.Planner.SystemPrompt ==
+			runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2
 	loaded := make(map[string]researchPlannerPromptToolV3)
 	history := make([]researchPlannerSearchHistoryV33, 0, len(receipts))
 	for index, receipt := range receipts {
@@ -229,7 +233,9 @@ func buildResearchPlannerPromptV33(
 		MaxToolCalls:      seal.Payload.PlannerBudget.MaxToolCalls,
 		ToolSearch: researchPlannerToolSearchContractV33{
 			Name: "tool_search", CatalogDigest: seal.ResearchToolPolicyDigest,
-			QueryMaxBytes: 512, LimitDefault: 8, LimitMaximum: 8,
+			QueryMaxBytes: researchPlannerSearchQueryMaxBytesV33(
+				seal.ResearchModel.Planner.SystemPrompt),
+			LimitDefault: 8, LimitMaximum: 8,
 			NetworkEffect:   false,
 			ResultAuthority: "only tools returned in search_history may appear in final steps",
 		},
@@ -281,7 +287,8 @@ func executeResearchPlannerToolSearchRoundsV33(
 			return runcontext.ResearchExecutionPlanV3{}, storepkg.ResearchRunLLMSpendReservationV3{}, callErr
 		}
 		decision, decisionErr := decodeResearchPlannerDecisionV33(
-			[]byte(modelReceipt.Call.Completion), snapshot.PlannerBudget.MaxToolCalls)
+			[]byte(modelReceipt.Call.Completion), snapshot.PlannerBudget.MaxToolCalls,
+			researchPlannerSearchQueryMaxBytesV33(seal.ResearchModel.Planner.SystemPrompt))
 		if decisionErr != nil {
 			prompt, err = buildResearchPlannerCorrectionPromptV3(
 				prompt, runtimepolicy.ResearchPlannerRendererVersionV33)
@@ -375,7 +382,15 @@ func executeResearchPlannerToolSearchRoundsV33(
 
 func researchPlannerFinalOnlyV33(systemPrompt string) bool {
 	return systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly ||
-		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools
+		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools ||
+		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2
+}
+
+func researchPlannerSearchQueryMaxBytesV33(systemPrompt string) int {
+	if systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2 {
+		return 144
+	}
+	return 512
 }
 
 func plannerHasLoadedToolsV33(

@@ -106,6 +106,7 @@ func TestResearchPlannerToolSearchV33ForcesFinalAfterLoadedTools(t *testing.T) {
 	for name, systemPrompt := range map[string]string{
 		"retained-final-only": runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly,
 		"compact-loaded":      runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools,
+		"compact-loaded-v2":   runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2,
 	} {
 		t.Run(name, func(t *testing.T) {
 			snapshot, seal := plannerToolSearchSealV33(t)
@@ -196,7 +197,7 @@ func TestResearchPlannerToolSearchV33ProductionRecoveryFitsRetainedTokenBudget(t
 	seal.Payload.PlannerBudget.MaxToolCalls = 8
 	seal.Payload.PlannerBudget.MaxTokens = 16000
 	seal.Payload.Definition.TaskName = "每小时检查 Kimi 会员定价页面的购买状态，状态变化时推送"
-	seal.Payload.Definition.TaskManual = "持续监测 Kimi 会员定价页面的套餐购买状态。使用官方套餐状态工具读取 https://www.kimi.com/membership/pricing 的第一方结构化购买状态。目标：判断页面是否出现可购买、立即订阅、购买或支付入口，并区分可购买、售罄、暂不可购买。推送规则：仅当状态变为可购买，或者购买条件发生实质变化时推送。"
+	seal.Payload.Definition.TaskManual = "持续监测 Kimi 会员定价页面的套餐购买状态。使用官方套餐状态工具读取 https://www.kimi.com/membership/pricing 的第一方结构化购买状态。目标：判断页面是否出现可购买、立即订阅、购买或支付入口，并区分以下状态：1. 可购买/开放购买（页面存在购买、订阅、支付等入口）；2. 售罄（页面显示售罄、无库存等）；3. 暂不可购买（页面显示暂不可购买、未开放、敬请期待等）。推送规则：仅当状态从\"不可购买或售罄\"变为\"可购买\"，或者购买条件（价格、购买门槛等）发生实质变化时立即推送。无变化不推送。第一次运行建立基线；若当前已可购买则直接推送。"
 	initial, err := buildResearchPlannerPromptV33(seal, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -206,6 +207,10 @@ func TestResearchPlannerToolSearchV33ProductionRecoveryFitsRetainedTokenBudget(t
 		t.Fatal(err)
 	}
 	productionQuery := "official structured tool to read first-party purchase status of Kimi membership pricing page https://www.kimi.com/membership/pricing"
+	productionQuery += strings.Repeat(" x", 6)
+	if len(productionQuery) != 144 {
+		t.Fatalf("production max query bytes=%d", len(productionQuery))
+	}
 	matches, err := catalog.Search(productionQuery, 8)
 	if err != nil || len(matches) != 3 {
 		t.Fatalf("production query matches=%d err=%v", len(matches), err)
@@ -246,6 +251,9 @@ func TestResearchPlannerToolSearchV33ProductionRecoveryFitsRetainedTokenBudget(t
 		t.Fatalf("search/final reserves %d bytes over budget %d", total,
 			seal.Payload.PlannerBudget.MaxTokens)
 	}
+	if remaining := seal.Payload.PlannerBudget.MaxTokens - total; remaining < 256 {
+		t.Fatalf("search/final reserves leave only %d bytes of production margin", remaining)
+	}
 	legacySeal := seal
 	legacySeal.ResearchModel.Planner.SystemPrompt =
 		runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly
@@ -274,10 +282,8 @@ func TestResearchPlannerToolSearchV33ProductionRecoveryFitsRetainedTokenBudget(t
 	}
 }
 
-func TestBuildResearchPlannerPromptV33RetainsLegacySchemaProjectionBytes(t *testing.T) {
+func TestBuildResearchPlannerPromptV33RetainsVersionedSchemaProjection(t *testing.T) {
 	_, seal := plannerToolSearchSealV33(t)
-	seal.ResearchModel.Planner.SystemPrompt =
-		runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly
 	tool := seal.ResearchTools.AllowedTools[0]
 	receipt, err := runcontext.BuildResearchPlannerToolSearchReceiptV1(
 		0, seal.ResearchToolPolicyDigest, "official web", 1,
@@ -287,16 +293,41 @@ func TestBuildResearchPlannerPromptV33RetainsLegacySchemaProjectionBytes(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	prompt, err := buildResearchPlannerPromptV33(
-		seal, []runcontext.ResearchPlannerToolSearchReceiptV1{receipt})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded researchPlannerPromptV33
-	if err := json.Unmarshal([]byte(prompt), &decoded); err != nil ||
-		len(decoded.SearchHistory) != 1 || len(decoded.SearchHistory[0].Tools) != 1 ||
-		len(decoded.LoadedTools) != 1 {
-		t.Fatalf("legacy schema projection changed: err=%v prompt=%s", err, prompt)
+	for name, fixture := range map[string]struct {
+		prompt       string
+		historyTools int
+		queryBytes   int
+	}{
+		"retained-final-only": {runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly, 1, 512},
+		"compact-loaded":      {runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools, 0, 512},
+		"compact-loaded-v2":   {runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2, 0, 144},
+	} {
+		t.Run(name, func(t *testing.T) {
+			versionedSeal := seal
+			versionedSeal.ResearchModel.Planner.SystemPrompt = fixture.prompt
+			prompt, err := buildResearchPlannerPromptV33(
+				versionedSeal, []runcontext.ResearchPlannerToolSearchReceiptV1{receipt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded researchPlannerPromptV33
+			if err := json.Unmarshal([]byte(prompt), &decoded); err != nil ||
+				len(decoded.SearchHistory) != 1 ||
+				len(decoded.SearchHistory[0].Tools) != fixture.historyTools ||
+				len(decoded.LoadedTools) != 1 ||
+				decoded.ToolSearch.QueryMaxBytes != fixture.queryBytes {
+				t.Fatalf("versioned schema projection changed: err=%v prompt=%s", err, prompt)
+			}
+			query145 := strings.Repeat("x", 145)
+			decision145 := `{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"` + query145 + `","limit":1}}`
+			_, decodeErr := decodeResearchPlannerDecisionV33(
+				[]byte(decision145), 2,
+				researchPlannerSearchQueryMaxBytesV33(fixture.prompt))
+			if (decodeErr == nil) != (fixture.queryBytes == 512) {
+				t.Fatalf("versioned query admission mismatch: max=%d err=%v",
+					fixture.queryBytes, decodeErr)
+			}
+		})
 	}
 }
 
@@ -333,7 +364,7 @@ func TestDecodeResearchPlannerDecisionV33ExactActionShapes(t *testing.T) {
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"one","tool_name":"web_search","arguments":{"query":"x"}},{"invocation_id":"two","tool_name":"web_search","arguments":{"query":"y"}}]}`,
 	}
 	for _, raw := range valid {
-		if _, err := decodeResearchPlannerDecisionV33([]byte(raw), 2); err != nil {
+		if _, err := decodeResearchPlannerDecisionV33([]byte(raw), 2, 512); err != nil {
 			t.Fatalf("valid decision rejected: %s: %v", raw, err)
 		}
 	}
@@ -345,9 +376,19 @@ func TestDecodeResearchPlannerDecisionV33ExactActionShapes(t *testing.T) {
 		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"one","tool_name":"web_search","arguments":{"query":"x"}}]}`,
 		`{"schema_version":"bad","schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[]}`,
 	} {
-		if _, err := decodeResearchPlannerDecisionV33([]byte(raw), 2); err == nil {
+		if _, err := decodeResearchPlannerDecisionV33([]byte(raw), 2, 512); err == nil {
 			t.Fatalf("invalid decision accepted: %s", raw)
 		}
+	}
+	query144 := strings.Repeat("x", 144)
+	valid144 := `{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"` + query144 + `","limit":1}}`
+	if _, err := decodeResearchPlannerDecisionV33([]byte(valid144), 2, 144); err != nil {
+		t.Fatalf("exact V2 query limit rejected: %v", err)
+	}
+	query145 := strings.Repeat("x", 145)
+	invalid145 := `{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"` + query145 + `","limit":1}}`
+	if _, err := decodeResearchPlannerDecisionV33([]byte(invalid145), 2, 144); err == nil {
+		t.Fatal("over-limit V2 query accepted")
 	}
 }
 

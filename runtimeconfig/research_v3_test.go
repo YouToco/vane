@@ -53,14 +53,15 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		got.Model.Synthesis.RendererVersion != runtimepolicy.ResearchSynthesisRendererVersionV34 ||
 		got.Model.GroundingVerifier.RendererVersion !=
 			runtimepolicy.ResearchGroundingVerifierRendererVersionV12 ||
+		got.Model.Planner.SystemPrompt !=
+			runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2 ||
 		!got.Model.Planner.DisableThinking || !got.Model.Synthesis.DisableThinking ||
 		!got.Model.GroundingVerifier.DisableThinking ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "query and limit only") ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "both are required") ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "next reply MUST be action=final") ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "MUST NOT search again") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "query (1..144 UTF-8 bytes)") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "next output must be action=final") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "never search again") ||
 		!strings.Contains(got.Model.Planner.SystemPrompt, "official structured tool") ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "two independent evidence paths") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "two evidence paths") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "tool_failures") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "vane.research-brief/v3.1") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "vane.research-brief/v3.2") ||
