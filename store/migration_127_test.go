@@ -1,8 +1,13 @@
 package store
 
 import (
+	"database/sql"
+	"io/fs"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/pressly/goose/v3"
 )
 
 func TestMigration127DurableRecoveryCursorBoundary(t *testing.T) {
@@ -37,5 +42,59 @@ func TestMigration127DurableRecoveryCursorBoundary(t *testing.T) {
 	}
 	if got := strings.Count(sql, "-- +goose StatementEnd"); got != 1 {
 		t.Fatalf("migration 127 must keep its PL/pgSQL body in one goose statement, end markers=%d", got)
+	}
+}
+
+func TestMigration127EmptyDownKeepsCurrentPurgeCompatible(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required for migration 127 integration tests")
+	}
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	database, err := sql.Open("pgx", scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, dir,
+		goose.WithAllowOutofOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 127); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(t.Context(), 126); err != nil {
+		t.Fatal(err)
+	}
+	var clean bool
+	if err := database.QueryRowContext(t.Context(), `
+		SELECT to_regclass('public.schedule_command_recovery_cursors') IS NULL
+		   AND to_regprocedure(
+		       'public.count_task_creation_capacity_v1(bigint,bigint)') IS NULL`,
+	).Scan(&clean); err != nil {
+		t.Fatal(err)
+	}
+	if !clean {
+		t.Fatal("migration 127 Down retained recovery cursor authority")
+	}
+	rolledBackStore, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rolledBackStore.Close)
+	var tenantID int64
+	if err := rolledBackStore.pool.QueryRow(t.Context(), `
+		INSERT INTO tenants (status,plan) VALUES ('active','free') RETURNING id`,
+	).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rolledBackStore.PurgeTenant(t.Context(), tenantID, false); err != nil {
+		t.Fatalf("current binary cannot purge after 127 rollback: %v", err)
 	}
 }

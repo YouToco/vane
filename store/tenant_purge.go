@@ -327,6 +327,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		researchV3CutoversAvailable          bool
 		researchV3PrepareHeadsAvailable      bool
 		researchV3PrepareOpsAvailable        bool
+		scheduleCommandCursorAvailable       bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -357,7 +358,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.research_v3_delivery_authorities') IS NOT NULL,
 		        to_regclass('public.research_v3_cutover_operations') IS NOT NULL,
 		        to_regclass('public.research_v3_prepared_definition_heads') IS NOT NULL,
-		        to_regclass('public.research_v3_definition_prepare_operations') IS NOT NULL`,
+		        to_regclass('public.research_v3_definition_prepare_operations') IS NOT NULL,
+		        to_regclass('public.schedule_command_recovery_cursors') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -388,6 +390,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&researchV3CutoversAvailable,
 		&researchV3PrepareHeadsAvailable,
 		&researchV3PrepareOpsAvailable,
+		&scheduleCommandCursorAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -422,6 +425,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"research_v3_cutover_operations":            researchV3CutoversAvailable,
 		"research_v3_prepared_definition_heads":     researchV3PrepareHeadsAvailable,
 		"research_v3_definition_prepare_operations": researchV3PrepareOpsAvailable,
+		"schedule_command_recovery_cursors":         scheduleCommandCursorAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
