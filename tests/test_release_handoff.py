@@ -52,14 +52,22 @@ class ReleaseHandoffTests(unittest.TestCase):
             )
             self.assertRegex(self.workflow, pattern)
 
-    def test_deploy_fails_fast_when_cache_codec_is_missing(self) -> None:
-        prereq = "- name: Verify release handoff cache prerequisites"
+    def test_both_handoff_peers_fail_fast_when_cache_codec_is_missing(self) -> None:
+        build_prereq = (
+            "- name: Verify build release handoff cache prerequisites"
+        )
+        deploy_prereq = (
+            "- name: Verify deploy release handoff cache prerequisites"
+        )
+        save = "- name: Save backend release handoff"
         restore = "- name: Restore backend release handoff from this run"
-        self.assertIn(prereq, self.workflow)
-        self.assertLess(self.workflow.index(prereq), self.workflow.index(restore))
-        self.assertIn("command -v tar >/dev/null", self.workflow)
-        self.assertIn("command -v zstd >/dev/null", self.workflow)
-        self.assertIn("zstd --version", self.workflow)
+        self.assertIn(build_prereq, self.workflow)
+        self.assertIn(deploy_prereq, self.workflow)
+        self.assertLess(self.workflow.index(build_prereq), self.workflow.index(save))
+        self.assertLess(self.workflow.index(deploy_prereq), self.workflow.index(restore))
+        self.assertEqual(self.workflow.count("command -v tar >/dev/null"), 2)
+        self.assertEqual(self.workflow.count("command -v zstd >/dev/null"), 2)
+        self.assertEqual(self.workflow.count("zstd --version"), 2)
 
     def test_self_hosted_handoff_roots_are_recreated_private(self) -> None:
         self.assertEqual(

@@ -181,7 +181,10 @@ All runner registrations are repository-scoped and implement three roles:
   reaches this runner.
 - build VM: `[self-hosted, Linux, vane-build]`; Docker is available for the
   PostgreSQL service, and the pinned setup actions provide Go 1.26 and Node 22.
-  The VM receives only read-only source keys and has no production credentials.
+  Install GNU `tar` and `zstd`: the cache version includes the available
+  compression tool, so build and deploy must use the same codec. The job checks
+  both tools before building or saving a handoff. The VM receives only read-only
+  source keys and has no production credentials.
 - primary deploy VM: `[self-hosted, Linux, vps-primary, vane-deploy]`. `plan`,
   `deploy`, and certificate renewal are deliberately pinned to this one
   durable-state owner; a broad-label fallback must not split a single DAG or
