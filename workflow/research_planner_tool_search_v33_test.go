@@ -103,33 +103,43 @@ func TestResearchPlannerToolSearchV33SearchThenFinalIsRecoverySafe(t *testing.T)
 }
 
 func TestResearchPlannerToolSearchV33ForcesFinalAfterLoadedTools(t *testing.T) {
-	snapshot, seal := plannerToolSearchSealV33(t)
-	completions := []string{
-		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"official web release","limit":8}}`,
-		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"redundant search","limit":8}}`,
-		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"official","tool_name":"web_search","arguments":{"query":"official status"}},{"invocation_id":"confirmation","tool_name":"web_search","arguments":{"query":"official status confirmation"}}]}`,
-	}
-	persistCalls := 0
-	execute := func(_ context.Context, round int, _ string) (
-		storepkg.ResearchRunLLMReceiptV3,
-		storepkg.ResearchRunLLMSpendReservationV3, error,
-	) {
-		return storepkg.ResearchRunLLMReceiptV3{
-			Call: types.LLMCall{Completion: completions[round]},
-		}, storepkg.ResearchRunLLMSpendReservationV3{ReservationID: int64(round + 1)}, nil
-	}
-	persist := func(_ context.Context, _ storepkg.ResearchRunLLMSpendReservationV3,
-		receipt runcontext.ResearchPlannerToolSearchReceiptV1,
-	) (runcontext.ResearchPlannerToolSearchReceiptV1, error) {
-		persistCalls++
-		return receipt, nil
-	}
-	plan, reservation, err := executeResearchPlannerToolSearchRoundsV33(
-		t.Context(), snapshot, seal, execute, persist)
-	if err != nil || len(plan.Steps) != 2 || reservation.ReservationID != 3 ||
-		persistCalls != 1 {
-		t.Fatalf("plan=%+v reservation=%+v persist=%d err=%v",
-			plan, reservation, persistCalls, err)
+	for name, systemPrompt := range map[string]string{
+		"retained-final-only": runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly,
+		"compact-loaded":      runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools,
+	} {
+		t.Run(name, func(t *testing.T) {
+			snapshot, seal := plannerToolSearchSealV33(t)
+			seal.ResearchModel.Planner.SystemPrompt = systemPrompt
+			completions := []string{
+				`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"official web release","limit":8}}`,
+				`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"redundant search","limit":8}}`,
+				`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"official","tool_name":"web_search","arguments":{"query":"official status"}},{"invocation_id":"confirmation","tool_name":"web_search","arguments":{"query":"official status confirmation"}}]}`,
+			}
+			persistCalls := 0
+			execute := func(_ context.Context, round int, _ string) (
+				storepkg.ResearchRunLLMReceiptV3,
+				storepkg.ResearchRunLLMSpendReservationV3, error,
+			) {
+				return storepkg.ResearchRunLLMReceiptV3{
+						Call: types.LLMCall{Completion: completions[round]},
+					}, storepkg.ResearchRunLLMSpendReservationV3{
+						ReservationID: int64(round + 1),
+					}, nil
+			}
+			persist := func(_ context.Context, _ storepkg.ResearchRunLLMSpendReservationV3,
+				receipt runcontext.ResearchPlannerToolSearchReceiptV1,
+			) (runcontext.ResearchPlannerToolSearchReceiptV1, error) {
+				persistCalls++
+				return receipt, nil
+			}
+			plan, reservation, err := executeResearchPlannerToolSearchRoundsV33(
+				t.Context(), snapshot, seal, execute, persist)
+			if err != nil || len(plan.Steps) != 2 || reservation.ReservationID != 3 ||
+				persistCalls != 1 {
+				t.Fatalf("plan=%+v reservation=%+v persist=%d err=%v",
+					plan, reservation, persistCalls, err)
+			}
+		})
 	}
 }
 
