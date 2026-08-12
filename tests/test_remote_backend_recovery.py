@@ -81,6 +81,10 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                 "/etc/systemd/system", systemd
             )
             shared = (
+                "VANE_LLM_AGENT_PROVIDER=kimi\n"
+                "VANE_LLM_AGENT_BASE_URL=https://api.moonshot.cn/v1\n"
+                "VANE_LLM_AGENT_API_KEY=retired-kimi-key\n"
+                "VANE_LLM_AGENT_MODEL=kimi-k2.6\n"
                 "VANE_DB_RESEARCH_RUNTIME_URL="
                 "postgres://vane_research_runtime:research@db/vane\n"
                 "VANE_DB_RESEARCH_CAPABILITY_KEY_ID=fixture\n"
@@ -160,6 +164,15 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
             "postgres://vane_server_runtime:server@db/vane\n",
             output,
         )
+        self.assertEqual(output.count("VANE_LLM_AGENT_MODEL=deepseek-v4-flash"), 1)
+        for retired in (
+            "VANE_LLM_AGENT_PROVIDER=",
+            "VANE_LLM_AGENT_BASE_URL=",
+            "VANE_LLM_AGENT_API_KEY=",
+            "kimi-k2.6",
+            "retired-kimi-key",
+        ):
+            self.assertNotIn(retired, output)
 
     def run_research_control_convergence(
         self, initial: str
