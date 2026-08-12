@@ -963,11 +963,22 @@ func loadPushEffectWithClock(
 	if err != nil {
 		return nil, time.Time{}, err
 	}
-	var databaseNow time.Time
-	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
-		return nil, time.Time{}, pushEffectDatabaseError("read database clock", err)
+	databaseNow, err := readPushEffectDatabaseClock(ctx, tx)
+	if err != nil {
+		return nil, time.Time{}, err
 	}
 	return effect, databaseNow, nil
+}
+
+func readPushEffectDatabaseClock(
+	ctx context.Context,
+	tx pgx.Tx,
+) (time.Time, error) {
+	var databaseNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return time.Time{}, pushEffectDatabaseError("read database clock", err)
+	}
+	return databaseNow, nil
 }
 
 func validatePushEffectReplay(
