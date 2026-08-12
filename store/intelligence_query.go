@@ -128,7 +128,11 @@ var intelligenceCatalog = map[IntelligenceDataset]intelligenceDatasetSpec{
 		defaults:     []string{"task_ref", "task_name", "playbook", "status", "schedule", "updated_at"},
 		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
 		stableOrder:  intelligenceStableOrder("created_at", "record_id"),
-		coverage:     IntelligenceCoverage{Status: "complete"}, relativeTimeZone: true,
+		coverage: IntelligenceCoverage{
+			Status: "complete",
+			Note:   "仅完整覆盖当前任务定义；不覆盖任务运行、Brief 或 Observation，不能据此判断时间窗内有无新情报。",
+		},
+		relativeTimeZone: true,
 	},
 	IntelligenceRuns: {
 		base: `SELECT rs.tenant_id,rs.user_id,rs.id::text AS record_id,
