@@ -178,6 +178,8 @@ func buildResearchPlannerPromptV33(
 	seal runcontext.ResearchSnapshotSealV3,
 	receipts []runcontext.ResearchPlannerToolSearchReceiptV1,
 ) (string, error) {
+	compactLoadedTools := seal.ResearchModel.Planner.SystemPrompt ==
+		runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools
 	loaded := make(map[string]researchPlannerPromptToolV3)
 	history := make([]researchPlannerSearchHistoryV33, 0, len(receipts))
 	for index, receipt := range receipts {
@@ -199,7 +201,16 @@ func buildResearchPlannerPromptV33(
 			tools = append(tools, promptTool)
 			loaded[tool.Name] = promptTool
 		}
-		history = append(history, researchPlannerSearchHistoryV33{Receipt: receipt, Tools: tools})
+		historyTools := tools
+		if compactLoadedTools {
+			// The immutable receipt already binds the ordered names, schema
+			// digests, and scores. New frozen policies project each full schema
+			// once through loaded_tools instead of duplicating it here.
+			historyTools = []researchPlannerPromptToolV3{}
+		}
+		history = append(history, researchPlannerSearchHistoryV33{
+			Receipt: receipt, Tools: historyTools,
+		})
 	}
 	loadedNames := make([]string, 0, len(loaded))
 	for name := range loaded {
@@ -306,8 +317,7 @@ func executeResearchPlannerToolSearchRoundsV33(
 		// cannot create another catalog authority receipt after schemas are loaded.
 		// Older v3.3 snapshots lack this exact frozen policy marker and retain
 		// their historical multi-search replay semantics unchanged.
-		if seal.ResearchModel.Planner.SystemPrompt ==
-			runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly &&
+		if researchPlannerFinalOnlyV33(seal.ResearchModel.Planner.SystemPrompt) &&
 			plannerHasLoadedToolsV33(receipts) {
 			prompt, err = buildResearchPlannerCorrectionPromptV3(
 				prompt, runtimepolicy.ResearchPlannerRendererVersionV33)
@@ -361,6 +371,11 @@ func executeResearchPlannerToolSearchRoundsV33(
 	}
 	return runcontext.ResearchExecutionPlanV3{}, storepkg.ResearchRunLLMSpendReservationV3{},
 		researchCoordinatorValidationV3("research planner exhausted its tool search budget")
+}
+
+func researchPlannerFinalOnlyV33(systemPrompt string) bool {
+	return systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly ||
+		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools
 }
 
 func plannerHasLoadedToolsV33(
