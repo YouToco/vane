@@ -9,7 +9,7 @@ import (
 )
 
 func TestResearchV3StaticAuthorityIsControlPlaneOnly(t *testing.T) {
-	for _, name := range []string{"reconcileOne", "applyScheduleCommandRemote", "UpdatePush"} {
+	for _, name := range []string{"reconcileOne", "applyScheduleCommandRemote"} {
 		if got := selectorCountInMethod(t, "scheduler.go", name, "authorityID"); got != 0 {
 			t.Fatalf("runtime method %s still reads static authorityID %d times", name, got)
 		}

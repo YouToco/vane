@@ -114,11 +114,11 @@ func TestTaskCreationSaga_LowLevelLifecycleIsControllerPrivate(t *testing.T) {
 	if len(references) != 0 {
 		t.Fatalf("A5 low-level creation lifecycle escaped CreationCoordinator: %v", references)
 	}
-	mainFile := filepath.Clean(filepath.Join(repoRoot, "cmd", "server", "main.go"))
+	v3File := filepath.Clean(filepath.Join(taskDir, "creation_v3.go"))
 	if len(controllerWiring) != 1 || !strings.HasPrefix(
-		filepath.Clean(controllerWiring[0]), mainFile+":",
+		filepath.Clean(controllerWiring[0]), v3File+":",
 	) {
-		t.Fatalf("A5 must have exactly one production coordinator wiring in cmd/server/main.go: %v",
+		t.Fatalf("A5 must have exactly one production coordinator wiring behind the V3-only facade: %v",
 			controllerWiring)
 	}
 }

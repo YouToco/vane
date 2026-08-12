@@ -16,7 +16,7 @@ import (
 
 // spyScheduler 记录是否真的对 Temporal 下了手。
 //
-// 关键：DeletePush/UpdatePush 的归属校验必须发生在**动 Temporal 之前**——
+// 关键：删除/更新任务的归属校验必须发生在**动 Temporal 之前**——
 // 生产实现里 Temporal 删除不可逆，「先删后校验」等于校验失败时对方的调度
 // 已经没了。本替身只要被调到，就说明归属把关没拦住。
 type spyScheduler struct {
@@ -31,10 +31,6 @@ func (s *spyScheduler) UpdatePush(_ context.Context, id string, _ int64, _ sched
 	s.updated = id
 	return nil
 }
-func (s *spyScheduler) DeletePush(_ context.Context, id string, _ int64) error {
-	s.deleted = id
-	return nil
-}
 func (s *spyScheduler) DeletePushIdempotent(
 	_ context.Context,
 	id string,
@@ -46,7 +42,7 @@ func (s *spyScheduler) DeletePushIdempotent(
 }
 
 // authzMux 起一个以 userID 身份登录的 mux。
-func authzMux(t *testing.T, userID, tenantID int64, sched Scheduler) (*http.ServeMux, *http.Cookie) {
+func authzMux(t *testing.T, userID, tenantID int64, sched any) (*http.ServeMux, *http.Cookie) {
 	t.Helper()
 	fake := newFakeAuthStore()
 	token, hash, err := auth.NewSessionToken()

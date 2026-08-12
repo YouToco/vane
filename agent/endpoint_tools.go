@@ -8,7 +8,7 @@
 //
 // 三条硬边界：
 //   - 端点工具按本地 ToolPolicy 声明网络读取、计费与 taint；
-//     因此它们永远不进 task_creation_operations，ExecuteAction 路径只需静态白名单。
+//     因此它们永远不进 task_creation_operations，也不能进入 owner 写操作边界。
 //   - 白名单语义（M4 契约 §10）扩展为「静态工具 ∪ 会话已激活端点」：模型编造的
 //     端点名（哪怕真在注册表里）只要没被本会话 tool_search 激活过，一律拒绝——
 //     激活集是显式审计过的调用面，跳过检索直呼端点名是绕过检索留痕的旁门。

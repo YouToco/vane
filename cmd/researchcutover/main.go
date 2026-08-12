@@ -1,5 +1,5 @@
-// Command researchcutover performs the durable exact-task V3 cutover or
-// rollback saga. It is an operator-only control plane and is not exposed to
+// Command researchcutover performs the durable exact-task V3 cutover saga.
+// It is an operator-only control plane and is not exposed to
 // HTTP, Feishu, or the Agent tool surface.
 package main
 
@@ -98,12 +98,6 @@ func run(arguments []string) error {
 		if err == nil {
 			inspection, err = sched.VerifyResearchV3(ctx, scope, args.idempotencyKey)
 		}
-	case "rollback":
-		_, err = sched.RollbackResearchV3(
-			ctx, args.taskID, scope.UserID, args.idempotencyKey)
-		if err == nil {
-			inspection, err = sched.VerifyResearchV3(ctx, scope, args.idempotencyKey)
-		}
 	}
 	if err != nil {
 		return fmt.Errorf("%s Research V3 task: %w", args.operation, err)
@@ -120,7 +114,7 @@ func parseCutoverArgs(arguments []string) (cutoverArgs, error) {
 	set := flag.NewFlagSet("researchcutover", flag.ContinueOnError)
 	set.SetOutput(os.Stderr)
 	var args cutoverArgs
-	set.StringVar(&args.operation, "operation", "", "preflight, status, cutover, verify or rollback")
+	set.StringVar(&args.operation, "operation", "", "preflight, status, cutover or verify")
 	set.StringVar(&args.taskID, "task-id", "", "exact configured schedule ID")
 	set.StringVar(&args.idempotencyKey, "idempotency-key", "", "stable saga retry key")
 	set.StringVar(&args.planDigest, "plan-digest", "", "exact preflight digest (cutover only)")
@@ -128,8 +122,7 @@ func parseCutoverArgs(arguments []string) (cutoverArgs, error) {
 		return cutoverArgs{}, err
 	}
 	validOperation := args.operation == "preflight" || args.operation == "status" ||
-		args.operation == "cutover" || args.operation == "verify" ||
-		args.operation == "rollback"
+		args.operation == "cutover" || args.operation == "verify"
 	validPlan := (args.operation == "cutover" && validDigest(args.planDigest)) ||
 		(args.operation != "cutover" && args.planDigest == "")
 	if set.NArg() != 0 || !validOperation || !validPlan ||
@@ -138,7 +131,7 @@ func parseCutoverArgs(arguments []string) (cutoverArgs, error) {
 		strings.TrimSpace(args.idempotencyKey) != args.idempotencyKey ||
 		len(args.idempotencyKey) > 512 {
 		return cutoverArgs{}, errors.New(
-			"require -operation preflight|status|cutover|verify|rollback, -task-id, -idempotency-key, and -plan-digest only for cutover")
+			"require -operation preflight|status|cutover|verify, -task-id, -idempotency-key, and -plan-digest only for cutover")
 	}
 	return args, nil
 }

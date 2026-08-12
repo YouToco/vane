@@ -62,9 +62,8 @@ const (
 	maxTaskOperationIDBytes = maxTaskOperationIDBytesV1
 )
 
-// SchedulerOption configures the A3 task-schedule control plane without
-// changing the legacy Scheduler behavior. Existing CreatePush callers do not
-// need an option; PrepareTaskSchedule requires an explicit namespace.
+// SchedulerOption configures the durable task-schedule control plane. New V3
+// admission and retained replay both require an explicit Temporal namespace.
 type SchedulerOption func(*Scheduler)
 
 // WithTaskScheduleNamespace binds prepared definitions to one Temporal

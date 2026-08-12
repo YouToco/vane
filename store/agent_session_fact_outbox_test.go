@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/types"
-	"github.com/jackc/pgx/v5"
 )
 
 type agentSessionFactFixture struct {
@@ -72,6 +71,24 @@ func (f agentSessionFactFixture) insertFeedback(
 		UserID: f.userA, DeliveryID: f.deliveryID, Action: action,
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := json.Marshal([]map[string]string{{
+		"role": "user", "content": fmt.Sprintf(
+			"[legacy feedback projection] delivery=%d action=%s",
+			f.deliveryID, action),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(messages)
+	if _, err := f.store.pool.Exec(t.Context(), `
+		INSERT INTO agent_session_fact_outbox (
+		 tenant_id,user_id,fact_type,fact_id,source_identity,
+		 session_id,session_messages,payload_digest,status
+		) VALUES ($1,$2,'feedback',$3,$4,$5,$6,$7,'pending')`,
+		f.tenantA, f.userA, id, fmt.Sprintf("feedback-click:%d", id),
+		f.sessionA, messages, fmt.Sprintf("%x", digest[:])); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -250,29 +267,15 @@ func TestAgentSessionFactCompletedReplayRejectsDamagedBatch(
 	}
 }
 
-func TestAgentSessionFactOutboxFailureRollsBackFeedback(t *testing.T) {
+func TestFeedbackNoLongerProducesAgentSessionFact(t *testing.T) {
 	f := newAgentSessionFactFixture(t)
-	faultStore := *f.store
-	faultStore.beginTx = func(
-		ctx context.Context,
-		options pgx.TxOptions,
-	) (pgx.Tx, error) {
-		realTx, err := f.store.pool.BeginTx(ctx, options)
-		if err != nil {
-			return nil, err
-		}
-		return &compiledTaskFaultTx{
-			Tx:           realTx,
-			failContains: "INSERT INTO agent_session_fact_outbox",
-		}, nil
-	}
-	_, err := faultStore.InsertFeedbackWithSessionCutoff(
+	id, err := f.store.InsertFeedbackWithSessionCutoff(
 		t.Context(), &types.Feedback{
 			UserID: f.userA, DeliveryID: f.deliveryID,
 			Action: types.FeedbackActionInterested,
 		}, time.Now().Add(-time.Hour))
-	if !errors.Is(err, types.ErrDatabase) {
-		t.Fatalf("outbox fault err=%v", err)
+	if err != nil {
+		t.Fatal(err)
 	}
 	var feedbacks, facts int
 	if err := f.store.pool.QueryRow(t.Context(),
@@ -285,8 +288,8 @@ func TestAgentSessionFactOutboxFailureRollsBackFeedback(t *testing.T) {
 	).Scan(&feedbacks, &facts); err != nil {
 		t.Fatal(err)
 	}
-	if feedbacks != 0 || facts != 0 {
-		t.Fatalf("atomic rollback feedbacks=%d facts=%d", feedbacks, facts)
+	if feedbacks != 1 || facts != 0 || id <= 0 {
+		t.Fatalf("feedbacks=%d facts=%d id=%d", feedbacks, facts, id)
 	}
 }
 
@@ -467,6 +470,15 @@ func TestAgentSessionFactNoActiveSessionSuppressedAndCorruptBlocked(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := f.store.pool.Exec(ctx, `
+		INSERT INTO agent_session_fact_outbox (
+		 tenant_id,user_id,fact_type,fact_id,source_identity,
+		 status,suppression_reason
+		) VALUES ($1,$2,'feedback',$3,$4,'suppressed','no_active_session')`,
+		f.tenantA, f.userA, suppressedID,
+		fmt.Sprintf("feedback-click:%d", suppressedID)); err != nil {
+		t.Fatal(err)
+	}
 	suppressed := f.loadFact(t, suppressedID)
 	if suppressed.Status != AgentSessionFactStatusSuppressed ||
 		suppressed.SessionID != nil ||
@@ -613,7 +625,7 @@ func TestAgentSessionFactLegacyMisjudgedReplayDoesNotCreateOutbox(
 	); err != nil {
 		t.Fatal(err)
 	}
-	if feedbacks != 1 || facts != 1 || triage != 1 ||
+	if feedbacks != 1 || facts != 0 || triage != 1 ||
 		triageReason != string(types.FeedbackReasonOther) ||
 		triageDetail != "first" || triageOutcome != "manual_review" ||
 		auditReason != triageReason || auditDetail != triageDetail {

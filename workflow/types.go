@@ -62,7 +62,7 @@ type PushParams struct {
 	Scope          PushScope `json:"scope"`
 	// NLDesc 触发本次推送的调度的自然语言描述（聚合卡 header 的任务名）。
 	// 存量调度的 Temporal Action 里没有本字段，解出零值空串——聚合卡落兜底标题，
-	// 行为安全；新建调度由 scheduler.CreatePush 填入。
+	// 行为安全；当前调度 Action 构造器会填入该字段。
 	NLDesc string `json:"nl_desc,omitempty"`
 	// Snapshot is nil in every durable Schedule Action. PrepareRun populates it
 	// in workflow memory and only the sealed reference crosses into downstream

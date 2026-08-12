@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
@@ -236,6 +239,28 @@ func TestDurableRunRejectsFormalResearchV3WithoutEnabledAuthority(t *testing.T) 
 	}
 }
 
+func TestDurableRunRejectsRetiredPushAction(t *testing.T) {
+	const taskID = "task-retired-manual-run"
+	client := &scheduleCommandTimeoutClient{service: &scheduleCommandStaticDescribe{
+		action: rawResumeScheduleAction(taskID, workflow.CompiledRuntimeSnapshotV1),
+	}}
+	s := New(client, "vane-tq", &scheduleCommandTimeoutStore{},
+		WithTaskScheduleNamespace("test"))
+	err := s.applyScheduleCommandRemote(t.Context(), &types.ScheduleCommand{
+		ID:       "01900000-0000-7000-8000-000000000003",
+		TenantID: 1, UserID: 7, TaskID: taskID,
+		Kind: types.ScheduleCommandRun, CreatedAt: time.Now().UTC(),
+	})
+	if types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("retired manual run error=%v", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.executeCalls != 0 {
+		t.Fatalf("retired manual workflow executions=%d", client.executeCalls)
+	}
+}
+
 func (s *scheduleCommandFirstRPCBlackhole) PatchSchedule(
 	ctx context.Context,
 	request *workflowservice.PatchScheduleRequest,
@@ -297,6 +322,7 @@ type scheduleCommandTimeoutStore struct {
 	schedule                   types.Schedule
 	researchV3AuthorityEnabled bool
 	researchV3AuthorityToken   string
+	researchV3TargetDigest     string
 }
 
 func (s *scheduleCommandTimeoutStore) VerifyEnabledResearchV3ActionAuthorization(
@@ -464,13 +490,23 @@ func TestScheduleCommandFirstRPCBlackholeUsesSharedAttemptBudget(
 		types.ScheduleCommandDelete,
 	} {
 		t.Run(string(kind), func(t *testing.T) {
-			st := &scheduleCommandTimeoutStore{}
+			token := strings.Repeat("c", 64)
+			st := &scheduleCommandTimeoutStore{
+				researchV3AuthorityEnabled: true,
+				researchV3AuthorityToken:   token,
+				schedule: types.Schedule{
+					ID: "blackhole-task", TenantID: 1, UserID: 7,
+					Status:        types.ScheduleStatusActive,
+					ExecutionMode: types.ExecutionModeDiscoverAtRun,
+				},
+			}
 			remote := &scheduleCommandFirstRPCBlackhole{
 				paused: kind == types.ScheduleCommandResume,
-				action: rawResumeScheduleAction(
-					"blackhole-task",
-					workflow.CompiledRuntimeSnapshotV1,
-				),
+				action: rawResearchV3ScheduleAction("blackhole-task",
+					workflow.ResearchScheduledInputV3{
+						TenantID: 1, UserID: 7, TaskID: "blackhole-task",
+						ActionAuthorizationToken: token,
+					}),
 			}
 			s := New(
 				&scheduleCommandTimeoutClient{service: remote},
@@ -521,7 +557,7 @@ func TestScheduleCommandFirstRPCBlackholeUsesSharedAttemptBudget(
 	}
 }
 
-func TestDurableResumeBlocksToolTaskAfterCanaryRemoval(t *testing.T) {
+func TestDurableResumeRejectsRetiredPushAction(t *testing.T) {
 	const taskID = "task-tool-resume-durable"
 	st := &scheduleCommandTimeoutStore{
 		toolDefinition: true,
@@ -544,13 +580,102 @@ func TestDurableResumeBlocksToolTaskAfterCanaryRemoval(t *testing.T) {
 		WithCompiledRuntimeRollout(true, taskID, false),
 	)
 	err := s.ResumePushIdempotent(
-		t.Context(), taskID, 7, "resume-without-tool-canary")
+		t.Context(), taskID, 7, "resume-retired-action")
 	if err == nil {
-		t.Fatal("durable resume bypassed disabled Tool canary")
+		t.Fatal("durable resume accepted a retired Push Action")
 	}
 	status, locked := st.state()
 	if status != types.ScheduleCommandBlocked || locked {
 		t.Fatalf("blocked resume state=%s locked=%v", status, locked)
+	}
+}
+
+func TestDurableRunRejectsQueueTamperWithValidResearchV3Token(t *testing.T) {
+	const taskID = "task-v3-manual-run-queue-tamper"
+	input := workflow.ResearchScheduledInputV3{
+		TenantID: 1, UserID: 7, TaskID: taskID,
+		ActionAuthorizationToken: strings.Repeat("d", 64),
+	}
+	approved := rawResearchV3ScheduleAction(taskID, input)
+	approvedBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(approved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvedDigest := sha256.Sum256(approvedBytes)
+	tampered := proto.Clone(approved).(*schedulepb.ScheduleAction)
+	tampered.GetStartWorkflow().TaskQueue.Name = "attacker-controlled-queue"
+	client := &scheduleCommandTimeoutClient{service: &scheduleCommandStaticDescribe{
+		action: tampered,
+	}}
+	s := New(client, "vane-tq", &scheduleCommandTimeoutStore{
+		researchV3AuthorityEnabled: true,
+		researchV3AuthorityToken:   input.ActionAuthorizationToken,
+		researchV3TargetDigest:     fmt.Sprintf("%x", approvedDigest[:]),
+	}, WithTaskScheduleNamespace("test"))
+	err = s.applyScheduleCommandRemote(t.Context(), &types.ScheduleCommand{
+		ID:       "01900000-0000-7000-8000-000000000004",
+		TenantID: 1, UserID: 7, TaskID: taskID,
+		Kind: types.ScheduleCommandRun, CreatedAt: time.Now().UTC(),
+	})
+	if types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("tampered queue error=%v", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.executeCalls != 0 {
+		t.Fatalf("tampered queue executions=%d", client.executeCalls)
+	}
+}
+
+func (s *scheduleCommandTimeoutStore) VerifyEnabledResearchV3ActionEvidence(
+	ctx context.Context,
+	tenantID, userID int64,
+	taskID, token, targetDigest string,
+) error {
+	if err := s.VerifyEnabledResearchV3ActionAuthorization(
+		ctx, tenantID, userID, taskID, token); err != nil {
+		return err
+	}
+	if s.researchV3TargetDigest != "" &&
+		targetDigest != s.researchV3TargetDigest {
+		return types.NewAppError(
+			types.CodeConflict, "Research V3 Action evidence differs", types.ErrConflict)
+	}
+	return nil
+}
+
+func TestDurableRunBlocksRetiredPushAction(t *testing.T) {
+	const taskID = "task-retired-run-durable"
+	st := &scheduleCommandTimeoutStore{schedule: types.Schedule{
+		ID: taskID, TenantID: 1, UserID: 7,
+		Status:        types.ScheduleStatusActive,
+		ExecutionMode: types.ExecutionModeCompiled,
+	}}
+	client := &scheduleCommandTimeoutClient{
+		service: &scheduleCommandStaticDescribe{
+			action: rawResumeScheduleAction(
+				taskID, workflow.CompiledRuntimeSnapshotV1),
+		},
+	}
+	s := New(client, "unused", st,
+		WithTaskScheduleNamespace("test"))
+	err := s.TriggerScheduleNowIdempotent(
+		t.Context(), taskID, 7, "run-retired-action")
+	if err == nil || !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("durable run retired action error=%v", err)
+	}
+	status, locked := st.state()
+	if status != types.ScheduleCommandBlocked || locked {
+		t.Fatalf("blocked run state=%s locked=%v", status, locked)
+	}
+	client.mu.Lock()
+	executeCalls := client.executeCalls
+	client.mu.Unlock()
+	if executeCalls != 0 {
+		t.Fatalf("retired action executions=%d", executeCalls)
+	}
+	if err := s.RecoverScheduleCommandsOnce(t.Context()); err != nil {
+		t.Fatalf("blocked run re-entered startup recovery: %v", err)
 	}
 }
 

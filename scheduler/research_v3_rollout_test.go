@@ -72,7 +72,7 @@ func TestResearchV3CutoverPublicControlPlaneIsExactTaskOnly(t *testing.T) {
 	}
 }
 
-func TestResearchRuntimeV3AuthorityCannotRewriteMondayNineSchedule(t *testing.T) {
+func TestResearchRuntimeV3AuthorityCannotAdmitLegacyMondayNineSchedule(t *testing.T) {
 	const taskID = "task-v3-monday-nine"
 	initial := makePushParams(
 		7, 42, taskID, workflow.PushScope{SourceIDs: []int64{21}, TopN: 4},
@@ -94,8 +94,8 @@ func TestResearchRuntimeV3AuthorityCannotRewriteMondayNineSchedule(t *testing.T)
 	}}}
 	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
 
-	if err := s.ReconcileActions(t.Context()); err != nil {
-		t.Fatal(err)
+	if err := s.ReconcileActions(t.Context()); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("legacy Monday 09:00 schedule error=%v", err)
 	}
 	if len(h.history) != 0 {
 		t.Fatalf("hard-disabled authority rewrote Action %d times", len(h.history))
@@ -262,84 +262,6 @@ func assertMondayNineSpec(t *testing.T, h *fakeScheduleHandle) {
 		!reflect.DeepEqual(h.current.Spec.CronExpressions, []string{"0 9 * * 1"}) ||
 		h.current.Spec.TimeZoneName != "Asia/Shanghai" {
 		t.Fatalf("Monday 09:00 ScheduleSpec changed: %+v", h.current.Spec)
-	}
-}
-
-func TestResearchRuntimeV3AuthorityCannotRewriteRename(t *testing.T) {
-	const taskID = "task-v3-rename"
-	h := &fakeScheduleHandle{current: reconcileSchedule(
-		"wf-"+taskID,
-		[]interface{}{payloadArg(t, makePushParams(
-			7, 42, taskID, workflow.PushScope{TopN: 5}, "old name",
-		))},
-	)}
-	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
-	s := New(fc, "tq", &fakeScheduleStore{}, WithResearchRuntimeV3AuthorityCanary(taskID))
-	name := "new name"
-	if err := s.UpdatePush(
-		t.Context(), taskID, 42,
-		ScheduleSpec{Cron: "0 9 * * 1", TZ: "Asia/Shanghai"}, &name,
-	); err != nil {
-		t.Fatal(err)
-	}
-	got := h.current.Action.(*client.ScheduleWorkflowAction).Args[0].(workflow.PushParams)
-	if got.RuntimeVersion != "" || got.ExecutionMode != types.ExecutionModeCompiled ||
-		got.NLDesc != "new name" {
-		t.Fatalf("authority rewrote renamed Action: %+v", got)
-	}
-}
-
-func TestUpdatePush_FormalV3RenameFailsClosedWithoutMutation(t *testing.T) {
-	const taskID = "task-v3-formal-rename"
-	token := strings.Repeat("b", 64)
-	h := &fakeScheduleHandle{current: formalResearchV3Schedule(t, taskID, token)}
-	beforeAction := h.current.Action
-	beforeSpec := h.current.Spec
-	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
-	st := &fakeScheduleStore{}
-	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
-	name := "new name"
-	err := s.UpdatePush(t.Context(), taskID, 42,
-		ScheduleSpec{Cron: "30 10 * * 1", TZ: "Asia/Shanghai"}, &name)
-	if types.CodeOf(err) != types.CodeConflict {
-		t.Fatalf("formal V3 rename error=%v", err)
-	}
-	if len(h.history) != 0 || st.updateCall != 0 ||
-		!reflect.DeepEqual(h.current.Action, beforeAction) ||
-		!reflect.DeepEqual(h.current.Spec, beforeSpec) {
-		t.Fatalf("failed rename mutated V3 schedule: history=%d mirror=%d schedule=%+v",
-			len(h.history), st.updateCall, h.current)
-	}
-	decoded, found, decodeErr := decodeResearchScheduledActionV3(h.current.Action)
-	if decodeErr != nil || !found || decoded.ActionAuthorizationToken != token {
-		t.Fatalf("failed rename changed token: found=%v input=%+v err=%v", found, decoded, decodeErr)
-	}
-}
-
-func TestUpdatePush_FormalV3SpecOnlyPreservesEnvelope(t *testing.T) {
-	const taskID = "task-v3-formal-spec"
-	token := strings.Repeat("c", 64)
-	h := &fakeScheduleHandle{current: formalResearchV3Schedule(t, taskID, token)}
-	beforeAction := h.current.Action
-	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
-	st := &fakeScheduleStore{}
-	s := New(fc, "tq", st, WithResearchRuntimeV3AuthorityCanary(taskID))
-
-	if err := s.UpdatePush(t.Context(), taskID, 42,
-		ScheduleSpec{Cron: "30 10 * * 1", TZ: "Asia/Shanghai"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if len(h.history) != 1 || st.updateCall != 1 ||
-		!reflect.DeepEqual(h.current.Action, beforeAction) {
-		t.Fatalf("spec-only update changed V3 envelope: history=%d mirror=%d action=%#v",
-			len(h.history), st.updateCall, h.current.Action)
-	}
-	if got := h.current.Spec.CronExpressions; !reflect.DeepEqual(got, []string{"30 10 * * 1"}) {
-		t.Fatalf("spec-only update cron=%v", got)
-	}
-	decoded, found, err := decodeResearchScheduledActionV3(h.current.Action)
-	if err != nil || !found || decoded.ActionAuthorizationToken != token {
-		t.Fatalf("spec-only update changed token: found=%v input=%+v err=%v", found, decoded, err)
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-func TestAgentContinuationWiringOwnsFeedbackSessionProjection(
+func TestAgentContinuationRuntimeIsRemoved(
 	t *testing.T,
 ) {
 	_, testFile, _, ok := runtime.Caller(0)
@@ -26,12 +26,12 @@ func TestAgentContinuationWiringOwnsFeedbackSessionProjection(
 		t.Fatal(err)
 	}
 	source := string(raw)
-	for fragment, want := range map[string]int{
-		"agentcontinuation.New(":          1,
-		"continuationDispatcher.Run(ctx)": 1,
+	for _, forbidden := range []string{
+		"agentcontinuation", "continuationDispatcher",
+		"agent_session_fact_outbox",
 	} {
-		if got := strings.Count(source, fragment); got != want {
-			t.Fatalf("%q count=%d want=%d", fragment, got, want)
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("production server retains Agent continuation runtime %q", forbidden)
 		}
 	}
 	file, err := parser.ParseFile(token.NewFileSet(), mainPath, raw, 0)
@@ -46,20 +46,21 @@ func TestAgentContinuationWiringOwnsFeedbackSessionProjection(
 			exactBindings,
 		)
 	}
-	runAt := strings.Index(source, "continuationDispatcher.Run(ctx)")
-	workerAt := strings.Index(source, "if err := w.Start(); err != nil")
-	managerAt := strings.Index(source, "manager.Start(ctx)")
-	if runAt < 0 || workerAt < 0 || managerAt < 0 ||
-		!(runAt < workerAt && workerAt < managerAt) {
-		t.Fatalf(
-			"continuation startup order invalid: run=%d worker=%d manager=%d",
-			runAt, workerAt, managerAt)
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(testFile), "..", ".."))
+	feedbackSource, err := os.ReadFile(filepath.Join(repoRoot, "store", "feedbacks.go"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(
-		source,
-		"maintenanceErr := waitMaintenance(maintenanceCtx)",
-	) {
-		t.Fatal("continuation Run must participate in graceful maintenance drain")
+	if strings.Contains(string(feedbackSource), "agent_session_fact_outbox") {
+		t.Fatal("new feedback still produces retired Agent session facts")
+	}
+	continuationSources, err := filepath.Glob(filepath.Join(
+		repoRoot, "agentcontinuation", "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(continuationSources) != 0 {
+		t.Fatalf("retired agentcontinuation sources remain: %v", continuationSources)
 	}
 }
 

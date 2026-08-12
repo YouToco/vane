@@ -5,6 +5,7 @@ package scheduler
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -113,14 +114,14 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 		server.Client(), taskQueue, st,
 		WithTaskScheduleNamespace(namespace),
 	)
-	taskID, err := base.CreatePush(
-		ctx, user.ID,
-		ScheduleSpec{Cron: "0 0 1 1 *", TZ: "UTC"},
-		workflow.PushScope{}, "schedule command integration",
+	taskID, err := seedHistoricalScheduleCommandFixture(
+		ctx, base, st, user.ID,
 	)
 	if err != nil {
 		t.Fatalf("create integration schedule: %v", err)
 	}
+	v3Input := installFormalV3ScheduleCommandFixture(
+		t, ctx, server.Client(), dbURL, taskID, user.ID)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(
 			context.Background(), 15*time.Second,
@@ -307,44 +308,6 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 	if err != nil {
 		t.Fatalf("describe before V3 manual run: %v", err)
 	}
-	v3Input := workflow.ResearchScheduledInputV3{
-		TenantID: 1, UserID: user.ID, TaskID: taskID,
-		ActionAuthorizationToken: strings.Repeat("c", 64),
-	}
-	authorityDigest := sha256.Sum256([]byte(v3Input.ActionAuthorizationToken))
-	authorityPool, err := pgxpool.New(ctx, dbURL)
-	if err != nil {
-		t.Fatalf("open V3 authority fixture pool: %v", err)
-	}
-	if _, err := authorityPool.Exec(ctx, `
-		INSERT INTO research_v3_delivery_authorities (
-		    tenant_id,user_id,task_id,generation,definition_version,
-		    definition_digest,target_action_digest,action_authorization_digest,
-		    status,enabled_at
-		) VALUES ($1,$2,$3,1,1,$4,$5,$6,'enabled',clock_timestamp())`,
-		1, user.ID, taskID, strings.Repeat("d", 64),
-		strings.Repeat("e", 64), fmt.Sprintf("%x", authorityDigest),
-	); err != nil {
-		authorityPool.Close()
-		t.Fatalf("install V3 authority fixture: %v", err)
-	}
-	authorityPool.Close()
-	if err := handle.Update(ctx, client.ScheduleUpdateOptions{
-		DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
-			schedule := in.Description.Schedule
-			action, ok := schedule.Action.(*client.ScheduleWorkflowAction)
-			if !ok || action == nil {
-				return nil, errors.New("integration schedule Action is not a workflow")
-			}
-			updated := *action
-			updated.Workflow = workflow.ResearchScheduledWorkflowV3Name
-			updated.Args = []interface{}{v3Input}
-			schedule.Action = &updated
-			return &client.ScheduleUpdate{Schedule: &schedule}, nil
-		},
-	}); err != nil {
-		t.Fatalf("install formal V3 Action fixture: %v", err)
-	}
 	formalBeforeV3, err := handle.Describe(ctx)
 	if err != nil {
 		t.Fatalf("describe installed formal V3 Action: %v", err)
@@ -465,6 +428,102 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 	); err != nil {
 		t.Fatalf("delete terminal replay: %v", err)
 	}
+}
+
+func installFormalV3ScheduleCommandFixture(
+	t *testing.T,
+	ctx context.Context,
+	temporal client.Client,
+	dbURL, taskID string,
+	userID int64,
+) workflow.ResearchScheduledInputV3 {
+	t.Helper()
+	input := workflow.ResearchScheduledInputV3{
+		TenantID: 1, UserID: userID, TaskID: taskID,
+		ActionAuthorizationToken: strings.Repeat("c", 64),
+	}
+	authorityDigest := sha256.Sum256([]byte(input.ActionAuthorizationToken))
+	authorityPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("open V3 authority fixture pool: %v", err)
+	}
+	defer authorityPool.Close()
+	if _, err := authorityPool.Exec(ctx, `
+		INSERT INTO research_v3_delivery_authorities (
+		    tenant_id,user_id,task_id,generation,definition_version,
+		    definition_digest,target_action_digest,action_authorization_digest,
+		    status,enabled_at
+		) VALUES ($1,$2,$3,1,1,$4,$5,$6,'enabled',clock_timestamp())`,
+		1, userID, taskID, strings.Repeat("d", 64),
+		strings.Repeat("e", 64), fmt.Sprintf("%x", authorityDigest),
+	); err != nil {
+		t.Fatalf("install V3 authority fixture: %v", err)
+	}
+	handle := temporal.ScheduleClient().GetHandle(ctx, taskID)
+	if err := handle.Update(ctx, client.ScheduleUpdateOptions{
+		DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
+			schedule := in.Description.Schedule
+			action, ok := schedule.Action.(*client.ScheduleWorkflowAction)
+			if !ok || action == nil {
+				return nil, errors.New("integration schedule Action is not a workflow")
+			}
+			updated := *action
+			updated.Workflow = workflow.ResearchScheduledWorkflowV3Name
+			updated.Args = []interface{}{input}
+			schedule.Action = &updated
+			return &client.ScheduleUpdate{Schedule: &schedule}, nil
+		},
+	}); err != nil {
+		t.Fatalf("install formal V3 Action fixture: %v", err)
+	}
+	return input
+}
+
+// seedHistoricalScheduleCommandFixture creates the old wire only as a fixture
+// for the explicit V3 promotion above. No command is allowed to execute or
+// resume it before that promotion.
+func seedHistoricalScheduleCommandFixture(
+	ctx context.Context,
+	s *Scheduler,
+	st *store.Store,
+	userID int64,
+) (string, error) {
+	const tenantID = int64(types.SingleTenantID)
+	taskID := fmt.Sprintf("push-%d-%s", userID, uuid.NewString())
+	spec := ScheduleSpec{Cron: "0 0 1 1 *", TZ: "UTC"}
+	sdkSpec, err := translateSpec(spec)
+	if err != nil {
+		return "", err
+	}
+	params := makePushParams(
+		tenantID, userID, taskID, workflow.PushScope{},
+		"schedule command integration",
+	)
+	if _, err := s.c.ScheduleClient().Create(ctx, client.ScheduleOptions{
+		ID:   taskID,
+		Spec: sdkSpec,
+		Action: &client.ScheduleWorkflowAction{
+			ID: "wf-" + taskID, Workflow: workflow.PushPipelineWorkflow,
+			Args: []any{params}, TaskQueue: s.tq,
+		},
+		Overlap: enums.SCHEDULE_OVERLAP_POLICY_SKIP,
+	}); err != nil {
+		return "", err
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		return "", err
+	}
+	if err := st.InsertSchedule(ctx, &types.Schedule{
+		ID: taskID, TenantID: tenantID, UserID: userID,
+		NLDescription: "schedule command integration",
+		SpecJSON:      json.RawMessage(specJSON), ScopeJSON: json.RawMessage(`{}`),
+		Status: types.ScheduleStatusActive,
+	}); err != nil {
+		_ = s.c.ScheduleClient().GetHandle(ctx, taskID).Delete(ctx)
+		return "", err
+	}
+	return taskID, nil
 }
 
 type scheduleCommandFaultClient struct {

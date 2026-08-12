@@ -153,9 +153,9 @@ func (s *Store) InsertSchedule(ctx context.Context, sc *types.Schedule) error {
 		return nil
 	}
 
-	// Legacy Scheduler.CreatePush still reaches this method while A5 is being
-	// rolled out. Its preflight list cannot serialize with an A5 reservation, so
-	// enforce the same user-wide limit again at the final database write. If the
+	// Every task creation path converges here. A preflight list cannot serialize
+	// with an A5 reservation, so enforce the same user-wide limit again at the
+	// final database write. If the
 	// race is lost, Scheduler's existing compensation deletes its Temporal row.
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
