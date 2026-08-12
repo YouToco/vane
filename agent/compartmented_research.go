@@ -31,10 +31,17 @@ const (
 	maxPublicEvidenceCount            = 32
 	maxPublicEvidenceBytes            = 512 << 10
 	maxPublicEvidenceArgumentsBytes   = 64 << 10
-	maxPublicEvidenceClaims           = 24
-	maxPublicEvidenceGaps             = 16
-	maxPublicEvidenceTextBytes        = 8 << 10
-	maxPublicEvidenceRefsPerClaim     = maxPublicEvidenceCount
+	maxPublicEvidenceClaims           = 8
+	maxPublicEvidenceGaps             = 4
+	maxPublicEvidenceTextBytes        = 512
+	// Keep a single claim's source list well below the 2,048-token summary
+	// budget. A production comparison over many historical observations once
+	// spent the entire response on 20 repeated refs and was truncated before
+	// the JSON object closed. The summarizer must narrow broad claims to the
+	// strongest directly supporting samples instead of enumerating the corpus.
+	maxPublicEvidenceRefsPerClaim = 4
+	maxPublicEvidenceRefsTotal    = 16
+	maxPublicEvidenceSummaryBytes = 1800
 )
 
 var toolCallProjectionRequiredColumns = []string{
@@ -77,7 +84,8 @@ const compartmentedPublicSummarySystemNote = `
 - 不得读取新的用户内部数据，不得创建、编辑、运行或删除任务，不得激活或持久化新工具。
 - 证据足够后只输出一个 JSON 对象，不要 Markdown、代码围栏、URL 或说明文字：
 {"schema":"vane.public-evidence-summary/v1","as_of":"RFC3339 时间或 unknown","claims":[{"statement":"公开证据直接支持的简短事实（不得含 URL）","status":"supported|contradicted|uncertain","public_evidence_refs":["逐字复制 bundle 中的 public_evidence_ref"]}],"gaps":["公开证据仍不能回答的缺口（不得含 URL）"]}
-- 每条 claim 最多引用 32 个 bundle ref；只引用直接支持该 claim 的 ref，不得重复。
+- 每条 claim 最多引用 4 个 bundle ref；优先选择最直接、最强的证据。若完整事实需要更多 ref 才能成立，必须把 claim 收窄到这 4 个 ref 能直接证明的范围，不得声称汇总了全部证据；不得重复。
+- 整个摘要最多 8 条 claims、4 条 gaps、16 次 ref 引用；每条 statement/gap 最多 512 bytes，完整 JSON 最多 1800 bytes。优先保留与用户问题直接相关的事实，不要罗列重复运行。
 - supported/contradicted 必须引用至少一个 bundle ref；uncertain 可无 ref。不得编造、改写或拼接 ref，不得用训练记忆补齐。`
 
 const compartmentedPublicSummaryRetrySystemNote = `
@@ -1083,7 +1091,8 @@ func decodePublicEvidenceSummary(
 	state *toolRunState,
 ) (publicEvidenceSummaryV1, error) {
 	var summary publicEvidenceSummaryV1
-	if strictjson.DecodeExact(json.RawMessage(raw), &summary) != nil ||
+	if len(raw) > maxPublicEvidenceSummaryBytes ||
+		strictjson.DecodeExact(json.RawMessage(raw), &summary) != nil ||
 		summary.Schema != publicEvidenceSummarySchema ||
 		strings.TrimSpace(summary.AsOf) == "" ||
 		summary.Claims == nil || summary.Gaps == nil ||
@@ -1096,6 +1105,7 @@ func decodePublicEvidenceSummary(
 			return publicEvidenceSummaryV1{}, errors.New("invalid public evidence as_of")
 		}
 	}
+	totalRefs := 0
 	for i := range summary.Claims {
 		claim := &summary.Claims[i]
 		claim.Statement = strings.TrimSpace(claim.Statement)
@@ -1123,6 +1133,10 @@ func decodePublicEvidenceSummary(
 			}
 			seen[ref] = struct{}{}
 		}
+		totalRefs += len(claim.PublicEvidenceRefs)
+		if totalRefs > maxPublicEvidenceRefsTotal {
+			return publicEvidenceSummaryV1{}, errors.New("too many public evidence refs")
+		}
 	}
 	for i := range summary.Gaps {
 		summary.Gaps[i] = strings.TrimSpace(summary.Gaps[i])
@@ -1133,6 +1147,10 @@ func decodePublicEvidenceSummary(
 	}
 	if len(summary.Claims) == 0 && len(summary.Gaps) == 0 {
 		return publicEvidenceSummaryV1{}, errors.New("empty public evidence summary")
+	}
+	canonical, err := json.Marshal(summary)
+	if err != nil || len(canonical) > maxPublicEvidenceSummaryBytes {
+		return publicEvidenceSummaryV1{}, errors.New("public evidence summary exceeds budget")
 	}
 	return summary, nil
 }
