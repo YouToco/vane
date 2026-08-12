@@ -32,4 +32,10 @@ func TestMigration127DurableRecoveryCursorBoundary(t *testing.T) {
 			t.Errorf("migration 127 lost boundary %q", fragment)
 		}
 	}
+	if got := strings.Count(sql, "-- +goose StatementBegin"); got != 1 {
+		t.Fatalf("migration 127 must keep its PL/pgSQL body in one goose statement, begin markers=%d", got)
+	}
+	if got := strings.Count(sql, "-- +goose StatementEnd"); got != 1 {
+		t.Fatalf("migration 127 must keep its PL/pgSQL body in one goose statement, end markers=%d", got)
+	}
 }

@@ -28,6 +28,7 @@ GRANT SELECT,INSERT,UPDATE ON schedule_command_recovery_cursors
 -- remains a per-user cross-tenant invariant, so expose only the aggregate
 -- integer after independently proving the exact tenant GUC and live
 -- membership. No schedule or operation identity crosses this boundary.
+-- +goose StatementBegin
 CREATE FUNCTION count_task_creation_capacity_v1(
     requested_tenant_id BIGINT,
     requested_user_id BIGINT
@@ -83,6 +84,7 @@ BEGIN
     RETURN used_capacity;
 END;
 $$;
+-- +goose StatementEnd
 
 REVOKE ALL ON FUNCTION count_task_creation_capacity_v1(BIGINT,BIGINT)
     FROM PUBLIC;
