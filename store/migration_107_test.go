@@ -63,6 +63,10 @@ func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *tes
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// This compatibility test freezes synthetic strong-model syntheses. Seed
+	// their price explicitly so paid-step admission does not depend on another
+	// test's execution order or shard assignment.
+	ensureResearchLLMPriceV3(t, st)
 
 	preparedFixture := newResearchBriefFixtureWithStoreAndWorkflowV3(
 		t, st, taskstate.NotificationThresholdMajorV3, true, nil, "", "")
