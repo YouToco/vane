@@ -324,7 +324,7 @@ func TestTaskDefinitionEditOperationBlocksLegacyReconcileAuthorization(t *testin
 	}
 
 	sc, releaseReconcile, err := f.state.store.AcquireScheduleReconcile(
-		ctx, f.op.TaskID,
+		ctx, f.op.TenantID, f.op.TaskID,
 	)
 	if err != nil {
 		t.Fatalf("AcquireScheduleReconcile = %+v, %v", sc, err)
@@ -345,7 +345,7 @@ func TestTaskDefinitionEditOperationBlocksLegacyReconcileAuthorization(t *testin
 	}
 
 	sc, releaseReconcile, err = f.state.store.AcquireScheduleReconcile(
-		ctx, f.op.TaskID,
+		ctx, f.op.TenantID, f.op.TaskID,
 	)
 	if err != nil {
 		t.Fatalf("AcquireScheduleReconcile after quiesce: %v", err)
@@ -963,17 +963,17 @@ func TestTaskDefinitionEditStaleTenantShardRLS(t *testing.T) {
 		}
 	}
 
-	tenantIDs, err := first.state.store.ListStaleTaskDefinitionEditTenantIDs(
-		ctx, time.Now().Add(time.Hour), 0, 1000)
+	tenantIDs, err := first.state.store.ListRecoveryTenantCatalogPage(
+		ctx, 0, maxRecoveryTenantCatalogPage)
 	if err != nil {
-		t.Fatalf("list stale tenant shards: %v", err)
+		t.Fatalf("list recovery tenant catalog: %v", err)
 	}
 	seenTenants := make(map[int64]bool, len(tenantIDs))
 	for _, tenantID := range tenantIDs {
 		seenTenants[tenantID] = true
 	}
 	if !seenTenants[first.op.TenantID] || !seenTenants[second.op.TenantID] {
-		t.Fatalf("stale tenant shards=%v, missing fixture tenants %d/%d",
+		t.Fatalf("recovery tenant catalog=%v, missing fixture tenants %d/%d",
 			tenantIDs, first.op.TenantID, second.op.TenantID)
 	}
 	for _, fixture := range []taskDefinitionEditOperationFixture{first, second} {

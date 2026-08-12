@@ -674,27 +674,28 @@ func (s *Store) BeginScheduleCommandAttempt(
 // re-authorized inside a tenant-scoped restricted-role transaction.
 func (s *Store) ListPendingScheduleCommands(
 	ctx context.Context,
-	afterTenantID int64,
+	tenantID int64,
 	afterID string,
 ) ([]types.ScheduleCommand, error) {
-	if afterTenantID < 0 || len(afterID) > 64 {
+	if tenantID <= 0 || len(afterID) > 64 {
 		return nil, types.NewAppError(
 			types.CodeValidation,
 			"任务命令恢复游标无效",
 			types.ErrValidation,
 		)
 	}
-	rows, err := s.pool.Query(ctx, `
+	tx, err := s.beginRecoveryTenantRead(ctx, tenantID, scheduleCommandRole)
+	if err != nil {
+		return nil, err
+	}
+	defer rollbackScheduleCommandTx(ctx, tx)
+	rows, err := tx.Query(ctx, `
 		SELECT `+scheduleCommandColumns+`
-		  FROM schedule_commands
-		 WHERE status='pending'
-		   AND (
-		       tenant_id > $1 OR
-		       (tenant_id = $1 AND id::text > $2)
-		   )
-		 ORDER BY tenant_id, id
+		  FROM public.schedule_commands
+		 WHERE tenant_id=$1 AND status='pending' AND id::text>$2
+		 ORDER BY id
 		 LIMIT $3`,
-		afterTenantID, afterID, scheduleCommandAttemptLimit,
+		tenantID, afterID, scheduleCommandAttemptLimit,
 	)
 	if err != nil {
 		return nil, types.NewAppError(
@@ -715,6 +716,12 @@ func (s *Store) ListPendingScheduleCommands(
 	if err := rows.Err(); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "遍历待恢复任务命令", err,
+		)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, types.NewAppError(
+			types.CodeDatabase, "提交待恢复任务命令扫描", err,
 		)
 	}
 	return commands, nil

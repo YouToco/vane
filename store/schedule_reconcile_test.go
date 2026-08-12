@@ -27,7 +27,8 @@ func TestAcquireScheduleReconcileAuthorizesFreshActiveRowAndSerializesMutation(t
 	}
 
 	acquireCtx, cancelAcquire := context.WithCancel(ctx)
-	sc, release, err := st.AcquireScheduleReconcile(acquireCtx, taskID)
+	sc, release, err := st.AcquireScheduleReconcile(
+		acquireCtx, f.tenantID, taskID)
 	if err != nil {
 		t.Fatalf("AcquireScheduleReconcile: %v", err)
 	}
@@ -71,7 +72,7 @@ func TestAcquireScheduleReconcileAuthorizesFreshActiveRowAndSerializesMutation(t
 	); err != nil {
 		t.Fatalf("pause fixture: %v", err)
 	}
-	sc, release, err = st.AcquireScheduleReconcile(ctx, taskID)
+	sc, release, err = st.AcquireScheduleReconcile(ctx, f.tenantID, taskID)
 	if err != nil {
 		t.Fatalf("AcquireScheduleReconcile paused: %v", err)
 	}

@@ -1370,59 +1370,6 @@ func (s *Store) RenewTaskDefinitionEditLease(
 	return nil
 }
 
-// ListStaleTaskDefinitionEditTenantIDs is the sole cross-tenant discovery
-// exception. It runs in an explicit read-only owner transaction and exposes
-// only tenant IDs; all row reads and every mutation are tenant-scoped below.
-func (s *Store) ListStaleTaskDefinitionEditTenantIDs(
-	ctx context.Context,
-	before time.Time,
-	afterTenantID int64,
-	limit int,
-) ([]int64, error) {
-	if before.IsZero() || afterTenantID < 0 || limit <= 0 || limit > 1000 {
-		return nil, taskDefinitionEditValidation("stale tenant query is invalid")
-	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, taskDefinitionEditDatabaseError("begin stale tenant discovery", err)
-	}
-	defer rollbackTaskDefinitionEditTx(ctx, tx)
-	rows, err := tx.Query(ctx,
-		`SELECT DISTINCT tenant_id
-		   FROM task_definition_edit_operations
-		  WHERE status=$1 AND tombstoned_at IS NULL AND tenant_id>$3
-		    AND operation_protocol=$5
-		    AND lease_owner<>'' AND fence>0 AND attempt>0
-		    AND lease_until IS NOT NULL AND takeover_not_before IS NOT NULL
-		    AND lease_until <= clock_timestamp()
-		    AND takeover_not_before <= LEAST($2, clock_timestamp())
-		  ORDER BY tenant_id
-		  LIMIT $4`, types.TaskDefinitionEditOperationStatusExecuting,
-		before, afterTenantID, limit,
-		types.TaskDefinitionEditProtocolLegacyV1V2)
-	if err != nil {
-		return nil, taskDefinitionEditDatabaseError("list stale tenant shards", err)
-	}
-	tenantIDs := make([]int64, 0)
-	for rows.Next() {
-		var tenantID int64
-		if err := rows.Scan(&tenantID); err != nil {
-			rows.Close()
-			return nil, taskDefinitionEditDatabaseError("scan stale tenant shard", err)
-		}
-		tenantIDs = append(tenantIDs, tenantID)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, taskDefinitionEditDatabaseError("iterate stale tenant shards", err)
-	}
-	rows.Close()
-	if err := tx.Commit(ctx); err != nil {
-		return nil, taskDefinitionEditDatabaseError("commit stale tenant discovery", err)
-	}
-	return tenantIDs, nil
-}
-
 // ListStaleTaskDefinitionEditOperations returns bounded recoverable rows for
 // one tenant, including suspended tenants. Membership state is irrelevant.
 func (s *Store) ListStaleTaskDefinitionEditOperations(

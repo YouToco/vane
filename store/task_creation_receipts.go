@@ -70,8 +70,15 @@ func (s *Store) LoadTaskCreationReceiptByOperation(
 		tenantID <= 0 || userID <= 0 {
 		return nil, taskCreationValidation("invalid receipt operation scope")
 	}
+	tx, err := s.beginTaskCreationTenantTx(ctx, tenantID, pgx.TxOptions{
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, taskCreationDatabaseError("begin task creation receipt load", err)
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
 	var receipt types.TaskCreationReceipt
-	err := scanTaskCreationReceipt(s.pool.QueryRow(ctx,
+	err = scanTaskCreationReceipt(tx.QueryRow(ctx,
 		taskCreationReceiptSelect(`
 		 WHERE r.operation_id = $1 AND r.tenant_id = $2 AND r.user_id = $3`),
 		operationID, tenantID, userID,
@@ -82,45 +89,10 @@ func (s *Store) LoadTaskCreationReceiptByOperation(
 		}
 		return nil, taskCreationDatabaseError("load task creation receipt", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit task creation receipt load", err)
+	}
 	return &receipt, nil
-}
-
-func (s *Store) ListDueTaskCreationReceiptTenantIDs(
-	ctx context.Context,
-	before time.Time,
-	afterTenantID int64,
-	limit int,
-) ([]int64, error) {
-	if before.IsZero() || afterTenantID < 0 || limit <= 0 || limit > 1000 {
-		return nil, taskCreationValidation("invalid due receipt tenant query")
-	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tenant_id
-		  FROM task_creation_receipts
-		 WHERE status = $1 AND tenant_id > $3
-		   AND provider <> '' AND target <> ''
-		   AND next_attempt_at <= LEAST($2, clock_timestamp())
-		   AND (lease_until IS NULL OR
-		        (takeover_not_before IS NOT NULL AND
-		         takeover_not_before <= LEAST($2, clock_timestamp())))
-		 ORDER BY tenant_id LIMIT $4`,
-		types.TaskCreationReceiptStatusPending, before, afterTenantID, limit)
-	if err != nil {
-		return nil, taskCreationDatabaseError("list due receipt tenant shards", err)
-	}
-	defer rows.Close()
-	tenantIDs := make([]int64, 0)
-	for rows.Next() {
-		var tenantID int64
-		if err := rows.Scan(&tenantID); err != nil {
-			return nil, taskCreationDatabaseError("scan due receipt tenant shard", err)
-		}
-		tenantIDs = append(tenantIDs, tenantID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, taskCreationDatabaseError("iterate due receipt tenant shards", err)
-	}
-	return tenantIDs, nil
 }
 
 func (s *Store) ListDueTaskCreationReceipts(
@@ -132,7 +104,12 @@ func (s *Store) ListDueTaskCreationReceipts(
 	if tenantID <= 0 || before.IsZero() || limit <= 0 || limit > 1000 {
 		return nil, taskCreationValidation("invalid due receipt query")
 	}
-	rows, err := s.pool.Query(ctx, taskCreationReceiptSelect(`
+	tx, err := s.beginRecoveryTenantRead(ctx, tenantID, "vane_app")
+	if err != nil {
+		return nil, err
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+	rows, err := tx.Query(ctx, taskCreationReceiptSelect(`
 		 WHERE r.tenant_id = $1 AND r.status = $2
 		   AND r.provider <> '' AND r.target <> ''
 		   AND r.next_attempt_at <= LEAST($3, clock_timestamp())
@@ -156,6 +133,10 @@ func (s *Store) ListDueTaskCreationReceipts(
 	if err := rows.Err(); err != nil {
 		return nil, taskCreationDatabaseError("iterate due task creation receipts", err)
 	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit due receipt list", err)
+	}
 	return receipts, nil
 }
 
@@ -166,7 +147,7 @@ func (s *Store) AcquireTaskCreationReceipt(
 	if err := validateAcquireTaskCreationReceiptParams(p); err != nil {
 		return nil, err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, p.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return nil, taskCreationDatabaseError("begin receipt acquisition", err)
 	}
@@ -239,7 +220,7 @@ func (s *Store) CheckpointTaskCreationReceiptPayload(
 	if hex.EncodeToString(sum[:]) != digest {
 		return taskCreationValidation("receipt payload digest differs")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin receipt payload checkpoint", err)
 	}
@@ -294,7 +275,7 @@ func (s *Store) RecordTaskCreationReceiptSessionMessages(
 	}
 	sum := sha256.Sum256(messages)
 	digest := hex.EncodeToString(sum[:])
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin receipt session checkpoint", err)
 	}
@@ -390,7 +371,7 @@ func (s *Store) MarkTaskCreationReceiptSent(
 		!utf8.ValidString(providerMessageID) {
 		return taskCreationValidation("provider message id is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin receipt sent checkpoint", err)
 	}
@@ -452,7 +433,7 @@ func (s *Store) RecordTaskCreationReceiptSendFailure(
 		(!retryable && p.RetryAfter != 0) {
 		return taskCreationValidation("receipt retry boundary is invalid")
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, p.Lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin receipt failure checkpoint", err)
 	}

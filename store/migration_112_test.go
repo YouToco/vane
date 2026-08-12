@@ -361,6 +361,10 @@ func TestMigration112DowngradeRejectsFrozenV32SnapshotPostgres(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// This downgrade test exercises snapshot retention, not provider pricing.
+	// Its synthetic strong-model must still satisfy the migration-091 paid-step
+	// admission that the fixture crosses before freezing the v3.2 snapshot.
+	ensureResearchLLMPriceV3(t, st)
 	model := testResearchModelPolicyStoreV3(t)
 	model.Synthesis.RendererVersion = runtimepolicy.ResearchSynthesisRendererVersionV32
 	model, err = runtimepolicy.BuildResearchModelPolicyV3(model)

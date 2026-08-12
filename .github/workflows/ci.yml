@@ -11,6 +11,7 @@ permissions:
 
 env:
   GOSUMDB: sum.golang.org
+  GOTOOLCHAIN: local
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -68,12 +69,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version: "1.26.5"
-          # The persistent Mac runner already reuses its local Go caches.
-          # Avoid uploading/restoring the much larger setup-go cache remotely.
-          cache: false
+      - name: Select pinned runner toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          go_root="${RUNNER_TOOL_CACHE}/go/1.26.5/arm64"
+          go_binary="${go_root}/bin/go"
+          [[ -x "${go_binary}" ]]
+          [[ "$("${go_binary}" version)" == "go version go1.26.5 linux/arm64" ]]
+          echo "GOROOT=${go_root}" >> "${GITHUB_ENV}"
+          echo "${go_root}/bin" >> "${GITHUB_PATH}"
 
       - name: Select trusted store timing cache
         id: store-timing-key
@@ -98,14 +103,25 @@ jobs:
             echo "key=store-race-timings-v1-${trusted_sha}" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Restore trusted store timings
+      - name: Restore trusted runner-local store timings
         if: steps.store-timing-key.outputs.key != ''
         continue-on-error: true
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: tmp/store-timing-cache
-          key: ${{ steps.store-timing-key.outputs.key }}
-          fail-on-cache-miss: false
+        shell: bash
+        env:
+          TIMING_KEY: ${{ steps.store-timing-key.outputs.key }}
+        run: |
+          set -euo pipefail
+          source_root="${RUNNER_TOOL_CACHE}/vane/store-race-timings-v1"
+          source_file="${source_root}/${TIMING_KEY}/store.timings.jsonl"
+          rm -rf tmp/store-timing-cache
+          if [[ -f "${source_file}" && ! -L "${source_file}" ]]; then
+            resolved_source="$(realpath "${source_file}")"
+            resolved_root="$(realpath "${source_root}")"
+            [[ "${resolved_source}" == "${resolved_root}"/* ]]
+            mkdir -p tmp/store-timing-cache
+            install -m 0644 "${resolved_source}" \
+              tmp/store-timing-cache/store.timings.jsonl
+          fi
 
       - name: Run store race shards
         shell: bash
@@ -147,8 +163,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # actions/cache includes the declared path in its version fingerprint.
-          # Restore and save must therefore use this exact same directory.
+          # The runner-local cache copies only this validated canonical seed;
+          # PR runs never publish timing data back into the trusted namespace.
           mkdir -p tmp/store-timing-cache
           go run ./cmd/storetestshard timing-seed \
             --tests tmp/store-sharding/store-tests.list.txt \
@@ -167,15 +183,21 @@ jobs:
             --tests tmp/store-sharding/store-tests.list.txt \
             tmp/store-timing-cache/store.timings.jsonl >/dev/null
 
-      - name: Save current main store timings
+      - name: Save current main store timings locally
         if: >-
           github.event_name == 'push' && github.ref == 'refs/heads/main' &&
           steps.store-timing-seed.outcome == 'success'
         continue-on-error: true
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: tmp/store-timing-cache
-          key: store-race-timings-v1-${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_root="${RUNNER_TOOL_CACHE}/vane/store-race-timings-v1"
+          target_dir="${target_root}/store-race-timings-v1-${GITHUB_SHA}"
+          mkdir -p "${target_dir}"
+          temp_file="$(mktemp "${target_dir}/.store.timings.XXXXXX")"
+          trap 'rm -f "${temp_file}"' EXIT
+          install -m 0644 tmp/store-timing-cache/store.timings.jsonl "${temp_file}"
+          mv -f "${temp_file}" "${target_dir}/store.timings.jsonl"
 
   rest:
     runs-on: [self-hosted, Linux, ARM64]
@@ -200,10 +222,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version: "1.26.5"
-          cache: false
+      - name: Select pinned runner toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          go_root="${RUNNER_TOOL_CACHE}/go/1.26.5/arm64"
+          go_binary="${go_root}/bin/go"
+          temporal_binary="${RUNNER_TOOL_CACHE}/temporal/1.8.2/arm64/temporal"
+          [[ -x "${go_binary}" ]]
+          [[ "$("${go_binary}" version)" == "go version go1.26.5 linux/arm64" ]]
+          [[ -x "${temporal_binary}" ]]
+          [[ "$("${temporal_binary}" --version)" == "temporal version 1.8.2"* ]]
+          echo "GOROOT=${go_root}" >> "${GITHUB_ENV}"
+          echo "VANE_TEMPORAL_CLI_PATH=${temporal_binary}" >> "${GITHUB_ENV}"
+          echo "${go_root}/bin" >> "${GITHUB_PATH}"
 
       - name: Download dependencies
         run: go mod download

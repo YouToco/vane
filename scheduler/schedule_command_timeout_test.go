@@ -288,6 +288,7 @@ func (s *scheduleCommandFirstRPCBlackhole) DeleteSchedule(
 }
 
 type scheduleCommandTimeoutStore struct {
+	scheduleCommandRecoveryMemoryCursor
 	scheduleStore
 	mu                         sync.Mutex
 	command                    *types.ScheduleCommand
@@ -431,6 +432,17 @@ func (s *scheduleCommandTimeoutStore) ListPendingScheduleCommands(
 		return nil, nil
 	}
 	return []types.ScheduleCommand{*s.command}, nil
+}
+
+func (s *scheduleCommandTimeoutStore) ListRecoveryTenantCatalogPage(
+	context.Context, int64, int,
+) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.command == nil {
+		return nil, nil
+	}
+	return []int64{s.command.TenantID}, nil
 }
 
 func (s *scheduleCommandTimeoutStore) state() (

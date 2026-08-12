@@ -378,11 +378,6 @@ func TestPushEffectCreateClaimFailureAndReceiptConverge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tenantIDs, err := f.store.ListRecoverablePushEffectTenantIDs(
-		ctx, f.prepared.TaskID, time.Now().Add(time.Minute), 0, 10)
-	if err != nil || len(tenantIDs) != 1 || tenantIDs[0] != f.prepared.TenantID {
-		t.Fatalf("recoverable tenant shards=%v err=%v", tenantIDs, err)
-	}
 	recoverable, err := f.store.ListRecoverablePushEffects(
 		ctx, f.prepared.TaskID, f.prepared.TenantID,
 		time.Now().Add(time.Minute), "", 10)
@@ -626,17 +621,6 @@ func TestRecoverablePushEffectDiscoveryUsesDBClockTaskAndKeyset(
 		t.Fatal(err)
 	}
 
-	if tenants, err := f.store.ListRecoverablePushEffectTenantIDs(
-		ctx, base.TaskID, cutoff, 0, 1,
-	); err != nil || len(tenants) != 1 || tenants[0] != base.TenantID {
-		t.Fatalf("tenant page=%v/%v", tenants, err)
-	}
-	if tenants, err := f.store.ListRecoverablePushEffectTenantIDs(
-		ctx, base.TaskID, cutoff, base.TenantID, 1,
-	); err != nil || len(tenants) != 0 {
-		t.Fatalf("tenant keyset tail=%v/%v", tenants, err)
-	}
-
 	var gotIDs []string
 	after := ""
 	for {
@@ -682,11 +666,6 @@ func TestRecoverablePushEffectDiscoveryUsesDBClockTaskAndKeyset(
 	); err != nil || len(siblingPage) != 1 ||
 		siblingPage[0].ID != sibling.ID {
 		t.Fatalf("sibling task page=%v/%v", siblingPage, err)
-	}
-	if _, err := f.store.ListRecoverablePushEffectTenantIDs(
-		ctx, " \n", cutoff, 0, 10,
-	); err == nil {
-		t.Fatal("malformed task ID was accepted")
 	}
 	if _, err := f.store.ListRecoverablePushEffects(
 		ctx, base.TaskID, base.TenantID, cutoff, " \n", 10,

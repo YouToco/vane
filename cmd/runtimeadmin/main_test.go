@@ -641,7 +641,11 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		"runs-on: [self-hosted, Linux, ARM64]",
 		"permissions:\n  contents: read",
 		"persist-credentials: false",
-		"cache: false",
+		"GOTOOLCHAIN: local",
+		`go_root="${RUNNER_TOOL_CACHE}/go/1.26.5/arm64"`,
+		`temporal_binary="${RUNNER_TOOL_CACHE}/temporal/1.8.2/arm64/temporal"`,
+		`source_root="${RUNNER_TOOL_CACHE}/vane/store-race-timings-v1"`,
+		`target_root="${RUNNER_TOOL_CACHE}/vane/store-race-timings-v1"`,
 		"- 5432/tcp",
 		"${{ job.services.postgres_0.ports['5432'] }}",
 		"${{ job.services.postgres.ports['5432'] }}",
@@ -652,8 +656,8 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		}
 	}
 	if got := strings.Count(workflow,
-		"          path: tmp/store-timing-cache\n"); got != 2 {
-		t.Errorf("source CI timing cache restore/save paths=%d, want 2", got)
+		"      - name: Select pinned runner toolchain\n"); got != 2 {
+		t.Errorf("source CI pinned toolchain selectors=%d, want 2", got)
 	}
 	for _, forbidden := range []string{
 		"vane-build",
@@ -665,6 +669,10 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		"- 5432:5432",
 		"@localhost:5432/",
 		"actions/upload-artifact",
+		"actions/setup-go@",
+		"actions/cache/restore@",
+		"actions/cache/save@",
+		"temporal.download",
 		"store-timing-cache-next",
 	} {
 		if strings.Contains(workflow, forbidden) {

@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -213,6 +216,297 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		}
 	})
 
+	// The compatibility cases above deliberately exercise schema 108. The
+	// recovery catalog and every remaining runtime boundary use the current
+	// contract, including the durable schedule-command recovery cursor.
+	if _, err := provider.UpTo(t.Context(), latestMigrationVersion); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("recovery catalog separates discovery from tenant payload reads", func(t *testing.T) {
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		user, err := st.UpsertUserByOpenID(t.Context(),
+			"ou-recovery-catalog-"+uuid.NewString(), "recovery catalog")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var tenantA, tenantB int64
+		if err := owner.QueryRowContext(t.Context(),
+			`INSERT INTO tenants(status,plan) VALUES('active','free') RETURNING id`).Scan(&tenantA); err != nil {
+			t.Fatal(err)
+		}
+		if err := owner.QueryRowContext(t.Context(),
+			`INSERT INTO tenants(status,plan) VALUES('active','free') RETURNING id`).Scan(&tenantB); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(), `
+			INSERT INTO memberships(tenant_id,user_id,role)
+			VALUES($1,$3,'owner'),($2,$3,'owner')`, tenantA, tenantB, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		taskA := "runtime-recovery-a-" + uuid.NewString()
+		taskB := "runtime-recovery-b-" + uuid.NewString()
+		if _, err := owner.ExecContext(t.Context(), `
+			INSERT INTO schedules
+			  (id,tenant_id,user_id,nl_description,spec_json,scope_json,status,execution_mode)
+			VALUES
+			  ($1,$3,$5,'tenant A','{}','{}','active','compiled'),
+			  ($2,$4,$5,'tenant B','{}','{}','active','compiled')`,
+			taskA, taskB, tenantA, tenantB, user.ID); err != nil {
+			t.Fatal(err)
+		}
+		commandID := uuid.New()
+		if _, err := owner.ExecContext(t.Context(), `
+			INSERT INTO schedule_commands
+			  (id,tenant_id,user_id,task_id,idempotency_key,kind,
+			   payload_digest,remote_request_id)
+			VALUES($1,$2,$3,$4,$5,'run',$6,$7)`,
+			commandID, tenantA, user.ID, taskA,
+			"runtime-recovery-"+uuid.NewString(), strings.Repeat("a", 64),
+			strings.Repeat("b", 64)); err != nil {
+			t.Fatal(err)
+		}
+
+		catalog, err := st.ListRecoveryTenantCatalogPage(
+			t.Context(), tenantA-1, maxRecoveryTenantCatalogPage)
+		if err != nil {
+			t.Fatalf("runtime recovery tenant catalog: %v", err)
+		}
+		contains := func(ids []int64, want int64) bool {
+			for _, id := range ids {
+				if id == want {
+					return true
+				}
+			}
+			return false
+		}
+		if !contains(catalog, tenantA) || !contains(catalog, tenantB) {
+			t.Fatalf("recovery catalog=%v, want tenants %d/%d", catalog, tenantA, tenantB)
+		}
+		activeA, err := st.ListActiveSchedules(t.Context(), tenantA)
+		if err != nil || len(activeA) != 1 || activeA[0].ID != taskA {
+			t.Fatalf("tenant A active schedules=%+v err=%v", activeA, err)
+		}
+		activeB, err := st.ListActiveSchedules(t.Context(), tenantB)
+		if err != nil || len(activeB) != 1 || activeB[0].ID != taskB {
+			t.Fatalf("tenant B active schedules=%+v err=%v", activeB, err)
+		}
+		commandsA, err := st.ListPendingScheduleCommands(t.Context(), tenantA, "")
+		if err != nil || len(commandsA) != 1 || commandsA[0].ID != commandID.String() {
+			t.Fatalf("tenant A commands=%+v err=%v", commandsA, err)
+		}
+		commandsB, err := st.ListPendingScheduleCommands(t.Context(), tenantB, "")
+		if err != nil || len(commandsB) != 0 {
+			t.Fatalf("tenant B saw tenant A commands=%+v err=%v", commandsB, err)
+		}
+		cursorTenant, cursorCommand, err := st.LoadScheduleCommandRecoveryCursor(t.Context())
+		if err != nil || cursorTenant != 0 || cursorCommand != "" {
+			t.Fatalf("initial durable command cursor=%d/%q err=%v",
+				cursorTenant, cursorCommand, err)
+		}
+		if err := st.SaveScheduleCommandRecoveryCursor(
+			t.Context(), tenantA, commandID.String(),
+		); err != nil {
+			t.Fatalf("save durable command cursor: %v", err)
+		}
+		cursorTenant, cursorCommand, err = st.LoadScheduleCommandRecoveryCursor(t.Context())
+		if err != nil || cursorTenant != tenantA || cursorCommand != commandID.String() {
+			t.Fatalf("durable command cursor=%d/%q err=%v",
+				cursorTenant, cursorCommand, err)
+		}
+		if err := st.SaveScheduleCommandRecoveryCursor(t.Context(), 0, ""); err != nil {
+			t.Fatalf("clear durable command cursor: %v", err)
+		}
+		reconciled, release, err := st.AcquireScheduleReconcile(
+			t.Context(), tenantA, taskA)
+		if err != nil || reconciled == nil || reconciled.ID != taskA || release == nil {
+			t.Fatalf("tenant A reconcile=%+v release=%v err=%v",
+				reconciled, release != nil, err)
+		}
+		if err := release(t.Context()); err != nil {
+			t.Fatalf("release tenant A reconcile: %v", err)
+		}
+		future := time.Now().Add(time.Hour)
+		assertEmpty := func(name string, count int, err error) {
+			t.Helper()
+			if err != nil || count != 0 {
+				t.Fatalf("%s count=%d err=%v", name, count, err)
+			}
+		}
+		creationOps, err := st.ListStaleTaskCreationOperations(
+			t.Context(), tenantA, future, 10)
+		assertEmpty("task creation recovery", len(creationOps), err)
+		creationReceipts, err := st.ListDueTaskCreationReceipts(
+			t.Context(), tenantA, future, 10)
+		assertEmpty("task creation receipt recovery", len(creationReceipts), err)
+		editOps, err := st.ListStaleTaskDefinitionEditOperations(
+			t.Context(), tenantA, future, 10)
+		assertEmpty("definition edit recovery", len(editOps), err)
+		nonterminalEdits, err := st.ListNonterminalTaskDefinitionEditOperations(
+			t.Context(), tenantA, "", 10)
+		assertEmpty("definition edit preflight", len(nonterminalEdits), err)
+		editReceipts, err := st.ListDueTaskDefinitionEditReceipts(
+			t.Context(), tenantA, future, 10)
+		assertEmpty("definition edit receipt recovery", len(editReceipts), err)
+		pushEffects, err := st.ListRecoverablePushEffects(
+			t.Context(), taskA, tenantA, future, "", 10)
+		assertEmpty("push effect recovery", len(pushEffects), err)
+		facts, err := st.ListDueAgentSessionFacts(
+			t.Context(), tenantA, future, 10)
+		assertEmpty("agent session fact recovery", len(facts), err)
+
+		// Prove the non-empty task-creation recovery chain through the actual
+		// server runtime role. Empty discovery assertions would not catch an
+		// RLS-scoped UPDATE that silently affected zero rows.
+		operationID := "runtime-creation-recovery-" + uuid.NewString()
+		created, err := st.CreateTaskCreationOperation(t.Context(),
+			types.CreateTaskCreationOperationParams{
+				ID: operationID, TenantID: tenantA, UserID: user.ID,
+				Args:    json.RawMessage(`{"intent":"runtime recovery proof"}`),
+				Summary: "runtime recovery proof", ExpiresAt: future,
+			})
+		if err != nil {
+			t.Fatalf("runtime create task creation operation: %v", err)
+		}
+		acquired, err := st.AcquireTaskCreationOperation(t.Context(),
+			types.AcquireTaskCreationOperationParams{
+				ID: created.ID, TenantID: tenantA, UserID: user.ID,
+				LeaseOwner: "runtime-recovery-worker", LeaseDuration: time.Minute,
+				ReceiptProvider: "feishu_message_patch",
+				ReceiptTarget:   "om_runtime_recovery",
+			})
+		if err != nil {
+			t.Fatalf("runtime acquire task creation operation: %v", err)
+		}
+		if err := st.SealTaskCreationCommand(
+			t.Context(), acquired.Lease(), []byte(`{"intent":"runtime recovery proof"}`),
+		); err != nil {
+			t.Fatalf("runtime checkpoint task creation operation: %v", err)
+		}
+		if err := st.FailTaskCreationOperation(
+			t.Context(), acquired.Lease(), "RUNTIME_RECOVERY_PROOF", "expected test terminal",
+		); err != nil {
+			t.Fatalf("runtime terminal task creation operation: %v", err)
+		}
+		if _, err := owner.ExecContext(t.Context(), `
+			UPDATE task_creation_receipts
+			   SET next_attempt_at=clock_timestamp()-interval '1 second'
+			 WHERE operation_id=$1`, operationID); err != nil {
+			t.Fatalf("age runtime receipt fixture: %v", err)
+		}
+		dueA, err := st.ListDueTaskCreationReceipts(
+			t.Context(), tenantA, future, 10)
+		if err != nil || len(dueA) != 1 || dueA[0].OperationID != operationID {
+			t.Fatalf("runtime tenant A due receipts=%+v err=%v", dueA, err)
+		}
+		dueB, err := st.ListDueTaskCreationReceipts(
+			t.Context(), tenantB, future, 10)
+		if err != nil || len(dueB) != 0 {
+			t.Fatalf("runtime tenant B saw tenant A receipt=%+v err=%v", dueB, err)
+		}
+		receipt, err := st.AcquireTaskCreationReceipt(t.Context(),
+			types.AcquireTaskCreationReceiptParams{
+				ID: dueA[0].ID, TenantID: tenantA, UserID: user.ID,
+				LeaseOwner: "runtime-receipt-worker", LeaseDuration: time.Minute,
+			})
+		if err != nil {
+			t.Fatalf("runtime acquire task creation receipt: %v", err)
+		}
+		payload := []byte(`{"text":"runtime receipt proof"}`)
+		sum := sha256.Sum256(payload)
+		digest := hex.EncodeToString(sum[:])
+		if err := st.CheckpointTaskCreationReceiptPayload(
+			t.Context(), receipt.Lease(), payload, digest,
+		); err != nil {
+			t.Fatalf("runtime checkpoint task creation receipt: %v", err)
+		}
+		if err := st.MarkTaskCreationReceiptSent(
+			t.Context(), receipt.Lease(), "om_runtime_receipt_sent",
+		); err != nil {
+			t.Fatalf("runtime terminal task creation receipt: %v", err)
+		}
+		loadedReceipt, err := st.LoadTaskCreationReceiptByOperation(
+			t.Context(), operationID, tenantA, user.ID)
+		if err != nil || loadedReceipt.Status != types.TaskCreationReceiptStatusSent {
+			t.Fatalf("runtime terminal receipt=%+v err=%v", loadedReceipt, err)
+		}
+
+		// Exercise the production first read (operation id + user, no tenant)
+		// and every activation/cleanup commit under NewServerRuntime. Fixture
+		// setup uses the owner Store only to create tenant/user roots.
+		ownerStore, err := New(t.Context(), scratchURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(ownerStore.Close)
+		creationFixture := newCompiledTaskFixture(t, ownerStore)
+		t.Cleanup(func() {
+			cleanupCtx, cancel := cleanupContext()
+			defer cancel()
+			cleanupExec(cleanupCtx, t, ownerStore,
+				`DELETE FROM task_creation_receipts WHERE tenant_id=$1`,
+				creationFixture.tenantID)
+			cleanupExec(cleanupCtx, t, ownerStore,
+				`DELETE FROM task_creation_operations WHERE tenant_id=$1`,
+				creationFixture.tenantID)
+		})
+		activation := preparedA5Commit(t, st, creationFixture, "runtime-activation")
+		resolved, err := st.LoadTaskCreationOperationByUser(
+			t.Context(), activation.Lease.ID, activation.Lease.UserID,
+		)
+		if err != nil || resolved.TenantID != activation.Lease.TenantID {
+			t.Fatalf("runtime production operation resolver=%+v err=%v", resolved, err)
+		}
+		if err := st.CommitPausedCompiledTaskDefinitionForCreation(
+			t.Context(), activation,
+		); err != nil {
+			t.Fatalf("runtime definition commit: %v", err)
+		}
+		started, err := st.BeginTaskCreationActivation(
+			t.Context(), activation.Lease, activation.Definition.TaskID,
+		)
+		if err != nil || !started {
+			t.Fatalf("runtime activation begin=%t err=%v", started, err)
+		}
+		if err := st.CommitTaskCreationActivation(
+			t.Context(), activation.Lease, activation.Definition.TaskID,
+		); err != nil {
+			t.Fatalf("runtime activation commit: %v", err)
+		}
+
+		cleanup := preparedA5Commit(t, st, creationFixture, "runtime-cleanup")
+		if err := st.CommitPausedCompiledTaskDefinitionForCreation(
+			t.Context(), cleanup,
+		); err != nil {
+			t.Fatalf("runtime cleanup definition commit: %v", err)
+		}
+		started, err = st.BeginTaskCreationCleanup(
+			t.Context(), cleanup.Lease, cleanup.Definition.TaskID,
+			"RUNTIME_CLEANUP_PROOF", "expected cleanup test",
+		)
+		if err != nil || !started {
+			t.Fatalf("runtime cleanup begin=%t err=%v", started, err)
+		}
+		if err := st.FinishTaskCreationCleanup(
+			t.Context(), cleanup.Lease, cleanup.Definition.TaskID,
+			types.TaskOperationStatusFailed,
+		); err != nil {
+			t.Fatalf("runtime cleanup finish: %v", err)
+		}
+
+		quarantine := preparedA5Commit(t, st, creationFixture, "runtime-quarantine")
+		if err := st.BlockTaskCreationOperationAfterSideEffect(
+			t.Context(), quarantine.Lease, quarantine.Definition.TaskID,
+			"RUNTIME_QUARANTINE_PROOF", "expected quarantine test",
+		); err != nil {
+			t.Fatalf("runtime side-effect quarantine: %v", err)
+		}
+	})
+
 	t.Run("exact profile and observability reads are tenant scoped", func(t *testing.T) {
 		st, err := NewServerRuntime(t.Context(), runtimeURL)
 		if err != nil {
@@ -416,13 +710,6 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 			})
 		}
 	})
-
-	// The preceding cases deliberately prove the schema-108 runtime boundary.
-	// The remaining V3 runtime cases use the current Store contract, including
-	// migrations 116/117's immutable schedule-status and quota bindings.
-	if _, err := provider.UpTo(t.Context(), 117); err != nil {
-		t.Fatal(err)
-	}
 
 	t.Run("V3 shadow binds exact app tenant and user scope", func(t *testing.T) {
 		ownerStore, err := New(t.Context(), scratchURL)

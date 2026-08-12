@@ -474,17 +474,6 @@ func TestAgentSessionFactNoActiveSessionSuppressedAndCorruptBlocked(
 		*suppressed.SuppressionReason != agentSessionFactSuppressedNoActive {
 		t.Fatalf("suppressed fact=%+v", suppressed)
 	}
-	tenantIDs, err := f.store.ListDueAgentSessionFactTenantIDs(
-		ctx, time.Now().Add(time.Hour), 0, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tenantID := range tenantIDs {
-		if tenantID == f.tenantA {
-			t.Fatal("suppressed fact must not be scanned")
-		}
-	}
-
 	if _, err := f.store.pool.Exec(ctx,
 		`UPDATE agent_sessions
 		    SET status='active',updated_at=clock_timestamp()

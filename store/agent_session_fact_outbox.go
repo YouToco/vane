@@ -97,48 +97,6 @@ func scanAgentSessionFact(row agentSessionFactScanner) (AgentSessionFact, error)
 	return fact, err
 }
 
-func (s *Store) ListDueAgentSessionFactTenantIDs(
-	ctx context.Context,
-	before time.Time,
-	afterTenantID int64,
-	limit int,
-) ([]int64, error) {
-	if before.IsZero() || afterTenantID < 0 || limit <= 0 ||
-		limit > maxAgentSessionFactPage {
-		return nil, agentEventValidationError(
-			"agent session fact tenant page is invalid")
-	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT tenant_id
-		   FROM agent_session_fact_outbox
-		  WHERE status='pending' AND tenant_id>$2
-		    AND next_attempt_at<=LEAST($1,clock_timestamp())
-		    AND (lease_expires_at IS NULL OR
-		         lease_expires_at<=clock_timestamp())
-		  ORDER BY tenant_id LIMIT $3`,
-		before, afterTenantID, limit,
-	)
-	if err != nil {
-		return nil, agentEventDatabaseError(
-			"list due agent session fact tenants", err)
-	}
-	defer rows.Close()
-	var tenantIDs []int64
-	for rows.Next() {
-		var tenantID int64
-		if err := rows.Scan(&tenantID); err != nil {
-			return nil, agentEventDatabaseError(
-				"scan due agent session fact tenant", err)
-		}
-		tenantIDs = append(tenantIDs, tenantID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, agentEventDatabaseError(
-			"iterate due agent session fact tenants", err)
-	}
-	return tenantIDs, nil
-}
-
 func (s *Store) ListDueAgentSessionFacts(
 	ctx context.Context,
 	tenantID int64,
@@ -150,9 +108,15 @@ func (s *Store) ListDueAgentSessionFacts(
 		return nil, agentEventValidationError(
 			"agent session fact page is invalid")
 	}
-	rows, err := s.pool.Query(ctx,
+	tx, err := s.beginRecoveryTenantRead(
+		ctx, tenantID, "vane_agent_session_fact_projector")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	rows, err := tx.Query(ctx,
 		`SELECT `+agentSessionFactColumns+`
-		   FROM agent_session_fact_outbox
+		   FROM public.agent_session_fact_outbox
 		  WHERE tenant_id=$1 AND status='pending'
 		    AND next_attempt_at<=LEAST($2,clock_timestamp())
 		    AND (lease_expires_at IS NULL OR
@@ -177,6 +141,11 @@ func (s *Store) ListDueAgentSessionFacts(
 	if err := rows.Err(); err != nil {
 		return nil, agentEventDatabaseError(
 			"iterate due agent session facts", err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, agentEventDatabaseError(
+			"commit due agent session fact list", err)
 	}
 	return facts, nil
 }

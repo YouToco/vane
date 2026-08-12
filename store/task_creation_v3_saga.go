@@ -480,44 +480,19 @@ func (s *Store) BlockResearchTaskCreationOperationV3(
 	return tx.Commit(ctx)
 }
 
-func (s *Store) ListStaleResearchTaskCreationTenantIDsV3(
-	ctx context.Context, before time.Time, afterTenantID int64, limit int,
-) ([]int64, error) {
-	if before.IsZero() || afterTenantID < 0 || limit <= 0 || limit > 1000 {
-		return nil, taskCreationValidation("invalid stale native V3 tenant query")
-	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tenant_id FROM task_creation_operations
-		 WHERE tool_name='manage_tasks' AND execution_version=$1 AND status=$2
-		   AND tenant_id>$3 AND tombstoned_at IS NULL
-		   AND lease_owner<>'' AND fence>0 AND attempt>0
-		   AND lease_until<=clock_timestamp()
-		   AND takeover_not_before<=LEAST($4,clock_timestamp())
-		 ORDER BY tenant_id LIMIT $5`, types.TaskCreationExecutionVersionV2,
-		types.TaskOperationStatusExecuting, afterTenantID, before, limit)
-	if err != nil {
-		return nil, taskCreationDatabaseError("list stale native V3 tenants", err)
-	}
-	defer rows.Close()
-	var out []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
-}
-
 func (s *Store) ListStaleResearchTaskCreationOperationsV3(
 	ctx context.Context, tenantID int64, before time.Time, limit int,
 ) ([]types.TaskCreationOperation, error) {
 	if tenantID <= 0 || before.IsZero() || limit <= 0 || limit > 1000 {
 		return nil, taskCreationValidation("invalid stale native V3 operation query")
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+taskCreationOperationColumns+`
-		 FROM task_creation_operations
+	tx, err := s.beginRecoveryTenantRead(ctx, tenantID, "vane_app")
+	if err != nil {
+		return nil, err
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+	rows, err := tx.Query(ctx, `SELECT `+taskCreationOperationColumns+`
+		 FROM public.task_creation_operations
 		 WHERE tenant_id=$1 AND tool_name='manage_tasks' AND execution_version=$2
 		   AND status=$3 AND tombstoned_at IS NULL AND lease_owner<>''
 		   AND fence>0 AND attempt>0 AND lease_until<=clock_timestamp()
@@ -537,7 +512,14 @@ func (s *Store) ListStaleResearchTaskCreationOperationsV3(
 		}
 		out = append(out, op)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, taskCreationDatabaseError("iterate stale native V3 operations", err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit stale native V3 operation list", err)
+	}
+	return out, nil
 }
 
 func loadScopedResearchTaskCreationOperationV3ForUpdate(

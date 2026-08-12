@@ -848,7 +848,7 @@ type definitionEditPreflightPagedStore struct {
 	operationCursors []string
 }
 
-func (s *definitionEditPreflightPagedStore) ListNonterminalTaskDefinitionEditTenantIDs(
+func (s *definitionEditPreflightPagedStore) ListRecoveryTenantCatalogPage(
 	_ context.Context,
 	afterTenantID int64,
 	_ int,
@@ -923,13 +923,26 @@ func (s *definitionEditCoordinatorFakeStore) CreateTaskDefinitionEditOperation(
 	return result, nil
 }
 
-func (s *definitionEditCoordinatorFakeStore) ListNonterminalTaskDefinitionEditTenantIDs(
+func (s *definitionEditCoordinatorFakeStore) ListRecoveryTenantCatalogPage(
 	_ context.Context,
 	afterTenantID int64,
-	_ int,
+	limit int,
 ) ([]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.cursors = append(s.cursors, afterTenantID)
+	if len(s.tenantIDs) > 0 {
+		result := make([]int64, 0, limit)
+		for _, tenantID := range s.tenantIDs {
+			if tenantID > afterTenantID {
+				result = append(result, tenantID)
+				if len(result) == limit {
+					break
+				}
+			}
+		}
+		return result, nil
+	}
 	if s.op == nil || s.op.TenantID <= afterTenantID ||
 		taskDefinitionEditOperationTerminal(s.op.Status) {
 		return nil, nil
@@ -1055,28 +1068,6 @@ func (s *definitionEditCoordinatorFakeStore) RenewTaskDefinitionEditLease(
 	}
 	s.events = append(s.events, "renew")
 	return nil
-}
-
-func (s *definitionEditCoordinatorFakeStore) ListStaleTaskDefinitionEditTenantIDs(
-	_ context.Context,
-	_ time.Time,
-	afterTenantID int64,
-	limit int,
-) ([]int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cursors = append(s.cursors, afterTenantID)
-	result := make([]int64, 0, limit)
-	for _, tenantID := range s.tenantIDs {
-		if tenantID <= afterTenantID {
-			continue
-		}
-		result = append(result, tenantID)
-		if len(result) == limit {
-			break
-		}
-	}
-	return result, nil
 }
 
 func (s *definitionEditCoordinatorFakeStore) ListStaleTaskDefinitionEditOperations(

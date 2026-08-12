@@ -52,9 +52,18 @@ func (*fakeAuthorityDiscoveryStore) ReadPushEffectRecoveryCutoff(context.Context
 	return time.Now(), nil
 }
 
-func (s *fakeAuthorityDiscoveryStore) ListRecoverablePushEffectTenantIDs(
-	ctx context.Context, taskID string, _ time.Time, _ int64, _ int,
+func (*fakeAuthorityDiscoveryStore) ListRecoveryTenantCatalogPage(
+	_ context.Context, afterTenantID int64, _ int,
 ) ([]int64, error) {
+	if afterTenantID > 0 {
+		return nil, nil
+	}
+	return []int64{1}, nil
+}
+
+func (s *fakeAuthorityDiscoveryStore) ListRecoverablePushEffects(
+	ctx context.Context, taskID string, _ int64, _ time.Time, _ string, _ int,
+) ([]pusheffect.Effect, error) {
 	s.mu.Lock()
 	s.runOrder = append(s.runOrder, taskID)
 	slow := s.slowTask == taskID
@@ -67,12 +76,6 @@ func (s *fakeAuthorityDiscoveryStore) ListRecoverablePushEffectTenantIDs(
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	return nil, nil
-}
-
-func (*fakeAuthorityDiscoveryStore) ListRecoverablePushEffects(
-	context.Context, string, int64, time.Time, string, int,
-) ([]pusheffect.Effect, error) {
 	return nil, nil
 }
 
