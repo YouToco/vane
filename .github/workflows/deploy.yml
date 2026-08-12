@@ -180,10 +180,9 @@ jobs:
   build:
     needs: plan
     if: needs.plan.outputs.any_changed == 'true'
-    # A fresh x64 VM is the build trust domain. It receives only read-only
-    # source keys and never receives production credentials. Ephemerality also
-    # removes host sleep and persistent-state inheritance from the release path.
-    runs-on: ubuntu-24.04
+    # The isolated build-only VM receives read-only source keys but no
+    # production credentials. It never runs PR-controlled code.
+    runs-on: [self-hosted, Linux, vane-build]
     timeout-minutes: 75
     env:
       BUILD_ROOT_NAME: vane-build-${{ github.run_id }}-${{ github.run_attempt }}
