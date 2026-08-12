@@ -1015,6 +1015,13 @@ func NewModelOwnerActionAuthorizer(client *llm.Client, recorder *llm.Recorder, m
 
 const authorizeOwnerActionSchema = `{"type":"object","properties":{"decision":{"type":"string","enum":["authorized","ambiguous","denied"]}},"required":["decision"],"additionalProperties":false}`
 
+// ownerActionAuthorizationMaxTokens leaves enough room for the provider's
+// native function-call envelope as well as the tiny decision payload. DeepSeek
+// V4 Flash consumes tokens for that envelope too: 32 truncated a valid
+// authorize_owner_action call with finish_reason=length in production. Keep
+// thinking disabled below and bound this dedicated authorization call at 128.
+const ownerActionAuthorizationMaxTokens = 128
+
 func (a *modelOwnerActionAuthorizer) AuthorizeOwnerAction(ctx context.Context, input OwnerActionAuthorization) (OwnerActionDecision, error) {
 	if a == nil || a.client == nil || strings.TrimSpace(input.OwnerRequest) == "" || len(input.Targets) == 0 {
 		return OwnerActionDenied, nil
@@ -1028,7 +1035,7 @@ func (a *modelOwnerActionAuthorizer) AuthorizeOwnerAction(ctx context.Context, i
 		return OwnerActionDenied, err
 	}
 	tenantID, userID := meta.scope.TenantID, meta.scope.UserID
-	maxTokens := 32
+	maxTokens := ownerActionAuthorizationMaxTokens
 	resp, err := llm.DoChat(ctx, a.client, a.recorder, llm.CallMeta{
 		TraceID: meta.traceID, TenantID: &tenantID, UserID: &userID,
 		SpanName: "authorize_owner_action",
