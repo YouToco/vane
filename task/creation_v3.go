@@ -117,23 +117,32 @@ func (c *ResearchCreationCoordinatorV3) RecoverStaleOnceV3(
 	passCtx, cancelPass := context.WithTimeout(ctx, creationRecoveryPassTimeout)
 	defer cancelPass()
 	boundary := time.Now()
-	tenantIDs, err := store.ListStaleResearchTaskCreationTenantIDsV3(
-		passCtx, boundary, c.inner.v3RecoveryCursor,
-		creationRecoveryTenantLimit,
+	tenantIDs, err := c.inner.store.ListRecoveryTenantCatalogPage(
+		passCtx, c.inner.recoveryCursor, creationRecoveryTenantLimit,
 	)
 	if err != nil {
 		return fmt.Errorf("list stale native V3 tenant shards: %w", err)
 	}
-	if c.inner.v3RecoveryCursor > 0 &&
+	if c.inner.recoveryCursor > 0 &&
 		len(tenantIDs) < creationRecoveryTenantLimit {
-		wrapped, wrapErr := store.ListStaleResearchTaskCreationTenantIDsV3(
-			passCtx, boundary, 0,
+		wrapped, wrapErr := c.inner.store.ListRecoveryTenantCatalogPage(
+			passCtx, 0,
 			creationRecoveryTenantLimit-len(tenantIDs),
 		)
 		if wrapErr != nil {
 			return fmt.Errorf("wrap stale native V3 tenant shards: %w", wrapErr)
 		}
-		tenantIDs = append(tenantIDs, wrapped...)
+		seen := make(map[int64]struct{}, len(tenantIDs)+len(wrapped))
+		for _, tenantID := range tenantIDs {
+			seen[tenantID] = struct{}{}
+		}
+		for _, tenantID := range wrapped {
+			if _, duplicate := seen[tenantID]; duplicate {
+				continue
+			}
+			seen[tenantID] = struct{}{}
+			tenantIDs = append(tenantIDs, tenantID)
+		}
 	}
 	operations := make([]types.TaskCreationOperation, 0,
 		creationRecoveryPassLimit)
@@ -142,10 +151,10 @@ func (c *ResearchCreationCoordinatorV3) RecoverStaleOnceV3(
 		if len(operations) >= creationRecoveryPassLimit {
 			break
 		}
-		c.inner.v3RecoveryCursor = tenantID
+		c.inner.recoveryCursor = tenantID
 		remaining := creationRecoveryPassLimit - len(operations)
 		shard, listErr := store.ListStaleResearchTaskCreationOperationsV3(
-			passCtx, tenantID, time.Now(),
+			passCtx, tenantID, boundary,
 			min(creationRecoveryPerTenant, remaining),
 		)
 		if listErr != nil {
