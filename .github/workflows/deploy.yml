@@ -188,7 +188,49 @@ jobs:
       BUILD_ROOT_NAME: vane-build-${{ github.run_id }}-${{ github.run_attempt }}
 
     services:
-      postgres:
+      postgres_rest:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: vane_test
+          POSTGRES_USER: vane
+          POSTGRES_PASSWORD: vane_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres_0:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: vane_test
+          POSTGRES_USER: vane
+          POSTGRES_PASSWORD: vane_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres_1:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: vane_test
+          POSTGRES_USER: vane
+          POSTGRES_PASSWORD: vane_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres_2:
         image: postgres:18-alpine
         env:
           POSTGRES_DB: vane_test
@@ -261,7 +303,7 @@ jobs:
         env:
           DATABASE_URL: >-
             postgres://vane:vane_test@localhost:${{
-              job.services.postgres.ports['5432']
+              job.services.postgres_rest.ports['5432']
             }}/vane_test?sslmode=disable
         run: |
           cd "$BUILD_ROOT/source/vane-gate"
@@ -273,12 +315,25 @@ jobs:
           go mod download
           go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
           go vet ./...
-          # DB-backed packages share one PostgreSQL service and some security
-          # tests deliberately mutate roles/ACLs. Match source CI by serializing
-          # packages and t.Parallel tests; explicit goroutine concurrency stays
-          # race-covered.
+          go run ./cmd/agenttoolinventory -check
+
+          # Match the source CI authority boundary. Store tests deliberately
+          # mutate roles, grants, migrations, pricing rows, and gateway
+          # receipts; one long-lived database makes later tests depend on the
+          # order and cleanup of unrelated fixtures. The reviewed sharder
+          # enumerates every top-level Store test exactly once and gives each
+          # shard a fresh PostgreSQL 18 instance.
+          go run ./cmd/storetestshard run \
+            --artifacts "$BUILD_ROOT/store-sharding" \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports['5432'] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports['5432'] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports['5432'] }}/vane_test?sslmode=disable'
+
+          store_package="$(go list ./store)"
+          mapfile -t packages < <(go list ./... | grep -Fvx "$store_package")
           go test -race -p=1 -parallel=1 -count=1 -timeout=40m \
-            -coverprofile=coverage.txt -covermode=atomic ./...
+            -coverprofile=non-store.coverage.out -covermode=atomic \
+            "${packages[@]}"
 
       - name: Rematerialize clean backend source for release
         if: needs.plan.outputs.backend_changed == 'true'
