@@ -301,6 +301,22 @@ func executeResearchPlannerToolSearchRoundsV33(
 			}
 			return plan, reservation, nil
 		}
+		// New v3.3 policies make a non-empty loaded_tools set final-only. Enforce
+		// that frozen policy in code as well as in prose: a redundant model search
+		// cannot create another catalog authority receipt after schemas are loaded.
+		// Older v3.3 snapshots lack this exact frozen policy marker and retain
+		// their historical multi-search replay semantics unchanged.
+		if seal.ResearchModel.Planner.SystemPrompt ==
+			runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly &&
+			plannerHasLoadedToolsV33(receipts) {
+			prompt, err = buildResearchPlannerCorrectionPromptV3(
+				prompt, runtimepolicy.ResearchPlannerRendererVersionV33)
+			if err != nil {
+				return runcontext.ResearchExecutionPlanV3{},
+					storepkg.ResearchRunLLMSpendReservationV3{}, err
+			}
+			continue
+		}
 		matches, searchErr := catalog.Search(decision.ToolSearch.Query, decision.ToolSearch.Limit)
 		if searchErr != nil {
 			return runcontext.ResearchExecutionPlanV3{}, storepkg.ResearchRunLLMSpendReservationV3{},
@@ -345,6 +361,17 @@ func executeResearchPlannerToolSearchRoundsV33(
 	}
 	return runcontext.ResearchExecutionPlanV3{}, storepkg.ResearchRunLLMSpendReservationV3{},
 		researchCoordinatorValidationV3("research planner exhausted its tool search budget")
+}
+
+func plannerHasLoadedToolsV33(
+	receipts []runcontext.ResearchPlannerToolSearchReceiptV1,
+) bool {
+	for _, receipt := range receipts {
+		if len(receipt.Matches) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalResearchPlannerArgumentsV33(toolName string, arguments json.RawMessage) (json.RawMessage, error) {

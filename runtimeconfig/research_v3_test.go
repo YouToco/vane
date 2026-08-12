@@ -49,14 +49,18 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		got.Model.GroundingVerifier == nil ||
 		got.Model.GroundingVerifier.Model != "strong-research-model" ||
 		got.Model.Planner.RendererVersion != runtimepolicy.ResearchPlannerRendererVersionV33 ||
+		got.Model.Planner.MaxTokens != 4096 ||
 		got.Model.Synthesis.RendererVersion != runtimepolicy.ResearchSynthesisRendererVersionV34 ||
 		got.Model.GroundingVerifier.RendererVersion !=
 			runtimepolicy.ResearchGroundingVerifierRendererVersionV12 ||
 		!got.Model.Planner.DisableThinking || !got.Model.Synthesis.DisableThinking ||
 		!got.Model.GroundingVerifier.DisableThinking ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "至少两条互补证据路径") ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "官方结构化工具") ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "搜索只可作为定位线索") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "query and limit only") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "both are required") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "next reply MUST be action=final") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "MUST NOT search again") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "official structured tool") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "two independent evidence paths") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "tool_failures") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "vane.research-brief/v3.1") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "vane.research-brief/v3.2") ||
