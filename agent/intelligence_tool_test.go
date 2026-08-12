@@ -31,6 +31,18 @@ func (f *historyQueryReplayStore) QueryMyIntelligence(
 	query store.IntelligenceQuery,
 ) (*store.IntelligenceQueryResult, error) {
 	f.queries = append(f.queries, query)
+	if query.Dataset == store.IntelligenceRuns {
+		for _, filter := range query.Filters {
+			if filter.Field == "outcome_status" && filter.Op == "eq" &&
+				string(filter.Value) == `"success"` {
+				return nil, types.NewAppError(
+					types.CodeValidation,
+					"情报查询字段 outcome_status 只接受 pending, finalized, ambiguous, failed, unavailable；不存在 success，运行是否产出情报需同时读取 result",
+					types.ErrValidation,
+				)
+			}
+		}
+	}
 	result := &store.IntelligenceQueryResult{
 		CatalogVersion: store.IntelligenceCatalogVersion,
 		Dataset:        query.Dataset,
@@ -41,11 +53,96 @@ func (f *historyQueryReplayStore) QueryMyIntelligence(
 		result.Coverage.Note = "仅完整覆盖当前任务定义；不覆盖任务运行、Brief 或 Observation，不能据此判断时间窗内有无新情报。"
 		result.Rows = []map[string]any{{"task_ref": "task-a", "task_name": "Kimi 套餐监控"}}
 	case store.IntelligenceRuns:
-		result.Rows = []map[string]any{{"task_ref": "task-a", "run_snapshot_id": "run-a", "outcome_status": "finalized"}}
+		result.Coverage.Note = "outcome_status 只表示运行记录状态，可取 pending/finalized/ambiguous/failed/unavailable，不存在 success；finalized 只表示已结算，是否产出情报必须同时读取 result=content/quiet/failed/interrupted。比较最近一次与上一次运行时不要先按 outcome_status 筛选，应按 created_at 倒序读取至少两行。"
+		result.Rows = []map[string]any{
+			{"task_ref": "task-a", "run_snapshot_id": "run-new", "outcome_status": "failed", "result": "failed", "created_at": "2026-08-12T08:00:00Z"},
+			{"task_ref": "task-a", "run_snapshot_id": "run-old", "outcome_status": "finalized", "result": "quiet", "created_at": "2026-08-09T08:00:00Z"},
+		}
 	case store.IntelligenceBriefs:
 		result.Rows = []map[string]any{{"task_ref": "task-a", "brief_preview": "发现一项重大更新"}}
 	}
 	return result, nil
+}
+
+func TestHistoricalRunComparisonUsesActualOutcomeSemantics(t *testing.T) {
+	const userRequest = "Kimi 今天相比上一次运行有什么变化？"
+	replay := &historyQueryReplayStore{fakeStore: newFakeStore()}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "tasks", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"tasks","filters":[{"field":"task_name","op":"contains","value":"Kimi"}],"limit":20}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "runs-invalid", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"runs","filters":[{"field":"task_ref","op":"eq","value":"task-a"},{"field":"outcome_status","op":"eq","value":"success"}],"order_by":[{"field":"created_at","direction":"desc"}],"limit":3}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "runs-corrected", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"runs","filters":[{"field":"task_ref","op":"eq","value":"task-a"}],"order_by":[{"field":"created_at","direction":"desc"}],"limit":3}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "briefs", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"briefs","filters":[{"field":"task_ref","op":"eq","value":"task-a"},{"field":"run_snapshot_id","op":"in","value":["run-new","run-old"]}],"limit":20}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "最近一次运行失败；上一次已结算且结果为 quiet。由于最近一次没有可比较的情报结论，不能声称内容发生了变化。", FinishReason: "stop"},
+	}}
+	loop := New(Deps{
+		Store: replay, Profiles: replay, OwnerAgent: true,
+		Evidence: &fakeAgentEvidenceWriter{},
+		Tools:    ownerTestTools(NewQueryMyIntelligenceTool(replay)),
+		Model:    "deepseek-v4-flash", MaxTurns: 6, SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+
+	out, err := loop.HandleMessage(t.Context(), 42, userRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Reply, "最近一次运行失败") || !strings.Contains(out.Reply, "不能声称") {
+		t.Fatalf("out=%+v", out)
+	}
+	if len(replay.queries) != 4 || replay.queries[1].Dataset != store.IntelligenceRuns ||
+		len(replay.queries[1].Filters) != 2 ||
+		string(replay.queries[1].Filters[1].Value) != `"success"` {
+		t.Fatalf("invalid comparison was not replayed: %+v", replay.queries)
+	}
+	corrected := replay.queries[2]
+	if corrected.Dataset != store.IntelligenceRuns || corrected.Limit < 2 ||
+		len(corrected.OrderBy) != 1 || corrected.OrderBy[0].Field != "created_at" ||
+		len(corrected.Filters) != 1 || corrected.Filters[0].Field != "task_ref" {
+		t.Fatalf("comparison queries=%+v", replay.queries)
+	}
+	if len(chat.requests) < 4 {
+		t.Fatalf("chat requests=%d", len(chat.requests))
+	}
+	invalidContext, err := json.Marshal(chat.requests[2].Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"query_my_intelligence 查询被拒绝：",
+		"不存在 success",
+		"同时读取 result",
+	} {
+		if !strings.Contains(string(invalidContext), required) {
+			t.Fatalf("rejection omitted %q: %s", required, invalidContext)
+		}
+	}
+	for _, unavailableBeforeRecovery := range []string{"run-new", "run-old"} {
+		if strings.Contains(string(invalidContext), unavailableBeforeRecovery) {
+			t.Fatalf("rejected query exposed %q before recovery: %s",
+				unavailableBeforeRecovery, invalidContext)
+		}
+	}
+	runsContext, err := json.Marshal(chat.requests[3].Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"不存在 success", "finalized 只表示已结算", "run-new", "run-old"} {
+		if !strings.Contains(string(runsContext), required) {
+			t.Fatalf("runs result omitted %q: %s", required, runsContext)
+		}
+	}
 }
 
 func (f *fakeIntelligenceQueryStore) QueryMyIntelligence(
@@ -141,6 +238,8 @@ func TestQueryMyIntelligenceSeparatesTaskDefinitionsFromHistoricalUpdates(t *tes
 		"省略 select 使用默认列",
 		"不自行猜窗口日期",
 		"不能用 tasks 空结果断言没有更新",
+		"outcome_status 只接受 pending/finalized/ambiguous/failed/unavailable",
+		"比较最近一次与上一次时按 created_at 倒序读取至少两条",
 	} {
 		if !strings.Contains(tool.Description(), required) {
 			t.Fatalf("query description is missing %q: %s", required, tool.Description())
@@ -155,6 +254,9 @@ func TestQueryMyIntelligenceSeparatesTaskDefinitionsFromHistoricalUpdates(t *tes
 		"不得自造 run_ref、brief_ref、result_summary、payload、coverage",
 		"不得自行猜测或平移窗口日期",
 		"tasks 空结果或 tasks.updated_at 无命中绝不能回答",
+		"runs.outcome_status 只表示运行记录状态",
+		"绝不存在 success",
+		"按 created_at 倒序读取至少两条运行",
 	} {
 		if !strings.Contains(systemPrompt, required) {
 			t.Fatalf("owner system prompt is missing %q", required)
@@ -168,6 +270,8 @@ func TestQueryMyIntelligenceSeparatesTaskDefinitionsFromHistoricalUpdates(t *tes
 		"briefs 默认 lineage,task_ref,run_snapshot_id,brief_preview",
 		"不存在 run_ref,brief_ref,result_summary,payload,coverage",
 		"仅定义/状态/计划变化",
+		"runs.outcome_status 只接受 pending/finalized/ambiguous/failed/unavailable",
+		"比较最近一次与上一次时按 created_at 倒序取至少两行",
 	} {
 		if !strings.Contains(queryMyIntelligenceSchema, required) {
 			t.Fatalf("query schema is missing %q", required)

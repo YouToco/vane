@@ -191,6 +191,42 @@ func TestCompileIntelligenceQueryRejectsSQLAndUnknownFields(t *testing.T) {
 	}
 }
 
+func TestCompileIntelligenceQueryRejectsInventedRunStatus(t *testing.T) {
+	st := &Store{}
+	base := IntelligenceQuery{
+		Dataset: IntelligenceRuns,
+		Filters: []IntelligenceFilter{{
+			Field: "outcome_status", Op: "eq", Value: json.RawMessage(`"success"`),
+		}},
+	}
+	_, err := st.compileIntelligenceQuery(
+		t.Context(), nil, IntelligenceScope{TenantID: 1, UserID: 2},
+		base, intelligenceCatalog[IntelligenceRuns],
+	)
+	if !errors.Is(err, types.ErrValidation) || !strings.Contains(err.Error(), "不存在 success") ||
+		!strings.Contains(err.Error(), "result") {
+		t.Fatalf("invented run status error=%v", err)
+	}
+
+	base.Filters[0].Value = json.RawMessage(`"finalized"`)
+	if _, err := st.compileIntelligenceQuery(
+		t.Context(), nil, IntelligenceScope{TenantID: 1, UserID: 2},
+		base, intelligenceCatalog[IntelligenceRuns],
+	); err != nil {
+		t.Fatalf("valid finalized status rejected: %v", err)
+	}
+
+	base.Filters[0] = IntelligenceFilter{
+		Field: "result", Op: "in", Value: json.RawMessage(`["content","quiet"]`),
+	}
+	if _, err := st.compileIntelligenceQuery(
+		t.Context(), nil, IntelligenceScope{TenantID: 1, UserID: 2},
+		base, intelligenceCatalog[IntelligenceRuns],
+	); err != nil {
+		t.Fatalf("valid result set rejected: %v", err)
+	}
+}
+
 func TestIntelligenceCursorBindsScopeAndQuery(t *testing.T) {
 	st := &Store{}
 	st.intelligenceCursorState = &intelligenceCursorState{
@@ -297,6 +333,21 @@ func TestIntelligenceTasksCoverageStatesDefinitionBoundary(t *testing.T) {
 	for _, required := range []string{"当前任务定义", "不覆盖任务运行", "Brief", "Observation", "不能据此判断"} {
 		if !strings.Contains(coverage.Note, required) {
 			t.Fatalf("tasks coverage note is missing %q: %q", required, coverage.Note)
+		}
+	}
+}
+
+func TestIntelligenceRunsCoveragePublishesStatusSemantics(t *testing.T) {
+	coverage := intelligenceCatalog[IntelligenceRuns].coverage
+	for _, required := range []string{
+		"pending/finalized/ambiguous/failed/unavailable",
+		"不存在 success",
+		"finalized 只表示已结算",
+		"result=content/quiet/failed/interrupted",
+		"created_at 倒序读取至少两行",
+	} {
+		if !strings.Contains(coverage.Note, required) {
+			t.Fatalf("runs coverage note is missing %q: %q", required, coverage.Note)
 		}
 	}
 }

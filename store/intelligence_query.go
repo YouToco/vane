@@ -106,6 +106,7 @@ type intelligenceColumnSpec struct {
 type intelligenceDatasetSpec struct {
 	base             string
 	columns          map[string]intelligenceColumnSpec
+	filterEnums      map[string][]string
 	defaults         []string
 	defaultOrder     []IntelligenceOrder
 	stableOrder      map[string]bool
@@ -174,10 +175,18 @@ var intelligenceCatalog = map[IntelligenceDataset]intelligenceDatasetSpec{
 			"execution_mode:text", "runtime_generation:text", "outcome_status:text", "result:text",
 			"source_coverage:text", "processing:text", "failure_code:text",
 			"failure_message:text", "finalized_at:time", "created_at:time"),
+		filterEnums: map[string][]string{
+			"outcome_status": {"pending", "finalized", "ambiguous", "failed", "unavailable"},
+			"result":         {"content", "quiet", "failed", "interrupted"},
+		},
 		defaults:     []string{"task_ref", "run_snapshot_id", "run_kind", "runtime_generation", "outcome_status", "result", "source_coverage", "processing", "finalized_at", "created_at"},
 		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
 		stableOrder:  intelligenceStableOrder("created_at", "record_id"),
-		coverage:     IntelligenceCoverage{Status: "mixed", Note: "运行快照自 migration 030 完整；061 前的运行没有 RunOutcome，逐行标记 outcome_status=unavailable。"}, relativeTimeZone: true,
+		coverage: IntelligenceCoverage{
+			Status: "mixed",
+			Note:   "运行快照自 migration 030 完整；061 前的运行没有 RunOutcome，逐行标记 outcome_status=unavailable。outcome_status 只表示运行记录状态，可取 pending/finalized/ambiguous/failed/unavailable，不存在 success；finalized 只表示已结算，是否产出情报必须同时读取 result=content/quiet/failed/interrupted。比较最近一次与上一次运行时不要先按 outcome_status 筛选，应按 created_at 倒序读取至少两行，并明确任何被跳过的失败或缺失运行。",
+		},
+		relativeTimeZone: true,
 	},
 	IntelligenceObservations: {
 		base: `SELECT p.tenant_id,p.user_id,
@@ -500,10 +509,18 @@ var intelligenceCatalogPreV3 = map[IntelligenceDataset]intelligenceDatasetSpec{
 			"execution_mode:text", "outcome_status:text", "result:text",
 			"source_coverage:text", "processing:text", "failure_code:text",
 			"failure_message:text", "finalized_at:time", "created_at:time"),
+		filterEnums: map[string][]string{
+			"outcome_status": {"pending", "finalized", "unavailable"},
+			"result":         {"content", "quiet", "failed", "interrupted"},
+		},
 		defaults:     []string{"task_ref", "run_snapshot_id", "run_kind", "outcome_status", "result", "source_coverage", "processing", "finalized_at", "created_at"},
 		defaultOrder: []IntelligenceOrder{{Field: "created_at", Direction: "desc"}, {Field: "record_id", Direction: "desc"}},
 		stableOrder:  intelligenceStableOrder("created_at", "record_id"),
-		coverage:     IntelligenceCoverage{Status: "mixed", Note: "运行快照自 migration 030 完整；061 前的运行没有 RunOutcome，逐行标记 outcome_status=unavailable。"}, relativeTimeZone: true,
+		coverage: IntelligenceCoverage{
+			Status: "mixed",
+			Note:   "运行快照自 migration 030 完整；061 前的运行没有 RunOutcome，逐行标记 outcome_status=unavailable。outcome_status 只表示运行记录状态，可取 pending/finalized/unavailable，不存在 success；finalized 只表示已结算，是否产出情报必须同时读取 result=content/quiet/failed/interrupted。比较最近一次与上一次运行时不要先按 outcome_status 筛选，应按 created_at 倒序读取至少两行。",
+		},
+		relativeTimeZone: true,
 	},
 	IntelligenceObservations: {
 		base: `SELECT p.tenant_id,p.user_id,
@@ -1121,6 +1138,7 @@ func compileIntelligenceFilter(
 	}
 	field := quoteIntelligenceIdent(filter.Field)
 	op := strings.ToLower(filter.Op)
+	allowedValues := spec.filterEnums[filter.Field]
 	if op == "within" {
 		if col.typ != "time" || location == nil {
 			return "", nil, types.NewAppError(types.CodeValidation,
@@ -1145,11 +1163,23 @@ func compileIntelligenceFilter(
 		if err := json.Unmarshal(filter.Value, &values); err != nil || len(values) == 0 || len(values) > 50 {
 			return "", nil, invalidIntelligenceFilterValue()
 		}
+		if err := validateIntelligenceFilterEnum(filter.Field, values, allowedValues); err != nil {
+			return "", nil, err
+		}
 		return fmt.Sprintf("%s = ANY($%d::text[])", field, firstParam), []any{values}, nil
 	}
 	value, err := decodeIntelligenceValue(filter.Value, col.typ)
 	if err != nil {
 		return "", nil, err
+	}
+	if len(allowedValues) > 0 {
+		text, ok := value.(string)
+		if !ok || (op != "eq" && op != "neq") {
+			return "", nil, invalidIntelligenceEnumFilter(filter.Field, allowedValues)
+		}
+		if err := validateIntelligenceFilterEnum(filter.Field, []string{text}, allowedValues); err != nil {
+			return "", nil, err
+		}
 	}
 	switch op {
 	case "eq":
@@ -1176,6 +1206,30 @@ func compileIntelligenceFilter(
 		return "", nil, types.NewAppError(types.CodeValidation,
 			"情报查询 filter.op 无效", types.ErrValidation)
 	}
+}
+
+func validateIntelligenceFilterEnum(field string, values, allowed []string) error {
+	if len(allowed) == 0 {
+		return nil
+	}
+	valid := make(map[string]struct{}, len(allowed))
+	for _, value := range allowed {
+		valid[value] = struct{}{}
+	}
+	for _, value := range values {
+		if _, ok := valid[value]; !ok {
+			return invalidIntelligenceEnumFilter(field, allowed)
+		}
+	}
+	return nil
+}
+
+func invalidIntelligenceEnumFilter(field string, allowed []string) error {
+	detail := fmt.Sprintf("情报查询字段 %s 只接受 %s", field, strings.Join(allowed, ", "))
+	if field == "outcome_status" {
+		detail += "；不存在 success，运行是否产出情报需同时读取 result"
+	}
+	return types.NewAppError(types.CodeValidation, detail, types.ErrValidation)
 }
 
 func decodeIntelligenceValue(raw json.RawMessage, typ string) (any, error) {

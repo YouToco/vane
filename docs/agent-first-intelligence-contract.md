@@ -27,6 +27,13 @@ v1/v2 已封存到 `AgentToolEvidenceV1` 的历史结果保持原字节和原版
 
 `briefs` 只联合终态：V3 `finalized` 是 `truth_coverage=exact`；`ambiguous/failed` 只保留 `unavailable` 缺口，绝不猜测结论。大 Brief 与 Evidence 使用相同的 8,192 字符不可变窗口和签名 keyset 续读，不存在 64 KiB 单行导致的不可达尾部。投递连接必须同时匹配 brief、tenant、user、task、snapshot 与 plan 全坐标。
 
+`runs.outcome_status` 是运行记录状态，不是“成功”布尔值。目录只接受
+`pending/finalized/ambiguous/failed/unavailable`，不存在 `success`；`finalized`
+仅说明终态已结算，实际是否有内容必须同时读取
+`result=content/quiet/failed/interrupted`。比较最近一次与上一次运行时，调用方应按
+不可变 `created_at` 倒序读取至少两行，不得先按 `outcome_status` 预筛；如果为了比较
+两次有结论的运行而跳过失败、未完成或缺失记录，必须在用户回答中显式披露。
+
 V3 研究综合读取 retained V1 Brief 时，`brief_snapshots.payload_digest` 是旧协议的
 Brief 语义摘要，不保证等于序列化正文的 SHA-256。`coverage=legacy` 的历史项保留这个
 不可变 artifact digest，同时用独立的 `context_visible_digest` 校验模型实际看到的 UTF-8
