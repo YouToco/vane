@@ -6,8 +6,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/agentcontext"
+	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
@@ -16,6 +18,34 @@ type fakeIntelligenceQueryStore struct {
 	scope store.IntelligenceScope
 	query store.IntelligenceQuery
 	err   error
+}
+
+type historyQueryReplayStore struct {
+	*fakeStore
+	queries []store.IntelligenceQuery
+}
+
+func (f *historyQueryReplayStore) QueryMyIntelligence(
+	_ context.Context,
+	_ store.IntelligenceScope,
+	query store.IntelligenceQuery,
+) (*store.IntelligenceQueryResult, error) {
+	f.queries = append(f.queries, query)
+	result := &store.IntelligenceQueryResult{
+		CatalogVersion: store.IntelligenceCatalogVersion,
+		Dataset:        query.Dataset,
+		Coverage:       store.IntelligenceCoverage{Status: "complete"},
+	}
+	switch query.Dataset {
+	case store.IntelligenceTasks:
+		result.Coverage.Note = "仅完整覆盖当前任务定义；不覆盖任务运行、Brief 或 Observation，不能据此判断时间窗内有无新情报。"
+		result.Rows = []map[string]any{{"task_ref": "task-a", "task_name": "Kimi 套餐监控"}}
+	case store.IntelligenceRuns:
+		result.Rows = []map[string]any{{"task_ref": "task-a", "run_snapshot_id": "run-a", "outcome_status": "finalized"}}
+	case store.IntelligenceBriefs:
+		result.Rows = []map[string]any{{"task_ref": "task-a", "brief_preview": "发现一项重大更新"}}
+	}
+	return result, nil
 }
 
 func (f *fakeIntelligenceQueryStore) QueryMyIntelligence(
@@ -128,10 +158,70 @@ func TestQueryMyIntelligenceSeparatesTaskDefinitionsFromHistoricalUpdates(t *tes
 	for _, required := range []string{
 		"tasks 是当前任务定义，不是历史情报活动",
 		"tasks.task_name",
+		"tasks 取得 task_ref",
 		"仅定义/状态/计划变化",
 	} {
 		if !strings.Contains(queryMyIntelligenceSchema, required) {
 			t.Fatalf("query schema is missing %q", required)
+		}
+	}
+}
+
+func TestHistoricalUpdateQuestionReplaysTasksRunsAndBriefsBeforeAnswer(t *testing.T) {
+	const userRequest = "请查询过去七天我的任务有哪些重大更新。只使用我自己的历史情报数据回答；按任务分别说明结论和证据覆盖，证据不足就明确说不足，不要查询外部网页，不要执行任何写操作。"
+	replay := &historyQueryReplayStore{fakeStore: newFakeStore()}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "tasks", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"tasks","select":["task_ref","task_name"],"limit":100}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "runs", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"runs","filters":[{"field":"task_ref","op":"eq","value":"task-a"},{"field":"created_at","op":"within","value":"last_7_days"}],"limit":100}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "briefs", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"briefs","filters":[{"field":"task_ref","op":"eq","value":"task-a"},{"field":"generated_at","op":"within","value":"last_7_days"}],"limit":100}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "Kimi 套餐监控：过去七天有一项重大更新；运行与简报覆盖完整。", FinishReason: "stop"},
+	}}
+	loop := New(Deps{
+		Store: replay, Profiles: replay, OwnerAgent: true,
+		Evidence: &fakeAgentEvidenceWriter{},
+		Tools:    ownerTestTools(NewQueryMyIntelligenceTool(replay)),
+		Model:    "deepseek-v4-pro", MaxTurns: 6, SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+
+	out, err := loop.HandleMessage(t.Context(), 42, userRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Reply, "重大更新") || len(replay.queries) != 3 {
+		t.Fatalf("out=%+v queries=%+v", out, replay.queries)
+	}
+	for i, want := range []store.IntelligenceDataset{
+		store.IntelligenceTasks, store.IntelligenceRuns, store.IntelligenceBriefs,
+	} {
+		if replay.queries[i].Dataset != want {
+			t.Fatalf("query[%d].dataset=%q want=%q", i, replay.queries[i].Dataset, want)
+		}
+	}
+	if len(replay.queries[0].Filters) != 0 {
+		t.Fatalf("tasks lookup must not use a history window: %+v", replay.queries[0])
+	}
+	for _, index := range []int{1, 2} {
+		if len(replay.queries[index].Filters) != 2 || replay.queries[index].Filters[0].Field != "task_ref" {
+			t.Fatalf("history query[%d] is not task_ref-bound: %+v", index, replay.queries[index])
+		}
+	}
+	encoded, err := json.Marshal(chat.requests[1].Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"仅完整覆盖当前任务定义", "不覆盖任务运行", "不能据此判断"} {
+		if !strings.Contains(string(encoded), required) {
+			t.Fatalf("tasks result did not preserve coverage warning %q: %s", required, encoded)
 		}
 	}
 }

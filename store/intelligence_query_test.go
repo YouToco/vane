@@ -288,3 +288,15 @@ func TestIntelligenceAuditSummaryIsBounded(t *testing.T) {
 		t.Fatalf("audit summary bytes=%d", len(summary))
 	}
 }
+
+func TestIntelligenceTasksCoverageStatesDefinitionBoundary(t *testing.T) {
+	coverage := intelligenceCatalog[IntelligenceTasks].coverage
+	if coverage.Status != "complete" {
+		t.Fatalf("tasks coverage status=%q", coverage.Status)
+	}
+	for _, required := range []string{"当前任务定义", "不覆盖任务运行", "Brief", "Observation", "不能据此判断"} {
+		if !strings.Contains(coverage.Note, required) {
+			t.Fatalf("tasks coverage note is missing %q: %q", required, coverage.Note)
+		}
+	}
+}
