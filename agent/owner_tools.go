@@ -113,7 +113,7 @@ const queryMyIntelligenceSchema = `{
     },
     "select": {
       "type": "array", "maxItems": 32, "items": {"type":"string"},
-      "description": "要返回的目录字段；省略使用该数据集的默认列"
+      "description": "要返回的真实目录字段；不完全确定时必须省略 select，默认列足够回答历史更新问题。tasks 默认 task_ref,task_name,playbook,status,schedule,updated_at；runs 默认 task_ref,run_snapshot_id,run_kind,runtime_generation,outcome_status,result,source_coverage,processing,finalized_at,created_at；briefs 默认 lineage,task_ref,run_snapshot_id,brief_preview,brief_digest,status,significance,decision,delivery_required,failure_code,delivery_status,truth_coverage,payload_coverage,payload_offset,payload_total_chars,payload_total_bytes,payload_complete,generated_at,created_at；observations 默认 lineage,task_ref,run_snapshot_id,invocation_ref,tool_name,model_visible_result,result_digest,stored_size,original_size,source_truncated,payload_coverage,evidence_coverage,trust_type,payload_offset,payload_total_chars,payload_complete,content_count,created_at。不存在 run_ref,brief_ref,result_summary,payload,coverage 通用字段"
     },
     "filters": {
       "type": "array", "maxItems": 16,
@@ -122,7 +122,7 @@ const queryMyIntelligenceSchema = `{
         "properties": {
           "field": {
             "type":"string",
-            "description":"目录字段名，不得自造 name 等字段。任务名称字段是 tasks.task_name。相对时间通常使用：tasks.updated_at（仅定义/状态/计划变化）；runs.created_at 或 finalized_at；observations.created_at；briefs.generated_at；agent_turns.created_at；tool_calls.created_at；profile.updated_at。"
+            "description":"真实目录字段名，不得自造 name、run_ref、brief_ref、result_summary、payload、coverage 等字段。任务名称字段是 tasks.task_name，跨历史数据集关联字段是 task_ref。相对时间通常使用：tasks.updated_at（仅定义/状态/计划变化）；runs.created_at 或 finalized_at；observations.created_at；briefs.generated_at；agent_turns.created_at；tool_calls.created_at；profile.updated_at。within 由 Store 按任务时区解析，不要自行计算日期边界"
           },
           "op": {"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","in","within"]},
           "value": {"description":"与字段类型匹配的 JSON 值；within 使用 today、yesterday 或 last_7_days"}
@@ -166,7 +166,7 @@ type queryMyIntelligenceTool struct{ st intelligenceQueryStore }
 
 func (*queryMyIntelligenceTool) Name() string { return "query_my_intelligence" }
 func (*queryMyIntelligenceTool) Description() string {
-	return "查询当前用户自己的任务、历史运行、legacy/V3 Observation/Evidence、legacy/V3 Brief、历史 Agent 回答、模型实际看到的工具证据、画像或推送反馈。tasks 只表示当前任务定义，tasks.updated_at 只表示定义、状态或计划变化；‘过去七天有哪些重大更新’等历史情报问题先用 tasks.task_name 定位任务且不要按时间过滤定义，保存返回的 task_ref，再用 task_ref 查询时间窗内的 runs 和 briefs，必要时查询 observations，不能用 tasks 空结果断言没有更新。observations/briefs 的 coverage 会区分 exact、unavailable、全文与分窗，payload_complete=false 或 truncated=true 时必须原样携带 next_cursor 连续查询到完整尾部，不能补猜；用户用‘刚才那条’、‘我点的’等方式指代卡片操作时查询 feedbacks，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
+	return "查询当前用户自己的任务、历史运行、legacy/V3 Observation/Evidence、legacy/V3 Brief、历史 Agent 回答、模型实际看到的工具证据、画像或推送反馈。tasks 只表示当前任务定义，tasks.updated_at 只表示定义、状态或计划变化；‘过去七天有哪些重大更新’等历史情报问题先用 tasks.task_name 定位任务且不要按时间过滤定义，保存返回的 task_ref，再用 task_ref 查询时间窗内的 runs 和 briefs，必要时查询 observations，不能用 tasks 空结果断言没有更新。字段不完全确定时省略 select 使用默认列，绝不自造 run_ref、brief_ref、result_summary、payload、coverage 等字段；within 由 Store 按任务时区解析，不自行猜窗口日期。observations/briefs 的 coverage 会区分 exact、unavailable、全文与分窗，payload_complete=false 或 truncated=true 时必须原样携带 next_cursor 连续查询到完整尾部，不能补猜；用户用‘刚才那条’、‘我点的’等方式指代卡片操作时查询 feedbacks，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
 }
 func (*queryMyIntelligenceTool) Parameters() json.RawMessage {
 	return json.RawMessage(queryMyIntelligenceSchema)
