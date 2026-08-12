@@ -103,67 +103,6 @@ func (s *Store) LoadTaskDefinitionEditReceiptByOperation(
 	return &receipt, nil
 }
 
-// ListDueTaskDefinitionEditReceiptTenantIDs is the sole receipt-discovery
-// exception to tenant-scoped RLS. It runs as the connection owner/admin, is
-// READ ONLY, returns only distinct tenant IDs, and is both keyset-paginated and
-// hard bounded. Every follow-up read and mutation must re-enter the restricted
-// receipt role with one explicit tenant context.
-func (s *Store) ListDueTaskDefinitionEditReceiptTenantIDs(
-	ctx context.Context,
-	before time.Time,
-	afterTenantID int64,
-	limit int,
-) ([]int64, error) {
-	if before.IsZero() || afterTenantID < 0 || limit <= 0 || limit > 1000 {
-		return nil, taskDefinitionEditReceiptValidation(
-			"task definition edit due receipt tenant query is invalid")
-	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, taskDefinitionEditReceiptDatabaseError(
-			"begin due receipt tenant discovery", err)
-	}
-	defer rollbackTaskDefinitionEditTx(ctx, tx)
-
-	rows, err := tx.Query(ctx, `
-		SELECT DISTINCT tenant_id
-		  FROM task_definition_edit_receipts
-		 WHERE status = $1 AND tenant_id > $3
-		   AND provider <> '' AND target <> ''
-		   AND next_attempt_at <= LEAST($2, clock_timestamp())
-		   AND (lease_until IS NULL OR
-		        (takeover_not_before IS NOT NULL AND
-		         takeover_not_before <= LEAST($2, clock_timestamp())))
-		 ORDER BY tenant_id
-		 LIMIT $4`,
-		types.TaskDefinitionEditReceiptStatusPending, before, afterTenantID, limit)
-	if err != nil {
-		return nil, taskDefinitionEditReceiptDatabaseError(
-			"list due receipt tenant shards", err)
-	}
-	defer rows.Close()
-
-	tenantIDs := make([]int64, 0)
-	for rows.Next() {
-		var tenantID int64
-		if err := rows.Scan(&tenantID); err != nil {
-			return nil, taskDefinitionEditReceiptDatabaseError(
-				"scan due receipt tenant shard", err)
-		}
-		tenantIDs = append(tenantIDs, tenantID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, taskDefinitionEditReceiptDatabaseError(
-			"iterate due receipt tenant shards", err)
-	}
-	rows.Close()
-	if err := tx.Commit(ctx); err != nil {
-		return nil, taskDefinitionEditReceiptDatabaseError(
-			"commit due receipt tenant discovery", err)
-	}
-	return tenantIDs, nil
-}
-
 func (s *Store) ListDueTaskDefinitionEditReceipts(
 	ctx context.Context,
 	tenantID int64,

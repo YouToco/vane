@@ -24,8 +24,8 @@ const definitionEditReceiptPayloadVersion = "vane.task-definition-edit-session-r
 // by the C2b3-2d receipt dispatcher. It cannot mutate edit operations or
 // reconstruct their terminal state.
 type DefinitionEditReceiptStore interface {
-	ListDueTaskDefinitionEditReceiptTenantIDs(
-		context.Context, time.Time, int64, int,
+	ListRecoveryTenantCatalogPage(
+		context.Context, int64, int,
 	) ([]int64, error)
 	ListDueTaskDefinitionEditReceipts(
 		context.Context, int64, time.Time, int,
@@ -139,16 +139,16 @@ func (d *DefinitionEditReceiptDispatcher) DispatchOnce(
 	defer d.dispatchMu.Unlock()
 
 	boundary := time.Now().Add(24 * time.Hour)
-	tenantIDs, err := d.store.ListDueTaskDefinitionEditReceiptTenantIDs(
-		ctx, boundary, d.cursor, creationReceiptTenantLimit,
+	tenantIDs, err := d.store.ListRecoveryTenantCatalogPage(
+		ctx, d.cursor, creationReceiptTenantLimit,
 	)
 	if err != nil {
 		return fmt.Errorf("list definition edit receipt tenant shards: %w", err)
 	}
 	if len(tenantIDs) == 0 && d.cursor > 0 {
 		tenantIDs, err =
-			d.store.ListDueTaskDefinitionEditReceiptTenantIDs(
-				ctx, boundary, 0, creationReceiptTenantLimit,
+			d.store.ListRecoveryTenantCatalogPage(
+				ctx, 0, creationReceiptTenantLimit,
 			)
 		if err != nil {
 			return fmt.Errorf(

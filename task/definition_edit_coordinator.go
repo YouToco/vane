@@ -61,9 +61,8 @@ type TaskDefinitionEditStore interface {
 		types.TaskDefinitionEditLease,
 		time.Duration,
 	) error
-	ListStaleTaskDefinitionEditTenantIDs(
+	ListRecoveryTenantCatalogPage(
 		context.Context,
-		time.Time,
 		int64,
 		int,
 	) ([]int64, error)
@@ -73,11 +72,6 @@ type TaskDefinitionEditStore interface {
 		time.Time,
 		int,
 	) ([]types.TaskDefinitionEditOperation, error)
-	ListNonterminalTaskDefinitionEditTenantIDs(
-		context.Context,
-		int64,
-		int,
-	) ([]int64, error)
 	ListNonterminalTaskDefinitionEditOperations(
 		context.Context,
 		int64,
@@ -244,7 +238,7 @@ func (c *TaskDefinitionEditCoordinator) ValidateRuntimeEnvironment(
 		scanned       int
 	)
 	for {
-		tenantIDs, err := c.store.ListNonterminalTaskDefinitionEditTenantIDs(
+		tenantIDs, err := c.store.ListRecoveryTenantCatalogPage(
 			ctx, afterTenantID, taskDefinitionEditPreflightTenantLimit,
 		)
 		if err != nil {
@@ -1098,16 +1092,15 @@ func (c *TaskDefinitionEditCoordinator) RecoverStaleOnce(ctx context.Context) er
 
 	passCtx, cancel := context.WithTimeout(ctx, taskDefinitionEditRecoveryPassTimeout)
 	defer cancel()
-	boundary := time.Now()
-	tenantIDs, err := c.store.ListStaleTaskDefinitionEditTenantIDs(
-		passCtx, boundary, c.recoveryCursor, taskDefinitionEditRecoveryTenantLimit,
+	tenantIDs, err := c.store.ListRecoveryTenantCatalogPage(
+		passCtx, c.recoveryCursor, taskDefinitionEditRecoveryTenantLimit,
 	)
 	if err != nil {
 		return fmt.Errorf("list stale task definition edit tenant shards: %w", err)
 	}
 	if c.recoveryCursor > 0 && len(tenantIDs) < taskDefinitionEditRecoveryTenantLimit {
-		wrapped, wrapErr := c.store.ListStaleTaskDefinitionEditTenantIDs(
-			passCtx, boundary, 0,
+		wrapped, wrapErr := c.store.ListRecoveryTenantCatalogPage(
+			passCtx, 0,
 			taskDefinitionEditRecoveryTenantLimit-len(tenantIDs),
 		)
 		if wrapErr != nil {

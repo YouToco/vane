@@ -68,7 +68,7 @@ func (s *Store) CreateTaskCreationOperation(
 		return nil, err
 	}
 
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, p.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return nil, taskCreationDatabaseError("begin operation creation", err)
 	}
@@ -216,7 +216,7 @@ func (s *Store) loadTaskCreationOperationCreationReplay(
 	ctx context.Context,
 	p types.CreateTaskCreationOperationParams,
 ) (*types.TaskCreationOperation, error) {
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, p.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return nil, taskCreationDatabaseError("begin operation creation replay", err)
 	}
@@ -259,7 +259,7 @@ func (s *Store) AcquireTaskCreationOperation(
 		return nil, err
 	}
 
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, p.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return nil, taskCreationDatabaseError("begin acquisition", err)
 	}
@@ -502,8 +502,15 @@ func (s *Store) LoadTaskCreationOperation(
 	if id == "" || tenantID <= 0 || userID <= 0 {
 		return nil, taskCreationValidation("invalid operation scope")
 	}
+	tx, err := s.beginTaskCreationTenantTx(ctx, tenantID, pgx.TxOptions{
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, taskCreationDatabaseError("begin operation load", err)
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
 	var op types.TaskCreationOperation
-	err := scanTaskCreationOperation(s.pool.QueryRow(ctx,
+	err = scanTaskCreationOperation(tx.QueryRow(ctx,
 		`SELECT `+taskCreationOperationColumns+`
 		   FROM task_creation_operations
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
@@ -516,14 +523,18 @@ func (s *Store) LoadTaskCreationOperation(
 		}
 		return nil, taskCreationDatabaseError("load operation", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit operation load", err)
+	}
 	return &op, nil
 }
 
-// LoadTaskCreationOperationByUser resolves the durable tenant scope from the
-// v1 operation itself. It deliberately does not route through the user's
-// current/active memberships: a suspended or multi-membership user must still
-// be able to resume or clean up the exact operation they started.
-// Wrong-user, v0, wrong-tool and missing rows are indistinguishable.
+// LoadTaskCreationOperationByUser resolves the durable tenant scope through the
+// recovery tenant catalog, then re-enters one tenant-scoped RLS transaction per
+// candidate. It never performs a cross-tenant business-row query. Suspended
+// tenants remain visible in the catalog, so recovery does not depend on current
+// membership state. Wrong-user, v0, wrong-tool and missing rows remain
+// indistinguishable.
 func (s *Store) LoadTaskCreationOperationByUser(
 	ctx context.Context,
 	id string,
@@ -533,21 +544,30 @@ func (s *Store) LoadTaskCreationOperationByUser(
 		len(id) > 255 || userID <= 0 {
 		return nil, taskCreationValidation("invalid operation lookup scope")
 	}
-	var op types.TaskCreationOperation
-	err := scanTaskCreationOperation(s.pool.QueryRow(ctx,
-		`SELECT `+taskCreationOperationColumns+`
-		   FROM task_creation_operations
-		  WHERE id = $1 AND user_id = $2
-		    AND tool_name = 'create_schedule' AND execution_version = $3`,
-		id, userID, types.TaskCreationExecutionVersionV1,
-	), &op)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	var afterTenantID int64
+	for {
+		tenantIDs, err := s.ListRecoveryTenantCatalogPage(
+			ctx, afterTenantID, maxRecoveryTenantCatalogPage,
+		)
+		if err != nil {
+			return nil, taskCreationDatabaseError(
+				"resolve operation tenant catalog", err,
+			)
+		}
+		for _, tenantID := range tenantIDs {
+			op, err := s.LoadTaskCreationOperation(ctx, id, tenantID, userID)
+			if err == nil {
+				return op, nil
+			}
+			if !errors.Is(err, types.ErrNotFound) {
+				return nil, err
+			}
+			afterTenantID = tenantID
+		}
+		if len(tenantIDs) < maxRecoveryTenantCatalogPage {
 			return nil, taskCreationNotFound()
 		}
-		return nil, taskCreationDatabaseError("load operation by user", err)
 	}
-	return &op, nil
 }
 
 // RenewTaskCreationLease extends only a still-active lease with the exact
@@ -564,7 +584,7 @@ func (s *Store) RenewTaskCreationLease(
 	if err := validateTaskCreationDuration(duration, maxTaskCreationLease, "lease duration"); err != nil {
 		return err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin lease renewal", err)
 	}
@@ -637,7 +657,7 @@ func (s *Store) BeginTaskCreationTranslation(
 		return false, err
 	}
 
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return false, taskCreationDatabaseError("begin translation checkpoint", err)
 	}
@@ -804,58 +824,6 @@ func (s *Store) CompleteTaskCreationOperation(
 	})
 }
 
-// ListStaleTaskCreationTenantIDs enumerates tenant shards which contain at
-// least one truly takeover-safe v1 operation. afterTenantID is an exclusive,
-// stable keyset cursor; the coordinator wraps it to zero at the end. Ordering
-// by tenant identity (rather than repeatedly taking the oldest top-N page)
-// guarantees that a permanently failing early shard cannot starve later ones.
-// The caller-supplied boundary is clamped to the database clock, so a
-// skewed/future process clock cannot make a still-owned operation recoverable
-// early.
-func (s *Store) ListStaleTaskCreationTenantIDs(
-	ctx context.Context,
-	before time.Time,
-	afterTenantID int64,
-	limit int,
-) ([]int64, error) {
-	if before.IsZero() || afterTenantID < 0 || limit <= 0 || limit > 1000 {
-		return nil, taskCreationValidation("invalid stale tenant query")
-	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT tenant_id
-		   FROM task_creation_operations
-		  WHERE tool_name = 'create_schedule'
-		    AND execution_version = $1 AND status = $2
-		    AND tenant_id > $4
-		    AND tombstoned_at IS NULL
-		    AND lease_owner <> '' AND fence > 0 AND attempt > 0
-		    AND lease_until IS NOT NULL AND takeover_not_before IS NOT NULL
-		    AND lease_until <= clock_timestamp()
-		    AND takeover_not_before <= LEAST($3, clock_timestamp())
-		  ORDER BY tenant_id
-		  LIMIT $5`,
-		types.TaskCreationExecutionVersionV1,
-		types.TaskOperationStatusExecuting, before, afterTenantID, limit,
-	)
-	if err != nil {
-		return nil, taskCreationDatabaseError("list stale tenant shards", err)
-	}
-	defer rows.Close()
-
-	tenantIDs := make([]int64, 0)
-	for rows.Next() {
-		var tenantID int64
-		if err := rows.Scan(&tenantID); err != nil {
-			return nil, taskCreationDatabaseError("scan stale tenant shard", err)
-		}
-		tenantIDs = append(tenantIDs, tenantID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, taskCreationDatabaseError("iterate stale tenant shards", err)
-	}
-	return tenantIDs, nil
-}
-
 // ListStaleTaskCreationOperations returns only recoverable v1 operations for a
 // single tenant. Terminal/tombstoned rows, incomplete/corrupt lease rows, and
 // all historical v0 actions are excluded.
@@ -868,9 +836,14 @@ func (s *Store) ListStaleTaskCreationOperations(
 	if tenantID <= 0 || before.IsZero() || limit <= 0 || limit > 1000 {
 		return nil, taskCreationValidation("invalid stale operation query")
 	}
-	rows, err := s.pool.Query(ctx,
+	tx, err := s.beginRecoveryTenantRead(ctx, tenantID, "vane_app")
+	if err != nil {
+		return nil, err
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+	rows, err := tx.Query(ctx,
 		`SELECT `+taskCreationOperationColumns+`
-		   FROM task_creation_operations
+		   FROM public.task_creation_operations
 		  WHERE tenant_id = $1 AND tool_name = 'create_schedule'
 		    AND execution_version = $2 AND status = $3
 		    AND tombstoned_at IS NULL
@@ -899,6 +872,10 @@ func (s *Store) ListStaleTaskCreationOperations(
 	if err := rows.Err(); err != nil {
 		return nil, taskCreationDatabaseError("iterate stale operations", err)
 	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit stale operation list", err)
+	}
 	return operations, nil
 }
 
@@ -918,7 +895,7 @@ func (s *Store) checkpointTaskCreationBytes(
 	if err := validateTaskCreationLease(lease); err != nil {
 		return err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin immutable checkpoint", err)
 	}
@@ -965,7 +942,7 @@ func (s *Store) checkpointTaskCreationDefinition(
 	if err := validateTaskCreationLease(lease); err != nil {
 		return err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin definition checkpoint", err)
 	}
@@ -1021,7 +998,7 @@ func (s *Store) checkpointTaskCreationEnsureReceipt(
 	if err := validateTaskCreationLease(lease); err != nil {
 		return err
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin ensure checkpoint", err)
 	}
@@ -1097,7 +1074,7 @@ func (s *Store) terminateTaskCreationOperation(
 		return taskCreationValidation("terminal error metadata is not normalized")
 	}
 
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTaskCreationTenantTx(ctx, lease.TenantID, pgx.TxOptions{})
 	if err != nil {
 		return taskCreationDatabaseError("begin terminal checkpoint", err)
 	}

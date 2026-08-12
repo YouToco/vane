@@ -51,8 +51,8 @@ func newReceiptDispatcherFakeStore(status types.TaskOperationStatus) *receiptDis
 	return &receiptDispatcherFakeStore{r: r}
 }
 
-func (s *receiptDispatcherFakeStore) ListDueTaskCreationReceiptTenantIDs(
-	_ context.Context, _ time.Time, afterTenantID int64, _ int,
+func (s *receiptDispatcherFakeStore) ListRecoveryTenantCatalogPage(
+	_ context.Context, afterTenantID int64, _ int,
 ) ([]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

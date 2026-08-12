@@ -77,7 +77,6 @@ type researchV3CreationSagaStore interface {
 	CompleteResearchTaskCreationOperationV3(context.Context, types.TaskCreationLease, string, json.RawMessage) error
 	CleanupResearchTaskCreationOperationV3(context.Context, types.TaskCreationLease, string, string, string) error
 	BlockResearchTaskCreationOperationV3(context.Context, types.TaskCreationLease, string, string, string) error
-	ListStaleResearchTaskCreationTenantIDsV3(context.Context, time.Time, int64, int) ([]int64, error)
 	ListStaleResearchTaskCreationOperationsV3(context.Context, int64, time.Time, int) ([]types.TaskCreationOperation, error)
 }
 

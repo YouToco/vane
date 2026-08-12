@@ -95,7 +95,6 @@ func pushEffectRecoverySelectorViolation(method, path string) bool {
 		"BlockExpiredUnclaimedPushEffect":
 		return !coordinator
 	case "ReadPushEffectRecoveryCutoff",
-		"ListRecoverablePushEffectTenantIDs",
 		"ListRecoverablePushEffects":
 		return !runner
 	case

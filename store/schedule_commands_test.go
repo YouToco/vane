@@ -141,7 +141,7 @@ func TestScheduleCommands_PostgreSQLLifecycleAndSharedLock(t *testing.T) {
 	// definition-edit/reconcile. A second process cannot enter its mutation
 	// window while Temporal I/O is in flight.
 	lockCtx, cancelLock := context.WithTimeout(ctx, 100*time.Millisecond)
-	_, release, lockErr := st.AcquireScheduleReconcile(lockCtx, taskID)
+	_, release, lockErr := st.AcquireScheduleReconcile(lockCtx, 1, taskID)
 	cancelLock()
 	if !errors.Is(lockErr, context.DeadlineExceeded) {
 		if release != nil {

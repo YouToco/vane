@@ -375,13 +375,6 @@ func TestTaskCreationRecoveryTenantEnumeration_OnlyTrulyStale(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tenants, err := st.ListStaleTaskCreationTenantIDs(ctx, time.Now().Add(time.Hour), 0, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !containsTenantID(tenants, f.tenantID) {
-		t.Fatalf("stale tenant 未枚举: %v", tenants)
-	}
 	operations, err := st.ListStaleTaskCreationOperations(
 		ctx, f.tenantID, time.Now().Add(time.Hour), 100)
 	if err != nil {
@@ -405,10 +398,6 @@ func TestTaskCreationRecoveryTenantEnumeration_OnlyTrulyStale(t *testing.T) {
 		cleanupExec(cleanupCtx, t, st,
 			`UPDATE tenants SET status = 'active' WHERE id = $1`, f.tenantID)
 	})
-	tenantIDs, err := st.ListStaleTaskCreationTenantIDs(ctx, time.Now().Add(time.Hour), 0, 100)
-	if err != nil || !containsTenantID(tenantIDs, f.tenantID) {
-		t.Fatalf("suspended tenant 的 stale 副作用仍须枚举: tenants=%v err=%v", tenantIDs, err)
-	}
 	operations, err = st.ListStaleTaskCreationOperations(
 		ctx, f.tenantID, time.Now().Add(time.Hour), 100)
 	if err != nil || !containsOperation(operations, stale.ID) {
@@ -2261,15 +2250,6 @@ func assertProvisioningScheduleIsNotUserManageable(
 func containsOperation(operations []types.TaskCreationOperation, id string) bool {
 	for _, operation := range operations {
 		if operation.ID == id {
-			return true
-		}
-	}
-	return false
-}
-
-func containsTenantID(values []int64, target int64) bool {
-	for _, value := range values {
-		if value == target {
 			return true
 		}
 	}

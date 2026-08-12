@@ -25,8 +25,8 @@ const (
 )
 
 type Store interface {
-	ListDueAgentSessionFactTenantIDs(
-		context.Context, time.Time, int64, int,
+	ListRecoveryTenantCatalogPage(
+		context.Context, int64, int,
 	) ([]int64, error)
 	ListDueAgentSessionFacts(
 		context.Context, int64, time.Time, int,
@@ -100,14 +100,14 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 	defer d.dispatchMu.Unlock()
 
 	boundary := time.Now().Add(24 * time.Hour)
-	tenantIDs, err := d.store.ListDueAgentSessionFactTenantIDs(
-		ctx, boundary, d.cursor, tenantPageSize)
+	tenantIDs, err := d.store.ListRecoveryTenantCatalogPage(
+		ctx, d.cursor, tenantPageSize)
 	if err != nil {
 		return fmt.Errorf("list continuation tenant shards: %w", err)
 	}
 	if len(tenantIDs) == 0 && d.cursor > 0 {
-		tenantIDs, err = d.store.ListDueAgentSessionFactTenantIDs(
-			ctx, boundary, 0, tenantPageSize)
+		tenantIDs, err = d.store.ListRecoveryTenantCatalogPage(
+			ctx, 0, tenantPageSize)
 		if err != nil {
 			return fmt.Errorf("wrap continuation tenant shards: %w", err)
 		}

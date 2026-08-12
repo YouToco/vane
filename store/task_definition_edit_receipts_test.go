@@ -70,30 +70,6 @@ func TestTaskDefinitionEditReceipt_TerminalInsertReplaySuppressionAndDiscovery(
 
 	makeTaskDefinitionEditReceiptDue(t, bound)
 	makeTaskDefinitionEditReceiptDue(t, suppressed)
-	discoveryStore := *st
-	var discoveryOptions pgx.TxOptions
-	discoveryStore.beginTx = func(
-		ctx context.Context,
-		options pgx.TxOptions,
-	) (pgx.Tx, error) {
-		discoveryOptions = options
-		return st.pool.BeginTx(ctx, options)
-	}
-	tenantIDs, err := discoveryStore.ListDueTaskDefinitionEditReceiptTenantIDs(
-		ctx, time.Now().Add(time.Hour), 0, 1000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if discoveryOptions.AccessMode != pgx.ReadOnly {
-		t.Fatalf("cross-tenant discovery access mode=%v want READ ONLY",
-			discoveryOptions.AccessMode)
-	}
-	if !taskDefinitionEditReceiptContainsTenantID(tenantIDs, bound.tenantID) {
-		t.Fatalf("bound receipt tenant missing from discovery: %+v", tenantIDs)
-	}
-	if taskDefinitionEditReceiptContainsTenantID(tenantIDs, suppressed.tenantID) {
-		t.Fatalf("suppressed receipt tenant must not be discovered: %+v", tenantIDs)
-	}
 	due, err := st.ListDueTaskDefinitionEditReceipts(
 		ctx, bound.tenantID, time.Now().Add(time.Hour), 100)
 	if err != nil {
@@ -756,15 +732,6 @@ func containsTaskDefinitionEditReceipt(
 ) bool {
 	for _, receipt := range receipts {
 		if receipt.ID == id {
-			return true
-		}
-	}
-	return false
-}
-
-func taskDefinitionEditReceiptContainsTenantID(values []int64, want int64) bool {
-	for _, value := range values {
-		if value == want {
 			return true
 		}
 	}

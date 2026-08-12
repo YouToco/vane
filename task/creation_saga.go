@@ -112,7 +112,7 @@ type CreationSagaStore interface {
 	FinishTaskCreationCleanup(ctx context.Context, lease types.TaskCreationLease, taskID string, terminalStatus types.TaskOperationStatus) error
 	BlockTaskCreationOperationAfterSideEffect(ctx context.Context, lease types.TaskCreationLease, taskID, errorCode, errorMessage string) error
 	CompleteTaskCreationOperation(ctx context.Context, lease types.TaskCreationLease, taskID string, result json.RawMessage) error
-	ListStaleTaskCreationTenantIDs(ctx context.Context, before time.Time, afterTenantID int64, limit int) ([]int64, error)
+	ListRecoveryTenantCatalogPage(ctx context.Context, afterTenantID int64, limit int) ([]int64, error)
 	ListStaleTaskCreationOperations(ctx context.Context, tenantID int64, before time.Time, limit int) ([]types.TaskCreationOperation, error)
 }
 
@@ -154,9 +154,8 @@ type CreationCoordinator struct {
 	// Recovery passes are serialized so two callers cannot race the same stale
 	// scan. The cursor rotates tenant order between bounded passes, preventing a
 	// noisy oldest shard from starving later tenants forever.
-	recoveryMu       sync.Mutex
-	recoveryCursor   int64
-	v3RecoveryCursor int64
+	recoveryMu     sync.Mutex
+	recoveryCursor int64
 }
 
 func NewCreationCoordinator(
@@ -917,8 +916,8 @@ func (c *CreationCoordinator) RecoverStaleOnce(ctx context.Context) error {
 	passCtx, cancelPass := context.WithTimeout(ctx, creationRecoveryPassTimeout)
 	defer cancelPass()
 	boundary := time.Now()
-	tenantIDs, err := c.store.ListStaleTaskCreationTenantIDs(
-		passCtx, boundary, c.recoveryCursor, creationRecoveryTenantLimit,
+	tenantIDs, err := c.store.ListRecoveryTenantCatalogPage(
+		passCtx, c.recoveryCursor, creationRecoveryTenantLimit,
 	)
 	if err != nil {
 		return fmt.Errorf("list stale task creation tenant shards: %w", err)
@@ -928,13 +927,23 @@ func (c *CreationCoordinator) RecoverStaleOnce(ctx context.Context) error {
 	// page, wrap once to the beginning; failures in tenants 1..100 can therefore
 	// never hide tenant 101 forever.
 	if c.recoveryCursor > 0 && len(tenantIDs) < creationRecoveryTenantLimit {
-		wrapped, wrapErr := c.store.ListStaleTaskCreationTenantIDs(
-			passCtx, boundary, 0, creationRecoveryTenantLimit-len(tenantIDs),
+		wrapped, wrapErr := c.store.ListRecoveryTenantCatalogPage(
+			passCtx, 0, creationRecoveryTenantLimit-len(tenantIDs),
 		)
 		if wrapErr != nil {
 			return fmt.Errorf("wrap stale task creation tenant shards: %w", wrapErr)
 		}
-		tenantIDs = append(tenantIDs, wrapped...)
+		seen := make(map[int64]struct{}, len(tenantIDs)+len(wrapped))
+		for _, tenantID := range tenantIDs {
+			seen[tenantID] = struct{}{}
+		}
+		for _, tenantID := range wrapped {
+			if _, duplicate := seen[tenantID]; duplicate {
+				continue
+			}
+			seen[tenantID] = struct{}{}
+			tenantIDs = append(tenantIDs, tenantID)
+		}
 	}
 	operations := make([]types.TaskCreationOperation, 0, creationRecoveryPassLimit)
 	v3Store, hasV3Store := c.store.(researchV3CreationSagaStore)
@@ -964,37 +973,20 @@ func (c *CreationCoordinator) RecoverStaleOnce(ctx context.Context) error {
 		operations = append(operations, shard...)
 	}
 	if hasV3Store && len(operations) < creationRecoveryPassLimit {
-		v3Tenants, v3Err := v3Store.ListStaleResearchTaskCreationTenantIDsV3(
-			passCtx, boundary, c.v3RecoveryCursor, creationRecoveryTenantLimit)
-		if v3Err != nil {
-			scanErrors = append(scanErrors,
-				fmt.Errorf("list stale native V3 tenant shards: %w", v3Err))
-		} else {
-			if c.v3RecoveryCursor > 0 && len(v3Tenants) < creationRecoveryTenantLimit {
-				wrapped, wrapErr := v3Store.ListStaleResearchTaskCreationTenantIDsV3(
-					passCtx, boundary, 0, creationRecoveryTenantLimit-len(v3Tenants))
-				if wrapErr != nil {
-					scanErrors = append(scanErrors,
-						fmt.Errorf("wrap stale native V3 tenant shards: %w", wrapErr))
-				} else {
-					v3Tenants = append(v3Tenants, wrapped...)
-				}
+		for _, tenantID := range tenantIDs {
+			if len(operations) >= creationRecoveryPassLimit {
+				break
 			}
-			for _, tenantID := range v3Tenants {
-				if len(operations) >= creationRecoveryPassLimit {
-					break
-				}
-				c.v3RecoveryCursor = tenantID
-				remaining := creationRecoveryPassLimit - len(operations)
-				shard, listErr := v3Store.ListStaleResearchTaskCreationOperationsV3(
-					passCtx, tenantID, time.Now(), min(creationRecoveryPerTenant, remaining))
-				if listErr != nil {
-					scanErrors = append(scanErrors, fmt.Errorf(
-						"list stale native V3 operations for tenant %d: %w", tenantID, listErr))
-					continue
-				}
-				operations = append(operations, shard...)
+			remaining := creationRecoveryPassLimit - len(operations)
+			shard, listErr := v3Store.ListStaleResearchTaskCreationOperationsV3(
+				passCtx, tenantID, boundary,
+				min(creationRecoveryPerTenant, remaining))
+			if listErr != nil {
+				scanErrors = append(scanErrors, fmt.Errorf(
+					"list stale native V3 operations for tenant %d: %w", tenantID, listErr))
+				continue
 			}
+			operations = append(operations, shard...)
 		}
 	}
 	semaphore := make(chan struct{}, creationRecoveryConcurrency)

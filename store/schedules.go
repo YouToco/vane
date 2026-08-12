@@ -256,15 +256,23 @@ func (s *Store) AuthorizeScheduledRun(
 	return authorized, nil
 }
 
-// ListActiveSchedules 返回全部 active 调度镜像（跨用户），按创建时间正序。
-// 无 user 谓词是刻意的：唯一调用方是启动时的 scheduler.ReconcileActions，它要把
-// **所有**存量调度的 Temporal Action 入参补齐（决策 #4 的"补手册→自包含"迁移路径），
-// 是系统级维护而非用户请求。单 owner MVP 下活跃调度 ≤20，无分页压力。
-func (s *Store) ListActiveSchedules(ctx context.Context) ([]types.Schedule, error) {
-	rows, err := s.pool.Query(ctx,
+// ListActiveSchedules returns active mirrors for exactly one recovery tenant.
+// Cross-tenant discovery belongs to ListRecoveryTenantCatalogPage; keeping the
+// tenant predicate here prevents an owner test connection from masking a
+// missing RLS context which would be vacuously empty in server runtime.
+func (s *Store) ListActiveSchedules(
+	ctx context.Context, tenantID int64,
+) ([]types.Schedule, error) {
+	tx, err := s.beginRecoveryTenantRead(ctx, tenantID, "vane_edit_coordinator")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	rows, err := tx.Query(ctx,
 		`SELECT `+scheduleColumns+`
-		 FROM schedules WHERE status = $1
-		 ORDER BY created_at`, types.ScheduleStatusActive)
+		 FROM public.schedules
+		 WHERE tenant_id=$1 AND status=$2
+		 ORDER BY created_at`, tenantID, types.ScheduleStatusActive)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "查询全部 active 调度", err)
 	}
@@ -280,6 +288,10 @@ func (s *Store) ListActiveSchedules(ctx context.Context) ([]types.Schedule, erro
 	}
 	if err := rows.Err(); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "遍历 schedule 结果集", err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "提交 active 调度读取", err)
 	}
 	return out, nil
 }

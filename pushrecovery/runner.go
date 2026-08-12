@@ -31,10 +31,8 @@ const (
 // Every returned scope is still reloaded and re-authorized by Coordinator.
 type DiscoveryStore interface {
 	ReadPushEffectRecoveryCutoff(context.Context) (time.Time, error)
-	ListRecoverablePushEffectTenantIDs(
+	ListRecoveryTenantCatalogPage(
 		context.Context,
-		string,
-		time.Time,
 		int64,
 		int,
 	) ([]int64, error)
@@ -372,9 +370,8 @@ func (r *Runner) runPass(ctx context.Context, trigger string) error {
 	}
 scanTenants:
 	for {
-		tenantIDs, err := r.store.ListRecoverablePushEffectTenantIDs(
-			passCtx, r.config.ExactTaskID, before, afterTenantID,
-			r.config.PageSize,
+		tenantIDs, err := r.store.ListRecoveryTenantCatalogPage(
+			passCtx, afterTenantID, r.config.PageSize,
 		)
 		if err != nil {
 			recordErr(err)

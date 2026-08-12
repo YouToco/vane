@@ -21,8 +21,8 @@ type fakeStore struct {
 	releaseCalls   int
 }
 
-func (f *fakeStore) ListDueAgentSessionFactTenantIDs(
-	context.Context, time.Time, int64, int,
+func (f *fakeStore) ListRecoveryTenantCatalogPage(
+	context.Context, int64, int,
 ) ([]int64, error) {
 	return []int64{f.fact.TenantID}, nil
 }

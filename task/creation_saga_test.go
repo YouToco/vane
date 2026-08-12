@@ -426,8 +426,8 @@ func (s *creationSagaFakeStore) CompleteTaskCreationOperation(
 	return nil
 }
 
-func (s *creationSagaFakeStore) ListStaleTaskCreationTenantIDs(
-	context.Context, time.Time, int64, int,
+func (s *creationSagaFakeStore) ListRecoveryTenantCatalogPage(
+	context.Context, int64, int,
 ) ([]int64, error) {
 	return nil, nil
 }
@@ -462,8 +462,8 @@ type recoveryListingStore struct {
 	cursors   []int64
 }
 
-func (s *recoveryListingStore) ListStaleTaskCreationTenantIDs(
-	_ context.Context, _ time.Time, afterTenantID int64, limit int,
+func (s *recoveryListingStore) ListRecoveryTenantCatalogPage(
+	_ context.Context, afterTenantID int64, limit int,
 ) ([]int64, error) {
 	s.cursors = append(s.cursors, afterTenantID)
 	result := make([]int64, 0, limit)

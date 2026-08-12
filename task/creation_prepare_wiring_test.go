@@ -50,7 +50,6 @@ func TestTaskCreationSaga_LowLevelLifecycleIsControllerPrivate(t *testing.T) {
 		"BeginTaskCreationCleanup":                      {},
 		"FinishTaskCreationCleanup":                     {},
 		"BlockTaskCreationOperationAfterSideEffect":     {},
-		"ListStaleTaskCreationTenantIDs":                {},
 		"ListStaleTaskCreationOperations":               {},
 	}
 
