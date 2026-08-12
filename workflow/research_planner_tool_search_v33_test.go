@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/runcontext"
+	"github.com/YouToco/vane/runtimeconfig"
 	"github.com/YouToco/vane/runtimepolicy"
 	storepkg "github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -98,6 +99,133 @@ func TestResearchPlannerToolSearchV33SearchThenFinalIsRecoverySafe(t *testing.T)
 	}
 	if providerCalls != 2 || len(settled) != 2 || len(stored) != 1 || persistCalls != 2 {
 		t.Fatalf("provider=%d settled=%d stored=%d persist=%d", providerCalls, len(settled), len(stored), persistCalls)
+	}
+}
+
+func TestResearchPlannerToolSearchV33ForcesFinalAfterLoadedTools(t *testing.T) {
+	snapshot, seal := plannerToolSearchSealV33(t)
+	completions := []string{
+		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"official web release","limit":8}}`,
+		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"redundant search","limit":8}}`,
+		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"official","tool_name":"web_search","arguments":{"query":"official status"}},{"invocation_id":"confirmation","tool_name":"web_search","arguments":{"query":"official status confirmation"}}]}`,
+	}
+	persistCalls := 0
+	execute := func(_ context.Context, round int, _ string) (
+		storepkg.ResearchRunLLMReceiptV3,
+		storepkg.ResearchRunLLMSpendReservationV3, error,
+	) {
+		return storepkg.ResearchRunLLMReceiptV3{
+			Call: types.LLMCall{Completion: completions[round]},
+		}, storepkg.ResearchRunLLMSpendReservationV3{ReservationID: int64(round + 1)}, nil
+	}
+	persist := func(_ context.Context, _ storepkg.ResearchRunLLMSpendReservationV3,
+		receipt runcontext.ResearchPlannerToolSearchReceiptV1,
+	) (runcontext.ResearchPlannerToolSearchReceiptV1, error) {
+		persistCalls++
+		return receipt, nil
+	}
+	plan, reservation, err := executeResearchPlannerToolSearchRoundsV33(
+		t.Context(), snapshot, seal, execute, persist)
+	if err != nil || len(plan.Steps) != 2 || reservation.ReservationID != 3 ||
+		persistCalls != 1 {
+		t.Fatalf("plan=%+v reservation=%+v persist=%d err=%v",
+			plan, reservation, persistCalls, err)
+	}
+}
+
+func TestResearchPlannerToolSearchV33RetainsOldPolicyMultiSearchReplay(t *testing.T) {
+	snapshot, seal := plannerToolSearchSealV33(t)
+	seal.ResearchModel.Planner.MaxTokens = 4096
+	seal.ResearchModel.Planner.SystemPrompt = "retained v3.3 planner policy"
+	completions := []string{
+		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"official web release","limit":1}}`,
+		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"official web confirmation","limit":1}}`,
+		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"official","tool_name":"web_search","arguments":{"query":"official status"}},{"invocation_id":"confirmation","tool_name":"web_search","arguments":{"query":"official status confirmation"}}]}`,
+	}
+	persistCalls := 0
+	execute := func(_ context.Context, round int, _ string) (
+		storepkg.ResearchRunLLMReceiptV3,
+		storepkg.ResearchRunLLMSpendReservationV3, error,
+	) {
+		return storepkg.ResearchRunLLMReceiptV3{
+			Call: types.LLMCall{Completion: completions[round]},
+		}, storepkg.ResearchRunLLMSpendReservationV3{ReservationID: int64(round + 1)}, nil
+	}
+	persist := func(_ context.Context, _ storepkg.ResearchRunLLMSpendReservationV3,
+		receipt runcontext.ResearchPlannerToolSearchReceiptV1,
+	) (runcontext.ResearchPlannerToolSearchReceiptV1, error) {
+		persistCalls++
+		return receipt, nil
+	}
+	plan, _, err := executeResearchPlannerToolSearchRoundsV33(
+		t.Context(), snapshot, seal, execute, persist)
+	if err != nil || len(plan.Steps) != 2 || persistCalls != 2 {
+		t.Fatalf("plan=%+v persist=%d err=%v", plan, persistCalls, err)
+	}
+}
+
+func TestResearchPlannerToolSearchV33ProductionRecoveryFitsRetainedTokenBudget(t *testing.T) {
+	_, seal := plannerToolSearchSealV33(t)
+	production, err := runtimeconfig.BuildResearchRuntimeV3(
+		runtimeconfig.CurrentCompiledV1Input{
+			Model: "cheap-model", ResearchModel: "deepseek-v4-pro",
+			ModelEndpointGeneration: 1, ModelCredentialGeneration: 1,
+			ExaCredentialGeneration: 1, TikHubCredentialGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal.ResearchTools = production.Tools
+	seal.ResearchModel = production.Model
+	seal.ResearchToolPolicyDigest, err = runtimepolicy.DigestResearchToolPolicyV3(
+		production.Tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal.Payload.PlannerBudget.MaxPlannerRounds = 4
+	seal.Payload.PlannerBudget.MaxToolCalls = 8
+	seal.Payload.PlannerBudget.MaxTokens = 16000
+	seal.Payload.Definition.TaskName = "每小时检查 Kimi 会员定价页面的购买状态，状态变化时推送"
+	seal.Payload.Definition.TaskManual = "持续监测 Kimi 会员定价页面的套餐购买状态。使用官方套餐状态工具读取 https://www.kimi.com/membership/pricing 的第一方结构化购买状态。目标：判断页面是否出现可购买、立即订阅、购买或支付入口，并区分可购买、售罄、暂不可购买。推送规则：仅当状态变为可购买，或者购买条件发生实质变化时推送。"
+	initial, err := buildResearchPlannerPromptV33(seal, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	productStatus, ok := frozenResearchToolV3(seal.ResearchTools, "web_product_status")
+	if !ok {
+		t.Fatal("production policy lost web_product_status")
+	}
+	webContents, ok := frozenResearchToolV3(seal.ResearchTools, "web_contents")
+	if !ok {
+		t.Fatal("production policy lost web_contents")
+	}
+	receipt, err := runcontext.BuildResearchPlannerToolSearchReceiptV1(
+		2, seal.ResearchToolPolicyDigest, "Kimi membership official structured status", 8,
+		[]runcontext.ResearchPlannerToolSearchMatchV1{
+			{Name: productStatus.Name, SchemaDigest: productStatus.SchemaDigest,
+				Score: "10.862487394"},
+			{Name: webContents.Name, SchemaDigest: webContents.SchemaDigest,
+				Score: "0.772534701"},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := buildResearchPlannerPromptV33(
+		seal, []runcontext.ResearchPlannerToolSearchReceiptV1{receipt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserve := func(prompt string) int {
+		return len(seal.ResearchModel.Planner.SystemPrompt) + len(prompt) + 64 +
+			seal.ResearchModel.Planner.MaxTokens
+	}
+	// The final-only policy makes the normal production path one search plus one
+	// final plan. Preserve the original 4096-token final capacity and prove both
+	// paid rounds fit the exact retained 16k task budget with real tool schemas.
+	total := reserve(initial) + reserve(loaded)
+	if total > seal.Payload.PlannerBudget.MaxTokens {
+		t.Fatalf("search/final reserves %d bytes over budget %d", total,
+			seal.Payload.PlannerBudget.MaxTokens)
 	}
 }
 
