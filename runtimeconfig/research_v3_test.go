@@ -83,6 +83,14 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "比较性陈述") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "必须同时引用") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "只报告当前证据支持的状态") ||
+		!strings.HasPrefix(got.Model.Synthesis.SystemPrompt,
+			"先确定 citations，再写 headline 和 summary。") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt,
+			`{"kind":"history","ref":"146"}`) ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt,
+			"绝不能复制或沿用 history.items[].payload_text 内嵌的旧 citations") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt,
+			"此检查优先于生成任何正文") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "history.history_through_utc") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "2026-07-28 不在窗口内") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "抓取时间不能代替事件时间") ||
