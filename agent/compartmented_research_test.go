@@ -457,6 +457,158 @@ func TestPublicEvidenceSummaryIsStrictAndSourceBound(t *testing.T) {
 	}
 }
 
+func TestPublicEvidenceSummaryCapsRefsBeforeOutputTruncation(t *testing.T) {
+	state := &toolRunState{publicEvidence: make(map[string]publicEvidenceRecord)}
+	refs := make([]string, 0, maxPublicEvidenceRefsPerClaim+1)
+	for i := 0; i < maxPublicEvidenceRefsPerClaim+1; i++ {
+		ref := fmt.Sprintf("pe_%d", i)
+		state.publicEvidence[ref] = publicEvidenceRecord{Ref: ref, Digest: "digest"}
+		refs = append(refs, ref)
+	}
+	raw := fmt.Sprintf(
+		`{"schema":"vane.public-evidence-summary/v1","as_of":"unknown","claims":[{"statement":"过宽的历史汇总结论","status":"supported","public_evidence_refs":%s}],"gaps":[]}`,
+		mustMarshalJSONText(refs),
+	)
+	if _, err := decodePublicEvidenceSummary(raw, state); err == nil {
+		t.Fatalf("summary with %d refs was admitted", len(refs))
+	}
+	if !strings.Contains(compartmentedPublicSummarySystemNote,
+		"每条 claim 最多引用 4 个 bundle ref") ||
+		!strings.Contains(compartmentedPublicSummarySystemNote, "必须把 claim 收窄") {
+		t.Fatalf("summary prompt does not explain bounded-ref fallback: %q",
+			compartmentedPublicSummarySystemNote)
+	}
+}
+
+func TestPublicEvidenceSummaryEnforcesWholeResponseBudget(t *testing.T) {
+	state := &toolRunState{publicEvidence: make(map[string]publicEvidenceRecord)}
+	refs := make([]string, 0, maxPublicEvidenceRefsTotal+maxPublicEvidenceRefsPerClaim)
+	for i := 0; i < cap(refs); i++ {
+		ref := fmt.Sprintf("pe_budget_%02d", i)
+		state.publicEvidence[ref] = publicEvidenceRecord{Ref: ref, Digest: "digest"}
+		refs = append(refs, ref)
+	}
+	claims := make([]publicEvidenceClaimV1, 0, 5)
+	for i := 0; i < 4; i++ {
+		claims = append(claims, publicEvidenceClaimV1{
+			Statement: fmt.Sprintf("有界事实 %d", i), Status: "supported",
+			PublicEvidenceRefs: refs[i*4 : i*4+4],
+		})
+	}
+	encode := func(summary publicEvidenceSummaryV1) string {
+		raw, err := json.Marshal(summary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	bounded := publicEvidenceSummaryV1{
+		Schema: publicEvidenceSummarySchema, AsOf: "unknown",
+		Claims: claims, Gaps: []string{},
+	}
+	if _, err := decodePublicEvidenceSummary(encode(bounded), state); err != nil {
+		t.Fatalf("bounded whole summary rejected: %v", err)
+	}
+
+	tooManyRefs := bounded
+	tooManyRefs.Claims = append(append([]publicEvidenceClaimV1(nil), claims...),
+		publicEvidenceClaimV1{
+			Statement: "超出总引用预算", Status: "supported",
+			PublicEvidenceRefs: refs[16:20],
+		})
+	if _, err := decodePublicEvidenceSummary(encode(tooManyRefs), state); err == nil {
+		t.Fatal("summary-wide reference overflow was admitted")
+	}
+
+	tooManyClaims := bounded
+	tooManyClaims.Claims = make([]publicEvidenceClaimV1, maxPublicEvidenceClaims+1)
+	for i := range tooManyClaims.Claims {
+		tooManyClaims.Claims[i] = publicEvidenceClaimV1{
+			Statement: fmt.Sprintf("事实 %d", i), Status: "uncertain",
+			PublicEvidenceRefs: []string{},
+		}
+	}
+	if _, err := decodePublicEvidenceSummary(encode(tooManyClaims), state); err == nil {
+		t.Fatal("claim count overflow was admitted")
+	}
+
+	tooManyGaps := bounded
+	tooManyGaps.Gaps = make([]string, maxPublicEvidenceGaps+1)
+	for i := range tooManyGaps.Gaps {
+		tooManyGaps.Gaps[i] = fmt.Sprintf("缺口 %d", i)
+	}
+	if _, err := decodePublicEvidenceSummary(encode(tooManyGaps), state); err == nil {
+		t.Fatal("gap count overflow was admitted")
+	}
+
+	longText := bounded
+	longText.Claims = []publicEvidenceClaimV1{{
+		Statement: strings.Repeat("x", maxPublicEvidenceTextBytes+1),
+		Status:    "supported", PublicEvidenceRefs: []string{refs[0]},
+	}}
+	if _, err := decodePublicEvidenceSummary(encode(longText), state); err == nil {
+		t.Fatal("oversized claim text was admitted")
+	}
+
+	oversizedRaw := encode(bounded) + strings.Repeat(" ", maxPublicEvidenceSummaryBytes)
+	if _, err := decodePublicEvidenceSummary(oversizedRaw, state); err == nil {
+		t.Fatal("oversized raw summary was admitted")
+	}
+}
+
+func TestCompartmentedResearchRetriesTruncatedRefHeavySummary(t *testing.T) {
+	const ref = "pe_retry"
+	set := frozenInternalEvidenceSetV1{
+		Schema:   compartmentedSynthesisInputSchema,
+		tenantID: 7, userID: 42, sessionID: 9, traceID: "trace-retry-budget",
+	}
+	set.Digest = frozenInternalEvidenceSetDigest(set)
+	state := &toolRunState{
+		ownerRequest:          "今天相比上一次有什么变化",
+		compartmentedResearch: &compartmentedResearchState{internal: set},
+		publicEvidence: map[string]publicEvidenceRecord{
+			ref: {
+				Ref: ref, Origin: "historical", ToolName: "web_product_status",
+				Arguments: `{}`, Result: `{"status":"reservation_only"}`,
+				Coverage: "exact:full", OriginalSize: 29, Digest: "digest",
+			},
+		},
+		publicEvidenceOrder: []string{ref},
+	}
+	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
+		traceID: "trace-retry-budget", userID: 42,
+		scope: agentcontext.Scope{TenantID: 7, UserID: 42, SessionID: 9},
+	})
+	requests := 0
+	loop := New(Deps{})
+	loop.chatFn = func(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+		requests++
+		switch requests {
+		case 1:
+			if len(req.Tools) != 0 ||
+				!strings.Contains(req.Messages[0].Content, "完整 JSON 最多 1800 bytes") ||
+				req.MaxTokens == nil || *req.MaxTokens < maxPublicEvidenceSummaryBytes {
+				t.Fatalf("retry request lacks bounded contract: %+v", req)
+			}
+			return &llm.ChatResponse{Content: `{"schema":"vane.public-evidence-summary/v1","as_of":"unknown","claims":[{"statement":"历史证据显示仅可预约","status":"supported","public_evidence_refs":["pe_retry"]}],"gaps":[]}`}, nil
+		case 2:
+			if len(req.Tools) != 0 || !strings.Contains(req.Messages[1].Content,
+				`"public_evidence_refs":["pe_retry"]`) {
+				t.Fatalf("final synthesis is not source-bound: %+v", req)
+			}
+			return &llm.ChatResponse{Content: "历史证据显示仅可预约；当前变化证据不足。"}, nil
+		default:
+			return nil, errors.New("unexpected chat request")
+		}
+	}
+	truncated := `{"schema":"vane.public-evidence-summary/v1","as_of":"unknown","claims":[{"statement":"重复历史运行","status":"supported","public_evidence_refs":["pe_retry","pe_retry"`
+	reply, turns, err := loop.finishCompartmentedResearch(ctx, state, truncated, 1)
+	if err != nil || reply != "历史证据显示仅可预约；当前变化证据不足。" ||
+		turns != 2 || requests != 2 {
+		t.Fatalf("reply=%q turns=%d requests=%d err=%v", reply, turns, requests, err)
+	}
+}
+
 func TestPublicEvidenceSummaryStripsOnlyURLFromCitedExactHistoricalBrief(t *testing.T) {
 	const sourceURL = "https://www.kimi.com/membership/pricing"
 	state := &toolRunState{publicEvidence: map[string]publicEvidenceRecord{
@@ -514,10 +666,10 @@ func TestPublicEvidenceSummaryStripsOnlyURLFromCitedExactHistoricalBrief(t *test
 	}
 }
 
-func TestPublicEvidenceSummaryAcceptsAllBoundedObservationRefs(t *testing.T) {
+func TestPublicEvidenceSummaryAcceptsBoundedObservationRefs(t *testing.T) {
 	state := &toolRunState{publicEvidence: make(map[string]publicEvidenceRecord)}
-	refs := make([]string, 0, 20)
-	for i := 0; i < 20; i++ {
+	refs := make([]string, 0, maxPublicEvidenceRefsPerClaim)
+	for i := 0; i < maxPublicEvidenceRefsPerClaim; i++ {
 		ref := fmt.Sprintf("pe_observation_%02d", i)
 		refs = append(refs, ref)
 		state.publicEvidence[ref] = publicEvidenceRecord{Ref: ref, Digest: "digest"}
@@ -525,7 +677,7 @@ func TestPublicEvidenceSummaryAcceptsAllBoundedObservationRefs(t *testing.T) {
 	raw, err := json.Marshal(publicEvidenceSummaryV1{
 		Schema: publicEvidenceSummarySchema, AsOf: "2026-08-03T12:00:00Z",
 		Claims: []publicEvidenceClaimV1{{
-			Statement: "二十次历史观察共同支持状态未变化",
+			Statement: "四次历史观察共同支持状态未变化",
 			Status:    "supported", PublicEvidenceRefs: refs,
 		}},
 		Gaps: []string{},
@@ -534,7 +686,7 @@ func TestPublicEvidenceSummaryAcceptsAllBoundedObservationRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := decodePublicEvidenceSummary(string(raw), state); err != nil {
-		t.Fatalf("bounded observation refs rejected: %v", err)
+		t.Fatalf("exactly bounded observation refs rejected: %v", err)
 	}
 
 	tooMany := make([]string, 0, maxPublicEvidenceRefsPerClaim+1)
@@ -555,7 +707,7 @@ func TestPublicEvidenceSummaryAcceptsAllBoundedObservationRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := decodePublicEvidenceSummary(string(raw), state); err == nil {
-		t.Fatal("summary accepted more refs than the per-turn evidence bound")
+		t.Fatal("summary accepted more refs than the per-claim evidence bound")
 	}
 }
 
