@@ -80,6 +80,9 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		!strings.Contains(got.Model.GroundingVerifier.SystemPrompt, "不得额外要求量化门槛") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "Sonnet 就不得写成 Opus") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "不得复用此前答案") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "比较性陈述") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "必须同时引用") ||
+		!strings.Contains(got.Model.Synthesis.SystemPrompt, "只报告当前证据支持的状态") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "history.history_through_utc") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "2026-07-28 不在窗口内") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "抓取时间不能代替事件时间") ||
