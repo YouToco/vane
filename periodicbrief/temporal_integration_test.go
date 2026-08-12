@@ -66,6 +66,7 @@ func TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges(
 	server, err := testsuite.StartDevServer(
 		startCtx,
 		testsuite.DevServerOptions{
+			ExistingPath:  os.Getenv("VANE_TEMPORAL_CLI_PATH"),
 			ClientOptions: &client.Options{Namespace: namespace},
 			LogLevel:      "error",
 		},
