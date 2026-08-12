@@ -81,6 +81,9 @@ var purgeOrder = []purgeStep{
 	// tombstones survive normal task deletion. Tenant hard-delete explicitly
 	// removes it before the tenant/user parents.
 	{"schedule_commands", "tenant_id = $1"},
+	// The scheduler singleton may point at this tenant between recovery passes.
+	// Deleting it resets recovery to the zero cursor on the next read.
+	{"schedule_command_recovery_cursors", "tenant_id = $1"},
 	// Cutover journal is the authority child; both retain rollback evidence
 	// during ordinary task life and are removed only by explicit tenant purge.
 	{"research_v3_prepared_definition_heads", "tenant_id = $1"},

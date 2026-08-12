@@ -147,7 +147,8 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 		return taskCreationConflict("definition commit phase is invalid")
 	}
 
-	used, err := countTaskCreationCapacity(ctx, tx, p.Lease.UserID)
+	used, err := countScopedTaskCreationCapacity(
+		ctx, tx, p.Lease.TenantID, p.Lease.UserID)
 	if err != nil {
 		return err
 	}
@@ -966,6 +967,21 @@ func countTaskCreationCapacity(
 	).Scan(&count)
 	if err != nil {
 		return 0, taskCreationDatabaseError("count active and reserved tasks", err)
+	}
+	return count, nil
+}
+
+func countScopedTaskCreationCapacity(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID int64,
+	userID int64,
+) (int, error) {
+	var count int
+	if err := tx.QueryRow(ctx,
+		`SELECT public.count_task_creation_capacity_v1($1,$2)`,
+		tenantID, userID).Scan(&count); err != nil {
+		return 0, taskCreationDatabaseError("count scoped task creation capacity", err)
 	}
 	return count, nil
 }
