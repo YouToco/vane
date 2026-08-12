@@ -85,6 +85,12 @@ imports only an exact allowlist of research-runtime, capability-key, gateway-
 socket, and V3/push-recovery canary settings from the gated restricted
 `server.env`. Migration and gateway DSNs, `POSTGRES_PASSWORD`, and gateway
 process credentials are stripped; values are compared without being logged.
+The interactive owner Agent route is a source-controlled deployment policy:
+both restricted and owner-compatible environments remove every dedicated
+provider/base URL/API-key override and set exactly
+`VANE_LLM_AGENT_MODEL=deepseek-v4-flash`. The Agent therefore inherits the
+primary DeepSeek endpoint and credential; a retained Kimi-specific override or
+any other dedicated Agent route fails the runtime contract.
 The restricted `server.env` itself is normalized from the legacy vane:vane
 mode 0600 state to root:vane mode 0640 before success and is verified
 non-writable by `vane`, so the primary process cannot alter the allowlist used

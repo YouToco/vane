@@ -264,6 +264,17 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertIn("contains a forbidden process credential", remote)
         self.assertIn("assert_gateway_peer_and_credential_boundary", remote)
         self.assertIn("assert_restricted_server_environment_readonly", remote)
+        self.assertIn("assert_deepseek_flash_agent_route", remote)
+        self.assertGreaterEqual(
+            remote.count("VANE_LLM_AGENT_MODEL=deepseek-v4-flash"), 3
+        )
+        for forbidden in (
+            "VANE_LLM_AGENT_PROVIDER",
+            "VANE_LLM_AGENT_BASE_URL",
+            "VANE_LLM_AGENT_API_KEY",
+        ):
+            self.assertIn(forbidden, remote)
+        self.assertIn("primary Agent route is not exact DeepSeek v4 Flash", remote)
         self.assertIn("chown root:vane /opt/vane/env/server.env", remote)
         self.assertIn("chmod 0640 /opt/vane/env/server.env", remote)
         self.assertIn('runuser -u vane -- test -w "$path"', remote)

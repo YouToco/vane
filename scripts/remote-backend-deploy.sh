@@ -372,6 +372,16 @@ assert_research_settings_exact() {
   fi
 }
 
+assert_deepseek_flash_agent_route() {
+  local path=$1
+  [[ -f $path && ! -L $path &&
+     $(grep -c '^VANE_LLM_AGENT_MODEL=deepseek-v4-flash$' "$path" || true) -eq 1 &&
+     $(grep -Ec '^VANE_LLM_AGENT_(PROVIDER|BASE_URL|API_KEY)=' "$path" || true) -eq 0 ]] || {
+    echo "primary Agent route is not exact DeepSeek v4 Flash" >&2
+    return 1
+  }
+}
+
 assert_legacy_research_settings_exact() {
   local destination=$1 source=${2:-/opt/vane/env/server.env}
   local name source_line dest_line
@@ -420,8 +430,9 @@ build_owner_compatible_environment() {
     echo "owner-compatible environment inputs are unavailable" >&2
     return 1
   }
-  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_GATEWAY_[A-Z0-9_]+|VANE_DB_RESEARCH_CONTROL_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID)=/' \
+  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_GATEWAY_[A-Z0-9_]+|VANE_DB_RESEARCH_CONTROL_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID|VANE_LLM_AGENT_PROVIDER|VANE_LLM_AGENT_BASE_URL|VANE_LLM_AGENT_API_KEY|VANE_LLM_AGENT_MODEL)=/' \
     "$owner_env_source" >"$destination"
+  printf 'VANE_LLM_AGENT_MODEL=deepseek-v4-flash\n' >>"$destination"
   for name in "${research_primary_env_keys[@]}"; do
     exact_env_line "$server_env_source" "$name" >>"$destination" || {
       echo "restricted server environment is missing a required research setting: $name" >&2
@@ -429,6 +440,7 @@ build_owner_compatible_environment() {
     }
   done
   assert_research_settings_exact "$destination" "$server_env_source"
+  assert_deepseek_flash_agent_route "$destination"
 }
 
 stage_research_control_environment() {
@@ -455,7 +467,9 @@ stage_research_control_environment() {
     return 1
   }
   rm -f -- "$next" "$destination"
-  awk '!/^VANE_DB_RESEARCH_CONTROL_URL=/' "$source" >"$next"
+  awk '!/^(VANE_DB_RESEARCH_CONTROL_URL|VANE_LLM_AGENT_PROVIDER|VANE_LLM_AGENT_BASE_URL|VANE_LLM_AGENT_API_KEY|VANE_LLM_AGENT_MODEL)=/' \
+    "$source" >"$next"
+  printf 'VANE_LLM_AGENT_MODEL=deepseek-v4-flash\n' >>"$next"
   case "$count" in
     0)
       printf 'VANE_DB_RESEARCH_CONTROL_URL=%s\n' "$primary_url" >>"$next"
@@ -475,6 +489,7 @@ stage_research_control_environment() {
   esac
   chown root:vane "$next"
   chmod 0640 "$next"
+  assert_deepseek_flash_agent_route "$next"
   mv -f -- "$next" "$destination"
 }
 
@@ -1081,6 +1096,9 @@ commit_legacy_primary_release() {
   systemctl daemon-reload
   assert_restricted_server_environment_readonly || return 1
   assert_audited_legacy_primary_runtime_contract || return 1
+  assert_deepseek_flash_agent_route /opt/vane/env/server.env || return 1
+  assert_deepseek_flash_agent_route \
+    /opt/vane/env/server-owner-compat.env || return 1
   systemctl enable vane.service >/dev/null
   systemctl start vane.service
   wait_for_vane_ready
@@ -1786,9 +1804,10 @@ if [[ ! -f $bootstrap_marker ]]; then
     } | docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U vane -d vane
   )
 
-  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_URL|VANE_DB_RESEARCH_CONTROL_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_GATEWAY_[A-Z0-9_]+|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID)=/' \
+  awk '!/^(POSTGRES_PASSWORD|VANE_MIGRATION_DB_URL|VANE_DB_URL|VANE_DB_RESEARCH_CONTROL_URL|VANE_DB_RESEARCH_RUNTIME_URL|VANE_DB_RESEARCH_GATEWAY_RUNTIME_URL|VANE_DB_RESEARCH_CAPABILITY_KEY_ID|VANE_DB_RESEARCH_CAPABILITY_KEY_HEX|VANE_DB_RESEARCH_CAPABILITY_RETIRED_KEYS|VANE_DB_RESEARCH_CAPABILITY_TTL_DAYS|VANE_RESEARCH_GATEWAY_SOCKET_PATH|VANE_GATEWAY_[A-Z0-9_]+|VANE_PIPELINE_RESEARCH_V3_SHADOW_CANARY_SCHEDULE_ID|VANE_PIPELINE_RESEARCH_V3_AUTHORITY_CANARY_SCHEDULE_ID|VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID|VANE_LLM_AGENT_PROVIDER|VANE_LLM_AGENT_BASE_URL|VANE_LLM_AGENT_API_KEY|VANE_LLM_AGENT_MODEL)=/' \
     /opt/vane/.env >/opt/vane/env/server.env.next
   {
+    printf 'VANE_LLM_AGENT_MODEL=deepseek-v4-flash\n'
     printf 'VANE_DB_URL=postgres://vane_server_runtime:%s@127.0.0.1:5432/vane?sslmode=disable\n' \
       "$server_password"
     printf 'VANE_DB_RESEARCH_CONTROL_URL=postgres://vane_server_runtime:%s@127.0.0.1:5432/vane?sslmode=disable\n' \
