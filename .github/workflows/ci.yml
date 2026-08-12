@@ -15,28 +15,16 @@ env:
   GOSUMDB: sum.golang.org
 
 jobs:
-  hosted-runner-smoke:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Verify clean x64 build substrate is available
-        run: |
-          set -euo pipefail
-          [[ $(uname -s) == Linux ]]
-          [[ $(uname -m) == x86_64 ]]
-          docker version --format '{{.Server.Arch}}' | grep -Fx amd64
-
   test:
-    # PR-controlled code stays on the isolated vane-test role. Exact-main
-    # push/schedule checks use a fresh GitHub-hosted VM so a sleeping or failed
-    # persistent build host cannot block the production control plane.
+    # PR-controlled code stays on the isolated vane-test VM. Exact-main
+    # push/schedule checks use the separate trusted vane-build VM, so untrusted
+    # PR state can never cross into release construction.
     runs-on: >-
       ${{
         fromJSON(
           github.event_name == 'pull_request'
           && '["self-hosted","Linux","vane-test"]'
-          || '"ubuntu-24.04"'
+          || '["self-hosted","Linux","vane-build"]'
         )
       }}
     timeout-minutes: 15
