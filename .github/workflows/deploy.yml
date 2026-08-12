@@ -335,6 +335,51 @@ jobs:
             -coverprofile=non-store.coverage.out -covermode=atomic \
             "${packages[@]}"
 
+      - name: Report backend Store shard failure
+        if: failure() && needs.plan.outputs.backend_changed == 'true'
+        run: |
+          set -euo pipefail
+          artifacts="$BUILD_ROOT/store-sharding"
+          if [[ ! -d "$artifacts" ]]; then
+            echo "Store shard artifacts were not created; failure occurred before sharding."
+            exit 0
+          fi
+
+          if [[ -f "$artifacts/store-shard-status.json" ]]; then
+            echo 'Store shard status:'
+            jq -cS . "$artifacts/store-shard-status.json"
+          fi
+
+          for result in "$artifacts"/store-shard-*.test.json; do
+            [[ -f "$result" ]] || continue
+            if ! jq -e 'select(.Action == "fail")' "$result" >/dev/null; then
+              continue
+            fi
+            echo "::group::$(basename "$result")"
+            mapfile -t failed_tests < <(
+              jq -r 'select(.Action == "fail" and .Test != null) | .Test' \
+                "$result" | sort -u
+            )
+            if (( ${#failed_tests[@]} == 0 )); then
+              jq -r '
+                select(.Action == "output" or .Action == "fail")
+                | .Output // ((.Test // "package") + ": " + .Action)
+              ' "$result"
+            else
+              for failed_test in "${failed_tests[@]}"; do
+                echo "--- $failed_test ---"
+                jq -r --arg test "$failed_test" '
+                  select(
+                    .Test == $test and
+                    (.Action == "output" or .Action == "fail")
+                  )
+                  | .Output // ((.Test // "package") + ": " + .Action)
+                ' "$result"
+              done
+            fi
+            echo '::endgroup::'
+          done
+
       - name: Rematerialize clean backend source for release
         if: needs.plan.outputs.backend_changed == 'true'
         env:
