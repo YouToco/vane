@@ -25,6 +25,112 @@ type historyQueryReplayStore struct {
 	queries []store.IntelligenceQuery
 }
 
+type unavailableHistoryComparisonStore struct {
+	*fakeStore
+	queries []store.IntelligenceQuery
+}
+
+type emptyScopedBriefComparisonStore struct {
+	*fakeStore
+	queries []store.IntelligenceQuery
+}
+
+func (f *emptyScopedBriefComparisonStore) QueryMyIntelligence(
+	_ context.Context,
+	_ store.IntelligenceScope,
+	query store.IntelligenceQuery,
+) (*store.IntelligenceQueryResult, error) {
+	f.queries = append(f.queries, query)
+	result := &store.IntelligenceQueryResult{
+		CatalogVersion: store.IntelligenceCatalogVersion,
+		Dataset:        query.Dataset,
+		Coverage:       store.IntelligenceCoverage{Status: "complete"},
+	}
+	switch query.Dataset {
+	case store.IntelligenceTasks:
+		result.Rows = []map[string]any{{
+			"task_ref": "task-kimi", "task_name": "Kimi 套餐监控",
+		}}
+	case store.IntelligenceRuns:
+		result.Rows = []map[string]any{
+			{
+				"task_ref": "task-kimi", "run_snapshot_id": "341",
+				"outcome_status": "unavailable", "result": nil,
+				"source_coverage": "unavailable", "created_at": "2026-08-12T17:00:00Z",
+			},
+			{
+				"task_ref": "task-kimi", "run_snapshot_id": "334",
+				"outcome_status": "finalized", "result": "content",
+				"source_coverage": "exact", "created_at": "2026-08-12T11:00:00Z",
+			},
+		}
+	case store.IntelligenceBriefs:
+		if !intelligenceQueryHasRunSnapshotFilter(query, "341", "334") {
+			return nil, errors.New("comparison widened beyond selected run snapshots")
+		}
+		result.Rows = nil
+		result.Coverage.Note = "目标运行没有可用 Brief；不能用其他运行回填。"
+	default:
+		return nil, errors.New("comparison queried an unrelated dataset")
+	}
+	return result, nil
+}
+
+func intelligenceQueryHasRunSnapshotFilter(query store.IntelligenceQuery, expected ...string) bool {
+	for _, filter := range query.Filters {
+		if filter.Field != "run_snapshot_id" || filter.Op != "in" {
+			continue
+		}
+		var values []string
+		if json.Unmarshal(filter.Value, &values) != nil || len(values) != len(expected) {
+			return false
+		}
+		for index := range values {
+			if values[index] != expected[index] {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func (f *unavailableHistoryComparisonStore) QueryMyIntelligence(
+	_ context.Context,
+	_ store.IntelligenceScope,
+	query store.IntelligenceQuery,
+) (*store.IntelligenceQueryResult, error) {
+	f.queries = append(f.queries, query)
+	result := &store.IntelligenceQueryResult{
+		CatalogVersion: store.IntelligenceCatalogVersion,
+		Dataset:        query.Dataset,
+		Coverage:       store.IntelligenceCoverage{Status: "complete"},
+	}
+	switch query.Dataset {
+	case store.IntelligenceTasks:
+		result.Rows = []map[string]any{{
+			"task_ref": "task-kimi", "task_name": "Kimi 套餐监控",
+		}}
+	case store.IntelligenceRuns:
+		result.Coverage.Note = "outcome_status 只表示运行记录状态；比较最近一次与上一次运行时不要先筛状态。"
+		result.Rows = []map[string]any{
+			{
+				"task_ref": "task-kimi", "run_snapshot_id": "341",
+				"outcome_status": "unavailable", "result": nil,
+				"source_coverage": "unavailable", "created_at": "2026-08-12T17:00:00Z",
+			},
+			{
+				"task_ref": "task-kimi", "run_snapshot_id": "340",
+				"outcome_status": "unavailable", "result": nil,
+				"source_coverage": "unavailable", "created_at": "2026-08-12T16:00:00Z",
+			},
+		}
+	default:
+		return nil, errors.New("comparison widened beyond selected runs")
+	}
+	return result, nil
+}
+
 func (f *historyQueryReplayStore) QueryMyIntelligence(
 	_ context.Context,
 	_ store.IntelligenceScope,
@@ -141,6 +247,114 @@ func TestHistoricalRunComparisonUsesActualOutcomeSemantics(t *testing.T) {
 	for _, required := range []string{"不存在 success", "finalized 只表示已结算", "run-new", "run-old"} {
 		if !strings.Contains(string(runsContext), required) {
 			t.Fatalf("runs result omitted %q: %s", required, runsContext)
+		}
+	}
+}
+
+func TestHistoricalRunComparisonStopsWhenBothLatestRunsAreUnavailable(t *testing.T) {
+	const userRequest = "Kimi 今天相比上一次运行有什么变化？只使用我自己的历史情报数据回答，说明两次运行的结论和证据覆盖；证据不足就明确说不足，不要查询外部网页，不要执行任何写操作。"
+	replay := &unavailableHistoryComparisonStore{fakeStore: newFakeStore()}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "tasks", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"tasks","filters":[{"field":"task_name","op":"contains","value":"Kimi"}]}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "runs", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"runs","filters":[{"field":"task_ref","op":"eq","value":"task-kimi"}],"order_by":[{"field":"created_at","direction":"desc"}],"limit":2}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "最近的 run 341 与上一次 run 340 都是 unavailable，result 均为空且 source_coverage 为 unavailable。两次都没有可比较的情报结论，证据不足，不能判断 Kimi 页面状态发生了变化。", FinishReason: "stop"},
+	}}
+	loop := New(Deps{
+		Store: replay, Profiles: replay, OwnerAgent: true,
+		Evidence: &fakeAgentEvidenceWriter{},
+		Tools:    ownerTestTools(NewQueryMyIntelligenceTool(replay)),
+		Model:    "deepseek-v4-flash", MaxTurns: 4, SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+
+	out, err := loop.HandleMessage(t.Context(), 42, userRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.queries) != 2 || replay.queries[0].Dataset != store.IntelligenceTasks ||
+		replay.queries[1].Dataset != store.IntelligenceRuns {
+		t.Fatalf("comparison did not stop at unavailable runs: %+v", replay.queries)
+	}
+	if !strings.Contains(out.Reply, "run 341") ||
+		!strings.Contains(out.Reply, "run 340") ||
+		!strings.Contains(out.Reply, "证据不足") {
+		t.Fatalf("out=%+v", out)
+	}
+	if len(chat.requests) != 3 {
+		t.Fatalf("chat requests=%d", len(chat.requests))
+	}
+	lastRequest, err := json.Marshal(chat.requests[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"必须立即基于 runs 回答证据不足",
+		"不再查询 briefs/observations",
+		`run_snapshot_id\":\"341`,
+		`run_snapshot_id\":\"340`,
+	} {
+		if !strings.Contains(string(lastRequest), required) {
+			t.Fatalf("final comparison context omitted %q: %s", required, lastRequest)
+		}
+	}
+}
+
+func TestHistoricalRunComparisonDoesNotWidenAfterEmptyScopedBriefs(t *testing.T) {
+	const userRequest = "Kimi 今天相比上一次运行有什么变化？"
+	replay := &emptyScopedBriefComparisonStore{fakeStore: newFakeStore()}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "tasks", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"tasks","filters":[{"field":"task_name","op":"contains","value":"Kimi"}]}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "runs", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"runs","filters":[{"field":"task_ref","op":"eq","value":"task-kimi"}],"order_by":[{"field":"created_at","direction":"desc"}],"limit":2}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "briefs-scoped", Name: "query_my_intelligence",
+			Arguments: `{"dataset":"briefs","filters":[{"field":"task_ref","op":"eq","value":"task-kimi"},{"field":"run_snapshot_id","op":"in","value":["341","334"]}]}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "最新 run 341 没有可用结论，而 run 334 虽已结算为 content，但精确查询这两次运行没有可用 Brief。旧运行不能证明这两次的结论，因此证据不足，不能判断内容发生了什么变化。", FinishReason: "stop"},
+	}}
+	loop := New(Deps{
+		Store: replay, Profiles: replay, OwnerAgent: true,
+		Evidence: &fakeAgentEvidenceWriter{},
+		Tools:    ownerTestTools(NewQueryMyIntelligenceTool(replay)),
+		Model:    "deepseek-v4-flash", MaxTurns: 5, SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+
+	out, err := loop.HandleMessage(t.Context(), 42, userRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.queries) != 3 || replay.queries[2].Dataset != store.IntelligenceBriefs ||
+		!intelligenceQueryHasRunSnapshotFilter(replay.queries[2], "341", "334") {
+		t.Fatalf("comparison widened after scoped empty result: %+v", replay.queries)
+	}
+	if !strings.Contains(out.Reply, "旧运行不能证明") ||
+		!strings.Contains(out.Reply, "证据不足") {
+		t.Fatalf("out=%+v", out)
+	}
+	finalRequest, err := json.Marshal(chat.requests[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"目标查询为空后不得移除 run_snapshot_id 扩查旧运行",
+		"目标运行没有可用 Brief",
+		`run_snapshot_id\":\"341`,
+		`run_snapshot_id\":\"334`,
+	} {
+		if !strings.Contains(string(finalRequest), required) {
+			t.Fatalf("scoped empty context omitted %q: %s", required, finalRequest)
 		}
 	}
 }
