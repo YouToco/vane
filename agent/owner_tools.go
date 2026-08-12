@@ -109,7 +109,7 @@ const queryMyIntelligenceSchema = `{
     "dataset": {
       "type": "string",
       "enum": ["tasks","runs","observations","briefs","agent_turns","tool_calls","profile","feedbacks"],
-      "description": "一次只查询一个用户情报数据集"
+      "description": "一次只查询一个用户情报数据集。tasks 是当前任务定义，不是历史情报活动；重大更新、昨天查到什么等时间窗问题必须查询 runs/briefs，必要时查询 observations"
     },
     "select": {
       "type": "array", "maxItems": 32, "items": {"type":"string"},
@@ -122,7 +122,7 @@ const queryMyIntelligenceSchema = `{
         "properties": {
           "field": {
             "type":"string",
-            "description":"目录字段名。相对时间通常使用：tasks.updated_at；runs.created_at 或 finalized_at；observations.created_at；briefs.generated_at；agent_turns.created_at；tool_calls.created_at；profile.updated_at。"
+            "description":"目录字段名，不得自造 name 等字段。任务名称字段是 tasks.task_name。相对时间通常使用：tasks.updated_at（仅定义/状态/计划变化）；runs.created_at 或 finalized_at；observations.created_at；briefs.generated_at；agent_turns.created_at；tool_calls.created_at；profile.updated_at。"
           },
           "op": {"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","in","within"]},
           "value": {"description":"与字段类型匹配的 JSON 值；within 使用 today、yesterday 或 last_7_days"}
@@ -166,7 +166,7 @@ type queryMyIntelligenceTool struct{ st intelligenceQueryStore }
 
 func (*queryMyIntelligenceTool) Name() string { return "query_my_intelligence" }
 func (*queryMyIntelligenceTool) Description() string {
-	return "查询当前用户自己的任务、历史运行、legacy/V3 Observation/Evidence、legacy/V3 Brief、历史 Agent 回答、模型实际看到的工具证据、画像或推送反馈。按名称、主题、用途和自然时间定位；observations/briefs 的 coverage 会区分 exact、unavailable、全文与分窗，payload_complete=false 或 truncated=true 时必须原样携带 next_cursor 连续查询到完整尾部，不能补猜；用户用‘刚才那条’、‘我点的’等方式指代卡片操作时查询 feedbacks，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
+	return "查询当前用户自己的任务、历史运行、legacy/V3 Observation/Evidence、legacy/V3 Brief、历史 Agent 回答、模型实际看到的工具证据、画像或推送反馈。tasks 只表示当前任务定义，tasks.updated_at 只表示定义、状态或计划变化；‘过去七天有哪些重大更新’等历史情报问题先用 tasks.task_name 定位任务且不要按时间过滤定义，再查询时间窗内的 runs 和 briefs，必要时查询 observations，不能用 tasks 空结果断言没有更新。observations/briefs 的 coverage 会区分 exact、unavailable、全文与分窗，payload_complete=false 或 truncated=true 时必须原样携带 next_cursor 连续查询到完整尾部，不能补猜；用户用‘刚才那条’、‘我点的’等方式指代卡片操作时查询 feedbacks，不要求用户提供内部 ID；跨数据集问题连续调用本工具后再综合。"
 }
 func (*queryMyIntelligenceTool) Parameters() json.RawMessage {
 	return json.RawMessage(queryMyIntelligenceSchema)

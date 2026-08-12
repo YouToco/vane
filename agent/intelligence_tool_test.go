@@ -101,3 +101,37 @@ func TestQueryMyIntelligenceAdvertisesFeedbackWithoutSpecializedTool(t *testing.
 		}
 	}
 }
+
+func TestQueryMyIntelligenceSeparatesTaskDefinitionsFromHistoricalUpdates(t *testing.T) {
+	tool := &queryMyIntelligenceTool{}
+	for _, required := range []string{
+		"tasks 只表示当前任务定义",
+		"不要按时间过滤定义",
+		"runs 和 briefs",
+		"不能用 tasks 空结果断言没有更新",
+	} {
+		if !strings.Contains(tool.Description(), required) {
+			t.Fatalf("query description is missing %q: %s", required, tool.Description())
+		}
+	}
+	for _, required := range []string{
+		"tasks.updated_at 只证明定义、状态或计划发生变化",
+		"任务名称是 task_name，不是 name",
+		"先用 tasks 定位任务（不要用时间窗过滤任务定义）",
+		"时间窗内的 runs 和 briefs",
+		"tasks 空结果或 tasks.updated_at 无命中绝不能回答",
+	} {
+		if !strings.Contains(systemPrompt, required) {
+			t.Fatalf("owner system prompt is missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"tasks 是当前任务定义，不是历史情报活动",
+		"tasks.task_name",
+		"仅定义/状态/计划变化",
+	} {
+		if !strings.Contains(queryMyIntelligenceSchema, required) {
+			t.Fatalf("query schema is missing %q", required)
+		}
+	}
+}
