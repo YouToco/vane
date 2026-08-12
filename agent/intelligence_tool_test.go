@@ -138,6 +138,8 @@ func TestQueryMyIntelligenceSeparatesTaskDefinitionsFromHistoricalUpdates(t *tes
 		"tasks 只表示当前任务定义",
 		"不要按时间过滤定义",
 		"runs 和 briefs",
+		"省略 select 使用默认列",
+		"不自行猜窗口日期",
 		"不能用 tasks 空结果断言没有更新",
 	} {
 		if !strings.Contains(tool.Description(), required) {
@@ -149,6 +151,9 @@ func TestQueryMyIntelligenceSeparatesTaskDefinitionsFromHistoricalUpdates(t *tes
 		"任务名称是 task_name，不是 name",
 		"先用 tasks 定位任务（不要用时间窗过滤任务定义）",
 		"时间窗内的 runs 和 briefs",
+		"省略 select",
+		"不得自造 run_ref、brief_ref、result_summary、payload、coverage",
+		"不得自行猜测或平移窗口日期",
 		"tasks 空结果或 tasks.updated_at 无命中绝不能回答",
 	} {
 		if !strings.Contains(systemPrompt, required) {
@@ -159,6 +164,9 @@ func TestQueryMyIntelligenceSeparatesTaskDefinitionsFromHistoricalUpdates(t *tes
 		"tasks 是当前任务定义，不是历史情报活动",
 		"tasks.task_name",
 		"tasks 取得 task_ref",
+		"runs 默认 task_ref,run_snapshot_id",
+		"briefs 默认 lineage,task_ref,run_snapshot_id,brief_preview",
+		"不存在 run_ref,brief_ref,result_summary,payload,coverage",
 		"仅定义/状态/计划变化",
 	} {
 		if !strings.Contains(queryMyIntelligenceSchema, required) {
@@ -214,6 +222,23 @@ func TestHistoricalUpdateQuestionReplaysTasksRunsAndBriefsBeforeAnswer(t *testin
 		if len(replay.queries[index].Filters) != 2 || replay.queries[index].Filters[0].Field != "task_ref" {
 			t.Fatalf("history query[%d] is not task_ref-bound: %+v", index, replay.queries[index])
 		}
+	}
+	seenDefaultQuery := map[string]bool{}
+	for _, request := range chat.requests {
+		for _, message := range request.Messages {
+			for _, call := range message.ToolCalls {
+				if call.ID != "runs" && call.ID != "briefs" {
+					continue
+				}
+				if strings.Contains(call.Arguments, `"select"`) {
+					t.Fatalf("history call %q invented a select projection: %s", call.ID, call.Arguments)
+				}
+				seenDefaultQuery[call.ID] = true
+			}
+		}
+	}
+	if !seenDefaultQuery["runs"] || !seenDefaultQuery["briefs"] {
+		t.Fatalf("default history calls were not replayed: %v", seenDefaultQuery)
 	}
 	encoded, err := json.Marshal(chat.requests[1].Messages)
 	if err != nil {
