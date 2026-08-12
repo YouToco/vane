@@ -103,33 +103,43 @@ func TestResearchPlannerToolSearchV33SearchThenFinalIsRecoverySafe(t *testing.T)
 }
 
 func TestResearchPlannerToolSearchV33ForcesFinalAfterLoadedTools(t *testing.T) {
-	snapshot, seal := plannerToolSearchSealV33(t)
-	completions := []string{
-		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"official web release","limit":8}}`,
-		`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"redundant search","limit":8}}`,
-		`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"official","tool_name":"web_search","arguments":{"query":"official status"}},{"invocation_id":"confirmation","tool_name":"web_search","arguments":{"query":"official status confirmation"}}]}`,
-	}
-	persistCalls := 0
-	execute := func(_ context.Context, round int, _ string) (
-		storepkg.ResearchRunLLMReceiptV3,
-		storepkg.ResearchRunLLMSpendReservationV3, error,
-	) {
-		return storepkg.ResearchRunLLMReceiptV3{
-			Call: types.LLMCall{Completion: completions[round]},
-		}, storepkg.ResearchRunLLMSpendReservationV3{ReservationID: int64(round + 1)}, nil
-	}
-	persist := func(_ context.Context, _ storepkg.ResearchRunLLMSpendReservationV3,
-		receipt runcontext.ResearchPlannerToolSearchReceiptV1,
-	) (runcontext.ResearchPlannerToolSearchReceiptV1, error) {
-		persistCalls++
-		return receipt, nil
-	}
-	plan, reservation, err := executeResearchPlannerToolSearchRoundsV33(
-		t.Context(), snapshot, seal, execute, persist)
-	if err != nil || len(plan.Steps) != 2 || reservation.ReservationID != 3 ||
-		persistCalls != 1 {
-		t.Fatalf("plan=%+v reservation=%+v persist=%d err=%v",
-			plan, reservation, persistCalls, err)
+	for name, systemPrompt := range map[string]string{
+		"retained-final-only": runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly,
+		"compact-loaded":      runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools,
+	} {
+		t.Run(name, func(t *testing.T) {
+			snapshot, seal := plannerToolSearchSealV33(t)
+			seal.ResearchModel.Planner.SystemPrompt = systemPrompt
+			completions := []string{
+				`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"official web release","limit":8}}`,
+				`{"schema_version":"vane.research-planner-output/v3.3","action":"tool_search","tool_search":{"query":"redundant search","limit":8}}`,
+				`{"schema_version":"vane.research-planner-output/v3.3","action":"final","steps":[{"invocation_id":"official","tool_name":"web_search","arguments":{"query":"official status"}},{"invocation_id":"confirmation","tool_name":"web_search","arguments":{"query":"official status confirmation"}}]}`,
+			}
+			persistCalls := 0
+			execute := func(_ context.Context, round int, _ string) (
+				storepkg.ResearchRunLLMReceiptV3,
+				storepkg.ResearchRunLLMSpendReservationV3, error,
+			) {
+				return storepkg.ResearchRunLLMReceiptV3{
+						Call: types.LLMCall{Completion: completions[round]},
+					}, storepkg.ResearchRunLLMSpendReservationV3{
+						ReservationID: int64(round + 1),
+					}, nil
+			}
+			persist := func(_ context.Context, _ storepkg.ResearchRunLLMSpendReservationV3,
+				receipt runcontext.ResearchPlannerToolSearchReceiptV1,
+			) (runcontext.ResearchPlannerToolSearchReceiptV1, error) {
+				persistCalls++
+				return receipt, nil
+			}
+			plan, reservation, err := executeResearchPlannerToolSearchRoundsV33(
+				t.Context(), snapshot, seal, execute, persist)
+			if err != nil || len(plan.Steps) != 2 || reservation.ReservationID != 3 ||
+				persistCalls != 1 {
+				t.Fatalf("plan=%+v reservation=%+v persist=%d err=%v",
+					plan, reservation, persistCalls, err)
+			}
+		})
 	}
 }
 
@@ -191,22 +201,31 @@ func TestResearchPlannerToolSearchV33ProductionRecoveryFitsRetainedTokenBudget(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	productStatus, ok := frozenResearchToolV3(seal.ResearchTools, "web_product_status")
-	if !ok {
-		t.Fatal("production policy lost web_product_status")
+	catalog, err := buildResearchPlannerCatalogV33(seal)
+	if err != nil {
+		t.Fatal(err)
 	}
-	webContents, ok := frozenResearchToolV3(seal.ResearchTools, "web_contents")
-	if !ok {
-		t.Fatal("production policy lost web_contents")
+	productionQuery := "official structured tool to read first-party purchase status of Kimi membership pricing page https://www.kimi.com/membership/pricing"
+	matches, err := catalog.Search(productionQuery, 8)
+	if err != nil || len(matches) != 3 {
+		t.Fatalf("production query matches=%d err=%v", len(matches), err)
+	}
+	receiptMatches := make([]runcontext.ResearchPlannerToolSearchMatchV1, 0, len(matches))
+	for _, match := range matches {
+		tool, ok := frozenResearchToolV3(seal.ResearchTools, match.Entry.Name)
+		if !ok {
+			t.Fatalf("production search returned unknown tool %q", match.Entry.Name)
+		}
+		score, scoreErr := runcontext.CanonicalResearchPlannerSearchScoreV1(match.Score)
+		if scoreErr != nil {
+			t.Fatal(scoreErr)
+		}
+		receiptMatches = append(receiptMatches, runcontext.ResearchPlannerToolSearchMatchV1{
+			Name: tool.Name, SchemaDigest: tool.SchemaDigest, Score: score,
+		})
 	}
 	receipt, err := runcontext.BuildResearchPlannerToolSearchReceiptV1(
-		2, seal.ResearchToolPolicyDigest, "Kimi membership official structured status", 8,
-		[]runcontext.ResearchPlannerToolSearchMatchV1{
-			{Name: productStatus.Name, SchemaDigest: productStatus.SchemaDigest,
-				Score: "10.862487394"},
-			{Name: webContents.Name, SchemaDigest: webContents.SchemaDigest,
-				Score: "0.772534701"},
-		})
+		0, seal.ResearchToolPolicyDigest, productionQuery, 8, receiptMatches)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,6 +245,58 @@ func TestResearchPlannerToolSearchV33ProductionRecoveryFitsRetainedTokenBudget(t
 	if total > seal.Payload.PlannerBudget.MaxTokens {
 		t.Fatalf("search/final reserves %d bytes over budget %d", total,
 			seal.Payload.PlannerBudget.MaxTokens)
+	}
+	legacySeal := seal
+	legacySeal.ResearchModel.Planner.SystemPrompt =
+		runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly
+	legacyInitial, err := buildResearchPlannerPromptV33(legacySeal, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyLoaded, err := buildResearchPlannerPromptV33(
+		legacySeal, []runcontext.ResearchPlannerToolSearchReceiptV1{receipt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyReserve := func(prompt string) int {
+		return len(legacySeal.ResearchModel.Planner.SystemPrompt) + len(prompt) + 64 +
+			legacySeal.ResearchModel.Planner.MaxTokens
+	}
+	if legacyReserve(legacyInitial)+legacyReserve(legacyLoaded) <=
+		seal.Payload.PlannerBudget.MaxTokens {
+		t.Fatal("production three-hit fixture no longer reproduces the duplicate-schema overflow")
+	}
+	var decoded researchPlannerPromptV33
+	if err := json.Unmarshal([]byte(loaded), &decoded); err != nil ||
+		len(decoded.SearchHistory) != 1 || len(decoded.SearchHistory[0].Tools) != 0 ||
+		len(decoded.LoadedTools) != 3 {
+		t.Fatalf("compact loaded prompt projection is invalid: err=%v prompt=%s", err, loaded)
+	}
+}
+
+func TestBuildResearchPlannerPromptV33RetainsLegacySchemaProjectionBytes(t *testing.T) {
+	_, seal := plannerToolSearchSealV33(t)
+	seal.ResearchModel.Planner.SystemPrompt =
+		runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly
+	tool := seal.ResearchTools.AllowedTools[0]
+	receipt, err := runcontext.BuildResearchPlannerToolSearchReceiptV1(
+		0, seal.ResearchToolPolicyDigest, "official web", 1,
+		[]runcontext.ResearchPlannerToolSearchMatchV1{{
+			Name: tool.Name, SchemaDigest: tool.SchemaDigest, Score: "1.000000000",
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := buildResearchPlannerPromptV33(
+		seal, []runcontext.ResearchPlannerToolSearchReceiptV1{receipt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded researchPlannerPromptV33
+	if err := json.Unmarshal([]byte(prompt), &decoded); err != nil ||
+		len(decoded.SearchHistory) != 1 || len(decoded.SearchHistory[0].Tools) != 1 ||
+		len(decoded.LoadedTools) != 1 {
+		t.Fatalf("legacy schema projection changed: err=%v prompt=%s", err, prompt)
 	}
 }
 
