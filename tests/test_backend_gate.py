@@ -28,6 +28,20 @@ class BackendGateTests(unittest.TestCase):
         self.assertNotIn(
             "-coverprofile=coverage.txt -covermode=atomic ./...", workflow
         )
+        self.assertIn(
+            "- name: Report backend Store shard failure\n"
+            "        if: failure() && needs.plan.outputs.backend_changed == 'true'",
+            workflow,
+        )
+        self.assertIn('store-shard-status.json', workflow)
+        self.assertIn('select(.Action == "fail")', workflow)
+        self.assertIn(
+            'select(.Action == "output" or .Action == "fail")', workflow
+        )
+        self.assertLess(
+            workflow.index("- name: Report backend Store shard failure"),
+            workflow.index("- name: Remove per-attempt build root"),
+        )
 
     def test_each_postgres_shard_uses_an_ephemeral_host_port(self) -> None:
         workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
