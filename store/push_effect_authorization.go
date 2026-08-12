@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -70,7 +71,7 @@ func (s *Store) claimAuthorizedPushEffectWithGate(
 	if err := lockPushEffectBatchForScope(ctx, tx, params.Scope); err != nil {
 		return nil, "", err
 	}
-	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, params.Scope)
+	effect, err := loadPushEffectForUpdate(ctx, tx, params.Scope)
 	if err != nil {
 		return nil, "", err
 	}
@@ -104,17 +105,18 @@ func (s *Store) claimAuthorizedPushEffectWithGate(
 	if err != nil {
 		return nil, "", err
 	}
+	// Take the single decision sample only after all non-temporal admission
+	// work. This keeps the provider lease complete from the mutation boundary
+	// while avoiding a second clock_timestamp() read that can move backwards on
+	// a virtualized runner.
+	databaseNow, err := readPushEffectDatabaseClock(ctx, tx)
+	if err != nil {
+		return nil, "", err
+	}
 	if !admitted {
 		if !reconciliation {
-			if _, err := tx.Exec(ctx, `
-				UPDATE push_effects
-				   SET next_attempt_at=clock_timestamp()+
-				       ($5*interval '1 microsecond'),
-				       updated_at=clock_timestamp()
-				 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND fence=$4
-				   AND status IN ('prepared','definite_failed')`,
-				effect.ID, effect.TenantID, effect.UserID, effect.Fence,
-				params.DenialRetryAfter.Microseconds(),
+			if err := deferCanonicalPushEffectRecovery(
+				ctx, tx, effect, params.DenialRetryAfter, databaseNow,
 			); err != nil {
 				return nil, "", pushEffectDatabaseError(
 					"defer canonical push effect recovery", err)
@@ -132,7 +134,7 @@ func (s *Store) claimAuthorizedPushEffectWithGate(
 		effect.LeaseUntil != nil &&
 		databaseNow.Before(*effect.LeaseUntil) {
 		replayed, authorized, err := loadAuthorizedPushEffectClaimReplay(
-			ctx, tx, effect, params, reconciliation)
+			ctx, tx, effect, params, reconciliation, databaseNow)
 		if err != nil {
 			return nil, "", err
 		}
@@ -172,7 +174,7 @@ func (s *Store) claimAuthorizedPushEffectWithGate(
 			return nil, "", pushEffectConflict(
 				"push effect provider window cannot contain the complete lease")
 		}
-		if databaseNow.Before(effect.NextAttemptAt) {
+		if !authorizedFreshPushEffectDue(effect, databaseNow) {
 			if err := tx.Commit(ctx); err != nil {
 				return nil, "", pushEffectDatabaseError(
 					"commit authorized claim not-due decision", err)
@@ -182,7 +184,7 @@ func (s *Store) claimAuthorizedPushEffectWithGate(
 	}
 
 	claimed, authorized, err := updateAuthorizedPushEffectClaim(
-		ctx, tx, effect, params, reconciliation)
+		ctx, tx, effect, params, reconciliation, databaseNow)
 	if err != nil {
 		return nil, "", err
 	}
@@ -201,6 +203,47 @@ func (s *Store) claimAuthorizedPushEffectWithGate(
 			"commit authorized claim transaction", err)
 	}
 	return claimed, pusheffect.AuthorizedClaimed, nil
+}
+
+func deferCanonicalPushEffectRecovery(
+	ctx context.Context,
+	tx pgx.Tx,
+	effect *pusheffect.Effect,
+	retryAfter time.Duration,
+	databaseNow time.Time,
+) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE push_effects
+		   SET next_attempt_at=$6::timestamptz+
+		       ($5*interval '1 microsecond'),
+		       updated_at=$6::timestamptz
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND fence=$4
+		   AND status IN ('prepared','definite_failed')`,
+		effect.ID, effect.TenantID, effect.UserID, effect.Fence,
+		retryAfter.Microseconds(), databaseNow,
+	)
+	return err
+}
+
+func authorizedFreshPushEffectDue(
+	effect *pusheffect.Effect,
+	databaseNow time.Time,
+) bool {
+	if effect == nil {
+		return false
+	}
+	if !databaseNow.Before(effect.NextAttemptAt) {
+		return true
+	}
+	// A never-attempted row is due at creation even if the virtualized DB wall
+	// clock steps backwards between Create and Claim. A denial/backoff moves
+	// next_attempt_at beyond its own updated_at, so it cannot use this exception
+	// even if the wall clock made a much larger backwards step.
+	return effect.Status == pusheffect.StatusPrepared &&
+		effect.Fence == 0 && effect.Attempt == 0 &&
+		effect.FailureClass == "" &&
+		!effect.NextAttemptAt.After(effect.CreatedAt) &&
+		!effect.NextAttemptAt.After(effect.UpdatedAt)
 }
 
 func canonicalBriefPushRecoveryAdmittedV1(
@@ -424,11 +467,12 @@ func loadAuthorizedPushEffectClaimReplay(
 	effect *pusheffect.Effect,
 	params pusheffect.AuthorizedClaimParams,
 	reconciliation bool,
+	databaseNow time.Time,
 ) (*pusheffect.Effect, bool, error) {
 	windowPredicate := ""
 	if reconciliation {
 		windowPredicate = `
-		   AND clock_timestamp()+($6*interval '1 microsecond')
+		   AND $11::timestamptz+($6*interval '1 microsecond')
 		       <=e.idempotency_expires_at`
 	} else {
 		// A same-owner replay returns the already-held lease rather than
@@ -443,14 +487,14 @@ func loadAuthorizedPushEffectClaimReplay(
 		  FROM push_effects e
 		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3
 		   AND e.status='sending' AND e.lease_owner=$4 AND e.fence=$5
-		   AND e.lease_until>clock_timestamp()`+windowPredicate+`
+		   AND e.lease_until>$11::timestamptz`+windowPredicate+`
 		   AND $7::bigint>0
 		   AND `+authorizedPushEffectRunPredicate(),
 		params.ID, params.TenantID, params.UserID, params.LeaseOwner,
 		effect.Fence, params.LeaseDuration.Microseconds(),
 		params.DenialRetryAfter.Microseconds(),
 		types.ScheduleStatusActive, types.TenantStatusActive,
-		params.ExpectedTaskID)
+		params.ExpectedTaskID, databaseNow)
 	replayed, err := scanPushEffect(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
@@ -471,24 +515,25 @@ func updateAuthorizedPushEffectClaim(
 	effect *pusheffect.Effect,
 	params pusheffect.AuthorizedClaimParams,
 	reconciliation bool,
+	databaseNow time.Time,
 ) (*pusheffect.Effect, bool, error) {
 	if !reconciliation {
 		return updateFreshAuthorizedPushEffectClaim(
-			ctx, tx, effect, params)
+			ctx, tx, effect, params, databaseNow)
 	}
 	statusPredicate := `
 		   AND e.status='ambiguous'
-		   AND e.next_attempt_at<=clock_timestamp()
-		   AND clock_timestamp()+($6*interval '1 microsecond')
+		   AND e.next_attempt_at<=$11::timestamptz
+		   AND $11::timestamptz+($6*interval '1 microsecond')
 		       <=e.idempotency_expires_at`
 	row := tx.QueryRow(ctx, `
 		UPDATE push_effects e
 		   SET status='sending', lease_owner=$4,
-		       lease_until=clock_timestamp()+($6*interval '1 microsecond'),
-		       takeover_not_before=clock_timestamp()+($7*interval '1 microsecond'),
+		       lease_until=$11::timestamptz+($6*interval '1 microsecond'),
+		       takeover_not_before=$11::timestamptz+($7*interval '1 microsecond'),
 		       fence=e.fence+1, attempt=e.attempt+1,
 		       failure_class='', ambiguous_since=NULL,
-		       updated_at=clock_timestamp()
+		       updated_at=$11::timestamptz
 		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3 AND e.fence=$5
 		   AND e.lease_owner='' AND e.lease_until IS NULL`+
 		statusPredicate+`
@@ -498,7 +543,7 @@ func updateAuthorizedPushEffectClaim(
 		effect.Fence, params.LeaseDuration.Microseconds(),
 		(params.LeaseDuration + pushEffectTakeoverGrace).Microseconds(),
 		types.ScheduleStatusActive, types.TenantStatusActive,
-		params.ExpectedTaskID)
+		params.ExpectedTaskID, databaseNow)
 	claimed, err := scanPushEffect(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
@@ -515,11 +560,12 @@ func updateFreshAuthorizedPushEffectClaim(
 	tx pgx.Tx,
 	effect *pusheffect.Effect,
 	params pusheffect.AuthorizedClaimParams,
+	databaseNow time.Time,
 ) (*pusheffect.Effect, bool, error) {
 	var authorized bool
 	err := tx.QueryRow(ctx, `
 		WITH database_clock AS MATERIALIZED (
-			SELECT clock_timestamp() AS database_now
+			SELECT $12::timestamptz AS database_now
 		), decision AS (
 			SELECT (
 				`+authorizedPushEffectRunPredicate()+`
@@ -560,7 +606,11 @@ func updateFreshAuthorizedPushEffectClaim(
 		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3 AND e.fence=$5
 		   AND e.task_id=$10
 		   AND e.status IN ('prepared','definite_failed')
-		   AND e.next_attempt_at<=clock_timestamp()
+		   AND (e.next_attempt_at<=decision.database_now OR (
+		       e.status='prepared' AND e.fence=0 AND e.attempt=0
+		       AND e.failure_class='' AND e.next_attempt_at<=e.created_at
+		       AND e.next_attempt_at<=e.updated_at
+		   ))
 		   AND e.lease_owner='' AND e.lease_until IS NULL
 		 RETURNING decision.authorized`,
 		params.ID, params.TenantID, params.UserID, params.LeaseOwner,
@@ -569,6 +619,7 @@ func updateFreshAuthorizedPushEffectClaim(
 		types.ScheduleStatusActive, types.TenantStatusActive,
 		params.ExpectedTaskID,
 		params.DenialRetryAfter.Microseconds(),
+		databaseNow,
 	).Scan(&authorized)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, pushEffectBusy()

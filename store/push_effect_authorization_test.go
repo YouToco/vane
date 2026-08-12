@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
@@ -869,17 +871,339 @@ func TestClaimAuthorizedPushEffectReconciliationHonorsDatabaseDueTime(
 	}
 }
 
+func TestUpdateFreshAuthorizedPushEffectClaimUsesFrozenDatabaseClock(t *testing.T) {
+	f, effect := authorizedPushEffectFixture(t)
+	var databaseNow time.Time
+	// Deliberately place the frozen sample beyond the live database clock. A
+	// regression that re-reads clock_timestamp() inside the UPDATE sees the
+	// effect as not due and returns the false competing-owner error.
+	if err := f.st.pool.QueryRow(t.Context(), `
+		SELECT clock_timestamp()+interval '30 minutes'`,
+	).Scan(&databaseNow); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.pool.Exec(t.Context(), `
+		UPDATE push_effects
+		   SET next_attempt_at=$2
+		 WHERE id=$1`,
+		effect.ID, databaseNow,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := f.st.beginPushEffectCoordinatorTx(t.Context(), effect.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackPushEffectTx(t.Context(), tx)
+	if err := lockPushEffectBatchForScope(t.Context(), tx, effect.Scope()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := loadPushEffectForUpdate(t.Context(), tx, effect.Scope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := pusheffect.AuthorizedClaimParams{
+		ClaimParams: pusheffect.ClaimParams{
+			Scope: stored.Scope(), LeaseOwner: "frozen-clock-test",
+			LeaseDuration: time.Minute,
+		},
+		ExpectedTaskID: stored.TaskID, DenialRetryAfter: time.Minute,
+	}
+	claimed, authorized, err := updateFreshAuthorizedPushEffectClaim(
+		t.Context(), tx, stored, params, databaseNow)
+	if err != nil || !authorized || claimed == nil {
+		t.Fatalf("claim=%+v authorized=%v err=%v", claimed, authorized, err)
+	}
+	wantLeaseUntil := databaseNow.Add(params.LeaseDuration)
+	wantTakeover := wantLeaseUntil.Add(pushEffectTakeoverGrace)
+	if claimed.LeaseUntil == nil || !claimed.LeaseUntil.Equal(wantLeaseUntil) ||
+		claimed.TakeoverNotBefore == nil ||
+		!claimed.TakeoverNotBefore.Equal(wantTakeover) ||
+		!claimed.NextAttemptAt.Equal(databaseNow) ||
+		!claimed.UpdatedAt.Equal(databaseNow) {
+		t.Fatalf(
+			"claim clock lease=%v takeover=%v next=%s updated=%s "+
+				"want lease=%s takeover=%s next/updated=%s",
+			claimed.LeaseUntil, claimed.TakeoverNotBefore,
+			claimed.NextAttemptAt, claimed.UpdatedAt,
+			wantLeaseUntil, wantTakeover, databaseNow,
+		)
+	}
+}
+
+func TestClaimAuthorizedPushEffectSamplesClockAfterAdmission(t *testing.T) {
+	f, effect := authorizedPushEffectFixture(t)
+	const leaseDuration = time.Minute
+	var gateCompleted time.Time
+	claimed, decision, err := f.st.claimAuthorizedPushEffectWithGate(
+		t.Context(),
+		pusheffect.AuthorizedClaimParams{
+			ClaimParams: pusheffect.ClaimParams{
+				Scope: effect.Scope(), LeaseOwner: "late-clock-test",
+				LeaseDuration: leaseDuration,
+			},
+			ExpectedTaskID: effect.TaskID, DenialRetryAfter: time.Minute,
+		},
+		false,
+		func(ctx context.Context, tx pgx.Tx, _ *pusheffect.Effect) error {
+			return tx.QueryRow(ctx, `
+				SELECT clock_timestamp() FROM (SELECT pg_sleep(0.05)) AS delayed`,
+			).Scan(&gateCompleted)
+		},
+	)
+	if err != nil || decision != pusheffect.AuthorizedClaimed || claimed == nil {
+		t.Fatalf("claim=%+v decision=%q err=%v", claimed, decision, err)
+	}
+	if claimed.LeaseUntil == nil ||
+		claimed.LeaseUntil.Before(gateCompleted.Add(leaseDuration)) {
+		t.Fatalf(
+			"lease=%v does not contain a complete post-admission window from %s",
+			claimed.LeaseUntil, gateCompleted,
+		)
+	}
+}
+
+func TestAuthorizedFreshPushEffectDueDistinguishesInitialFromBackoff(t *testing.T) {
+	created := time.Date(2026, time.August, 12, 10, 0, 0, 0, time.UTC)
+	databaseNow := created.Add(-time.Second)
+	initial := &pusheffect.Effect{
+		Status: pusheffect.StatusPrepared, NextAttemptAt: created,
+		CreatedAt: created, UpdatedAt: created.Add(time.Microsecond),
+	}
+	if !authorizedFreshPushEffectDue(initial, databaseNow) {
+		t.Fatal("never-attempted effect was delayed by a database clock rollback")
+	}
+	backoff := *initial
+	backoff.UpdatedAt = databaseNow
+	backoff.NextAttemptAt = databaseNow.Add(time.Minute)
+	if authorizedFreshPushEffectDue(&backoff, databaseNow) {
+		t.Fatal("authorization denial backoff was bypassed as an initial claim")
+	}
+}
+
+func TestClaimAuthorizedPushEffectHandlesInitialClockRollbackWithoutBypassingBackoff(
+	t *testing.T,
+) {
+	t.Run("pristine public claim", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		if _, err := f.st.pool.Exec(t.Context(), `
+			UPDATE push_effects
+			   SET next_attempt_at=clock_timestamp()+interval '1 minute',
+			       created_at=clock_timestamp()+interval '1 minute',
+			       updated_at=clock_timestamp()+interval '1 minute'
+			 WHERE id=$1`, effect.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(), authorizedPushEffectClaimParams(effect, "rollback-public"))
+		if err != nil || decision != pusheffect.AuthorizedClaimed || claimed == nil {
+			t.Fatalf("rollback claim=%+v decision=%q err=%v", claimed, decision, err)
+		}
+	})
+
+	t.Run("committed denial remains not due", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		if _, err := f.st.pool.Exec(t.Context(), `
+			DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+			effect.TenantID, effect.UserID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		params := authorizedPushEffectClaimParams(effect, "denied-backoff")
+		params.DenialRetryAfter = 2 * time.Minute
+		if claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(), params,
+		); err != nil || claimed != nil || decision != pusheffect.AuthorizedClaimDenied {
+			t.Fatalf("denial=%+v/%q/%v", claimed, decision, err)
+		}
+		if _, err := f.st.pool.Exec(t.Context(), `
+			INSERT INTO memberships (tenant_id,user_id,role) VALUES ($1,$2,'owner')`,
+			effect.TenantID, effect.UserID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(), params,
+		); err != nil || claimed != nil || decision != pusheffect.AuthorizedClaimNotDue {
+			t.Fatalf("backoff replay=%+v/%q/%v", claimed, decision, err)
+		}
+	})
+}
+
+func TestAuthorizedPushEffectClockSampleBindsReplayReconciliationAndDenials(
+	t *testing.T,
+) {
+	t.Run("same-owner replay", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		params := pusheffect.AuthorizedClaimParams{
+			ClaimParams: pusheffect.ClaimParams{
+				Scope: effect.Scope(), LeaseOwner: "replay-clock-test",
+				LeaseDuration: time.Minute,
+			},
+			ExpectedTaskID: effect.TaskID, DenialRetryAfter: time.Minute,
+		}
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(t.Context(), params)
+		if err != nil || decision != pusheffect.AuthorizedClaimed || claimed == nil {
+			t.Fatalf("initial claim=%+v/%q/%v", claimed, decision, err)
+		}
+		var leaseUntil time.Time
+		if err := f.st.pool.QueryRow(t.Context(), `
+			UPDATE push_effects
+			   SET lease_until=clock_timestamp()-interval '1 second',
+			       takeover_not_before=clock_timestamp()+interval '29 seconds'
+			 WHERE id=$1
+			 RETURNING lease_until`, effect.ID,
+		).Scan(&leaseUntil); err != nil {
+			t.Fatal(err)
+		}
+		tx, stored := lockedAuthorizedPushEffectForClockTest(t, f, effect)
+		defer rollbackPushEffectTx(t.Context(), tx)
+		replayed, authorized, err := loadAuthorizedPushEffectClaimReplay(
+			t.Context(), tx, stored, params, false, leaseUntil.Add(-time.Second))
+		if err != nil || !authorized || replayed == nil {
+			t.Fatalf("replay=%+v authorized=%v err=%v", replayed, authorized, err)
+		}
+	})
+
+	t.Run("reconciliation", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		params := pusheffect.AuthorizedClaimParams{
+			ClaimParams: pusheffect.ClaimParams{
+				Scope: effect.Scope(), LeaseOwner: "initial-clock-test",
+				LeaseDuration: time.Minute,
+			},
+			ExpectedTaskID: effect.TaskID, DenialRetryAfter: time.Minute,
+		}
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(t.Context(), params)
+		if err != nil || decision != pusheffect.AuthorizedClaimed || claimed == nil {
+			t.Fatalf("initial claim=%+v/%q/%v", claimed, decision, err)
+		}
+		if err := f.st.RecordPushEffectAmbiguous(t.Context(), pusheffect.FailureParams{
+			Lease: pusheffect.Lease{
+				Scope: claimed.Scope(), LeaseOwner: claimed.LeaseOwner,
+				Fence: claimed.Fence,
+			},
+			Class: "provider_response_unknown",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var databaseNow time.Time
+		if err := f.st.pool.QueryRow(t.Context(), `
+			SELECT clock_timestamp()+interval '10 minutes'`,
+		).Scan(&databaseNow); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.st.pool.Exec(t.Context(), `
+			UPDATE push_effects SET next_attempt_at=$2 WHERE id=$1`,
+			effect.ID, databaseNow,
+		); err != nil {
+			t.Fatal(err)
+		}
+		tx, stored := lockedAuthorizedPushEffectForClockTest(t, f, effect)
+		defer rollbackPushEffectTx(t.Context(), tx)
+		params.LeaseOwner = "reconciliation-clock-test"
+		reconciled, authorized, err := updateAuthorizedPushEffectClaim(
+			t.Context(), tx, stored, params, true, databaseNow)
+		if err != nil || !authorized || reconciled == nil ||
+			reconciled.LeaseUntil == nil ||
+			!reconciled.LeaseUntil.Equal(databaseNow.Add(params.LeaseDuration)) ||
+			!reconciled.UpdatedAt.Equal(databaseNow) {
+			t.Fatalf("reconciliation=%+v authorized=%v err=%v", reconciled, authorized, err)
+		}
+	})
+
+	t.Run("live authority denial", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		if _, err := f.st.pool.Exec(t.Context(), `
+			UPDATE tenants SET status=$2 WHERE id=$1`,
+			effect.TenantID, types.TenantStatusSuspended,
+		); err != nil {
+			t.Fatal(err)
+		}
+		tx, stored := lockedAuthorizedPushEffectForClockTest(t, f, effect)
+		defer rollbackPushEffectTx(t.Context(), tx)
+		databaseNow := stored.CreatedAt.Add(10 * time.Minute)
+		params := pusheffect.AuthorizedClaimParams{
+			ClaimParams: pusheffect.ClaimParams{
+				Scope: stored.Scope(), LeaseOwner: "denial-clock-test",
+				LeaseDuration: time.Minute,
+			},
+			ExpectedTaskID: stored.TaskID, DenialRetryAfter: 2 * time.Minute,
+		}
+		claimed, authorized, err := updateFreshAuthorizedPushEffectClaim(
+			t.Context(), tx, stored, params, databaseNow)
+		if err != nil || authorized || claimed != nil {
+			t.Fatalf("denial=%+v authorized=%v err=%v", claimed, authorized, err)
+		}
+		denied, err := loadPushEffectForUpdate(t.Context(), tx, effect.Scope())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !denied.NextAttemptAt.Equal(databaseNow.Add(params.DenialRetryAfter)) ||
+			!denied.UpdatedAt.Equal(databaseNow) {
+			t.Fatalf("denial clock next=%s updated=%s", denied.NextAttemptAt, denied.UpdatedAt)
+		}
+	})
+
+	t.Run("canonical admission denial", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		tx, stored := lockedAuthorizedPushEffectForClockTest(t, f, effect)
+		defer rollbackPushEffectTx(t.Context(), tx)
+		databaseNow := stored.CreatedAt.Add(10 * time.Minute)
+		const retryAfter = 2 * time.Minute
+		if err := deferCanonicalPushEffectRecovery(
+			t.Context(), tx, stored, retryAfter, databaseNow,
+		); err != nil {
+			t.Fatal(err)
+		}
+		denied, err := loadPushEffectForUpdate(t.Context(), tx, effect.Scope())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !denied.NextAttemptAt.Equal(databaseNow.Add(retryAfter)) ||
+			!denied.UpdatedAt.Equal(databaseNow) {
+			t.Fatalf("canonical denial clock next=%s updated=%s",
+				denied.NextAttemptAt, denied.UpdatedAt)
+		}
+	})
+}
+
+func lockedAuthorizedPushEffectForClockTest(
+	t *testing.T,
+	f *taskRunSnapshotFixture,
+	effect *pusheffect.Effect,
+) (pgx.Tx, *pusheffect.Effect) {
+	t.Helper()
+	tx, err := f.st.beginPushEffectCoordinatorTx(t.Context(), effect.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockPushEffectBatchForScope(t.Context(), tx, effect.Scope()); err != nil {
+		rollbackPushEffectTx(t.Context(), tx)
+		t.Fatal(err)
+	}
+	stored, err := loadPushEffectForUpdate(t.Context(), tx, effect.Scope())
+	if err != nil {
+		rollbackPushEffectTx(t.Context(), tx)
+		t.Fatal(err)
+	}
+	return tx, stored
+}
+
 func authorizedPushEffectFixture(
 	t *testing.T,
 ) (*taskRunSnapshotFixture, *pusheffect.Effect) {
-	return authorizedPushEffectFixtureWithExpiry(t, "", time.Hour)
+	return authorizedPushEffectFixtureWithExpiry(t, "", 59*time.Minute+30*time.Second)
 }
 
 func authorizedPushEffectFixtureForWorkflow(
 	t *testing.T,
 	workflowID string,
 ) (*taskRunSnapshotFixture, *pusheffect.Effect) {
-	return authorizedPushEffectFixtureWithExpiry(t, workflowID, time.Hour)
+	return authorizedPushEffectFixtureWithExpiry(
+		t, workflowID, 59*time.Minute+30*time.Second)
 }
 
 func authorizedPushEffectFixtureWithExpiry(
