@@ -389,7 +389,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("llm.agent_provider", "")
 	v.SetDefault("llm.agent_base_url", "")
 	v.SetDefault("llm.agent_model", "deepseek-v4-pro")
-	v.SetDefault("llm.research_model", "deepseek-v4-pro")
+	// Research V3 is intentionally pinned to the same economical DeepSeek
+	// flash tier as the fixed pipeline. Agent conversations retain v4-pro;
+	// content-addressed Research snapshots keep their already-frozen model.
+	v.SetDefault("llm.research_model", "deepseek-v4-flash")
 	// max_concurrent 32：真实 API 受控实验定的值（2026-07-18），不是拍脑袋。
 	// 45 条批次（生产实测批次规模）在并发 5 下 5.7 秒、并发 32 下 1.25 秒，零错误零 429。
 	// 上限侧余量极大——打分/出卡走 deepseek-v4-flash，官方并发限额 2500；
@@ -496,7 +499,7 @@ func readConfigFile(v *viper.Viper, path string) error {
 func (c *Config) Validate() error {
 	c.LLM.ResearchModel = strings.TrimSpace(c.LLM.ResearchModel)
 	if c.LLM.ResearchModel == "" {
-		c.LLM.ResearchModel = "deepseek-v4-pro"
+		c.LLM.ResearchModel = "deepseek-v4-flash"
 	}
 	c.DB.ResearchCapabilityKeyID = strings.TrimSpace(c.DB.ResearchCapabilityKeyID)
 	c.DB.ResearchCapabilityKeyHex = strings.TrimSpace(c.DB.ResearchCapabilityKeyHex)

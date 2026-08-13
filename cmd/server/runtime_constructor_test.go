@@ -4,6 +4,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/runtimeconfig"
+	"github.com/YouToco/vane/runtimepolicy"
 )
 
 // This is an intentional release fence, not the end-state architecture.  The
@@ -49,6 +53,38 @@ func TestResearchV3UsesIndependentRestrictedControlStore(t *testing.T) {
 	}
 	if strings.Contains(source, "st.Close()") {
 		t.Fatal("an error or shutdown path bypasses dual-Store close")
+	}
+}
+
+func TestDefaultResearchModelFreezesFlashAcrossEveryV3Stage(t *testing.T) {
+	cfg := config.Config{DB: config.DBConfig{URL: "postgres://test"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := runtimeconfig.BuildResearchRuntimeV3(
+		runtimeconfig.CurrentCompiledV1Input{
+			Model: "pipeline-model", ResearchModel: cfg.LLM.ResearchModel,
+			ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
+			ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
+			ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
+			TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := runtimepolicy.WithExplicitEventWindowV36(runtime.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scoped.Planner.Model != "deepseek-v4-flash" ||
+		scoped.Synthesis.Model != "deepseek-v4-flash" ||
+		scoped.GroundingVerifier == nil ||
+		scoped.GroundingVerifier.Model != "deepseek-v4-flash" ||
+		scoped.GroundingCorrector == nil ||
+		scoped.GroundingCorrector.Model != "deepseek-v4-flash" {
+		t.Fatalf("default research stages do not all freeze flash: %+v",
+			scoped)
 	}
 }
 
