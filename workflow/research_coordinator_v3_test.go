@@ -480,7 +480,9 @@ func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *te
 	}
 	initial, err := json.Marshal(types.ResearchBriefPayloadV3{
 		SchemaVersion: types.ResearchBriefPayloadSchemaV3,
-		Headline:      "Initial claim", Summary: "An unsupported dated claim.",
+		Headline:      "OpenAI 向免费用户开放 GPT-5.6 Luna 并移除文本聊天限制",
+		Summary: "OpenAI 官方扩大 GPT-5.6 Luna 的免费访问；" +
+			"第三方报道据此称免费用户已无限使用文本聊天。",
 		Significance: types.ResearchBriefSignificanceMajorV3,
 		Citations:    []types.ResearchBriefCitationV3{citation},
 	})
@@ -489,9 +491,10 @@ func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *te
 	}
 	corrected, err := json.Marshal(types.ResearchBriefPayloadV3{
 		SchemaVersion: types.ResearchBriefPayloadSchemaV3,
-		Headline:      "Corrected claim", Summary: "The cited page reports a release.",
-		Significance: types.ResearchBriefSignificanceMajorV3,
-		Citations:    []types.ResearchBriefCitationV3{citation},
+		Headline:      "OpenAI 扩大 GPT-5.6 Luna 的免费访问",
+		Summary:       "OpenAI 官方页面写明正在扩大免费用户对 GPT-5.6 Luna 的访问。",
+		Significance:  types.ResearchBriefSignificanceMajorV3,
+		Citations:     []types.ResearchBriefCitationV3{citation},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -506,9 +509,9 @@ func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *te
 		SchemaVersion:   types.ResearchGroundingVerdictSchemaV1,
 		CandidateDigest: initialDigest, Verdict: types.ResearchGroundingUnsupportedV1,
 		Issues: []types.ResearchGroundingIssueV1{{
-			Field: "summary", Claim: "An unsupported dated claim.",
+			Field: "summary", Claim: "第三方报道据此称免费用户已无限使用文本聊天。",
 			Refs:   []types.ResearchBriefCitationV3{citation},
-			Reason: "The citation does not establish the event date.",
+			Reason: "官方 citation 只直接支持 expanding access，不能证明 unlimited text chats。",
 		}},
 	})
 	if err != nil {
@@ -546,6 +549,18 @@ func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *te
 		beginLLMSpend: func(_ context.Context, params storepkg.BeginResearchRunLLMSpendV3Params) (
 			storepkg.ResearchRunLLMSpendReservationV3, error,
 		) {
+			if params.RoundOrdinal == 2 {
+				for _, contract := range []string{
+					"不得把 access 扩大写成默认或无限使用",
+					"删除包含它的整句以及 headline 中对应分句",
+					"重新审计 headline、summary 和 significance",
+				} {
+					if !strings.Contains(params.SystemPrompt, contract) {
+						t.Fatalf("round-2 production correction lacks %q: %s",
+							contract, params.SystemPrompt)
+					}
+				}
+			}
 			rounds = append(rounds, params.RoundOrdinal)
 			reservation := storepkg.ResearchRunLLMSpendReservationV3{
 				ReservationID: int64(100 + params.RoundOrdinal), Stage: params.Stage,

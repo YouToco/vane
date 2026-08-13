@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -182,6 +183,19 @@ func TestWithExplicitEventWindowV36FreezesOneCorrector(t *testing.T) {
 			ResearchGroundingCorrectorRendererVersionV1 ||
 		scoped.GroundingCorrector.Temperature != 0 {
 		t.Fatalf("corrector=%+v", scoped.GroundingCorrector)
+	}
+	for _, contract := range []string{
+		"重新审计 headline、summary 和 significance",
+		"不得把 access 扩大写成默认或无限使用",
+		"把 fallback 写成误拒绝",
+		"把取得突破写成发布新模型",
+		"删除包含它的整句以及 headline 中对应分句",
+		"才可写‘全部’‘均有’或数量汇总",
+	} {
+		if !strings.Contains(scoped.GroundingCorrector.SystemPrompt, contract) {
+			t.Fatalf("corrector prompt missing production grounding contract %q: %s",
+				contract, scoped.GroundingCorrector.SystemPrompt)
+		}
 	}
 	if retained.GroundingCorrector != nil ||
 		retained.Synthesis.RendererVersion != ResearchSynthesisRendererVersionV34 {
