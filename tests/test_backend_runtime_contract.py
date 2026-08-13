@@ -24,6 +24,7 @@ class BackendRuntimeContractTest(unittest.TestCase):
             "bin/gate",
             "bin/runtimeadmin",
             "bin/vane-migrate",
+            "bin/agentfirstretention",
             "bin/vane-research-gateway",
             "bin/vane-research-prepare",
             "bin/researchshadow",
@@ -45,6 +46,7 @@ class BackendRuntimeContractTest(unittest.TestCase):
 
         for binary, command in {
             "vane-migrate": "./cmd/migrate",
+            "agentfirstretention": "./cmd/agentfirstretention",
             "vane-research-gateway": "./cmd/researchgateway",
             "vane-research-prepare": "./cmd/researchprepare",
             "researchshadow": "./cmd/researchshadow",
@@ -62,6 +64,36 @@ class BackendRuntimeContractTest(unittest.TestCase):
             self.assertIn(unit, remote)
         self.assertIn("vane-legacy-compat.service", deploy)
         self.assertIn("vane-legacy-compat.service", remote)
+        self.assertIn('"$payload/release-receipt.json"', deploy)
+        self.assertIn(
+            "incoming Agent-first release receipt differs from staged binaries",
+            remote,
+        )
+        self.assertIn('stage_vane_digest=$(sha256sum "$stage/bin/vane"', remote)
+        self.assertIn(
+            'stage_collector_digest=$(sha256sum "$stage/bin/agentfirstretention"',
+            remote,
+        )
+        self.assertNotIn("rm -rf -- /opt/vane/releases", remote)
+        publisher = (ROOT / "scripts" / "publish-retention-release.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('pending=$(mktemp -d "$release_root/.', publisher)
+        self.assertIn('mv -T -- "$pending" "$release_dir"', publisher)
+        self.assertIn('trap cleanup EXIT', publisher)
+        self.assertIn('trusted_directory "$release_root" 755', publisher)
+        self.assertIn('trusted_file "$release_dir/agentfirstretention" 755', publisher)
+        self.assertIn('trusted_file "$release_dir/release-receipt.json" 644', publisher)
+        receipt_publish = remote.rindex('bash "$stage/publish-retention-release.sh"')
+        final_gate = remote.rindex(
+            "/opt/vane/bin/gate -env /opt/vane/env/server.env"
+        )
+        self.assertGreater(receipt_publish, final_gate)
+        self.assertIn('/proc/"$vane_pid"/exe', remote[final_gate:receipt_publish])
+        self.assertIn(
+            "live vane process differs from the deployed artifact",
+            remote[final_gate:receipt_publish],
+        )
 
     def test_primary_release_contract_is_probed_and_bound_to_artifact(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

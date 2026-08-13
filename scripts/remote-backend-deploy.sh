@@ -12,6 +12,12 @@ stage=$1
   echo "unsafe remote stage path" >&2
   exit 1
 }
+release_suffix=${stage##*/.deploy-}
+release_sha=${release_suffix:0:40}
+[[ $release_sha =~ ^[0-9a-f]{40}$ ]] || {
+  echo "unsafe release SHA" >&2
+  exit 1
+}
 old_vane_recovery_required=false
 old_vane_restart_safe=false
 previous_vane_snapshot_ready=false
@@ -1590,6 +1596,29 @@ actual_server_release_contract=$(
   echo "incoming vane binary has an unexpected release contract" >&2
   exit 1
 }
+[[ -f $stage/bin/agentfirstretention && ! -L $stage/bin/agentfirstretention &&
+   -x $stage/bin/agentfirstretention &&
+   -f $stage/release-receipt.json && ! -L $stage/release-receipt.json ]] || {
+  echo "incoming Agent-first collector release authority is incomplete" >&2
+  exit 1
+}
+stage_vane_digest=$(sha256sum "$stage/bin/vane" | awk '{print $1}')
+stage_collector_digest=$(sha256sum "$stage/bin/agentfirstretention" | awk '{print $1}')
+release_receipt_digest=$(sha256sum "$stage/release-receipt.json" | awk '{print $1}')
+[[ $release_receipt_digest =~ ^[0-9a-f]{64}$ ]] || {
+  echo "incoming Agent-first release receipt digest is invalid" >&2
+  exit 1
+}
+release_dir=/opt/vane/releases/$release_receipt_digest
+grep -Fq '"source_revision":"'"$release_sha"'"' \
+  "$stage/release-receipt.json" &&
+  grep -Fq '"vane_sha256":"'"$stage_vane_digest"'"' \
+    "$stage/release-receipt.json" &&
+  grep -Fq '"agentfirstretention_sha256":"'"$stage_collector_digest"'"' \
+    "$stage/release-receipt.json" || {
+      echo "incoming Agent-first release receipt differs from staged binaries" >&2
+      exit 1
+    }
 
 # The current gateway remains live throughout the migration gate. Capture its
 # complete process contract before bootstrap can rotate its environment or
@@ -2160,5 +2189,29 @@ echo "deploy verified: readyz OK"
 env -i PATH=/usr/bin:/bin \
   CREDENTIALS_DIRECTORY=/etc/vane/credentials \
   /opt/vane/bin/gate -env /opt/vane/env/server.env
+
+# Publish the offline retention authority only after the new service passed
+# the final Gate and its actual process image is byte-identical to both the
+# installed binary and this deployment's staged artifact. A failed deploy must
+# not leave a receipt that a later operator can mistake for a live release.
+vane_pid=$(systemctl show vane.service --property=MainPID --value)
+[[ $vane_pid =~ ^[1-9][0-9]*$ &&
+   $(readlink /proc/"$vane_pid"/exe 2>/dev/null || true) == /opt/vane/bin/vane &&
+   -r /proc/"$vane_pid"/exe ]] || {
+  echo "live vane process authority is unavailable" >&2
+  exit 1
+}
+cmp -s -- /proc/"$vane_pid"/exe /opt/vane/bin/vane &&
+  cmp -s -- /proc/"$vane_pid"/exe "$stage/bin/vane" || {
+    echo "live vane process differs from the deployed artifact" >&2
+    exit 1
+  }
+[[ -f $stage/publish-retention-release.sh &&
+   ! -L $stage/publish-retention-release.sh ]] || {
+  echo "retention release publisher is unavailable" >&2
+  exit 1
+}
+bash "$stage/publish-retention-release.sh" /opt/vane/releases \
+  "$stage/bin/agentfirstretention" "$stage/release-receipt.json" >/dev/null
 old_vane_recovery_required=false
 gateway_recovery_required=false
