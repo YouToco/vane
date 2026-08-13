@@ -169,6 +169,7 @@ var wantTables = []string{
 	"memory_records",
 	"memory_events",
 	"memory_receipts",
+	"memory_authorizations",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

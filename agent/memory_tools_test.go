@@ -21,6 +21,17 @@ type fakeAgentMemoryStore struct {
 	actionResult     *types.MemoryActionResult
 	recallResult     *types.MemoryRecallResult
 	err              error
+	authorizationID  string
+}
+
+func (f *fakeAgentMemoryStore) PrepareMemoryAuthorization(
+	_ context.Context, tenantID, userID, _ int64, action types.MemoryAction,
+) (string, error) {
+	f.tenantID, f.userID, f.action = tenantID, userID, action
+	if f.authorizationID == "" {
+		f.authorizationID = "922b377b-12e6-4958-b8d1-fcfb3d7708e3"
+	}
+	return f.authorizationID, f.err
 }
 
 func (f *fakeAgentMemoryStore) GetMemory(
@@ -153,9 +164,10 @@ func TestManageMemoryBindsTrustedEvidenceAndAuthorizesTargetText(t *testing.T) {
 func TestManageMemoryDeniedOrInvalidHasNoWrite(t *testing.T) {
 	ctx, _ := memoryToolContext("聊聊记忆系统")
 	store := &fakeAgentMemoryStore{actionResult: &types.MemoryActionResult{}}
-	denied := NewManageMemoryTool(store, &fakeOwnerActionAuthorizer{
+	authorizer := &fakeOwnerActionAuthorizer{
 		decision: OwnerActionDenied,
-	})
+	}
+	denied := NewManageMemoryTool(store, authorizer)
 	result, err := denied.Execute(ctx, 42, json.RawMessage(
 		`{"action":"remember","text":"不要把普通聊天自动记住"}`,
 	))
@@ -171,11 +183,16 @@ func TestManageMemoryDeniedOrInvalidHasNoWrite(t *testing.T) {
 		`{"action":"correct","memory_id":1}`,
 		`{"action":"forget","memory_id":1,"text":"x"}`,
 		`{"action":"learn_implicitly","text":"x"}`,
+		`{"action":"remember","text":"postgres://owner:secret-value@db/vane"}`,
+		`{"action":"remember","text":"token: 1234567890abcdef"}`,
 	} {
 		result, err = denied.Execute(ctx, 42, json.RawMessage(raw))
 		if err != nil || !strings.Contains(result, "请求被拒绝") {
 			t.Fatalf("raw=%s result=%q err=%v", raw, result, err)
 		}
+	}
+	if authorizer.calls != 1 {
+		t.Fatal("credential or structurally invalid request reached authorizer")
 	}
 }
 
@@ -273,5 +290,37 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 		`"memory_id":3`,
 	) {
 		t.Fatal("next model turn did not receive the bounded memory projection")
+	}
+}
+
+func TestMemoryFullLoopModelCannotPromoteOrdinaryChat(t *testing.T) {
+	store := &fakeAgentMemoryStore{actionResult: &types.MemoryActionResult{}}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionDenied}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "misfire", Name: "manage_memory",
+			Arguments: `{"action":"remember","text":"用户在讨论发布策略"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "这只是讨论，没有写入长期记忆。", FinishReason: "stop"},
+	}}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs,
+		Tools:    ownerTestTools(NewManageMemoryTool(store, authorizer)),
+		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
+	})
+	loop.chatFn = chat.fn
+	out, err := loop.HandleMessage(t.Context(), 42, "我们讨论一下发布策略")
+	if err != nil || !strings.Contains(out.Reply, "没有写入") {
+		t.Fatalf("outcome=%+v err=%v", out, err)
+	}
+	if authorizer.calls != 1 || store.key != "" {
+		t.Fatalf("ordinary chat promoted: auth=%d key=%q", authorizer.calls, store.key)
+	}
+	if len(chat.requests) != 2 || !strings.Contains(
+		chat.requests[1].Messages[len(chat.requests[1].Messages)-1].Content,
+		"没有授权长期记忆变更",
+	) {
+		t.Fatal("model did not receive the deterministic denial receipt")
 	}
 }

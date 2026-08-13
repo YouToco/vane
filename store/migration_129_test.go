@@ -17,15 +17,18 @@ func TestMigration129LedgerBoundary(t *testing.T) {
 	}
 	sqlText := string(payload)
 	for _, fragment := range []string{
+		"CREATE TABLE memory_authorizations",
 		"CREATE TABLE memory_records",
 		"CREATE TABLE memory_events",
 		"CREATE TABLE memory_receipts",
 		"evidence_source_type='owner_explicit_agent_turn'",
 		"CREATE UNIQUE INDEX uq_memory_event_target_once",
+		"CREATE FUNCTION assert_vane_memory_editor_v129()",
 		"ALTER TABLE memory_records FORCE ROW LEVEL SECURITY",
 		"CREATE POLICY memory_records_exact_user",
 		"GRANT SELECT,INSERT ON memory_records,memory_events,memory_receipts",
 		"refusing downgrade while retained memory history exists",
+		"REVOKE vane_memory_editor FROM vane_server_runtime",
 	} {
 		if !strings.Contains(sqlText, fragment) {
 			t.Errorf("migration 129 lost boundary %q", fragment)
@@ -110,28 +113,48 @@ func TestMigration129RLSRetentionAndDownGuardPostgres(t *testing.T) {
 	}
 	userA, tenantA := migration129Identity(t, database, "a")
 	userB, tenantB := migration129Identity(t, database, "b")
+	var sessionA int64
+	if err := database.QueryRowContext(t.Context(), `
+		INSERT INTO agent_sessions(tenant_id,user_id) VALUES($1,$2) RETURNING id`,
+		tenantA, userA).Scan(&sessionA); err != nil {
+		t.Fatal(err)
+	}
+	authorizationA := uuid.NewString()
+	if _, err := database.ExecContext(t.Context(), `
+		INSERT INTO memory_authorizations(
+		 id,tenant_id,user_id,session_id,trace_id,owner_request,
+		 authorization_digest,request_digest)
+		VALUES($1,$2,$3,$4,$5,'请记住 retained memory',repeat('d',64),repeat('c',64))`,
+		authorizationA, tenantA, userA, sessionA, uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := database.ExecContext(t.Context(), `
 		INSERT INTO memory_records(
-		 tenant_id,user_id,memory_text,evidence_source_type,evidence_source_id)
-		VALUES($1,$2,'inferred','model_inferred',$3)`,
-		tenantA, userA, uuid.NewString()); err == nil {
+		 tenant_id,user_id,memory_text,evidence_source_type,evidence_source_id,
+		 authorization_id,owner_request,authorization_digest)
+		VALUES($1,$2,'inferred','model_inferred',$3,$4,'请记住 inferred',repeat('d',64))`,
+		tenantA, userA, uuid.NewString(), authorizationA); err == nil {
 		t.Fatal("database accepted model-inferred memory authority")
 	}
 	var recordA int64
 	if err := database.QueryRowContext(t.Context(), `
 		INSERT INTO memory_records(
-		 tenant_id,user_id,memory_text,evidence_source_type,evidence_source_id)
-		VALUES($1,$2,'retained memory','owner_explicit_agent_turn',$3)
-		RETURNING id`, tenantA, userA, uuid.NewString()).Scan(&recordA); err != nil {
+		 tenant_id,user_id,memory_text,evidence_source_type,evidence_source_id,
+		 authorization_id,owner_request,authorization_digest)
+		VALUES($1,$2,'retained memory','owner_explicit_agent_turn',$3,$4,
+		       '请记住 retained memory',repeat('d',64))
+		RETURNING id`, tenantA, userA, uuid.NewString(), authorizationA).Scan(&recordA); err != nil {
 		t.Fatal(err)
 	}
 	var eventA int64
 	if err := database.QueryRowContext(t.Context(), `
 		INSERT INTO memory_events(
 		 tenant_id,user_id,actor_user_id,event_kind,result_memory_id,
-		 evidence_source_type,evidence_source_id)
-		VALUES($1,$2,$2,'remember',$3,'owner_explicit_agent_turn',$4)
-		RETURNING id`, tenantA, userA, recordA, uuid.NewString()).Scan(&eventA); err != nil {
+		 evidence_source_type,evidence_source_id,authorization_id,
+		 owner_request,authorization_digest)
+		VALUES($1,$2,$2,'remember',$3,'owner_explicit_agent_turn',$4,$5,
+		       '请记住 retained memory',repeat('d',64))
+		RETURNING id`, tenantA, userA, recordA, uuid.NewString(), authorizationA).Scan(&eventA); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(t.Context(), `
@@ -214,6 +237,23 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 	if _, err := provider.UpTo(t.Context(), 129); err != nil {
 		t.Fatal(err)
 	}
+	assertMembershipColumns := func(want bool) {
+		t.Helper()
+		var tenantColumn, userColumn bool
+		if err := database.QueryRowContext(t.Context(), `
+			SELECT has_column_privilege(
+			         'vane_memory_editor','memberships','tenant_id','SELECT'),
+			       has_column_privilege(
+			         'vane_memory_editor','memberships','user_id','SELECT')`,
+		).Scan(&tenantColumn, &userColumn); err != nil {
+			t.Fatal(err)
+		}
+		if tenantColumn != want || userColumn != want {
+			t.Fatalf("membership column privileges=(%t,%t), want %t",
+				tenantColumn, userColumn, want)
+		}
+	}
+	assertMembershipColumns(false)
 	assertRuntimeMemoryMembership := func(want bool) {
 		t.Helper()
 		var got bool
@@ -228,10 +268,56 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		}
 	}
 	assertRuntimeMemoryMembership(false)
+	if _, err := database.ExecContext(t.Context(),
+		`GRANT SELECT ON agent_sessions TO vane_memory_editor`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+		!strings.Contains(err.Error(), "unexpected authorities") {
+		t.Fatalf("provision accepted extra relation ACL: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(),
+		`REVOKE SELECT ON agent_sessions FROM vane_memory_editor`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(t.Context(),
+		`GRANT vane_memory_editor TO vane_app WITH SET TRUE, INHERIT FALSE`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+		!strings.Contains(err.Error(), "membership drift") {
+		t.Fatalf("provision accepted extra memory member: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(),
+		`REVOKE vane_memory_editor FROM vane_app`); err != nil {
+		t.Fatal(err)
+	}
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
 		t.Fatal(err)
 	}
 	assertRuntimeMemoryMembership(true)
+	// Provisioning is a deploy/restart reconciliation operation, not a one-shot
+	// migration. The v129 wrapper must remain idempotent even though the frozen
+	// v098 validator only knows the historical role set.
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatalf("second exact v129 provision: %v", err)
+	}
+	assertRuntimeMemoryMembership(true)
+	var admin, inherit, setOption bool
+	if err := database.QueryRowContext(t.Context(), `
+		SELECT edge.admin_option,edge.inherit_option,edge.set_option
+		  FROM pg_catalog.pg_auth_members edge
+		  JOIN pg_catalog.pg_roles granted ON granted.oid=edge.roleid
+		  JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+		 WHERE granted.rolname='vane_memory_editor'
+		   AND member.rolname='vane_server_runtime'`,
+	).Scan(&admin, &inherit, &setOption); err != nil {
+		t.Fatal(err)
+	}
+	if admin || inherit || !setOption {
+		t.Fatalf("memory runtime edge admin=%t inherit=%t set=%t",
+			admin, inherit, setOption)
+	}
 	if _, err := provider.DownTo(t.Context(), 128); err == nil ||
 		!strings.Contains(err.Error(), "deprovision vane_server_runtime") {
 		t.Fatalf("migration 129 Down accepted retained runtime: %v", err)
@@ -242,6 +328,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 	if _, err := provider.DownTo(t.Context(), 128); err != nil {
 		t.Fatal(err)
 	}
+	assertMembershipColumns(false)
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
 		!strings.Contains(err.Error(), "provision_vane_server_runtime_v129") {
 		t.Fatalf("current provisioner silently fell back after Down: %v", err)

@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/internal/credentialguard"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
@@ -21,6 +22,11 @@ const (
 )
 
 type memoryStore interface {
+	PrepareMemoryAuthorization(
+		ctx context.Context,
+		tenantID, userID, sessionID int64,
+		action types.MemoryAction,
+	) (string, error)
 	GetMemory(
 		ctx context.Context,
 		tenantID, userID, memoryID int64,
@@ -200,6 +206,9 @@ func (t *manageMemoryTool) Execute(
 	if err := validateManageMemoryArgs(args); err != nil {
 		return "manage_memory 请求被拒绝：" + err.Error(), nil
 	}
+	if credentialguard.ContainsCredential(args.Text) {
+		return "manage_memory 请求被拒绝：长期记忆不能保存密码、密钥、令牌或其他凭证。", nil
+	}
 	meta, ok := ctx.Value(chatMetaKey{}).(chatMeta)
 	if !ok || meta.scope.TenantID <= 0 || meta.scope.UserID != userID ||
 		meta.scope.SessionID <= 0 || !validDirectActionID(meta.traceID) {
@@ -227,7 +236,8 @@ func (t *manageMemoryTool) Execute(
 			ctx, meta.scope.TenantID, userID, args.MemoryID,
 		)
 		if err != nil {
-			if errors.Is(err, types.ErrValidation) || errors.Is(err, types.ErrNotFound) {
+			if errors.Is(err, types.ErrValidation) || errors.Is(err, types.ErrNotFound) ||
+				errors.Is(err, types.ErrConflict) {
 				return "manage_memory 目标记忆不存在或已失效，本次未执行。", nil
 			}
 			return "", err
@@ -239,12 +249,13 @@ func (t *manageMemoryTool) Execute(
 	if err != nil {
 		return "", err
 	}
-	decision, err := t.authorizer.AuthorizeOwnerAction(ctx, OwnerActionAuthorization{
+	authorization := OwnerActionAuthorization{
 		OwnerRequest: stateOwnerRequest(state),
 		Action:       "manage_memory." + args.Action,
 		Changes:      changes,
 		Targets:      []OwnerActionTarget{target},
-	})
+	}
+	decision, err := t.authorizer.AuthorizeOwnerAction(ctx, authorization)
 	if err != nil {
 		return "", err
 	}
@@ -261,15 +272,31 @@ func (t *manageMemoryTool) Execute(
 		return "", types.NewAppError(types.CodeInternal, "长期记忆写入未装配", nil)
 	}
 	digest := sha256.Sum256([]byte(invocationID))
+	authorizationBytes, err := json.Marshal(authorization)
+	if err != nil {
+		return "", err
+	}
+	authorizationDigest := sha256.Sum256(authorizationBytes)
 	action := types.MemoryAction{
 		Action:   args.Action,
 		MemoryID: args.MemoryID,
 		Text:     args.Text,
 		Evidence: types.MemoryEvidence{
-			SourceType: "owner_explicit_agent_turn",
-			SourceID:   meta.traceID,
+			SourceType:   types.MemoryEvidenceOwnerExplicitAgentTurn,
+			SourceID:     meta.traceID,
+			OwnerRequest: authorization.OwnerRequest,
+			AuthorizationDigest: hex.EncodeToString(
+				authorizationDigest[:],
+			),
 		},
 	}
+	authorizationID, err := t.st.PrepareMemoryAuthorization(
+		ctx, meta.scope.TenantID, userID, meta.scope.SessionID, action,
+	)
+	if err != nil {
+		return "", err
+	}
+	action.Evidence.AuthorizationID = authorizationID
 	result, err := t.st.ApplyMemoryAction(
 		ctx, meta.scope.TenantID, userID,
 		hex.EncodeToString(digest[:]), action,

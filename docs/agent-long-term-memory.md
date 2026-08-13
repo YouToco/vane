@@ -14,6 +14,17 @@ authorization channel.
   cannot create active memories.
 - The server constructs the evidence link from the trusted Agent turn and
   durable invocation identity. Model arguments cannot choose a source.
+- After the isolated owner-action authorizer returns `authorized`, Vane first
+  appends an idempotent authorization row containing the authenticated
+  session, trace UUID, exact owner request, authorization digest, and canonical
+  action digest. Applying the memory must consume that exact row. A crash
+  before apply leaves only an unconsumed audit fact; an active memory can never
+  be created from a bare/random trace UUID.
+- High-confidence credentials (private keys, authenticated database URLs,
+  common API tokens/JWTs, and explicit password/key/token assignments) are
+  rejected both before authorization and again by the Store. Rejections never
+  echo the submitted value. Credentials belong in the dedicated secret store,
+  never in long-term memory.
 - Correction appends a new record and supersedes one active record in the same
   scope. Forget appends a retraction event. Historical rows remain available
   for audit but leave the retrieval set.

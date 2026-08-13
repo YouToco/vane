@@ -124,6 +124,7 @@ var purgeOrder = []purgeStep{
 	{"memory_receipts", "tenant_id = $1"},
 	{"memory_events", "tenant_id = $1"},
 	{"memory_records", "tenant_id = $1"},
+	{"memory_authorizations", "tenant_id = $1"},
 	// V3 delivery anchors reference the effect and projections, so they are the
 	// first child in the durable delivery chain.
 	{"research_brief_deliveries", "tenant_id = $1"},

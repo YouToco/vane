@@ -16,8 +16,11 @@ const (
 // MemoryEvidence binds an explicit owner instruction to its trusted server
 // trace. SourceID is a canonical UUID string generated outside the model.
 type MemoryEvidence struct {
-	SourceType string `json:"source_type"`
-	SourceID   string `json:"source_id"`
+	AuthorizationID     string `json:"authorization_id,omitempty"`
+	SourceType          string `json:"source_type"`
+	SourceID            string `json:"source_id"`
+	OwnerRequest        string `json:"owner_request"`
+	AuthorizationDigest string `json:"authorization_digest"`
 }
 
 // MemoryAction is one explicit append-only mutation. MemoryID is required for
@@ -48,8 +51,8 @@ type MemoryEvent struct {
 	CreatedAt      time.Time      `json:"created_at"`
 }
 
-// MemoryActionResult is persisted byte-for-byte in the idempotency receipt.
-// For forget, Memory is the forgotten target with Active=false.
+// MemoryActionResult is persisted with exact JSON semantics in the idempotency
+// receipt. For forget, Memory is the forgotten target with Active=false.
 type MemoryActionResult struct {
 	Memory MemoryRecord `json:"memory"`
 	Event  MemoryEvent  `json:"event"`

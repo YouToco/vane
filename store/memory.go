@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/internal/credentialguard"
 	"github.com/YouToco/vane/toolsearch"
 	"github.com/YouToco/vane/types"
 )
@@ -25,6 +26,66 @@ const (
 	maxMemoryRecallQueryBytes  = 512
 	maxMemoryRecallResults     = 8
 )
+
+// PrepareMemoryAuthorization durably binds the exact owner request and
+// authorizer decision digest before an active memory can be created. A crash
+// after this call leaves only an unconsumed audit row, never an active memory.
+func (s *Store) PrepareMemoryAuthorization(
+	ctx context.Context, tenantID, userID, sessionID int64,
+	action types.MemoryAction,
+) (string, error) {
+	if sessionID <= 0 || action.Evidence.AuthorizationID != "" {
+		return "", memoryValidationError("长期记忆授权范围无效")
+	}
+	_, digest, err := validateMemoryAction(strings.Repeat("0", 64), action)
+	if err != nil {
+		return "", err
+	}
+	tx, err := s.beginMemoryScopedTx(ctx, tenantID, userID, true)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	id := uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf(
+		"vane-memory-authorization/v1:%d:%d:%d:%s:%s",
+		tenantID, userID, sessionID, action.Evidence.SourceID, digest,
+	))).String()
+	_, err = tx.Exec(ctx, `
+		INSERT INTO memory_authorizations(
+		 id,tenant_id,user_id,session_id,trace_id,owner_request,
+		 authorization_digest,request_digest)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT (id) DO NOTHING`, id, tenantID, userID, sessionID,
+		action.Evidence.SourceID, action.Evidence.OwnerRequest,
+		action.Evidence.AuthorizationDigest, digest,
+	)
+	if err != nil {
+		return "", memoryDBError("写入长期记忆授权", err)
+	}
+	var storedSession int64
+	var storedTrace, storedOwner, storedAuthorizationDigest, storedDigest string
+	if err := tx.QueryRow(ctx, `
+		SELECT session_id,trace_id::text,owner_request,
+		       authorization_digest,request_digest
+		  FROM memory_authorizations
+		 WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		tenantID, userID, id,
+	).Scan(&storedSession, &storedTrace, &storedOwner,
+		&storedAuthorizationDigest, &storedDigest); err != nil {
+		return "", memoryDBError("验证长期记忆授权重放", err)
+	}
+	if storedSession != sessionID || storedTrace != action.Evidence.SourceID ||
+		storedOwner != action.Evidence.OwnerRequest ||
+		storedAuthorizationDigest != action.Evidence.AuthorizationDigest ||
+		storedDigest != digest {
+		return "", types.NewAppError(types.CodeConflict,
+			"长期记忆授权重放内容不一致", nil)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", memoryDBError("提交长期记忆授权", err)
+	}
+	return id, nil
+}
 
 // ApplyMemoryAction appends one explicit owner-authorized mutation and its
 // exact response-loss receipt. It never updates or deletes retained history.
@@ -46,6 +107,26 @@ func (s *Store) ApplyMemoryAction(
 		ctx, tx, tenantID, userID, idempotencyKey, digest,
 	); err != nil || found {
 		return result, err
+	}
+	if canonical.Evidence.AuthorizationID == "" {
+		return nil, memoryValidationError("长期记忆缺少耐久授权")
+	}
+	var authorizedDigest string
+	var consumedEventID *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT request_digest,consumed_event_id
+		  FROM memory_authorizations
+		 WHERE tenant_id=$1 AND user_id=$2 AND id=$3
+		 FOR UPDATE`, tenantID, userID, canonical.Evidence.AuthorizationID,
+	).Scan(&authorizedDigest, &consumedEventID); errors.Is(err, pgx.ErrNoRows) {
+		return nil, types.NewAppError(types.CodeConflict,
+			"长期记忆授权不存在", nil)
+	} else if err != nil {
+		return nil, memoryDBError("读取长期记忆授权", err)
+	}
+	if authorizedDigest != digest || consumedEventID != nil {
+		return nil, types.NewAppError(types.CodeConflict,
+			"长期记忆授权与请求不一致或已消费", nil)
 	}
 
 	activeCount, corpusBytes, err := activeMemoryBoundsTx(ctx, tx, tenantID, userID)
@@ -83,11 +164,14 @@ func (s *Store) ApplyMemoryAction(
 		err = tx.QueryRow(ctx, `
 			INSERT INTO memory_records(
 			 tenant_id,user_id,memory_text,evidence_source_type,
-			 evidence_source_id,supersedes_memory_id)
-			VALUES($1,$2,$3,$4,$5,$6)
+			 evidence_source_id,authorization_id,owner_request,authorization_digest,
+			 supersedes_memory_id)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			RETURNING id,created_at`,
 			tenantID, userID, canonical.Text, canonical.Evidence.SourceType,
-			canonical.Evidence.SourceID, supersedes,
+			canonical.Evidence.SourceID, canonical.Evidence.AuthorizationID,
+			canonical.Evidence.OwnerRequest,
+			canonical.Evidence.AuthorizationDigest, supersedes,
 		).Scan(&resultMemory.ID, &resultMemory.CreatedAt)
 		if err != nil {
 			return nil, memoryDBError("写入长期记忆记录", err)
@@ -123,11 +207,14 @@ func (s *Store) ApplyMemoryAction(
 	err = tx.QueryRow(ctx, `
 		INSERT INTO memory_events(
 		 tenant_id,user_id,actor_user_id,event_kind,target_memory_id,
-		 result_memory_id,evidence_source_type,evidence_source_id)
-		VALUES($1,$2,$2,$3,$4,$5,$6,$7)
+		 result_memory_id,evidence_source_type,evidence_source_id,
+		 authorization_id,owner_request,authorization_digest)
+		VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		RETURNING id,created_at`,
 		tenantID, userID, canonical.Action, targetID, resultID,
 		canonical.Evidence.SourceType, canonical.Evidence.SourceID,
+		canonical.Evidence.AuthorizationID,
+		canonical.Evidence.OwnerRequest, canonical.Evidence.AuthorizationDigest,
 	).Scan(&event.ID, &event.CreatedAt)
 	if err != nil {
 		return nil, memoryDBError("写入长期记忆事件", err)
@@ -144,6 +231,17 @@ func (s *Store) ApplyMemoryAction(
 		tenantID, userID, idempotencyKey, digest, event.ID, payload,
 	); err != nil {
 		return nil, memoryDBError("写入长期记忆回执", err)
+	}
+	if tag, err := tx.Exec(ctx, `
+		UPDATE memory_authorizations SET consumed_event_id=$1
+		 WHERE tenant_id=$2 AND user_id=$3 AND id=$4
+		   AND consumed_event_id IS NULL`, event.ID, tenantID, userID,
+		canonical.Evidence.AuthorizationID,
+	); err != nil || tag.RowsAffected() != 1 {
+		if err == nil {
+			err = errors.New("authorization consumption lost")
+		}
+		return nil, memoryDBError("消费长期记忆授权", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, memoryDBError("提交长期记忆操作", err)
@@ -170,9 +268,16 @@ func (s *Store) RecallMemories(
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	activeCount, corpusBytes, err := activeMemoryBoundsTx(
+		ctx, tx, tenantID, userID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := tx.Query(ctx, `
 		SELECT r.id,r.memory_text,r.evidence_source_type,
-		       r.evidence_source_id::text,COALESCE(r.supersedes_memory_id,0),
+		       r.evidence_source_id::text,r.owner_request,
+		       r.authorization_digest,COALESCE(r.supersedes_memory_id,0),
 		       r.created_at
 		  FROM memory_records r
 		 WHERE r.tenant_id=$1 AND r.user_id=$2
@@ -186,32 +291,39 @@ func (s *Store) RecallMemories(
 		        WHERE consumed.tenant_id=r.tenant_id
 		          AND consumed.user_id=r.user_id
 		          AND consumed.target_memory_id=r.id)
-		 ORDER BY r.id`, tenantID, userID)
+		 ORDER BY r.id
+		 LIMIT $3`, tenantID, userID, maxActiveMemories+1)
 	if err != nil {
 		return nil, memoryDBError("读取生效长期记忆", err)
 	}
 	defer rows.Close()
 	records := make([]types.MemoryRecord, 0)
-	corpusBytes := 0
+	observedBytes := 0
 	for rows.Next() {
 		var record types.MemoryRecord
 		if err := rows.Scan(
 			&record.ID, &record.Text, &record.Evidence.SourceType,
-			&record.Evidence.SourceID, &record.SupersedesMemoryID,
+			&record.Evidence.SourceID, &record.Evidence.OwnerRequest,
+			&record.Evidence.AuthorizationDigest, &record.SupersedesMemoryID,
 			&record.CreatedAt,
 		); err != nil {
 			return nil, memoryDBError("扫描生效长期记忆", err)
 		}
 		record.Active = true
-		corpusBytes += len(record.Text)
+		observedBytes += len(record.Text)
+		if len(records) >= maxActiveMemories ||
+			observedBytes > maxActiveMemoryCorpusBytes {
+			return nil, types.NewAppError(
+				types.CodeConflict, "长期记忆语料超过安全边界，拒绝建立索引", nil)
+		}
 		records = append(records, record)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, memoryDBError("扫描生效长期记忆", err)
 	}
-	if len(records) > maxActiveMemories || corpusBytes > maxActiveMemoryCorpusBytes {
+	if len(records) != activeCount || observedBytes != corpusBytes {
 		return nil, types.NewAppError(
-			types.CodeConflict, "长期记忆语料超过安全边界，拒绝建立索引", nil)
+			types.CodeConflict, "长期记忆语料在召回期间发生漂移", nil)
 	}
 	memories, err := rankMemoryRecords(records, query.Query, query.Limit)
 	if err != nil {
@@ -281,9 +393,24 @@ func validateMemoryAction(
 	if action.Evidence.SourceType != types.MemoryEvidenceOwnerExplicitAgentTurn {
 		return action, "", memoryValidationError("长期记忆只接受用户明确指令证据")
 	}
+	action.Evidence.OwnerRequest = strings.TrimSpace(action.Evidence.OwnerRequest)
+	if !utf8.ValidString(action.Evidence.OwnerRequest) ||
+		len(action.Evidence.OwnerRequest) == 0 ||
+		len(action.Evidence.OwnerRequest) > 65536 ||
+		!validMemoryDigest(action.Evidence.AuthorizationDigest) {
+		return action, "", memoryValidationError(
+			"长期记忆缺少当前用户原话或授权摘要")
+	}
 	parsed, err := uuid.Parse(action.Evidence.SourceID)
 	if err != nil || parsed.String() != action.Evidence.SourceID {
 		return action, "", memoryValidationError("长期记忆证据 ID 必须是规范 UUID")
+	}
+	if action.Evidence.AuthorizationID != "" {
+		parsedAuthorization, parseErr := uuid.Parse(action.Evidence.AuthorizationID)
+		if parseErr != nil || parsedAuthorization.String() != action.Evidence.AuthorizationID {
+			return action, "", memoryValidationError(
+				"长期记忆授权 ID 必须是规范 UUID")
+		}
 	}
 	if !utf8.ValidString(action.Text) {
 		return action, "", memoryValidationError("长期记忆文本必须是有效 UTF-8")
@@ -308,10 +435,15 @@ func validateMemoryAction(
 	if len(action.Text) > maxMemoryTextBytes {
 		return action, "", memoryValidationError("长期记忆文本不能超过 4096 字节")
 	}
+	if credentialguard.ContainsCredential(action.Text) {
+		return action, "", memoryValidationError("长期记忆不能保存认证凭证")
+	}
 	if action.Text != "" && len(toolsearch.Tokenize(action.Text)) == 0 {
 		return action, "", memoryValidationError("长期记忆文本没有可检索内容")
 	}
-	request, err := json.Marshal(action)
+	digestAction := action
+	digestAction.Evidence.AuthorizationID = ""
+	request, err := json.Marshal(digestAction)
 	if err != nil {
 		return action, "", types.NewAppError(types.CodeInternal, "编码长期记忆请求", err)
 	}
@@ -418,7 +550,8 @@ func loadActiveMemoryTx(
 	var record types.MemoryRecord
 	err := tx.QueryRow(ctx, `
 		SELECT r.id,r.memory_text,r.evidence_source_type,
-		       r.evidence_source_id::text,COALESCE(r.supersedes_memory_id,0),
+		       r.evidence_source_id::text,r.owner_request,
+		       r.authorization_digest,COALESCE(r.supersedes_memory_id,0),
 		       r.created_at
 		  FROM memory_records r
 		 WHERE r.tenant_id=$1 AND r.user_id=$2 AND r.id=$3
@@ -430,7 +563,9 @@ func loadActiveMemoryTx(
 		                      AND e.target_memory_id=r.id)`,
 		tenantID, userID, memoryID,
 	).Scan(&record.ID, &record.Text, &record.Evidence.SourceType,
-		&record.Evidence.SourceID, &record.SupersedesMemoryID, &record.CreatedAt)
+		&record.Evidence.SourceID, &record.Evidence.OwnerRequest,
+		&record.Evidence.AuthorizationDigest, &record.SupersedesMemoryID,
+		&record.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return record, types.NewAppError(
 			types.CodeConflict, "只能纠正或遗忘当前生效的长期记忆", nil)
