@@ -83,6 +83,7 @@ class RetentionReleasePublisherTest(unittest.TestCase):
         self.assertNotEqual(self.publish().returncode, 0)
         self.releases.unlink()
         self.releases.mkdir(mode=0o777)
+        self.releases.chmod(0o777)
         self.assertNotEqual(self.publish().returncode, 0)
 
 
