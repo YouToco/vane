@@ -11,9 +11,10 @@ import (
 const AgentFirstRetentionClockWorkflowNameV1 = "AgentFirstRetentionClockWorkflowV1"
 
 // AgentFirstRetentionClockRequestV1 binds the server-time witness to one
-// operator-generated nonce and one exact source revision. Neither value grants
-// authority; the retention audit persists and independently digests the
-// completed workflow history before it may become an attestation baseline.
+// operator-generated nonce and one expected source revision. Neither echoed
+// value proves which binary executed the Workflow; the retention audit must
+// additionally bind the WorkflowTaskCompleted worker BuildID recorded by the
+// Temporal server to the trusted deployment revision.
 type AgentFirstRetentionClockRequestV1 struct {
 	Nonce          string `json:"nonce"`
 	SourceRevision string `json:"source_revision"`
