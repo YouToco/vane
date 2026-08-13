@@ -308,13 +308,21 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "provision_vane_server_runtime_v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := callServerRuntimeProvisioner(t.Context(), scratchURL,
+		"provision_vane_server_runtime_research_binder_v1"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = DeprovisionServerRuntime(ctx, scratchURL)
+		_ = callServerRuntimeProvisioner(ctx, scratchURL,
+			"deprovision_vane_server_runtime_research_binder_v1")
+		_ = callServerRuntimeProvisioner(
+			ctx, scratchURL, "deprovision_vane_server_runtime_v1")
 	})
 	const password = "native-v3-edit-runtime-password"
 	if _, err := owner.pool.Exec(t.Context(),
@@ -325,7 +333,11 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 		_, _ = owner.pool.Exec(context.Background(),
 			`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
 	})
-	runtime, err := NewServerRuntime(t.Context(), serverRuntimeTestURL(t, scratchURL, password))
+	// This fixture intentionally stops at schema 110. Current binaries reject
+	// that retained membership set after migration 128, so use an unvalidated
+	// historical pool; the assertions below exercise only the independent edit
+	// recovery capability under test.
+	runtime, err := New(t.Context(), serverRuntimeTestURL(t, scratchURL, password))
 	if err != nil {
 		t.Fatal(err)
 	}

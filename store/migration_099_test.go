@@ -34,13 +34,21 @@ func TestMigration099BinderGrantAndDownGuardPostgres(t *testing.T) {
 	if _, err := provider.UpTo(t.Context(), 99); err != nil {
 		t.Fatal(err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "provision_vane_server_runtime_v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "provision_vane_server_runtime_research_binder_v1"); err != nil {
 		t.Fatal(err)
 	}
 	deprovisioned := false
 	t.Cleanup(func() {
 		if !deprovisioned {
-			_ = DeprovisionServerRuntime(t.Context(), scratchURL)
+			_ = callServerRuntimeProvisioner(t.Context(), scratchURL,
+				"deprovision_vane_server_runtime_research_binder_v1")
+			_ = callServerRuntimeProvisioner(t.Context(), scratchURL,
+				"deprovision_vane_server_runtime_v1")
 		}
 	})
 	var runtimeCanExecute, appCanExecute bool
@@ -60,7 +68,12 @@ func TestMigration099BinderGrantAndDownGuardPostgres(t *testing.T) {
 		!strings.Contains(err.Error(), "deprovision vane_server_runtime") {
 		t.Fatalf("099 Down did not guard a provisioned runtime: %v", err)
 	}
-	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := callServerRuntimeProvisioner(t.Context(), scratchURL,
+		"deprovision_vane_server_runtime_research_binder_v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := callServerRuntimeProvisioner(t.Context(), scratchURL,
+		"deprovision_vane_server_runtime_v1"); err != nil {
 		t.Fatal(err)
 	}
 	deprovisioned = true

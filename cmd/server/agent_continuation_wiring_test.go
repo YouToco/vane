@@ -62,6 +62,9 @@ func TestAgentContinuationRuntimeIsRemoved(
 	if len(continuationSources) != 0 {
 		t.Fatalf("retired agentcontinuation sources remain: %v", continuationSources)
 	}
+	if _, err := os.Stat(filepath.Join(repoRoot, "store", "agent_session_fact_outbox.go")); !os.IsNotExist(err) {
+		t.Fatalf("retired Agent session fact runtime remains: %v", err)
+	}
 }
 
 func TestFeedbackSessionProjectionCallBoundary(t *testing.T) {

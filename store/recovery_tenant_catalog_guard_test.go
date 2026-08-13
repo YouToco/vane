@@ -78,13 +78,12 @@ func TestRecoveryCallersUseOnlyTenantCatalogForCrossTenantDiscovery(t *testing.T
 
 func TestRecoveryPayloadReadersEnterExplicitTenantRole(t *testing.T) {
 	expect := map[string][]string{
-		"agent_session_fact_outbox.go": {"func (s *Store) ListDueAgentSessionFacts(", "beginRecoveryTenantRead("},
-		"schedule_commands.go":         {"func (s *Store) ListPendingScheduleCommands(", "beginRecoveryTenantRead("},
-		"schedules.go":                 {"func (s *Store) ListActiveSchedules(", "beginRecoveryTenantRead("},
-		"schedule_reconcile.go":        {"func (s *Store) AcquireScheduleReconcile(", "beginRecoveryTenantRead("},
-		"task_creation_operations.go":  {"func (s *Store) ListStaleTaskCreationOperations(", "beginRecoveryTenantRead("},
-		"task_creation_v3_saga.go":     {"func (s *Store) ListStaleResearchTaskCreationOperationsV3(", "beginRecoveryTenantRead("},
-		"task_creation_receipts.go":    {"func (s *Store) ListDueTaskCreationReceipts(", "beginRecoveryTenantRead("},
+		"schedule_commands.go":        {"func (s *Store) ListPendingScheduleCommands(", "beginRecoveryTenantRead("},
+		"schedules.go":                {"func (s *Store) ListActiveSchedules(", "beginRecoveryTenantRead("},
+		"schedule_reconcile.go":       {"func (s *Store) AcquireScheduleReconcile(", "beginRecoveryTenantRead("},
+		"task_creation_operations.go": {"func (s *Store) ListStaleTaskCreationOperations(", "beginRecoveryTenantRead("},
+		"task_creation_v3_saga.go":    {"func (s *Store) ListStaleResearchTaskCreationOperationsV3(", "beginRecoveryTenantRead("},
+		"task_creation_receipts.go":   {"func (s *Store) ListDueTaskCreationReceipts(", "beginRecoveryTenantRead("},
 	}
 	for name, fragments := range expect {
 		raw, err := os.ReadFile(name)

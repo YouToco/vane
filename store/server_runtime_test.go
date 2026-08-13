@@ -56,6 +56,9 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 	if roleCount != 0 {
 		t.Fatal("migration 098 provisioned a cluster-global runtime implicitly")
 	}
+	if _, err := provider.UpTo(t.Context(), latestMigrationVersion); err != nil {
+		t.Fatal(err)
+	}
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
 		t.Fatal(err)
 	}
@@ -355,10 +358,6 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		pushEffects, err := st.ListRecoverablePushEffects(
 			t.Context(), taskA, tenantA, future, "", 10)
 		assertEmpty("push effect recovery", len(pushEffects), err)
-		facts, err := st.ListDueAgentSessionFacts(
-			t.Context(), tenantA, future, 10)
-		assertEmpty("agent session fact recovery", len(facts), err)
-
 		// Prove the non-empty task-creation recovery chain through the actual
 		// server runtime role. Empty discovery assertions would not catch an
 		// RLS-scoped UPDATE that silently affected zero rows.
