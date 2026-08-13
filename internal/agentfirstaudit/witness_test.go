@@ -88,6 +88,19 @@ func TestRetentionClockEvidenceRejectsRepresentationDrift(t *testing.T) {
 	}
 }
 
+func TestReadRetentionClockEvidenceRejectsArchivedHistory(t *testing.T) {
+	expect, events := retentionClockHistoryFixture(t)
+	reader := historyReaderFunc(func(*workflowservice.GetWorkflowExecutionHistoryRequest) (
+		*workflowservice.GetWorkflowExecutionHistoryResponse, error) {
+		return &workflowservice.GetWorkflowExecutionHistoryResponse{
+			History: &historypb.History{Events: events}, Archived: true,
+		}, nil
+	})
+	if _, err := ReadRetentionClockEvidence(context.Background(), reader, expect); err == nil {
+		t.Fatal("archived fresh witness accepted")
+	}
+}
+
 func retentionClockHistoryFixture(t *testing.T) (
 	RetentionClockExpectation, []*historypb.HistoryEvent) {
 	t.Helper()

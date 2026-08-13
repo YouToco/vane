@@ -70,6 +70,7 @@ func ReadRetentionClockEvidence(
 	var events []*historypb.HistoryEvent
 	var token []byte
 	seenTokens := map[string]struct{}{}
+	archived := false
 	for page := 0; ; page++ {
 		if page >= maxWitnessHistoryPages {
 			return RetentionClockEvidence{}, fmt.Errorf("retention clock history exceeds page limit")
@@ -91,6 +92,7 @@ func ReadRetentionClockEvidence(
 		if response == nil || response.History == nil {
 			return RetentionClockEvidence{}, fmt.Errorf("retention clock history page is absent")
 		}
+		archived = archived || response.Archived
 		events = append(events, response.History.Events...)
 		if len(events) > maxWitnessHistoryEvents {
 			return RetentionClockEvidence{}, fmt.Errorf("retention clock history exceeds event limit")
@@ -105,6 +107,9 @@ func ReadRetentionClockEvidence(
 		}
 		seenTokens[key] = struct{}{}
 		token = bytes.Clone(next)
+	}
+	if archived {
+		return RetentionClockEvidence{}, fmt.Errorf("fresh retention clock history is archived")
 	}
 	return validateRetentionClockEvents(events, expect)
 }
@@ -136,6 +141,13 @@ func validateRetentionClockEvents(
 		started.TaskQueue.GetName() != expect.TaskQueue {
 		return RetentionClockEvidence{}, fmt.Errorf("retention clock start authority differs")
 	}
+	expectedRequest, err := converter.GetDefaultDataConverter().ToPayloads(
+		vaneworkflow.AgentFirstRetentionClockRequestV1{
+			Nonce: expect.Nonce, SourceRevision: expect.SourceRevision,
+		})
+	if err != nil || !proto.Equal(started.Input, expectedRequest) {
+		return RetentionClockEvidence{}, fmt.Errorf("retention clock input bytes differ")
+	}
 	var request vaneworkflow.AgentFirstRetentionClockRequestV1
 	if err := converter.GetDefaultDataConverter().FromPayloads(started.Input, &request); err != nil ||
 		request.Nonce != expect.Nonce || request.SourceRevision != expect.SourceRevision {
@@ -146,7 +158,8 @@ func validateRetentionClockEvents(
 	if taskStarted == nil || taskStarted.ScheduledEventId != 2 ||
 		taskCompleted == nil || taskCompleted.ScheduledEventId != 2 ||
 		taskCompleted.StartedEventId != 3 ||
-		taskCompleted.GetWorkerVersion().GetBuildId() != expect.WorkerBuildID {
+		taskCompleted.GetWorkerVersion().GetBuildId() != expect.WorkerBuildID ||
+		taskCompleted.GetWorkerVersion().GetUseVersioning() {
 		return RetentionClockEvidence{}, fmt.Errorf("retention clock worker authority differs")
 	}
 	completed := events[4].GetWorkflowExecutionCompletedEventAttributes()
@@ -162,6 +175,10 @@ func validateRetentionClockEvents(
 		result.Namespace != expect.Namespace || result.WorkflowID != expect.WorkflowID ||
 		result.RunID != expect.RunID {
 		return RetentionClockEvidence{}, fmt.Errorf("retention clock result differs from server history")
+	}
+	expectedResult, err := converter.GetDefaultDataConverter().ToPayloads(result)
+	if err != nil || !proto.Equal(completed.Result, expectedResult) {
+		return RetentionClockEvidence{}, fmt.Errorf("retention clock result bytes differ")
 	}
 	history := &historypb.History{Events: events}
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(history)
