@@ -463,6 +463,9 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 		return fmt.Errorf("server runtime memberships differ: got=%v want=%v",
 			memberships, wantMemberships)
 	}
+	if err := verifyMemoryRuntimeAuthority(ctx, tx); err != nil {
+		return err
+	}
 
 	for _, role := range serverRuntimeForbiddenRoles {
 		var member bool
@@ -487,6 +490,58 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit server runtime authority probe: %w", err)
+	}
+	return nil
+}
+
+// verifyMemoryRuntimeAuthority is the read-only startup half of migration
+// 129's owner-only exact validator. Deployment/provisioning rejects both extra
+// and missing authority; every new server connection independently rechecks
+// that all fourteen required direct ACL entries still exist, come from each
+// object's owner, and are not delegable.
+func verifyMemoryRuntimeAuthority(
+	ctx context.Context, querier serverRuntimeQuotaProjectionQuerier,
+) error {
+	var required int
+	if err := querier.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM pg_catalog.pg_namespace object
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.nspacl,
+		       pg_catalog.acldefault('n',object.nspowner))) acl
+		   JOIN pg_catalog.pg_roles role ON role.oid=acl.grantee
+		   WHERE role.rolname='vane_memory_editor' AND
+		         object.nspname='public' AND acl.privilege_type='USAGE' AND
+		         acl.grantor=object.nspowner AND NOT acl.is_grantable) +
+		  (SELECT count(*) FROM pg_catalog.pg_class object
+		   JOIN pg_catalog.pg_namespace namespace ON namespace.oid=object.relnamespace
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.relacl,
+		       pg_catalog.acldefault(CASE WHEN object.relkind='S' THEN 's'::"char"
+		                                 ELSE 'r'::"char" END,object.relowner))) acl
+		   JOIN pg_catalog.pg_roles role ON role.oid=acl.grantee
+		   WHERE role.rolname='vane_memory_editor' AND
+		         namespace.nspname='public' AND acl.grantor=object.relowner AND
+		         NOT acl.is_grantable AND (
+		           (object.relname IN ('memory_authorizations','memory_records',
+		                               'memory_events','memory_receipts') AND
+		            acl.privilege_type IN ('SELECT','INSERT')) OR
+		           (object.relname IN ('memory_records_id_seq','memory_events_id_seq') AND
+		            acl.privilege_type IN ('USAGE','SELECT')))) +
+		  (SELECT count(*) FROM pg_catalog.pg_attribute object
+		   JOIN pg_catalog.pg_class relation ON relation.oid=object.attrelid
+		   JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(object.attacl) acl
+		   JOIN pg_catalog.pg_roles role ON role.oid=acl.grantee
+		   WHERE role.rolname='vane_memory_editor' AND
+		         namespace.nspname='public' AND
+		         relation.relname='memory_authorizations' AND
+		         object.attname='consumed_event_id' AND
+		         acl.privilege_type='UPDATE' AND acl.grantor=relation.relowner AND
+		         NOT acl.is_grantable)`,
+	).Scan(&required); err != nil {
+		return fmt.Errorf("verify memory runtime authority: %w", err)
+	}
+	if required != 14 {
+		return fmt.Errorf("memory runtime has %d of 14 required authorities", required)
 	}
 	return nil
 }

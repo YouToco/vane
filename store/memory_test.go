@@ -209,6 +209,26 @@ func TestMemoryLedgerRecallIsolationReplayAndLifecyclePostgres(t *testing.T) {
 			t.Fatalf("exact replay diverged: %+v / %+v", remembered, got.result)
 		}
 	}
+	// A receipt replay is authorized by the exact consumed authorization, not
+	// merely by the same semantic action. Replacing that ID must conflict even
+	// when the idempotency key and every other action byte are unchanged.
+	swappedAuthorization := remember
+	swappedAuthorization.Evidence.AuthorizationID = uuid.NewString()
+	if _, err := st.ApplyMemoryAction(ctx, 1, userA, key,
+		swappedAuthorization); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("receipt replay accepted a different authorization ID: %v", err)
+	}
+	var postReplayRecords, postReplayEvents int
+	if err := st.pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM memory_records WHERE tenant_id=1 AND user_id=$1),
+		       (SELECT count(*) FROM memory_events WHERE tenant_id=1 AND user_id=$1)`,
+		userA).Scan(&postReplayRecords, &postReplayEvents); err != nil {
+		t.Fatal(err)
+	}
+	if postReplayRecords != recordsBefore+1 || postReplayEvents != eventsBefore+1 {
+		t.Fatalf("authorization replay mutation wrote history: records=%d events=%d",
+			postReplayRecords, postReplayEvents)
+	}
 	if _, err := st.ApplyMemoryAction(ctx, 1, userA, key,
 		types.MemoryAction{
 			Action: types.MemoryActionRemember, Text: "different",

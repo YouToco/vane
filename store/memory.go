@@ -93,7 +93,11 @@ func (s *Store) ApplyMemoryAction(
 	ctx context.Context, tenantID, userID int64, idempotencyKey string,
 	action types.MemoryAction,
 ) (*types.MemoryActionResult, error) {
-	canonical, digest, err := validateMemoryAction(idempotencyKey, action)
+	canonical, authorizationDigest, err := validateMemoryAction(idempotencyKey, action)
+	if err != nil {
+		return nil, err
+	}
+	receiptDigest, err := memoryActionDigest(canonical, true)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +108,7 @@ func (s *Store) ApplyMemoryAction(
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if result, found, err := loadMemoryReceiptTx(
-		ctx, tx, tenantID, userID, idempotencyKey, digest,
+		ctx, tx, tenantID, userID, idempotencyKey, receiptDigest,
 	); err != nil || found {
 		return result, err
 	}
@@ -124,7 +128,7 @@ func (s *Store) ApplyMemoryAction(
 	} else if err != nil {
 		return nil, memoryDBError("读取长期记忆授权", err)
 	}
-	if authorizedDigest != digest || consumedEventID != nil {
+	if authorizedDigest != authorizationDigest || consumedEventID != nil {
 		return nil, types.NewAppError(types.CodeConflict,
 			"长期记忆授权与请求不一致或已消费", nil)
 	}
@@ -228,7 +232,7 @@ func (s *Store) ApplyMemoryAction(
 		INSERT INTO memory_receipts(
 		 tenant_id,user_id,idempotency_key,request_digest,event_id,response_payload)
 		VALUES($1,$2,$3,$4,$5,$6)`,
-		tenantID, userID, idempotencyKey, digest, event.ID, payload,
+		tenantID, userID, idempotencyKey, receiptDigest, event.ID, payload,
 	); err != nil {
 		return nil, memoryDBError("写入长期记忆回执", err)
 	}
@@ -445,14 +449,27 @@ func validateMemoryAction(
 	if action.Text != "" && len(toolsearch.Tokenize(action.Text)) == 0 {
 		return action, "", memoryValidationError("长期记忆文本没有可检索内容")
 	}
-	digestAction := action
-	digestAction.Evidence.AuthorizationID = ""
-	request, err := json.Marshal(digestAction)
+	digest, err := memoryActionDigest(action, false)
 	if err != nil {
-		return action, "", types.NewAppError(types.CodeInternal, "编码长期记忆请求", err)
+		return action, "", err
+	}
+	return action, digest, nil
+}
+
+// memoryActionDigest deliberately has two domains. The durable authorization
+// binds the exact semantic action before an authorization ID exists. The
+// response-loss receipt additionally binds the exact authorization row that
+// was consumed, so replacing that ID can never replay an earlier success.
+func memoryActionDigest(action types.MemoryAction, includeAuthorization bool) (string, error) {
+	if !includeAuthorization {
+		action.Evidence.AuthorizationID = ""
+	}
+	request, err := json.Marshal(action)
+	if err != nil {
+		return "", types.NewAppError(types.CodeInternal, "编码长期记忆请求", err)
 	}
 	digestBytes := sha256.Sum256(request)
-	return action, hex.EncodeToString(digestBytes[:]), nil
+	return hex.EncodeToString(digestBytes[:]), nil
 }
 
 func validMemoryDigest(value string) bool {

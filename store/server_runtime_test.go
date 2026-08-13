@@ -226,6 +226,48 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Run("memory capability requires every exact ACL at startup", func(t *testing.T) {
+		mutations := []struct {
+			name, revoke, restore string
+		}{
+			{"schema usage", `REVOKE USAGE ON SCHEMA public FROM vane_memory_editor`, `GRANT USAGE ON SCHEMA public TO vane_memory_editor`},
+			{"authorizations select", `REVOKE SELECT ON memory_authorizations FROM vane_memory_editor`, `GRANT SELECT ON memory_authorizations TO vane_memory_editor`},
+			{"authorizations insert", `REVOKE INSERT ON memory_authorizations FROM vane_memory_editor`, `GRANT INSERT ON memory_authorizations TO vane_memory_editor`},
+			{"records select", `REVOKE SELECT ON memory_records FROM vane_memory_editor`, `GRANT SELECT ON memory_records TO vane_memory_editor`},
+			{"records insert", `REVOKE INSERT ON memory_records FROM vane_memory_editor`, `GRANT INSERT ON memory_records TO vane_memory_editor`},
+			{"events select", `REVOKE SELECT ON memory_events FROM vane_memory_editor`, `GRANT SELECT ON memory_events TO vane_memory_editor`},
+			{"events insert", `REVOKE INSERT ON memory_events FROM vane_memory_editor`, `GRANT INSERT ON memory_events TO vane_memory_editor`},
+			{"receipts select", `REVOKE SELECT ON memory_receipts FROM vane_memory_editor`, `GRANT SELECT ON memory_receipts TO vane_memory_editor`},
+			{"receipts insert", `REVOKE INSERT ON memory_receipts FROM vane_memory_editor`, `GRANT INSERT ON memory_receipts TO vane_memory_editor`},
+			{"records sequence usage", `REVOKE USAGE ON SEQUENCE memory_records_id_seq FROM vane_memory_editor`, `GRANT USAGE ON SEQUENCE memory_records_id_seq TO vane_memory_editor`},
+			{"records sequence select", `REVOKE SELECT ON SEQUENCE memory_records_id_seq FROM vane_memory_editor`, `GRANT SELECT ON SEQUENCE memory_records_id_seq TO vane_memory_editor`},
+			{"events sequence usage", `REVOKE USAGE ON SEQUENCE memory_events_id_seq FROM vane_memory_editor`, `GRANT USAGE ON SEQUENCE memory_events_id_seq TO vane_memory_editor`},
+			{"events sequence select", `REVOKE SELECT ON SEQUENCE memory_events_id_seq FROM vane_memory_editor`, `GRANT SELECT ON SEQUENCE memory_events_id_seq TO vane_memory_editor`},
+			{"authorization consume", `REVOKE UPDATE (consumed_event_id) ON memory_authorizations FROM vane_memory_editor`, `GRANT UPDATE (consumed_event_id) ON memory_authorizations TO vane_memory_editor`},
+		}
+		for _, mutation := range mutations {
+			if _, err := owner.ExecContext(t.Context(), mutation.revoke); err != nil {
+				t.Fatalf("revoke %s: %v", mutation.name, err)
+			}
+			st, err := NewServerRuntime(t.Context(), runtimeURL)
+			if err == nil {
+				st.Close()
+				t.Fatalf("startup accepted missing %s", mutation.name)
+			}
+			if !strings.Contains(err.Error(), "required authorities") {
+				t.Fatalf("missing %s returned unexpected error: %v", mutation.name, err)
+			}
+			if _, err := owner.ExecContext(t.Context(), mutation.restore); err != nil {
+				t.Fatalf("restore %s: %v", mutation.name, err)
+			}
+		}
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatalf("restored memory authority rejected: %v", err)
+		}
+		st.Close()
+	})
+
 	t.Run("recovery catalog separates discovery from tenant payload reads", func(t *testing.T) {
 		st, err := NewServerRuntime(t.Context(), runtimeURL)
 		if err != nil {
