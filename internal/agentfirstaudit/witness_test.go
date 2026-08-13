@@ -101,6 +101,21 @@ func TestReadRetentionClockEvidenceRejectsArchivedHistory(t *testing.T) {
 	}
 }
 
+func TestReadRetentionClockEvidenceRejectsNonCanonicalRevision(t *testing.T) {
+	expect, events := retentionClockHistoryFixture(t)
+	expect.SourceRevision = "ABCDEF6789abcdef0123456789abcdef01234567"
+	expect.WorkerBuildID = "vane/" + expect.SourceRevision
+	reader := historyReaderFunc(func(*workflowservice.GetWorkflowExecutionHistoryRequest) (
+		*workflowservice.GetWorkflowExecutionHistoryResponse, error) {
+		return &workflowservice.GetWorkflowExecutionHistoryResponse{
+			History: &historypb.History{Events: events},
+		}, nil
+	})
+	if _, err := ReadRetentionClockEvidence(context.Background(), reader, expect); err == nil {
+		t.Fatal("non-canonical source revision accepted")
+	}
+}
+
 func retentionClockHistoryFixture(t *testing.T) (
 	RetentionClockExpectation, []*historypb.HistoryEvent) {
 	t.Helper()

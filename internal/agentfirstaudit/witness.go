@@ -63,7 +63,7 @@ func ReadRetentionClockEvidence(
 ) (RetentionClockEvidence, error) {
 	if reader == nil || expect.Namespace == "" || expect.WorkflowID == "" ||
 		expect.RunID == "" || expect.TaskQueue == "" || expect.Nonce == "" ||
-		len(expect.SourceRevision) != 40 ||
+		!validSourceRevision(expect.SourceRevision) ||
 		expect.WorkerBuildID != "vane/"+expect.SourceRevision {
 		return RetentionClockEvidence{}, fmt.Errorf("retention clock expectation is invalid")
 	}
@@ -112,6 +112,19 @@ func ReadRetentionClockEvidence(
 		return RetentionClockEvidence{}, fmt.Errorf("fresh retention clock history is archived")
 	}
 	return validateRetentionClockEvents(events, expect)
+}
+
+func validSourceRevision(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, current := range value {
+		if !('0' <= current && current <= '9') &&
+			!('a' <= current && current <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validateRetentionClockEvents(
