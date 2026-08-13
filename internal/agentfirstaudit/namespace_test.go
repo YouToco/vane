@@ -77,6 +77,9 @@ func TestReadTemporalAuthorityRejectsUnprovablePolicy(t *testing.T) {
 		{"active cluster absent", func(f *namespaceReaderFake) {
 			f.namespace.ReplicationConfig.ActiveClusterName = "absent"
 		}},
+		{"passive cluster endpoint", func(f *namespaceReaderFake) {
+			f.cluster.ClusterName = "standby"
+		}},
 		{"replication unspecified", func(f *namespaceReaderFake) {
 			f.namespace.ReplicationConfig.State = enumspb.REPLICATION_STATE_UNSPECIFIED
 		}},

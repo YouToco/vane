@@ -189,11 +189,27 @@ func readScheduleInventory(
 			entry.GetInfo().GetWorkflowType().GetName() != start.GetWorkflowType().GetName() {
 			return ScheduleInventory{}, fmt.Errorf("Temporal schedule Action is legacy or unknown")
 		}
-		raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(description)
+		scheduleRaw, err := proto.MarshalOptions{Deterministic: true}.Marshal(description.GetSchedule())
 		if err != nil {
 			return ScheduleInventory{}, fmt.Errorf("marshal Temporal schedule authority: %w", err)
 		}
-		sum := sha256.Sum256(raw)
+		if len(scheduleRaw) == 0 {
+			return ScheduleInventory{}, fmt.Errorf("Temporal schedule authority bytes are empty")
+		}
+		scheduleSum := sha256.Sum256(scheduleRaw)
+		conflictSum := sha256.Sum256(description.GetConflictToken())
+		descriptionDigest, err := digestCanonical(struct {
+			ConflictTokenDigest string `json:"conflict_token_digest"`
+			ScheduleDigest      string `json:"schedule_digest"`
+			SchemaVersion       string `json:"schema_version"`
+		}{
+			ConflictTokenDigest: hex.EncodeToString(conflictSum[:]),
+			ScheduleDigest:      hex.EncodeToString(scheduleSum[:]),
+			SchemaVersion:       "vane.agent-first-schedule-description/v1",
+		})
+		if err != nil {
+			return ScheduleInventory{}, err
+		}
 		actionRaw, err := proto.MarshalOptions{Deterministic: true}.Marshal(
 			description.GetSchedule().GetAction())
 		if err != nil {
@@ -204,7 +220,6 @@ func readScheduleInventory(
 		}
 		actionSum := sha256.Sum256(actionRaw)
 		actionDigest := hex.EncodeToString(actionSum[:])
-		descriptionDigest := hex.EncodeToString(sum[:])
 		paused := description.GetSchedule().GetState().GetPaused()
 		authorities = append(authorities, scheduleAuthorityV1{
 			SchemaVersion: "vane.agent-first-schedule-authority/v1",
@@ -222,14 +237,30 @@ func readScheduleInventory(
 	sort.Slice(publicItems, func(i, j int) bool {
 		return publicItems[i].ScheduleID < publicItems[j].ScheduleID
 	})
-	digest, err := digestCanonical(struct {
-		Schedules     []scheduleAuthorityV1 `json:"schedules"`
-		SchemaVersion string                `json:"schema_version"`
-	}{authorities, "vane.agent-first-schedule-inventory/v1"})
+	digest, err := digestScheduleInventory(publicItems)
 	if err != nil {
 		return ScheduleInventory{}, err
 	}
 	return ScheduleInventory{
 		Count: len(authorities), Digest: digest, Items: publicItems,
 	}, nil
+}
+
+func digestScheduleInventory(items []ScheduleAuthority) (string, error) {
+	authorities := make([]scheduleAuthorityV1, 0, len(items))
+	for _, item := range items {
+		authorities = append(authorities, scheduleAuthorityV1{
+			SchemaVersion: "vane.agent-first-schedule-authority/v1",
+			ScheduleID:    item.ScheduleID, WorkflowType: item.WorkflowType,
+			ActionDigest: item.ActionDigest, DescriptionDigest: item.DescriptionDigest,
+			Paused: item.Paused,
+		})
+	}
+	sort.Slice(authorities, func(i, j int) bool {
+		return authorities[i].ScheduleID < authorities[j].ScheduleID
+	})
+	return digestCanonical(struct {
+		Schedules     []scheduleAuthorityV1 `json:"schedules"`
+		SchemaVersion string                `json:"schema_version"`
+	}{authorities, "vane.agent-first-schedule-inventory/v1"})
 }

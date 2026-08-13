@@ -13,6 +13,7 @@ import (
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
+	sdkworkflow "go.temporal.io/sdk/workflow"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -21,12 +22,16 @@ import (
 func TestReadLegacyWorkflowInventoryReadsEveryPageDescribesAndReplays(t *testing.T) {
 	reader := validLegacyWorkflowReader()
 	replayed := 0
+	seenExecutions := map[string]bool{}
 	inventory, err := ReadLegacyWorkflowInventory(t.Context(), reader, "vane", false,
-		func(history *historypb.History) error {
+		func(history *historypb.History, execution sdkworkflow.Execution) error {
 			replayed++
-			if len(history.GetEvents()) != 2 {
-				t.Fatalf("events=%d", len(history.GetEvents()))
+			want := reader.infos[execution.ID]
+			if len(history.GetEvents()) != 2 || want == nil ||
+				want.GetExecution().GetRunId() != execution.RunID {
+				t.Fatalf("events=%d execution=%+v", len(history.GetEvents()), execution)
 			}
+			seenExecutions[execution.ID] = true
 			return nil
 		})
 	if err != nil {
@@ -34,7 +39,8 @@ func TestReadLegacyWorkflowInventoryReadsEveryPageDescribesAndReplays(t *testing
 	}
 	if inventory.Archived || inventory.Count != 2 || replayed != 2 || len(inventory.Digest) != 64 ||
 		inventory.Runs[0].WorkflowID != "legacy-a" || inventory.Runs[1].WorkflowID != "legacy-b" ||
-		reader.standardCalls != 2 || reader.describeCalls != 2 || reader.historyCalls != 2 {
+		reader.standardCalls != 2 || reader.describeCalls != 2 || reader.historyCalls != 2 ||
+		!seenExecutions["legacy-a"] || !seenExecutions["legacy-b"] {
 		t.Fatalf("inventory=%+v reader=%+v replayed=%d", inventory, reader, replayed)
 	}
 }
@@ -46,13 +52,14 @@ func TestReadLegacyWorkflowInventoryUsesArchivedAuthority(t *testing.T) {
 		"": {Executions: []*workflowpb.WorkflowExecutionInfo{reader.infos["legacy-a"]}},
 	}
 	reader.archivedHistory = true
+	reader.describeNotFound = true
 	inventory, err := ReadLegacyWorkflowInventory(t.Context(), reader, "vane", true,
-		func(*historypb.History) error { return nil })
+		func(*historypb.History, sdkworkflow.Execution) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !inventory.Archived || inventory.Count != 1 || reader.archivedCalls != 1 ||
-		reader.standardCalls != 0 || !reader.lastHistoryRequestArchived {
+		reader.standardCalls != 0 || reader.describeCalls != 0 || !reader.lastHistoryRequestArchived {
 		t.Fatalf("inventory=%+v reader=%+v", inventory, reader)
 	}
 }
@@ -61,7 +68,7 @@ func TestReadStableLegacyWorkflowInventoryRejectsSecondScanDrift(t *testing.T) {
 	reader := validLegacyWorkflowReader()
 	reader.driftSecondScan = true
 	if _, err := ReadStableLegacyWorkflowInventory(t.Context(), reader, "vane", false,
-		func(*historypb.History) error { return nil }); err == nil {
+		func(*historypb.History, sdkworkflow.Execution) error { return nil }); err == nil {
 		t.Fatal("visibility drift accepted")
 	}
 }
@@ -147,6 +154,9 @@ func TestReadLegacyWorkflowInventoryRejectsIncompleteOrDriftingEvidence(t *testi
 		{"history event drift", func(f *legacyWorkflowReaderFake) {
 			f.historyEventMutate = func(events []*historypb.HistoryEvent) { events[1].EventId = 7 }
 		}},
+		{"history length drift", func(f *legacyWorkflowReaderFake) {
+			f.infos["legacy-a"].HistoryLength++
+		}},
 		{"history closure drift", func(f *legacyWorkflowReaderFake) {
 			f.historyEventMutate = func(events []*historypb.HistoryEvent) {
 				events[1].EventType = enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED
@@ -158,7 +168,7 @@ func TestReadLegacyWorkflowInventoryRejectsIncompleteOrDriftingEvidence(t *testi
 			reader := validLegacyWorkflowReader()
 			tc.mutate(reader)
 			_, err := ReadLegacyWorkflowInventory(t.Context(), reader, "vane", false,
-				func(*historypb.History) error {
+				func(*historypb.History, sdkworkflow.Execution) error {
 					if reader.replayFails {
 						return errors.New("nondeterministic")
 					}

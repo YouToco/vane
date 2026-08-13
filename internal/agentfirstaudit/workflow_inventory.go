@@ -15,6 +15,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
+	sdkworkflow "go.temporal.io/sdk/workflow"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
@@ -43,7 +44,7 @@ type LegacyWorkflowReader interface {
 		...grpc.CallOption) (*workflowservice.GetWorkflowExecutionHistoryResponse, error)
 }
 
-type WorkflowHistoryReplayer func(*historypb.History) error
+type WorkflowHistoryReplayer func(*historypb.History, sdkworkflow.Execution) error
 
 type LegacyWorkflowRun struct {
 	WorkflowID      string
@@ -204,24 +205,27 @@ func ReadLegacyWorkflowInventory(
 			return LegacyWorkflowInventory{}, err
 		}
 		execution := listedInfo.GetExecution()
-		description, err := reader.DescribeWorkflowExecution(ctx,
-			&workflowservice.DescribeWorkflowExecutionRequest{
-				Namespace: namespace,
-				Execution: &commonpb.WorkflowExecution{
-					WorkflowId: execution.GetWorkflowId(), RunId: execution.GetRunId(),
-				},
-			})
-		if err != nil {
-			return LegacyWorkflowInventory{}, fmt.Errorf("describe legacy workflow: %w", err)
-		}
-		if description == nil || len(description.GetPendingActivities()) != 0 ||
-			len(description.GetPendingChildren()) != 0 || description.GetPendingWorkflowTask() != nil ||
-			len(description.GetCallbacks()) != 0 || len(description.GetPendingNexusOperations()) != 0 {
-			return LegacyWorkflowInventory{}, fmt.Errorf("legacy workflow description is incomplete or pending")
-		}
-		described, err := canonicalLegacyWorkflowInfo(description.GetWorkflowExecutionInfo())
-		if err != nil || described != canonical {
-			return LegacyWorkflowInventory{}, fmt.Errorf("legacy workflow list and description differ")
+		if !archived {
+			description, err := reader.DescribeWorkflowExecution(ctx,
+				&workflowservice.DescribeWorkflowExecutionRequest{
+					Namespace: namespace,
+					Execution: &commonpb.WorkflowExecution{
+						WorkflowId: execution.GetWorkflowId(), RunId: execution.GetRunId(),
+					},
+				})
+			if err != nil {
+				return LegacyWorkflowInventory{}, fmt.Errorf("describe legacy workflow: %w", err)
+			}
+			if description == nil || len(description.GetPendingActivities()) != 0 ||
+				len(description.GetPendingChildren()) != 0 ||
+				description.GetPendingWorkflowTask() != nil || len(description.GetCallbacks()) != 0 ||
+				len(description.GetPendingNexusOperations()) != 0 {
+				return LegacyWorkflowInventory{}, fmt.Errorf("legacy workflow description is incomplete or pending")
+			}
+			described, err := canonicalLegacyWorkflowInfo(description.GetWorkflowExecutionInfo())
+			if err != nil || described != canonical {
+				return LegacyWorkflowInventory{}, fmt.Errorf("legacy workflow list and description differ")
+			}
 		}
 		history, historyDigest, eventCount, err := readLegacyWorkflowHistory(
 			ctx, reader, namespace, execution.GetWorkflowId(), execution.GetRunId(),
@@ -229,7 +233,12 @@ func ReadLegacyWorkflowInventory(
 		if err != nil {
 			return LegacyWorkflowInventory{}, err
 		}
-		if err := replay(history); err != nil {
+		if eventCount != int(listedInfo.GetHistoryLength()) {
+			return LegacyWorkflowInventory{}, fmt.Errorf("legacy workflow history length differs")
+		}
+		if err := replay(history, sdkworkflow.Execution{
+			ID: execution.GetWorkflowId(), RunID: execution.GetRunId(),
+		}); err != nil {
 			return LegacyWorkflowInventory{}, fmt.Errorf("replay retained legacy workflow: %w", err)
 		}
 		run := legacyWorkflowRunV1{
@@ -257,17 +266,39 @@ func ReadLegacyWorkflowInventory(
 		}
 		return publicRuns[i].WorkflowID < publicRuns[j].WorkflowID
 	})
-	digest, err := digestCanonical(struct {
-		Archived      bool                  `json:"archived"`
-		Runs          []legacyWorkflowRunV1 `json:"runs"`
-		SchemaVersion string                `json:"schema_version"`
-	}{archived, runs, "vane.agent-first-legacy-workflow-inventory/v1"})
+	digest, err := digestLegacyWorkflowInventory(archived, publicRuns)
 	if err != nil {
 		return LegacyWorkflowInventory{}, err
 	}
 	return LegacyWorkflowInventory{
 		Archived: archived, Count: len(runs), Digest: digest, Runs: publicRuns,
 	}, nil
+}
+
+func digestLegacyWorkflowInventory(
+	archived bool,
+	runs []LegacyWorkflowRun,
+) (string, error) {
+	canonical := make([]legacyWorkflowRunV1, 0, len(runs))
+	for _, run := range runs {
+		canonical = append(canonical, legacyWorkflowRunV1{
+			SchemaVersion: "vane.agent-first-legacy-workflow-run/v1",
+			WorkflowID:    run.WorkflowID, RunID: run.RunID, Status: run.Status,
+			AuthorityDigest: run.AuthorityDigest, HistoryDigest: run.HistoryDigest,
+			HistoryEvents: run.HistoryEvents,
+		})
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].WorkflowID == canonical[j].WorkflowID {
+			return canonical[i].RunID < canonical[j].RunID
+		}
+		return canonical[i].WorkflowID < canonical[j].WorkflowID
+	})
+	return digestCanonical(struct {
+		Archived      bool                  `json:"archived"`
+		Runs          []legacyWorkflowRunV1 `json:"runs"`
+		SchemaVersion string                `json:"schema_version"`
+	}{archived, canonical, "vane.agent-first-legacy-workflow-inventory/v1"})
 }
 
 func listLegacyWorkflowExecutions(

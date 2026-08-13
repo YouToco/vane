@@ -28,6 +28,14 @@ func TestReadStableScheduleInventoryScansEveryPageAndDescribesEverySchedule(t *t
 	}
 }
 
+func TestReadStableScheduleInventoryIgnoresDynamicRuntimeInfo(t *testing.T) {
+	reader := validScheduleInventoryReader()
+	reader.changeRuntimeInfo = true
+	if _, err := ReadStableScheduleInventory(t.Context(), reader, "vane"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReadStableScheduleInventoryRejectsLegacyUnknownOrDriftingAuthority(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -93,11 +101,12 @@ func TestValidateScheduleInventoryParityBindsActionAndPausedState(t *testing.T) 
 }
 
 type scheduleInventoryReaderFake struct {
-	pages           map[string]*workflowservice.ListSchedulesResponse
-	descriptions    map[string]*workflowservice.DescribeScheduleResponse
-	listCalls       int
-	describeCalls   int
-	driftSecondScan bool
+	pages             map[string]*workflowservice.ListSchedulesResponse
+	descriptions      map[string]*workflowservice.DescribeScheduleResponse
+	listCalls         int
+	describeCalls     int
+	driftSecondScan   bool
+	changeRuntimeInfo bool
 }
 
 func validScheduleInventoryReader() *scheduleInventoryReaderFake {
@@ -166,5 +175,9 @@ func (f *scheduleInventoryReaderFake) DescribeSchedule(
 	if response == nil {
 		return nil, errors.New("unknown schedule")
 	}
-	return proto.Clone(response).(*workflowservice.DescribeScheduleResponse), nil
+	cloned := proto.Clone(response).(*workflowservice.DescribeScheduleResponse)
+	if f.changeRuntimeInfo && f.describeCalls > len(f.descriptions) {
+		cloned.Info.ActionCount++
+	}
+	return cloned, nil
 }

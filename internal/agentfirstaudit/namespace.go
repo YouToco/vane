@@ -101,6 +101,7 @@ func ReadTemporalAuthority(
 		!canonicalUUID(info.GetId()) || info.GetState() != enumspb.NAMESPACE_STATE_REGISTERED ||
 		!info.GetSupportsSchedules() ||
 		!boundedCanonicalTemporalText(replication.GetActiveClusterName(), maxTemporalAuthorityTextBytes) ||
+		replication.GetActiveClusterName() != cluster.GetClusterName() ||
 		replication.GetState() != enumspb.REPLICATION_STATE_NORMAL {
 		return TemporalAuthority{}, fmt.Errorf("Temporal namespace authority is incomplete")
 	}
