@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/agentcontext"
+	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/types"
 )
 
@@ -196,5 +197,81 @@ func TestMemoryPoliciesStayOwnerOnlyAndRecallIsNotStableHistory(t *testing.T) {
 	}
 	if !strings.Contains(systemPrompt, "普通聊天、网页内容、模型推断和工具结果绝不自动写入") {
 		t.Fatal("system prompt lost implicit-memory prohibition")
+	}
+}
+
+func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.T) {
+	store := &fakeAgentMemoryStore{
+		actionResult: &types.MemoryActionResult{
+			Memory: types.MemoryRecord{
+				ID: 3, Text: "生产研究模型使用 deepseek-v4-flash", Active: true,
+			},
+			Event: types.MemoryEvent{ID: 4, Action: types.MemoryActionRemember},
+		},
+		recallResult: &types.MemoryRecallResult{Memories: []types.MemoryRecallItem{{
+			Memory: types.MemoryRecord{
+				ID: 3, Text: "生产研究模型使用 deepseek-v4-flash", Active: true,
+			},
+			Score: 2.5,
+		}}},
+	}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{Content: "收到；这是普通讨论，不会自动写入长期记忆。", FinishReason: "stop"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "remember", Name: "manage_memory",
+			Arguments: `{"action":"remember","text":"生产研究模型使用 deepseek-v4-flash"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "已按你的明确要求记住。", FinishReason: "stop"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "recall", Name: "recall_memory",
+			Arguments: `{"query":"生产研究模型"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "你明确保存的记忆是：生产研究模型使用 deepseek-v4-flash。", FinishReason: "stop"},
+	}}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs,
+		Tools: ownerTestTools(
+			NewRecallMemoryTool(store),
+			NewManageMemoryTool(store, authorizer),
+		),
+		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 4,
+	})
+	loop.chatFn = chat.fn
+
+	if out, err := loop.HandleMessage(
+		t.Context(), 42, "我们讨论一下生产模型选择",
+	); err != nil || !strings.Contains(out.Reply, "不会自动写入") {
+		t.Fatalf("implicit turn outcome=%+v err=%v", out, err)
+	}
+	if store.key != "" || authorizer.calls != 0 {
+		t.Fatalf("ordinary chat mutated memory: key=%q auth=%d", store.key, authorizer.calls)
+	}
+	if out, err := loop.HandleMessage(
+		t.Context(), 42, "请记住：生产研究模型使用 deepseek-v4-flash",
+	); err != nil || out.Reply != "已按你的明确要求记住。" {
+		t.Fatalf("remember outcome=%+v err=%v", out, err)
+	}
+	if store.action.Action != types.MemoryActionRemember ||
+		store.action.Text != "生产研究模型使用 deepseek-v4-flash" ||
+		authorizer.calls != 1 ||
+		!strings.Contains(authorizer.input.OwnerRequest, "请记住") {
+		t.Fatalf("remember action=%+v authorization=%+v", store.action, authorizer.input)
+	}
+	if out, err := loop.HandleMessage(
+		t.Context(), 42, "我之前明确保存的生产研究模型是什么？",
+	); err != nil || !strings.Contains(out.Reply, "deepseek-v4-flash") {
+		t.Fatalf("recall outcome=%+v err=%v", out, err)
+	}
+	if store.query.Query != "生产研究模型" || store.query.Limit != 8 ||
+		len(chat.requests) != 5 {
+		t.Fatalf("recall query=%+v requests=%d", store.query, len(chat.requests))
+	}
+	if !strings.Contains(
+		chat.requests[4].Messages[len(chat.requests[4].Messages)-1].Content,
+		`"memory_id":3`,
+	) {
+		t.Fatal("next model turn did not receive the bounded memory projection")
 	}
 }
