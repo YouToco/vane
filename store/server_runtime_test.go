@@ -299,6 +299,81 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		st.Close()
 	})
 
+	t.Run("memory capability rejects role and membership drift at startup", func(t *testing.T) {
+		assertRejected := func(name string) {
+			t.Helper()
+			st, err := NewServerRuntime(t.Context(), runtimeURL)
+			if err == nil {
+				st.Close()
+				t.Fatalf("startup accepted %s", name)
+			}
+			if !strings.Contains(err.Error(), "role contract is unsafe") {
+				t.Fatalf("%s returned unexpected error: %v", name, err)
+			}
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor LOGIN PASSWORD 'memory-drift-test'`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("LOGIN memory role")
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor NOLOGIN PASSWORD NULL`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor INHERIT`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("INHERIT memory role")
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor NOINHERIT`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor SET search_path=public`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("memory role search_path drift")
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor SET search_path=pg_catalog,public,pg_temp`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`GRANT vane_memory_editor TO vane_app WITH ADMIN FALSE, SET TRUE, INHERIT FALSE`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("extra memory role member")
+		if _, err := owner.ExecContext(t.Context(),
+			`REVOKE vane_memory_editor FROM vane_app`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`GRANT vane_app TO vane_memory_editor WITH ADMIN FALSE, SET TRUE, INHERIT FALSE`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("memory role outbound membership")
+		if _, err := owner.ExecContext(t.Context(),
+			`REVOKE vane_app FROM vane_memory_editor`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`GRANT vane_memory_editor TO vane_server_runtime WITH ADMIN OPTION`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("memory runtime edge option drift")
+		if _, err := owner.ExecContext(t.Context(), `
+			REVOKE vane_memory_editor FROM vane_server_runtime;
+			GRANT vane_memory_editor TO vane_server_runtime
+			  WITH ADMIN FALSE, SET TRUE, INHERIT FALSE`); err != nil {
+			t.Fatal(err)
+		}
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatalf("restored exact memory role contract rejected: %v", err)
+		}
+		st.Close()
+	})
+
 	t.Run("recovery catalog separates discovery from tenant payload reads", func(t *testing.T) {
 		st, err := NewServerRuntime(t.Context(), runtimeURL)
 		if err != nil {

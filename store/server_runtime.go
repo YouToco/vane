@@ -502,6 +502,47 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 func verifyMemoryRuntimeAuthority(
 	ctx context.Context, querier serverRuntimeQuotaProjectionQuerier,
 ) error {
+	var roleSafe, membershipSafe bool
+	if err := querier.QueryRow(ctx, `
+		WITH memory_role AS (
+		  SELECT oid,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolinherit,
+		         rolreplication,rolbypassrls,rolconfig
+		    FROM pg_catalog.pg_roles WHERE rolname='vane_memory_editor'
+		), object_owner AS (
+		  SELECT owner.oid,owner.rolname
+		    FROM pg_catalog.pg_class relation
+		    JOIN pg_catalog.pg_roles owner ON owner.oid=relation.relowner
+		   WHERE relation.oid='memory_authorizations'::pg_catalog.regclass
+		)
+		SELECT
+		  EXISTS (SELECT 1 FROM memory_role
+		           WHERE NOT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb
+		             AND NOT rolcreaterole AND NOT rolinherit AND NOT rolreplication
+		             AND NOT rolbypassrls AND
+		             rolconfig=ARRAY['search_path=pg_catalog, public, pg_temp']::TEXT[]),
+		  (SELECT count(*)=2 FROM pg_catalog.pg_auth_members edge
+		    JOIN memory_role role ON role.oid=edge.roleid
+		    JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+		    CROSS JOIN object_owner owner
+		   WHERE member.rolname IN (owner.rolname,'vane_server_runtime') AND
+		         NOT edge.admin_option AND NOT edge.inherit_option AND edge.set_option) AND
+		  NOT EXISTS (
+		    SELECT 1 FROM pg_catalog.pg_auth_members edge
+		    JOIN memory_role role ON role.oid=edge.roleid
+		    JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+		    CROSS JOIN object_owner owner
+		    WHERE member.rolname NOT IN (owner.rolname,'vane_server_runtime') OR
+		          edge.admin_option OR edge.inherit_option OR NOT edge.set_option) AND
+		  NOT EXISTS (
+		    SELECT 1 FROM pg_catalog.pg_auth_members edge
+		    JOIN memory_role role ON role.oid=edge.member)
+	`).Scan(&roleSafe, &membershipSafe); err != nil {
+		return fmt.Errorf("verify memory runtime role contract: %w", err)
+	}
+	if !roleSafe || !membershipSafe {
+		return fmt.Errorf("memory runtime role contract is unsafe: attributes=%v memberships=%v",
+			roleSafe, membershipSafe)
+	}
 	var required, unexpected int
 	if err := querier.QueryRow(ctx, `
 		SELECT
