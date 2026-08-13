@@ -333,14 +333,18 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 		_, _ = owner.pool.Exec(context.Background(),
 			`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
 	})
-	// This fixture intentionally stops at schema 110. Current binaries reject
-	// that retained membership set after migration 128, so use an unvalidated
-	// historical pool; the assertions below exercise only the independent edit
-	// recovery capability under test.
-	runtime, err := New(t.Context(), serverRuntimeTestURL(t, scratchURL, password))
+	// This fixture intentionally stops at schema 110. Current membership
+	// validation targets schema 128, but historical server connections still
+	// entered vane_app before tenant-scoped Store methods ran.
+	runtimePool, err := newStorePool(t.Context(),
+		serverRuntimeTestURL(t, scratchURL, password), func(ctx context.Context, conn *pgx.Conn) error {
+			_, err := conn.Exec(ctx, `SET ROLE vane_app`)
+			return err
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtime := newStore(runtimePool, nil)
 	t.Cleanup(runtime.Close)
 	if _, err := runtime.ClaimStaleResearchTaskDefinitionEditOperationV3(
 		t.Context(), time.Now(), "missing-recovery-credential", time.Minute); !errors.Is(
