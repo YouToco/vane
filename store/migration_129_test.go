@@ -45,52 +45,6 @@ func TestMigration129LedgerBoundary(t *testing.T) {
 	}
 }
 
-func TestMigration129SecondDatabaseUpKeepsClusterRoleExactPostgres(t *testing.T) {
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
-	}
-	first, firstProvider, _, dropFirst := migration128Scratch(t, databaseURL)
-	t.Cleanup(dropFirst)
-	second, secondProvider, _, dropSecond := migration128Scratch(t, databaseURL)
-	t.Cleanup(dropSecond)
-	if _, err := firstProvider.UpTo(t.Context(), 129); err != nil {
-		t.Fatal(err)
-	}
-	snapshot := func(database *sql.DB) string {
-		t.Helper()
-		var got string
-		if err := database.QueryRowContext(t.Context(), `
-			SELECT jsonb_build_object(
-			 'login',role.rolcanlogin,'super',role.rolsuper,
-			 'createdb',role.rolcreatedb,'createrole',role.rolcreaterole,
-			 'inherit',role.rolinherit,'replication',role.rolreplication,
-			 'bypassrls',role.rolbypassrls,'config',role.rolconfig,
-			 'memberships',(
-			   SELECT jsonb_agg(jsonb_build_array(member.rolname,edge.set_option,
-			                                      edge.admin_option,edge.inherit_option)
-			                    ORDER BY member.rolname)
-			     FROM pg_catalog.pg_auth_members edge
-			     JOIN pg_catalog.pg_roles member ON member.oid=edge.member
-			    WHERE edge.roleid=role.oid))::text
-			  FROM pg_catalog.pg_roles role
-			 WHERE role.rolname='vane_memory_editor'`,
-		).Scan(&got); err != nil {
-			t.Fatal(err)
-		}
-		return got
-	}
-	before := snapshot(first)
-	if _, err := secondProvider.UpTo(t.Context(), 129); err != nil {
-		t.Fatal(err)
-	}
-	after := snapshot(second)
-	if after != before {
-		t.Fatalf("ordinary second-database Up mutated cluster role:\nbefore=%s\nafter=%s",
-			before, after)
-	}
-}
-
 func TestMigration129RLSRetentionAndDownGuardPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {

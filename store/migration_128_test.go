@@ -289,7 +289,7 @@ func TestMigration128SchemaUpDoesNotChangeClusterRuntimeMembershipPostgres(t *te
 	if databaseURL == "" {
 		t.Skip("DATABASE_URL is required")
 	}
-	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
+	database, provider, _, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
 	if _, err := provider.UpTo(t.Context(), 127); err != nil {
 		t.Fatal(err)
@@ -303,7 +303,8 @@ func TestMigration128SchemaUpDoesNotChangeClusterRuntimeMembershipPostgres(t *te
 		defer cancel()
 		_, _ = database.ExecContext(ctx,
 			`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
-		if err := DeprovisionServerRuntime(ctx, scratchURL); err != nil {
+		if _, err := database.ExecContext(ctx,
+			`SELECT public.deprovision_vane_server_runtime_v128()`); err != nil {
 			t.Errorf("deprovision cross-database runtime fixture: %v", err)
 		}
 	})
@@ -330,11 +331,13 @@ func TestMigration128SchemaUpDoesNotChangeClusterRuntimeMembershipPostgres(t *te
 	// identity shared by other databases in the PostgreSQL cluster.
 	assertRuntimeProjectorMembership(true)
 
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if _, err := database.ExecContext(t.Context(),
+		`SELECT public.provision_vane_server_runtime_v128()`); err != nil {
 		t.Fatal(err)
 	}
 	assertRuntimeProjectorMembership(false)
-	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if _, err := database.ExecContext(t.Context(),
+		`SELECT public.deprovision_vane_server_runtime_v128()`); err != nil {
 		t.Fatal(err)
 	}
 }
