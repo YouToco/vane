@@ -18,17 +18,22 @@ receipt=$3
 }
 
 trusted_uid=$(id -u)
+trusted_gid=$(id -g)
 trusted_file() {
-  local path=$1 mode=$2 actual_uid
+  local path=$1 mode=$2 actual_uid actual_gid
   [[ -f $path && ! -L $path && $(stat -c '%a' "$path") == "$mode" ]] || return 1
   actual_uid=$(stat -c '%u' "$path")
-  [[ $actual_uid == 0 || $actual_uid == "$trusted_uid" ]]
+  actual_gid=$(stat -c '%g' "$path")
+  [[ ($actual_uid == 0 || $actual_uid == "$trusted_uid") &&
+     ($actual_gid == 0 || $actual_gid == "$trusted_gid") ]]
 }
 trusted_directory() {
-  local path=$1 mode=$2 actual_uid
+  local path=$1 mode=$2 actual_uid actual_gid
   [[ -d $path && ! -L $path && $(stat -c '%a' "$path") == "$mode" ]] || return 1
   actual_uid=$(stat -c '%u' "$path")
-  [[ $actual_uid == 0 || $actual_uid == "$trusted_uid" ]]
+  actual_gid=$(stat -c '%g' "$path")
+  [[ ($actual_uid == 0 || $actual_uid == "$trusted_uid") &&
+     ($actual_gid == 0 || $actual_gid == "$trusted_gid") ]]
 }
 
 if [[ -e $release_root || -L $release_root ]]; then
