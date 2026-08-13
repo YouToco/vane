@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +58,19 @@ class RetentionReleasePublisherTest(unittest.TestCase):
         result = self.publish()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.release_dir().is_dir())
+
+    def test_concurrent_publishers_leave_one_release_and_no_pending_dirs(self) -> None:
+        self.collector.write_bytes(b"collector-v1" * (1024 * 1024))
+        self.collector.chmod(0o755)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(lambda _: self.publish(), range(16)))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(Path(result.stdout.strip()), self.release_dir())
+        self.assertEqual(
+            sorted(path.name for path in self.releases.iterdir()),
+            [self.release_dir().name],
+        )
 
     def test_existing_permission_or_content_drift_is_rejected(self) -> None:
         self.assertEqual(self.publish().returncode, 0)

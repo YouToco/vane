@@ -80,13 +80,20 @@ chmod 0755 "$pending"
 install -m 0755 "$collector" "$pending/agentfirstretention"
 install -m 0644 "$receipt" "$pending/release-receipt.json"
 
+won_publication=true
 if ! mv -T -- "$pending" "$release_dir"; then
+  won_publication=false
   validate_release || {
     echo "concurrent versioned collector release differs" >&2
     exit 1
   }
 fi
-pending=
+if [[ $won_publication == true ]]; then
+  pending=
+else
+  rm -rf -- "$pending"
+  pending=
+fi
 trap - EXIT
 validate_release || {
   echo "published versioned collector release is unsafe" >&2
