@@ -41,7 +41,7 @@ func TestReadVerifiedReleaseReceiptBindsCanonicalReceiptAndBinaries(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verified.Receipt != receipt || !validLowerHex(verified.DeployDigest, 32) {
+	if verified.receipt != receipt || !validLowerHex(verified.deployDigest, 32) {
 		t.Fatalf("verified=%+v", verified)
 	}
 

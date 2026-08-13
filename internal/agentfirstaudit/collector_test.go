@@ -3,6 +3,7 @@ package agentfirstaudit
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 
@@ -21,7 +23,7 @@ import (
 func TestCollectBaselineClosesAuditAndAdoptsLostAppendResponse(t *testing.T) {
 	fixture := newBaselineCollectorFixture(t)
 	fixture.database.appendErr = errors.New("response lost")
-	result, err := CollectBaseline(t.Context(), fixture.database, fixture.temporal,
+	result, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
 		fixture.clock, fixture.request)
 	if err != nil {
 		t.Fatal(err)
@@ -38,10 +40,25 @@ func TestCollectBaselineClosesAuditAndAdoptsLostAppendResponse(t *testing.T) {
 	}
 }
 
+func TestCollectBaselineAdoptsAfterCallerCancellation(t *testing.T) {
+	fixture := newBaselineCollectorFixture(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	fixture.database.appendHook = cancel
+	fixture.database.appendErr = errors.New("response lost after commit")
+	result, err := collectBaselineWithClock(ctx, fixture.database, fixture.temporal,
+		fixture.clock, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Event == nil || fixture.database.loadContextErr != nil {
+		t.Fatalf("result=%+v load context=%v", result, fixture.database.loadContextErr)
+	}
+}
+
 func TestCollectBaselineRejectsDatabaseDriftBeforeAppend(t *testing.T) {
 	fixture := newBaselineCollectorFixture(t)
 	fixture.database.driftSecondRead = true
-	if _, err := CollectBaseline(t.Context(), fixture.database, fixture.temporal,
+	if _, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
 		fixture.clock, fixture.request); err == nil {
 		t.Fatal("database drift accepted")
 	}
@@ -56,12 +73,38 @@ func TestCollectBaselineRejectsScheduleParityMismatchBeforeAppend(t *testing.T) 
 	fixture.database.snapshot.Schedules = []store.AgentFirstRetentionSchedule{{
 		ID: "orphan", Status: "active", TargetActionDigest: &digest,
 	}}
-	if _, err := CollectBaseline(t.Context(), fixture.database, fixture.temporal,
+	if _, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
 		fixture.clock, fixture.request); err == nil {
 		t.Fatal("schedule parity mismatch accepted")
 	}
 	if fixture.database.appendCalls != 0 {
 		t.Fatal("schedule mismatch reached append")
+	}
+}
+
+func TestCollectBaselineRejectsUncalibratedEmptyEnabledArchive(t *testing.T) {
+	fixture := newBaselineCollectorFixture(t)
+	fixture.temporal.namespace.Config.HistoryArchivalState = enumspb.ARCHIVAL_STATE_ENABLED
+	fixture.temporal.namespace.Config.VisibilityArchivalState = enumspb.ARCHIVAL_STATE_ENABLED
+	fixture.temporal.namespace.Config.HistoryArchivalUri = "s3://history"
+	fixture.temporal.namespace.Config.VisibilityArchivalUri = "s3://visibility"
+	if _, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
+		fixture.clock, fixture.request); err == nil {
+		t.Fatal("empty enabled archive was treated as calibrated")
+	}
+	if fixture.database.appendCalls != 0 {
+		t.Fatal("uncalibrated archive reached append")
+	}
+}
+
+func TestCollectBaselineRejectsMismatchedCommittedEvent(t *testing.T) {
+	fixture := newBaselineCollectorFixture(t)
+	fixture.database.mutateCommitted = func(event *store.AgentFirstRetentionAttestationEvent) {
+		event.TemporalNamespace = "other"
+	}
+	if _, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
+		fixture.clock, fixture.request); err == nil {
+		t.Fatal("mismatched committed event accepted")
 	}
 }
 
@@ -115,13 +158,29 @@ func newBaselineCollectorFixture(t *testing.T) baselineCollectorFixture {
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	receipt := ReleaseReceipt{
+		SchemaVersion: "vane.release-receipt/v1", SourceRevision: source,
+		ControlPlaneRevision: strings.Repeat("f", 40), DeployRunID: "123456",
+		DeployRunAttempt:            1,
+		BackendArchiveDigest:        strings.Repeat("1", 64),
+		BackendManifestDigest:       strings.Repeat("2", 64),
+		ServerReleaseContractDigest: strings.Repeat("3", 64),
+		VaneDigest:                  strings.Repeat("4", 64),
+		CollectorDigest:             strings.Repeat("5", 64),
+	}
+	canonicalReceipt, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return baselineCollectorFixture{
 		database: database, temporal: temporal, clock: clock,
 		request: BaselineCollectorRequest{
-			Namespace: "vane", SourceRevision: source,
+			Namespace: "vane", TaskQueue: "vane",
+			OperationID:    "123e4567-e89b-42d3-a456-426614174010",
+			SourceRevision: source,
 			Release: VerifiedReleaseReceipt{
-				Receipt:      ReleaseReceipt{SourceRevision: source},
-				DeployDigest: strings.Repeat("e", 64),
+				receipt: receipt, canonical: canonicalReceipt,
+				deployDigest: digestBytes(canonicalReceipt),
 			},
 			EvidenceDirectory: directory,
 		},
@@ -141,7 +200,10 @@ type baselineStoreFake struct {
 	loadCalls       int
 	driftSecondRead bool
 	appendErr       error
+	appendHook      func()
+	loadContextErr  error
 	committed       *store.AgentFirstRetentionAttestationEvent
+	mutateCommitted func(*store.AgentFirstRetentionAttestationEvent)
 }
 
 func (fake *baselineStoreFake) ReadAgentFirstRetentionAuditSnapshot(
@@ -164,9 +226,34 @@ func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
 ) (*store.AgentFirstRetentionAttestationEvent, error) {
 	fake.appendCalls++
 	fake.committed = &store.AgentFirstRetentionAttestationEvent{
-		ID: 1, Phase: input.Phase, TemporalEvidenceDigest: input.TemporalEvidenceDigest,
+		ID: 1, Phase: input.Phase,
+		TemporalClusterID:          input.TemporalClusterID,
+		TemporalNamespace:          input.TemporalNamespace,
+		TemporalNamespaceID:        input.TemporalNamespaceID,
+		RetentionSeconds:           input.RetentionSeconds,
+		HistoryArchivalState:       input.HistoryArchivalState,
+		HistoryArchiveURIDigest:    input.HistoryArchiveURIDigest,
+		VisibilityArchivalState:    input.VisibilityArchivalState,
+		VisibilityArchiveURIDigest: input.VisibilityArchiveURIDigest,
+		TemporalServerWitness:      input.TemporalServerWitness,
+		WorkflowInventoryDigest:    input.WorkflowInventoryDigest,
+		ScheduleInventoryDigest:    input.ScheduleInventoryDigest,
+		ArchiveInventoryDigest:     input.ArchiveInventoryDigest,
+		TemporalEvidenceDigest:     input.TemporalEvidenceDigest,
+		SourceRevision:             input.SourceRevision, DeployDigest: input.DeployDigest,
+		DatabaseIdentity:       []byte(`{"schema_version":"fixture/v1"}`),
 		LegacyDBSnapshot:       bytes.Clone(fake.snapshot.LegacyDBSnapshot),
 		LegacyDBSnapshotDigest: fake.snapshot.LegacyDBSnapshotDigest,
+		CanonicalPayload:       []byte(`{"schema_version":"fixture/v1"}`),
+		PayloadDigest:          strings.Repeat("6", 64),
+		IssuedAt:               time.Date(2026, 8, 13, 18, 0, 1, 0, time.UTC),
+		ExpiresAt:              time.Date(2026, 8, 13, 19, 0, 1, 0, time.UTC),
+	}
+	if fake.mutateCommitted != nil {
+		fake.mutateCommitted(fake.committed)
+	}
+	if fake.appendHook != nil {
+		fake.appendHook()
 	}
 	if fake.appendErr != nil {
 		return nil, fake.appendErr
@@ -175,10 +262,11 @@ func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
 }
 
 func (fake *baselineStoreFake) LoadAgentFirstRetentionAttestation(
-	context.Context,
-	store.AgentFirstRetentionAttestationInput,
+	ctx context.Context,
+	_ store.AgentFirstRetentionAttestationInput,
 ) (*store.AgentFirstRetentionAttestationEvent, error) {
 	fake.loadCalls++
+	fake.loadContextErr = ctx.Err()
 	if fake.committed == nil {
 		return nil, errors.New("absent")
 	}

@@ -14,13 +14,10 @@ import (
 	"syscall"
 	"time"
 
-	enumspb "go.temporal.io/api/enums/v1"
-	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
 	"github.com/YouToco/vane/internal/agentfirstaudit"
 	"github.com/YouToco/vane/store"
-	vaneworkflow "github.com/YouToco/vane/workflow"
 )
 
 const (
@@ -68,7 +65,7 @@ func run(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	if release.Receipt.SourceRevision != sourceRevision {
+	if release.SourceRevision() != sourceRevision {
 		return errors.New("release receipt source differs from collector build")
 	}
 	databaseURL, err := migrationDatabaseURL()
@@ -91,10 +88,10 @@ func run(arguments []string) error {
 		return fmt.Errorf("connect Temporal: %w", err)
 	}
 	defer temporalClient.Close()
-	clockRunner := productionClockRunner(temporalClient, parsed, sourceRevision)
-	result, err := agentfirstaudit.CollectBaseline(ctx, database,
-		temporalClient.WorkflowService(), clockRunner, agentfirstaudit.BaselineCollectorRequest{
-			Namespace: parsed.temporalNamespace, SourceRevision: sourceRevision,
+	result, err := agentfirstaudit.CollectBaseline(ctx, database, temporalClient,
+		agentfirstaudit.BaselineCollectorRequest{
+			Namespace: parsed.temporalNamespace, TaskQueue: parsed.temporalTaskQueue,
+			OperationID: parsed.operationID, SourceRevision: sourceRevision,
 			Release: release, EvidenceDirectory: parsed.evidenceDirectory,
 		})
 	if err != nil {
@@ -148,48 +145,14 @@ func parseOptions(arguments []string) (options, error) {
 	return parsed, nil
 }
 
-func productionClockRunner(
-	temporalClient client.Client,
-	parsed options,
-	sourceRevision string,
-) agentfirstaudit.BaselineClockRunner {
-	return func(ctx context.Context, _ agentfirstaudit.TemporalAuthority) (
-		agentfirstaudit.RetentionClockEvidence, error,
-	) {
-		workflowID := "agent-first-retention-clock-" + parsed.operationID
-		request := vaneworkflow.AgentFirstRetentionClockRequestV1{
-			Nonce: parsed.operationID, SourceRevision: sourceRevision,
-		}
-		run, err := temporalClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-			ID: workflowID, TaskQueue: parsed.temporalTaskQueue,
-			WorkflowExecutionTimeout: 5 * time.Minute,
-			WorkflowTaskTimeout:      time.Minute,
-			WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
-		}, vaneworkflow.AgentFirstRetentionClockWorkflowNameV1, request)
-		if err != nil {
-			var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
-			if !errors.As(err, &alreadyStarted) {
-				return agentfirstaudit.RetentionClockEvidence{}, err
-			}
-			run = temporalClient.GetWorkflow(ctx, workflowID, alreadyStarted.RunId)
-		}
-		var result vaneworkflow.AgentFirstRetentionClockResultV1
-		if err := run.Get(ctx, &result); err != nil {
-			return agentfirstaudit.RetentionClockEvidence{}, err
-		}
-		return agentfirstaudit.ReadRetentionClockEvidence(ctx,
-			temporalClient.WorkflowService(), agentfirstaudit.RetentionClockExpectation{
-				Namespace: parsed.temporalNamespace, WorkflowID: workflowID, RunID: run.GetRunID(),
-				TaskQueue: parsed.temporalTaskQueue, Nonce: parsed.operationID,
-				SourceRevision: sourceRevision, WorkerBuildID: "vane/" + sourceRevision,
-			})
-	}
-}
-
 func migrationDatabaseURL() (string, error) {
 	directory := strings.TrimSpace(os.Getenv(migrationCredentialDirectoryEnv))
 	if !canonicalAbsolute(directory) {
 		return "", errors.New("migration database credential directory is unavailable")
+	}
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil || !safeCredentialAuthority(directoryInfo, true) {
+		return "", errors.New("migration database credential directory authority is unsafe")
 	}
 	root, err := os.OpenRoot(directory)
 	if err != nil {
@@ -197,7 +160,7 @@ func migrationDatabaseURL() (string, error) {
 	}
 	defer root.Close()
 	info, err := root.Lstat(migrationDatabaseCredential)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 ||
+	if err != nil || !safeCredentialAuthority(info, false) ||
 		info.Size() <= 0 || info.Size() > 16<<10 {
 		return "", errors.New("migration database credential authority is unsafe")
 	}
@@ -210,6 +173,15 @@ func migrationDatabaseURL() (string, error) {
 		return "", errors.New("migration database credential is empty")
 	}
 	return value, nil
+}
+
+func safeCredentialAuthority(info os.FileInfo, directory bool) bool {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 ||
+		(directory && !info.IsDir()) || (!directory && !info.Mode().IsRegular()) {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && (stat.Uid == 0 || int(stat.Uid) == os.Geteuid())
 }
 
 func buildSourceRevision() (string, error) {

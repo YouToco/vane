@@ -30,9 +30,17 @@ type ReleaseReceipt struct {
 }
 
 type VerifiedReleaseReceipt struct {
-	Receipt      ReleaseReceipt
-	Canonical    []byte
-	DeployDigest string
+	receipt      ReleaseReceipt
+	canonical    []byte
+	deployDigest string
+}
+
+func (verified VerifiedReleaseReceipt) SourceRevision() string {
+	return verified.receipt.SourceRevision
+}
+
+func (verified VerifiedReleaseReceipt) DeployDigest() string {
+	return verified.deployDigest
 }
 
 func ReadVerifiedReleaseReceipt(
@@ -81,9 +89,24 @@ func ReadVerifiedReleaseReceipt(
 	}
 	sum := sha256.Sum256(payload)
 	return VerifiedReleaseReceipt{
-		Receipt: receipt, Canonical: bytes.Clone(payload),
-		DeployDigest: hex.EncodeToString(sum[:]),
+		receipt: receipt, canonical: bytes.Clone(payload),
+		deployDigest: hex.EncodeToString(sum[:]),
 	}, nil
+}
+
+func (verified VerifiedReleaseReceipt) validate() error {
+	if len(verified.canonical) == 0 || verified.receipt.SourceRevision == "" {
+		return fmt.Errorf("verified release receipt is absent")
+	}
+	canonical, err := json.Marshal(verified.receipt)
+	if err != nil || !bytes.Equal(canonical, verified.canonical) {
+		return fmt.Errorf("verified release receipt canonical bytes differ")
+	}
+	sum := sha256.Sum256(canonical)
+	if hex.EncodeToString(sum[:]) != verified.deployDigest {
+		return fmt.Errorf("verified release receipt digest differs")
+	}
+	return nil
 }
 
 func canonicalUnsignedDecimal(value string) bool {

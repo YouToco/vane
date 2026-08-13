@@ -49,6 +49,15 @@ func TestMigrationDatabaseURLUsesOnlyCredentialDirectory(t *testing.T) {
 	if _, err := migrationDatabaseURL(); err == nil {
 		t.Fatal("unsafe credential mode accepted")
 	}
+	if err := os.Chmod(filepath.Join(directory, migrationDatabaseCredential), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrationDatabaseURL(); err == nil {
+		t.Fatal("unsafe credential directory mode accepted")
+	}
 }
 
 func TestCanonicalUUIDRejectsNonCanonicalOrWrongVariant(t *testing.T) {
