@@ -44,6 +44,29 @@ func TestFinalizeRunStatusRecordsFailure(t *testing.T) {
 	}
 }
 
+func TestStoreShardCommandSerializesTestsWithinOneDatabase(t *testing.T) {
+	args := storeShardCommandArgs(
+		"/tmp/store.test", "^(TestA|TestB)$", 40*time.Minute,
+		"/tmp/store.coverage.out",
+	)
+	if got := countExact(args, "-test.parallel=1"); got != 1 {
+		t.Fatalf("parallel serialization args=%q count=%d", args, got)
+	}
+	if got := countExact(args, "-test.count=1"); got != 1 {
+		t.Fatalf("single-run args=%q count=%d", args, got)
+	}
+}
+
+func countExact(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
+}
+
 func TestResolveRepoRelativeFileRejectsAbsoluteAndParentPaths(t *testing.T) {
 	repo := t.TempDir()
 	timingDir := filepath.Join(repo, "timings")
