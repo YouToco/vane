@@ -85,7 +85,8 @@ CREATE TABLE agent_first_retention_attestation_events (
         canonical_payload=
             convert_to((convert_from(canonical_payload,'UTF8')::jsonb)::text,'UTF8')),
     CONSTRAINT ck_agent_first_retention_time CHECK (
-        expires_at>issued_at),
+        isfinite(temporal_server_witness) AND isfinite(issued_at) AND
+        isfinite(expires_at) AND expires_at>issued_at),
     CONSTRAINT uq_agent_first_retention_payload UNIQUE (payload_digest),
     CONSTRAINT fk_agent_first_retention_parent FOREIGN KEY (parent_digest)
         REFERENCES agent_first_retention_attestation_events (payload_digest)
@@ -120,26 +121,16 @@ WITH creation_operations AS (
                             NOT EXISTS (
                               SELECT 1 FROM public.task_creation_receipts receipt
                                WHERE receipt.operation_id=operation.id)) AS receipt_gap_count
-      ,encode(sha256(convert_to(COALESCE(jsonb_agg(jsonb_build_object(
-          'attempt',attempt,'fence',fence,'id',id,'lease_owner',lease_owner,
-          'lease_until',lease_until,'phase',phase,'status',status,'task_id',task_id,
-          'takeover_not_before',takeover_not_before,'tenant_id',tenant_id,
-          'tombstoned_at',tombstoned_at,'updated_at',updated_at,'user_id',user_id)
+      ,encode(sha256(convert_to(COALESCE(jsonb_agg(to_jsonb(operation)
           ORDER BY tenant_id,user_id,id)::text,'[]'),'UTF8')),'hex') AS operation_digest
       FROM public.task_creation_operations operation
      WHERE execution_version=1 AND tool_name='create_schedule'
 ), creation_receipts AS (
     SELECT count(*) AS receipt_count,
            count(*) FILTER (WHERE status='pending') AS pending_receipt_count,
-           encode(sha256(convert_to(COALESCE(jsonb_agg(jsonb_build_object(
-             'ambiguous_since',ambiguous_since,'attempt',attempt,
-             'blocked_at',blocked_at,'failure_class',failure_class,'fence',fence,
-             'id',id,'lease_owner',lease_owner,'lease_until',lease_until,
-             'next_attempt_at',next_attempt_at,'operation_id',operation_id,
-             'payload_digest',payload_digest,'provider_message_id',provider_message_id,
-             'sent_at',sent_at,'session_messages_digest',session_messages_digest,
-             'status',status,'takeover_not_before',takeover_not_before,
-             'tenant_id',tenant_id,'updated_at',updated_at,'user_id',user_id)
+           count(*) FILTER (WHERE lease_owner<>'' OR lease_until IS NOT NULL OR
+                                  takeover_not_before IS NOT NULL) AS receipt_lease_count,
+           encode(sha256(convert_to(COALESCE(jsonb_agg(to_jsonb(receipt)
              ORDER BY tenant_id,user_id,operation_id,id)::text,'[]'),'UTF8')),'hex')
              AS receipt_digest
       FROM public.task_creation_receipts receipt
@@ -157,27 +148,16 @@ WITH creation_operations AS (
                             NOT EXISTS (
                               SELECT 1 FROM public.task_definition_edit_receipts receipt
                                WHERE receipt.operation_id=operation.id)) AS receipt_gap_count
-      ,encode(sha256(convert_to(COALESCE(jsonb_agg(jsonb_build_object(
-          'attempt',attempt,'fence',fence,'id',id,'lease_owner',lease_owner,
-          'lease_until',lease_until,'phase',phase,'status',status,'task_id',task_id,
-          'takeover_not_before',takeover_not_before,'target_tenant_id',target_tenant_id,
-          'target_user_id',target_user_id,'tenant_id',tenant_id,
-          'tombstoned_at',tombstoned_at,'updated_at',updated_at,'user_id',user_id)
+      ,encode(sha256(convert_to(COALESCE(jsonb_agg(to_jsonb(operation)
           ORDER BY tenant_id,user_id,id)::text,'[]'),'UTF8')),'hex') AS operation_digest
       FROM public.task_definition_edit_operations operation
      WHERE operation_protocol=1
 ), edit_receipts AS (
     SELECT count(*) AS receipt_count,
            count(*) FILTER (WHERE status='pending') AS pending_receipt_count,
-           encode(sha256(convert_to(COALESCE(jsonb_agg(jsonb_build_object(
-             'ambiguous_since',ambiguous_since,'attempt',attempt,
-             'blocked_at',blocked_at,'failure_class',failure_class,'fence',fence,
-             'id',id,'lease_owner',lease_owner,'lease_until',lease_until,
-             'next_attempt_at',next_attempt_at,'operation_id',operation_id,
-             'payload_digest',payload_digest,'provider_message_id',provider_message_id,
-             'sent_at',sent_at,'session_messages_digest',session_messages_digest,
-             'status',status,'takeover_not_before',takeover_not_before,
-             'tenant_id',tenant_id,'updated_at',updated_at,'user_id',user_id)
+           count(*) FILTER (WHERE lease_owner<>'' OR lease_until IS NOT NULL OR
+                                  takeover_not_before IS NOT NULL) AS receipt_lease_count,
+           encode(sha256(convert_to(COALESCE(jsonb_agg(to_jsonb(receipt)
              ORDER BY tenant_id,user_id,operation_id,id)::text,'[]'),'UTF8')),'hex')
              AS receipt_digest
       FROM public.task_definition_edit_receipts receipt
@@ -220,6 +200,7 @@ SELECT convert_to(jsonb_build_object(
        'pending_receipt_count',creation_receipts.pending_receipt_count,
        'receipt_count',creation_receipts.receipt_count,
        'receipt_digest',creation_receipts.receipt_digest,
+       'receipt_lease_count',creation_receipts.receipt_lease_count,
        'receipt_gap_count',creation_operations.receipt_gap_count),
     'protocol1_definition_edit',jsonb_build_object(
        'active_count',edit_operations.active_count,
@@ -229,6 +210,7 @@ SELECT convert_to(jsonb_build_object(
        'pending_receipt_count',edit_receipts.pending_receipt_count,
        'receipt_count',edit_receipts.receipt_count,
        'receipt_digest',edit_receipts.receipt_digest,
+       'receipt_lease_count',edit_receipts.receipt_lease_count,
        'receipt_gap_count',edit_operations.receipt_gap_count),
     'schedule_inventory',jsonb_build_object(
        'digest',schedule_inventory.digest,'item_count',schedule_inventory.item_count),
@@ -289,7 +271,7 @@ CREATE FUNCTION append_agent_first_retention_attestation_v130(
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE
-    database_now TIMESTAMPTZ:=clock_timestamp();
+    database_now TIMESTAMPTZ;
     database_system_identifier TEXT;
     database_name TEXT:=current_database();
     database_oid_value OID;
@@ -318,6 +300,7 @@ BEGIN
          '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' OR
        requested_retention_seconds NOT BETWEEN 1 AND 315360000 OR
        requested_temporal_server_witness IS NULL OR
+       NOT isfinite(requested_temporal_server_witness) OR
        requested_source_revision !~ '^[0-9a-f]{40}$' OR
        requested_deploy_digest !~ '^[0-9a-f]{64}$' OR
        requested_workflow_inventory_digest !~ '^[0-9a-f]{64}$' OR
@@ -343,6 +326,7 @@ BEGIN
     END IF;
 
     PERFORM pg_advisory_xact_lock(6215335020355474130);
+    database_now:=clock_timestamp();
     SELECT system_identifier::text INTO database_system_identifier
       FROM pg_control_system();
     SELECT oid INTO database_oid_value FROM pg_database WHERE datname=database_name;
@@ -355,12 +339,23 @@ BEGIN
     snapshot_payload:=public.agent_first_legacy_db_snapshot_v130();
     snapshot_digest:=encode(sha256(snapshot_payload),'hex');
 
+    -- Temporal supplies this witness from its own server clock. Bind every
+    -- observation to this database append, allowing only bounded transport and
+    -- clock skew rather than accepting fabricated future/past timestamps.
+    IF requested_temporal_server_witness<database_now-interval '10 minutes' OR
+       requested_temporal_server_witness>database_now+interval '5 seconds' THEN
+        RAISE EXCEPTION '130: Temporal server witness is outside DB clock skew'
+            USING ERRCODE='22008';
+    END IF;
+
     IF COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{legacy_creation,active_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{legacy_creation,lease_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{legacy_creation,pending_receipt_count}')::bigint,-1)<>0 OR
+       COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
+          '{legacy_creation,receipt_lease_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{legacy_creation,receipt_gap_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
@@ -369,6 +364,8 @@ BEGIN
           '{protocol1_definition_edit,lease_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{protocol1_definition_edit,pending_receipt_count}')::bigint,-1)<>0 OR
+       COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
+          '{protocol1_definition_edit,receipt_lease_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{protocol1_definition_edit,receipt_gap_count}')::bigint,-1)<>0 THEN
         RAISE EXCEPTION '130: legacy database snapshot is not quiescent'
@@ -409,6 +406,7 @@ BEGIN
                 USING ERRCODE='23514';
         END IF;
         IF parent_event.phase<>'baseline' OR
+           parent_event.expires_at<=database_now OR
            parent_event.database_identity<>database_identity_value OR
            requested_temporal_server_witness <
              parent_event.temporal_server_witness+
@@ -437,6 +435,13 @@ BEGIN
                 USING ERRCODE='23514';
         END IF;
         expires:=database_now+interval '10 minutes';
+    END IF;
+
+    IF expires<=clock_timestamp() OR
+       (requested_phase='prepared' AND
+        parent_event.expires_at<=clock_timestamp()) THEN
+        RAISE EXCEPTION '130: attestation evidence expired before append'
+            USING ERRCODE='22008';
     END IF;
 
     payload:=convert_to(jsonb_build_object(

@@ -143,6 +143,7 @@ type agentFirstLegacyLaneSnapshotV130 struct {
 	PendingReceiptCount int64  `json:"pending_receipt_count"`
 	ReceiptCount        int64  `json:"receipt_count"`
 	ReceiptDigest       string `json:"receipt_digest"`
+	ReceiptLeaseCount   int64  `json:"receipt_lease_count"`
 	ReceiptGapCount     int64  `json:"receipt_gap_count"`
 }
 
@@ -243,7 +244,8 @@ func validateAgentFirstRetentionInput(in AgentFirstRetentionAttestationInput) er
 		!validBoundedAgentFirstText(in.TemporalNamespace, maxAgentFirstNamespaceBytes) ||
 		!agentFirstNamespaceIDPattern.MatchString(in.TemporalNamespaceID) ||
 		in.RetentionSeconds < 1 || in.RetentionSeconds > maxAgentFirstRetentionSeconds ||
-		in.TemporalServerWitness.IsZero() {
+		in.TemporalServerWitness.IsZero() ||
+		in.TemporalServerWitness.Year() < 1 || in.TemporalServerWitness.Year() > 9999 {
 		return fmt.Errorf("store: Agent-first Temporal identity is invalid")
 	}
 	if in.HistoryArchivalState != in.VisibilityArchivalState ||
@@ -308,7 +310,8 @@ func validateAgentFirstRetentionEvent(event *AgentFirstRetentionAttestationEvent
 		!agentFirstDigestPattern.MatchString(snapshot.AuthorityInventory.Digest) ||
 		snapshot.LegacyCreation.ActiveCount < 0 || snapshot.LegacyCreation.LeaseCount < 0 ||
 		snapshot.LegacyCreation.OperationCount < 0 || snapshot.LegacyCreation.PendingReceiptCount < 0 ||
-		snapshot.LegacyCreation.ReceiptCount < 0 || snapshot.LegacyCreation.ReceiptGapCount < 0 ||
+		snapshot.LegacyCreation.ReceiptCount < 0 || snapshot.LegacyCreation.ReceiptLeaseCount < 0 ||
+		snapshot.LegacyCreation.ReceiptGapCount < 0 ||
 		!agentFirstDigestPattern.MatchString(snapshot.LegacyCreation.OperationDigest) ||
 		!agentFirstDigestPattern.MatchString(snapshot.LegacyCreation.ReceiptDigest) ||
 		snapshot.Protocol1DefinitionEdit.ActiveCount < 0 ||
@@ -316,10 +319,15 @@ func validateAgentFirstRetentionEvent(event *AgentFirstRetentionAttestationEvent
 		snapshot.Protocol1DefinitionEdit.OperationCount < 0 ||
 		snapshot.Protocol1DefinitionEdit.PendingReceiptCount < 0 ||
 		snapshot.Protocol1DefinitionEdit.ReceiptCount < 0 ||
+		snapshot.Protocol1DefinitionEdit.ReceiptLeaseCount < 0 ||
 		snapshot.Protocol1DefinitionEdit.ReceiptGapCount < 0 ||
 		!agentFirstDigestPattern.MatchString(snapshot.Protocol1DefinitionEdit.OperationDigest) ||
 		!agentFirstDigestPattern.MatchString(snapshot.Protocol1DefinitionEdit.ReceiptDigest) {
 		return fmt.Errorf("store: Agent-first legacy DB snapshot fields are invalid")
+	}
+	if !agentFirstLegacyLaneQuiescent(snapshot.LegacyCreation) ||
+		!agentFirstLegacyLaneQuiescent(snapshot.Protocol1DefinitionEdit) {
+		return fmt.Errorf("store: Agent-first legacy DB snapshot is not quiescent")
 	}
 	var payload agentFirstRetentionPayloadV130
 	if err := strictjson.DecodeExact(event.CanonicalPayload, &payload); err != nil {
@@ -368,4 +376,10 @@ func sameAgentFirstParent(left, right *string) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+func agentFirstLegacyLaneQuiescent(lane agentFirstLegacyLaneSnapshotV130) bool {
+	return lane.ActiveCount == 0 && lane.LeaseCount == 0 &&
+		lane.ReceiptLeaseCount == 0 && lane.PendingReceiptCount == 0 &&
+		lane.ReceiptGapCount == 0
 }

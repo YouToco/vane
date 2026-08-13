@@ -26,6 +26,11 @@ func TestMigration130IsEvidenceOnlyAndOwnerAppendOnly(t *testing.T) {
 		"only the direct schema owner may append attestation",
 		"prepared evidence has not crossed full retention",
 		"prepared evidence does not cite latest baseline",
+		"NOT isfinite(requested_temporal_server_witness)",
+		"requested_temporal_server_witness<database_now-interval '10 minutes'",
+		"parent_event.expires_at<=database_now",
+		"database_now:=clock_timestamp()",
+		"attestation evidence expired before append",
 		"CREATE TRIGGER agent_first_retention_history_immutable_v130",
 		"BEFORE UPDATE OR DELETE",
 		"BEFORE TRUNCATE",
@@ -144,6 +149,20 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 	_ = tx.Rollback()
 
 	witness := time.Now().UTC().Truncate(time.Microsecond)
+	future := agentFirstRetentionTestInput(
+		AgentFirstRetentionPhaseBaseline, "", witness.Add(time.Minute))
+	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), future); err == nil ||
+		!strings.Contains(err.Error(), "outside DB clock skew") {
+		t.Fatalf("baseline accepted future Temporal witness: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `SELECT * FROM
+		append_agent_first_retention_attestation_v130(
+		'baseline',NULL,'cluster','default','123e4567-e89b-42d3-a456-426614174000',
+		1,'disabled',$1,'disabled',$1,'infinity'::timestamptz,
+		repeat('a',64),repeat('b',64),repeat('c',64),repeat('d',64),
+		repeat('e',40),repeat('f',64))`, agentFirstEmptyDigest); err == nil {
+		t.Fatal("baseline accepted infinite Temporal witness")
+	}
 	firstBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(),
 		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", witness))
 	if err != nil {
@@ -151,7 +170,7 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 	}
 	if firstBaseline.Phase != AgentFirstRetentionPhaseBaseline ||
 		firstBaseline.ParentDigest != nil ||
-		firstBaseline.ExpiresAt.Sub(firstBaseline.IssuedAt) != 60*time.Second+10*time.Minute {
+		firstBaseline.ExpiresAt.Sub(firstBaseline.IssuedAt) != time.Second+10*time.Minute {
 		t.Fatalf("baseline evidence=%+v", firstBaseline)
 	}
 	if !strings.Contains(string(firstBaseline.CanonicalPayload),
@@ -160,24 +179,31 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 	}
 
 	secondBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(),
-		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", witness.Add(time.Second)))
+		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", time.Now().UTC()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	stalePrepared := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
-		firstBaseline.PayloadDigest, witness.Add(61*time.Second))
-	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), stalePrepared); err == nil ||
-		!strings.Contains(err.Error(), "latest baseline") {
-		t.Fatalf("prepared accepted stale baseline: %v", err)
-	}
 	tooEarly := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
-		secondBaseline.PayloadDigest, secondBaseline.TemporalServerWitness.Add(59*time.Second))
+		secondBaseline.PayloadDigest, time.Now().UTC())
 	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), tooEarly); err == nil ||
 		!strings.Contains(err.Error(), "full retention") {
 		t.Fatalf("prepared accepted short retention: %v", err)
 	}
+	futurePrepared := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
+		secondBaseline.PayloadDigest, time.Now().UTC().Add(time.Minute))
+	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), futurePrepared); err == nil ||
+		!strings.Contains(err.Error(), "outside DB clock skew") {
+		t.Fatalf("prepared accepted future Temporal witness: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	stalePrepared := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
+		firstBaseline.PayloadDigest, time.Now().UTC())
+	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), stalePrepared); err == nil ||
+		!strings.Contains(err.Error(), "latest baseline") {
+		t.Fatalf("prepared accepted stale baseline: %v", err)
+	}
 	preparedInput := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
-		secondBaseline.PayloadDigest, secondBaseline.TemporalServerWitness.Add(60*time.Second))
+		secondBaseline.PayloadDigest, time.Now().UTC())
 	prepared, err := st.AppendAgentFirstRetentionAttestation(t.Context(), preparedInput)
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +218,7 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		t.Fatal("prepared accepted a different source deployment")
 	}
 	changedBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(),
-		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", witness.Add(3*time.Minute)))
+		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", time.Now().UTC()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,11 +244,27 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		t.Fatal(err)
 	}
 	changedPrepared := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
-		changedBaseline.PayloadDigest,
-		changedBaseline.TemporalServerWitness.Add(60*time.Second))
+		changedBaseline.PayloadDigest, time.Now().UTC())
+	time.Sleep(1100 * time.Millisecond)
+	changedPrepared.TemporalServerWitness = time.Now().UTC()
 	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), changedPrepared); err == nil ||
 		!strings.Contains(err.Error(), "lane snapshot changed") {
 		t.Fatalf("prepared accepted changed legacy history: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		UPDATE task_creation_receipts
+		   SET lease_owner='retained-terminal-lease',
+		       lease_until=clock_timestamp()+interval '1 minute',
+		       takeover_not_before=clock_timestamp()+interval '2 minutes'
+		 WHERE operation_id='migration-130-terminal'`); err != nil {
+		t.Fatal(err)
+	}
+	leasedReceiptBaseline := agentFirstRetentionTestInput(
+		AgentFirstRetentionPhaseBaseline, "", time.Now().UTC())
+	if _, err := st.AppendAgentFirstRetentionAttestation(
+		t.Context(), leasedReceiptBaseline); err == nil ||
+		!strings.Contains(err.Error(), "not quiescent") {
+		t.Fatalf("baseline accepted terminal receipt lease: %v", err)
 	}
 	if _, err := database.ExecContext(t.Context(), `
 		INSERT INTO task_creation_operations(
@@ -234,7 +276,7 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		t.Fatal(err)
 	}
 	liveBaseline := agentFirstRetentionTestInput(
-		AgentFirstRetentionPhaseBaseline, "", witness.Add(2*time.Minute))
+		AgentFirstRetentionPhaseBaseline, "", time.Now().UTC())
 	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), liveBaseline); err == nil ||
 		!strings.Contains(err.Error(), "not quiescent") {
 		t.Fatalf("baseline accepted live legacy root: %v", err)
@@ -288,7 +330,7 @@ func agentFirstRetentionTestInput(
 		Phase: phase, ParentDigest: parent,
 		TemporalClusterID: "temporal-cluster-1", TemporalNamespace: "default",
 		TemporalNamespaceID: "123e4567-e89b-42d3-a456-426614174000",
-		RetentionSeconds:    60, HistoryArchivalState: AgentFirstArchivalDisabled,
+		RetentionSeconds:    1, HistoryArchivalState: AgentFirstArchivalDisabled,
 		VisibilityArchivalState:    AgentFirstArchivalDisabled,
 		HistoryArchiveURIDigest:    agentFirstEmptyDigest,
 		VisibilityArchiveURIDigest: agentFirstEmptyDigest,
