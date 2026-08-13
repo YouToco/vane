@@ -78,6 +78,9 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		!strings.Contains(got.Model.GroundingVerifier.SystemPrompt, "history_through_utc") ||
 		!strings.Contains(got.Model.GroundingVerifier.SystemPrompt, "抓取时间不能代替事件时间") ||
 		!strings.Contains(got.Model.GroundingVerifier.SystemPrompt, "不得额外要求量化门槛") ||
+		!strings.Contains(got.Model.GroundingVerifier.SystemPrompt, "响应第一个字节必须是 {") ||
+		!strings.Contains(got.Model.GroundingVerifier.SystemPrompt, "最后一个字节必须是 }") ||
+		!strings.Contains(got.Model.GroundingVerifier.SystemPrompt, "严禁 Markdown、```、json 代码围栏") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "Sonnet 就不得写成 Opus") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "不得复用此前答案") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "比较性陈述") ||
