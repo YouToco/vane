@@ -54,14 +54,15 @@ func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testin
 		got.Model.GroundingVerifier.RendererVersion !=
 			runtimepolicy.ResearchGroundingVerifierRendererVersionV12 ||
 		got.Model.Planner.SystemPrompt !=
-			runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2 ||
+			runtimepolicy.ResearchPlannerSystemPromptV33MultiEntityWindowV3 ||
 		!got.Model.Planner.DisableThinking || !got.Model.Synthesis.DisableThinking ||
 		!got.Model.GroundingVerifier.DisableThinking ||
 		!strings.Contains(got.Model.Planner.SystemPrompt, "query (1..144 UTF-8 bytes)") ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "next output must be action=final") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "With loaded_tools output final steps") ||
 		!strings.Contains(got.Model.Planner.SystemPrompt, "never search again") ||
 		!strings.Contains(got.Model.Planner.SystemPrompt, "official structured tool") ||
-		!strings.Contains(got.Model.Planner.SystemPrompt, "two evidence paths") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "one subject-specific official-source query step per subject") ||
+		!strings.Contains(got.Model.Planner.SystemPrompt, "broad combined queries do not count") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "tool_failures") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "vane.research-brief/v3.1") ||
 		!strings.Contains(got.Model.Synthesis.SystemPrompt, "vane.research-brief/v3.2") ||

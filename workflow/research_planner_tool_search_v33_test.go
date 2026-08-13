@@ -107,6 +107,7 @@ func TestResearchPlannerToolSearchV33ForcesFinalAfterLoadedTools(t *testing.T) {
 		"retained-final-only": runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly,
 		"compact-loaded":      runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools,
 		"compact-loaded-v2":   runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2,
+		"multi-entity-v3":     runtimepolicy.ResearchPlannerSystemPromptV33MultiEntityWindowV3,
 	} {
 		t.Run(name, func(t *testing.T) {
 			snapshot, seal := plannerToolSearchSealV33(t)
@@ -314,6 +315,7 @@ func TestBuildResearchPlannerPromptV33RetainsVersionedSchemaProjection(t *testin
 		"retained-final-only": {runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly, 1, 512},
 		"compact-loaded":      {runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools, 0, 512},
 		"compact-loaded-v2":   {runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2, 0, 144},
+		"multi-entity-v3":     {runtimepolicy.ResearchPlannerSystemPromptV33MultiEntityWindowV3, 0, 144},
 	} {
 		t.Run(name, func(t *testing.T) {
 			versionedSeal := seal
