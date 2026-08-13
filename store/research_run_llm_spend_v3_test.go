@@ -24,13 +24,16 @@ func ensureResearchLLMPriceV3(t *testing.T, st *Store) {
 	if exists {
 		return
 	}
+	// Keep the synthetic rule active even when a virtualized CI clock steps
+	// backwards between fixture setup and the admission transaction. Production
+	// prices remain versioned by their real effective timestamps.
 	if _, err := st.pool.Exec(t.Context(),
 		`INSERT INTO provider_price_rules (
 		     provider,resource,meter,currency,input_cache_hit_per_million,
 		     input_cache_miss_per_million,output_per_million,effective_from,
 		     source_url,note,created_by,change_id,request_hash
 		 ) VALUES ('deepseek','strong-model','llm_tokens','USD',0.1,1.0,2.0,
-		           clock_timestamp(),'https://example.test/pricing',
+		           TIMESTAMPTZ '2000-01-01 00:00:00+00','https://example.test/pricing',
 		           'V3 research model spend test',NULL,$1,$2)`,
 		"research-llm-v3-test-"+uuid.NewString(),
 		"research-llm-v3-test-"+uuid.NewString()); err != nil {
