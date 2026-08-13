@@ -194,6 +194,16 @@ func TestManageMemoryDeniedOrInvalidHasNoWrite(t *testing.T) {
 	if authorizer.calls != 1 {
 		t.Fatal("credential or structurally invalid request reached authorizer")
 	}
+	secretCtx, _ := memoryToolContext(
+		"请记住这个 token: 1234567890abcdef，但只保存轮换策略",
+	)
+	result, err = denied.Execute(secretCtx, 42, json.RawMessage(
+		`{"action":"remember","text":"令牌需要按季度轮换"}`,
+	))
+	if err != nil || !strings.Contains(result, "不能保存") || authorizer.calls != 1 {
+		t.Fatalf("credential-bearing owner request result=%q err=%v auth=%d",
+			result, err, authorizer.calls)
+	}
 }
 
 func TestMemoryPoliciesStayOwnerOnlyAndRecallIsNotStableHistory(t *testing.T) {

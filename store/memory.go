@@ -401,6 +401,10 @@ func validateMemoryAction(
 		return action, "", memoryValidationError(
 			"长期记忆缺少当前用户原话或授权摘要")
 	}
+	if credentialguard.ContainsCredential(action.Evidence.OwnerRequest) {
+		return action, "", memoryValidationError(
+			"长期记忆授权原话包含认证凭证")
+	}
 	parsed, err := uuid.Parse(action.Evidence.SourceID)
 	if err != nil || parsed.String() != action.Evidence.SourceID {
 		return action, "", memoryValidationError("长期记忆证据 ID 必须是规范 UUID")

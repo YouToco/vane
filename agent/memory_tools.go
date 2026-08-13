@@ -206,7 +206,8 @@ func (t *manageMemoryTool) Execute(
 	if err := validateManageMemoryArgs(args); err != nil {
 		return "manage_memory 请求被拒绝：" + err.Error(), nil
 	}
-	if credentialguard.ContainsCredential(args.Text) {
+	if credentialguard.ContainsCredential(args.Text) ||
+		credentialguard.ContainsCredential(stateOwnerRequest(runStateFrom(ctx))) {
 		return "manage_memory 请求被拒绝：长期记忆不能保存密码、密钥、令牌或其他凭证。", nil
 	}
 	meta, ok := ctx.Value(chatMetaKey{}).(chatMeta)

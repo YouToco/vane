@@ -106,6 +106,10 @@ func TestValidateMemoryBoundsAndExplicitAuthority(t *testing.T) {
 			a.Text = "password: correct-horse-battery"
 			return validKey
 		},
+		"credential in owner request": func(a *types.MemoryAction) string {
+			a.Evidence.OwnerRequest = "token: 1234567890abcdef"
+			return validKey
+		},
 		"bad key": func(_ *types.MemoryAction) string { return "A" + validKey[1:] },
 	} {
 		t.Run(name, func(t *testing.T) {
