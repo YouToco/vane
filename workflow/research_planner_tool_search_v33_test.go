@@ -206,6 +206,19 @@ func TestResearchPlannerToolSearchV33ProductionRecoveryFitsRetainedTokenBudget(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The planner searches for capabilities, but production models can include
+	// the research subjects in that query. Keep the generic real-time search
+	// discoverable for the exact formal-B shape; otherwise the English query
+	// only matches the unrelated Kimi product-status adapter and the scoped run
+	// reaches synthesis with zero eligible evidence.
+	formalBQuery := "OpenAI Anthropic Google DeepMind foundation model API agent major update official announcement past week"
+	formalBMatches, err := catalog.Search(formalBQuery, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(formalBMatches) == 0 || formalBMatches[0].Entry.Name != "web_search" {
+		t.Fatalf("formal B query matches=%#v, want web_search first", formalBMatches)
+	}
 	productionQuery := "official structured tool to read first-party purchase status of Kimi membership pricing page https://www.kimi.com/membership/pricing"
 	productionQuery += strings.Repeat(" x", 6)
 	if len(productionQuery) != 144 {
