@@ -314,6 +314,18 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(t.Context(), `
+		UPDATE task_creation_operations
+		   SET lease_owner='retained-terminal-owner'
+		 WHERE id='migration-130-terminal'`); err != nil {
+		t.Fatal(err)
+	}
+	terminalOwnerBaseline := agentFirstRetentionTestInput(
+		AgentFirstRetentionPhaseBaseline, "", time.Now().UTC())
+	if _, err := st.AppendAgentFirstRetentionAttestation(
+		t.Context(), terminalOwnerBaseline); err != nil {
+		t.Fatalf("baseline rejected a terminal replay owner without live lease: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
 		INSERT INTO task_creation_operations(
 		 id,tenant_id,user_id,tool_name,args,summary,status,expires_at,
 		 execution_version,phase)

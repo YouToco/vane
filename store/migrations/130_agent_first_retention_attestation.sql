@@ -116,19 +116,26 @@ WITH creation_operations AS (
       count(*) AS operation_count,
       count(*) FILTER (WHERE status IN ('pending','executing')) AS active_count,
       count(*) FILTER (WHERE NOT (
-        (status='pending' AND phase='' AND tombstoned_at IS NULL) OR
+        (status='pending' AND phase='' AND tombstoned_at IS NULL AND
+         lease_owner='' AND lease_until IS NULL AND takeover_not_before IS NULL) OR
         (status='executing' AND phase IN (
           'claimed','command_sealed','translation_started','definition_compiled',
           'schedule_prepared','schedule_ensured','definition_committed',
           'activation_started','activated','cleanup_pending') AND
-         tombstoned_at IS NULL) OR
-        (status='executed' AND phase='completed' AND tombstoned_at IS NOT NULL) OR
-        (status='cancelled' AND phase='cancelled' AND tombstoned_at IS NOT NULL) OR
-        (status='expired' AND phase='expired' AND tombstoned_at IS NOT NULL) OR
-        (status='blocked' AND phase='blocked' AND tombstoned_at IS NOT NULL) OR
-        (status='failed' AND phase='failed' AND tombstoned_at IS NOT NULL)
+         tombstoned_at IS NULL AND lease_owner<>'' AND
+         lease_until IS NOT NULL AND takeover_not_before IS NOT NULL) OR
+        (status='executed' AND phase='completed' AND tombstoned_at IS NOT NULL AND
+         lease_until IS NULL AND takeover_not_before IS NULL) OR
+        (status='cancelled' AND phase='cancelled' AND tombstoned_at IS NOT NULL AND
+         lease_until IS NULL AND takeover_not_before IS NULL) OR
+        (status='expired' AND phase='expired' AND tombstoned_at IS NOT NULL AND
+         lease_until IS NULL AND takeover_not_before IS NULL) OR
+        (status='blocked' AND phase='blocked' AND tombstoned_at IS NOT NULL AND
+         lease_until IS NULL AND takeover_not_before IS NULL) OR
+        (status='failed' AND phase='failed' AND tombstoned_at IS NOT NULL AND
+         lease_until IS NULL AND takeover_not_before IS NULL)
       )) AS invalid_state_count,
-      count(*) FILTER (WHERE lease_owner<>'' OR lease_until IS NOT NULL OR
+      count(*) FILTER (WHERE lease_until IS NOT NULL OR
                             takeover_not_before IS NOT NULL) AS lease_count,
       count(*) FILTER (WHERE status NOT IN ('pending','executing') AND
                             NOT EXISTS (
@@ -161,10 +168,16 @@ WITH creation_operations AS (
         phase NOT IN ('','proposal_sealed','db_quiesced','temporal_base_paused',
                       'definition_committed','temporal_target_applied',
                       'temporal_target_restored') OR
-        (status IN ('pending','executing') AND tombstoned_at IS NOT NULL) OR
-        (status NOT IN ('pending','executing') AND tombstoned_at IS NULL)
+        (status='pending' AND (phase<>'' OR tombstoned_at IS NOT NULL OR
+          lease_owner<>'' OR lease_until IS NOT NULL OR
+          takeover_not_before IS NOT NULL)) OR
+        (status='executing' AND (phase='' OR tombstoned_at IS NOT NULL OR
+          lease_owner='' OR lease_until IS NULL OR takeover_not_before IS NULL)) OR
+        (status NOT IN ('pending','executing') AND
+          (tombstoned_at IS NULL OR lease_owner<>'' OR lease_until IS NOT NULL OR
+           takeover_not_before IS NOT NULL))
       ) AS invalid_state_count,
-      count(*) FILTER (WHERE lease_owner<>'' OR lease_until IS NOT NULL OR
+      count(*) FILTER (WHERE lease_until IS NOT NULL OR
                             takeover_not_before IS NOT NULL) AS lease_count,
       count(*) FILTER (WHERE status NOT IN ('pending','executing') AND
                             NOT EXISTS (
