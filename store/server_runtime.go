@@ -29,6 +29,7 @@ var serverRuntimeCapabilityRoles = []string{
 	"vane_edit_coordinator",
 	"vane_edit_receipt",
 	"vane_intelligence_reader",
+	"vane_memory_editor",
 	"vane_periodic_brief_writer",
 	"vane_profile_claim_editor",
 	"vane_profile_editor",
@@ -75,7 +76,7 @@ var serverRuntimeForbiddenReadRelations = []string{
 // delegated callers.
 func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_v128")
+		ctx, dbURL, "provision_vane_server_runtime_v129")
 }
 
 // DeprovisionServerRuntime removes only migration 098's exact memberships and
@@ -84,7 +85,7 @@ func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 // with DROP OWNED.
 func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "deprovision_vane_server_runtime_v128")
+		ctx, dbURL, "deprovision_vane_server_runtime_v129")
 }
 
 // ProvisionNativeV3EditRecoveryRuntime creates only the independent recovery
@@ -156,7 +157,9 @@ func callServerRuntimeProvisioner(
 		return fmt.Errorf("store: connect server runtime provisioner: %w", err)
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	// functionName is selected only by the two closed wrappers above.
+	// functionName is selected only by the two closed current-version wrappers.
+	// Historical schema tests invoke their exact provisioner directly; current
+	// binaries must never silently fall back across a migration boundary.
 	if _, err := conn.Exec(ctx, "SELECT public."+functionName+"()"); err != nil {
 		return fmt.Errorf("store: %s: %w", functionName, err)
 	}

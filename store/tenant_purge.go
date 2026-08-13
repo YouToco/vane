@@ -119,6 +119,11 @@ var purgeOrder = []purgeStep{
 	// by writers, but purge already pre-locks session roots before child deletes.
 	{"agent_session_projection_authority_events", "tenant_id = $1"},
 	{"agent_events", "tenant_id = $1"},
+	// Explicit tenant erasure is the sole deletion path for retained long-term
+	// memory history. Receipts reference events and events reference records.
+	{"memory_receipts", "tenant_id = $1"},
+	{"memory_events", "tenant_id = $1"},
+	{"memory_records", "tenant_id = $1"},
 	// V3 delivery anchors reference the effect and projections, so they are the
 	// first child in the durable delivery chain.
 	{"research_brief_deliveries", "tenant_id = $1"},
