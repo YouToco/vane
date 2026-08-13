@@ -170,6 +170,8 @@ var wantTables = []string{
 	"memory_events",
 	"memory_receipts",
 	"memory_authorizations",
+	// 130 deployment-bound Agent-first retention attestation foundation.
+	"agent_first_retention_attestation_events",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
