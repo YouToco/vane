@@ -27,6 +27,7 @@ func TestMigration128RetiresOnlySessionFactContinuation(t *testing.T) {
 		"CREATE FUNCTION deprovision_vane_server_runtime_v128()",
 		"REVOKE vane_agent_session_fact_projector FROM vane_server_runtime",
 		"REVOKE USAGE ON SEQUENCE agent_session_fact_outbox_id_seq FROM vane_app",
+		"FROM pg_catalog.pg_shdepend dependency",
 		"direct_grants<>0",
 		"GRANT USAGE ON SEQUENCE agent_session_fact_outbox_id_seq TO vane_app",
 	} {
@@ -186,6 +187,96 @@ func TestMigration128DownRejectsRetiredProjectorDriftPostgres(t *testing.T) {
 	if _, err := database.ExecContext(t.Context(), `
 		ALTER ROLE vane_agent_session_fact_projector NOLOGIN NOINHERIT NOBYPASSRLS
 		 NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`); err != nil {
+		t.Fatal(err)
+	}
+	assertDownRejectsAuthority := func(label string) {
+		t.Helper()
+		if _, err := provider.DownTo(t.Context(), 127); err == nil ||
+			!strings.Contains(err.Error(), "retired projector retains") {
+			t.Fatalf("migration 128 Down accepted %s authority drift: %v", label, err)
+		}
+	}
+
+	// Database ACLs are shared-catalog objects.  Checking only the current
+	// database's relation/function catalogs misses both this database and a
+	// different database in the same PostgreSQL cluster.
+	var currentDatabase string
+	if err := database.QueryRowContext(t.Context(), `SELECT current_database()`).Scan(
+		&currentDatabase,
+	); err != nil {
+		t.Fatal(err)
+	}
+	grantCurrentDatabase := `GRANT CONNECT ON DATABASE ` + pgQuoteIdent(currentDatabase) +
+		` TO vane_agent_session_fact_projector`
+	revokeCurrentDatabase := `REVOKE CONNECT ON DATABASE ` + pgQuoteIdent(currentDatabase) +
+		` FROM vane_agent_session_fact_projector`
+	if _, err := database.ExecContext(t.Context(), grantCurrentDatabase); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		_, _ = database.ExecContext(ctx, revokeCurrentDatabase)
+	})
+	assertDownRejectsAuthority("current database CONNECT")
+	if _, err := database.ExecContext(t.Context(), revokeCurrentDatabase); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := database.ExecContext(t.Context(),
+		`GRANT CONNECT ON DATABASE postgres TO vane_agent_session_fact_projector`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		_, _ = database.ExecContext(ctx,
+			`REVOKE CONNECT ON DATABASE postgres FROM vane_agent_session_fact_projector`)
+	})
+	assertDownRejectsAuthority("cross-database CONNECT")
+	if _, err := database.ExecContext(t.Context(),
+		`REVOKE CONNECT ON DATABASE postgres FROM vane_agent_session_fact_projector`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := database.ExecContext(t.Context(), `
+		CREATE TYPE migration_128_projector_acl AS ENUM ('retired');
+		GRANT USAGE ON TYPE migration_128_projector_acl
+		  TO vane_agent_session_fact_projector`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		_, _ = database.ExecContext(ctx, `
+			REVOKE USAGE ON TYPE migration_128_projector_acl
+			  FROM vane_agent_session_fact_projector;
+			DROP TYPE IF EXISTS migration_128_projector_acl`)
+	})
+	assertDownRejectsAuthority("type ACL")
+	if _, err := database.ExecContext(t.Context(), `
+		REVOKE USAGE ON TYPE migration_128_projector_acl
+		  FROM vane_agent_session_fact_projector;
+		DROP TYPE migration_128_projector_acl`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := database.ExecContext(t.Context(), `
+		CREATE SCHEMA migration_128_projector_owned
+		  AUTHORIZATION vane_agent_session_fact_projector`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		_, _ = database.ExecContext(ctx, `
+			ALTER SCHEMA migration_128_projector_owned OWNER TO CURRENT_USER;
+			DROP SCHEMA IF EXISTS migration_128_projector_owned CASCADE`)
+	})
+	assertDownRejectsAuthority("owned schema")
+	if _, err := database.ExecContext(t.Context(), `
+		ALTER SCHEMA migration_128_projector_owned OWNER TO CURRENT_USER;
+		DROP SCHEMA migration_128_projector_owned`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(t.Context(), 127); err != nil {
