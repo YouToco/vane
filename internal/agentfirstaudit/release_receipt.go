@@ -21,7 +21,7 @@ type ReleaseReceipt struct {
 	SourceRevision              string `json:"source_revision"`
 	ControlPlaneRevision        string `json:"control_plane_revision"`
 	DeployRunID                 string `json:"deploy_run_id"`
-	DeployRunAttempt            int64  `json:"deploy_run_attempt"`
+	BuildRunAttempt             int64  `json:"build_run_attempt"`
 	BackendArchiveDigest        string `json:"backend_archive_sha256"`
 	BackendManifestDigest       string `json:"backend_manifest_sha256"`
 	ServerReleaseContractDigest string `json:"server_release_contract_sha256"`
@@ -65,7 +65,7 @@ func ReadVerifiedReleaseReceipt(
 		receipt.SchemaVersion != "vane.release-receipt/v1" ||
 		!validSourceRevision(receipt.SourceRevision) ||
 		!validSourceRevision(receipt.ControlPlaneRevision) ||
-		!canonicalUnsignedDecimal(receipt.DeployRunID) || receipt.DeployRunAttempt <= 0 {
+		!canonicalUnsignedDecimal(receipt.DeployRunID) || receipt.BuildRunAttempt <= 0 {
 		return VerifiedReleaseReceipt{}, fmt.Errorf("release receipt is not canonical")
 	}
 	for _, digest := range []string{

@@ -23,7 +23,7 @@ func TestReadVerifiedReleaseReceiptBindsCanonicalReceiptAndBinaries(t *testing.T
 	receipt := ReleaseReceipt{
 		SchemaVersion: "vane.release-receipt/v1", SourceRevision: strings.Repeat("a", 40),
 		ControlPlaneRevision: strings.Repeat("f", 40), DeployRunID: "123456",
-		DeployRunAttempt:            2,
+		BuildRunAttempt:             2,
 		BackendArchiveDigest:        strings.Repeat("b", 64),
 		BackendManifestDigest:       strings.Repeat("c", 64),
 		ServerReleaseContractDigest: strings.Repeat("d", 64),

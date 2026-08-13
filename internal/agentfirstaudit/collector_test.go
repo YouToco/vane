@@ -170,7 +170,7 @@ func newBaselineCollectorFixture(t *testing.T) baselineCollectorFixture {
 	receipt := ReleaseReceipt{
 		SchemaVersion: "vane.release-receipt/v1", SourceRevision: source,
 		ControlPlaneRevision: strings.Repeat("f", 40), DeployRunID: "123456",
-		DeployRunAttempt:            1,
+		BuildRunAttempt:             1,
 		BackendArchiveDigest:        strings.Repeat("1", 64),
 		BackendManifestDigest:       strings.Repeat("2", 64),
 		ServerReleaseContractDigest: strings.Repeat("3", 64),
