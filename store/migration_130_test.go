@@ -24,10 +24,11 @@ func TestMigration130IsEvidenceOnlyAndOwnerAppendOnly(t *testing.T) {
 		"CREATE FUNCTION agent_first_legacy_db_snapshot_v130() RETURNS BYTEA",
 		"CREATE FUNCTION append_agent_first_retention_attestation_v130(",
 		"only the direct schema owner may append attestation",
-		"prepared evidence has not crossed full retention",
+		"prepared evidence has not crossed full Temporal and database retention",
 		"prepared evidence does not cite latest baseline",
 		"NOT isfinite(requested_temporal_server_witness)",
 		"requested_temporal_server_witness<database_now-interval '10 minutes'",
+		"database_now < parent_event.issued_at+",
 		"parent_event.expires_at<=database_now",
 		"database_now:=clock_timestamp()",
 		"attestation evidence expired before append",
@@ -186,7 +187,7 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 	tooEarly := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
 		secondBaseline.PayloadDigest, time.Now().UTC())
 	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), tooEarly); err == nil ||
-		!strings.Contains(err.Error(), "full retention") {
+		!strings.Contains(err.Error(), "full Temporal and database retention") {
 		t.Fatalf("prepared accepted short retention: %v", err)
 	}
 	futurePrepared := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
@@ -195,27 +196,48 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		!strings.Contains(err.Error(), "outside DB clock skew") {
 		t.Fatalf("prepared accepted future Temporal witness: %v", err)
 	}
+	staleClockBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(),
+		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "",
+			time.Now().UTC().Add(-2*time.Second)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleClockImmediate := agentFirstRetentionTestInput(
+		AgentFirstRetentionPhasePrepared, staleClockBaseline.PayloadDigest,
+		time.Now().UTC())
+	if _, err := st.AppendAgentFirstRetentionAttestation(
+		t.Context(), staleClockImmediate); err == nil ||
+		!strings.Contains(err.Error(), "full Temporal and database retention") {
+		t.Fatalf("prepared accepted without a full database retention interval: %v", err)
+	}
 	time.Sleep(1100 * time.Millisecond)
 	stalePrepared := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
-		firstBaseline.PayloadDigest, time.Now().UTC())
+		secondBaseline.PayloadDigest, time.Now().UTC())
 	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), stalePrepared); err == nil ||
 		!strings.Contains(err.Error(), "latest baseline") {
 		t.Fatalf("prepared accepted stale baseline: %v", err)
 	}
 	preparedInput := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
-		secondBaseline.PayloadDigest, time.Now().UTC())
+		staleClockBaseline.PayloadDigest, time.Now().UTC())
 	prepared, err := st.AppendAgentFirstRetentionAttestation(t.Context(), preparedInput)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prepared.ParentDigest == nil || *prepared.ParentDigest != secondBaseline.PayloadDigest {
+	if prepared.ParentDigest == nil || *prepared.ParentDigest != staleClockBaseline.PayloadDigest {
 		t.Fatalf("prepared chain differs: %+v", prepared)
 	}
-	differentDeploy := preparedInput
-	differentDeploy.ParentDigest = firstBaseline.PayloadDigest
+	deployBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(),
+		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", time.Now().UTC()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	differentDeploy := agentFirstRetentionTestInput(
+		AgentFirstRetentionPhasePrepared, deployBaseline.PayloadDigest, time.Now().UTC())
 	differentDeploy.DeployDigest = strings.Repeat("7", 64)
-	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), differentDeploy); err == nil {
-		t.Fatal("prepared accepted a different source deployment")
+	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), differentDeploy); err == nil ||
+		!strings.Contains(err.Error(), "source or deploy differs") {
+		t.Fatalf("prepared accepted a different source deployment: %v", err)
 	}
 	changedBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(),
 		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", time.Now().UTC()))
@@ -243,6 +265,25 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		tenantID, userID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := database.ExecContext(t.Context(), `
+		UPDATE task_creation_operations
+		   SET status='mystery',phase='mystery'
+		 WHERE id='migration-130-terminal'`); err != nil {
+		t.Fatal(err)
+	}
+	unknownStateBaseline := agentFirstRetentionTestInput(
+		AgentFirstRetentionPhaseBaseline, "", time.Now().UTC())
+	if _, err := st.AppendAgentFirstRetentionAttestation(
+		t.Context(), unknownStateBaseline); err == nil ||
+		!strings.Contains(err.Error(), "not quiescent") {
+		t.Fatalf("baseline accepted unknown legacy state: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		UPDATE task_creation_operations
+		   SET status='expired',phase='expired'
+		 WHERE id='migration-130-terminal'`); err != nil {
+		t.Fatal(err)
+	}
 	changedPrepared := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
 		changedBaseline.PayloadDigest, time.Now().UTC())
 	time.Sleep(1100 * time.Millisecond)
@@ -265,6 +306,12 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		t.Context(), leasedReceiptBaseline); err == nil ||
 		!strings.Contains(err.Error(), "not quiescent") {
 		t.Fatalf("baseline accepted terminal receipt lease: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		UPDATE task_creation_receipts
+		   SET lease_owner='',lease_until=NULL,takeover_not_before=NULL
+		 WHERE operation_id='migration-130-terminal'`); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(t.Context(), `
 		INSERT INTO task_creation_operations(

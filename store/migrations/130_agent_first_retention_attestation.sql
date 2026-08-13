@@ -115,6 +115,19 @@ WITH creation_operations AS (
     SELECT
       count(*) AS operation_count,
       count(*) FILTER (WHERE status IN ('pending','executing')) AS active_count,
+      count(*) FILTER (WHERE NOT (
+        (status='pending' AND phase='' AND tombstoned_at IS NULL) OR
+        (status='executing' AND phase IN (
+          'claimed','command_sealed','translation_started','definition_compiled',
+          'schedule_prepared','schedule_ensured','definition_committed',
+          'activation_started','activated','cleanup_pending') AND
+         tombstoned_at IS NULL) OR
+        (status='executed' AND phase='completed' AND tombstoned_at IS NOT NULL) OR
+        (status='cancelled' AND phase='cancelled' AND tombstoned_at IS NOT NULL) OR
+        (status='expired' AND phase='expired' AND tombstoned_at IS NOT NULL) OR
+        (status='blocked' AND phase='blocked' AND tombstoned_at IS NOT NULL) OR
+        (status='failed' AND phase='failed' AND tombstoned_at IS NOT NULL)
+      )) AS invalid_state_count,
       count(*) FILTER (WHERE lease_owner<>'' OR lease_until IS NOT NULL OR
                             takeover_not_before IS NOT NULL) AS lease_count,
       count(*) FILTER (WHERE status NOT IN ('pending','executing') AND
@@ -142,6 +155,15 @@ WITH creation_operations AS (
     SELECT
       count(*) AS operation_count,
       count(*) FILTER (WHERE status IN ('pending','executing')) AS active_count,
+      count(*) FILTER (WHERE
+        status NOT IN ('pending','executing','completed','cancelled','expired',
+                       'blocked','superseded') OR
+        phase NOT IN ('','proposal_sealed','db_quiesced','temporal_base_paused',
+                      'definition_committed','temporal_target_applied',
+                      'temporal_target_restored') OR
+        (status IN ('pending','executing') AND tombstoned_at IS NOT NULL) OR
+        (status NOT IN ('pending','executing') AND tombstoned_at IS NULL)
+      ) AS invalid_state_count,
       count(*) FILTER (WHERE lease_owner<>'' OR lease_until IS NOT NULL OR
                             takeover_not_before IS NOT NULL) AS lease_count,
       count(*) FILTER (WHERE status NOT IN ('pending','executing') AND
@@ -194,6 +216,7 @@ SELECT convert_to(jsonb_build_object(
        'digest',authority_inventory.digest,'item_count',authority_inventory.item_count),
     'legacy_creation',jsonb_build_object(
        'active_count',creation_operations.active_count,
+       'invalid_state_count',creation_operations.invalid_state_count,
        'lease_count',creation_operations.lease_count,
        'operation_count',creation_operations.operation_count,
        'operation_digest',creation_operations.operation_digest,
@@ -204,6 +227,7 @@ SELECT convert_to(jsonb_build_object(
        'receipt_gap_count',creation_operations.receipt_gap_count),
     'protocol1_definition_edit',jsonb_build_object(
        'active_count',edit_operations.active_count,
+       'invalid_state_count',edit_operations.invalid_state_count,
        'lease_count',edit_operations.lease_count,
        'operation_count',edit_operations.operation_count,
        'operation_digest',edit_operations.operation_digest,
@@ -326,7 +350,6 @@ BEGIN
     END IF;
 
     PERFORM pg_advisory_xact_lock(6215335020355474130);
-    database_now:=clock_timestamp();
     SELECT system_identifier::text INTO database_system_identifier
       FROM pg_control_system();
     SELECT oid INTO database_oid_value FROM pg_database WHERE datname=database_name;
@@ -338,6 +361,9 @@ BEGIN
         'schema_version','vane.agent-first-database-identity/v130')::text,'UTF8');
     snapshot_payload:=public.agent_first_legacy_db_snapshot_v130();
     snapshot_digest:=encode(sha256(snapshot_payload),'hex');
+    -- Bind issued_at to the completed database observation, not to a time
+    -- sampled before the semantic snapshot or while waiting for the chain lock.
+    database_now:=clock_timestamp();
 
     -- Temporal supplies this witness from its own server clock. Bind every
     -- observation to this database append, allowing only bounded transport and
@@ -351,6 +377,8 @@ BEGIN
     IF COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{legacy_creation,active_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
+          '{legacy_creation,invalid_state_count}')::bigint,-1)<>0 OR
+       COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{legacy_creation,lease_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{legacy_creation,pending_receipt_count}')::bigint,-1)<>0 OR
@@ -360,6 +388,8 @@ BEGIN
           '{legacy_creation,receipt_gap_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{protocol1_definition_edit,active_count}')::bigint,-1)<>0 OR
+       COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
+          '{protocol1_definition_edit,invalid_state_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
           '{protocol1_definition_edit,lease_count}')::bigint,-1)<>0 OR
        COALESCE((convert_from(snapshot_payload,'UTF8')::jsonb #>>
@@ -406,12 +436,14 @@ BEGIN
                 USING ERRCODE='23514';
         END IF;
         IF parent_event.phase<>'baseline' OR
+           database_now < parent_event.issued_at+
+             make_interval(secs=>requested_retention_seconds) OR
            parent_event.expires_at<=database_now OR
            parent_event.database_identity<>database_identity_value OR
            requested_temporal_server_witness <
              parent_event.temporal_server_witness+
              make_interval(secs=>requested_retention_seconds) THEN
-            RAISE EXCEPTION '130: prepared evidence has not crossed full retention on the same database'
+            RAISE EXCEPTION '130: prepared evidence has not crossed full Temporal and database retention'
                 USING ERRCODE='23514';
         END IF;
         IF (convert_from(parent_event.legacy_db_snapshot,'UTF8')::jsonb->

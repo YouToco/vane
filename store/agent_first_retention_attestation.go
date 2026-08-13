@@ -137,6 +137,7 @@ type agentFirstLegacyDBSnapshotV130 struct {
 
 type agentFirstLegacyLaneSnapshotV130 struct {
 	ActiveCount         int64  `json:"active_count"`
+	InvalidStateCount   int64  `json:"invalid_state_count"`
 	LeaseCount          int64  `json:"lease_count"`
 	OperationCount      int64  `json:"operation_count"`
 	OperationDigest     string `json:"operation_digest"`
@@ -308,13 +309,17 @@ func validateAgentFirstRetentionEvent(event *AgentFirstRetentionAttestationEvent
 	if snapshot.SchemaVersion != "vane.agent-first-legacy-db-snapshot/v130" ||
 		!agentFirstDigestPattern.MatchString(snapshot.ScheduleInventory.Digest) ||
 		!agentFirstDigestPattern.MatchString(snapshot.AuthorityInventory.Digest) ||
+		snapshot.ScheduleInventory.ItemCount < 0 ||
+		snapshot.AuthorityInventory.ItemCount < 0 ||
 		snapshot.LegacyCreation.ActiveCount < 0 || snapshot.LegacyCreation.LeaseCount < 0 ||
+		snapshot.LegacyCreation.InvalidStateCount < 0 ||
 		snapshot.LegacyCreation.OperationCount < 0 || snapshot.LegacyCreation.PendingReceiptCount < 0 ||
 		snapshot.LegacyCreation.ReceiptCount < 0 || snapshot.LegacyCreation.ReceiptLeaseCount < 0 ||
 		snapshot.LegacyCreation.ReceiptGapCount < 0 ||
 		!agentFirstDigestPattern.MatchString(snapshot.LegacyCreation.OperationDigest) ||
 		!agentFirstDigestPattern.MatchString(snapshot.LegacyCreation.ReceiptDigest) ||
 		snapshot.Protocol1DefinitionEdit.ActiveCount < 0 ||
+		snapshot.Protocol1DefinitionEdit.InvalidStateCount < 0 ||
 		snapshot.Protocol1DefinitionEdit.LeaseCount < 0 ||
 		snapshot.Protocol1DefinitionEdit.OperationCount < 0 ||
 		snapshot.Protocol1DefinitionEdit.PendingReceiptCount < 0 ||
@@ -368,6 +373,41 @@ func validateAgentFirstRetentionEvent(event *AgentFirstRetentionAttestationEvent
 		!witness.Equal(event.TemporalServerWitness) {
 		return fmt.Errorf("store: Agent-first retention payload differs from row evidence")
 	}
+	parentDigest := ""
+	if event.ParentDigest != nil {
+		parentDigest = *event.ParentDigest
+	}
+	if err := validateAgentFirstRetentionInput(AgentFirstRetentionAttestationInput{
+		Phase: event.Phase, ParentDigest: parentDigest,
+		TemporalClusterID:          event.TemporalClusterID,
+		TemporalNamespace:          event.TemporalNamespace,
+		TemporalNamespaceID:        event.TemporalNamespaceID,
+		RetentionSeconds:           event.RetentionSeconds,
+		HistoryArchivalState:       event.HistoryArchivalState,
+		HistoryArchiveURIDigest:    event.HistoryArchiveURIDigest,
+		VisibilityArchivalState:    event.VisibilityArchivalState,
+		VisibilityArchiveURIDigest: event.VisibilityArchiveURIDigest,
+		TemporalServerWitness:      event.TemporalServerWitness,
+		WorkflowInventoryDigest:    event.WorkflowInventoryDigest,
+		ScheduleInventoryDigest:    event.ScheduleInventoryDigest,
+		ArchiveInventoryDigest:     event.ArchiveInventoryDigest,
+		TemporalEvidenceDigest:     event.TemporalEvidenceDigest,
+		SourceRevision:             event.SourceRevision, DeployDigest: event.DeployDigest,
+	}); err != nil {
+		return fmt.Errorf("store: Agent-first retention row fields are invalid: %w", err)
+	}
+	if event.IssuedAt.IsZero() || event.ExpiresAt.IsZero() ||
+		event.TemporalServerWitness.Before(event.IssuedAt.Add(-10*time.Minute)) ||
+		event.TemporalServerWitness.After(event.IssuedAt.Add(5*time.Second)) {
+		return fmt.Errorf("store: Agent-first retention row time binding is invalid")
+	}
+	wantLifetime := 10 * time.Minute
+	if event.Phase == AgentFirstRetentionPhaseBaseline {
+		wantLifetime += time.Duration(event.RetentionSeconds) * time.Second
+	}
+	if event.ExpiresAt.Sub(event.IssuedAt) != wantLifetime {
+		return fmt.Errorf("store: Agent-first retention row expiry is invalid")
+	}
 	return nil
 }
 
@@ -380,6 +420,7 @@ func sameAgentFirstParent(left, right *string) bool {
 
 func agentFirstLegacyLaneQuiescent(lane agentFirstLegacyLaneSnapshotV130) bool {
 	return lane.ActiveCount == 0 && lane.LeaseCount == 0 &&
+		lane.InvalidStateCount == 0 &&
 		lane.ReceiptLeaseCount == 0 && lane.PendingReceiptCount == 0 &&
 		lane.ReceiptGapCount == 0
 }
