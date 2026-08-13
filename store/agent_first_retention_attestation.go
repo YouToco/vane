@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -34,6 +35,7 @@ const (
 	maxAgentFirstRetentionSeconds = int64(315360000)
 	maxAgentFirstClusterIDBytes   = 512
 	maxAgentFirstNamespaceBytes   = 255
+	maxAgentFirstAuditSchedules   = 100000
 	agentFirstEmptyDigest         = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
 
@@ -91,6 +93,30 @@ type AgentFirstRetentionAttestationEvent struct {
 	PayloadDigest              string
 	IssuedAt                   time.Time
 	ExpiresAt                  time.Time
+}
+
+type AgentFirstRetentionAuditSnapshot struct {
+	LegacyDBSnapshot       []byte
+	LegacyDBSnapshotDigest string
+	ScheduleDigest         string
+	Schedules              []AgentFirstRetentionSchedule
+}
+
+type AgentFirstRetentionSchedule struct {
+	ID                         string  `json:"id"`
+	TenantID                   int64   `json:"tenant_id"`
+	UserID                     int64   `json:"user_id"`
+	Status                     string  `json:"status"`
+	ExecutionMode              string  `json:"execution_mode"`
+	ApprovedDefinitionVersion  *int64  `json:"approved_definition_version"`
+	ApprovedDefinitionDigest   *string `json:"approved_definition_digest"`
+	DefinitionEditOperationID  *string `json:"definition_edit_operation_id"`
+	DefinitionEditFence        *int64  `json:"definition_edit_fence"`
+	AuthorityGeneration        *int64  `json:"authority_generation"`
+	AuthorityDefinitionVersion *int64  `json:"authority_definition_version"`
+	AuthorityDefinitionDigest  *string `json:"authority_definition_digest"`
+	TargetActionDigest         *string `json:"target_action_digest"`
+	ActionAuthorizationDigest  *string `json:"action_authorization_digest"`
 }
 
 type agentFirstRetentionPayloadV130 struct {
@@ -162,6 +188,118 @@ const agentFirstRetentionEventColumnsV130 = `
 	legacy_db_snapshot,legacy_db_snapshot_digest,canonical_payload,payload_digest,
 	issued_at,expires_at`
 
+// ReadAgentFirstRetentionAuditSnapshot reads the exact v130 semantic snapshot
+// and the per-schedule V3 Action authority from one owner-only, repeatable-read
+// transaction. It is for the offline deployment collector, never server or
+// Agent runtime paths.
+func (s *Store) ReadAgentFirstRetentionAuditSnapshot(
+	ctx context.Context,
+) (*AgentFirstRetentionAuditSnapshot, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin Agent-first audit snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	var snapshot AgentFirstRetentionAuditSnapshot
+	if err := tx.QueryRow(ctx,
+		`SELECT public.agent_first_legacy_db_snapshot_v130()`).Scan(
+		&snapshot.LegacyDBSnapshot); err != nil {
+		return nil, fmt.Errorf("store: read Agent-first semantic snapshot: %w", err)
+	}
+	var scheduleCount int64
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM public.schedules`).Scan(
+		&scheduleCount); err != nil {
+		return nil, fmt.Errorf("store: count Agent-first schedules: %w", err)
+	}
+	if scheduleCount < 0 || scheduleCount > maxAgentFirstAuditSchedules {
+		return nil, fmt.Errorf("store: Agent-first schedule inventory exceeds limit")
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT schedule.id,schedule.tenant_id,schedule.user_id,schedule.status,
+		       schedule.execution_mode,schedule.approved_definition_version,
+		       schedule.approved_definition_digest,schedule.definition_edit_operation_id,
+		       schedule.definition_edit_fence,authority.generation,
+		       authority.definition_version,authority.definition_digest,
+		       authority.target_action_digest,authority.action_authorization_digest
+		  FROM public.schedules schedule
+		  LEFT JOIN public.research_v3_delivery_authorities authority
+		    ON authority.tenant_id=schedule.tenant_id
+		   AND authority.user_id=schedule.user_id
+		   AND authority.task_id=schedule.id
+		   AND authority.status='enabled'
+		 ORDER BY schedule.tenant_id,schedule.user_id,schedule.id,authority.generation`)
+	if err != nil {
+		return nil, fmt.Errorf("store: read Agent-first schedule authority: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var schedule AgentFirstRetentionSchedule
+		if err := rows.Scan(&schedule.ID, &schedule.TenantID, &schedule.UserID,
+			&schedule.Status, &schedule.ExecutionMode,
+			&schedule.ApprovedDefinitionVersion, &schedule.ApprovedDefinitionDigest,
+			&schedule.DefinitionEditOperationID, &schedule.DefinitionEditFence,
+			&schedule.AuthorityGeneration, &schedule.AuthorityDefinitionVersion,
+			&schedule.AuthorityDefinitionDigest, &schedule.TargetActionDigest,
+			&schedule.ActionAuthorizationDigest); err != nil {
+			return nil, fmt.Errorf("store: scan Agent-first schedule authority: %w", err)
+		}
+		if _, duplicate := seen[schedule.ID]; duplicate {
+			return nil, fmt.Errorf("store: multiple enabled authorities for schedule %q", schedule.ID)
+		}
+		if err := validateAgentFirstRetentionSchedule(schedule); err != nil {
+			return nil, err
+		}
+		seen[schedule.ID] = struct{}{}
+		snapshot.Schedules = append(snapshot.Schedules, schedule)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate Agent-first schedule authority: %w", err)
+	}
+	if int64(len(snapshot.Schedules)) != scheduleCount {
+		return nil, fmt.Errorf("store: Agent-first schedule inventory count differs")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("store: commit Agent-first audit snapshot: %w", err)
+	}
+	legacySum := sha256.Sum256(snapshot.LegacyDBSnapshot)
+	snapshot.LegacyDBSnapshot = bytes.Clone(snapshot.LegacyDBSnapshot)
+	snapshot.LegacyDBSnapshotDigest = hex.EncodeToString(legacySum[:])
+	canonicalSchedules, err := json.Marshal(snapshot.Schedules)
+	if err != nil {
+		return nil, fmt.Errorf("store: marshal Agent-first schedule snapshot: %w", err)
+	}
+	scheduleSum := sha256.Sum256(canonicalSchedules)
+	snapshot.ScheduleDigest = hex.EncodeToString(scheduleSum[:])
+	return &snapshot, nil
+}
+
+func validateAgentFirstRetentionSchedule(schedule AgentFirstRetentionSchedule) error {
+	if !validBoundedAgentFirstText(schedule.ID, maxAgentFirstNamespaceBytes) ||
+		schedule.TenantID <= 0 || schedule.UserID <= 0 ||
+		(schedule.Status != "active" && schedule.Status != "paused") ||
+		schedule.ExecutionMode != "discover_at_run" ||
+		schedule.ApprovedDefinitionVersion == nil || *schedule.ApprovedDefinitionVersion <= 0 ||
+		schedule.ApprovedDefinitionDigest == nil ||
+		!agentFirstDigestPattern.MatchString(*schedule.ApprovedDefinitionDigest) ||
+		schedule.DefinitionEditOperationID != nil || schedule.DefinitionEditFence != nil ||
+		schedule.AuthorityGeneration == nil || *schedule.AuthorityGeneration <= 0 ||
+		schedule.AuthorityDefinitionVersion == nil ||
+		*schedule.AuthorityDefinitionVersion != *schedule.ApprovedDefinitionVersion ||
+		schedule.AuthorityDefinitionDigest == nil ||
+		*schedule.AuthorityDefinitionDigest != *schedule.ApprovedDefinitionDigest ||
+		schedule.TargetActionDigest == nil ||
+		!agentFirstDigestPattern.MatchString(*schedule.TargetActionDigest) ||
+		schedule.ActionAuthorizationDigest == nil ||
+		!agentFirstDigestPattern.MatchString(*schedule.ActionAuthorizationDigest) {
+		return fmt.Errorf("store: schedule %q lacks exact enabled V3 authority", schedule.ID)
+	}
+	return nil
+}
+
 // AppendAgentFirstRetentionAttestation appends one owner-issued phase event.
 // It intentionally has no idempotent adoption rule: the parent has at most one
 // child, and a lost response is recovered by reading the immutable ledger
@@ -204,6 +342,62 @@ func (s *Store) AppendAgentFirstRetentionAttestation(
 		return nil, fmt.Errorf("store: commit Agent-first retention attestation: %w", err)
 	}
 	return event, nil
+}
+
+// LoadAgentFirstRetentionAttestation adopts a committed event after a lost
+// append response. Every caller-supplied external evidence field participates
+// in the lookup; zero or multiple matches fail closed.
+func (s *Store) LoadAgentFirstRetentionAttestation(
+	ctx context.Context,
+	in AgentFirstRetentionAttestationInput,
+) (*AgentFirstRetentionAttestationEvent, error) {
+	if err := validateAgentFirstRetentionInput(in); err != nil {
+		return nil, err
+	}
+	var parent any
+	if in.ParentDigest != "" {
+		parent = in.ParentDigest
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+agentFirstRetentionEventColumnsV130+`
+		  FROM public.agent_first_retention_attestation_events
+		 WHERE phase=$1 AND parent_digest IS NOT DISTINCT FROM $2
+		   AND temporal_cluster_id=$3 AND temporal_namespace=$4
+		   AND temporal_namespace_id=$5 AND retention_seconds=$6
+		   AND history_archival_state=$7 AND history_archive_uri_digest=$8
+		   AND visibility_archival_state=$9 AND visibility_archive_uri_digest=$10
+		   AND temporal_server_witness=$11 AND workflow_inventory_digest=$12
+		   AND schedule_inventory_digest=$13 AND archive_inventory_digest=$14
+		   AND temporal_evidence_digest=$15 AND source_revision=$16 AND deploy_digest=$17
+		 ORDER BY id DESC LIMIT 2`,
+		string(in.Phase), parent, in.TemporalClusterID, in.TemporalNamespace,
+		in.TemporalNamespaceID, in.RetentionSeconds, string(in.HistoryArchivalState),
+		in.HistoryArchiveURIDigest, string(in.VisibilityArchivalState),
+		in.VisibilityArchiveURIDigest, in.TemporalServerWitness,
+		in.WorkflowInventoryDigest, in.ScheduleInventoryDigest,
+		in.ArchiveInventoryDigest, in.TemporalEvidenceDigest,
+		in.SourceRevision, in.DeployDigest)
+	if err != nil {
+		return nil, fmt.Errorf("store: load Agent-first retention attestation: %w", err)
+	}
+	defer rows.Close()
+	var found []*AgentFirstRetentionAttestationEvent
+	for rows.Next() {
+		event, err := scanAgentFirstRetentionEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan Agent-first retention attestation: %w", err)
+		}
+		if err := validateAgentFirstRetentionEvent(event); err != nil {
+			return nil, err
+		}
+		found = append(found, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate Agent-first retention attestation: %w", err)
+	}
+	if len(found) != 1 {
+		return nil, fmt.Errorf("store: exact Agent-first retention attestation count is %d", len(found))
+	}
+	return found[0], nil
 }
 
 func scanAgentFirstRetentionEvent(row pgx.Row) (*AgentFirstRetentionAttestationEvent, error) {

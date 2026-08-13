@@ -52,6 +52,8 @@ func TestReadRetentionClockEvidenceBindsServerTimeAndWorkerBuild(t *testing.T) {
 	}
 	if calls != 2 || evidence.EventCount != 5 || evidence.HistoryDigest == "" ||
 		evidence.WorkerBuildID != expect.WorkerBuildID ||
+		evidence.Namespace != expect.Namespace || evidence.WorkflowID != expect.WorkflowID ||
+		evidence.RunID != expect.RunID || evidence.TaskQueue != expect.TaskQueue ||
 		!evidence.ObservedAtUTC.Equal(events[2].EventTime.AsTime()) {
 		t.Fatalf("calls=%d evidence=%+v", calls, evidence)
 	}

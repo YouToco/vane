@@ -46,6 +46,10 @@ type RetentionClockExpectation struct {
 }
 
 type RetentionClockEvidence struct {
+	Namespace     string
+	WorkflowID    string
+	RunID         string
+	TaskQueue     string
 	ObservedAtUTC time.Time
 	HistoryDigest string
 	EventCount    int
@@ -111,7 +115,15 @@ func ReadRetentionClockEvidence(
 	if archived {
 		return RetentionClockEvidence{}, fmt.Errorf("fresh retention clock history is archived")
 	}
-	return validateRetentionClockEvents(events, expect)
+	evidence, err := validateRetentionClockEvents(events, expect)
+	if err != nil {
+		return RetentionClockEvidence{}, err
+	}
+	evidence.Namespace = expect.Namespace
+	evidence.WorkflowID = expect.WorkflowID
+	evidence.RunID = expect.RunID
+	evidence.TaskQueue = expect.TaskQueue
+	return evidence, nil
 }
 
 func validSourceRevision(value string) bool {

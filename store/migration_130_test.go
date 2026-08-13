@@ -99,6 +99,45 @@ func TestAgentFirstRetentionInputValidation(t *testing.T) {
 	}
 }
 
+func TestAgentFirstRetentionScheduleRequiresExactEnabledV3Authority(t *testing.T) {
+	version, generation := int64(3), int64(7)
+	digest, target, authorization := strings.Repeat("a", 64), strings.Repeat("b", 64),
+		strings.Repeat("c", 64)
+	schedule := AgentFirstRetentionSchedule{
+		ID: "task-1", TenantID: 1, UserID: 2, Status: "active",
+		ExecutionMode: "discover_at_run", ApprovedDefinitionVersion: &version,
+		ApprovedDefinitionDigest: &digest, AuthorityGeneration: &generation,
+		AuthorityDefinitionVersion: &version, AuthorityDefinitionDigest: &digest,
+		TargetActionDigest: &target, ActionAuthorizationDigest: &authorization,
+	}
+	if err := validateAgentFirstRetentionSchedule(schedule); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*AgentFirstRetentionSchedule)
+	}{
+		{"legacy mode", func(s *AgentFirstRetentionSchedule) { s.ExecutionMode = "compiled" }},
+		{"missing authority", func(s *AgentFirstRetentionSchedule) { s.TargetActionDigest = nil }},
+		{"definition drift", func(s *AgentFirstRetentionSchedule) {
+			other := strings.Repeat("d", 64)
+			s.AuthorityDefinitionDigest = &other
+		}},
+		{"edit in flight", func(s *AgentFirstRetentionSchedule) {
+			operation := "edit-1"
+			s.DefinitionEditOperationID = &operation
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := schedule
+			tc.mutate(&mutated)
+			if err := validateAgentFirstRetentionSchedule(mutated); err == nil {
+				t.Fatal("unsafe schedule authority accepted")
+			}
+		})
+	}
+}
+
 func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
@@ -165,8 +204,8 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		repeat('e',40),repeat('f',64))`, agentFirstEmptyDigest); err == nil {
 		t.Fatal("baseline accepted infinite Temporal witness")
 	}
-	firstBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(),
-		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", witness))
+	firstInput := agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", witness)
+	firstBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(), firstInput)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,6 +217,20 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 	if !strings.Contains(string(firstBaseline.CanonicalPayload),
 		`"schema_version": "vane.agent-first-retention-attestation/v130"`) {
 		t.Fatalf("canonical payload=%s", firstBaseline.CanonicalPayload)
+	}
+	loaded, err := st.LoadAgentFirstRetentionAttestation(t.Context(), firstInput)
+	if err != nil || loaded.PayloadDigest != firstBaseline.PayloadDigest {
+		t.Fatalf("adopt exact baseline loaded=%+v err=%v", loaded, err)
+	}
+	wrongEvidence := firstInput
+	wrongEvidence.TemporalEvidenceDigest = strings.Repeat("9", 64)
+	if _, err := st.LoadAgentFirstRetentionAttestation(t.Context(), wrongEvidence); err == nil {
+		t.Fatal("adopted baseline with different external evidence")
+	}
+	auditSnapshot, err := st.ReadAgentFirstRetentionAuditSnapshot(t.Context())
+	if err != nil || auditSnapshot.LegacyDBSnapshotDigest !=
+		firstBaseline.LegacyDBSnapshotDigest || len(auditSnapshot.Schedules) != 0 {
+		t.Fatalf("audit snapshot=%+v err=%v", auditSnapshot, err)
 	}
 
 	secondBaseline, err := st.AppendAgentFirstRetentionAttestation(t.Context(),

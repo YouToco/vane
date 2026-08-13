@@ -800,6 +800,14 @@ func taskDefinitionEditRawTransportExpectations(
 ) []taskDefinitionEditRawTransportExpectation {
 	return []taskDefinitionEditRawTransportExpectation{
 		{
+			filepath.Clean(filepath.Join(
+				filepath.Dir(schedulerDir), "internal", "agentfirstaudit", "schedule_inventory.go",
+			)),
+			"readScheduleInventory",
+			"DescribeSchedule",
+			1,
+		},
+		{
 			filepath.Clean(filepath.Join(schedulerDir, "research_v3_cutover.go")),
 			"describeResearchV3CutoverSchedule",
 			"DescribeSchedule",
@@ -908,11 +916,18 @@ func taskDefinitionEditRawTransportViolations(
 				if !ok {
 					return true
 				}
+				selector, selectorCall := taskDefinitionEditUnparen(call.Fun).(*ast.SelectorExpr)
 				method, raw := taskDefinitionEditRawWorkflowServiceCall(call)
 				if !raw {
+					if selectorCall {
+						key := expectationKey{cleanPath, function.Name.Name, selector.Sel.Name}
+						if _, expected := want[key]; expected {
+							got[key]++
+							allowed[selector.Sel.Pos()] = struct{}{}
+						}
+					}
 					return true
 				}
-				selector := taskDefinitionEditUnparen(call.Fun).(*ast.SelectorExpr)
 				key := expectationKey{cleanPath, function.Name.Name, method}
 				if _, watched := want[key]; !watched &&
 					method != "UpdateSchedule" && method != "DescribeSchedule" &&
