@@ -1,0 +1,140 @@
+package agentfirstaudit
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"syscall"
+
+	"github.com/YouToco/vane/internal/strictjson"
+)
+
+const maxReleaseReceiptBytes = 16 << 10
+
+type ReleaseReceipt struct {
+	SchemaVersion               string `json:"schema_version"`
+	SourceRevision              string `json:"source_revision"`
+	BackendArchiveDigest        string `json:"backend_archive_sha256"`
+	BackendManifestDigest       string `json:"backend_manifest_sha256"`
+	ServerReleaseContractDigest string `json:"server_release_contract_sha256"`
+	VaneDigest                  string `json:"vane_sha256"`
+	CollectorDigest             string `json:"agentfirstretention_sha256"`
+}
+
+type VerifiedReleaseReceipt struct {
+	Receipt      ReleaseReceipt
+	Canonical    []byte
+	DeployDigest string
+}
+
+func ReadVerifiedReleaseReceipt(
+	receiptPath string,
+	collectorPath string,
+	liveVanePath string,
+) (VerifiedReleaseReceipt, error) {
+	if !canonicalAbsolutePath(receiptPath) || !canonicalAbsolutePath(collectorPath) ||
+		!canonicalAbsolutePath(liveVanePath) {
+		return VerifiedReleaseReceipt{}, fmt.Errorf("release receipt paths are invalid")
+	}
+	payload, err := readRootAuthorityFile(receiptPath, maxReleaseReceiptBytes)
+	if err != nil {
+		return VerifiedReleaseReceipt{}, fmt.Errorf("read release receipt: %w", err)
+	}
+	var receipt ReleaseReceipt
+	if err := strictjson.DecodeExact(payload, &receipt); err != nil {
+		return VerifiedReleaseReceipt{}, fmt.Errorf("decode release receipt: %w", err)
+	}
+	canonical, err := json.Marshal(receipt)
+	if err != nil || !bytes.Equal(canonical, payload) ||
+		receipt.SchemaVersion != "vane.release-receipt/v1" ||
+		!validSourceRevision(receipt.SourceRevision) {
+		return VerifiedReleaseReceipt{}, fmt.Errorf("release receipt is not canonical")
+	}
+	for _, digest := range []string{
+		receipt.BackendArchiveDigest, receipt.BackendManifestDigest,
+		receipt.ServerReleaseContractDigest, receipt.VaneDigest, receipt.CollectorDigest,
+	} {
+		if !validLowerHex(digest, sha256.Size) {
+			return VerifiedReleaseReceipt{}, fmt.Errorf("release receipt digest is invalid")
+		}
+	}
+	collectorDigest, err := digestAuthorityFile(collectorPath)
+	if err != nil {
+		return VerifiedReleaseReceipt{}, fmt.Errorf("digest collector binary: %w", err)
+	}
+	vaneDigest, err := digestAuthorityFile(liveVanePath)
+	if err != nil {
+		return VerifiedReleaseReceipt{}, fmt.Errorf("digest live vane binary: %w", err)
+	}
+	if collectorDigest != receipt.CollectorDigest || vaneDigest != receipt.VaneDigest {
+		return VerifiedReleaseReceipt{}, fmt.Errorf("release receipt binary binding differs")
+	}
+	sum := sha256.Sum256(payload)
+	return VerifiedReleaseReceipt{
+		Receipt: receipt, Canonical: bytes.Clone(payload),
+		DeployDigest: hex.EncodeToString(sum[:]),
+	}, nil
+}
+
+func canonicalAbsolutePath(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path
+}
+
+func readRootAuthorityFile(path string, maximum int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm()&0o022 != 0 || !trustedAuthorityOwner(stat.Uid) ||
+		info.Size() <= 0 || info.Size() > maximum {
+		return nil, fmt.Errorf("file authority is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	payload, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) == 0 || int64(len(payload)) > maximum {
+		return nil, fmt.Errorf("file exceeds authority bounds")
+	}
+	return payload, nil
+}
+
+func digestAuthorityFile(path string) (string, error) {
+	const maxBinaryBytes = 512 << 20
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm()&0o022 != 0 || !trustedAuthorityOwner(stat.Uid) ||
+		info.Size() <= 0 || info.Size() > maxBinaryBytes {
+		return "", fmt.Errorf("binary authority is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	read, err := io.Copy(hash, io.LimitReader(file, maxBinaryBytes+1))
+	if err != nil || read != info.Size() {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}

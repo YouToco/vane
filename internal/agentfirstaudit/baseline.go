@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	vaneworkflow "github.com/YouToco/vane/workflow"
 )
@@ -12,9 +13,6 @@ import (
 type BaselineManifestInput struct {
 	Temporal               TemporalAuthority
 	Clock                  RetentionClockEvidence
-	ClockWorkflowID        string
-	ClockRunID             string
-	ClockTaskQueue         string
 	StandardWorkflows      LegacyWorkflowInventory
 	ArchivedWorkflows      LegacyWorkflowInventory
 	Schedules              ScheduleInventory
@@ -105,9 +103,10 @@ func BuildBaselineManifest(input BaselineManifestInput) (BaselineManifest, error
 		!validLowerHex(input.Clock.HistoryDigest, sha256.Size) || input.Clock.EventCount != 5 ||
 		input.Clock.ObservedAtUTC.IsZero() ||
 		input.Clock.WorkerBuildID != "vane/"+input.SourceRevision ||
-		!boundedCanonicalTemporalText(input.ClockWorkflowID, maxTemporalAuthorityTextBytes) ||
-		!canonicalUUID(input.ClockRunID) ||
-		!boundedCanonicalTemporalText(input.ClockTaskQueue, maxTemporalAuthorityTextBytes) ||
+		input.Clock.Namespace != temporal.Namespace ||
+		!boundedCanonicalTemporalText(input.Clock.WorkflowID, maxTemporalAuthorityTextBytes) ||
+		!canonicalUUID(input.Clock.RunID) ||
+		!boundedCanonicalTemporalText(input.Clock.TaskQueue, maxTemporalAuthorityTextBytes) ||
 		input.StandardWorkflows.Archived || input.StandardWorkflows.Count != len(input.StandardWorkflows.Runs) ||
 		input.Schedules.Count != len(input.Schedules.Items) ||
 		!validLowerHex(input.StandardWorkflows.Digest, sha256.Size) ||
@@ -194,13 +193,31 @@ func BuildBaselineManifest(input BaselineManifestInput) (BaselineManifest, error
 			Count: input.Schedules.Count, Digest: input.Schedules.Digest,
 		},
 		Clock: baselineClockV1{
-			WorkflowID: input.ClockWorkflowID, RunID: input.ClockRunID,
-			TaskQueue: input.ClockTaskQueue, WorkerBuildID: input.Clock.WorkerBuildID,
+			WorkflowID: input.Clock.WorkflowID, RunID: input.Clock.RunID,
+			TaskQueue: input.Clock.TaskQueue, WorkerBuildID: input.Clock.WorkerBuildID,
 			ObservedAtUTC: input.Clock.ObservedAtUTC.UTC().Format("2006-01-02T15:04:05.999999999Z"),
 			HistoryDigest: input.Clock.HistoryDigest, EventCount: input.Clock.EventCount,
 		},
 	}
-	for _, run := range input.StandardWorkflows.Runs {
+	standardRuns := append([]LegacyWorkflowRun(nil), input.StandardWorkflows.Runs...)
+	sort.Slice(standardRuns, func(i, j int) bool {
+		if standardRuns[i].WorkflowID == standardRuns[j].WorkflowID {
+			return standardRuns[i].RunID < standardRuns[j].RunID
+		}
+		return standardRuns[i].WorkflowID < standardRuns[j].WorkflowID
+	})
+	archiveRuns := append([]LegacyWorkflowRun(nil), input.ArchivedWorkflows.Runs...)
+	sort.Slice(archiveRuns, func(i, j int) bool {
+		if archiveRuns[i].WorkflowID == archiveRuns[j].WorkflowID {
+			return archiveRuns[i].RunID < archiveRuns[j].RunID
+		}
+		return archiveRuns[i].WorkflowID < archiveRuns[j].WorkflowID
+	})
+	schedules := append([]ScheduleAuthority(nil), input.Schedules.Items...)
+	sort.Slice(schedules, func(i, j int) bool {
+		return schedules[i].ScheduleID < schedules[j].ScheduleID
+	})
+	for _, run := range standardRuns {
 		manifest.StandardWorkflowRuns = append(manifest.StandardWorkflowRuns,
 			baselineWorkflowV1{
 				WorkflowID: run.WorkflowID, RunID: run.RunID, Status: run.Status,
@@ -208,7 +225,7 @@ func BuildBaselineManifest(input BaselineManifestInput) (BaselineManifest, error
 				HistoryEvents: run.HistoryEvents,
 			})
 	}
-	for _, run := range input.ArchivedWorkflows.Runs {
+	for _, run := range archiveRuns {
 		manifest.ArchivedWorkflowRuns = append(manifest.ArchivedWorkflowRuns,
 			baselineWorkflowV1{
 				WorkflowID: run.WorkflowID, RunID: run.RunID, Status: run.Status,
@@ -216,7 +233,7 @@ func BuildBaselineManifest(input BaselineManifestInput) (BaselineManifest, error
 				HistoryEvents: run.HistoryEvents,
 			})
 	}
-	for _, schedule := range input.Schedules.Items {
+	for _, schedule := range schedules {
 		manifest.Schedules = append(manifest.Schedules, baselineScheduleV1{
 			ScheduleID: schedule.ScheduleID, WorkflowType: schedule.WorkflowType,
 			ActionDigest:      schedule.ActionDigest,

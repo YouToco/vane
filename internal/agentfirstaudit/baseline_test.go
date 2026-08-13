@@ -84,6 +84,34 @@ func TestBuildBaselineManifestAcceptsBoundEnabledArchiveInventory(t *testing.T) 
 	}
 }
 
+func TestBuildBaselineManifestCanonicalizesInventoryOrder(t *testing.T) {
+	input := validBaselineManifestInput(t)
+	runA := validBaselineWorkflowRun()
+	runB := validBaselineWorkflowRun()
+	runB.WorkflowID = "legacy-0"
+	runB.RunID = "123e4567-e89b-42d3-a456-426614174003"
+	digest, err := digestLegacyWorkflowInventory(false, []LegacyWorkflowRun{runA, runB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.StandardWorkflows = LegacyWorkflowInventory{
+		Count: 2, Digest: digest, Runs: []LegacyWorkflowRun{runA, runB},
+	}
+	first, err := BuildBaselineManifest(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.StandardWorkflows.Runs[0], input.StandardWorkflows.Runs[1] =
+		input.StandardWorkflows.Runs[1], input.StandardWorkflows.Runs[0]
+	second, err := BuildBaselineManifest(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Digest != second.Digest || !bytes.Equal(first.Canonical, second.Canonical) {
+		t.Fatal("inventory input order changed canonical baseline")
+	}
+}
+
 func validBaselineManifestInput(t *testing.T) BaselineManifestInput {
 	t.Helper()
 	temporal, err := ReadTemporalAuthority(t.Context(), validNamespaceReader(), "default")
@@ -102,13 +130,12 @@ func validBaselineManifestInput(t *testing.T) BaselineManifestInput {
 	return BaselineManifestInput{
 		Temporal: temporal,
 		Clock: RetentionClockEvidence{
+			Namespace: "default", WorkflowID: "agent-first-retention-clock-baseline",
+			RunID: "123e4567-e89b-42d3-a456-426614174001", TaskQueue: "vane",
 			ObservedAtUTC: time.Date(2026, 8, 13, 18, 0, 0, 123, time.UTC),
 			HistoryDigest: strings.Repeat("b", 64), EventCount: 5,
 			WorkerBuildID: "vane/" + source,
 		},
-		ClockWorkflowID: "agent-first-retention-clock-baseline",
-		ClockRunID:      "123e4567-e89b-42d3-a456-426614174001",
-		ClockTaskQueue:  "vane",
 		StandardWorkflows: LegacyWorkflowInventory{
 			Archived: false, Count: 0, Digest: standardDigest,
 		},

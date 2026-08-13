@@ -23,7 +23,7 @@ func TestReadLegacyWorkflowInventoryReadsEveryPageDescribesAndReplays(t *testing
 	reader := validLegacyWorkflowReader()
 	replayed := 0
 	seenExecutions := map[string]bool{}
-	inventory, err := ReadLegacyWorkflowInventory(t.Context(), reader, "vane", false,
+	inventory, err := readLegacyWorkflowInventoryWithReplayer(t.Context(), reader, "vane", false,
 		func(history *historypb.History, execution sdkworkflow.Execution) error {
 			replayed++
 			want := reader.infos[execution.ID]
@@ -53,7 +53,7 @@ func TestReadLegacyWorkflowInventoryUsesArchivedAuthority(t *testing.T) {
 	}
 	reader.archivedHistory = true
 	reader.describeNotFound = true
-	inventory, err := ReadLegacyWorkflowInventory(t.Context(), reader, "vane", true,
+	inventory, err := readLegacyWorkflowInventoryWithReplayer(t.Context(), reader, "vane", true,
 		func(*historypb.History, sdkworkflow.Execution) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestReadLegacyWorkflowInventoryUsesArchivedAuthority(t *testing.T) {
 func TestReadStableLegacyWorkflowInventoryRejectsSecondScanDrift(t *testing.T) {
 	reader := validLegacyWorkflowReader()
 	reader.driftSecondScan = true
-	if _, err := ReadStableLegacyWorkflowInventory(t.Context(), reader, "vane", false,
+	if _, err := readStableLegacyWorkflowInventoryWithReplayer(t.Context(), reader, "vane", false,
 		func(*historypb.History, sdkworkflow.Execution) error { return nil }); err == nil {
 		t.Fatal("visibility drift accepted")
 	}
@@ -167,7 +167,7 @@ func TestReadLegacyWorkflowInventoryRejectsIncompleteOrDriftingEvidence(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			reader := validLegacyWorkflowReader()
 			tc.mutate(reader)
-			_, err := ReadLegacyWorkflowInventory(t.Context(), reader, "vane", false,
+			_, err := readLegacyWorkflowInventoryWithReplayer(t.Context(), reader, "vane", false,
 				func(*historypb.History, sdkworkflow.Execution) error {
 					if reader.replayFails {
 						return errors.New("nondeterministic")
@@ -178,6 +178,13 @@ func TestReadLegacyWorkflowInventoryRejectsIncompleteOrDriftingEvidence(t *testi
 				t.Fatal("incomplete legacy evidence accepted")
 			}
 		})
+	}
+}
+
+func TestReadLegacyWorkflowInventoryCannotBypassProductionReplayer(t *testing.T) {
+	reader := validLegacyWorkflowReader()
+	if _, err := ReadLegacyWorkflowInventory(t.Context(), reader, "vane", false); err == nil {
+		t.Fatal("non-production-shaped history bypassed the fixed production replayer")
 	}
 }
 

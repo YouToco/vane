@@ -129,13 +129,23 @@ func ReadStableLegacyWorkflowInventory(
 	reader LegacyWorkflowReader,
 	namespace string,
 	archived bool,
+) (LegacyWorkflowInventory, error) {
+	return readStableLegacyWorkflowInventoryWithReplayer(
+		ctx, reader, namespace, archived, ReplayLegacyPushPipeline)
+}
+
+func readStableLegacyWorkflowInventoryWithReplayer(
+	ctx context.Context,
+	reader LegacyWorkflowReader,
+	namespace string,
+	archived bool,
 	replay WorkflowHistoryReplayer,
 ) (LegacyWorkflowInventory, error) {
-	first, err := ReadLegacyWorkflowInventory(ctx, reader, namespace, archived, replay)
+	first, err := readLegacyWorkflowInventoryWithReplayer(ctx, reader, namespace, archived, replay)
 	if err != nil {
 		return LegacyWorkflowInventory{}, err
 	}
-	second, err := ReadLegacyWorkflowInventory(ctx, reader, namespace, archived, replay)
+	second, err := readLegacyWorkflowInventoryWithReplayer(ctx, reader, namespace, archived, replay)
 	if err != nil {
 		return LegacyWorkflowInventory{}, err
 	}
@@ -183,6 +193,16 @@ func RequireWorkflowVisible(
 // callers compare two independent scans and, for disabled archival, directly
 // negative-probe every run retained by the baseline.
 func ReadLegacyWorkflowInventory(
+	ctx context.Context,
+	reader LegacyWorkflowReader,
+	namespace string,
+	archived bool,
+) (LegacyWorkflowInventory, error) {
+	return readLegacyWorkflowInventoryWithReplayer(
+		ctx, reader, namespace, archived, ReplayLegacyPushPipeline)
+}
+
+func readLegacyWorkflowInventoryWithReplayer(
 	ctx context.Context,
 	reader LegacyWorkflowReader,
 	namespace string,
