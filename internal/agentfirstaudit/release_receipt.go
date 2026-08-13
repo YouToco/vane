@@ -19,6 +19,9 @@ const maxReleaseReceiptBytes = 16 << 10
 type ReleaseReceipt struct {
 	SchemaVersion               string `json:"schema_version"`
 	SourceRevision              string `json:"source_revision"`
+	ControlPlaneRevision        string `json:"control_plane_revision"`
+	DeployRunID                 string `json:"deploy_run_id"`
+	DeployRunAttempt            int64  `json:"deploy_run_attempt"`
 	BackendArchiveDigest        string `json:"backend_archive_sha256"`
 	BackendManifestDigest       string `json:"backend_manifest_sha256"`
 	ServerReleaseContractDigest string `json:"server_release_contract_sha256"`
@@ -52,7 +55,9 @@ func ReadVerifiedReleaseReceipt(
 	canonical, err := json.Marshal(receipt)
 	if err != nil || !bytes.Equal(canonical, payload) ||
 		receipt.SchemaVersion != "vane.release-receipt/v1" ||
-		!validSourceRevision(receipt.SourceRevision) {
+		!validSourceRevision(receipt.SourceRevision) ||
+		!validSourceRevision(receipt.ControlPlaneRevision) ||
+		!canonicalUnsignedDecimal(receipt.DeployRunID) || receipt.DeployRunAttempt <= 0 {
 		return VerifiedReleaseReceipt{}, fmt.Errorf("release receipt is not canonical")
 	}
 	for _, digest := range []string{
@@ -79,6 +84,18 @@ func ReadVerifiedReleaseReceipt(
 		Receipt: receipt, Canonical: bytes.Clone(payload),
 		DeployDigest: hex.EncodeToString(sum[:]),
 	}, nil
+}
+
+func canonicalUnsignedDecimal(value string) bool {
+	if value == "" || len(value) > 20 || (len(value) > 1 && value[0] == '0') {
+		return false
+	}
+	for _, current := range value {
+		if current < '0' || current > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func canonicalAbsolutePath(path string) bool {
