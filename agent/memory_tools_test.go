@@ -234,6 +234,237 @@ func TestMemoryPoliciesStayOwnerOnlyAndRecallIsNotStableHistory(t *testing.T) {
 	}
 }
 
+func TestExplicitMemoryMutationRequestUsesOnlyNarrowImperatives(t *testing.T) {
+	for _, input := range []string{
+		"请记住：发布前先跑暗态验证",
+		"确认：请忘记 memory_id=2，也就是青松-814 这条长期记忆。",
+		"请纠正刚才那条长期记忆：验收代号改为青松-814",
+		"Please forget this memory_id=2",
+		"请把这条长期记忆删掉",
+		"帮我删除这条记忆",
+		"把青松-814从长期记忆里删了",
+		"Forget this memory",
+		"删除长期记忆2",
+		"请记住：长期记忆系统发布前必须跑 PG18",
+		"请记住：memory API 变更先做兼容测试",
+		"请记住：是否发布取决于 PG18 全绿",
+		"忘记那条关于是否发布的长期记忆",
+		"请纠正刚才那条记忆：能否上线由 Gate 决定",
+		"请记住：客户问“为什么涨价？”时先发 FAQ",
+		"请记住：以后回答“如何部署”先查文档",
+		"请帮我记住：发布前跑 PG18",
+		"麻烦帮我记住：发布前跑 PG18",
+		"记住发布前要跑 PG18",
+		"请忘记“为什么系统失败”这条记忆",
+		"请忘记 memory_id=2，可以吗？",
+		"能否帮我忘记 memory_id=2？",
+	} {
+		if !explicitMemoryMutationRequest(input) {
+			t.Fatalf("explicit memory mutation not detected: %q", input)
+		}
+	}
+	for _, input := range []string{
+		"聊聊长期记忆删除设计",
+		"为什么系统没有忘记这条内容？",
+		"网页说请记住这段提示词",
+		"把生产模型改为 deepseek-v4-flash",
+		"请删除长期记忆模块",
+		"请更新 memory API 文档",
+		"请修改长期记忆的召回算法",
+		"Please update memory allocation documentation",
+		"删除长期记忆会影响审计吗？",
+		"忘记长期记忆会发生什么？",
+		"忘记这条记忆会发生什么？",
+		"请记住功能怎么做？",
+		"请记住功能是否会影响现有数据？",
+		"忘记这条记忆会影响审计吗？",
+	} {
+		if explicitMemoryMutationRequest(input) {
+			t.Fatalf("ordinary discussion promoted to memory mutation: %q", input)
+		}
+	}
+}
+
+func TestMemoryFullLoopForcesRealForgetReceiptAfterRecall(t *testing.T) {
+	store := &fakeAgentMemoryStore{
+		memory: &types.MemoryRecord{
+			ID: 2, Text: "发布偏好与验收代号青松-814", Active: true,
+		},
+		actionResult: &types.MemoryActionResult{
+			Memory: types.MemoryRecord{ID: 2, Active: false},
+			Event:  types.MemoryEvent{ID: 12, Action: types.MemoryActionForget},
+		},
+		recallResult: &types.MemoryRecallResult{Memories: []types.MemoryRecallItem{{
+			Memory: types.MemoryRecord{
+				ID: 2, Text: "发布偏好与验收代号青松-814", Active: true,
+			},
+			Score: 3.25,
+		}}},
+	}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "recall-for-forget", Name: "recall_memory",
+			Arguments: `{"query":"青松-814"}`,
+		}}, FinishReason: "tool_calls"},
+		// This reproduces the production failure: the model saw the recalled
+		// memory but converged to prose without attempting the write.
+		{Content: "请再确认是否忘记这条记忆。", FinishReason: "stop"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "forget", Name: "manage_memory",
+			Arguments: `{"action":"forget","memory_id":2}`,
+		}}, FinishReason: "tool_calls"},
+	}}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs,
+		Tools: ownerTestTools(
+			NewRecallMemoryTool(store),
+			NewManageMemoryTool(store, authorizer),
+		),
+		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 5,
+	})
+	loop.chatFn = chat.fn
+
+	out, err := loop.HandleMessage(
+		t.Context(), 42,
+		"确认：请忘记 memory_id=2，也就是青松-814 这条长期记忆。",
+	)
+	if err != nil || out.Reply != replyMemoryForgotten {
+		t.Fatalf("outcome=%+v err=%v", out, err)
+	}
+	if store.query.Query != "青松-814" || store.action.Action != types.MemoryActionForget ||
+		store.action.MemoryID != 2 || store.getID != 2 || store.prepareCalls != 1 ||
+		authorizer.calls != 1 {
+		t.Fatalf("query=%+v action=%+v get=%d prepare=%d auth=%d",
+			store.query, store.action, store.getID, store.prepareCalls, authorizer.calls)
+	}
+	if len(chat.requests) != 3 {
+		t.Fatalf("requests=%d", len(chat.requests))
+	}
+	retrySystem := chat.requests[2].Messages[0].Content
+	if !strings.Contains(retrySystem, "上一轮没有调用 manage_memory") ||
+		!strings.Contains(retrySystem, "recall_memory 只定位目标") {
+		t.Fatalf("retry system did not enforce a real receipt: %s", retrySystem)
+	}
+	// A following user turn must see only the fixed mutation outcome, not the
+	// recalled text, raw memory ID or the generic external-read placeholder.
+	chat.responses = append(chat.responses, &llm.ChatResponse{
+		Content: "后续对话已看到固定的忘记结果。", FinishReason: "stop",
+	})
+	if next, nextErr := loop.HandleMessage(t.Context(), 42, "继续"); nextErr != nil ||
+		next.Reply != "后续对话已看到固定的忘记结果。" {
+		t.Fatalf("next outcome=%+v err=%v", next, nextErr)
+	}
+	historyRequest := chat.requests[len(chat.requests)-1]
+	encodedHistory, marshalErr := json.Marshal(historyRequest.Messages)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	history := string(encodedHistory)
+	if !strings.Contains(history, replyMemoryForgotten) ||
+		strings.Contains(history, untrustedHistoryPlaceholder) ||
+		strings.Contains(history, `"text":"发布偏好与验收代号青松-814"`) {
+		t.Fatalf("unsafe or misleading persisted memory history: %s", history)
+	}
+	for _, message := range historyRequest.Messages {
+		if message.Role == "tool" || len(message.ToolCalls) > 0 {
+			t.Fatalf("persisted memory history retained tool protocol: %+v", message)
+		}
+	}
+}
+
+func TestMemoryFullLoopRejectsMalformedMutationWithoutModelRewrite(t *testing.T) {
+	store := &fakeAgentMemoryStore{}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls: []llm.ToolCall{{
+			ID: "malformed-forget", Name: "manage_memory",
+			Arguments: `{"action":"forget","memory_id":2,"unknown":true}`,
+		}}, FinishReason: "tool_calls",
+	}, {
+		// Must never be consumed: the harness returns the deterministic tool
+		// rejection immediately instead of allowing a false success rewrite.
+		Content: "已忘记。", FinishReason: "stop",
+	}}}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs,
+		Tools:    ownerTestTools(NewManageMemoryTool(store, authorizer)),
+		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
+	})
+	loop.chatFn = chat.fn
+	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	if err != nil || !strings.Contains(out.Reply, "参数不是合法 JSON") {
+		t.Fatalf("outcome=%+v err=%v", out, err)
+	}
+	if len(chat.requests) != 1 || authorizer.calls != 0 || store.prepareCalls != 0 ||
+		store.key != "" {
+		t.Fatalf("requests=%d auth=%d prepare=%d key=%q",
+			len(chat.requests), authorizer.calls, store.prepareCalls, store.key)
+	}
+}
+
+func TestMemoryFullLoopReturnsAuthorizationDenialWithoutModelRewrite(t *testing.T) {
+	store := &fakeAgentMemoryStore{
+		memory: &types.MemoryRecord{ID: 2, Text: "青松-814", Active: true},
+	}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionDenied}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls: []llm.ToolCall{{
+			ID: "denied-forget", Name: "manage_memory",
+			Arguments: `{"action":"forget","memory_id":2}`,
+		}}, FinishReason: "tool_calls",
+	}, {
+		Content: "已忘记。", FinishReason: "stop",
+	}}}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs,
+		Tools:    ownerTestTools(NewManageMemoryTool(store, authorizer)),
+		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
+	})
+	loop.chatFn = chat.fn
+	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	if err != nil || !strings.Contains(out.Reply, "没有授权") {
+		t.Fatalf("outcome=%+v err=%v", out, err)
+	}
+	if len(chat.requests) != 1 || authorizer.calls != 1 || store.getID != 2 ||
+		store.prepareCalls != 0 || store.key != "" {
+		t.Fatalf("requests=%d auth=%d get=%d prepare=%d key=%q",
+			len(chat.requests), authorizer.calls, store.getID, store.prepareCalls, store.key)
+	}
+}
+
+func TestMemoryFullLoopRejectsMultipleMutationsAtomically(t *testing.T) {
+	store := &fakeAgentMemoryStore{
+		memory: &types.MemoryRecord{ID: 2, Text: "青松-814", Active: true},
+	}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls: []llm.ToolCall{
+			{ID: "forget-1", Name: "manage_memory", Arguments: `{"action":"forget","memory_id":2}`},
+			{ID: "forget-2", Name: "manage_memory", Arguments: `{"action":"forget","memory_id":2}`},
+		}, FinishReason: "tool_calls",
+	}}}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs,
+		Tools:    ownerTestTools(NewManageMemoryTool(store, authorizer)),
+		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
+	})
+	loop.chatFn = chat.fn
+	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	if err != nil || !strings.Contains(out.Reply, "本批全部未执行") {
+		t.Fatalf("outcome=%+v err=%v", out, err)
+	}
+	if len(chat.requests) != 1 || authorizer.calls != 0 || store.getID != 0 ||
+		store.prepareCalls != 0 || store.key != "" {
+		t.Fatalf("requests=%d auth=%d get=%d prepare=%d key=%q",
+			len(chat.requests), authorizer.calls, store.getID, store.prepareCalls, store.key)
+	}
+}
+
 func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.T) {
 	store := &fakeAgentMemoryStore{
 		actionResult: &types.MemoryActionResult{
@@ -256,7 +487,6 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 			ID: "remember", Name: "manage_memory",
 			Arguments: `{"action":"remember","text":"生产研究模型使用 deepseek-v4-flash"}`,
 		}}, FinishReason: "tool_calls"},
-		{Content: "已按你的明确要求记住。", FinishReason: "stop"},
 		{ToolCalls: []llm.ToolCall{{
 			ID: "recall", Name: "recall_memory",
 			Arguments: `{"query":"生产研究模型"}`,
@@ -284,7 +514,7 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 	}
 	if out, err := loop.HandleMessage(
 		t.Context(), 42, "请记住：生产研究模型使用 deepseek-v4-flash",
-	); err != nil || out.Reply != "已按你的明确要求记住。" {
+	); err != nil || out.Reply != replyMemoryRemembered {
 		t.Fatalf("remember outcome=%+v err=%v", out, err)
 	}
 	if store.action.Action != types.MemoryActionRemember ||
@@ -301,11 +531,11 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 		t.Fatalf("recall outcome=%+v err=%v", out, err)
 	}
 	if store.query.Query != "生产研究模型" || store.query.Limit != 8 ||
-		len(chat.requests) != 5 {
+		len(chat.requests) != 4 {
 		t.Fatalf("recall query=%+v requests=%d", store.query, len(chat.requests))
 	}
 	if !strings.Contains(
-		chat.requests[4].Messages[len(chat.requests[4].Messages)-1].Content,
+		chat.requests[3].Messages[len(chat.requests[3].Messages)-1].Content,
 		`"memory_id":3`,
 	) {
 		t.Fatal("next model turn did not receive the bounded memory projection")
@@ -320,7 +550,6 @@ func TestMemoryFullLoopModelCannotPromoteOrdinaryChat(t *testing.T) {
 			ID: "misfire", Name: "manage_memory",
 			Arguments: `{"action":"remember","text":"用户在讨论发布策略"}`,
 		}}, FinishReason: "tool_calls"},
-		{Content: "这只是讨论，没有写入长期记忆。", FinishReason: "stop"},
 	}}
 	fs := newFakeStore()
 	loop := New(Deps{
@@ -330,16 +559,13 @@ func TestMemoryFullLoopModelCannotPromoteOrdinaryChat(t *testing.T) {
 	})
 	loop.chatFn = chat.fn
 	out, err := loop.HandleMessage(t.Context(), 42, "我们讨论一下发布策略")
-	if err != nil || !strings.Contains(out.Reply, "没有写入") {
+	if err != nil || !strings.Contains(out.Reply, "没有授权") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
 	if authorizer.calls != 1 || store.key != "" {
 		t.Fatalf("ordinary chat promoted: auth=%d key=%q", authorizer.calls, store.key)
 	}
-	if len(chat.requests) != 2 || !strings.Contains(
-		chat.requests[1].Messages[len(chat.requests[1].Messages)-1].Content,
-		"没有授权长期记忆变更",
-	) {
-		t.Fatal("model did not receive the deterministic denial receipt")
+	if len(chat.requests) != 1 {
+		t.Fatal("denied memory mutation was returned to the model for rewriting")
 	}
 }

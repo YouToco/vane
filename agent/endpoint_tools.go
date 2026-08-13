@@ -80,7 +80,14 @@ type toolRunState struct {
 	clarifiedOwnerAction string
 	manageTasksResult    string
 	intents              ToolIntent
-	agentFirstEnabled    bool
+	// memoryMutationRequired is derived only from the trusted current owner
+	// request. It never authorizes a write; it only prevents the model from
+	// claiming an explicit remember/correct/forget request completed before a
+	// real manage_memory attempt produced a tool receipt.
+	memoryMutationRequired         bool
+	memoryMutationResponseRejected bool
+	manageMemoryResult             string
+	agentFirstEnabled              bool
 	// Unified loop breaker state. Provider-specific message caps are not used
 	// for planning; this hidden ceiling only stops repeated or runaway calls.
 	toolExecutions     int
