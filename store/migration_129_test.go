@@ -268,6 +268,75 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		}
 	}
 	assertRuntimeMemoryMembership(false)
+	// Every required authority is part of the startup contract. Removing any
+	// single privilege must fail the same provision operation that deploys and
+	// reconciles the server runtime, rather than surfacing on the first owner
+	// memory request.
+	requiredACLMutations := []struct {
+		name    string
+		revoke  string
+		restore string
+	}{
+		{"schema usage", `REVOKE USAGE ON SCHEMA public FROM vane_memory_editor`, `GRANT USAGE ON SCHEMA public TO vane_memory_editor`},
+		{"authorizations select", `REVOKE SELECT ON memory_authorizations FROM vane_memory_editor`, `GRANT SELECT ON memory_authorizations TO vane_memory_editor`},
+		{"authorizations insert", `REVOKE INSERT ON memory_authorizations FROM vane_memory_editor`, `GRANT INSERT ON memory_authorizations TO vane_memory_editor`},
+		{"records select", `REVOKE SELECT ON memory_records FROM vane_memory_editor`, `GRANT SELECT ON memory_records TO vane_memory_editor`},
+		{"records insert", `REVOKE INSERT ON memory_records FROM vane_memory_editor`, `GRANT INSERT ON memory_records TO vane_memory_editor`},
+		{"events select", `REVOKE SELECT ON memory_events FROM vane_memory_editor`, `GRANT SELECT ON memory_events TO vane_memory_editor`},
+		{"events insert", `REVOKE INSERT ON memory_events FROM vane_memory_editor`, `GRANT INSERT ON memory_events TO vane_memory_editor`},
+		{"receipts select", `REVOKE SELECT ON memory_receipts FROM vane_memory_editor`, `GRANT SELECT ON memory_receipts TO vane_memory_editor`},
+		{"receipts insert", `REVOKE INSERT ON memory_receipts FROM vane_memory_editor`, `GRANT INSERT ON memory_receipts TO vane_memory_editor`},
+		{"records sequence usage", `REVOKE USAGE ON SEQUENCE memory_records_id_seq FROM vane_memory_editor`, `GRANT USAGE ON SEQUENCE memory_records_id_seq TO vane_memory_editor`},
+		{"records sequence select", `REVOKE SELECT ON SEQUENCE memory_records_id_seq FROM vane_memory_editor`, `GRANT SELECT ON SEQUENCE memory_records_id_seq TO vane_memory_editor`},
+		{"events sequence usage", `REVOKE USAGE ON SEQUENCE memory_events_id_seq FROM vane_memory_editor`, `GRANT USAGE ON SEQUENCE memory_events_id_seq TO vane_memory_editor`},
+		{"events sequence select", `REVOKE SELECT ON SEQUENCE memory_events_id_seq FROM vane_memory_editor`, `GRANT SELECT ON SEQUENCE memory_events_id_seq TO vane_memory_editor`},
+		{"authorization consume", `REVOKE UPDATE (consumed_event_id) ON memory_authorizations FROM vane_memory_editor`, `GRANT UPDATE (consumed_event_id) ON memory_authorizations TO vane_memory_editor`},
+	}
+	for _, mutation := range requiredACLMutations {
+		if _, err := database.ExecContext(t.Context(), mutation.revoke); err != nil {
+			t.Fatalf("revoke %s: %v", mutation.name, err)
+		}
+		if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+			!strings.Contains(err.Error(), "required authorities") {
+			t.Fatalf("provision accepted missing %s: %v", mutation.name, err)
+		}
+		if _, err := database.ExecContext(t.Context(), mutation.restore); err != nil {
+			t.Fatalf("restore %s: %v", mutation.name, err)
+		}
+	}
+	// Required privileges must not be delegable by the restricted role.
+	if _, err := database.ExecContext(t.Context(),
+		`GRANT SELECT ON memory_records TO vane_memory_editor WITH GRANT OPTION`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+		!strings.Contains(err.Error(), "unexpected authorities") {
+		t.Fatalf("provision accepted grant-option drift: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(),
+		`REVOKE GRANT OPTION FOR SELECT ON memory_records FROM vane_memory_editor`); err != nil {
+		t.Fatal(err)
+	}
+	// Database CONNECT is a shared-object ACL and is therefore not visible in
+	// relation/schema catalogs. pg_shdepend must nevertheless reject it.
+	if _, err := database.ExecContext(t.Context(), `DO $body$
+	BEGIN
+	  EXECUTE format('GRANT CONNECT ON DATABASE %I TO vane_memory_editor',
+	                 current_database());
+	END $body$`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+		!strings.Contains(err.Error(), "unexpected authorities") {
+		t.Fatalf("provision accepted database CONNECT authority: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `DO $body$
+	BEGIN
+	  EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM vane_memory_editor',
+	                 current_database());
+	END $body$`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := database.ExecContext(t.Context(),
 		`GRANT SELECT ON agent_sessions TO vane_memory_editor`); err != nil {
 		t.Fatal(err)

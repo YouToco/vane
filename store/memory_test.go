@@ -160,6 +160,31 @@ func TestMemoryLedgerRecallIsolationReplayAndLifecyclePostgres(t *testing.T) {
 		t.Fatalf("bare trace created active memory without durable authorization: %v", err)
 	}
 	remember = authorizeMemoryAction(t, st, 1, userA, remember)
+	var recordsBefore, eventsBefore int
+	if err := st.pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM memory_records WHERE tenant_id=1 AND user_id=$1),
+		       (SELECT count(*) FROM memory_events WHERE tenant_id=1 AND user_id=$1)`,
+		userA).Scan(&recordsBefore, &eventsBefore); err != nil {
+		t.Fatal(err)
+	}
+	wrongBinding := remember
+	wrongBinding.Text = "授权后被替换的记忆文本"
+	wrongBinding.Evidence.OwnerRequest = "请记住另一条未授权内容"
+	if _, err := st.ApplyMemoryAction(ctx, 1, userA,
+		strings.Repeat("f", 64), wrongBinding); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("authorization accepted a different action binding: %v", err)
+	}
+	var recordsAfter, eventsAfter int
+	if err := st.pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM memory_records WHERE tenant_id=1 AND user_id=$1),
+		       (SELECT count(*) FROM memory_events WHERE tenant_id=1 AND user_id=$1)`,
+		userA).Scan(&recordsAfter, &eventsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if recordsAfter != recordsBefore || eventsAfter != eventsBefore {
+		t.Fatalf("wrong authorization binding wrote records/events: before=(%d,%d) after=(%d,%d)",
+			recordsBefore, eventsBefore, recordsAfter, eventsAfter)
+	}
 	key := strings.Repeat("1", 64)
 	type outcome struct {
 		result *types.MemoryActionResult

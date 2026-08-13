@@ -22,12 +22,16 @@ type fakeAgentMemoryStore struct {
 	recallResult     *types.MemoryRecallResult
 	err              error
 	authorizationID  string
+	prepareCalls     int
+	preparedAction   types.MemoryAction
 }
 
 func (f *fakeAgentMemoryStore) PrepareMemoryAuthorization(
 	_ context.Context, tenantID, userID, _ int64, action types.MemoryAction,
 ) (string, error) {
-	f.tenantID, f.userID, f.action = tenantID, userID, action
+	f.tenantID, f.userID = tenantID, userID
+	f.prepareCalls++
+	f.preparedAction = action
 	if f.authorizationID == "" {
 		f.authorizationID = "922b377b-12e6-4958-b8d1-fcfb3d7708e3"
 	}
@@ -149,6 +153,9 @@ func TestManageMemoryBindsTrustedEvidenceAndAuthorizesTargetText(t *testing.T) {
 	}
 	if store.action.Evidence.SourceType != types.MemoryEvidenceOwnerExplicitAgentTurn ||
 		store.action.Evidence.SourceID != "695df46b-da69-435a-84d3-c6f3f0a906fe" ||
+		store.action.Evidence.AuthorizationID != store.authorizationID ||
+		store.prepareCalls != 1 ||
+		store.preparedAction.Evidence.AuthorizationID != "" ||
 		len(store.key) != 64 || store.action.MemoryID != 9 {
 		t.Fatalf("key=%q action=%+v", store.key, store.action)
 	}
@@ -282,6 +289,8 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 	}
 	if store.action.Action != types.MemoryActionRemember ||
 		store.action.Text != "生产研究模型使用 deepseek-v4-flash" ||
+		store.prepareCalls != 1 ||
+		store.action.Evidence.AuthorizationID != store.authorizationID ||
 		authorizer.calls != 1 ||
 		!strings.Contains(authorizer.input.OwnerRequest, "请记住") {
 		t.Fatalf("remember action=%+v authorization=%+v", store.action, authorizer.input)

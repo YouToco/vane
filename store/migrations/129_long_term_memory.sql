@@ -275,7 +275,11 @@ GRANT USAGE,SELECT ON SEQUENCE memory_records_id_seq,memory_events_id_seq
 CREATE FUNCTION assert_vane_memory_editor_v129() RETURNS VOID
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE owner_name TEXT:=current_user; role_oid OID; unexpected BIGINT;
+DECLARE
+    owner_name TEXT:=current_user;
+    role_oid OID;
+    unexpected BIGINT;
+    required_acl_count BIGINT;
 BEGIN
     IF session_user<>owner_name THEN
         RAISE EXCEPTION '129: only direct migration owner may validate memory editor'
@@ -307,11 +311,44 @@ BEGIN
     END IF;
 
     SELECT
+      -- pg_shdepend is the complete authority index for this database plus
+      -- shared cluster objects. Exclude only the object addresses that must
+      -- carry the exact ACL enumerated below. Privilege kind, grantor and
+      -- grant-option drift on those objects is still rejected by the catalog
+      -- scans and required_acl_count.
+      (SELECT count(*) FROM pg_catalog.pg_shdepend dependency
+       WHERE dependency.refclassid='pg_authid'::pg_catalog.regclass
+         AND dependency.refobjid=role_oid
+         AND dependency.deptype IN ('a','o')
+         AND (dependency.dbid=0 OR (
+           dependency.dbid=(SELECT oid FROM pg_catalog.pg_database
+                              WHERE datname=pg_catalog.current_database()) AND
+           NOT (
+             (dependency.classid='pg_namespace'::pg_catalog.regclass AND
+              dependency.objid='public'::pg_catalog.regnamespace AND
+              dependency.objsubid=0) OR
+             (dependency.classid='pg_class'::pg_catalog.regclass AND
+              dependency.objid IN (
+                'memory_authorizations'::pg_catalog.regclass,
+                'memory_records'::pg_catalog.regclass,
+                'memory_events'::pg_catalog.regclass,
+                'memory_receipts'::pg_catalog.regclass,
+                'memory_records_id_seq'::pg_catalog.regclass,
+                'memory_events_id_seq'::pg_catalog.regclass) AND
+              dependency.objsubid=0) OR
+             (dependency.classid='pg_class'::pg_catalog.regclass AND
+              dependency.objid='memory_authorizations'::pg_catalog.regclass AND
+              dependency.objsubid=(SELECT attnum FROM pg_catalog.pg_attribute
+                 WHERE attrelid='memory_authorizations'::pg_catalog.regclass
+                   AND attname='consumed_event_id' AND NOT attisdropped))
+           )
+         ))) +
       (SELECT count(*) FROM pg_catalog.pg_namespace object
        CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.nspacl,
            pg_catalog.acldefault('n',object.nspowner))) acl
        WHERE acl.grantee=role_oid AND NOT (
-           object.nspname='public' AND acl.privilege_type='USAGE')) +
+           object.nspname='public' AND acl.privilege_type='USAGE' AND
+           acl.grantor=object.nspowner AND NOT acl.is_grantable)) +
       (SELECT count(*) FROM pg_catalog.pg_class object
        JOIN pg_catalog.pg_namespace namespace ON namespace.oid=object.relnamespace
        CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.relacl,
@@ -320,9 +357,11 @@ BEGIN
        WHERE acl.grantee=role_oid AND NOT (
          namespace.nspname='public' AND (
            (object.relname IN ('memory_authorizations','memory_records','memory_events','memory_receipts')
-             AND acl.privilege_type IN ('SELECT','INSERT')) OR
+             AND acl.privilege_type IN ('SELECT','INSERT') AND
+             acl.grantor=object.relowner AND NOT acl.is_grantable) OR
            (object.relname IN ('memory_records_id_seq','memory_events_id_seq')
-             AND acl.privilege_type IN ('USAGE','SELECT'))))) +
+             AND acl.privilege_type IN ('USAGE','SELECT') AND
+             acl.grantor=object.relowner AND NOT acl.is_grantable)))) +
       (SELECT count(*) FROM pg_catalog.pg_attribute object
        JOIN pg_catalog.pg_class relation ON relation.oid=object.attrelid
        JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
@@ -331,7 +370,8 @@ BEGIN
          namespace.nspname='public' AND
          relation.relname='memory_authorizations' AND
          object.attname='consumed_event_id' AND
-         acl.privilege_type='UPDATE')) +
+         acl.privilege_type='UPDATE' AND acl.grantor=relation.relowner AND
+         NOT acl.is_grantable)) +
       (SELECT count(*) FROM pg_catalog.pg_proc object
        CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.proacl,
            pg_catalog.acldefault('f',object.proowner))) acl
@@ -347,6 +387,42 @@ BEGIN
     IF unexpected<>0 THEN
         RAISE EXCEPTION '129: memory editor retains % unexpected authorities',unexpected
             USING ERRCODE='42501';
+    END IF;
+
+    SELECT
+      (SELECT count(*) FROM pg_catalog.pg_namespace object
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.nspacl,
+           pg_catalog.acldefault('n',object.nspowner))) acl
+       WHERE acl.grantee=role_oid AND object.nspname='public' AND
+             acl.privilege_type='USAGE' AND acl.grantor=object.nspowner AND
+             NOT acl.is_grantable) +
+      (SELECT count(*) FROM pg_catalog.pg_class object
+       JOIN pg_catalog.pg_namespace namespace ON namespace.oid=object.relnamespace
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.relacl,
+           pg_catalog.acldefault(CASE WHEN object.relkind='S' THEN 's'::"char"
+                                     ELSE 'r'::"char" END,object.relowner))) acl
+       WHERE acl.grantee=role_oid AND namespace.nspname='public' AND
+             acl.grantor=object.relowner AND NOT acl.is_grantable AND (
+               (object.relname IN ('memory_authorizations','memory_records',
+                                   'memory_events','memory_receipts') AND
+                acl.privilege_type IN ('SELECT','INSERT')) OR
+               (object.relname IN ('memory_records_id_seq','memory_events_id_seq') AND
+                acl.privilege_type IN ('USAGE','SELECT')))) +
+      (SELECT count(*) FROM pg_catalog.pg_attribute object
+       JOIN pg_catalog.pg_class relation ON relation.oid=object.attrelid
+       JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+       CROSS JOIN LATERAL pg_catalog.aclexplode(object.attacl) acl
+       WHERE acl.grantee=role_oid AND namespace.nspname='public' AND
+             relation.relname='memory_authorizations' AND
+             object.attname='consumed_event_id' AND
+             acl.privilege_type='UPDATE' AND acl.grantor=relation.relowner AND
+             NOT acl.is_grantable)
+      INTO required_acl_count;
+    -- public USAGE (1), table SELECT+INSERT (8), sequence USAGE+SELECT
+    -- (4), and the single consumed_event_id column UPDATE (1).
+    IF required_acl_count<>14 THEN
+        RAISE EXCEPTION '129: memory editor has % of 14 required authorities',
+            required_acl_count USING ERRCODE='42501';
     END IF;
 END $$;
 -- +goose StatementEnd
