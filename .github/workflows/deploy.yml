@@ -451,7 +451,7 @@ jobs:
               "${{ steps.server_contract.outputs.value }}" \
             --control-plane-revision "${{ github.sha }}" \
             --deploy-run-id "${{ github.run_id }}" \
-            --deploy-run-attempt "${{ github.run_attempt }}" \
+            --build-run-attempt "${{ github.run_attempt }}" \
             --output "$HANDOFF_ROOT/backend"
 
       # GitHub Artifact storage is billing-coupled. An exact same-run cache
@@ -635,6 +635,8 @@ jobs:
           "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" validate \
             --component backend \
             --sha "${{ needs.plan.outputs.backend_sha }}" \
+            --control-plane-revision "${{ github.sha }}" \
+            --deploy-run-id "${{ github.run_id }}" \
             --input "$HANDOFF_ROOT/backend" \
             --output "$DEPLOY_ROOT/verified/backend"
 

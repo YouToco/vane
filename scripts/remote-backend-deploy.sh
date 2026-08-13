@@ -18,7 +18,6 @@ release_sha=${release_suffix:0:40}
   echo "unsafe release SHA" >&2
   exit 1
 }
-release_dir=/opt/vane/releases/$release_sha
 old_vane_recovery_required=false
 old_vane_restart_safe=false
 previous_vane_snapshot_ready=false
@@ -1605,6 +1604,12 @@ actual_server_release_contract=$(
 }
 stage_vane_digest=$(sha256sum "$stage/bin/vane" | awk '{print $1}')
 stage_collector_digest=$(sha256sum "$stage/bin/agentfirstretention" | awk '{print $1}')
+release_receipt_digest=$(sha256sum "$stage/release-receipt.json" | awk '{print $1}')
+[[ $release_receipt_digest =~ ^[0-9a-f]{64}$ ]] || {
+  echo "incoming Agent-first release receipt digest is invalid" >&2
+  exit 1
+}
+release_dir=/opt/vane/releases/$release_receipt_digest
 grep -Fq '"source_revision":"'"$release_sha"'"' \
   "$stage/release-receipt.json" &&
   grep -Fq '"vane_sha256":"'"$stage_vane_digest"'"' \
@@ -2201,25 +2206,12 @@ cmp -s -- /proc/"$vane_pid"/exe /opt/vane/bin/vane &&
     echo "live vane process differs from the deployed artifact" >&2
     exit 1
   }
-install -d -o root -g root -m 0755 /opt/vane/releases
-if [[ -e $release_dir || -L $release_dir ]]; then
-  [[ -d $release_dir && ! -L $release_dir &&
-     -f $release_dir/agentfirstretention && ! -L $release_dir/agentfirstretention &&
-     -f $release_dir/release-receipt.json && ! -L $release_dir/release-receipt.json ]] || {
-    echo "existing versioned collector release is unsafe" >&2
-    exit 1
-  }
-  cmp -s -- "$stage/bin/agentfirstretention" "$release_dir/agentfirstretention" &&
-    cmp -s -- "$stage/release-receipt.json" "$release_dir/release-receipt.json" || {
-      echo "existing versioned collector release differs" >&2
-      exit 1
-    }
-else
-  install -d -o root -g root -m 0755 "$release_dir"
-  install -o root -g root -m 0755 "$stage/bin/agentfirstretention" \
-    "$release_dir/agentfirstretention"
-  install -o root -g root -m 0644 "$stage/release-receipt.json" \
-    "$release_dir/release-receipt.json"
-fi
+[[ -f $stage/publish-retention-release.sh &&
+   ! -L $stage/publish-retention-release.sh ]] || {
+  echo "retention release publisher is unavailable" >&2
+  exit 1
+}
+bash "$stage/publish-retention-release.sh" /opt/vane/releases \
+  "$stage/bin/agentfirstretention" "$stage/release-receipt.json" >/dev/null
 old_vane_recovery_required=false
 gateway_recovery_required=false

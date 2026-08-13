@@ -51,6 +51,18 @@ class ArtifactValidationTest(unittest.TestCase):
     def archive_path(self, case: Path) -> Path:
         return case / f"frontend-{SHA}.tar.gz"
 
+    def _write_backend_source(self, source: Path) -> None:
+        for name, mode in artifact.BACKEND_FILES.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if name.startswith("bin/"):
+                path.write_bytes(
+                    f"fixture vcs.revision={SHA} vcs.modified=false\n".encode()
+                )
+            else:
+                path.write_text(f"fixture {name}\n", encoding="utf-8")
+            path.chmod(mode)
+
     def refresh_archive_metadata(self, case: Path) -> None:
         archive_path = self.archive_path(case)
         digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
@@ -80,16 +92,7 @@ class ArtifactValidationTest(unittest.TestCase):
 
     def test_backend_round_trip_includes_collector_and_release_receipt(self) -> None:
         source = self.root / "backend-source"
-        for name, mode in artifact.BACKEND_FILES.items():
-            path = source / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if name.startswith("bin/"):
-                path.write_bytes(
-                    f"fixture vcs.revision={SHA} vcs.modified=false\n".encode()
-                )
-            else:
-                path.write_text(f"fixture {name}\n", encoding="utf-8")
-            path.chmod(mode)
+        self._write_backend_source(source)
         packed = self.root / "backend-packed"
         artifact.pack(
             "backend",
@@ -102,7 +105,11 @@ class ArtifactValidationTest(unittest.TestCase):
             2,
         )
         output = self.root / "backend-verified"
-        artifact.validate("backend", SHA, packed, output)
+        artifact.validate(
+            "backend", SHA, packed, output,
+            control_plane_revision=CONTROL_SHA,
+            deploy_run_id="123456",
+        )
         self.assertTrue((output / "bin/vane-research-prepare").is_file())
         self.assertTrue((output / "bin/agentfirstretention").is_file())
         receipt_raw = (output / "release-receipt.json").read_text(encoding="utf-8")
@@ -118,7 +125,7 @@ class ArtifactValidationTest(unittest.TestCase):
                 "source_revision",
                 "control_plane_revision",
                 "deploy_run_id",
-                "deploy_run_attempt",
+                "build_run_attempt",
                 "backend_archive_sha256",
                 "backend_manifest_sha256",
                 "server_release_contract_sha256",
@@ -130,7 +137,7 @@ class ArtifactValidationTest(unittest.TestCase):
         self.assertEqual(receipt["source_revision"], SHA)
         self.assertEqual(receipt["control_plane_revision"], CONTROL_SHA)
         self.assertEqual(receipt["deploy_run_id"], "123456")
-        self.assertEqual(receipt["deploy_run_attempt"], 2)
+        self.assertEqual(receipt["build_run_attempt"], 2)
         self.assertEqual(
             receipt["backend_manifest_sha256"],
             artifact.sha256_file(packed / f"backend-{SHA}.manifest.json"),
@@ -143,17 +150,46 @@ class ArtifactValidationTest(unittest.TestCase):
             for entry in manifest["files"]
             if entry["path"] == "bin/vane-research-prepare"
         )
-        self.assertEqual(
-            prepare_entry["mode"],
-            0o755,
-        )
+        self.assertEqual(prepare_entry["mode"], 0o755)
         collector_entry = next(
             entry
             for entry in manifest["files"]
             if entry["path"] == "bin/agentfirstretention"
         )
-        self.assertEqual(receipt["agentfirstretention_sha256"], collector_entry["sha256"])
+        self.assertEqual(
+            receipt["agentfirstretention_sha256"], collector_entry["sha256"]
+        )
 
+    def test_backend_pack_is_byte_deterministic(self) -> None:
+        source = self.root / "backend-deterministic-source"
+        self._write_backend_source(source)
+        first = self.root / "backend-deterministic-first"
+        second = self.root / "backend-deterministic-second"
+        for output in (first, second):
+            artifact.pack(
+                "backend", source, SHA, output,
+                artifact.SERVER_RELEASE_CONTRACT, CONTROL_SHA, "123456", 2,
+            )
+        for suffix in ("tar.gz", "manifest.json", "sha256"):
+            name = f"backend-{SHA}.{suffix}"
+            self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+
+    def test_backend_validate_binds_control_plane_and_run(self) -> None:
+        source = self.root / "backend-identity-source"
+        self._write_backend_source(source)
+        packed = self.root / "backend-identity-packed"
+        artifact.pack(
+            "backend", source, SHA, packed,
+            artifact.SERVER_RELEASE_CONTRACT, CONTROL_SHA, "123456", 2,
+        )
+        for control, run_id in (("f" * 40, "123456"), (CONTROL_SHA, "654321")):
+            with self.assertRaises(ValueError):
+                artifact.validate(
+                    "backend", SHA, packed,
+                    self.root / f"identity-out-{control[:4]}-{run_id}",
+                    control_plane_revision=control,
+                    deploy_run_id=run_id,
+                )
     def test_backend_pack_fails_without_research_prepare(self) -> None:
         source = self.root / "backend-incomplete"
         for name, mode in artifact.BACKEND_FILES.items():

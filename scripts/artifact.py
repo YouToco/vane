@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -116,7 +117,7 @@ def pack(
     server_release_contract: str | None = None,
     control_plane_revision: str | None = None,
     deploy_run_id: str | None = None,
-    deploy_run_attempt: int | None = None,
+    build_run_attempt: int | None = None,
 ) -> None:
     source_sha = validate_sha(source_sha)
     if component == "backend":
@@ -127,7 +128,7 @@ def pack(
         control_plane_revision = validate_sha(control_plane_revision)
         if not deploy_run_id or not deploy_run_id.isascii() or not deploy_run_id.isdigit():
             raise ValueError("backend deploy run ID is invalid")
-        if not isinstance(deploy_run_attempt, int) or deploy_run_attempt <= 0:
+        if not isinstance(build_run_attempt, int) or build_run_attempt <= 0:
             raise ValueError("backend deploy run attempt is invalid")
     elif server_release_contract is not None:
         raise ValueError("frontend artifact cannot carry a server release contract")
@@ -140,27 +141,29 @@ def pack(
     files = source_files(component, source)
     manifest_files = []
 
-    with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-        for name, file_path, mode in files:
-            file_stat = file_path.stat()
-            info = tarfile.TarInfo(name=name)
-            info.size = file_stat.st_size
-            info.mode = mode
-            info.mtime = 0
-            info.uid = 0
-            info.gid = 0
-            info.uname = ""
-            info.gname = ""
-            with file_path.open("rb") as handle:
-                archive.addfile(info, handle)
-            manifest_files.append(
-                {
-                    "path": name,
-                    "sha256": sha256_file(file_path),
-                    "size": file_stat.st_size,
-                    "mode": mode,
-                }
-            )
+    with archive_path.open("xb") as raw_archive:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw_archive, mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                for name, file_path, mode in files:
+                    file_stat = file_path.stat()
+                    info = tarfile.TarInfo(name=name)
+                    info.size = file_stat.st_size
+                    info.mode = mode
+                    info.mtime = 0
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    with file_path.open("rb") as handle:
+                        archive.addfile(info, handle)
+                    manifest_files.append(
+                        {
+                            "path": name,
+                            "sha256": sha256_file(file_path),
+                            "size": file_stat.st_size,
+                            "mode": mode,
+                        }
+                    )
 
     archive_sha256 = sha256_file(archive_path)
     manifest = {
@@ -176,7 +179,7 @@ def pack(
         manifest["server_release_contract"] = server_release_contract
         manifest["control_plane_revision"] = control_plane_revision
         manifest["deploy_run_id"] = deploy_run_id
-        manifest["deploy_run_attempt"] = deploy_run_attempt
+        manifest["build_run_attempt"] = build_run_attempt
     manifest_path = output / f"{component}-{source_sha}.manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -201,7 +204,12 @@ def strict_object(pairs: list[tuple[str, object]]) -> dict:
 
 
 def validate(
-    component: str, source_sha: str, input_dir: Path, output_dir: Path
+    component: str,
+    source_sha: str,
+    input_dir: Path,
+    output_dir: Path,
+    control_plane_revision: str | None = None,
+    deploy_run_id: str | None = None,
 ) -> None:
     source_sha = validate_sha(source_sha)
     archive_name = f"{component}-{source_sha}.tar.gz"
@@ -245,7 +253,7 @@ def validate(
     if component == "backend":
         manifest_keys.extend((
             "server_release_contract", "control_plane_revision",
-            "deploy_run_id", "deploy_run_attempt",
+            "deploy_run_id", "build_run_attempt",
         ))
     exact_keys(manifest, manifest_keys, "manifest")
     if manifest["schema"] != SCHEMA:
@@ -257,15 +265,26 @@ def validate(
     ):
         raise ValueError("backend server release contract is not exact")
     if component == "backend":
-        validate_sha(manifest["control_plane_revision"])
+        if control_plane_revision is None:
+            raise ValueError("backend expected control-plane revision is required")
+        control_plane_revision = validate_sha(control_plane_revision)
         if (
             not isinstance(manifest["deploy_run_id"], str)
             or not manifest["deploy_run_id"].isascii()
             or not manifest["deploy_run_id"].isdigit()
-            or not isinstance(manifest["deploy_run_attempt"], int)
-            or manifest["deploy_run_attempt"] <= 0
+            or not isinstance(manifest["build_run_attempt"], int)
+            or manifest["build_run_attempt"] <= 0
         ):
             raise ValueError("backend deployment identity is invalid")
+        if (
+            manifest["control_plane_revision"] != control_plane_revision
+            or manifest["deploy_run_id"] != deploy_run_id
+        ):
+            raise ValueError("backend deployment identity differs from this run")
+    elif any(value is not None for value in (
+        control_plane_revision, deploy_run_id
+    )):
+        raise ValueError("frontend validation cannot carry deployment identity")
     if manifest["archive"] != archive_name:
         raise ValueError("manifest archive name is not exact")
     archive_path = input_dir / archive_name
@@ -384,7 +403,7 @@ def validate(
                 "source_revision": source_sha,
                 "control_plane_revision": manifest["control_plane_revision"],
                 "deploy_run_id": manifest["deploy_run_id"],
-                "deploy_run_attempt": manifest["deploy_run_attempt"],
+                "build_run_attempt": manifest["build_run_attempt"],
                 "backend_archive_sha256": archive_sha256,
                 "backend_manifest_sha256": sha256_file(input_dir / manifest_name),
                 "server_release_contract_sha256": hashlib.sha256(
@@ -417,9 +436,11 @@ def main() -> None:
             sub.add_argument("--server-release-contract")
             sub.add_argument("--control-plane-revision")
             sub.add_argument("--deploy-run-id")
-            sub.add_argument("--deploy-run-attempt", type=int)
+            sub.add_argument("--build-run-attempt", type=int)
         else:
             sub.add_argument("--input", type=Path, required=True)
+            sub.add_argument("--control-plane-revision")
+            sub.add_argument("--deploy-run-id")
         sub.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -432,10 +453,17 @@ def main() -> None:
             args.server_release_contract,
             args.control_plane_revision,
             args.deploy_run_id,
-            args.deploy_run_attempt,
+            args.build_run_attempt,
         )
     else:
-        validate(args.component, args.sha, args.input, args.output)
+        validate(
+            args.component,
+            args.sha,
+            args.input,
+            args.output,
+            args.control_plane_revision,
+            args.deploy_run_id,
+        )
 
 
 if __name__ == "__main__":

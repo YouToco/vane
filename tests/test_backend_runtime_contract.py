@@ -65,10 +65,6 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertIn("vane-legacy-compat.service", deploy)
         self.assertIn("vane-legacy-compat.service", remote)
         self.assertIn('"$payload/release-receipt.json"', deploy)
-        self.assertIn("release_dir=/opt/vane/releases/$release_sha", remote)
-        self.assertIn('"$release_dir/agentfirstretention"', remote)
-        self.assertIn('"$release_dir/release-receipt.json"', remote)
-        self.assertIn("existing versioned collector release differs", remote)
         self.assertIn(
             "incoming Agent-first release receipt differs from staged binaries",
             remote,
@@ -79,9 +75,16 @@ class BackendRuntimeContractTest(unittest.TestCase):
             remote,
         )
         self.assertNotIn("rm -rf -- /opt/vane/releases", remote)
-        receipt_publish = remote.rindex(
-            'install -o root -g root -m 0644 "$stage/release-receipt.json"'
+        publisher = (ROOT / "scripts" / "publish-retention-release.sh").read_text(
+            encoding="utf-8"
         )
+        self.assertIn('pending=$(mktemp -d "$release_root/.', publisher)
+        self.assertIn('mv -T -- "$pending" "$release_dir"', publisher)
+        self.assertIn('trap cleanup EXIT', publisher)
+        self.assertIn('trusted_directory "$release_root" 755', publisher)
+        self.assertIn('trusted_file "$release_dir/agentfirstretention" 755', publisher)
+        self.assertIn('trusted_file "$release_dir/release-receipt.json" 644', publisher)
+        receipt_publish = remote.rindex('bash "$stage/publish-retention-release.sh"')
         final_gate = remote.rindex(
             "/opt/vane/bin/gate -env /opt/vane/env/server.env"
         )
