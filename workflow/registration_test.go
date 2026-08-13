@@ -61,7 +61,10 @@ func TestRetiredPushWorkflowIsNotRegisteredInProduction(t *testing.T) {
 	for _, m := range workflowRegisterRe.FindAllStringSubmatch(src, -1) {
 		got[m[1]] = true
 	}
-	for _, name := range []string{"ResearchShadowWorkflowV3", "ResearchScheduledWorkflowV3"} {
+	for _, name := range []string{
+		"ResearchShadowWorkflowV3", "ResearchScheduledWorkflowV3",
+		"AgentFirstRetentionClockWorkflowV1",
+	} {
 		if !got[name] {
 			t.Errorf("current V3 Workflow %s is not registered", name)
 		}
