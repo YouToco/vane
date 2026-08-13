@@ -1423,7 +1423,7 @@ func TestDefaults(t *testing.T) {
 		{"llm.agent_provider", cfg.LLM.AgentProvider, ""},
 		{"llm.agent_base_url", cfg.LLM.AgentBaseURL, ""},
 		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-pro"},
-		{"llm.research_model", cfg.LLM.ResearchModel, "deepseek-v4-pro"},
+		{"llm.research_model", cfg.LLM.ResearchModel, "deepseek-v4-flash"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 32},
 		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(1)},
 		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(1)},
@@ -1461,6 +1461,17 @@ func TestDefaults(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s = %v, 期望默认值 %v", c.name, c.got, c.want)
 		}
+	}
+}
+
+func TestValidateDefaultsResearchModelToFlash(t *testing.T) {
+	cfg := Config{DB: DBConfig{URL: "postgres://test"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.ResearchModel != "deepseek-v4-flash" {
+		t.Fatalf("research model = %q, want deepseek-v4-flash",
+			cfg.LLM.ResearchModel)
 	}
 }
 
