@@ -329,6 +329,7 @@ func TestMigration128SchemaUpDoesNotChangeClusterRuntimeMembershipPostgres(t *te
 	// Ordinary per-database schema migration must not alter a cluster-global
 	// identity shared by other databases in the PostgreSQL cluster.
 	assertRuntimeProjectorMembership(true)
+
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
 		t.Fatal(err)
 	}

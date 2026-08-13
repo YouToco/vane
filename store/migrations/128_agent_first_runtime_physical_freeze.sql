@@ -130,14 +130,22 @@ BEGIN
         EXECUTE 'REVOKE vane_agent_session_fact_projector FROM vane_server_runtime';
     END IF;
     SELECT
-      -- pg_shdepend is the cluster-wide authority index.  The projector is a
-      -- cluster-global role, so a per-database catalog scan cannot prove that
-      -- another database did not grant it CONNECT, object ACLs, ownership,
-      -- policy membership, or another shared dependency.  After retirement
-      -- this role is allowed to have no shared dependency at all.
+      -- pg_shdepend is the authority index for this database plus shared
+      -- cluster objects.  It catches ACL/ownership classes omitted by local
+      -- relation scans (types, FDWs, parameters, and database CONNECT,
+      -- including CONNECT on another database).  Dependencies owned by a
+      -- different database are deliberately outside this per-database schema
+      -- transition: an older database in the same cluster may still be at
+      -- schema 127, and ordinary migration/provision tests exercise that
+      -- coexistence concurrently.
       (SELECT count(*) FROM pg_catalog.pg_shdepend dependency
        WHERE dependency.refclassid='pg_authid'::pg_catalog.regclass
-         AND dependency.refobjid=role_oid) +
+         AND dependency.refobjid=role_oid
+         AND dependency.deptype IN ('a','o')
+         AND (dependency.dbid=0 OR dependency.dbid=(
+             SELECT oid FROM pg_catalog.pg_database
+              WHERE datname=pg_catalog.current_database()
+         ))) +
       (SELECT count(*) FROM pg_catalog.pg_auth_members edge
        JOIN pg_catalog.pg_roles member ON member.oid=edge.member
        WHERE (edge.roleid=role_oid AND member.rolname<>owner_name)
