@@ -26,7 +26,7 @@ class ReleaseHandoffTests(unittest.TestCase):
     def test_handoffs_are_exact_to_run_component_and_source(self) -> None:
         for component in ("backend", "frontend"):
             key = (
-                "vane-release-v1-${{ github.run_id }}-"
+                "vane-release-v2-${{ github.run_id }}-"
                 f"{component}-${{{{ needs.plan.outputs.{component}_sha }}}}"
             )
             self.assertEqual(self.workflow.count(f"key: {key}"), 3)
@@ -36,7 +36,7 @@ class ReleaseHandoffTests(unittest.TestCase):
 
         self.assertNotIn("restore-keys:", self.workflow)
         self.assertNotIn(
-            "vane-release-v1-${{ github.run_id }}-${{ github.run_attempt }}",
+            "vane-release-v2-${{ github.run_id }}-${{ github.run_attempt }}",
             self.workflow,
         )
         self.assertEqual(self.workflow.count("lookup-only: true"), 2)

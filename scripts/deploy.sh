@@ -142,6 +142,7 @@ deploy_backend() {
 
   local binary infra legacy_compat_unit primary_unit gateway_unit
   for binary in vane useradmin gate runtimeadmin vane-migrate \
+    agentfirstretention \
     vane-research-gateway vane-research-prepare researchshadow \
     researchcutover; do
     [[ -x $payload/bin/$binary ]] || {
@@ -236,11 +237,15 @@ deploy_backend() {
     "$payload/bin/gate" \
     "$payload/bin/runtimeadmin" \
     "$payload/bin/vane-migrate" \
+    "$payload/bin/agentfirstretention" \
     "$payload/bin/vane-research-gateway" \
     "$payload/bin/vane-research-prepare" \
     "$payload/bin/researchshadow" \
     "$payload/bin/researchcutover" \
     "$backend_ssh_target:$backend_remote_stage/bin/"
+  scp "${scp_opts[@]}" \
+    "$payload/release-receipt.json" \
+    "$backend_ssh_target:$backend_remote_stage/"
   scp "${scp_opts[@]}" \
     "$payload/deploy/Caddyfile" \
     "$payload/deploy/docker-compose.yml" \

@@ -404,11 +404,13 @@ jobs:
           go build -buildvcs=true -o bin/gate ./cmd/gate
           go build -buildvcs=true -o bin/runtimeadmin ./cmd/runtimeadmin
           go build -buildvcs=true -o bin/vane-migrate ./cmd/migrate
+          go build -buildvcs=true -o bin/agentfirstretention ./cmd/agentfirstretention
           go build -buildvcs=true -o bin/vane-research-gateway ./cmd/researchgateway
           go build -buildvcs=true -o bin/vane-research-prepare ./cmd/researchprepare
           go build -buildvcs=true -o bin/researchshadow ./cmd/researchshadow
           go build -buildvcs=true -o bin/researchcutover ./cmd/researchcutover
           for binary in vane useradmin gate runtimeadmin vane-migrate \
+            agentfirstretention \
             vane-research-gateway vane-research-prepare researchshadow \
             researchcutover; do
             go version -m "bin/$binary" |
@@ -447,6 +449,9 @@ jobs:
             --source "$BUILD_ROOT/source/vane-release" \
             --server-release-contract \
               "${{ steps.server_contract.outputs.value }}" \
+            --control-plane-revision "${{ github.sha }}" \
+            --deploy-run-id "${{ github.run_id }}" \
+            --deploy-run-attempt "${{ github.run_attempt }}" \
             --output "$HANDOFF_ROOT/backend"
 
       # GitHub Artifact storage is billing-coupled. An exact same-run cache
@@ -457,7 +462,7 @@ jobs:
         if: needs.plan.outputs.backend_changed == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: vane-release-v1-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
+          key: vane-release-v2-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
           path: release-handoff/backend
 
       # cache/save deliberately treats several remote save failures as
@@ -467,7 +472,7 @@ jobs:
         if: needs.plan.outputs.backend_changed == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: vane-release-v1-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
+          key: vane-release-v2-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
           path: release-handoff/backend
           lookup-only: true
           fail-on-cache-miss: true
@@ -532,14 +537,14 @@ jobs:
         if: needs.plan.outputs.frontend_changed == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: vane-release-v1-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
+          key: vane-release-v2-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
           path: release-handoff/frontend
 
       - name: Verify frontend release handoff is remotely visible
         if: needs.plan.outputs.frontend_changed == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: vane-release-v1-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
+          key: vane-release-v2-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
           path: release-handoff/frontend
           lookup-only: true
           fail-on-cache-miss: true
@@ -611,7 +616,7 @@ jobs:
         if: needs.plan.outputs.backend_changed == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: vane-release-v1-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
+          key: vane-release-v2-${{ github.run_id }}-backend-${{ needs.plan.outputs.backend_sha }}
           path: release-handoff/backend
           fail-on-cache-miss: true
 
@@ -620,7 +625,7 @@ jobs:
         if: needs.plan.outputs.frontend_changed == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: vane-release-v1-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
+          key: vane-release-v2-${{ github.run_id }}-frontend-${{ needs.plan.outputs.frontend_sha }}
           path: release-handoff/frontend
           fail-on-cache-miss: true
 

@@ -21,6 +21,7 @@ SPEC.loader.exec_module(artifact)
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 OTHER_SHA = "1123456789abcdef0123456789abcdef01234567"
+CONTROL_SHA = "2123456789abcdef0123456789abcdef01234567"
 
 
 class ArtifactValidationTest(unittest.TestCase):
@@ -77,7 +78,7 @@ class ArtifactValidationTest(unittest.TestCase):
     def test_wrong_source_sha_is_rejected(self) -> None:
         self.assert_rejected(self.good, OTHER_SHA)
 
-    def test_backend_round_trip_includes_research_prepare(self) -> None:
+    def test_backend_round_trip_includes_collector_and_release_receipt(self) -> None:
         source = self.root / "backend-source"
         for name, mode in artifact.BACKEND_FILES.items():
             path = source / name
@@ -96,10 +97,44 @@ class ArtifactValidationTest(unittest.TestCase):
             SHA,
             packed,
             artifact.SERVER_RELEASE_CONTRACT,
+            CONTROL_SHA,
+            "123456",
+            2,
         )
         output = self.root / "backend-verified"
         artifact.validate("backend", SHA, packed, output)
         self.assertTrue((output / "bin/vane-research-prepare").is_file())
+        self.assertTrue((output / "bin/agentfirstretention").is_file())
+        receipt_raw = (output / "release-receipt.json").read_text(encoding="utf-8")
+        receipt = json.loads(receipt_raw, object_pairs_hook=artifact.strict_object)
+        self.assertEqual(
+            receipt_raw,
+            json.dumps(receipt, separators=(",", ":")),
+        )
+        self.assertEqual(
+            set(receipt),
+            {
+                "schema_version",
+                "source_revision",
+                "control_plane_revision",
+                "deploy_run_id",
+                "deploy_run_attempt",
+                "backend_archive_sha256",
+                "backend_manifest_sha256",
+                "server_release_contract_sha256",
+                "vane_sha256",
+                "agentfirstretention_sha256",
+            },
+        )
+        self.assertEqual(receipt["schema_version"], "vane.release-receipt/v1")
+        self.assertEqual(receipt["source_revision"], SHA)
+        self.assertEqual(receipt["control_plane_revision"], CONTROL_SHA)
+        self.assertEqual(receipt["deploy_run_id"], "123456")
+        self.assertEqual(receipt["deploy_run_attempt"], 2)
+        self.assertEqual(
+            receipt["backend_manifest_sha256"],
+            artifact.sha256_file(packed / f"backend-{SHA}.manifest.json"),
+        )
         manifest = json.loads(
             (packed / f"backend-{SHA}.manifest.json").read_text(encoding="utf-8")
         )
@@ -112,6 +147,12 @@ class ArtifactValidationTest(unittest.TestCase):
             prepare_entry["mode"],
             0o755,
         )
+        collector_entry = next(
+            entry
+            for entry in manifest["files"]
+            if entry["path"] == "bin/agentfirstretention"
+        )
+        self.assertEqual(receipt["agentfirstretention_sha256"], collector_entry["sha256"])
 
     def test_backend_pack_fails_without_research_prepare(self) -> None:
         source = self.root / "backend-incomplete"
@@ -129,6 +170,9 @@ class ArtifactValidationTest(unittest.TestCase):
                 SHA,
                 self.root / "backend-rejected",
                 artifact.SERVER_RELEASE_CONTRACT,
+                CONTROL_SHA,
+                "123456",
+                2,
             )
 
     def test_backend_pack_requires_exact_server_release_contract(self) -> None:

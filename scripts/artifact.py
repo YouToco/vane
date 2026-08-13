@@ -13,7 +13,7 @@ import stat
 import tarfile
 from typing import Iterable
 
-SCHEMA = 1
+SCHEMA = 2
 MAX_TOTAL_SIZE = 1_000_000_000
 MAX_FILE_SIZE = 500_000_000
 SERVER_RELEASE_CONTRACT = (
@@ -26,6 +26,7 @@ BACKEND_FILES = {
     "bin/gate": 0o755,
     "bin/runtimeadmin": 0o755,
     "bin/vane-migrate": 0o755,
+    "bin/agentfirstretention": 0o755,
     "bin/vane-research-gateway": 0o755,
     "bin/vane-research-prepare": 0o755,
     "bin/researchshadow": 0o755,
@@ -113,11 +114,21 @@ def pack(
     source_sha: str,
     output: Path,
     server_release_contract: str | None = None,
+    control_plane_revision: str | None = None,
+    deploy_run_id: str | None = None,
+    deploy_run_attempt: int | None = None,
 ) -> None:
     source_sha = validate_sha(source_sha)
     if component == "backend":
         if server_release_contract != SERVER_RELEASE_CONTRACT:
             raise ValueError("backend server release contract is not exact")
+        if control_plane_revision is None:
+            raise ValueError("backend control-plane revision is required")
+        control_plane_revision = validate_sha(control_plane_revision)
+        if not deploy_run_id or not deploy_run_id.isascii() or not deploy_run_id.isdigit():
+            raise ValueError("backend deploy run ID is invalid")
+        if not isinstance(deploy_run_attempt, int) or deploy_run_attempt <= 0:
+            raise ValueError("backend deploy run attempt is invalid")
     elif server_release_contract is not None:
         raise ValueError("frontend artifact cannot carry a server release contract")
     if output.exists() and any(output.iterdir()):
@@ -163,6 +174,9 @@ def pack(
     }
     if component == "backend":
         manifest["server_release_contract"] = server_release_contract
+        manifest["control_plane_revision"] = control_plane_revision
+        manifest["deploy_run_id"] = deploy_run_id
+        manifest["deploy_run_attempt"] = deploy_run_attempt
     manifest_path = output / f"{component}-{source_sha}.manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -229,7 +243,10 @@ def validate(
         "files",
     ]
     if component == "backend":
-        manifest_keys.append("server_release_contract")
+        manifest_keys.extend((
+            "server_release_contract", "control_plane_revision",
+            "deploy_run_id", "deploy_run_attempt",
+        ))
     exact_keys(manifest, manifest_keys, "manifest")
     if manifest["schema"] != SCHEMA:
         raise ValueError("unsupported manifest schema")
@@ -239,6 +256,16 @@ def validate(
         manifest["server_release_contract"] != SERVER_RELEASE_CONTRACT
     ):
         raise ValueError("backend server release contract is not exact")
+    if component == "backend":
+        validate_sha(manifest["control_plane_revision"])
+        if (
+            not isinstance(manifest["deploy_run_id"], str)
+            or not manifest["deploy_run_id"].isascii()
+            or not manifest["deploy_run_id"].isdigit()
+            or not isinstance(manifest["deploy_run_attempt"], int)
+            or manifest["deploy_run_attempt"] <= 0
+        ):
+            raise ValueError("backend deployment identity is invalid")
     if manifest["archive"] != archive_name:
         raise ValueError("manifest archive name is not exact")
     archive_path = input_dir / archive_name
@@ -343,6 +370,7 @@ def validate(
         if component == "backend":
             for binary in (
                 "vane", "useradmin", "gate", "runtimeadmin", "vane-migrate",
+                "agentfirstretention",
                 "vane-research-gateway", "vane-research-prepare",
                 "researchshadow", "researchcutover",
             ):
@@ -351,6 +379,27 @@ def validate(
                     raise ValueError(f"{binary} lacks exact vcs.revision build info")
                 if b"vcs.modified=false" not in data or b"vcs.modified=true" in data:
                     raise ValueError(f"{binary} was not built from a clean worktree")
+            release_receipt = {
+                "schema_version": "vane.release-receipt/v1",
+                "source_revision": source_sha,
+                "control_plane_revision": manifest["control_plane_revision"],
+                "deploy_run_id": manifest["deploy_run_id"],
+                "deploy_run_attempt": manifest["deploy_run_attempt"],
+                "backend_archive_sha256": archive_sha256,
+                "backend_manifest_sha256": sha256_file(input_dir / manifest_name),
+                "server_release_contract_sha256": hashlib.sha256(
+                    SERVER_RELEASE_CONTRACT.encode("utf-8")
+                ).hexdigest(),
+                "vane_sha256": manifest_files["bin/vane"]["sha256"],
+                "agentfirstretention_sha256": manifest_files[
+                    "bin/agentfirstretention"
+                ]["sha256"],
+            }
+            (output_dir / "release-receipt.json").write_text(
+                json.dumps(release_receipt, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.chmod(output_dir / "release-receipt.json", 0o644)
     except Exception:
         shutil.rmtree(output_dir)
         raise
@@ -366,6 +415,9 @@ def main() -> None:
         if command == "pack":
             sub.add_argument("--source", type=Path, required=True)
             sub.add_argument("--server-release-contract")
+            sub.add_argument("--control-plane-revision")
+            sub.add_argument("--deploy-run-id")
+            sub.add_argument("--deploy-run-attempt", type=int)
         else:
             sub.add_argument("--input", type=Path, required=True)
         sub.add_argument("--output", type=Path, required=True)
@@ -378,6 +430,9 @@ def main() -> None:
             args.sha,
             args.output,
             args.server_release_contract,
+            args.control_plane_revision,
+            args.deploy_run_id,
+            args.deploy_run_attempt,
         )
     else:
         validate(args.component, args.sha, args.input, args.output)
