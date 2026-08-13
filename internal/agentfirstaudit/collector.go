@@ -3,6 +3,8 @@ package agentfirstaudit
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -210,6 +212,11 @@ func validateCommittedBaseline(
 	input store.AgentFirstRetentionAttestationInput,
 	snapshot *store.AgentFirstRetentionAuditSnapshot,
 ) error {
+	var canonicalDigest, legacyDigest [sha256.Size]byte
+	if event != nil {
+		canonicalDigest = sha256.Sum256(event.CanonicalPayload)
+		legacyDigest = sha256.Sum256(event.LegacyDBSnapshot)
+	}
 	if event == nil || snapshot == nil || event.ID <= 0 ||
 		event.Phase != input.Phase || event.ParentDigest != nil ||
 		event.TemporalClusterID != input.TemporalClusterID ||
@@ -231,6 +238,8 @@ func validateCommittedBaseline(
 		!bytes.Equal(event.LegacyDBSnapshot, snapshot.LegacyDBSnapshot) ||
 		len(event.DatabaseIdentity) == 0 || len(event.CanonicalPayload) == 0 ||
 		!validLowerHex(event.PayloadDigest, 32) ||
+		event.PayloadDigest != hex.EncodeToString(canonicalDigest[:]) ||
+		event.LegacyDBSnapshotDigest != hex.EncodeToString(legacyDigest[:]) ||
 		event.IssuedAt.IsZero() || !event.ExpiresAt.After(event.IssuedAt) {
 		return fmt.Errorf("committed baseline fields differ")
 	}

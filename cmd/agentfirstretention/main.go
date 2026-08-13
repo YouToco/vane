@@ -176,7 +176,12 @@ func migrationDatabaseURL() (string, error) {
 }
 
 func safeCredentialAuthority(info os.FileInfo, directory bool) bool {
-	if info == nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 ||
+	forbiddenPermissions := os.FileMode(0o077)
+	if directory {
+		forbiddenPermissions = 0o022
+	}
+	if info == nil || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm()&forbiddenPermissions != 0 ||
 		(directory && !info.IsDir()) || (!directory && !info.Mode().IsRegular()) {
 		return false
 	}

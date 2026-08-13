@@ -43,13 +43,16 @@ func TestMigrationDatabaseURLUsesOnlyCredentialDirectory(t *testing.T) {
 	if err != nil || value != "postgres://owner" {
 		t.Fatalf("value=%q err=%v", value, err)
 	}
-	if err := os.Chmod(filepath.Join(directory, migrationDatabaseCredential), 0o666); err != nil {
-		t.Fatal(err)
+	credential := filepath.Join(directory, migrationDatabaseCredential)
+	for _, mode := range []os.FileMode{0o644, 0o444, 0o666} {
+		if err := os.Chmod(credential, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := migrationDatabaseURL(); err == nil {
+			t.Fatalf("unsafe credential mode accepted: %04o", mode)
+		}
 	}
-	if _, err := migrationDatabaseURL(); err == nil {
-		t.Fatal("unsafe credential mode accepted")
-	}
-	if err := os.Chmod(filepath.Join(directory, migrationDatabaseCredential), 0o600); err != nil {
+	if err := os.Chmod(credential, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(directory, 0o777); err != nil {

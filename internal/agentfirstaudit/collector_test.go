@@ -98,13 +98,22 @@ func TestCollectBaselineRejectsUncalibratedEmptyEnabledArchive(t *testing.T) {
 }
 
 func TestCollectBaselineRejectsMismatchedCommittedEvent(t *testing.T) {
-	fixture := newBaselineCollectorFixture(t)
-	fixture.database.mutateCommitted = func(event *store.AgentFirstRetentionAttestationEvent) {
-		event.TemporalNamespace = "other"
-	}
-	if _, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
-		fixture.clock, fixture.request); err == nil {
-		t.Fatal("mismatched committed event accepted")
+	for name, mutate := range map[string]func(*store.AgentFirstRetentionAttestationEvent){
+		"namespace": func(event *store.AgentFirstRetentionAttestationEvent) {
+			event.TemporalNamespace = "other"
+		},
+		"payload digest": func(event *store.AgentFirstRetentionAttestationEvent) {
+			event.CanonicalPayload = []byte(`{"different":true}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newBaselineCollectorFixture(t)
+			fixture.database.mutateCommitted = mutate
+			if _, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
+				fixture.clock, fixture.request); err == nil {
+				t.Fatal("mismatched committed event accepted")
+			}
+		})
 	}
 }
 
@@ -245,10 +254,10 @@ func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
 		LegacyDBSnapshot:       bytes.Clone(fake.snapshot.LegacyDBSnapshot),
 		LegacyDBSnapshotDigest: fake.snapshot.LegacyDBSnapshotDigest,
 		CanonicalPayload:       []byte(`{"schema_version":"fixture/v1"}`),
-		PayloadDigest:          strings.Repeat("6", 64),
 		IssuedAt:               time.Date(2026, 8, 13, 18, 0, 1, 0, time.UTC),
 		ExpiresAt:              time.Date(2026, 8, 13, 19, 0, 1, 0, time.UTC),
 	}
+	fake.committed.PayloadDigest = digestBytes(fake.committed.CanonicalPayload)
 	if fake.mutateCommitted != nil {
 		fake.mutateCommitted(fake.committed)
 	}
