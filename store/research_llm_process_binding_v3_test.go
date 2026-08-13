@@ -262,10 +262,13 @@ func TestResolveResearchLLMProcessGatewayBindingV1RejectsCrossScopePostgres(t *t
 
 func TestResolveResearchLLMProcessGatewayBindingV1RejectsRevokedExpiredAndForgedPostgres(t *testing.T) {
 	runtime := newResearchProcessBindingServerRuntimeV1(t)
+	// Bind negative fixtures to stored/fixed times so a virtualized CI clock
+	// stepping backwards cannot make otherwise-valid mutations violate the
+	// capability lifetime constraint before the resolver is exercised.
 	t.Run("revoked", func(t *testing.T) {
 		f, reservation := newResearchProcessBindingFixtureV1(t, "revoked binding")
 		if _, err := f.store.pool.Exec(t.Context(),
-			`UPDATE research_run_capabilities SET revoked_at=clock_timestamp()
+			`UPDATE research_run_capabilities SET revoked_at=issued_at
 			  WHERE run_snapshot_id=$1`, f.snapshotID); err != nil {
 			t.Fatal(err)
 		}
@@ -280,8 +283,8 @@ func TestResolveResearchLLMProcessGatewayBindingV1RejectsRevokedExpiredAndForged
 		f, reservation := newResearchProcessBindingFixtureV1(t, "expired binding")
 		if _, err := f.store.pool.Exec(t.Context(),
 			`UPDATE research_run_capabilities
-			    SET issued_at=clock_timestamp()-interval '2 days',
-			        not_after=clock_timestamp()-interval '1 day'
+			    SET issued_at=TIMESTAMPTZ '2000-01-01 00:00:00+00',
+			        not_after=TIMESTAMPTZ '2000-01-02 00:00:00+00'
 			  WHERE run_snapshot_id=$1`, f.snapshotID); err != nil {
 			t.Fatal(err)
 		}
