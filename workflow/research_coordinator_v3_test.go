@@ -490,12 +490,11 @@ func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *te
 		t.Fatal(err)
 	}
 	corrected, err := json.Marshal(types.ResearchBriefPayloadV3{
-		SchemaVersion: types.ResearchBriefPayloadSchemaV31,
-		Assessment:    types.ResearchBriefAssessmentUnknownV31,
+		SchemaVersion: types.ResearchBriefPayloadSchemaV3,
 		Headline:      "当前证据不足",
 		Summary:       "当前冻结证据不足以形成符合任务手册的可验证结论。",
 		Significance:  types.ResearchBriefSignificanceNoneV3,
-		Citations:     []types.ResearchBriefCitationV3{},
+		Citations:     []types.ResearchBriefCitationV3{citation},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -556,6 +555,8 @@ func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *te
 					"删除包含它的整句以及 headline 中对应分句",
 					"重新审计 headline、summary 和 significance",
 					"initial_verdict=unsupported 时禁止原样返回 original candidate",
+					"tool_failures 为 null 或空数组时仍是完整覆盖",
+					"必须输出 vane.research-brief/v3",
 					`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","headline":"当前证据不足","summary":"当前冻结证据不足以形成符合任务手册的可验证结论。","significance":"none","citations":[]}`,
 				} {
 					if !strings.Contains(params.SystemPrompt, contract) {

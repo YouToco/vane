@@ -192,11 +192,23 @@ func TestWithExplicitEventWindowV36FreezesOneCorrector(t *testing.T) {
 		"删除包含它的整句以及 headline 中对应分句",
 		"才可写‘全部’‘均有’或数量汇总",
 		"initial_verdict=unsupported 时禁止原样返回 original candidate",
+		"tool_failures 为 null 或空数组时仍是完整覆盖",
+		"必须输出 vane.research-brief/v3",
 		`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","headline":"当前证据不足","summary":"当前冻结证据不足以形成符合任务手册的可验证结论。","significance":"none","citations":[]}`,
 	} {
 		if !strings.Contains(scoped.GroundingCorrector.SystemPrompt, contract) {
 			t.Fatalf("corrector prompt missing production grounding contract %q: %s",
 				contract, scoped.GroundingCorrector.SystemPrompt)
+		}
+	}
+	for _, contract := range []string{
+		"tool_failures 为 null 或空数组时属于完整覆盖",
+		"输出只能使用 vane.research-brief/v3",
+		"只有 tool_failures 非空时",
+	} {
+		if !strings.Contains(scoped.Synthesis.SystemPrompt, contract) {
+			t.Fatalf("synthesis prompt missing coverage contract %q: %s",
+				contract, scoped.Synthesis.SystemPrompt)
 		}
 	}
 	if retained.GroundingCorrector != nil ||
