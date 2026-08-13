@@ -183,7 +183,9 @@ func buildResearchPlannerPromptV33(
 	compactLoadedTools := seal.ResearchModel.Planner.SystemPrompt ==
 		runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools ||
 		seal.ResearchModel.Planner.SystemPrompt ==
-			runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2
+			runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2 ||
+		seal.ResearchModel.Planner.SystemPrompt ==
+			runtimepolicy.ResearchPlannerSystemPromptV33MultiEntityWindowV3
 	loaded := make(map[string]researchPlannerPromptToolV3)
 	history := make([]researchPlannerSearchHistoryV33, 0, len(receipts))
 	for index, receipt := range receipts {
@@ -383,11 +385,13 @@ func executeResearchPlannerToolSearchRoundsV33(
 func researchPlannerFinalOnlyV33(systemPrompt string) bool {
 	return systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33FinalOnly ||
 		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedTools ||
-		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2
+		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2 ||
+		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33MultiEntityWindowV3
 }
 
 func researchPlannerSearchQueryMaxBytesV33(systemPrompt string) int {
-	if systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2 {
+	if systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33CompactLoadedToolsV2 ||
+		systemPrompt == runtimepolicy.ResearchPlannerSystemPromptV33MultiEntityWindowV3 {
 		return 144
 	}
 	return 512
