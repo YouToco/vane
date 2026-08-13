@@ -502,7 +502,7 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 func verifyMemoryRuntimeAuthority(
 	ctx context.Context, querier serverRuntimeQuotaProjectionQuerier,
 ) error {
-	var required int
+	var required, unexpected int
 	if err := querier.QueryRow(ctx, `
 		SELECT
 		  (SELECT count(*) FROM pg_catalog.pg_namespace object
@@ -539,6 +539,91 @@ func verifyMemoryRuntimeAuthority(
 		         NOT acl.is_grantable)`,
 	).Scan(&required); err != nil {
 		return fmt.Errorf("verify memory runtime authority: %w", err)
+	}
+	if err := querier.QueryRow(ctx, `
+		WITH memory_role AS (
+		  SELECT oid FROM pg_catalog.pg_roles WHERE rolname='vane_memory_editor'
+		)
+		SELECT
+		  (SELECT count(*) FROM pg_catalog.pg_shdepend dependency,memory_role
+		   WHERE dependency.refclassid='pg_authid'::pg_catalog.regclass
+		     AND dependency.refobjid=memory_role.oid
+		     AND dependency.deptype IN ('a','o')
+		     AND (dependency.dbid=0 OR (
+		       dependency.dbid=(SELECT oid FROM pg_catalog.pg_database
+		                          WHERE datname=pg_catalog.current_database()) AND
+		       NOT (
+		         (dependency.classid='pg_namespace'::pg_catalog.regclass AND
+		          dependency.objid='public'::pg_catalog.regnamespace AND
+		          dependency.objsubid=0) OR
+		         (dependency.classid='pg_class'::pg_catalog.regclass AND
+		          dependency.objid IN (
+		            'memory_authorizations'::pg_catalog.regclass,
+		            'memory_records'::pg_catalog.regclass,
+		            'memory_events'::pg_catalog.regclass,
+		            'memory_receipts'::pg_catalog.regclass,
+		            'memory_records_id_seq'::pg_catalog.regclass,
+		            'memory_events_id_seq'::pg_catalog.regclass) AND
+		          dependency.objsubid=0) OR
+		         (dependency.classid='pg_class'::pg_catalog.regclass AND
+		          dependency.objid='memory_authorizations'::pg_catalog.regclass AND
+		          dependency.objsubid=(SELECT attnum FROM pg_catalog.pg_attribute
+		             WHERE attrelid='memory_authorizations'::pg_catalog.regclass
+		               AND attname='consumed_event_id' AND NOT attisdropped))
+		       )
+		     ))) +
+		  (SELECT count(*) FROM pg_catalog.pg_namespace object,memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.nspacl,
+		       pg_catalog.acldefault('n',object.nspowner))) acl
+		   WHERE acl.grantee=memory_role.oid AND NOT (
+		       object.nspname='public' AND acl.privilege_type='USAGE' AND
+		       acl.grantor=object.nspowner AND NOT acl.is_grantable)) +
+		  (SELECT count(*) FROM pg_catalog.pg_class object
+		   JOIN pg_catalog.pg_namespace namespace ON namespace.oid=object.relnamespace
+		   CROSS JOIN memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.relacl,
+		       pg_catalog.acldefault(CASE WHEN object.relkind='S' THEN 's'::"char"
+		                                 ELSE 'r'::"char" END,object.relowner))) acl
+		   WHERE acl.grantee=memory_role.oid AND NOT (
+		     namespace.nspname='public' AND (
+		       (object.relname IN ('memory_authorizations','memory_records',
+		                           'memory_events','memory_receipts') AND
+		        acl.privilege_type IN ('SELECT','INSERT') AND
+		        acl.grantor=object.relowner AND NOT acl.is_grantable) OR
+		       (object.relname IN ('memory_records_id_seq','memory_events_id_seq') AND
+		        acl.privilege_type IN ('USAGE','SELECT') AND
+		        acl.grantor=object.relowner AND NOT acl.is_grantable)))) +
+		  (SELECT count(*) FROM pg_catalog.pg_attribute object
+		   JOIN pg_catalog.pg_class relation ON relation.oid=object.attrelid
+		   JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+		   CROSS JOIN memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(object.attacl) acl
+		   WHERE acl.grantee=memory_role.oid AND NOT (
+		     namespace.nspname='public' AND relation.relname='memory_authorizations' AND
+		     object.attname='consumed_event_id' AND acl.privilege_type='UPDATE' AND
+		     acl.grantor=relation.relowner AND NOT acl.is_grantable)) +
+		  (SELECT count(*) FROM pg_catalog.pg_proc object,memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.proacl,
+		       pg_catalog.acldefault('f',object.proowner))) acl
+		   WHERE acl.grantee=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_default_acl object,memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(object.defaclacl) acl
+		   WHERE acl.grantee=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_database object,memory_role
+		   WHERE object.datdba=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_namespace object,memory_role
+		   WHERE object.nspowner=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_class object,memory_role
+		   WHERE object.relowner=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_proc object,memory_role
+		   WHERE object.proowner=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_type object,memory_role
+		   WHERE object.typowner=memory_role.oid)`,
+	).Scan(&unexpected); err != nil {
+		return fmt.Errorf("verify unexpected memory runtime authority: %w", err)
+	}
+	if unexpected != 0 {
+		return fmt.Errorf("memory runtime retains %d unexpected authorities", unexpected)
 	}
 	if required != 14 {
 		return fmt.Errorf("memory runtime has %d of 14 required authorities", required)

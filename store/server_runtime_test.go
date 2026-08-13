@@ -268,6 +268,37 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		st.Close()
 	})
 
+	t.Run("memory capability rejects extra ACL at startup", func(t *testing.T) {
+		mutations := []struct {
+			name, grant, revoke string
+		}{
+			{"mutable history", `GRANT UPDATE ON memory_records TO vane_memory_editor`, `REVOKE UPDATE ON memory_records FROM vane_memory_editor`},
+			{"foreign session read", `GRANT SELECT ON agent_sessions TO vane_memory_editor`, `REVOKE SELECT ON agent_sessions FROM vane_memory_editor`},
+			{"delegable required read", `GRANT SELECT ON memory_records TO vane_memory_editor WITH GRANT OPTION`, `REVOKE GRANT OPTION FOR SELECT ON memory_records FROM vane_memory_editor; GRANT SELECT ON memory_records TO vane_memory_editor`},
+		}
+		for _, mutation := range mutations {
+			if _, err := owner.ExecContext(t.Context(), mutation.grant); err != nil {
+				t.Fatalf("grant %s: %v", mutation.name, err)
+			}
+			st, err := NewServerRuntime(t.Context(), runtimeURL)
+			if err == nil {
+				st.Close()
+				t.Fatalf("startup accepted %s", mutation.name)
+			}
+			if !strings.Contains(err.Error(), "unexpected authorities") {
+				t.Fatalf("extra %s returned unexpected error: %v", mutation.name, err)
+			}
+			if _, err := owner.ExecContext(t.Context(), mutation.revoke); err != nil {
+				t.Fatalf("revoke %s: %v", mutation.name, err)
+			}
+		}
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatalf("restored exact memory authority rejected: %v", err)
+		}
+		st.Close()
+	})
+
 	t.Run("recovery catalog separates discovery from tenant payload reads", func(t *testing.T) {
 		st, err := NewServerRuntime(t.Context(), runtimeURL)
 		if err != nil {
