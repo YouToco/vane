@@ -417,17 +417,8 @@ func runShard(
 	if err != nil {
 		return shardResult{index: shard.Index, err: err}
 	}
-	command := exec.Command(
-		"go", "tool", "test2json",
-		"-t",
-		"-p", storePackage,
-		binaryPath,
-		"-test.v=test2json",
-		"-test.count=1",
-		"-test.run="+shard.RunRegex,
-		"-test.timeout="+timeout.String(),
-		"-test.coverprofile="+coveragePath,
-	)
+	commandArgs := storeShardCommandArgs(binaryPath, shard.RunRegex, timeout, coveragePath)
+	command := exec.Command(commandArgs[0], commandArgs[1:]...)
 	command.Dir = storeDir
 	command.Env = withEnvironment(os.Environ(), "DATABASE_URL", databaseURL)
 	command.Stdout = output
@@ -445,6 +436,29 @@ func runShard(
 		return shardResult{index: shard.Index, elapsed: time.Since(started), err: closeErr}
 	}
 	return shardResult{index: shard.Index, elapsed: time.Since(started)}
+}
+
+func storeShardCommandArgs(
+	binaryPath string,
+	runRegex string,
+	timeout time.Duration,
+	coveragePath string,
+) []string {
+	return []string{
+		"go", "tool", "test2json",
+		"-t",
+		"-p", storePackage,
+		binaryPath,
+		"-test.v=test2json",
+		"-test.count=1",
+		// Each shard owns one database. Preserve the historical Store Gate's
+		// within-database serialization while the independent shards themselves
+		// run concurrently against separate PostgreSQL instances.
+		"-test.parallel=1",
+		"-test.run=" + runRegex,
+		"-test.timeout=" + timeout.String(),
+		"-test.coverprofile=" + coveragePath,
+	}
 }
 
 func mergeCoverage(args []string) error {

@@ -41,7 +41,7 @@ var modelToolDefinitionsV1 = []ModelToolDefinitionV1{
 			Capability: types.CapSearch, Kind: types.KindArticle,
 			ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
 		},
-		Description: "每次任务运行时实时搜索公开网页。query 可由模型按任务手册整理；include_domains 只能逐字使用已冻结在认证当前请求或可信任务手册中的用户明确裸域名。",
+		Description: "公开网页实时搜索（public web search）：official announcement、model/API/Agent update、交叉核验。query 按手册整理；include_domains 仅限认证请求/可信手册冻结的用户裸域名。",
 		decoder:     decodeWebSearchArgumentsV1,
 		ExternalLocators: []ExternalLocatorV1{
 			{Argument: "include_domains", Kind: ExternalLocatorDomainsV1},
