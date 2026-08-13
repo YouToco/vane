@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 127
+const latestMigrationVersion int64 = 128
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -163,6 +163,7 @@ var wantTables = []string{
 	"periodic_brief_reports",
 	"periodic_report_deliveries",
 	// 127 process-restart-safe scheduler command recovery progress.
+	// 128 physical freeze for retired Agent-first runtime writers.
 	"schedule_command_recovery_cursors",
 }
 

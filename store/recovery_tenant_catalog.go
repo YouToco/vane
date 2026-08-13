@@ -159,7 +159,6 @@ func (s *Store) beginRecoveryTenantRead(
 func allowedRecoveryTenantReadRole(role string) bool {
 	switch role {
 	case "vane_app",
-		"vane_agent_session_fact_projector",
 		"vane_edit_coordinator",
 		"vane_schedule_commander":
 		return true

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pressly/goose/v3"
 )
@@ -208,11 +209,21 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 		t.Fatalf("unsafe coordinator role app_member=%v server_member=%v login=%v inherit=%v bypass=%v",
 			appMember, serverMember, coordinatorLogin, coordinatorInherit, coordinatorBypass)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "provision_vane_server_runtime_v1"); err != nil {
 		t.Fatalf("provision exact server runtime V2: %v", err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := callServerRuntimeProvisioner(t.Context(), scratchURL,
+		"provision_vane_server_runtime_research_binder_v1"); err != nil {
+		t.Fatalf("provision exact server runtime binder: %v", err)
+	}
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "provision_vane_server_runtime_v1"); err != nil {
 		t.Fatalf("replay exact server runtime V2 provision: %v", err)
+	}
+	if err := callServerRuntimeProvisioner(t.Context(), scratchURL,
+		"provision_vane_server_runtime_research_binder_v1"); err != nil {
+		t.Fatalf("replay exact server runtime binder: %v", err)
 	}
 	if err := db.QueryRowContext(t.Context(), `
 		SELECT EXISTS (
@@ -237,25 +248,25 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 		_, _ = db.ExecContext(cleanupCtx,
 			`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
 	})
-	runtimeStore, err := NewServerRuntime(
+	runtimeConn, err := pgx.Connect(
 		t.Context(), serverRuntimeTestURL(t, scratchURL, runtimePassword))
 	if err != nil {
-		t.Fatalf("NewServerRuntime after migration 109 provisioning: %v", err)
+		t.Fatalf("connect historical server runtime after migration 109: %v", err)
 	}
-	runtimeTx, err := runtimeStore.pool.Begin(t.Context())
+	runtimeTx, err := runtimeConn.Begin(t.Context())
 	if err != nil {
-		runtimeStore.Close()
+		_ = runtimeConn.Close(t.Context())
 		t.Fatal(err)
 	}
 	if _, err := runtimeTx.Exec(t.Context(),
 		`SET LOCAL ROLE vane_native_v3_creation_coordinator`); err == nil ||
 		!postgresCodeIs(err, "42501") {
 		_ = runtimeTx.Rollback(t.Context())
-		runtimeStore.Close()
+		_ = runtimeConn.Close(t.Context())
 		t.Fatalf("server runtime entered native V3 coordinator: %v", err)
 	}
 	_ = runtimeTx.Rollback(t.Context())
-	runtimeStore.Close()
+	_ = runtimeConn.Close(t.Context())
 	if _, err := db.ExecContext(t.Context(),
 		`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`); err != nil {
 		t.Fatal(err)
@@ -364,7 +375,12 @@ func TestMigration109NativeResearchCreationBoundaryPostgres(t *testing.T) {
 		`DELETE FROM task_creation_operations WHERE id='migration-109-v2'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := callServerRuntimeProvisioner(t.Context(), scratchURL,
+		"deprovision_vane_server_runtime_research_binder_v1"); err != nil {
+		t.Fatalf("deprovision exact server runtime binder: %v", err)
+	}
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "deprovision_vane_server_runtime_v1"); err != nil {
 		t.Fatalf("deprovision exact server runtime V2: %v", err)
 	}
 

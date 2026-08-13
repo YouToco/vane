@@ -308,13 +308,21 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "provision_vane_server_runtime_v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := callServerRuntimeProvisioner(t.Context(), scratchURL,
+		"provision_vane_server_runtime_research_binder_v1"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = DeprovisionServerRuntime(ctx, scratchURL)
+		_ = callServerRuntimeProvisioner(ctx, scratchURL,
+			"deprovision_vane_server_runtime_research_binder_v1")
+		_ = callServerRuntimeProvisioner(
+			ctx, scratchURL, "deprovision_vane_server_runtime_v1")
 	})
 	const password = "native-v3-edit-runtime-password"
 	if _, err := owner.pool.Exec(t.Context(),
@@ -325,10 +333,18 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 		_, _ = owner.pool.Exec(context.Background(),
 			`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
 	})
-	runtime, err := NewServerRuntime(t.Context(), serverRuntimeTestURL(t, scratchURL, password))
+	// This fixture intentionally stops at schema 110. Current membership
+	// validation targets schema 128, but historical server connections still
+	// entered vane_app before tenant-scoped Store methods ran.
+	runtimePool, err := newStorePool(t.Context(),
+		serverRuntimeTestURL(t, scratchURL, password), func(ctx context.Context, conn *pgx.Conn) error {
+			_, err := conn.Exec(ctx, `SET ROLE vane_app`)
+			return err
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtime := newStore(runtimePool, nil)
 	t.Cleanup(runtime.Close)
 	if _, err := runtime.ClaimStaleResearchTaskDefinitionEditOperationV3(
 		t.Context(), time.Now(), "missing-recovery-credential", time.Minute); !errors.Is(

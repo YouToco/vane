@@ -15,11 +15,11 @@ const nativeV3EditRecoveryRuntimeLoginRole = "vane_native_v3_edit_recovery_runti
 const nativeV3EditRecoveryCapabilityRole = "vane_native_v3_edit_recovery"
 
 // serverRuntimeCapabilityRoles is intentionally an exact, closed set. Keep it
-// synchronized with migration 098 and with literal production Store SET LOCAL
-// ROLE sites. Paid research execution and provider gateway roles do not belong
-// in the long-lived application process.
+// synchronized with migration 098 plus the versioned retirement wrapper in
+// migration 128, and with literal production Store SET LOCAL ROLE sites. Paid
+// research execution and retired/provider roles do not belong in the
+// long-lived application process.
 var serverRuntimeCapabilityRoles = []string{
-	"vane_agent_session_fact_projector",
 	"vane_agent_session_projection_operator",
 	"vane_app",
 	"vane_brief_reader",
@@ -43,6 +43,7 @@ var serverRuntimeCapabilityRoles = []string{
 }
 
 var serverRuntimeForbiddenRoles = []string{
+	"vane_agent_session_fact_projector",
 	"vane_research_llm_gateway",
 	"vane_research_llm_gateway_runtime",
 	"vane_research_runtime",
@@ -73,12 +74,8 @@ var serverRuntimeForbiddenReadRelations = []string{
 // directly as the migration/schema owner; migration 098 rejects SET ROLE and
 // delegated callers.
 func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
-	if err := callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_v1"); err != nil {
-		return err
-	}
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_research_binder_v1")
+		ctx, dbURL, "provision_vane_server_runtime_v128")
 }
 
 // DeprovisionServerRuntime removes only migration 098's exact memberships and
@@ -86,12 +83,8 @@ func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 // dependency error is intentional evidence of drift and is never papered over
 // with DROP OWNED.
 func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
-	if err := callServerRuntimeProvisioner(
-		ctx, dbURL, "deprovision_vane_server_runtime_research_binder_v1"); err != nil {
-		return err
-	}
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "deprovision_vane_server_runtime_v1")
+		ctx, dbURL, "deprovision_vane_server_runtime_v128")
 }
 
 // ProvisionNativeV3EditRecoveryRuntime creates only the independent recovery
