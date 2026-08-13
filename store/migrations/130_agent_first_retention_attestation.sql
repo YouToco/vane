@@ -309,6 +309,7 @@ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE
     database_now TIMESTAMPTZ;
+    observation_started_at TIMESTAMPTZ;
     database_system_identifier TEXT;
     database_name TEXT:=current_database();
     database_oid_value OID;
@@ -363,6 +364,9 @@ BEGIN
     END IF;
 
     PERFORM pg_advisory_xact_lock(6215335020355474130);
+    -- The retention interval is measured to the start of the semantic
+    -- observation. A slow aggregate must not manufacture elapsed retention.
+    observation_started_at:=clock_timestamp();
     SELECT system_identifier::text INTO database_system_identifier
       FROM pg_control_system();
     SELECT oid INTO database_oid_value FROM pg_database WHERE datname=database_name;
@@ -449,7 +453,7 @@ BEGIN
                 USING ERRCODE='23514';
         END IF;
         IF parent_event.phase<>'baseline' OR
-           database_now < parent_event.issued_at+
+           observation_started_at < parent_event.issued_at+
              make_interval(secs=>requested_retention_seconds) OR
            parent_event.expires_at<=database_now OR
            parent_event.database_identity<>database_identity_value OR
