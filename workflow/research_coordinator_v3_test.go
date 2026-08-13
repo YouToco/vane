@@ -490,11 +490,12 @@ func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *te
 		t.Fatal(err)
 	}
 	corrected, err := json.Marshal(types.ResearchBriefPayloadV3{
-		SchemaVersion: types.ResearchBriefPayloadSchemaV3,
-		Headline:      "OpenAI 扩大 GPT-5.6 Luna 的免费访问",
-		Summary:       "OpenAI 官方页面写明正在扩大免费用户对 GPT-5.6 Luna 的访问。",
-		Significance:  types.ResearchBriefSignificanceMajorV3,
-		Citations:     []types.ResearchBriefCitationV3{citation},
+		SchemaVersion: types.ResearchBriefPayloadSchemaV31,
+		Assessment:    types.ResearchBriefAssessmentUnknownV31,
+		Headline:      "当前证据不足",
+		Summary:       "当前冻结证据不足以形成符合任务手册的可验证结论。",
+		Significance:  types.ResearchBriefSignificanceNoneV3,
+		Citations:     []types.ResearchBriefCitationV3{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -554,6 +555,8 @@ func TestProductionResearchRuntimeV36ExecutesOneCorrectionAndFinalVerifier(t *te
 					"不得把 access 扩大写成默认或无限使用",
 					"删除包含它的整句以及 headline 中对应分句",
 					"重新审计 headline、summary 和 significance",
+					"initial_verdict=unsupported 时禁止原样返回 original candidate",
+					`{"schema_version":"vane.research-brief/v3.1","assessment":"unknown","headline":"当前证据不足","summary":"当前冻结证据不足以形成符合任务手册的可验证结论。","significance":"none","citations":[]}`,
 				} {
 					if !strings.Contains(params.SystemPrompt, contract) {
 						t.Fatalf("round-2 production correction lacks %q: %s",
