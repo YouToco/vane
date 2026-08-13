@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -159,15 +158,21 @@ func TestQuota_MissingBucketIsDenied(t *testing.T) {
 func TestQuota_RefillsOverTime(t *testing.T) {
 	st := quotaStore(t)
 	tenantID := newQuotaTenant(t, st)
-	// 空桶、每秒补 100：等 100ms 应该补出约 10 个。
-	setBucket(t, st, tenantID, QuotaPush, 0, 100, 1000)
+	// 空桶、每秒补 1。测试用数据库可能运行在会校正壁钟的虚拟机里，
+	// 因此不以宿主机 Sleep 推断数据库经过时间；先证明空桶拒绝，再由
+	// PostgreSQL 自己把同一行回拨到固定过去，确定性验证按 elapsed refill。
+	setBucket(t, st, tenantID, QuotaPush, 0, 1, 100)
 
 	if err := st.TryConsume(t.Context(), tenantID, QuotaPush, 5); !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("空桶应立刻拒绝，实得 %v", err)
 	}
-	time.Sleep(150 * time.Millisecond)
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE tenant_quota SET updated_at = TIMESTAMPTZ '2000-01-01 00:00:00+00'
+		  WHERE tenant_id = $1 AND bucket = $2`, tenantID, string(QuotaPush)); err != nil {
+		t.Fatalf("设置确定性补充窗口失败: %v", err)
+	}
 	if err := st.TryConsume(t.Context(), tenantID, QuotaPush, 5); err != nil {
-		t.Errorf("等待 150ms 后应补出约 15 个令牌，取 5 个不该被拒：%v", err)
+		t.Errorf("经过数据库时间窗口后应补出令牌，取 5 个不该被拒：%v", err)
 	}
 }
 
