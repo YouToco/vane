@@ -29,6 +29,7 @@ var serverRuntimeCapabilityRoles = []string{
 	"vane_edit_coordinator",
 	"vane_edit_receipt",
 	"vane_intelligence_reader",
+	"vane_memory_editor",
 	"vane_periodic_brief_writer",
 	"vane_profile_claim_editor",
 	"vane_profile_editor",
@@ -75,7 +76,7 @@ var serverRuntimeForbiddenReadRelations = []string{
 // delegated callers.
 func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_v128")
+		ctx, dbURL, "provision_vane_server_runtime_v129")
 }
 
 // DeprovisionServerRuntime removes only migration 098's exact memberships and
@@ -84,7 +85,7 @@ func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 // with DROP OWNED.
 func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "deprovision_vane_server_runtime_v128")
+		ctx, dbURL, "deprovision_vane_server_runtime_v129")
 }
 
 // ProvisionNativeV3EditRecoveryRuntime creates only the independent recovery
@@ -156,7 +157,9 @@ func callServerRuntimeProvisioner(
 		return fmt.Errorf("store: connect server runtime provisioner: %w", err)
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	// functionName is selected only by the two closed wrappers above.
+	// functionName is selected only by the two closed current-version wrappers.
+	// Historical schema tests invoke their exact provisioner directly; current
+	// binaries must never silently fall back across a migration boundary.
 	if _, err := conn.Exec(ctx, "SELECT public."+functionName+"()"); err != nil {
 		return fmt.Errorf("store: %s: %w", functionName, err)
 	}
@@ -460,6 +463,9 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 		return fmt.Errorf("server runtime memberships differ: got=%v want=%v",
 			memberships, wantMemberships)
 	}
+	if err := verifyMemoryRuntimeAuthority(ctx, tx); err != nil {
+		return err
+	}
 
 	for _, role := range serverRuntimeForbiddenRoles {
 		var member bool
@@ -484,6 +490,184 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit server runtime authority probe: %w", err)
+	}
+	return nil
+}
+
+// verifyMemoryRuntimeAuthority is the read-only startup half of migration
+// 129's owner-only exact validator. Deployment/provisioning rejects both extra
+// and missing authority; every new server connection independently rechecks
+// that all fourteen required direct ACL entries still exist, come from each
+// object's owner, and are not delegable.
+func verifyMemoryRuntimeAuthority(
+	ctx context.Context, querier serverRuntimeQuotaProjectionQuerier,
+) error {
+	var roleSafe, membershipSafe bool
+	if err := querier.QueryRow(ctx, `
+		WITH memory_role AS (
+		  SELECT oid,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolinherit,
+		         rolreplication,rolbypassrls,rolconfig
+		    FROM pg_catalog.pg_roles WHERE rolname='vane_memory_editor'
+		), object_owner AS (
+		  SELECT owner.oid,owner.rolname
+		    FROM pg_catalog.pg_class relation
+		    JOIN pg_catalog.pg_roles owner ON owner.oid=relation.relowner
+		   WHERE relation.oid='memory_authorizations'::pg_catalog.regclass
+		)
+		SELECT
+		  EXISTS (SELECT 1 FROM memory_role
+		           WHERE NOT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb
+		             AND NOT rolcreaterole AND NOT rolinherit AND NOT rolreplication
+		             AND NOT rolbypassrls AND
+		             rolconfig=ARRAY['search_path=pg_catalog, public, pg_temp']::TEXT[]),
+		  (SELECT count(*)=2 FROM pg_catalog.pg_auth_members edge
+		    JOIN memory_role role ON role.oid=edge.roleid
+		    JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+		    CROSS JOIN object_owner owner
+		   WHERE member.rolname IN (owner.rolname,'vane_server_runtime') AND
+		         NOT edge.admin_option AND NOT edge.inherit_option AND edge.set_option) AND
+		  NOT EXISTS (
+		    SELECT 1 FROM pg_catalog.pg_auth_members edge
+		    JOIN memory_role role ON role.oid=edge.roleid
+		    JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+		    CROSS JOIN object_owner owner
+		    WHERE member.rolname NOT IN (owner.rolname,'vane_server_runtime') OR
+		          edge.admin_option OR edge.inherit_option OR NOT edge.set_option) AND
+		  NOT EXISTS (
+		    SELECT 1 FROM pg_catalog.pg_auth_members edge
+		    JOIN memory_role role ON role.oid=edge.member)
+	`).Scan(&roleSafe, &membershipSafe); err != nil {
+		return fmt.Errorf("verify memory runtime role contract: %w", err)
+	}
+	if !roleSafe || !membershipSafe {
+		return fmt.Errorf("memory runtime role contract is unsafe: attributes=%v memberships=%v",
+			roleSafe, membershipSafe)
+	}
+	var required, unexpected int
+	if err := querier.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM pg_catalog.pg_namespace object
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.nspacl,
+		       pg_catalog.acldefault('n',object.nspowner))) acl
+		   JOIN pg_catalog.pg_roles role ON role.oid=acl.grantee
+		   WHERE role.rolname='vane_memory_editor' AND
+		         object.nspname='public' AND acl.privilege_type='USAGE' AND
+		         acl.grantor=object.nspowner AND NOT acl.is_grantable) +
+		  (SELECT count(*) FROM pg_catalog.pg_class object
+		   JOIN pg_catalog.pg_namespace namespace ON namespace.oid=object.relnamespace
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.relacl,
+		       pg_catalog.acldefault(CASE WHEN object.relkind='S' THEN 's'::"char"
+		                                 ELSE 'r'::"char" END,object.relowner))) acl
+		   JOIN pg_catalog.pg_roles role ON role.oid=acl.grantee
+		   WHERE role.rolname='vane_memory_editor' AND
+		         namespace.nspname='public' AND acl.grantor=object.relowner AND
+		         NOT acl.is_grantable AND (
+		           (object.relname IN ('memory_authorizations','memory_records',
+		                               'memory_events','memory_receipts') AND
+		            acl.privilege_type IN ('SELECT','INSERT')) OR
+		           (object.relname IN ('memory_records_id_seq','memory_events_id_seq') AND
+		            acl.privilege_type IN ('USAGE','SELECT')))) +
+		  (SELECT count(*) FROM pg_catalog.pg_attribute object
+		   JOIN pg_catalog.pg_class relation ON relation.oid=object.attrelid
+		   JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(object.attacl) acl
+		   JOIN pg_catalog.pg_roles role ON role.oid=acl.grantee
+		   WHERE role.rolname='vane_memory_editor' AND
+		         namespace.nspname='public' AND
+		         relation.relname='memory_authorizations' AND
+		         object.attname='consumed_event_id' AND
+		         acl.privilege_type='UPDATE' AND acl.grantor=relation.relowner AND
+		         NOT acl.is_grantable)`,
+	).Scan(&required); err != nil {
+		return fmt.Errorf("verify memory runtime authority: %w", err)
+	}
+	if err := querier.QueryRow(ctx, `
+		WITH memory_role AS (
+		  SELECT oid FROM pg_catalog.pg_roles WHERE rolname='vane_memory_editor'
+		)
+		SELECT
+		  (SELECT count(*) FROM pg_catalog.pg_shdepend dependency,memory_role
+		   WHERE dependency.refclassid='pg_authid'::pg_catalog.regclass
+		     AND dependency.refobjid=memory_role.oid
+		     AND dependency.deptype IN ('a','o')
+		     AND (dependency.dbid=0 OR (
+		       dependency.dbid=(SELECT oid FROM pg_catalog.pg_database
+		                          WHERE datname=pg_catalog.current_database()) AND
+		       NOT (
+		         (dependency.classid='pg_namespace'::pg_catalog.regclass AND
+		          dependency.objid='public'::pg_catalog.regnamespace AND
+		          dependency.objsubid=0) OR
+		         (dependency.classid='pg_class'::pg_catalog.regclass AND
+		          dependency.objid IN (
+		            'memory_authorizations'::pg_catalog.regclass,
+		            'memory_records'::pg_catalog.regclass,
+		            'memory_events'::pg_catalog.regclass,
+		            'memory_receipts'::pg_catalog.regclass,
+		            'memory_records_id_seq'::pg_catalog.regclass,
+		            'memory_events_id_seq'::pg_catalog.regclass) AND
+		          dependency.objsubid=0) OR
+		         (dependency.classid='pg_class'::pg_catalog.regclass AND
+		          dependency.objid='memory_authorizations'::pg_catalog.regclass AND
+		          dependency.objsubid=(SELECT attnum FROM pg_catalog.pg_attribute
+		             WHERE attrelid='memory_authorizations'::pg_catalog.regclass
+		               AND attname='consumed_event_id' AND NOT attisdropped))
+		       )
+		     ))) +
+		  (SELECT count(*) FROM pg_catalog.pg_namespace object,memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.nspacl,
+		       pg_catalog.acldefault('n',object.nspowner))) acl
+		   WHERE acl.grantee=memory_role.oid AND NOT (
+		       object.nspname='public' AND acl.privilege_type='USAGE' AND
+		       acl.grantor=object.nspowner AND NOT acl.is_grantable)) +
+		  (SELECT count(*) FROM pg_catalog.pg_class object
+		   JOIN pg_catalog.pg_namespace namespace ON namespace.oid=object.relnamespace
+		   CROSS JOIN memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.relacl,
+		       pg_catalog.acldefault(CASE WHEN object.relkind='S' THEN 's'::"char"
+		                                 ELSE 'r'::"char" END,object.relowner))) acl
+		   WHERE acl.grantee=memory_role.oid AND NOT (
+		     namespace.nspname='public' AND (
+		       (object.relname IN ('memory_authorizations','memory_records',
+		                           'memory_events','memory_receipts') AND
+		        acl.privilege_type IN ('SELECT','INSERT') AND
+		        acl.grantor=object.relowner AND NOT acl.is_grantable) OR
+		       (object.relname IN ('memory_records_id_seq','memory_events_id_seq') AND
+		        acl.privilege_type IN ('USAGE','SELECT') AND
+		        acl.grantor=object.relowner AND NOT acl.is_grantable)))) +
+		  (SELECT count(*) FROM pg_catalog.pg_attribute object
+		   JOIN pg_catalog.pg_class relation ON relation.oid=object.attrelid
+		   JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+		   CROSS JOIN memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(object.attacl) acl
+		   WHERE acl.grantee=memory_role.oid AND NOT (
+		     namespace.nspname='public' AND relation.relname='memory_authorizations' AND
+		     object.attname='consumed_event_id' AND acl.privilege_type='UPDATE' AND
+		     acl.grantor=relation.relowner AND NOT acl.is_grantable)) +
+		  (SELECT count(*) FROM pg_catalog.pg_proc object,memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(object.proacl,
+		       pg_catalog.acldefault('f',object.proowner))) acl
+		   WHERE acl.grantee=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_default_acl object,memory_role
+		   CROSS JOIN LATERAL pg_catalog.aclexplode(object.defaclacl) acl
+		   WHERE acl.grantee=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_database object,memory_role
+		   WHERE object.datdba=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_namespace object,memory_role
+		   WHERE object.nspowner=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_class object,memory_role
+		   WHERE object.relowner=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_proc object,memory_role
+		   WHERE object.proowner=memory_role.oid) +
+		  (SELECT count(*) FROM pg_catalog.pg_type object,memory_role
+		   WHERE object.typowner=memory_role.oid)`,
+	).Scan(&unexpected); err != nil {
+		return fmt.Errorf("verify unexpected memory runtime authority: %w", err)
+	}
+	if unexpected != 0 {
+		return fmt.Errorf("memory runtime retains %d unexpected authorities", unexpected)
+	}
+	if required != 14 {
+		return fmt.Errorf("memory runtime has %d of 14 required authorities", required)
 	}
 	return nil
 }

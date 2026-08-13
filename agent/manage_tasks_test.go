@@ -1195,7 +1195,10 @@ func TestOwnerGeneralChatInventoryHidesLegacyTaskTools(t *testing.T) {
 	for _, def := range defs {
 		got[def.Name] = true
 	}
-	for _, required := range []string{"query_my_intelligence", "manage_tasks", "update_profile"} {
+	for _, required := range []string{
+		"query_my_intelligence", "manage_tasks", "update_profile",
+		"recall_memory", "manage_memory",
+	} {
 		if !got[required] {
 			t.Errorf("Agent-first inventory missing %s: %v", required, got)
 		}

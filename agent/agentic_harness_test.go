@@ -299,7 +299,7 @@ func TestOwnerAgentCatalogIsNotKeywordRouted(t *testing.T) {
 		got[def.Name] = true
 	}
 	for _, required := range []string{"query_my_intelligence", "manage_tasks",
-		"update_profile", "web_search", "read_page"} {
+		"update_profile", "recall_memory", "manage_memory", "web_search", "read_page"} {
 		if !got[required] {
 			t.Fatalf("owner catalog missing %s: %v", required, got)
 		}

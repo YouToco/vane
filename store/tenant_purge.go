@@ -119,6 +119,12 @@ var purgeOrder = []purgeStep{
 	// by writers, but purge already pre-locks session roots before child deletes.
 	{"agent_session_projection_authority_events", "tenant_id = $1"},
 	{"agent_events", "tenant_id = $1"},
+	// Explicit tenant erasure is the sole deletion path for retained long-term
+	// memory history. Receipts reference events and events reference records.
+	{"memory_receipts", "tenant_id = $1"},
+	{"memory_events", "tenant_id = $1"},
+	{"memory_records", "tenant_id = $1"},
+	{"memory_authorizations", "tenant_id = $1"},
 	// V3 delivery anchors reference the effect and projections, so they are the
 	// first child in the durable delivery chain.
 	{"research_brief_deliveries", "tenant_id = $1"},
@@ -328,6 +334,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		researchV3PrepareHeadsAvailable      bool
 		researchV3PrepareOpsAvailable        bool
 		scheduleCommandCursorAvailable       bool
+		memoryAuthorizationsAvailable        bool
+		memoryRecordsAvailable               bool
+		memoryEventsAvailable                bool
+		memoryReceiptsAvailable              bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -359,7 +369,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.research_v3_cutover_operations') IS NOT NULL,
 		        to_regclass('public.research_v3_prepared_definition_heads') IS NOT NULL,
 		        to_regclass('public.research_v3_definition_prepare_operations') IS NOT NULL,
-		        to_regclass('public.schedule_command_recovery_cursors') IS NOT NULL`,
+		        to_regclass('public.schedule_command_recovery_cursors') IS NOT NULL,
+		        to_regclass('public.memory_authorizations') IS NOT NULL,
+		        to_regclass('public.memory_records') IS NOT NULL,
+		        to_regclass('public.memory_events') IS NOT NULL,
+		        to_regclass('public.memory_receipts') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -391,6 +405,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&researchV3PrepareHeadsAvailable,
 		&researchV3PrepareOpsAvailable,
 		&scheduleCommandCursorAvailable,
+		&memoryAuthorizationsAvailable,
+		&memoryRecordsAvailable,
+		&memoryEventsAvailable,
+		&memoryReceiptsAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -426,6 +444,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"research_v3_prepared_definition_heads":     researchV3PrepareHeadsAvailable,
 		"research_v3_definition_prepare_operations": researchV3PrepareOpsAvailable,
 		"schedule_command_recovery_cursors":         scheduleCommandCursorAvailable,
+		"memory_authorizations":                     memoryAuthorizationsAvailable,
+		"memory_records":                            memoryRecordsAvailable,
+		"memory_events":                             memoryEventsAvailable,
+		"memory_receipts":                           memoryReceiptsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,

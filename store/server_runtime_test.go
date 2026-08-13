@@ -226,6 +226,154 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Run("memory capability requires every exact ACL at startup", func(t *testing.T) {
+		mutations := []struct {
+			name, revoke, restore string
+		}{
+			{"schema usage", `REVOKE USAGE ON SCHEMA public FROM vane_memory_editor`, `GRANT USAGE ON SCHEMA public TO vane_memory_editor`},
+			{"authorizations select", `REVOKE SELECT ON memory_authorizations FROM vane_memory_editor`, `GRANT SELECT ON memory_authorizations TO vane_memory_editor`},
+			{"authorizations insert", `REVOKE INSERT ON memory_authorizations FROM vane_memory_editor`, `GRANT INSERT ON memory_authorizations TO vane_memory_editor`},
+			{"records select", `REVOKE SELECT ON memory_records FROM vane_memory_editor`, `GRANT SELECT ON memory_records TO vane_memory_editor`},
+			{"records insert", `REVOKE INSERT ON memory_records FROM vane_memory_editor`, `GRANT INSERT ON memory_records TO vane_memory_editor`},
+			{"events select", `REVOKE SELECT ON memory_events FROM vane_memory_editor`, `GRANT SELECT ON memory_events TO vane_memory_editor`},
+			{"events insert", `REVOKE INSERT ON memory_events FROM vane_memory_editor`, `GRANT INSERT ON memory_events TO vane_memory_editor`},
+			{"receipts select", `REVOKE SELECT ON memory_receipts FROM vane_memory_editor`, `GRANT SELECT ON memory_receipts TO vane_memory_editor`},
+			{"receipts insert", `REVOKE INSERT ON memory_receipts FROM vane_memory_editor`, `GRANT INSERT ON memory_receipts TO vane_memory_editor`},
+			{"records sequence usage", `REVOKE USAGE ON SEQUENCE memory_records_id_seq FROM vane_memory_editor`, `GRANT USAGE ON SEQUENCE memory_records_id_seq TO vane_memory_editor`},
+			{"records sequence select", `REVOKE SELECT ON SEQUENCE memory_records_id_seq FROM vane_memory_editor`, `GRANT SELECT ON SEQUENCE memory_records_id_seq TO vane_memory_editor`},
+			{"events sequence usage", `REVOKE USAGE ON SEQUENCE memory_events_id_seq FROM vane_memory_editor`, `GRANT USAGE ON SEQUENCE memory_events_id_seq TO vane_memory_editor`},
+			{"events sequence select", `REVOKE SELECT ON SEQUENCE memory_events_id_seq FROM vane_memory_editor`, `GRANT SELECT ON SEQUENCE memory_events_id_seq TO vane_memory_editor`},
+			{"authorization consume", `REVOKE UPDATE (consumed_event_id) ON memory_authorizations FROM vane_memory_editor`, `GRANT UPDATE (consumed_event_id) ON memory_authorizations TO vane_memory_editor`},
+		}
+		for _, mutation := range mutations {
+			if _, err := owner.ExecContext(t.Context(), mutation.revoke); err != nil {
+				t.Fatalf("revoke %s: %v", mutation.name, err)
+			}
+			st, err := NewServerRuntime(t.Context(), runtimeURL)
+			if err == nil {
+				st.Close()
+				t.Fatalf("startup accepted missing %s", mutation.name)
+			}
+			if !strings.Contains(err.Error(), "required authorities") {
+				t.Fatalf("missing %s returned unexpected error: %v", mutation.name, err)
+			}
+			if _, err := owner.ExecContext(t.Context(), mutation.restore); err != nil {
+				t.Fatalf("restore %s: %v", mutation.name, err)
+			}
+		}
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatalf("restored memory authority rejected: %v", err)
+		}
+		st.Close()
+	})
+
+	t.Run("memory capability rejects extra ACL at startup", func(t *testing.T) {
+		mutations := []struct {
+			name, grant, revoke string
+		}{
+			{"mutable history", `GRANT UPDATE ON memory_records TO vane_memory_editor`, `REVOKE UPDATE ON memory_records FROM vane_memory_editor`},
+			{"foreign session read", `GRANT SELECT ON agent_sessions TO vane_memory_editor`, `REVOKE SELECT ON agent_sessions FROM vane_memory_editor`},
+			{"delegable required read", `GRANT SELECT ON memory_records TO vane_memory_editor WITH GRANT OPTION`, `REVOKE GRANT OPTION FOR SELECT ON memory_records FROM vane_memory_editor; GRANT SELECT ON memory_records TO vane_memory_editor`},
+		}
+		for _, mutation := range mutations {
+			if _, err := owner.ExecContext(t.Context(), mutation.grant); err != nil {
+				t.Fatalf("grant %s: %v", mutation.name, err)
+			}
+			st, err := NewServerRuntime(t.Context(), runtimeURL)
+			if err == nil {
+				st.Close()
+				t.Fatalf("startup accepted %s", mutation.name)
+			}
+			if !strings.Contains(err.Error(), "unexpected authorities") {
+				t.Fatalf("extra %s returned unexpected error: %v", mutation.name, err)
+			}
+			if _, err := owner.ExecContext(t.Context(), mutation.revoke); err != nil {
+				t.Fatalf("revoke %s: %v", mutation.name, err)
+			}
+		}
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatalf("restored exact memory authority rejected: %v", err)
+		}
+		st.Close()
+	})
+
+	t.Run("memory capability rejects role and membership drift at startup", func(t *testing.T) {
+		assertRejected := func(name string) {
+			t.Helper()
+			st, err := NewServerRuntime(t.Context(), runtimeURL)
+			if err == nil {
+				st.Close()
+				t.Fatalf("startup accepted %s", name)
+			}
+			if !strings.Contains(err.Error(), "role contract is unsafe") {
+				t.Fatalf("%s returned unexpected error: %v", name, err)
+			}
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor LOGIN PASSWORD 'memory-drift-test'`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("LOGIN memory role")
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor NOLOGIN PASSWORD NULL`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor INHERIT`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("INHERIT memory role")
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor NOINHERIT`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor SET search_path=public`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("memory role search_path drift")
+		if _, err := owner.ExecContext(t.Context(),
+			`ALTER ROLE vane_memory_editor SET search_path=pg_catalog,public,pg_temp`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`GRANT vane_memory_editor TO vane_app WITH ADMIN FALSE, SET TRUE, INHERIT FALSE`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("extra memory role member")
+		if _, err := owner.ExecContext(t.Context(),
+			`REVOKE vane_memory_editor FROM vane_app`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`GRANT vane_app TO vane_memory_editor WITH ADMIN FALSE, SET TRUE, INHERIT FALSE`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("memory role outbound membership")
+		if _, err := owner.ExecContext(t.Context(),
+			`REVOKE vane_app FROM vane_memory_editor`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := owner.ExecContext(t.Context(),
+			`GRANT vane_memory_editor TO vane_server_runtime WITH ADMIN OPTION`); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected("memory runtime edge option drift")
+		if _, err := owner.ExecContext(t.Context(), `
+			REVOKE vane_memory_editor FROM vane_server_runtime;
+			GRANT vane_memory_editor TO vane_server_runtime
+			  WITH ADMIN FALSE, SET TRUE, INHERIT FALSE`); err != nil {
+			t.Fatal(err)
+		}
+		st, err := NewServerRuntime(t.Context(), runtimeURL)
+		if err != nil {
+			t.Fatalf("restored exact memory role contract rejected: %v", err)
+		}
+		st.Close()
+	})
+
 	t.Run("recovery catalog separates discovery from tenant payload reads", func(t *testing.T) {
 		st, err := NewServerRuntime(t.Context(), runtimeURL)
 		if err != nil {
@@ -1005,11 +1153,13 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 			"provision_vane_server_runtime_v1",
 			"provision_vane_server_runtime_v2",
 			"provision_vane_server_runtime_v128",
+			"provision_vane_server_runtime_v129",
 			"provision_vane_server_runtime_research_binder_v1",
 			"retire_agent_session_fact_projector_v128",
 			"deprovision_vane_server_runtime_v1",
 			"deprovision_vane_server_runtime_v2",
 			"deprovision_vane_server_runtime_v128",
+			"deprovision_vane_server_runtime_v129",
 			"deprovision_vane_server_runtime_research_binder_v1",
 			"restore_agent_session_fact_projector_v128",
 		} {
@@ -1125,8 +1275,32 @@ func TestSchemaMigrationsCoexistWithoutServerRuntimeProvisionPostgres(t *testing
 	if existing != 0 {
 		t.Skip("cluster must be explicitly deprovisioned before fresh-database migration")
 	}
+	memoryRoleSnapshot := ""
+	snapshotMemoryRole := func() string {
+		t.Helper()
+		var got string
+		if err := admin.QueryRowContext(t.Context(), `
+			SELECT jsonb_build_object(
+			 'login',role.rolcanlogin,'super',role.rolsuper,
+			 'createdb',role.rolcreatedb,'createrole',role.rolcreaterole,
+			 'inherit',role.rolinherit,'replication',role.rolreplication,
+			 'bypassrls',role.rolbypassrls,'config',role.rolconfig,
+			 'memberships',(
+			   SELECT jsonb_agg(jsonb_build_array(member.rolname,edge.set_option,
+			                                      edge.admin_option,edge.inherit_option)
+			                    ORDER BY member.rolname)
+			     FROM pg_catalog.pg_auth_members edge
+			     JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+			    WHERE edge.roleid=role.oid))::text
+			  FROM pg_catalog.pg_roles role
+			 WHERE role.rolname='vane_memory_editor'`,
+		).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
 
-	for _, name := range []string{"first schema", "second schema"} {
+	for index, name := range []string{"first schema", "second schema"} {
 		t.Run(name, func(t *testing.T) {
 			scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 			defer drop()
@@ -1141,6 +1315,13 @@ func TestSchemaMigrationsCoexistWithoutServerRuntimeProvisionPostgres(t *testing
 			}
 			if count != 0 {
 				t.Fatal("ordinary schema migration leaked server runtime into cluster")
+			}
+			gotMemoryRole := snapshotMemoryRole()
+			if index == 0 {
+				memoryRoleSnapshot = gotMemoryRole
+			} else if gotMemoryRole != memoryRoleSnapshot {
+				t.Fatalf("ordinary second-database migration mutated memory role:\n"+
+					"first=%s\nsecond=%s", memoryRoleSnapshot, gotMemoryRole)
 			}
 		})
 	}

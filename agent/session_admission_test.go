@@ -256,6 +256,12 @@ func newSharedAdmissionTestLoops(
 		newToolSpec(&fakeTool{name: "update_profile", mutating: true}, withToolSurface(
 			ownerPolicy(Effects(EffectStateWrite, EffectDirectOwnerWrite), BudgetNone),
 			ExposureAlways, knownToolIntents, ResultTrustLocal, true)),
+		newToolSpec(&fakeTool{name: "recall_memory"}, withToolSurface(
+			ownerPolicy(Effects(EffectInternalRead), BudgetNone),
+			ExposureAlways, knownToolIntents, ResultTrustLocal, false)),
+		newToolSpec(&fakeTool{name: "manage_memory", mutating: true}, withToolSurface(
+			ownerPolicy(Effects(EffectStateWrite, EffectDirectOwnerWrite), BudgetNone),
+			ExposureAlways, knownToolIntents, ResultTrustLocal, true)),
 	}
 	owner := New(Deps{
 		Store: store, Profiles: store, Tools: ownerTools,
