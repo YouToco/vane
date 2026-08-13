@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 129
+const latestMigrationVersion int64 = 130
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -170,6 +170,8 @@ var wantTables = []string{
 	"memory_events",
 	"memory_receipts",
 	"memory_authorizations",
+	// 130 deployment-bound Agent-first retention attestation foundation.
+	"agent_first_retention_attestation_events",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

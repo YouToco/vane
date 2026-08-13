@@ -439,6 +439,7 @@ func run() error {
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, temporalWorkerOptions())
 	w.RegisterWorkflow(workflow.ResearchShadowWorkflowV3)
 	w.RegisterWorkflow(workflow.ResearchScheduledWorkflowV3)
+	w.RegisterWorkflow(workflow.AgentFirstRetentionClockWorkflowV1)
 	w.RegisterWorkflow(periodicbrief.WorkflowV1)
 	// Only V3 research activities remain registered in the production worker.
 	// V1/V2 implementations stay in source solely for retained-history replay and

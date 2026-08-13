@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/worker"
@@ -32,7 +34,42 @@ const (
 )
 
 func temporalWorkerOptions() worker.Options {
-	return worker.Options{WorkerStopTimeout: temporalWorkerStopTimeout}
+	return worker.Options{
+		WorkerStopTimeout: temporalWorkerStopTimeout,
+		// BuildID is recorded in WorkflowTask history even though routing remains
+		// unversioned. The Agent-first retention audit binds its clock witness to
+		// this immutable VCS revision; an unstamped development binary can still
+		// run normal workflows but can never satisfy the production audit.
+		BuildID: temporalWorkerBuildID(),
+	}
+}
+
+func temporalWorkerBuildID() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "vane/development"
+	}
+	var revision string
+	modified := false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if modified || len(revision) != 40 || !isLowerHex(revision) {
+		return "vane/development"
+	}
+	return "vane/" + revision
+}
+
+func isLowerHex(value string) bool {
+	return strings.IndexFunc(value, func(current rune) bool {
+		return !('0' <= current && current <= '9') &&
+			!('a' <= current && current <= 'f')
+	}) < 0
 }
 
 func beginHTTPShutdown(srv *http.Server, timeout time.Duration) <-chan error {
