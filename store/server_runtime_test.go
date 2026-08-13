@@ -1275,8 +1275,32 @@ func TestSchemaMigrationsCoexistWithoutServerRuntimeProvisionPostgres(t *testing
 	if existing != 0 {
 		t.Skip("cluster must be explicitly deprovisioned before fresh-database migration")
 	}
+	memoryRoleSnapshot := ""
+	snapshotMemoryRole := func() string {
+		t.Helper()
+		var got string
+		if err := admin.QueryRowContext(t.Context(), `
+			SELECT jsonb_build_object(
+			 'login',role.rolcanlogin,'super',role.rolsuper,
+			 'createdb',role.rolcreatedb,'createrole',role.rolcreaterole,
+			 'inherit',role.rolinherit,'replication',role.rolreplication,
+			 'bypassrls',role.rolbypassrls,'config',role.rolconfig,
+			 'memberships',(
+			   SELECT jsonb_agg(jsonb_build_array(member.rolname,edge.set_option,
+			                                      edge.admin_option,edge.inherit_option)
+			                    ORDER BY member.rolname)
+			     FROM pg_catalog.pg_auth_members edge
+			     JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+			    WHERE edge.roleid=role.oid))::text
+			  FROM pg_catalog.pg_roles role
+			 WHERE role.rolname='vane_memory_editor'`,
+		).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
 
-	for _, name := range []string{"first schema", "second schema"} {
+	for index, name := range []string{"first schema", "second schema"} {
 		t.Run(name, func(t *testing.T) {
 			scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 			defer drop()
@@ -1291,6 +1315,13 @@ func TestSchemaMigrationsCoexistWithoutServerRuntimeProvisionPostgres(t *testing
 			}
 			if count != 0 {
 				t.Fatal("ordinary schema migration leaked server runtime into cluster")
+			}
+			gotMemoryRole := snapshotMemoryRole()
+			if index == 0 {
+				memoryRoleSnapshot = gotMemoryRole
+			} else if gotMemoryRole != memoryRoleSnapshot {
+				t.Fatalf("ordinary second-database migration mutated memory role:\n"+
+					"first=%s\nsecond=%s", memoryRoleSnapshot, gotMemoryRole)
 			}
 		})
 	}
