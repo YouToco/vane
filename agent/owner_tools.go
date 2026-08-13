@@ -93,6 +93,8 @@ func BuildOwnerTools(
 		NewQueryMyIntelligenceTool(st),
 		NewManageTasksTool(manage),
 		NewAuthorizedUpdateProfileTool(st, authorizer),
+		NewRecallMemoryTool(st),
+		NewManageMemoryTool(st, authorizer),
 	}
 	return append(tools, BuildPublicResearchTools(endpoints, exa)...)
 }

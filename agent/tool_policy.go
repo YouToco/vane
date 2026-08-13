@@ -123,10 +123,11 @@ const (
 	IntentSocialResearch
 	IntentTasks
 	IntentProfile
+	IntentMemory
 )
 
 const knownToolIntents = IntentWebResearch | IntentSocialResearch |
-	IntentTasks | IntentProfile
+	IntentTasks | IntentProfile | IntentMemory
 
 func Intents(values ...ToolIntent) ToolIntent {
 	var out ToolIntent
