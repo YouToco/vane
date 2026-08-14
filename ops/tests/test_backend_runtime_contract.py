@@ -16,6 +16,13 @@ SPEC.loader.exec_module(artifact)
 
 
 class BackendRuntimeContractTest(unittest.TestCase):
+    def test_atomic_release_entrypoint_is_executable(self) -> None:
+        self.assertNotEqual(
+            REMOTE.stat().st_mode & 0o111,
+            0,
+            "controller archive must preserve an executable production entrypoint",
+        )
+
     def test_toolchain_uses_fixed_security_release(self) -> None:
         lock = json.loads((REPO / "tools/toolchain.lock.json").read_text(encoding="utf-8"))
         self.assertEqual(lock["tools"]["go"]["version"], "1.26.6")
