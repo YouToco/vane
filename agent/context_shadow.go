@@ -135,7 +135,6 @@ func (l *Loop) shadowFinalPendingContext(
 		Messages: withSystem(
 			l.sys, messages, "", false,
 		),
-		MaxTokens:       iptr(replyMaxTokens),
 		EnableThinking:  true,
 		ReasoningEffort: llm.ReasoningEffortHigh,
 	}

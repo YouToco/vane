@@ -106,7 +106,6 @@ func TestContextShadowSealPanicIsContainedAndDrainCompletes(t *testing.T) {
 				{Role: "system", Content: loop.sys},
 				{Role: "user", Content: "question"},
 			},
-			MaxTokens: iptr(replyMaxTokens),
 		},
 		&toolRunState{activation: &activationState{}},
 		1,
@@ -147,7 +146,6 @@ func TestContextShadowDoesNotChangeLegacyRequestOrOutcome(t *testing.T) {
 				[]llm.ChatMessage{}, "", loop.renderProfile)[0].Content},
 			{Role: "user", Content: "hello"},
 		},
-		MaxTokens:       iptr(replyMaxTokens),
 		EnableThinking:  true,
 		ReasoningEffort: llm.ReasoningEffortHigh,
 	}

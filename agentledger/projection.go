@@ -19,9 +19,7 @@ const (
 	ProjectionSchemaVersion = "vane.agent-session-projection/v1"
 	ProjectionFullSnapshot  = "full_snapshot"
 
-	maxProjectionMessages        = 60
-	maxProjectionTurnID          = 128
-	keepRecentProjectionMessages = 40
+	maxProjectionTurnID = 128
 )
 
 var ErrInvalidProjection = errors.New("agent ledger: invalid session projection")
@@ -49,7 +47,8 @@ type ProjectionShadowAudit struct {
 }
 
 // ProjectionSnapshotInput is one complete normal Agent turn after all
-// trust-boundary scrubbing and message truncation have run.
+// trust-boundary scrubbing has run. The projection retains the complete
+// session history; it does not impose a model-context message count cap.
 type ProjectionSnapshotInput struct {
 	Scope                Scope
 	TurnID               string
@@ -129,11 +128,6 @@ func BuildProjectionSnapshotBatch(
 	}
 
 	eventCount := len(messages) + 2
-	// This mirrors migration 035's immutable batch bound. Refuse the complete
-	// write instead of silently dropping semantic events and reporting match.
-	if eventCount > 64 {
-		return AppendBatch{}, invalidProjection("snapshot event count exceeds the batch limit")
-	}
 
 	events := make([]Input, 0, eventCount)
 	started, err := projectionBody(projectionStartedV1{
@@ -215,10 +209,9 @@ func ProjectionSnapshotTurnID(event CanonicalEvent) (string, error) {
 	return started.TurnID, nil
 }
 
-// AppendProjectionMessages applies the retained session-history truncation
-// contract to one side-writer append. It preserves the first user intent and
-// advances the recent-history boundary to a user message so a tool result is
-// never retained without its initiating user turn.
+// AppendProjectionMessages appends a side-writer message batch without
+// discarding earlier context. Trust-boundary scrubbing remains the caller's
+// responsibility; message-count truncation is deliberately absent.
 func AppendProjectionMessages(
 	current json.RawMessage,
 	appended json.RawMessage,
@@ -235,23 +228,6 @@ func AppendProjectionMessages(
 		return nil, invalidProjection("appended messages must not be empty")
 	}
 	messages := append(base, additions...)
-	if len(messages) > maxProjectionMessages {
-		cut := len(messages) - keepRecentProjectionMessages
-		for cut < len(messages) && messages[cut].Role != "user" {
-			cut++
-		}
-		if cut >= len(messages) {
-			cut = len(messages)
-		}
-		truncated := make([]projectionMessageV1, 0, len(messages)-cut+1)
-		for i := 0; i < cut; i++ {
-			if messages[i].Role == "user" {
-				truncated = append(truncated, messages[i])
-				break
-			}
-		}
-		messages = append(truncated, messages[cut:]...)
-	}
 	raw, err := json.Marshal(messages)
 	if err != nil {
 		return nil, invalidProjection("appended messages cannot be encoded")
@@ -399,9 +375,6 @@ func ProjectCanonicalSessionSnapshot(
 	if completed.Outcome != expectedOutcome || completed.TurnCount < 0 {
 		return SessionProjection{}, invalidProjection("snapshot outcome is inconsistent")
 	}
-	if len(messages) > maxProjectionMessages {
-		return SessionProjection{}, invalidProjection("snapshot has too many messages")
-	}
 	messagesRaw, err := json.Marshal(messages)
 	if err != nil {
 		return SessionProjection{}, invalidProjection("snapshot messages cannot be encoded")
@@ -514,9 +487,6 @@ func decodeProjectionMessages(raw json.RawMessage) ([]projectionMessageV1, error
 	var messages *[]projectionMessageV1
 	if err := strictjson.Decode(raw, &messages); err != nil || messages == nil {
 		return nil, invalidProjection("messages must be a strict json array")
-	}
-	if len(*messages) > maxProjectionMessages {
-		return nil, invalidProjection("messages exceed the projection limit")
 	}
 	for i := range *messages {
 		if _, err := projectionMessageKind((*messages)[i]); err != nil {

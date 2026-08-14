@@ -79,7 +79,7 @@ func TestBuildProjectionSnapshotRejectsMoreThanSixteenActivatedTools(t *testing.
 	}
 }
 
-func TestBuildProjectionSnapshotBatchBounds(t *testing.T) {
+func TestBuildProjectionSnapshotBatchPreservesMoreThanSixtyMessages(t *testing.T) {
 	baseDigest, err := ProjectionDigest(SessionProjection{
 		Messages:       json.RawMessage("[]"),
 		ActivatedTools: json.RawMessage("[]"),
@@ -95,32 +95,30 @@ func TestBuildProjectionSnapshotBatchBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = BuildProjectionSnapshotBatch(ProjectionSnapshotInput{
+	batch, err := BuildProjectionSnapshotBatch(ProjectionSnapshotInput{
 		Scope:                Scope{TenantID: 1, UserID: 2, SessionID: 3},
 		TurnID:               "turn-bounds",
 		BaseProjectionDigest: baseDigest,
 		Messages:             raw,
 	})
-	if !errors.Is(err, ErrInvalidProjection) {
-		t.Fatalf("61 messages error=%v, want ErrInvalidProjection", err)
-	}
-
-	sixty := messages[:60]
-	raw, err = json.Marshal(sixty)
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch, err := BuildProjectionSnapshotBatch(ProjectionSnapshotInput{
-		Scope:                Scope{TenantID: 1, UserID: 2, SessionID: 3},
-		TurnID:               "turn-at-limit",
-		BaseProjectionDigest: baseDigest,
-		Messages:             raw,
-	})
+	if len(batch.Events) != 63 {
+		t.Fatalf("event count=%d want=63", len(batch.Events))
+	}
+	projected, err := ProjectCanonicalSessionSnapshot(
+		mustCanonicalProjectionBatch(t, batch),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(batch.Events) != 62 {
-		t.Fatalf("event count=%d want=62", len(batch.Events))
+	var got []map[string]string
+	if err := json.Unmarshal(projected.Messages, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 61 {
+		t.Fatalf("projected messages=%d want=61", len(got))
 	}
 }
 
@@ -155,7 +153,7 @@ func TestProjectionDigestDoesNotExposeBodiesInErrors(t *testing.T) {
 	}
 }
 
-func TestAppendProjectionMessagesTruncatesAtUserBoundary(t *testing.T) {
+func TestAppendProjectionMessagesPreservesCompleteHistory(t *testing.T) {
 	messages := make([]map[string]string, 60)
 	for i := range messages {
 		role := "assistant"
@@ -181,15 +179,15 @@ func TestAppendProjectionMessagesTruncatesAtUserBoundary(t *testing.T) {
 	if err := json.Unmarshal(got, &projected); err != nil {
 		t.Fatal(err)
 	}
-	if len(projected) > 41 {
-		t.Fatalf("truncated message count=%d want <=41", len(projected))
+	if len(projected) != 61 {
+		t.Fatalf("message count=%d want=61", len(projected))
 	}
 	if projected[0]["role"] != "user" ||
 		projected[0]["content"] != messages[0]["content"] {
 		t.Fatalf("first user intent not preserved: %#v", projected[0])
 	}
-	if projected[1]["role"] != "user" {
-		t.Fatalf("recent boundary role=%v want user", projected[1]["role"])
+	if projected[1]["content"] != messages[1]["content"] {
+		t.Fatalf("middle history changed: %#v", projected[1])
 	}
 	if projected[len(projected)-1]["content"] != "callback" {
 		t.Fatalf("callback not retained: %#v", projected[len(projected)-1])
@@ -281,6 +279,22 @@ func materializeProjectionBatch(
 		}
 	}
 	return events
+}
+
+func mustCanonicalProjectionBatch(
+	t *testing.T,
+	batch AppendBatch,
+) []CanonicalEvent {
+	t.Helper()
+	canonical := make([]CanonicalEvent, len(batch.Events))
+	for i := range batch.Events {
+		event, err := Canonicalize(batch.Events[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		canonical[i] = event
+	}
+	return canonical
 }
 
 func contains(value, fragment string) bool {

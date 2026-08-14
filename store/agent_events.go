@@ -18,7 +18,6 @@ import (
 )
 
 const (
-	maxAgentEventBatchSize          = 64
 	maxAgentEventListSize           = 200
 	maxAgentEventKeyBytes           = 255
 	maxAgentSideWriterIdentityBytes = 512
@@ -965,7 +964,7 @@ func prepareAgentEventBatch(
 		return nil, "", agentEventValidationError(
 			"agent event idempotency key is invalid")
 	}
-	if len(batch.Events) == 0 || len(batch.Events) > maxAgentEventBatchSize {
+	if len(batch.Events) == 0 {
 		return nil, "", agentEventValidationError(
 			"agent event batch size is invalid")
 	}
@@ -1227,7 +1226,7 @@ func validateStoredAgentEvent(
 		event.SchemaVersion != agentledger.SchemaVersion ||
 		!event.Kind.Valid() ||
 		!validAgentEventIdempotencyKey(event.IdempotencyKey) ||
-		event.BatchSize <= 0 || event.BatchSize > maxAgentEventBatchSize ||
+		event.BatchSize <= 0 ||
 		event.BatchIndex < 0 || event.BatchIndex >= event.BatchSize ||
 		!validAgentEventDigest(event.BatchDigest) {
 		return agentledger.CanonicalEvent{}, agentEventIntegrityError()
