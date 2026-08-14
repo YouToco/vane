@@ -158,6 +158,7 @@ def main() -> int:
     output.mkdir(mode=0o777)
     go_mod_cache.mkdir()
     go_build_cache.mkdir()
+    (go_build_cache / "tmp").mkdir()
     npm_cache.mkdir()
     network = run_id
     containers: list[str] = []
@@ -286,6 +287,7 @@ def main() -> int:
                 "-e", "VANE_FULL_GATE_DEPENDENCIES=/dependencies.json",
                 "-e", "GOMODCACHE=/gomodcache",
                 "-e", "GOCACHE=/gocache",
+                "-e", "GOTMPDIR=/gocache/tmp",
                 "-e", "GOPROXY=off",
                 "-e", "npm_config_cache=/npmcache",
                 "-e", f"VANE_FULL_SHA={args.sha}",

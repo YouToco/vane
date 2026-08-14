@@ -23,6 +23,7 @@ class BuildSupervisorPolicyTest(unittest.TestCase):
             '"VANE_SOURCE_ROOT=/workspace"',
             '"GOMODCACHE=/gomodcache"',
             '"GOCACHE=/gocache"',
+            '"GOTMPDIR=/gocache/tmp"',
             '"GOPROXY=off"',
             '"npm_config_cache=/npmcache"',
             '[str(go), "mod", "verify"]',
