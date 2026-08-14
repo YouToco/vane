@@ -31,12 +31,35 @@ func TestCollectBaselineClosesAuditAndAdoptsLostAppendResponse(t *testing.T) {
 	if result.Event == nil || result.Event.TemporalEvidenceDigest != result.Manifest.Digest ||
 		result.EvidencePath != filepath.Join(fixture.request.EvidenceDirectory,
 			result.Manifest.Digest+".json") || fixture.database.appendCalls != 1 ||
-		fixture.database.loadCalls != 1 || fixture.database.readCalls != 2 {
+		fixture.database.loadCalls != 2 || fixture.database.readCalls != 2 {
 		t.Fatalf("result=%+v database=%+v", result, fixture.database)
 	}
 	if payload, err := os.ReadFile(result.EvidencePath); err != nil ||
 		!bytes.Equal(payload, result.Manifest.Canonical) {
 		t.Fatalf("persisted=%q err=%v", payload, err)
+	}
+}
+
+func TestCollectBaselineNormalizesDatabaseTimeAndAdoptsExactCommittedEvent(t *testing.T) {
+	fixture := newBaselineCollectorFixture(t)
+	first, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
+		fixture.clock, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Event.TemporalServerWitness.Nanosecond()%int(time.Microsecond) != 0 ||
+		fixture.database.appendCalls != 1 || fixture.database.loadCalls != 1 {
+		t.Fatalf("first=%+v database=%+v", first.Event, fixture.database)
+	}
+
+	second, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
+		fixture.clock, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Event.PayloadDigest != first.Event.PayloadDigest ||
+		fixture.database.appendCalls != 1 || fixture.database.loadCalls != 2 {
+		t.Fatalf("second=%+v database=%+v", second.Event, fixture.database)
 	}
 }
 
@@ -158,7 +181,7 @@ func newBaselineCollectorFixture(t *testing.T) baselineCollectorFixture {
 	clock := func(_ context.Context, authority TemporalAuthority) (RetentionClockEvidence, error) {
 		return RetentionClockEvidence{
 			Namespace: authority.Namespace, WorkflowID: clockID, RunID: clockRunID,
-			TaskQueue: "vane", ObservedAtUTC: time.Date(2026, 8, 13, 18, 0, 0, 0, time.UTC),
+			TaskQueue: "vane", ObservedAtUTC: time.Date(2026, 8, 13, 18, 0, 0, 471, time.UTC),
 			HistoryDigest: strings.Repeat("b", 64), EventCount: 5,
 			WorkerBuildID: "vane/" + source,
 		}, nil
@@ -212,6 +235,7 @@ type baselineStoreFake struct {
 	appendHook      func()
 	loadContextErr  error
 	committed       *store.AgentFirstRetentionAttestationEvent
+	events          map[string]*store.AgentFirstRetentionAttestationEvent
 	mutateCommitted func(*store.AgentFirstRetentionAttestationEvent)
 }
 
@@ -234,6 +258,11 @@ func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
 	input store.AgentFirstRetentionAttestationInput,
 ) (*store.AgentFirstRetentionAttestationEvent, error) {
 	fake.appendCalls++
+	canonicalPayload, _ := json.Marshal(struct {
+		Evidence string `json:"evidence"`
+		Parent   string `json:"parent"`
+		Phase    string `json:"phase"`
+	}{input.TemporalEvidenceDigest, input.ParentDigest, string(input.Phase)})
 	fake.committed = &store.AgentFirstRetentionAttestationEvent{
 		ID: 1, Phase: input.Phase,
 		TemporalClusterID:          input.TemporalClusterID,
@@ -253,14 +282,22 @@ func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
 		DatabaseIdentity:       []byte(`{"schema_version":"fixture/v1"}`),
 		LegacyDBSnapshot:       bytes.Clone(fake.snapshot.LegacyDBSnapshot),
 		LegacyDBSnapshotDigest: fake.snapshot.LegacyDBSnapshotDigest,
-		CanonicalPayload:       []byte(`{"schema_version":"fixture/v1"}`),
+		CanonicalPayload:       canonicalPayload,
 		IssuedAt:               time.Date(2026, 8, 13, 18, 0, 1, 0, time.UTC),
 		ExpiresAt:              time.Date(2026, 8, 13, 19, 0, 1, 0, time.UTC),
 	}
 	fake.committed.PayloadDigest = digestBytes(fake.committed.CanonicalPayload)
+	if input.ParentDigest != "" {
+		parent := input.ParentDigest
+		fake.committed.ParentDigest = &parent
+	}
 	if fake.mutateCommitted != nil {
 		fake.mutateCommitted(fake.committed)
 	}
+	if fake.events == nil {
+		fake.events = make(map[string]*store.AgentFirstRetentionAttestationEvent)
+	}
+	fake.events[fake.committed.PayloadDigest] = fake.committed
 	if fake.appendHook != nil {
 		fake.appendHook()
 	}
@@ -270,14 +307,28 @@ func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
 	return fake.committed, nil
 }
 
+func (fake *baselineStoreFake) LoadAgentFirstRetentionAttestationByDigest(
+	_ context.Context,
+	digest string,
+) (*store.AgentFirstRetentionAttestationEvent, error) {
+	if event := fake.events[digest]; event != nil {
+		return event, nil
+	}
+	return nil, store.ErrAgentFirstRetentionAttestationNotFound
+}
+
 func (fake *baselineStoreFake) LoadAgentFirstRetentionAttestation(
 	ctx context.Context,
-	_ store.AgentFirstRetentionAttestationInput,
+	input store.AgentFirstRetentionAttestationInput,
 ) (*store.AgentFirstRetentionAttestationEvent, error) {
 	fake.loadCalls++
 	fake.loadContextErr = ctx.Err()
 	if fake.committed == nil {
-		return nil, errors.New("absent")
+		return nil, store.ErrAgentFirstRetentionAttestationNotFound
+	}
+	if !fake.committed.TemporalServerWitness.Equal(input.TemporalServerWitness) ||
+		fake.committed.TemporalEvidenceDigest != input.TemporalEvidenceDigest {
+		return nil, store.ErrAgentFirstRetentionAttestationNotFound
 	}
 	return fake.committed, nil
 }

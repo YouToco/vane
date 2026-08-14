@@ -27,6 +27,7 @@ const (
 )
 
 type options struct {
+	command           string
 	temporalHost      string
 	temporalNamespace string
 	temporalTaskQueue string
@@ -34,6 +35,7 @@ type options struct {
 	releaseReceipt    string
 	evidenceDirectory string
 	liveVaneBinary    string
+	parentDigest      string
 }
 
 func main() {
@@ -88,14 +90,35 @@ func run(arguments []string) error {
 		return fmt.Errorf("connect Temporal: %w", err)
 	}
 	defer temporalClient.Close()
-	result, err := agentfirstaudit.CollectBaseline(ctx, database, temporalClient,
-		agentfirstaudit.BaselineCollectorRequest{
-			Namespace: parsed.temporalNamespace, TaskQueue: parsed.temporalTaskQueue,
-			OperationID: parsed.operationID, SourceRevision: sourceRevision,
-			Release: release, EvidenceDirectory: parsed.evidenceDirectory,
-		})
-	if err != nil {
-		return err
+	baseRequest := agentfirstaudit.BaselineCollectorRequest{
+		Namespace: parsed.temporalNamespace, TaskQueue: parsed.temporalTaskQueue,
+		OperationID: parsed.operationID, SourceRevision: sourceRevision,
+		Release: release, EvidenceDirectory: parsed.evidenceDirectory,
+	}
+	var event *store.AgentFirstRetentionAttestationEvent
+	var manifest agentfirstaudit.BaselineManifest
+	var evidencePath, schemaVersion string
+	var notBefore time.Time
+	if parsed.command == "baseline" {
+		result, err := agentfirstaudit.CollectBaseline(ctx, database, temporalClient, baseRequest)
+		if err != nil {
+			return err
+		}
+		event, manifest, evidencePath = result.Event, result.Manifest, result.EvidencePath
+		schemaVersion = "vane.agent-first-retention-baseline-result/v1"
+		notBefore = event.TemporalServerWitness.Add(
+			time.Duration(event.RetentionSeconds) * time.Second)
+	} else {
+		result, err := agentfirstaudit.CollectPrepared(ctx, database, temporalClient,
+			agentfirstaudit.PreparedCollectorRequest{
+				BaselineCollectorRequest: baseRequest, ParentDigest: parsed.parentDigest,
+			})
+		if err != nil {
+			return err
+		}
+		event, manifest, evidencePath = result.Event, result.Manifest, result.EvidencePath
+		schemaVersion = "vane.agent-first-retention-prepared-result/v1"
+		notBefore = event.IssuedAt
 	}
 	return json.NewEncoder(os.Stdout).Encode(struct {
 		SchemaVersion  string `json:"schema_version"`
@@ -106,29 +129,30 @@ func run(arguments []string) error {
 		NotBeforeUTC   string `json:"not_before_utc"`
 		ExpiresAtUTC   string `json:"expires_at_utc"`
 	}{
-		SchemaVersion: "vane.agent-first-retention-baseline-result/v1",
-		EventID:       result.Event.ID, PayloadDigest: result.Event.PayloadDigest,
-		EvidenceDigest: result.Manifest.Digest, EvidencePath: result.EvidencePath,
-		NotBeforeUTC: result.Event.TemporalServerWitness.Add(
-			time.Duration(result.Event.RetentionSeconds) * time.Second).UTC().Format(time.RFC3339Nano),
-		ExpiresAtUTC: result.Event.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		SchemaVersion: schemaVersion,
+		EventID:       event.ID, PayloadDigest: event.PayloadDigest,
+		EvidenceDigest: manifest.Digest, EvidencePath: evidencePath,
+		NotBeforeUTC: notBefore.UTC().Format(time.RFC3339Nano),
+		ExpiresAtUTC: event.ExpiresAt.UTC().Format(time.RFC3339Nano),
 	})
 }
 
 func parseOptions(arguments []string) (options, error) {
 	var parsed options
-	if len(arguments) == 0 || arguments[0] != "baseline" {
-		return options{}, errors.New("baseline subcommand is required")
+	if len(arguments) == 0 || (arguments[0] != "baseline" && arguments[0] != "prepared") {
+		return options{}, errors.New("baseline or prepared subcommand is required")
 	}
+	parsed.command = arguments[0]
 	set := flag.NewFlagSet("agentfirstretention", flag.ContinueOnError)
 	set.SetOutput(os.Stderr)
 	set.StringVar(&parsed.temporalHost, "temporal-host", "", "Temporal frontend host:port")
 	set.StringVar(&parsed.temporalNamespace, "temporal-namespace", "", "Temporal namespace")
 	set.StringVar(&parsed.temporalTaskQueue, "temporal-task-queue", "", "production task queue")
-	set.StringVar(&parsed.operationID, "operation-id", "", "stable UUID for this baseline")
+	set.StringVar(&parsed.operationID, "operation-id", "", "stable UUID for this observation")
 	set.StringVar(&parsed.releaseReceipt, "release-receipt", "", "absolute trusted receipt path")
 	set.StringVar(&parsed.evidenceDirectory, "evidence-directory", "", "absolute evidence directory")
 	set.StringVar(&parsed.liveVaneBinary, "live-vane-binary", "", "absolute live vane binary")
+	set.StringVar(&parsed.parentDigest, "parent-digest", "", "baseline attestation payload digest")
 	if err := set.Parse(arguments[1:]); err != nil {
 		return options{}, err
 	}
@@ -139,8 +163,10 @@ func parseOptions(arguments []string) (options, error) {
 		!canonicalUUID(parsed.operationID) ||
 		!canonicalAbsolute(parsed.releaseReceipt) ||
 		!canonicalAbsolute(parsed.evidenceDirectory) ||
-		!canonicalAbsolute(parsed.liveVaneBinary) {
-		return options{}, errors.New("baseline options are invalid")
+		!canonicalAbsolute(parsed.liveVaneBinary) ||
+		(parsed.command == "baseline" && parsed.parentDigest != "") ||
+		(parsed.command == "prepared" && !validLowerHex(parsed.parentDigest, 64)) {
+		return options{}, errors.New("retention collector options are invalid")
 	}
 	return parsed, nil
 }

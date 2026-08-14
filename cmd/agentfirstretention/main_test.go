@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestParseOptionsRequiresBaselineAndCanonicalAuthority(t *testing.T) {
+func TestParseOptionsRequiresPhaseAndCanonicalAuthority(t *testing.T) {
 	directory := t.TempDir()
 	arguments := []string{
 		"baseline", "--temporal-host", "127.0.0.1:7233",
@@ -20,13 +20,21 @@ func TestParseOptionsRequiresBaselineAndCanonicalAuthority(t *testing.T) {
 	if _, err := parseOptions(arguments); err != nil {
 		t.Fatal(err)
 	}
+	prepared := append([]string{"prepared"}, arguments[1:]...)
+	prepared = append(prepared, "--parent-digest", strings.Repeat("a", 64))
+	if parsed, err := parseOptions(prepared); err != nil ||
+		parsed.command != "prepared" || parsed.parentDigest != strings.Repeat("a", 64) {
+		t.Fatalf("prepared=%+v err=%v", parsed, err)
+	}
 	for _, mutation := range [][]string{
 		append([]string(nil), arguments[1:]...),
 		append(append([]string(nil), arguments...), "extra"),
 		append([]string(nil), arguments[:6]...),
+		prepared[:len(prepared)-2],
+		append(append([]string(nil), arguments...), "--parent-digest", strings.Repeat("b", 64)),
 	} {
 		if _, err := parseOptions(mutation); err == nil {
-			t.Fatal("invalid baseline options accepted")
+			t.Fatal("invalid retention options accepted")
 		}
 	}
 }

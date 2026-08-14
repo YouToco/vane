@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -43,6 +44,13 @@ var agentFirstSourceRevisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var agentFirstDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var agentFirstNamespaceIDPattern = regexp.MustCompile(
 	`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// ErrAgentFirstRetentionAttestationNotFound lets the offline collector
+// distinguish a first append from an unavailable or ambiguous adoption read.
+// It is deliberately returned only after an exact external-evidence or
+// canonical payload-digest lookup.
+var ErrAgentFirstRetentionAttestationNotFound = errors.New(
+	"Agent-first retention attestation not found")
 
 // AgentFirstRetentionAttestationInput contains only evidence observed outside
 // PostgreSQL. The append function supplies database identity, the semantic DB
@@ -394,8 +402,52 @@ func (s *Store) LoadAgentFirstRetentionAttestation(
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: iterate Agent-first retention attestation: %w", err)
 	}
+	if len(found) == 0 {
+		return nil, ErrAgentFirstRetentionAttestationNotFound
+	}
 	if len(found) != 1 {
 		return nil, fmt.Errorf("store: exact Agent-first retention attestation count is %d", len(found))
+	}
+	return found[0], nil
+}
+
+// LoadAgentFirstRetentionAttestationByDigest loads one immutable ledger event
+// by its database-generated canonical payload digest. The offline prepared
+// collector uses this to bind a content-addressed evidence file to the exact
+// baseline row; it does not grant any server or Agent runtime authority.
+func (s *Store) LoadAgentFirstRetentionAttestationByDigest(
+	ctx context.Context,
+	payloadDigest string,
+) (*AgentFirstRetentionAttestationEvent, error) {
+	if !agentFirstDigestPattern.MatchString(payloadDigest) {
+		return nil, fmt.Errorf("store: Agent-first retention payload digest is invalid")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+agentFirstRetentionEventColumnsV130+`
+		  FROM public.agent_first_retention_attestation_events
+		 WHERE payload_digest=$1 ORDER BY id DESC LIMIT 2`, payloadDigest)
+	if err != nil {
+		return nil, fmt.Errorf("store: load Agent-first retention attestation by digest: %w", err)
+	}
+	defer rows.Close()
+	var found []*AgentFirstRetentionAttestationEvent
+	for rows.Next() {
+		event, err := scanAgentFirstRetentionEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan Agent-first retention attestation by digest: %w", err)
+		}
+		if err := validateAgentFirstRetentionEvent(event); err != nil {
+			return nil, err
+		}
+		found = append(found, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate Agent-first retention attestation by digest: %w", err)
+	}
+	if len(found) == 0 {
+		return nil, ErrAgentFirstRetentionAttestationNotFound
+	}
+	if len(found) != 1 {
+		return nil, fmt.Errorf("store: Agent-first retention payload digest count is %d", len(found))
 	}
 	return found[0], nil
 }

@@ -181,13 +181,35 @@ func collectBaselineWithClock(
 		HistoryArchiveURIDigest:    afterTemporal.HistoryArchiveURIDigest,
 		VisibilityArchivalState:    store.AgentFirstArchivalState(afterTemporal.VisibilityArchivalState),
 		VisibilityArchiveURIDigest: afterTemporal.VisibilityArchiveURIDigest,
-		TemporalServerWitness:      clock.ObservedAtUTC,
-		WorkflowInventoryDigest:    afterStandard.Digest,
-		ScheduleInventoryDigest:    afterSchedules.Digest,
-		ArchiveInventoryDigest:     afterArchive.Digest,
-		TemporalEvidenceDigest:     manifest.Digest,
-		SourceRevision:             request.SourceRevision, DeployDigest: request.Release.DeployDigest(),
+		// PostgreSQL timestamptz has microsecond precision. Normalize before the
+		// exact adoption key is built so a real Temporal nanosecond timestamp
+		// round-trips through the immutable ledger without weakening the raw
+		// history digest or the canonical evidence file.
+		TemporalServerWitness:   clock.ObservedAtUTC.UTC().Truncate(time.Microsecond),
+		WorkflowInventoryDigest: afterStandard.Digest,
+		ScheduleInventoryDigest: afterSchedules.Digest,
+		ArchiveInventoryDigest:  afterArchive.Digest,
+		TemporalEvidenceDigest:  manifest.Digest,
+		SourceRevision:          request.SourceRevision, DeployDigest: request.Release.DeployDigest(),
 	}
+	// A prior attempt can commit the append and then lose its response (or fail
+	// a caller-side post-commit check). Adopt the exact immutable event before
+	// authorizing another append. Only an exact not-found result may proceed.
+	event, loadErr := database.LoadAgentFirstRetentionAttestation(ctx, input)
+	if loadErr == nil {
+		if err := validateCommittedBaseline(event, input, afterDB); err != nil {
+			return BaselineCollectorResult{}, fmt.Errorf(
+				"existing baseline differs from collected evidence")
+		}
+		return BaselineCollectorResult{
+			Event: event, Manifest: manifest, EvidencePath: evidencePath,
+		}, nil
+	}
+	if !errors.Is(loadErr, store.ErrAgentFirstRetentionAttestationNotFound) {
+		return BaselineCollectorResult{}, fmt.Errorf(
+			"load exact baseline before append: %w", loadErr)
+	}
+
 	event, appendErr := database.AppendAgentFirstRetentionAttestation(ctx, input)
 	if appendErr != nil {
 		adoptionContext, cancelAdoption := context.WithTimeout(
