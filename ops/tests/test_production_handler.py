@@ -8,6 +8,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 from ops.broker import production_handler
 
@@ -54,6 +55,10 @@ class ProductionHandlerTest(unittest.TestCase):
             marker.read_text(encoding="ascii").strip(),
             hashlib.sha256(archive.read_bytes()).hexdigest(),
         )
+        self.assertEqual(control.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((control / "releases").stat().st_mode & 0o777, 0o755)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
         replay = production_handler.stage_controller(
             archive=archive, revision=REVISION, controller_root=control
         )
@@ -88,6 +93,18 @@ class ProductionHandlerTest(unittest.TestCase):
                 controller_root=self.root / "link-control",
             )
 
+    def test_controller_root_rejects_symlink_authority(self) -> None:
+        outside = self.root / "outside-control"
+        outside.mkdir()
+        control = self.root / "control-link"
+        control.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "root is unsafe"):
+            production_handler.stage_controller(
+                archive=self.archive(self.valid_members()),
+                revision=REVISION,
+                controller_root=control,
+            )
+
     def test_atomic_current_release_refuses_stale_cas(self) -> None:
         current = self.root / "current-release.json"
         current.write_text('{"state":"N"}\n', encoding="utf-8")
@@ -110,6 +127,26 @@ class ProductionHandlerTest(unittest.TestCase):
             {"schema": "fixture", "state": "N+1"},
         )
         self.assertEqual(current.stat().st_mode & 0o777, 0o600)
+
+    def test_atomic_current_release_sets_readable_group_before_replace(self) -> None:
+        current = self.root / "current-release.json"
+        current.write_text('{"state":"N"}\n', encoding="utf-8")
+        expected = hashlib.sha256(current.read_bytes()).hexdigest()
+        original = production_handler.grp.getgrnam
+        self.addCleanup(setattr, production_handler.grp, "getgrnam", original)
+        production_handler.grp.getgrnam = lambda _: type("Group", (), {"gr_gid": os.getgid()})()
+        original_chown = production_handler.os.chown
+        self.addCleanup(setattr, production_handler.os, "chown", original_chown)
+        production_handler.os.chown = lambda path, uid, gid: None
+
+        production_handler.atomic_current_release(
+            current,
+            {"state": "N+1"},
+            expected,
+            reader_group="vane-broker",
+        )
+
+        self.assertEqual(current.stat().st_mode & 0o777, 0o640)
 
     def test_active_controller_is_confined_to_release_authority(self) -> None:
         control = self.root / "control"
@@ -160,6 +197,17 @@ class ProductionHandlerTest(unittest.TestCase):
         self.assertNotIn("docker build", source)
         self.assertNotIn("docker push", source)
 
+    def test_current_state_uses_the_activated_release_manifest_digest(self) -> None:
+        source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'infra_manifest = Path(f"/opt/vane/releases/{revision}/infra-manifest.sha256")',
+            source,
+        )
+        self.assertIn('"infra_manifest_digest": digest(infra_manifest)', source)
+        self.assertNotIn('"infra_manifest_digest": gate["infra_tree_sha256"]', source)
+
     def test_retry_restarts_the_same_atomic_release_state_machine(self) -> None:
         source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
             encoding="utf-8"
@@ -175,6 +223,67 @@ class ProductionHandlerTest(unittest.TestCase):
         self.assertEqual(
             launcher.count("--property=ReadWritePaths=/etc/systemd/system"), 1
         )
+        controller = (Path(__file__).parents[1] / "broker/controller.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('["/usr/bin/sudo", "--non-interactive", "--", *command]', controller)
+
+    def test_uat_uses_a_temporary_session_and_always_revokes_it(self) -> None:
+        executable = self.root / "uat.py"
+        executable.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+credential = Path(os.environ["CREDENTIALS_DIRECTORY"]) / "uat_session_cookie"
+token = credential.read_text(encoding="ascii").strip()
+assert len(token) == 43
+assert credential.stat().st_mode & 0o777 == 0o600
+print(json.dumps({"schema":"vane.production-uat/v1","revision":sys.argv[-1],"ok":True}))
+""",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        statements: list[str] = []
+
+        def query(sql: str) -> str:
+            statements.append(sql)
+            return "1"
+
+        output = self.root / "uat.json"
+        with mock.patch.object(production_handler, "postgres_query", side_effect=query):
+            value = production_handler.run_uat(
+                [str(executable)], REVISION, output, {"user_id": 1, "tenant_id": 1}
+            )
+
+        self.assertTrue(value["ok"])
+        self.assertEqual(len(statements), 2)
+        self.assertIn("INSERT INTO user_sessions", statements[0])
+        self.assertIn("interval '10 minutes'", statements[0])
+        self.assertIn("DELETE FROM user_sessions", statements[1])
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+    def test_uat_failure_still_revokes_the_temporary_session(self) -> None:
+        executable = self.root / "fail.sh"
+        executable.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
+        executable.chmod(0o755)
+        statements: list[str] = []
+
+        def query(sql: str) -> str:
+            statements.append(sql)
+            return "1"
+
+        with mock.patch.object(production_handler, "postgres_query", side_effect=query):
+            with self.assertRaisesRegex(RuntimeError, "exit 23"):
+                production_handler.run_uat(
+                    [str(executable)],
+                    REVISION,
+                    self.root / "unused.json",
+                    {"user_id": 1, "tenant_id": 1},
+                )
+        self.assertEqual(len(statements), 2)
+        self.assertIn("DELETE FROM user_sessions", statements[1])
 
 
 if __name__ == "__main__":

@@ -11,7 +11,28 @@ import re
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        del request, file_pointer, code, message, headers, new_url
+        return None
+
+
+OPENER = build_opener(RejectRedirects())
+
+
+def strict_json(payload: bytes) -> object:
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in items:
+            if key in value:
+                raise RuntimeError(f"production UAT response has duplicate key: {key}")
+            value[key] = item
+        return value
+
+    return json.loads(payload, object_pairs_hook=pairs)
 
 
 def request_json(origin: str, path: str, *, cookie: str, method: str = "GET") -> object:
@@ -25,10 +46,10 @@ def request_json(origin: str, path: str, *, cookie: str, method: str = "GET") ->
     if data is not None:
         headers["Content-Type"] = "application/json"
     request = Request(origin.rstrip("/") + path, data=data, headers=headers, method=method)
-    with urlopen(request, timeout=20) as response:
+    with OPENER.open(request, timeout=20) as response:
         if response.status != 200:
             raise RuntimeError(f"{path} returned HTTP {response.status}")
-        return json.loads(response.read(1024 * 1024))
+        return strict_json(response.read(1024 * 1024))
 
 
 def main() -> int:
@@ -37,7 +58,15 @@ def main() -> int:
     parser.add_argument("--sha", required=True)
     args = parser.parse_args()
     parsed = urlsplit(args.origin)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.path not in {"", "/"}:
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
         raise RuntimeError("UAT origin must be an HTTPS origin")
     if not re.fullmatch(r"[0-9a-f]{40}", args.sha):
         raise RuntimeError("UAT revision is not an exact SHA")
@@ -50,7 +79,13 @@ def main() -> int:
         raise RuntimeError("UAT session credential is malformed")
 
     me = request_json(args.origin, "/api/auth/me", cookie=cookie)
-    if not isinstance(me, dict) or not me.get("email") or not me.get("tenant_id"):
+    if (
+        not isinstance(me, dict)
+        or not isinstance(me.get("email"), str)
+        or not me["email"]
+        or type(me.get("tenant_id")) is not int
+        or me["tenant_id"] <= 0
+    ):
         raise RuntimeError("authenticated /api/auth/me response is incomplete")
     schedules = request_json(args.origin, "/api/schedules/summary", cookie=cookie)
     if not isinstance(schedules, dict) or not isinstance(schedules.get("items"), list):

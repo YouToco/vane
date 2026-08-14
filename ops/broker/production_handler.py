@@ -11,11 +11,15 @@ and Caddy.
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 import hashlib
+import grp
 import json
 import os
 from pathlib import Path
+import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -71,17 +75,6 @@ def write_revision(path: Path, revision: str) -> None:
     os.replace(temporary, path)
 
 
-def credential(name: str) -> str:
-    root = Path(os.environ.get("CREDENTIALS_DIRECTORY", ""))
-    path = root / name
-    if not root.is_absolute() or path.is_symlink() or not path.is_file():
-        raise RuntimeError(f"systemd credential is unavailable: {name}")
-    value = path.read_text(encoding="utf-8").rstrip("\r\n")
-    if not value:
-        raise RuntimeError(f"systemd credential is empty: {name}")
-    return value
-
-
 def load_config() -> dict:
     path = Path("/etc/vane-broker/production.json")
     if os.environ.get("VANE_BROKER_HANDLER_TESTING") == "1" and os.geteuid() != 0:
@@ -93,6 +86,8 @@ def load_config() -> dict:
         "evidence_root",
         "signer",
         "controller_root",
+        "state_reader_group",
+        "uat_identity",
     }
     if set(value) != expected or value.get("schema") != "vane.production-handler/v1":
         raise RuntimeError("production handler configuration keys are not exact")
@@ -107,6 +102,19 @@ def load_config() -> dict:
         character.isspace() for character in value["signer"]
     ):
         raise RuntimeError("production handler signer is invalid")
+    group = value["state_reader_group"]
+    if not isinstance(group, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", group):
+        raise RuntimeError("production handler state reader group is invalid")
+    identity = value["uat_identity"]
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"user_id", "tenant_id"}
+        or type(identity["user_id"]) is not int
+        or type(identity["tenant_id"]) is not int
+        or identity["user_id"] <= 0
+        or identity["tenant_id"] <= 0
+    ):
+        raise RuntimeError("production handler UAT identity is invalid")
     return value
 
 
@@ -152,25 +160,105 @@ def stage_server(validated: Path, revision: str) -> Path:
     return stage
 
 
-def run_uat(command: list[str], revision: str, output: Path) -> dict:
+def postgres_query(sql: str) -> str:
+    """Run one fixed local-container query without putting a DB secret in argv."""
+    result = subprocess.run(
+        [
+            "/usr/bin/docker",
+            "exec",
+            "-i",
+            "vane-postgres-1",
+            "psql",
+            "-X",
+            "-U",
+            "vane",
+            "-d",
+            "vane",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-Atq",
+        ],
+        input=sql,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("temporary production UAT session database operation failed")
+    return result.stdout.strip()
+
+
+def create_uat_session(identity: dict, *, token: Optional[str] = None) -> tuple[str, str]:
+    token = token or base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(
+        "ascii"
+    ).rstrip("=")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        raise RuntimeError("generated production UAT session token is invalid")
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    sql = f"""
+WITH eligible AS (
+  SELECT 1
+    FROM memberships m JOIN tenants t ON t.id=m.tenant_id
+   WHERE m.user_id={identity['user_id']} AND m.tenant_id={identity['tenant_id']}
+     AND m.role='owner' AND t.status='active' AND t.deleted_at IS NULL
+), inserted AS (
+  INSERT INTO user_sessions(token_hash,user_id,tenant_id,expires_at)
+  SELECT decode('{token_hash}','hex'),{identity['user_id']},{identity['tenant_id']},
+         now()+interval '10 minutes' FROM eligible RETURNING 1
+)
+SELECT count(*) FROM inserted;
+"""
+    if postgres_query(sql) != "1":
+        raise RuntimeError("temporary production UAT owner session was not inserted exactly once")
+    return token, token_hash
+
+
+def revoke_uat_session(token_hash: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{64}", token_hash):
+        raise RuntimeError("temporary production UAT session hash is invalid")
+    sql = f"""
+WITH deleted AS (
+  DELETE FROM user_sessions WHERE token_hash=decode('{token_hash}','hex') RETURNING 1
+)
+SELECT count(*) FROM deleted;
+"""
+    if postgres_query(sql) != "1":
+        raise RuntimeError("temporary production UAT session was not revoked exactly once")
+
+
+def run_uat(command: list[str], revision: str, output: Path, identity: dict) -> dict:
     executable = Path(command[0])
     if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
         raise RuntimeError("fixed production UAT command is unavailable")
-    result = subprocess.run(
-        [*command, "--sha", revision], text=True, capture_output=True, check=False
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"production UAT failed with exit {result.returncode}")
-    value = json.loads(result.stdout)
-    if (
-        not isinstance(value, dict)
-        or value.get("schema") != "vane.production-uat/v1"
-        or value.get("revision") != revision
-        or value.get("ok") is not True
-    ):
-        raise RuntimeError("production UAT evidence is invalid")
-    write_json(output, value)
-    return value
+    token, token_hash = create_uat_session(identity)
+    try:
+        with tempfile.TemporaryDirectory(prefix="vane-production-uat-") as directory:
+            credential_path = Path(directory) / "uat_session_cookie"
+            credential_path.write_text(token + "\n", encoding="ascii")
+            credential_path.chmod(0o600)
+            environment = os.environ.copy()
+            environment["CREDENTIALS_DIRECTORY"] = directory
+            result = subprocess.run(
+                [*command, "--sha", revision],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"production UAT failed with exit {result.returncode}")
+            value = json.loads(result.stdout)
+            if (
+                not isinstance(value, dict)
+                or value.get("schema") != "vane.production-uat/v1"
+                or value.get("revision") != revision
+                or value.get("ok") is not True
+            ):
+                raise RuntimeError("production UAT evidence is invalid")
+            write_json(output, value)
+            return value
+    finally:
+        revoke_uat_session(token_hash)
 
 
 def restore(
@@ -188,7 +276,13 @@ def restore(
     )
 
 
-def atomic_current_release(path: Path, value: dict, expected_digest: str) -> None:
+def atomic_current_release(
+    path: Path,
+    value: dict,
+    expected_digest: str,
+    *,
+    reader_group: Optional[str] = None,
+) -> None:
     if digest(path) != expected_digest:
         raise RuntimeError("current-release CAS changed before finalize")
     temporary = path.with_name(f".current-release.{os.getpid()}.json")
@@ -196,7 +290,10 @@ def atomic_current_release(path: Path, value: dict, expected_digest: str) -> Non
         handle.write(canonical(value))
         handle.flush()
         os.fsync(handle.fileno())
-    temporary.chmod(0o600)
+    temporary.chmod(0o640 if reader_group else 0o600)
+    if reader_group:
+        group_id = grp.getgrnam(reader_group).gr_gid
+        os.chown(temporary, 0, group_id)
     os.replace(temporary, path)
     directory = os.open(str(path.parent), os.O_RDONLY)
     try:
@@ -206,8 +303,15 @@ def atomic_current_release(path: Path, value: dict, expected_digest: str) -> Non
 
 
 def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> Path:
+    controller_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if controller_root.is_symlink() or not controller_root.is_dir():
+        raise RuntimeError("controller root is unsafe")
+    controller_root.chmod(0o755)
     releases = controller_root / "releases"
     releases.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if releases.is_symlink() or not releases.is_dir():
+        raise RuntimeError("controller release root is unsafe")
+    releases.chmod(0o755)
     target = releases / revision
     marker_name = ".controller-archive.sha256"
     archive_digest = digest(archive)
@@ -258,6 +362,7 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
                 raise RuntimeError(f"controller archive lacks required member: {required}")
         (pending / marker_name).write_text(archive_digest + "\n", encoding="ascii")
         (pending / marker_name).chmod(0o600)
+        pending.chmod(0o755)
         os.replace(pending, target)
     except BaseException:
         shutil.rmtree(pending, ignore_errors=True)
@@ -387,7 +492,16 @@ def release(
             "ready": True,
             "server": "ready-and-gate-passed",
         })
-        run_uat(config["uat_command"], revision, transaction / "uat.json")
+        run_uat(
+            config["uat_command"],
+            revision,
+            transaction / "uat.json",
+            config["uat_identity"],
+        )
+
+        infra_manifest = Path(f"/opt/vane/releases/{revision}/infra-manifest.sha256")
+        if infra_manifest.is_symlink() or not infra_manifest.is_file():
+            raise RuntimeError("activated Server release lacks its bound infra manifest")
 
         candidate = {
             "schema": "vane.current-release/v2",
@@ -397,7 +511,7 @@ def release(
                 "artifact_digest": receipt["backend_archive_sha256"],
                 "deployed_revision": revision,
             },
-            "infra_manifest_digest": gate["infra_tree_sha256"],
+            "infra_manifest_digest": digest(infra_manifest),
             "controller_revision": revision,
         }
         write_json(transaction / "candidate-current-release.json", candidate)
@@ -483,7 +597,12 @@ def release(
         shutil.copy2(controller_archive, durable / controller_archive.name)
         activate_controller(target=controller_target, controller_root=controller_root)
         controller_activated = True
-        atomic_current_release(current_path, candidate, expected_digest)
+        atomic_current_release(
+            current_path,
+            candidate,
+            expected_digest,
+            reader_group=config["state_reader_group"],
+        )
         shutil.rmtree(transaction, ignore_errors=True)
         return {
             "ok": True,

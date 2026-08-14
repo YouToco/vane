@@ -332,19 +332,23 @@ def invoke_handler(
     state_root: Path,
     repo: Path,
     expected_current_digest: str,
+    privileged: bool = False,
 ) -> dict:
     if handler.is_symlink() or not handler.is_file() or not os.access(handler, os.X_OK):
         raise RuntimeError("root-owned production handler is unavailable")
+    command = [
+        str(handler),
+        verb,
+        str(request_root),
+        str(validated_root),
+        str(state_root),
+        str(repo),
+        expected_current_digest,
+    ]
+    if privileged:
+        command = ["/usr/bin/sudo", "--non-interactive", "--", *command]
     result = subprocess.run(
-        [
-            str(handler),
-            verb,
-            str(request_root),
-            str(validated_root),
-            str(state_root),
-            str(repo),
-            expected_current_digest,
-        ],
+        command,
         text=True,
         capture_output=True,
         check=False,
@@ -399,12 +403,12 @@ def handle(
     if verb == "audit":
         return {"ok": True, "verb": verb}
 
-    if state_root.is_symlink():
-        raise RuntimeError("broker state root must not be a symlink")
-    state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not state_root.is_dir():
+    if state_root.is_symlink() or not state_root.is_dir():
         raise RuntimeError("broker state root is unavailable")
-    lock_path = state_root / "release.lock"
+    work_root = state_root / "broker-work"
+    if work_root.is_symlink() or not work_root.is_dir():
+        raise RuntimeError("broker work root is unavailable")
+    lock_path = work_root / "release.lock"
     if lock_path.is_symlink():
         raise RuntimeError("broker release lock must not be a symlink")
     with lock_path.open("a+b") as lock:
@@ -420,7 +424,7 @@ def handle(
             target_submission = load_submission(target_root)
             target_manifest = verify_submission_evidence(target_root, target_submission)
             invoke_cli(repo, ["audit", "--manifest", str(target_manifest)])
-        inflight_root = state_root / "inflight"
+        inflight_root = work_root / "inflight"
         if inflight_root.is_symlink():
             raise RuntimeError("broker inflight root must not be a symlink")
         inflight_root.mkdir(mode=0o700, exist_ok=True)
@@ -442,6 +446,7 @@ def handle(
                 state_root=state_root,
                 repo=repo,
                 expected_current_digest=expected_digest,
+                privileged=handler is None,
             )
         if not current.is_file() or current.is_symlink():
             raise RuntimeError("production handler removed current-release authority")

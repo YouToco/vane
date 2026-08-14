@@ -63,6 +63,8 @@ class BackendRuntimeContractTest(unittest.TestCase):
             "release_root=/opt/vane/releases",
             "release_dir=$release_root/$release_sha",
             "current_link=/opt/vane/current",
+            'install -d -o root -g root -m 0755 "$release_root"',
+            'chmod 0755 "$pending" "$pending/bin" "$pending/deploy"',
             "current release CAS mismatch",
             'mv -T "$pending" "$release_dir"',
             'mv -Tf "$next_link" "$current_link"',
@@ -72,6 +74,13 @@ class BackendRuntimeContractTest(unittest.TestCase):
             self.assertIn(required, remote)
         self.assertNotIn("/opt/vane/bin/", remote)
         self.assertNotIn("rm -rf -- /opt/vane/releases", remote)
+
+    def test_release_tree_is_traversable_by_unprivileged_systemd_users(self) -> None:
+        remote = REMOTE.read_text(encoding="utf-8")
+        permission_fix = remote.index('chmod 0755 "$pending"')
+        activation = remote.index('mv -T "$pending" "$release_dir"')
+        self.assertLess(permission_fix, activation)
+        self.assertIn("existing immutable release has unsafe directory mode", remote)
 
     def test_all_active_scripts_reject_scattered_binary_authority(self) -> None:
         for directory in (OPS / "release", OPS / "rollback", OPS / "bootstrap"):

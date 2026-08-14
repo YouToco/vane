@@ -15,7 +15,7 @@ class DeployStateOwnerTests(unittest.TestCase):
         broker = BROKER.read_text(encoding="utf-8")
         web = WEB_PUBLISHER.read_text(encoding="utf-8")
         certificate = CERT.read_text(encoding="utf-8")
-        self.assertIn('state_root / "release.lock"', broker)
+        self.assertIn('work_root / "release.lock"', broker)
         self.assertIn("fcntl.flock(lock, fcntl.LOCK_EX)", broker)
         self.assertIn('state_root / "web-release.lock"', web)
         self.assertIn("fcntl.flock(state_lock, fcntl.LOCK_EX)", web)

@@ -31,6 +31,7 @@ class ForcedCommandBrokerTest(unittest.TestCase):
         self.repo = self.root / "repo"
         self.requests.mkdir()
         self.state.mkdir()
+        (self.state / "broker-work").mkdir()
         (self.repo / "ops/bin").mkdir(parents=True)
         (self.repo / "ops/release").mkdir(parents=True)
         cli = self.repo / "ops/bin/vane"
@@ -186,7 +187,7 @@ class ForcedCommandBrokerTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 78, result)
         self.assertIn(b"production handler", result.stderr)
-        self.assertTrue((self.state / "release.lock").is_file())
+        self.assertTrue((self.state / "broker-work/release.lock").is_file())
         self.assertEqual(self.current.read_text(encoding="utf-8"), '{"fixture":"N"}\n')
 
     def test_successful_handler_must_advance_current_release(self) -> None:
@@ -223,7 +224,7 @@ class ForcedCommandBrokerTest(unittest.TestCase):
         digest = hashlib.sha256(self.current.read_bytes()).hexdigest()
         outside = self.root / "outside.lock"
         outside.write_text("unchanged\n", encoding="utf-8")
-        (self.state / "release.lock").symlink_to(outside)
+        (self.state / "broker-work/release.lock").symlink_to(outside)
         result = self.run_broker(
             "vane-broker release",
             {"request_id": request_id, "expected_current_digest": digest},
@@ -231,6 +232,17 @@ class ForcedCommandBrokerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 78, result)
         self.assertIn(b"lock must not be a symlink", result.stderr)
         self.assertEqual(outside.read_text(encoding="utf-8"), "unchanged\n")
+
+    def test_mutation_refuses_missing_preprovisioned_broker_work_root(self) -> None:
+        request_id = self.upload()
+        digest = hashlib.sha256(self.current.read_bytes()).hexdigest()
+        (self.state / "broker-work").rmdir()
+        result = self.run_broker(
+            "vane-broker release",
+            {"request_id": request_id, "expected_current_digest": digest},
+        )
+        self.assertEqual(result.returncode, 78, result)
+        self.assertIn(b"work root is unavailable", result.stderr)
 
     def test_legacy_import_cannot_return(self) -> None:
         self.assertFalse((OPS / "legacy-import").exists())

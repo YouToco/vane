@@ -31,8 +31,16 @@ class LocalGatePolicyTests(unittest.TestCase):
 
     def test_doctor_checks_real_executables_downloads_and_signer(self) -> None:
         with tempfile.TemporaryDirectory() as empty_cache:
+            empty_signers = pathlib.Path(empty_cache) / "allowed_signers"
+            empty_signers.write_text("# deliberately empty fixture\n", encoding="utf-8")
             result = subprocess.run(
-                [str(CLI), "doctor", "--json"],
+                [
+                    str(CLI),
+                    "doctor",
+                    "--json",
+                    "--allowed-signers",
+                    str(empty_signers),
+                ],
                 cwd=ROOT,
                 env={**os.environ, "VANE_TOOL_CACHE": empty_cache},
                 text=True,

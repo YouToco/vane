@@ -1,5 +1,59 @@
-# Tool bootstrap
+# Bootstrap
 
-Bootstrap scripts install only integrity-pinned build/deployment tools below a
+Tool installers place integrity-pinned development dependencies below a
 caller-owned private temporary directory. Version-only or unresolved pins are
-not sufficient for release; `vane doctor` enforces `tools/toolchain.lock.json`.
+not sufficient for release; `vane doctor` enforces
+`tools/toolchain.lock.json`.
+
+## One-time production control-plane cutover
+
+`production_cutover.py` is the only exception to normal broker admission. It
+exists because the first broker cannot install itself. The exception is
+narrow: an exact merged `origin/main` revision B creates a signed plan, and the
+VPS rechecks the frozen legacy bytes before creating any new authority.
+
+The local, non-production phase is:
+
+```bash
+python3 ops/bootstrap/production_cutover.py create-plan \
+  --output /private/bootstrap-B \
+  --signing-key /private/release-signing-key \
+  --transport-public-key /private/broker-transport-key.pub \
+  --broker-public-key /private/broker-signing-key.pub
+```
+
+Copy only the generated plan, its detached signature, and controller archive
+to a root-only VPS staging directory. Extract that same signed controller
+archive to a separate root-only temporary directory, then run its copy of the
+bootstrap tool. This ensures the installer and policy files come from B:
+
+```bash
+python3 ops/bootstrap/production_cutover.py audit \
+  --plan /root/bootstrap-B/bootstrap-plan.json \
+  --controller-archive /root/bootstrap-B/controller-B.tar.gz
+python3 ops/bootstrap/production_cutover.py apply \
+  --plan /root/bootstrap-B/bootstrap-plan.json \
+  --controller-archive /root/bootstrap-B/controller-B.tar.gz
+```
+
+Both VPS commands require root. `audit` is read-only and must pass immediately
+before `apply`. The apply transaction:
+
+1. verifies the signed plan, controller archive, legacy state, live process,
+   exact binaries/configuration, and middleware images;
+2. creates an immutable legacy SHA release so the existing process has a
+   complete rollback target;
+3. stages controller B and installs the unprivileged SSH forced-command broker;
+4. initializes the root-owned current-release CAS and activates the two
+   canonical `current` links.
+
+No persistent browser session is provisioned. Each later release creates a
+10-minute owner UAT session through the local PostgreSQL container, passes it
+to the UAT subprocess in a private temporary credential directory, and revokes
+it even when UAT fails.
+
+B must never publish product revision B through the broker it introduces. A
+later exact-main revision C is the first normal `./ops/bin/vane release --sha C`:
+installed B validates and mutates C, then activates controller C only after
+Server verification and UAT. Old GitHub runners remain online until this B→C
+rehearsal and production cutover both succeed.

@@ -17,7 +17,7 @@ release_root=/opt/vane/releases
 release_dir=$release_root/$release_sha
 current_link=/opt/vane/current
 lock_file=/opt/vane/.release.lock
-mkdir -p "$release_root"
+install -d -o root -g root -m 0755 "$release_root"
 exec 9>"$lock_file"
 flock 9
 
@@ -109,7 +109,16 @@ install -m 0644 "$stage/release-receipt.json" "$pending/release-receipt.json"
   find deploy -type f -print0 | sort -z | xargs -0 sha256sum >infra-manifest.sha256
 )
 printf '%s\n' "$release_sha" >"$pending/monorepo-revision"
+chmod 0755 "$pending" "$pending/bin" "$pending/deploy" "$pending/deploy/dynamicconfig"
+chmod 0644 \
+  "$pending/infra-bound-files.sha256" \
+  "$pending/infra-manifest.sha256" \
+  "$pending/monorepo-revision" \
+  "$pending/release-receipt.json"
 if [[ -e $release_dir ]]; then
+  [[ ! -L $release_dir && -d $release_dir && $(stat -c '%a' "$release_dir") == 755 ]] || {
+    echo "existing immutable release has unsafe directory mode" >&2; exit 1;
+  }
   diff -qr --no-dereference "$pending" "$release_dir" >/dev/null || {
     echo "immutable release replay differs from existing SHA directory" >&2; exit 1;
   }
