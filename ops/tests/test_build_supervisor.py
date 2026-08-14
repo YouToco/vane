@@ -6,12 +6,48 @@ import tempfile
 import unittest
 
 from ops.audit import full_gate
+from ops.release import build_supervisor
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class BuildSupervisorPolicyTest(unittest.TestCase):
+    def test_failure_evidence_is_bounded_inert_and_sealed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir()
+            (output / "store").mkdir()
+            (output / "store/shard.jsonl").write_text("failure\n", encoding="utf-8")
+            failure = build_supervisor.preserve_failure_evidence(
+                output=output,
+                work_root=root,
+                revision="a" * 40,
+                run_id="vane-full-fixture",
+                error=RuntimeError("shard failed"),
+            )
+            self.assertFalse(output.exists())
+            self.assertEqual((failure / "store/shard.jsonl").read_text(), "failure\n")
+            metadata = json.loads((failure / "failure.json").read_text())
+            self.assertEqual(metadata["error"], "shard failed")
+            self.assertEqual(failure.stat().st_mode & 0o777, 0o500)
+
+    def test_failure_evidence_rejects_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir()
+            (output / "escape").symlink_to("/etc/passwd")
+            with self.assertRaisesRegex(RuntimeError, "unsafe"):
+                build_supervisor.preserve_failure_evidence(
+                    output=output,
+                    work_root=root,
+                    revision="b" * 40,
+                    run_id="vane-full-fixture",
+                    error=RuntimeError("failed"),
+                )
+
     def test_candidate_runner_has_no_home_credentials_or_docker_socket(self) -> None:
         source = (ROOT / "ops/release/build_supervisor.py").read_text(encoding="utf-8")
         for required in (

@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import uuid
 
 CONTROL_ROOT = Path(__file__).resolve().parents[2]
 EXACT_SHA = re.compile(r"^[0-9a-f]{40}$")
+MAX_FAILURE_EVIDENCE_BYTES = 1024 * 1024 * 1024
 
 
 def command(args: list[str], *, capture: bool = False) -> str:
@@ -126,6 +128,51 @@ def rewrite_evidence(path: Path, output_root: Path) -> None:
         host = output_root / relative
         if host.is_symlink() or not host.is_dir():
             raise RuntimeError("runner evidence artifact path is unavailable on the supervisor")
+
+
+def preserve_failure_evidence(
+    *, output: Path, work_root: Path, revision: str, run_id: str, error: Exception
+) -> Path:
+    """Move bounded, inert candidate output into the root-owned failure store."""
+    failure_root = work_root / "failures"
+    if failure_root.is_symlink():
+        raise RuntimeError("build failure evidence root is a symlink")
+    failure_root.mkdir(mode=0o700, exist_ok=True)
+    if not failure_root.is_dir():
+        raise RuntimeError("build failure evidence root is not a directory")
+    total = 0
+    for candidate in output.rglob("*"):
+        info = candidate.lstat()
+        if stat.S_ISLNK(info.st_mode) or not (
+            stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)
+        ):
+            raise RuntimeError("candidate produced unsafe failure evidence")
+        if stat.S_ISREG(info.st_mode):
+            total += info.st_size
+            if total > MAX_FAILURE_EVIDENCE_BYTES:
+                raise RuntimeError("candidate failure evidence exceeds the size limit")
+    failure = failure_root / f"{revision}-{run_id}"
+    if failure.exists() or failure.is_symlink():
+        raise RuntimeError("build failure evidence destination already exists")
+    metadata = {
+        "schema": "vane.build-failure/v1",
+        "revision": revision,
+        "run_id": run_id,
+        "error": str(error),
+    }
+    (output / "failure.json").write_text(
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(output, failure)
+    uid = os.geteuid()
+    gid = os.getegid()
+    for candidate in sorted(failure.rglob("*"), reverse=True):
+        os.chown(candidate, uid, gid, follow_symlinks=False)
+        candidate.chmod(0o500 if candidate.is_dir() else 0o400)
+    os.chown(failure, uid, gid)
+    failure.chmod(0o500)
+    return failure
 
 
 def main() -> int:
@@ -301,6 +348,15 @@ def main() -> int:
         os.replace(output, args.output)
         print(json.dumps({"ok": True, "revision": args.sha, "evidence": str(args.output / "full-gate.json")}, sort_keys=True, separators=(",", ":")))
         return 0
+    except Exception as error:
+        failure = preserve_failure_evidence(
+            output=output,
+            work_root=work_root,
+            revision=args.sha,
+            run_id=run_id,
+            error=error,
+        )
+        raise RuntimeError(f"{error}; failure evidence: {failure}") from error
     finally:
         for name in reversed(containers):
             subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
