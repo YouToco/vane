@@ -1,4 +1,4 @@
-import type { TaskLatestCheck } from "@/api";
+import type { TaskLatestCheck } from "@/shared/api/client";
 
 export type TaskRunOutcome =
   | "completed"

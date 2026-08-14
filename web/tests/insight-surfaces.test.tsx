@@ -6,11 +6,11 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import ExplorationPanel, {
   type ExplorationCopy,
   type ExplorationItem,
-} from "@/components/ExplorationPanel";
+} from "@/features/exploration/ExplorationPanel";
 import TaskHealthPanel, {
   type TaskHealthCopy,
   type TaskHealthProjection,
-} from "@/components/TaskHealthPanel";
+} from "@/features/task/TaskHealthPanel";
 
 afterEach(cleanup);
 

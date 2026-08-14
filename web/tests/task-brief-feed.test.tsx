@@ -26,7 +26,7 @@ const apiMock = vi.hoisted(() => ({
   reportGrounding: vi.fn(),
 }));
 
-vi.mock("@/api", () => ({
+vi.mock("@/shared/api/client", () => ({
   api: apiMock,
   ApiError: class ApiError extends Error {
     status: number;
@@ -75,14 +75,14 @@ import TaskBriefFeed, {
   BriefInsightBody,
   InsightBody,
   validatedEventEvidence,
-} from "@/components/TaskBriefFeed";
+} from "@/features/task/TaskBriefFeed";
 import type {
   ExecutiveContent,
   TaskBrief,
   TaskBriefsResp,
   TaskBriefStructuredInsight,
-} from "@/api";
-import { ApiError } from "@/api";
+} from "@/shared/api/client";
+import { ApiError } from "@/shared/api/client";
 import { briefDict } from "@/i18n/brief";
 
 function deferred<T>() {

@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { Plus, Loader2, Send, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { api } from "../api";
-import type { DeliveryHistoryItem } from "../api";
+import { api } from "@/shared/api/client";
+import type { DeliveryHistoryItem } from "@/shared/api/client";
 import { useI18n } from "@/i18n";
-import { BEIJING_TZ, fmtBeijing } from "@/lib/time";
+import { BEIJING_TZ, fmtBeijing } from "@/shared/utils/time";
 
 // 后端 parseHistoryQuery 规定 page_size ∈ [1,100]，越界直接 400。
 // 这里取满 100：既是「今日推送」计数能拿到的最大窗口，也是合法上限。

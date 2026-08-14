@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Fragment } from "react";
-import { api, ApiError } from "../api";
-import type { RunstatsResp, SpanDayCost } from "../api";
+import { api, ApiError } from "@/shared/api/client";
+import type { RunstatsResp, SpanDayCost } from "@/shared/api/client";
 import {
   Card,
   CardContent,

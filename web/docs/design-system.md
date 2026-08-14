@@ -1,6 +1,6 @@
 # 见微 Vane 设计系统 v3 —「天青雾 / Celadon Mist」
 
-> 2026-07-19 三改定稿（vane-web#19）。Token 实体在 [`src/index.css`](../src/index.css)，
+> 2026-07-19 三改定稿（vane-web#19）。Token 实体在 [`src/app/index.css`](../src/app/index.css)，
 > 本文档解释设计决策与使用规则；两处冲突时以 index.css 为准。
 
 ## 品牌故事
@@ -18,7 +18,7 @@
 
 ## Logo
 
-实体在 [`src/components/brand/Logo.tsx`](../src/components/brand/Logo.tsx)：
+实体在 [`src/shared/brand/Logo.tsx`](../src/shared/brand/Logo.tsx)：
 
 | 组件 | 用途 | 颜色 |
 |---|---|---|

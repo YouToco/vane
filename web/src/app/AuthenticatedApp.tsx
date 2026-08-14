@@ -1,6 +1,6 @@
 import { lazy, Suspense } from "react";
-import { api, PLATFORM_OWNER_TENANT_ID } from "./api";
-import type { MeResponse } from "./api";
+import { api, PLATFORM_OWNER_TENANT_ID } from "@/shared/api/client";
+import type { MeResponse } from "@/shared/api/client";
 import {
   Sidebar,
   SidebarContent,
@@ -36,17 +36,17 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { LogoMark } from "@/components/brand/Logo";
-import { LocaleSwitch } from "@/components/LocaleSwitch";
+import { LogoMark } from "@/shared/brand/Logo";
+import { LocaleSwitch } from "@/app/LocaleSwitch";
 import { useI18n } from "@/i18n";
-import { clearTaskMutationSessionStorage } from "@/lib/task-action-session";
+import { clearTaskMutationSessionStorage } from "@/shared/runtime/task-action-session";
 
-const Home = lazy(() => import("./pages/Home"));
-const TaskDashboard = lazy(() => import("./pages/TaskDashboard"));
-const TaskDetail = lazy(() => import("./pages/TaskDetail"));
-const History = lazy(() => import("./pages/History"));
-const Settings = lazy(() => import("./pages/Settings"));
-const Admin = lazy(() => import("./pages/Admin"));
+const Home = lazy(() => import("@/pages/Home"));
+const TaskDashboard = lazy(() => import("@/pages/TaskDashboard"));
+const TaskDetail = lazy(() => import("@/pages/TaskDetail"));
+const History = lazy(() => import("@/pages/History"));
+const Settings = lazy(() => import("@/pages/Settings"));
+const Admin = lazy(() => import("@/pages/Admin"));
 
 interface NavItem {
   hash: string;

@@ -4,16 +4,16 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import TaskActionDialog from "@/components/TaskActionDialog";
-import { api, ApiError } from "../api";
+import TaskActionDialog from "@/features/task/TaskActionDialog";
+import { api, ApiError } from "@/shared/api/client";
 import type {
   Schedule,
   ScheduleSpec,
   ScheduleRunSummary,
-} from "../api";
+} from "@/shared/api/client";
 import { fmt, useI18n, type Dict } from "@/i18n";
-import { fmtBeijing } from "@/lib/time";
-import { taskRunOutcome } from "@/lib/task-detail-presentation";
+import { fmtBeijing } from "@/shared/utils/time";
+import { taskRunOutcome } from "@/shared/utils/task-detail-presentation";
 
 // describeSpec 的 i18n 版：用户面所有任务文案都必须随语言走。
 function describeSpecI18n(spec: ScheduleSpec, s: Dict["app"]["schedule"]): string {

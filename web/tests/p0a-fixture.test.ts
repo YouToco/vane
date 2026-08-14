@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   ownerPreviewFixture,
   prototypePresentation,
-} from "@/prototypes/p0a-task-brief/fixture";
+} from "../prototypes/p0a-task-brief/fixture";
 
 describe("P0-A owner preview fixture", () => {
   test("uses explicit synthetic operational values", () => {

@@ -23,18 +23,18 @@ const [appHtml, previewHtml, headers, mainSource, componentSource, fixtureSource
     readFile(resolve(distRoot, previewRelative), "utf8"),
     readFile(resolve(distRoot, "_headers"), "utf8"),
     readFile(
-      resolve(projectRoot, "src/prototypes/p0a-task-brief/main.tsx"),
+      resolve(projectRoot, "prototypes/p0a-task-brief/main.tsx"),
       "utf8",
     ),
     readFile(
       resolve(
         projectRoot,
-        "src/prototypes/p0a-task-brief/PrototypeTaskDetail.tsx",
+        "prototypes/p0a-task-brief/PrototypeTaskDetail.tsx",
       ),
       "utf8",
     ),
     readFile(
-      resolve(projectRoot, "src/prototypes/p0a-task-brief/fixture.ts"),
+      resolve(projectRoot, "prototypes/p0a-task-brief/fixture.ts"),
       "utf8",
     ),
   ]);

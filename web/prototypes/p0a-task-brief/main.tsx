@@ -1,6 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import "@/index.css";
+import "@/app/index.css";
 import "./prototype.css";
 import PrototypeTaskDetail from "./PrototypeTaskDetail";
 

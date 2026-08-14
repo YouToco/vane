@@ -10,7 +10,7 @@ import {
   RELEASE_ID,
   type ChunkRecoveryFallbackReason,
   type ChunkRecoveryRuntime,
-} from "@/chunk-load-recovery";
+} from "@/shared/runtime/chunk-load-recovery";
 
 interface ChunkLoadErrorBoundaryProps {
   children: ReactNode;

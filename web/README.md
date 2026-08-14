@@ -1,28 +1,40 @@
-# 见微 Vane — Web Dashboard
+# 见微 Vane Web
 
-自用单用户 Dashboard（MVP 里程碑 M7）：信源管理 / 画像查看编辑 / 推送历史 / 成本监控。
+Vane monorepo 的 React 单页前端。生产源码只位于 `src/`；设计验证原型位于
+`prototypes/`，不得被生产路由或共享运行时代码导入。
 
-## 技术栈
+## 目录
 
-Vite 8 + React 19 + TypeScript 7（SPA，纯静态构建）
+- `src/app/`：启动、顶层 shell、providers 与全局运行时边界。
+- `src/pages/`：路由级组合；不作为可复用业务状态容器。
+- `src/features/`：按 task、delivery、exploration 等业务域组织交互与状态。
+- `src/components/ui/`：无业务知识的 UI primitives；不得依赖 `features/`。
+- `src/shared/api/`：HTTP client、API 类型与前后端 canonical contract。
+- `src/shared/runtime/`：浏览器生命周期、session storage 与 chunk 恢复。
+- `src/shared/utils/`：无副作用的展示、时间和通用工具。
+- `src/i18n/`：稳定文案键与本地化资源。
+- `prototypes/`：独立 owner preview 与测试计划，不属于生产源码树。
+- `scripts/`：bundle、版本和不可变发布树校验。
 
-## 部署（前后端分离，双线 CDN）
+## 固定工具链
 
-- 域名 `vane.zhuoqidev.com`，阿里云 DNS 分线路：
-  - 默认（国内）→ 阿里云 CDN 回源 OSS
-  - 境外 → Cloudflare Pages
-- 后端 API：`https://api.vane.zhuoqidev.com`（Go，仓库 [YouToco/vane](https://github.com/YouToco/vane)）
-- CI：push main → typecheck + build；部署接线在 M7（见 ci.yml 注释）
-
-## 开发
+必须使用 Node `22.23.2`；`.node-version`、`.nvmrc`、`package.json#engines` 和
+`.npmrc` 共同阻止版本漂移。依赖只认根目录唯一的 `package-lock.json`：
 
 ```bash
-npm install
-npm run dev        # /api 代理到线上 API，见 vite.config.ts
+npm ci
+npm run audit
+npm test
+npm run test:coverage
+npm run typecheck
 npm run build
 ```
 
-## 工作流规范
+`npm run build` 会在 `dist/.well-known/vane-release.json` 写入 monorepo Git SHA、
+dirty 状态和排除 marker 自身后的确定性 tree SHA-256，并立即重新计算验证。
+生产发布必须从 clean exact SHA 构建，并设置
+`VANE_RELEASE_SHA=<exact-sha> VANE_REQUIRE_CLEAN_RELEASE=1`；本地 dirty 构建会被如实标记，
+不能充当生产制品。
 
-分支 / 提交 / 版本管理遵循 [vane/docs/git-workflow.md](https://github.com/YouToco/vane/blob/main/docs/git-workflow.md)
-（GitHub Flow + Conventional Commits + SemVer 里程碑 tag）。
+本仓不使用 GitHub Actions。合并、Gate、发布和生产验收由 monorepo 根目录固定脚本及
+`AGENTS.md` 约束执行。

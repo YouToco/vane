@@ -8,8 +8,8 @@ const root = resolve(import.meta.dirname, "..");
 test("P0-A owner preview is built but absent from app routing and navigation", async () => {
   const [main, app, vite, prototypeHtml, packageJson, gitignore, p0aVite, headers] =
     await Promise.all([
-      readFile(resolve(root, "src/main.tsx"), "utf8"),
-      readFile(resolve(root, "src/App.tsx"), "utf8"),
+      readFile(resolve(root, "src/app/main.tsx"), "utf8"),
+      readFile(resolve(root, "src/app/App.tsx"), "utf8"),
       readFile(resolve(root, "vite.config.ts"), "utf8"),
       readFile(
         resolve(
@@ -28,7 +28,7 @@ test("P0-A owner preview is built but absent from app routing and navigation", a
   assert.doesNotMatch(app, /p0a-task-brief|VANE_P0A_OWNER_PREVIEW/);
   assert.match(vite, /ownerPreview/);
   assert.match(vite, /p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/);
-  assert.match(prototypeHtml, /src\/prototypes\/p0a-task-brief\/main\.tsx/);
+  assert.match(prototypeHtml, /prototypes\/p0a-task-brief\/main\.tsx/);
   assert.match(prototypeHtml, /connect-src 'none'/);
   assert.match(prototypeHtml, /noindex, nofollow, noarchive/);
   const scripts = JSON.parse(packageJson).scripts;

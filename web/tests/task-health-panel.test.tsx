@@ -3,9 +3,9 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, test } from "vitest";
 
-import TaskHealthPanel from "@/components/TaskHealthPanel";
+import TaskHealthPanel from "@/features/task/TaskHealthPanel";
 import { taskHealthCopy } from "@/i18n/task-health";
-import type { TaskHealthProjection } from "@/api";
+import type { TaskHealthProjection } from "@/shared/api/client";
 
 function health(
   failureReason: NonNullable<

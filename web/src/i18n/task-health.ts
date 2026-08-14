@@ -1,4 +1,4 @@
-import type { TaskHealthCopy } from "@/components/TaskHealthPanel";
+import type { TaskHealthCopy } from "@/features/task/TaskHealthPanel";
 import type { Locale } from "@/i18n";
 
 const copies = {

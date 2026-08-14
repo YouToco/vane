@@ -28,7 +28,7 @@ import {
   ThumbsUp,
   X,
 } from "lucide-react";
-import { LogoMark } from "@/components/brand/Logo";
+import { LogoMark } from "@/shared/brand/Logo";
 import {
   ownerPreviewFixture,
   prototypePresentation,

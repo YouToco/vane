@@ -3,16 +3,28 @@
   "private": true,
   "version": "0.0.1",
   "type": "module",
+  "engines": {
+    "node": "22.23.2"
+  },
   "scripts": {
+    "node:check": "node scripts/check-node-version.mjs",
     "dev": "vite",
     "prototype:p0a": "vite --open /_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html",
     "prototype:p0a:build": "vite build --config vite.p0a.config.ts && node scripts/verify-p0a-build.mjs",
-    "prebuild": "node scripts/check-react-versions.mjs",
-    "build": "tsc -b && vite build && node scripts/verify-p0a-production-build.mjs && npm run bundle:check",
+    "prebuild": "npm run node:check && node scripts/check-react-versions.mjs",
+    "build": "tsc -b && vite build && node scripts/verify-p0a-production-build.mjs && npm run bundle:check && npm run release:generate && npm run release:verify",
+    "audit": "npm audit --audit-level=high",
     "bundle:check": "node scripts/verify-bundle-budget.mjs",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "test": "node --test tests/prototype-isolation.test.mjs tests/prototype-build.test.mjs tests/task-detail-surface.test.mjs tests/cache-headers.test.mjs && vitest run tests/task-action-dialog.test.tsx tests/task-contract.test.ts tests/task-health-panel.test.tsx tests/task-detail-presentation.test.ts tests/task-brief-feed.test.tsx tests/p0a-fixture.test.ts tests/p0a-task-brief.test.tsx tests/profile-edit.test.tsx tests/profile-api.test.ts tests/provider-pricing.test.tsx tests/call-cost-ledger.test.tsx tests/execution-traces.test.tsx tests/chunk-load-recovery.test.tsx"
+    "pretest": "npm run node:check",
+    "test": "npm run test:node && npm run test:unit",
+    "test:node": "node --test tests/prototype-isolation.test.mjs tests/prototype-build.test.mjs tests/task-detail-surface.test.mjs tests/cache-headers.test.mjs tests/release-marker.test.mjs",
+    "test:unit": "vitest run tests/task-action-dialog.test.tsx tests/task-contract.test.ts tests/task-health-panel.test.tsx tests/task-detail-presentation.test.ts tests/task-brief-feed.test.tsx tests/p0a-fixture.test.ts tests/p0a-task-brief.test.tsx tests/profile-edit.test.tsx tests/profile-api.test.ts tests/provider-pricing.test.tsx tests/call-cost-ledger.test.tsx tests/execution-traces.test.tsx tests/chunk-load-recovery.test.tsx",
+    "pretest:coverage": "npm run node:check",
+    "test:coverage": "npm run test:node && npm run test:unit -- --coverage",
+    "release:generate": "node scripts/release-marker.mjs generate",
+    "release:verify": "node scripts/release-marker.mjs verify"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",
@@ -42,6 +54,7 @@
     "@types/react-dom": "^19.2.0",
     "@types/three": "^0.185.1",
     "@vitejs/plugin-react": "^6.0.3",
+    "@vitest/coverage-v8": "4.1.10",
     "jsdom": "^30.0.0",
     "tailwindcss": "^4.3.3",
     "typescript": "~7.0.2",

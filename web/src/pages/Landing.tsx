@@ -13,17 +13,17 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { LocaleSwitch } from "@/components/LocaleSwitch";
-import { LogoMark } from "@/components/brand/Logo";
-import { TypewriterDemo } from "@/components/landing/TypewriterDemo";
-import { FilterShowcase } from "@/components/landing/FilterShowcase";
+import { LocaleSwitch } from "@/app/LocaleSwitch";
+import { LogoMark } from "@/shared/brand/Logo";
+import { TypewriterDemo } from "@/features/landing/TypewriterDemo";
+import { FilterShowcase } from "@/features/landing/FilterShowcase";
 import { useI18n } from "@/i18n";
 
 export const EXAMPLE_ICONS: readonly LucideIcon[] = [User, Zap, Search, Eye] as const;
 const STEP_ICONS: readonly LucideIcon[] = [MessageSquare, Radar, ThumbsUp] as const;
 
 // 3D 吉祥物按需加载（three.js 独立 chunk，不拖累首屏）
-const VaneMascot = lazy(() => import("@/components/landing/VaneMascot"));
+const VaneMascot = lazy(() => import("@/features/landing/VaneMascot"));
 
 const fadeUp: Variants = {
   hidden: { opacity: 0, y: 26, filter: "blur(6px)" },

@@ -13,8 +13,8 @@ import {
   isChunkLoadError,
   type ChunkRecoveryFallbackReason,
   type ChunkRecoveryRuntime,
-} from "@/chunk-load-recovery";
-import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
+} from "@/shared/runtime/chunk-load-recovery";
+import { ChunkLoadErrorBoundary } from "@/app/ChunkLoadErrorBoundary";
 
 function runtime(overrides: Partial<ChunkRecoveryRuntime> = {}) {
   const fallback = vi.fn<(reason: ChunkRecoveryFallbackReason) => void>();

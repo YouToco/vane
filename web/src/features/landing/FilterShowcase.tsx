@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useInView, useReducedMotion } from "motion/react";
 import { Check, Inbox, Send, Sparkles } from "lucide-react";
-import { LogoMark } from "@/components/brand/Logo";
+import { LogoMark } from "@/shared/brand/Logo";
 import { useI18n } from "@/i18n";
-import { cn } from "@/lib/utils";
+import { cn } from "@/shared/utils/class-names";
 
 // source/tag 只存索引，渲染时查 i18n 字典——切语言即时生效，数据结构语言无关
 interface FeedItem {

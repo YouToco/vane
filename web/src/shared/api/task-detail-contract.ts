@@ -1,4 +1,4 @@
-import type { Schedule, ScheduleDetail } from "@/api";
+import type { Schedule, ScheduleDetail } from "@/shared/api/client";
 
 export function taskDefinitionEditEnabled(detail: ScheduleDetail): boolean {
   return detail.capabilities.definition_edit === true;

@@ -3,7 +3,7 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { api } from "@/api";
+import { api } from "@/shared/api/client";
 import ExecutionTraces from "@/pages/ExecutionTraces";
 
 afterEach(() => {

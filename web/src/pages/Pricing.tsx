@@ -11,13 +11,13 @@ import {
   Save,
 } from "lucide-react";
 
-import { api, ApiError } from "@/api";
+import { api, ApiError } from "@/shared/api/client";
 import type {
   ProviderPriceCurrency,
   ProviderPriceMeter,
   ProviderPriceRule,
   ReplaceProviderPriceRule,
-} from "@/api";
+} from "@/shared/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, ApiError } from "../api";
-import type { FeishuStatus, VerifyResult } from "../api";
+import { api, ApiError } from "@/shared/api/client";
+import type { FeishuStatus, VerifyResult } from "@/shared/api/client";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";

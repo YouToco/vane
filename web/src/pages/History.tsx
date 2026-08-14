@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { api } from "../api";
+import { api } from "@/shared/api/client";
 import { Button } from "@/components/ui/button";
 import { RefreshCw, Loader2 } from "lucide-react";
 import { useI18n } from "@/i18n";
-import DeliveriesTable from "@/components/DeliveriesTable";
+import DeliveriesTable from "@/features/delivery/DeliveriesTable";
 
 // 投递档案页：DeliveriesTable 专门承载跨任务的发送凭证、反馈和审计记录。
 // 本页只负责全局取数（api.listDeliveries）与刷新按钮（换 key 重挂载）。

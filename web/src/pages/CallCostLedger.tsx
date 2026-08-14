@@ -16,7 +16,7 @@ import {
   type CallCostLedgerFilters,
   type CallCostLedgerItem,
   type CallCostPricingStatus,
-} from "@/api";
+} from "@/shared/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";

@@ -2,11 +2,11 @@ import { describe, expect, test } from "vitest";
 import {
   canonicalCheckOutcome,
   taskRunOutcome,
-} from "@/lib/task-detail-presentation";
+} from "@/shared/utils/task-detail-presentation";
 import {
   safeBriefMarkdownURL,
   safeBriefURL,
-} from "@/lib/brief-presentation";
+} from "@/shared/utils/brief-presentation";
 
 describe("task detail content presentation", () => {
   test.each([

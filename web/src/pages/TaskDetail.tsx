@@ -14,9 +14,9 @@ import {
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import TaskActionDialog from "@/components/TaskActionDialog";
-import TaskHealthPanel from "@/components/TaskHealthPanel";
-import type { TaskHealthAction } from "@/components/TaskHealthPanel";
+import TaskActionDialog from "@/features/task/TaskActionDialog";
+import TaskHealthPanel from "@/features/task/TaskHealthPanel";
+import type { TaskHealthAction } from "@/features/task/TaskHealthPanel";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -34,31 +34,31 @@ import {
   TableHead,
   TableCell,
 } from "@/components/ui/table";
-import { api, ApiError } from "../api";
+import { api, ApiError } from "@/shared/api/client";
 import type {
   ScheduleDetail,
   ScheduleBatchItem,
   ObservationPolicy,
   TaskLatestCheck,
   TaskHealthProjection,
-} from "../api";
+} from "@/shared/api/client";
 import { fmt, useI18n, type Dict, type Locale } from "@/i18n";
 import {
   taskHealthCopy,
   taskHealthLoadingCopy,
   taskHealthUnavailableCopy,
 } from "@/i18n/task-health";
-import { fmtBeijing } from "@/lib/time";
-import { SCHEDULE_COMMAND_STORAGE_PREFIX } from "@/lib/task-action-session";
+import { fmtBeijing } from "@/shared/utils/time";
+import { SCHEDULE_COMMAND_STORAGE_PREFIX } from "@/shared/runtime/task-action-session";
 import {
   canonicalCheckOutcome,
   taskRunOutcome,
   type TaskRunOutcome,
-} from "@/lib/task-detail-presentation";
-import { nextRunPresentation } from "@/lib/task-detail-contract";
+} from "@/shared/utils/task-detail-presentation";
+import { nextRunPresentation } from "@/shared/api/task-detail-contract";
 
 const PAGE_SIZE = 20;
-const TaskBriefFeed = lazy(() => import("@/components/TaskBriefFeed"));
+const TaskBriefFeed = lazy(() => import("@/features/task/TaskBriefFeed"));
 type ScheduleCommand = "run" | "pause" | "resume" | "delete";
 type TaskSection = "brief" | "manage";
 

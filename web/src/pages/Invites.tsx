@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { api, ApiError } from "../api";
-import type { Invite } from "../api";
+import { api, ApiError } from "@/shared/api/client";
+import type { Invite } from "@/shared/api/client";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/table";
 import { RefreshCw, Loader2, Plus, Copy, Ban } from "lucide-react";
 import { fmt, useI18n } from "@/i18n";
-import { fmtBeijing } from "@/lib/time";
+import { fmtBeijing } from "@/shared/utils/time";
 
 // 判定用服务端算好的 used/expired 布尔（vane#104：used=用满、expired 按服务端
 // 时钟），前端不从 used_count/expires_at 重算——两边口径漂移时以服务端为准。

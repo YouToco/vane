@@ -15,14 +15,14 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { api, ApiError } from "@/api";
+import { api, ApiError } from "@/shared/api/client";
 import type {
   AdminExecutionTrace,
   AdminTraceEvent,
   AdminTraceRun,
   AdminTraceTask,
   AdminTraceUser,
-} from "@/api";
+} from "@/shared/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -35,7 +35,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { cn } from "@/lib/utils";
+import { cn } from "@/shared/utils/class-names";
 
 function formatTime(value?: string): string {
   if (!value) return "—";

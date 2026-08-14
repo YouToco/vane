@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ExternalLink, Loader2, MessageCircle, Settings2 } from "lucide-react";
 
-import { api, ApiError } from "@/api";
+import { api, ApiError } from "@/shared/api/client";
 import type {
   TaskBrief,
   TaskBriefEvidenceSource,
@@ -14,7 +14,7 @@ import type {
   BriefReportSettings,
   GroundedBriefContext,
   TaskHealthProjection,
-} from "@/api";
+} from "@/shared/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,8 +25,8 @@ import { briefDict, type BriefDict } from "@/i18n/brief";
 import {
   safeBriefMarkdownURL,
   safeBriefURL,
-} from "@/lib/brief-presentation";
-import { fmtBeijing } from "@/lib/time";
+} from "@/shared/utils/brief-presentation";
+import { fmtBeijing } from "@/shared/utils/time";
 
 const PAGE_SIZE = 10;
 

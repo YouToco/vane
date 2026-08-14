@@ -4,11 +4,11 @@ import {
   normalizeScheduleDetail,
   normalizeTaskHealth,
   type ScheduleRunSummary,
-} from "@/api";
+} from "@/shared/api/client";
 import {
   nextRunPresentation,
   taskDefinitionEditEnabled,
-} from "@/lib/task-detail-contract";
+} from "@/shared/api/task-detail-contract";
 import { LOCALES } from "@/i18n";
 import {
   taskHealthCopy,

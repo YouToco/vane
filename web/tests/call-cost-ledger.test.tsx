@@ -4,7 +4,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { api, type CallCostLedgerItem } from "@/api";
+import { api, type CallCostLedgerItem } from "@/shared/api/client";
 import CallCostLedger, {
   describeCallCostFormula,
   describeCallUsage,

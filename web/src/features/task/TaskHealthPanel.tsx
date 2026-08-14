@@ -10,7 +10,7 @@ import type {
   TaskHealthIssue,
   TaskHealthProjection,
   TaskHealthState,
-} from "@/api";
+} from "@/shared/api/client";
 
 export type {
   BudgetState,
@@ -19,7 +19,7 @@ export type {
   TaskHealthIssue,
   TaskHealthProjection,
   TaskHealthState,
-} from "@/api";
+} from "@/shared/api/client";
 
 export interface TaskHealthCopy {
   title: string;

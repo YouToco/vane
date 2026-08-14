@@ -10,8 +10,8 @@ import {
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { api } from "@/api";
-import type { ProviderPriceRule } from "@/api";
+import { api } from "@/shared/api/client";
+import type { ProviderPriceRule } from "@/shared/api/client";
 import Pricing from "@/pages/Pricing";
 
 const current: ProviderPriceRule = {

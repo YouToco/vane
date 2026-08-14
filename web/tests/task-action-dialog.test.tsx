@@ -15,7 +15,7 @@ const apiMock = vi.hoisted(() => ({
   executeTaskAction: vi.fn(),
 }));
 
-vi.mock("@/api", () => ({
+vi.mock("@/shared/api/client", () => ({
   api: apiMock,
   ApiError: class ApiError extends Error {
     status: number;
@@ -82,8 +82,8 @@ vi.mock("@/components/ui/input", () => ({
 
 import TaskActionDialog, {
   type TaskActionDialogLabels,
-} from "@/components/TaskActionDialog";
-import { ApiError } from "@/api";
+} from "@/features/task/TaskActionDialog";
+import { ApiError } from "@/shared/api/client";
 
 const labels: TaskActionDialogLabels = {
   title: "New task",

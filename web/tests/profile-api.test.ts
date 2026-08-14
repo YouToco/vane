@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { api } from "@/api";
+import { api } from "@/shared/api/client";
 
 const profile = {
   industry: "AI",

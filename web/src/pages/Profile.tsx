@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { api, ApiError } from "../api";
+import { api, ApiError } from "@/shared/api/client";
 import type {
   EditableProfileField,
   Profile as ProfileData,
@@ -12,7 +12,7 @@ import type {
   ProfileEpochActionRequest,
   ProfileEpochActionResponse,
   UpdateProfileRequest,
-} from "../api";
+} from "@/shared/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -44,8 +44,8 @@ import {
 } from "lucide-react";
 import { fmt, useI18n } from "@/i18n";
 import { profileEpochCopy } from "@/i18n/profile-epoch";
-import { fmtBeijing } from "@/lib/time";
-import { cn } from "@/lib/utils";
+import { fmtBeijing } from "@/shared/utils/time";
+import { cn } from "@/shared/utils/class-names";
 
 interface EditableProfile {
   industry: string;

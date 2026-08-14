@@ -4,7 +4,7 @@ import React from "react";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test } from "vitest";
-import PrototypeTaskDetail from "@/prototypes/p0a-task-brief/PrototypeTaskDetail";
+import PrototypeTaskDetail from "../prototypes/p0a-task-brief/PrototypeTaskDetail";
 
 afterEach(cleanup);
 

@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 import type { Plugin } from "vite";
 import react from "@vitejs/plugin-react";
@@ -12,7 +13,8 @@ const ownerPreviewHtml = path.resolve(
 );
 
 function releaseID(): string {
-  const configured = process.env.VITE_RELEASE_ID?.trim();
+  const configured =
+    process.env.VANE_RELEASE_SHA?.trim() || process.env.VITE_RELEASE_ID?.trim();
   if (configured) return configured;
   try {
     return execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
@@ -78,6 +80,15 @@ export default defineConfig({
         app: path.resolve(root, "index.html"),
         ownerPreview: ownerPreviewHtml,
       },
+    },
+  },
+  test: {
+    coverage: {
+      provider: "v8",
+      include: ["src/**/*.{ts,tsx}"],
+      exclude: ["src/vite-env.d.ts"],
+      reporter: ["text", "json-summary", "lcov"],
+      reportsDirectory: "coverage",
     },
   },
   server: {

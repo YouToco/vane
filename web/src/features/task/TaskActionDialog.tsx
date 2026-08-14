@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Loader2 } from "lucide-react";
-import { api, ApiError } from "@/api";
+import { api, ApiError } from "@/shared/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,8 +15,8 @@ import { Input } from "@/components/ui/input";
 import {
   normalizeTaskActionField,
   taskActionPayloadHash,
-} from "@/lib/task-action-canonical";
-import { TASK_EXECUTION_STORAGE_PREFIX } from "@/lib/task-action-session";
+} from "@/shared/api/task-action-canonical";
+import { TASK_EXECUTION_STORAGE_PREFIX } from "@/shared/runtime/task-action-session";
 
 export interface TaskActionDialogLabels {
   title: string;

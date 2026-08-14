@@ -1,4 +1,4 @@
-import { cn } from "@/lib/utils";
+import { cn } from "@/shared/utils/class-names";
 
 /**
  * 见微 Vane 品牌标：相风铜乌——汉代观象台顶的风向铜鸟，

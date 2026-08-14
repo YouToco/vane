@@ -9,9 +9,9 @@ test("task pages keep operational internals off the reader-facing surface", asyn
   const [dashboard, detail, briefs, zh, apiClient, briefDictionary] = await Promise.all([
     readFile(resolve(root, "src/pages/TaskDashboard.tsx"), "utf8"),
     readFile(resolve(root, "src/pages/TaskDetail.tsx"), "utf8"),
-    readFile(resolve(root, "src/components/TaskBriefFeed.tsx"), "utf8"),
+    readFile(resolve(root, "src/features/task/TaskBriefFeed.tsx"), "utf8"),
     readFile(resolve(root, "src/i18n/zh.ts"), "utf8"),
-    readFile(resolve(root, "src/api.ts"), "utf8"),
+    readFile(resolve(root, "src/shared/api/client.ts"), "utf8"),
     readFile(resolve(root, "src/i18n/brief.ts"), "utf8"),
   ]);
 

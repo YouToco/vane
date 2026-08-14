@@ -1,9 +1,9 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
 import { Loader2, Lock, Mail, Ticket } from "lucide-react";
-import { LogoMark } from "@/components/brand/Logo";
-import { LocaleSwitch } from "@/components/LocaleSwitch";
-import { api, ApiError } from "../api";
+import { LogoMark } from "@/shared/brand/Logo";
+import { LocaleSwitch } from "@/app/LocaleSwitch";
+import { api, ApiError } from "@/shared/api/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";

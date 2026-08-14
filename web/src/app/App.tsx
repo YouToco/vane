@@ -1,10 +1,10 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
-import { api } from "./api";
-import type { MeResponse } from "./api";
+import { api } from "@/shared/api/client";
+import type { MeResponse } from "@/shared/api/client";
 
-const Landing = lazy(() => import("./pages/Landing"));
-const Login = lazy(() => import("./pages/Login"));
+const Landing = lazy(() => import("@/pages/Landing"));
+const Login = lazy(() => import("@/pages/Login"));
 const AuthenticatedApp = lazy(() => import("./AuthenticatedApp"));
 
 function useHash(): string {

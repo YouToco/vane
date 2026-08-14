@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { fmtBeijing } from "@/lib/time";
-import { api, ApiError } from "../api";
+import { fmtBeijing } from "@/shared/utils/time";
+import { api, ApiError } from "@/shared/api/client";
 import type {
   ObservabilityReport,
   PipelineCounts,
@@ -9,7 +9,7 @@ import type {
   ProbeStatus,
   ScoreBucket,
   SpanDayCost,
-} from "../api";
+} from "@/shared/api/client";
 import {
   Card,
   CardContent,

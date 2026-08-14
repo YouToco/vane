@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { ApiError } from "../api";
-import type { DeliveriesResp, DeliveryHistoryItem } from "../api";
+import { ApiError } from "@/shared/api/client";
+import type { DeliveriesResp, DeliveryHistoryItem } from "@/shared/api/client";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/tooltip";
 import { Loader2, ExternalLink } from "lucide-react";
 import { fmt, useI18n, type Dict } from "@/i18n";
-import { fmtBeijing } from "@/lib/time";
+import { fmtBeijing } from "@/shared/utils/time";
 
 const PAGE_SIZE = 20;
 

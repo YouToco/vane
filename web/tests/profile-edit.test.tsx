@@ -21,7 +21,7 @@ const apiMock = vi.hoisted(() => ({
   applyProfileEpochAction: vi.fn(),
 }));
 
-vi.mock("@/api", () => ({
+vi.mock("@/shared/api/client", () => ({
   api: apiMock,
   ApiError: class ApiError extends Error {
     status: number;
@@ -193,7 +193,7 @@ vi.mock("@/components/ui/collapsible", () => ({
 }));
 
 import Profile, { retireProfileClaims } from "@/pages/Profile";
-import { ApiError, type ProfileClaimsResponse } from "@/api";
+import { ApiError, type ProfileClaimsResponse } from "@/shared/api/client";
 
 const baseProfile = {
   industry: "AI",
