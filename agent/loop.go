@@ -120,9 +120,11 @@ const (
 	maxSessionMessages = 60
 	keepRecentMessages = 40
 
-	// replyMaxTokens 每次模型调用的输出预算（契约 §7：MaxTokens 2048）。
-	// 配合 DisableThinking=true 时 2048 全是 content，预算充裕。
-	replyMaxTokens = 2048
+	// replyMaxTokens is the interactive Agent's bounded completion budget.
+	// Production-shaped thinking-mode evaluation showed that 2048 can truncate
+	// otherwise valid summaries while 4096 closes the tested tool/recovery set.
+	// Dedicated strict-JSON authorizers retain their smaller independent caps.
+	replyMaxTokens = 4096
 	// These are hidden execution fuses, not model-visible planning quotas.
 	// The loop preserves a final tool-free turn to synthesize partial evidence.
 	// Eight executions cover the complete intelligence catalog lookup plus
@@ -1027,14 +1029,10 @@ func (l *Loop) converse(
 			Messages: withSystem(system, requestMessages, profileHint, renderProfile),
 			// 每轮现算工具面：静态声明 + 会话已激活端点声明（tool_search 本轮
 			// 激活的端点，下一轮就出现在这里——检索后注入的核心闭环）。
-			Tools:     tools,
-			MaxTokens: iptr(replyMaxTokens),
-			// 关思维链（审查 #思维链吃预算，覆盖契约 §7 原定值）：与打分/出卡策略统一。
-			// 依据 2026-07-14 实测：v4-pro 关思维链后多轮 FC 无退化（两轮工具全选对），
-			// 而开思维链时 CoT 与 content 共享 MaxTokens 预算，复杂请求可能整轮空输出
-			// （与当日打分全空事故同机理）。
-			// Temperature 保持 nil：用上游默认值。
-			DisableThinking: true,
+			Tools:           tools,
+			MaxTokens:       iptr(replyMaxTokens),
+			EnableThinking:  true,
+			ReasoningEffort: llm.ReasoningEffortHigh,
 		}
 		// 7.8-A is observation-only: synchronously build the provider-neutral
 		// candidate, send the already-built legacy request unchanged, and only
@@ -1178,9 +1176,10 @@ func (l *Loop) converse(
 		currentUser := latestUserMessage(msgs)
 		assistantContent := resp.Content
 		msgs = append(msgs, llm.ChatMessage{
-			Role:      "assistant",
-			Content:   assistantContent,
-			ToolCalls: resp.ToolCalls,
+			Role:             "assistant",
+			Content:          assistantContent,
+			ReasoningContent: resp.ReasoningContent,
+			ToolCalls:        resp.ToolCalls,
 		})
 
 		wasUntrusted := state.untrustedExternalResult

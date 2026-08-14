@@ -37,9 +37,10 @@ func (r StopReason) String() string {
 // choice. ToolCalls are executable only after the wire adapter accepts the
 // complete turn.
 type AssistantTurn struct {
-	Content    string
-	ToolCalls  []ToolCall
-	StopReason StopReason
+	Content          string
+	ReasoningContent string
+	ToolCalls        []ToolCall
+	StopReason       StopReason
 }
 
 // wireString intentionally never fails JSON unmarshalling. It records whether
@@ -65,6 +66,27 @@ type wireNullableString struct {
 	Valid bool
 }
 
+type wireOptionalNullableString struct {
+	Value   string
+	Present bool
+	Valid   bool
+}
+
+func (s *wireOptionalNullableString) UnmarshalJSON(raw []byte) error {
+	s.Present = true
+	if string(raw) == "null" {
+		s.Valid = true
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil
+	}
+	s.Value = value
+	s.Valid = true
+	return nil
+}
+
 func (s *wireNullableString) UnmarshalJSON(raw []byte) error {
 	if string(raw) == "null" {
 		*s = wireNullableString{Valid: true}
@@ -80,8 +102,9 @@ func (s *wireNullableString) UnmarshalJSON(raw []byte) error {
 }
 
 type wireAssistantMessage struct {
-	Content   wireNullableString      `json:"content"`
-	ToolCalls []wireAssistantToolCall `json:"tool_calls"`
+	Content          wireNullableString         `json:"content"`
+	ReasoningContent wireOptionalNullableString `json:"reasoning_content"`
+	ToolCalls        []wireAssistantToolCall    `json:"tool_calls"`
 }
 
 func (m *wireAssistantMessage) UnmarshalJSON(raw []byte) error {
@@ -114,10 +137,11 @@ type wireChatChoice struct {
 }
 
 type assistantTurnOptions struct {
-	Provider      string
-	RequestModel  string
-	ResponseModel string
-	ToolsDeclared bool
+	Provider        string
+	RequestModel    string
+	ResponseModel   string
+	ToolsDeclared   bool
+	ThinkingEnabled bool
 }
 
 // adaptAssistantTurn is the single pure wire-to-domain adapter for chat
@@ -125,6 +149,10 @@ type assistantTurnOptions struct {
 // classified, non-retryable protocol error.
 func adaptAssistantTurn(choice wireChatChoice, opts assistantTurnOptions) (AssistantTurn, error) {
 	if !choice.FinishReason.Valid || !choice.Message.Content.Valid {
+		return AssistantTurn{}, newToolProtocolResponseError()
+	}
+	if choice.Message.ReasoningContent.Present &&
+		!choice.Message.ReasoningContent.Valid {
 		return AssistantTurn{}, newToolProtocolResponseError()
 	}
 	if isDeepSeekV4DSML(
@@ -141,13 +169,21 @@ func adaptAssistantTurn(choice wireChatChoice, opts assistantTurnOptions) (Assis
 		// A tool-free finalizer has no executable tool surface. Preserve its
 		// content and normalized stop reason, but discard any provider drift.
 		return AssistantTurn{
-			Content:    choice.Message.Content.Value,
-			StopReason: reason,
+			Content:          choice.Message.Content.Value,
+			ReasoningContent: choice.Message.ReasoningContent.Value,
+			StopReason:       reason,
 		}, nil
 	}
 
 	wireCalls := choice.Message.ToolCalls
 	if (len(wireCalls) > 0) != (reason == StopReasonToolCalls) {
+		return AssistantTurn{}, newToolProtocolResponseError()
+	}
+	if opts.ThinkingEnabled && len(wireCalls) > 0 &&
+		strings.TrimSpace(choice.Message.ReasoningContent.Value) == "" {
+		// DeepSeek requires the assistant reasoning_content to be echoed on the
+		// next tool-result round. Executing a call without it would create a
+		// continuation that cannot be replayed faithfully.
 		return AssistantTurn{}, newToolProtocolResponseError()
 	}
 
@@ -173,9 +209,10 @@ func adaptAssistantTurn(choice wireChatChoice, opts assistantTurnOptions) (Assis
 	}
 
 	return AssistantTurn{
-		Content:    choice.Message.Content.Value,
-		ToolCalls:  calls,
-		StopReason: reason,
+		Content:          choice.Message.Content.Value,
+		ReasoningContent: choice.Message.ReasoningContent.Value,
+		ToolCalls:        calls,
+		StopReason:       reason,
 	}, nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,6 +207,163 @@ func TestChatDisableThinking(t *testing.T) {
 	}
 	if th["type"] != "disabled" {
 		t.Errorf("thinking.type = %v, 期望 disabled", th["type"])
+	}
+}
+
+func TestChatThinkingRoundTripsReasoningWithoutPersistingIt(t *testing.T) {
+	const reasoning = "private chain of thought for call_abc"
+	responses := []string{
+		`{"model":"deepseek-v4-flash","choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","reasoning_content":"` + reasoning + `","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"view_profile","arguments":"{}"}}]}}],"usage":{"prompt_tokens":20,"completion_tokens":18}}`,
+		`{"model":"deepseek-v4-flash","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done","reasoning_content":"final private thought"}}],"usage":{"prompt_tokens":32,"completion_tokens":12}}`,
+	}
+	var requests []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests = append(requests, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responses[len(requests)-1]))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newTestClient(srv.URL, 1)
+	maxTokens := 4096
+	first, err := c.Chat(t.Context(), ChatRequest{
+		Messages:        []ChatMessage{{Role: "user", Content: "inspect"}},
+		Tools:           []ToolDef{{Name: "view_profile"}},
+		MaxTokens:       &maxTokens,
+		EnableThinking:  true,
+		ReasoningEffort: ReasoningEffortHigh,
+	})
+	if err != nil {
+		t.Fatalf("first Chat: %v", err)
+	}
+	if first.ReasoningContent != reasoning || len(first.ToolCalls) != 1 {
+		t.Fatalf("first response = %+v", first)
+	}
+	history := []ChatMessage{
+		{Role: "user", Content: "inspect"},
+		{Role: "assistant", ReasoningContent: first.ReasoningContent, ToolCalls: first.ToolCalls},
+		{Role: "tool", ToolCallID: "call_abc", Content: "profile result"},
+	}
+	second, err := c.Chat(t.Context(), ChatRequest{
+		Messages: history, MaxTokens: &maxTokens,
+		EnableThinking: true, ReasoningEffort: ReasoningEffortHigh,
+	})
+	if err != nil || second.Content != "done" {
+		t.Fatalf("second Chat = %+v, %v", second, err)
+	}
+
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	for i, body := range requests {
+		thinking, _ := body["thinking"].(map[string]any)
+		if thinking["type"] != "enabled" || body["reasoning_effort"] != "high" ||
+			body["max_tokens"] != float64(4096) {
+			t.Fatalf("request %d thinking policy = %#v", i, body)
+		}
+	}
+	secondMessages, _ := requests[1]["messages"].([]any)
+	assistant, _ := secondMessages[1].(map[string]any)
+	if assistant["reasoning_content"] != reasoning {
+		t.Fatalf("reasoning_content was not echoed exactly: %#v", assistant)
+	}
+	persisted, err := json.Marshal(history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), reasoning) ||
+		strings.Contains(string(persisted), "reasoning_content") {
+		t.Fatalf("reasoning leaked into persisted ChatMessage JSON: %s", persisted)
+	}
+}
+
+func TestChatThinkingFailsClosedOnIncompleteResponses(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "length",
+			body: `{"model":"deepseek-v4-flash","choices":[{"finish_reason":"length","message":{"content":"partial","reasoning_content":"unfinished"}}],"usage":{"prompt_tokens":20,"completion_tokens":4096}}`,
+		},
+		{
+			name: "empty",
+			body: `{"model":"deepseek-v4-flash","choices":[{"finish_reason":"stop","message":{"content":"","reasoning_content":"thought only"}}],"usage":{"prompt_tokens":20,"completion_tokens":80}}`,
+		},
+		{
+			name: "content filter",
+			body: `{"model":"deepseek-v4-flash","choices":[{"finish_reason":"content_filter","message":{"content":"partial refusal","reasoning_content":"filtered"}}],"usage":{"prompt_tokens":20,"completion_tokens":80}}`,
+		},
+		{
+			name: "tool call missing reasoning",
+			body: chatToolCallsBody,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(test.body))
+			}))
+			t.Cleanup(srv.Close)
+			resp, err := newTestClient(srv.URL, 1).Chat(t.Context(), ChatRequest{
+				Messages:       []ChatMessage{{Role: "user", Content: "complex task"}},
+				Tools:          []ToolDef{{Name: "view_profile"}, {Name: "remove_schedule"}},
+				EnableThinking: true, ReasoningEffort: ReasoningEffortHigh,
+			})
+			if !errors.Is(err, ErrToolProtocolResponse) || resp == nil {
+				t.Fatalf("Chat = response %+v, error %v; want metadata + protocol error", resp, err)
+			}
+			if resp.PromptTokens == 0 || resp.Content != "" || len(resp.ToolCalls) != 0 {
+				t.Fatalf("unsafe partial response escaped: %+v", resp)
+			}
+		})
+	}
+}
+
+func TestDoChatNeverRecordsReasoningContent(t *testing.T) {
+	const requestReasoning = "private request reasoning"
+	const responseReasoning = "private response reasoning"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"deepseek-v4-flash","choices":[{"finish_reason":"stop","message":{"content":"done","reasoning_content":"` + responseReasoning + `"}}],"usage":{"prompt_tokens":20,"completion_tokens":10}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	store := &capturingRecorderStore{}
+	response, err := DoChat(t.Context(), newTestClient(srv.URL, 1), &Recorder{st: store},
+		CallMeta{TraceID: "transient-reasoning", SpanName: "agent"},
+		ChatRequest{
+			Messages: []ChatMessage{{
+				Role: "assistant", Content: "", ReasoningContent: requestReasoning,
+			}},
+			EnableThinking: true, ReasoningEffort: ReasoningEffortHigh,
+		})
+	if err != nil || response.ReasoningContent != responseReasoning {
+		t.Fatalf("DoChat response=%+v err=%v", response, err)
+	}
+	call := store.onlyCall(t)
+	for _, secret := range []string{requestReasoning, responseReasoning, "reasoning_content"} {
+		if strings.Contains(call.UserPrompt, secret) || strings.Contains(call.Completion, secret) ||
+			strings.Contains(call.Error, secret) {
+			t.Fatalf("reasoning leaked into LLM ledger: %+v", call)
+		}
+	}
+}
+
+func TestChatRejectsContradictoryThinkingPolicy(t *testing.T) {
+	c := newTestClient("http://127.0.0.1:1", 1)
+	for _, request := range []ChatRequest{
+		{EnableThinking: true, DisableThinking: true},
+		{ReasoningEffort: ReasoningEffortHigh},
+		{EnableThinking: true, ReasoningEffort: "unbounded"},
+	} {
+		_, err := c.Chat(t.Context(), request)
+		if types.CodeOf(err) != types.CodeLLMBadRequest {
+			t.Fatalf("request %+v error = %v, want bad request", request, err)
+		}
 	}
 }
 
@@ -602,7 +760,7 @@ func TestDoChatCancellationAfterReservationRefundsBeforeSend(t *testing.T) {
 func TestChatMessageRoundtripJSON(t *testing.T) {
 	in := []ChatMessage{
 		{Role: "user", Content: "删掉源 3"},
-		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_abc", Name: "remove_schedule", Arguments: `{"task_ids":["task-3"]}`}}},
+		{Role: "assistant", ReasoningContent: "must remain transient", ToolCalls: []ToolCall{{ID: "call_abc", Name: "remove_schedule", Arguments: `{"task_ids":["task-3"]}`}}},
 		{Role: "tool", ToolCallID: "call_abc", Content: "已删除"},
 	}
 	raw, err := json.Marshal(in)
@@ -618,6 +776,9 @@ func TestChatMessageRoundtripJSON(t *testing.T) {
 	}
 	if out[1].ToolCalls[0] != in[1].ToolCalls[0] {
 		t.Errorf("ToolCall 往返不一致: %+v != %+v", out[1].ToolCalls[0], in[1].ToolCalls[0])
+	}
+	if strings.Contains(string(raw), "must remain transient") || out[1].ReasoningContent != "" {
+		t.Fatalf("reasoning content entered persisted JSON: raw=%s out=%+v", raw, out[1])
 	}
 	if out[2].ToolCallID != "call_abc" {
 		t.Errorf("ToolCallID 往返丢失: %+v", out[2])

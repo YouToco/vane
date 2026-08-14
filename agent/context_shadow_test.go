@@ -148,7 +148,8 @@ func TestContextShadowDoesNotChangeLegacyRequestOrOutcome(t *testing.T) {
 			{Role: "user", Content: "hello"},
 		},
 		MaxTokens:       iptr(replyMaxTokens),
-		DisableThinking: true,
+		EnableThinking:  true,
+		ReasoningEffort: llm.ReasoningEffortHigh,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("chat request changed by shadow:\ngot=%+v\nwant=%+v", got, want)

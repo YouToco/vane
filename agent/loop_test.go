@@ -413,6 +413,50 @@ func newTestLoop(t *testing.T, fs *fakeStore, chat func(context.Context, llm.Cha
 	return l
 }
 
+func TestAgentThinkingPolicyAndReasoningContinuationStayTransient(t *testing.T) {
+	const reasoning = "private tool selection chain"
+	tool := &fakeTool{name: "inspect", result: "inspection complete"}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			ReasoningContent: reasoning,
+			ToolCalls:        []llm.ToolCall{{ID: "call-1", Name: "inspect", Arguments: `{}`}},
+			FinishReason:     "tool_calls",
+		},
+		{Content: "done", ReasoningContent: "private final chain", FinishReason: "stop"},
+	}}
+	store := newFakeStore()
+	loop := newTestLoop(t, store, chat.fn, tool)
+
+	outcome, err := loop.HandleMessage(t.Context(), 7, "inspect it")
+	if err != nil || outcome.Reply != "done" {
+		t.Fatalf("outcome=%+v err=%v", outcome, err)
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("requests=%d, want 2", len(chat.requests))
+	}
+	for i, request := range chat.requests {
+		if request.MaxTokens == nil || *request.MaxTokens != 4096 ||
+			!request.EnableThinking || request.DisableThinking ||
+			request.ReasoningEffort != llm.ReasoningEffortHigh {
+			t.Fatalf("request %d policy = %+v", i, request)
+		}
+	}
+	found := false
+	for _, message := range chat.requests[1].Messages {
+		if message.Role == "assistant" && len(message.ToolCalls) == 1 {
+			found = message.ReasoningContent == reasoning
+		}
+	}
+	if !found {
+		t.Fatalf("second request did not echo reasoning: %+v", chat.requests[1].Messages)
+	}
+	if strings.Contains(string(store.lastMessages), reasoning) ||
+		strings.Contains(string(store.lastMessages), "private final chain") ||
+		strings.Contains(string(store.lastMessages), "reasoning_content") {
+		t.Fatalf("reasoning leaked into session persistence: %s", store.lastMessages)
+	}
+}
+
 // persistedMessages 解出最近一次 CommitAgentSessionTurn 写入的消息数组。
 func persistedMessages(t *testing.T, fs *fakeStore) []llm.ChatMessage {
 	t.Helper()

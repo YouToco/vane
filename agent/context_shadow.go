@@ -136,7 +136,8 @@ func (l *Loop) shadowFinalPendingContext(
 			l.sys, messages, "", false,
 		),
 		MaxTokens:       iptr(replyMaxTokens),
-		DisableThinking: true,
+		EnableThinking:  true,
+		ReasoningEffort: llm.ReasoningEffortHigh,
 	}
 	candidate, err := l.buildShadowAgentContext(
 		meta, request, state, contextStep,
