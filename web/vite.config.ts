@@ -3,6 +3,7 @@ import { defineConfig } from "vite";
 import type { Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import path from "path";
 
@@ -13,18 +14,19 @@ const ownerPreviewHtml = path.resolve(
 );
 
 function releaseID(): string {
-  const configured =
-    process.env.VANE_RELEASE_SHA?.trim() || process.env.VITE_RELEASE_ID?.trim();
-  if (configured) return configured;
-  try {
-    return execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    return "unknown";
+  const actual = execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+  assert.match(actual, /^[0-9a-f]{40}$/, "build HEAD must be an exact Git revision");
+  for (const [name, value] of [
+    ["VANE_RELEASE_SHA", process.env.VANE_RELEASE_SHA?.trim()],
+    ["VITE_RELEASE_ID", process.env.VITE_RELEASE_ID?.trim()],
+  ] as const) {
+    if (value) assert.equal(value, actual, `${name} must equal the checked-out monorepo HEAD`);
   }
+  return actual;
 }
 
 function normalizeModuleID(id: string): string {
