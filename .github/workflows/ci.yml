@@ -73,10 +73,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go_root="${RUNNER_TOOL_CACHE}/go/1.26.5/arm64"
+          go_root="${RUNNER_TOOL_CACHE}/go/1.26.6/arm64"
           go_binary="${go_root}/bin/go"
           [[ -x "${go_binary}" ]]
-          [[ "$("${go_binary}" version)" == "go version go1.26.5 linux/arm64" ]]
+          [[ "$("${go_binary}" version)" == "go version go1.26.6 linux/arm64" ]]
           echo "GOROOT=${go_root}" >> "${GITHUB_ENV}"
           echo "${go_root}/bin" >> "${GITHUB_PATH}"
 
@@ -226,11 +226,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go_root="${RUNNER_TOOL_CACHE}/go/1.26.5/arm64"
+          go_root="${RUNNER_TOOL_CACHE}/go/1.26.6/arm64"
           go_binary="${go_root}/bin/go"
           temporal_binary="${RUNNER_TOOL_CACHE}/temporal/1.8.2/arm64/temporal"
           [[ -x "${go_binary}" ]]
-          [[ "$("${go_binary}" version)" == "go version go1.26.5 linux/arm64" ]]
+          [[ "$("${go_binary}" version)" == "go version go1.26.6 linux/arm64" ]]
           [[ -x "${temporal_binary}" ]]
           [[ "$("${temporal_binary}" --version)" == "temporal version 1.8.2"* ]]
           echo "GOROOT=${go_root}" >> "${GITHUB_ENV}"
