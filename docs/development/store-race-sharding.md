@@ -1,11 +1,11 @@
 # Store race test sharding
 
-The default `.github/workflows/ci.yml` runs the migration-heavy `store` race
-suite as three concurrent manifests, each backed by a fresh PostgreSQL 18
-service. The separate `rest` job retains the remaining package race tests,
-Temporal recovery gate, vet, inventory check, vulnerability scan, and builds.
-Both jobs target the repository-scoped Linux/ARM64 Mac test runner; production
-build and deployment identities remain outside this source workflow.
+The monorepo full gate runs the migration-heavy `store` race suite as three
+concurrent manifests, each backed by a fresh PostgreSQL 18 instance. The
+remaining package race tests, Temporal recovery gate, vet, inventory check,
+vulnerability scan, coverage merge, and builds run in the same exact-SHA gate.
+The disposable test environment has no production credentials; production
+mutation remains behind the external root-owned broker.
 
 `storetestshard run`:
 
@@ -18,10 +18,9 @@ build and deployment identities remain outside this source workflow.
 6. requires the three coverage profiles to contain identical block sets before
    summing their atomic counters.
 
-After a successful `main` run, CI projects its verified terminal events to a
-canonical timing seed and saves the small seed under an exact commit key. A PR
-may restore only its exact trusted base SHA; a push may restore only the
-previous main SHA. Historical longest-processing-time balancing is used only
+After a successful full run, the supervisor projects verified terminal events
+to a canonical timing seed under the exact commit key. A candidate may restore
+only its exact trusted base SHA. Historical longest-processing-time balancing is used only
 when every current top-level test has authoritative timing. Missing, corrupt,
 empty, or incomplete timing data falls back to stable FNV-1a assignment and is
 reported in `store-shard-status.json`. Cache restore, seed construction, and
@@ -38,7 +37,7 @@ The same historical balancing remains available to explicit callers that
 provide the timing file inside the checkout:
 
 ```text
-go run ./cmd/storetestshard run ... --timings tmp/prior-store.test.json
+(cd server && GOWORK=off go run ./cmd/storetestshard run ... --timings tmp/prior-store.test.json)
 ```
 
 `--timings` accepts only a repository-relative regular file whose resolved path
@@ -54,12 +53,10 @@ shard execution, integrity verification, or coverage merge fails; `phase`,
 `error`, `failed_shards`, wall timings, and `exit_code` identify the stopping
 point.
 
-Service containers publish PostgreSQL 5432 to dynamically allocated, distinct
-host ports, so jobs cannot collide with a host database or fixed ports. GitHub
-Actions fails the job before test execution if a service cannot become healthy.
-The workflow has only `contents: read`, receives no secrets, uses no artifact
-upload/download actions, and disables `setup-go` remote caching because the
-persistent test runner already reuses its local Go caches.
+Disposable PostgreSQL instances publish 5432 to dynamically allocated,
+distinct host ports so shards cannot collide with a host database or fixed
+ports. The full gate fails before test execution if any dependency cannot
+become healthy and parses `go test -json`; any terminal skip is a failure.
 
 The earlier six-job hosted experiment workflow was deleted after measurement;
 it is not a retained dispatch or cost surface. Hosted run `31331916553` proved
@@ -115,4 +112,4 @@ invalid for performance comparison:
 This historical Windows result did not justify promotion on performance alone.
 The later hosted measurement and the explicit 2026-08-09 operating-cost
 decision above supersede its old "manual only" recommendation; the integrity
-checks and stable fallback remain mandatory in default CI.
+checks and stable fallback remain mandatory in the full gate.

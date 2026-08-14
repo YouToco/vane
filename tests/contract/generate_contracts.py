@@ -39,9 +39,47 @@ def migrations_contract() -> dict[str, object]:
     return {"schema": "vane.migrations/v1", "files": files}
 
 
+def temporal_registration_contract() -> dict[str, object]:
+    wiring = (ROOT / "server/cmd/server/main.go").read_text(encoding="utf-8")
+    config = (ROOT / "server/config/config.go").read_text(encoding="utf-8")
+    schedule = (ROOT / "server/scheduler/task_schedule.go").read_text(encoding="utf-8")
+
+    workflow_calls = re.findall(r"w\.(RegisterWorkflow(?:WithOptions)?)\(([^\n]+)\)", wiring)
+    activity_calls = re.findall(r"w\.(RegisterActivity(?:WithOptions)?)\(([^\n]+)\)", wiring)
+    if not workflow_calls or not activity_calls:
+        raise RuntimeError("no production Temporal registrations discovered")
+    if any(method != "RegisterWorkflow" for method, _ in workflow_calls):
+        raise RuntimeError("explicit workflow registration options require generator support")
+    if any(method != "RegisterActivity" for method, _ in activity_calls):
+        raise RuntimeError("explicit activity registration options require generator support")
+
+    def symbol(arguments: str) -> str:
+        match = re.fullmatch(r"(?:workflow|periodicbrief|activities|periodicActivities)\.(\w+)", arguments.strip())
+        if match is None:
+            raise RuntimeError(f"unsupported Temporal registration expression: {arguments}")
+        return match.group(1)
+
+    queue = re.search(
+        r'v\.SetDefault\("temporal\.task_queue",\s*"([^"]+)"\)', config
+    )
+    converter = re.search(
+        r'taskScheduleDefaultConverterID\s*=\s*"([^"]+)"', schedule
+    )
+    if queue is None or converter is None:
+        raise RuntimeError("Temporal task queue or converter identity was not discovered")
+    return {
+        "schema": "vane.temporal-registration/v1",
+        "default_task_queue": queue.group(1),
+        "default_converter": converter.group(1),
+        "workflows": sorted(symbol(arguments) for _, arguments in workflow_calls),
+        "activities": sorted(symbol(arguments) for _, arguments in activity_calls),
+    }
+
+
 OUTPUTS = {
     ROOT / "contracts/http/routes.json": routes_contract,
     ROOT / "contracts/release/migrations.json": migrations_contract,
+    ROOT / "contracts/temporal/production-registration.json": temporal_registration_contract,
 }
 
 

@@ -15,23 +15,6 @@ class GeneratedContractsTest(unittest.TestCase):
             self.assertTrue(path.is_file(), path)
             self.assertEqual(path.read_text(encoding="utf-8"), canonical_json(build()))
 
-    def test_temporal_registration_matches_production_wiring(self) -> None:
-        contract = json.loads(
-            (ROOT / "contracts/temporal/production-registration.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        source = (ROOT / "server/cmd/server/main.go").read_text(encoding="utf-8")
-        workflows = set(re.findall(r"w\.RegisterWorkflow\((?:workflow|periodicbrief)\.(\w+)\)", source))
-        activities = set(
-            re.findall(
-                r"w\.RegisterActivity\((?:activities|periodicActivities)\.(\w+)\)",
-                source,
-            )
-        )
-        self.assertEqual(workflows, set(contract["workflows"]))
-        self.assertEqual(activities, set(contract["activities"]))
-
     def test_release_binary_inventory_is_complete(self) -> None:
         contract = json.loads(
             (ROOT / "contracts/release/server-binaries.json").read_text(encoding="utf-8")

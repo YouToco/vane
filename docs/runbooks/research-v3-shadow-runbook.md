@@ -62,7 +62,7 @@ cutover 进入 prepared、pause 或后续恢复阶段，sidecar 会被硬围栏�
 `vane-research-cutover rollback` 收敛到 `rolled_back`，避免调度已暂停但定义被删除。
 
 ```powershell
-go run ./cmd/researchshadow -task-id <schedule-id> -idempotency-key <stable-key>
+(cd server && GOWORK=off go run ./cmd/researchshadow -task-id <schedule-id> -idempotency-key <stable-key>)
 ```
 
 重试必须复用同一个 idempotency key；Temporal 只创建一次 shadow Workflow。命令会等待
@@ -119,8 +119,8 @@ Gate 获批后，不修改 server 的 shadow/authority canary 配置；继续使
 
 ```powershell
 $env:VANE_MIGRATION_DB_URL = "<one-shot migration owner DSN>"
-go run ./cmd/researchcutover -operation preflight -task-id <schedule-id> -idempotency-key <stable-cutover-key>
-go run ./cmd/researchcutover -operation cutover -task-id <schedule-id> -idempotency-key <stable-cutover-key> -plan-digest <exact-preflight-plan-digest>
+(cd server && GOWORK=off go run ./cmd/researchcutover -operation preflight -task-id <schedule-id> -idempotency-key <stable-cutover-key>)
+(cd server && GOWORK=off go run ./cmd/researchcutover -operation cutover -task-id <schedule-id> -idempotency-key <stable-cutover-key> -plan-digest <exact-preflight-plan-digest>)
 ```
 
 `researchcutover` 是一次性 operator 控制面，只接受 migration owner credential（也支持 systemd `CREDENTIALS_DIRECTORY/migration_db_url`）；长期运行的 `vane_server_runtime` 永远不获得 cutover operator 身份。
@@ -139,7 +139,7 @@ V3 任务，Agent-first server 的 `research_v3_runtime_enabled` 仍保持开启
 
 ```powershell
 $env:VANE_RESEARCH_OPERATOR_EXACT_TASK_ID = "<schedule-id>"
-go run ./cmd/researchcutover -operation rollback -task-id <schedule-id> -idempotency-key <same-stable-cutover-key>
+(cd server && GOWORK=off go run ./cmd/researchcutover -operation rollback -task-id <schedule-id> -idempotency-key <same-stable-cutover-key>)
 ```
 
 Rollback 首先撤销数据库投递 authority，然后暂停、恢复冻结的旧 Action，并在仍暂停时原子恢复旧 DB head/mode，最后恢复原暂停状态。若发现外部紧急暂停且无法证明由 saga 持有，状态进入 `manual_intervention`，不会擅自恢复调度。只有输出 phase=`rolled_back` 且 `verify` 成功后，才能清除一次性 exact-task 环境。

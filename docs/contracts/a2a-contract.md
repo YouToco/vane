@@ -508,10 +508,10 @@ if cfg.A2A.Enabled {
 | **PR-1 契约** | 本文档 | changelog 核对结论在案（§1）；全部签名级接口就位；拍板记录在案（§13） | **是**（契约级，仿 M5 双怀疑者） |
 | **PR-2 存储** | migration 013 + types.A2ATask + store/a2a_tasks.go + SearchContentItems + 基准 + wantTables 补账（4 张欠账 + a2a_tasks + 对账守卫）+ §9.3 门控测试 | 门控测试全绿；基准数据附 PR；**纯 store 层，零 SDK import**；无公网面变化 | 否（常规 review） |
 | **PR-3 服务端** | a2a/ 包全部（含 taskstore.go 适配）+ config 段 + main.go 装配 + probe P-A2A + `go list -deps` 实测记录 | §9.1/9.2/9.4/9.5 全绿；enabled=false 时 `/a2a` 与 card 404 + 守卫绿 + 既有测试全绿；enabled=true 验证窗口：VPS 部署后探针绿 + 真人 ①-⑥⑧ 过 | **是**（公网暴露面 + 认证 + 错误卫生） |
-| **PR-infra Caddyfile** | 主域 vane.zhuoqidev.com 块内、SPA handle 之前加 `handle /.well-known/* { reverse_proxy 127.0.0.1:8080 }`（上游写 127.0.0.1 与 vane 的 loopback 绑定精确配对，见 deploy/Caddyfile 注释；现状 try_files 把该路径回落 index.html） | 合并后主域 card 可达、SPA 路由不回归；CI 自动上传 infra、合并即生效，不与代码 PR 搭车 | 否 |
+| **PR-infra Caddyfile** | 主域 vane.zhuoqidev.com 块内、SPA handle 之前加 `handle /.well-known/* { reverse_proxy 127.0.0.1:8080 }`（上游写 127.0.0.1 与 vane 的 loopback 绑定精确配对，见 `infra/production/caddy/Caddyfile` 注释；现状 try_files 把该路径回落 index.html） | 合并后主域 card 可达、SPA 路由不回归；exact-main 本地 release 上传 canonical infra 后生效，不与代码 PR 搭车 | 否 |
 | **PR-4 agent 桥接** | ✅ **已实施（2026-07-18，Boss 拍板启动）**：assistant.chat + agent RunOnce 重构 + M4 契约 §7.1 修订，实现形态见 §12 | — | **是**（触碰 M4 契约核心） |
 
-PR-2 与 PR-3 无同包文件耦合可真并行（SDK 触点全在 PR-3）；PR-3 合并依赖 PR-2。**PR-infra 须在 PR-3 的 enabled=true 验证窗口开启前合并**——真人 ① 的主域 curl 依赖它（Caddyfile 现状 try_files 把 `/.well-known/*` 回落 index.html，deploy/Caddyfile:13-17）；若届时未合并，① 按其判定列的降级方式代跑。PR-4 砍掉不影响前三个的价值闭环。
+PR-2 与 PR-3 无同包文件耦合可真并行（SDK 触点全在 PR-3）；PR-3 合并依赖 PR-2。**PR-infra 须在 PR-3 的 enabled=true 验证窗口开启前合并**——真人 ① 的主域 curl 依赖它（Caddyfile 现状 try_files 把 `/.well-known/*` 回落 index.html，canonical path 为 `infra/production/caddy/Caddyfile`）；若届时未合并，① 按其判定列的降级方式代跑。PR-4 砍掉不影响前三个的价值闭环。
 
 ## 12. 演进与已知取舍（记录在案）
 

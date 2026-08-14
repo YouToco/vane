@@ -3,10 +3,10 @@
 # config server.addr），显式 127.0.0.1 避免 localhost 先解析到 ::1 再回退的抖动。
 #
 # 主域 vane.zhuoqidev.com 自 2026-07-18 起不再由本 Caddy 服务：前端迁 OSS+CDN 双线
-# （国内线阿里 CDN→OSS、境外线 Cloudflare Pages，DNS 分线 CNAME，见 vane-web ci.yml），
+# （国内线阿里 CDN→OSS、境外线 Cloudflare Pages，DNS 分线 CNAME），
 # 主域 /.well-known/* 由两线静态层 302 到 api 子域（a2a-contract §5.2 口径备注）。
 # 若需回滚到 VPS 托管：恢复 vane A 记录 → 188.253.125.238，并从 git 历史找回主域 site block
-# （本文件 2026-07-18 前版本）+ compose 的 ./web 卷 + vane-web CI 的 scp 三步。
+# （本文件 2026-07-18 前版本）+ compose 的 ./web 卷 + 历史静态上传步骤。
 api.vane.zhuoqidev.com {
 	# 代理订阅：仅通过随机路径从 /data 提供静态文件
 	handle /t06knmXR2nupepPf/* {

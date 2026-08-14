@@ -1,4 +1,4 @@
-# Git 工作流规范（vane + vane-web 共同遵守）
+# Git 工作流规范（Vane monorepo）
 
 > 参考大型开源项目实践（React / Vue / Next.js / Kubernetes / Angular），
 > 按 solo + AI coding 的实际规模裁剪。2026-07-14 定稿。
@@ -7,9 +7,9 @@
 
 参考 React / Next.js / Go：`main` 单主干常绿，短命功能分支，不用 Git Flow。
 
-- **`main`**：永远可部署。源仓库 CI 全绿才能合入；生产发布由私有
-  `vane-deploy` 控制面定时解析后端与前端 `main` 的精确 SHA，重新执行独立 Gate
-  后部署（后端→VPS，前端→CDN）。源仓库工作流不持有生产凭证。
+- **`main`**：永远可部署。合入前在无生产凭证的环境执行 `make full`；
+  发布时以 `./ops/bin/vane release --sha <exact-origin-main-sha>` 重跑 exact-SHA Gate。
+  只有 VPS 上 root-owned broker 可取得全局锁、读凭证和修改生产状态。
 - **功能分支**：从 main 切出，命名 `<type>/<slug>`：
   - `feat/agent-loop-policy`、`fix/rss-timeout`、`chore/bump-deps`、`docs/api-schema`
 - **合并方式**：**squash merge**（保持 main 线性历史，React/Next.js 实践），
@@ -44,24 +44,21 @@ chore(deps): bump pgx to v5.8
   push 后在 GitHub 建 Release，正文列本期变更（从 conventional commits 归纳）。
 - **CHANGELOG.md**：keep-a-changelog 格式，每次打 tag 时更新 Unreleased 段落。
   v1.0.0 后如需自动化，接 release-please（Google 实践）。
-- 前后端版本独立演进，不强制同步；API 破坏性变更时后端 minor +1 并在
-  Release notes 标注需要的前端最低版本。
+- 产品 Release 使用根级 `v0.x.y` tag。服务端与 Web 部署状态仍独立记录；
+  若未来对外发布 Go module，再同步创建 `server/v0.x.y` tag。
 
 ## PR 约定
 
 - 标题即 squash 后的 commit message（Conventional Commits 格式）。
 - 描述三段：**做了什么 / 为什么 / 怎么验证的**（附命令或截图）。
-- CI 绿 + self-review 后合并；GitHub 免费版私有仓库无强制 branch protection，
-  以上靠纪律执行，CI 状态是硬门槛。
+- 本地 exact-SHA Gate + self-review 后合并；GitHub 免费版私有仓库无强制
+  branch protection，因此 broker 仍必须独立重验 revision、manifest、锁和 CAS。
 
-### 后端 self-hosted runner 的 Go cache
+### 本地 build supervisor 的 Go cache
 
-- `vane-test` 是持久化 self-hosted runner，`GOMODCACHE` 与 `GOCACHE` 已在本机跨任务复用。
-  默认 CI 因此对 `actions/setup-go` 显式设置 `cache: false`；这只关闭 GitHub Actions
-  远端 archive 的 restore/save，不会删除或禁用 runner 本地 Go cache。
-- 不要在默认 CI 重新启用 setup-go 远端 cache：向已有只读 module cache 解包会产生
-  `tar: Cannot open: File exists`，而保存整个持久目录曾产生约 1.33 GB 的 post-step 上传。
-  若将来需要远端 cache，先把两个 cache 目录隔离到每个任务的干净临时目录。
+- build supervisor 可在宿主上维护可重建的 `GOMODCACHE` / `GOCACHE`，但每次
+  exact-SHA Gate 必须在无 Home、无 Docker socket、无生产凭证的一次性容器内运行。
+- cache 不是 authority；损坏、不完整或版本不符时必须丢弃并重建，不得降级 Gate。
 
 ## 与里程碑排期的对应
 
@@ -73,5 +70,5 @@ chore(deps): bump pgx to v5.8
 | v0.4.0 | M4 | Agent Loop 对话交互 |
 | v0.5.0 | M5 | 反馈闭环 |
 | v0.6.0 | M6 | 源插件化 |
-| v0.7.0 | M7 | Web Dashboard（vane-web 同步打 v0.7.0） |
+| v0.7.0 | M7 | Web Dashboard |
 | v1.0.0 | — | MVP 全量验收 |

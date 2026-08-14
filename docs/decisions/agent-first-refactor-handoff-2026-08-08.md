@@ -54,7 +54,7 @@ worktree 是本机目录，不会被 GitHub 直接同步；远端分支、提交
   错把所有未截断历史都按 `exact` 字节摘要验证，因而拒绝合法 legacy 历史。
 - 修复已推送到接续分支的 `933f30f`：只有 `coverage=exact` 的未截断记录才要求制品摘要等于
   可见 payload 摘要；legacy 仍分别验证语义制品摘要、模型实际可见字节摘要、长度、截断和 scope。
-  生产形状 PostgreSQL 18 回归、对应 race、`go vet ./store`、全仓编译和 V3 workflow 测试已通过。
+  生产形状 PostgreSQL 18 回归、对应 race、`(cd server && GOWORK=off go vet ./store)`、全仓编译和 V3 workflow 测试已通过。
   PR #306 的完整 CI 正在运行，S 级要求的两次独立审查尚未完成，因此尚未合并或部署。
 - 飞书曾把 Provider 失败错误归因为“本租户 LLM 额度已用尽”。老板确认 Kimi 和 DeepSeek
   账户余额充足；当前没有证据支持额度耗尽。该问题按要求仅记录为待诊断的错误归因，

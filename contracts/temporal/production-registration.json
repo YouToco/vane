@@ -1,13 +1,4 @@
 {
-  "schema": "vane.temporal-registration/v1",
-  "default_task_queue": "vane-push",
-  "default_converter": "temporal-default-json-v1",
-  "workflows": [
-    "AgentFirstRetentionClockWorkflowV1",
-    "ResearchScheduledWorkflowV3",
-    "ResearchShadowWorkflowV3",
-    "WorkflowV1"
-  ],
   "activities": [
     "DeliverPeriodicBriefV1",
     "DeliverResearchBriefV3",
@@ -16,5 +7,14 @@
     "PrepareResearchRunV3",
     "SynthesizePeriodicBriefV1",
     "SynthesizeResearchBriefV3"
+  ],
+  "default_converter": "temporal-default-json-v1",
+  "default_task_queue": "vane-push",
+  "schema": "vane.temporal-registration/v1",
+  "workflows": [
+    "AgentFirstRetentionClockWorkflowV1",
+    "ResearchScheduledWorkflowV3",
+    "ResearchShadowWorkflowV3",
+    "WorkflowV1"
   ]
 }
