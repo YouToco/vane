@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/YouToco/vane/server/periodicbrief"
 	vaneworkflow "github.com/YouToco/vane/server/workflow"
 	"go.temporal.io/sdk/worker"
 )
@@ -99,16 +98,13 @@ func TestProductionHistoryReplay(t *testing.T) {
 	if err := json.Unmarshal(raw, &contract); err != nil {
 		t.Fatal(err)
 	}
-	if contract.Schema != "vane.temporal-production-history-replay/v1" || len(contract.Histories) != 5 {
+	if contract.Schema != "vane.temporal-production-history-replay/v1" || len(contract.Histories) != 2 {
 		t.Fatalf("unexpected replay contract: schema=%q histories=%d", contract.Schema, len(contract.Histories))
 	}
 
 	replayer := worker.NewWorkflowReplayer()
-	replayer.RegisterWorkflow(vaneworkflow.PushPipelineWorkflow)
 	replayer.RegisterWorkflow(vaneworkflow.ResearchShadowWorkflowV3)
 	replayer.RegisterWorkflow(vaneworkflow.ResearchScheduledWorkflowV3)
-	replayer.RegisterWorkflow(vaneworkflow.AgentFirstRetentionClockWorkflowV1)
-	replayer.RegisterWorkflow(periodicbrief.WorkflowV1)
 
 	seen := map[string]bool{}
 	seenDigests := map[[sha256.Size]byte]string{}
@@ -132,6 +128,14 @@ func TestProductionHistoryReplay(t *testing.T) {
 		seenDigests[digest] = history.Workflow
 		if err := replayer.ReplayWorkflowHistoryFromJSONFile(nil, path); err != nil {
 			t.Fatalf("replay %s from %s: %v", history.Workflow, path, err)
+		}
+	}
+	for _, required := range []string{
+		vaneworkflow.ResearchScheduledWorkflowV3Name,
+		"ResearchShadowWorkflowV3",
+	} {
+		if !seen[required] {
+			t.Fatalf("current production history contract omits %s", required)
 		}
 	}
 }

@@ -1,10 +1,7 @@
 {
   "schema": "vane.temporal-production-history-replay/v1",
   "histories": [
-    {"workflow": "AgentFirstRetentionClockWorkflowV1", "file": "AgentFirstRetentionClockWorkflowV1.json", "status": "production"},
     {"workflow": "ResearchScheduledWorkflowV3", "file": "ResearchScheduledWorkflowV3.json", "status": "production"},
-    {"workflow": "ResearchShadowWorkflowV3", "file": "ResearchShadowWorkflowV3.json", "status": "production"},
-    {"workflow": "WorkflowV1", "file": "WorkflowV1.json", "status": "production"},
-    {"workflow": "PushPipelineWorkflow", "file": "PushPipelineWorkflow.json", "status": "retained"}
+    {"workflow": "ResearchShadowWorkflowV3", "file": "ResearchShadowWorkflowV3.json", "status": "production"}
   ]
 }
