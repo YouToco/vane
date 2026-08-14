@@ -275,7 +275,7 @@ def main() -> int:
             time.sleep(1)
         else:
             raise PolicyError("canonical Temporal Server did not become healthy")
-        run_checked([str(temporal), "operator", "cluster", "system-info", "--address", temporal_address, "--disable-config-file", "--disable-config-env"], cwd=ROOT)
+        run_checked([str(temporal), "operator", "cluster", "system", "--address", temporal_address, "--disable-config-file", "--disable-config-env"], cwd=ROOT)
         os.environ["VANE_TEMPORAL_ADDRESS"] = temporal_address
         run_go_tests_no_skips(
             [

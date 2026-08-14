@@ -79,7 +79,7 @@ class FullGatePolicyTest(unittest.TestCase):
             "TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges",
             "TestProductionHistoryReplay",
             "temporal_server",
-            "operator\", \"cluster\", \"system-info",
+            "operator\", \"cluster\", \"system",
             "TestCanonicalTemporalServerPostgreSQLRoundTrip",
             "server-binaries.json",
             "check-go-build-info.sh",
