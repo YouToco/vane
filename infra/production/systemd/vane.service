@@ -11,7 +11,7 @@ Group=vane
 WorkingDirectory=/opt/vane
 EnvironmentFile=/opt/vane/env/server.env
 LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url
-ExecStart=/opt/vane/bin/vane
+ExecStart=/opt/vane/current/bin/vane
 Restart=on-failure
 RestartSec=5
 # A5 关停会依次排空 HTTP、飞书回调、deep-dive、Agent 旁路写、创建恢复器、

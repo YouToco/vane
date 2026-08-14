@@ -102,6 +102,12 @@ class RepositoryPolicyTest(unittest.TestCase):
         )
         self.assertNotIn("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL=", environment)
 
+        for unit in systemd.glob("*.service"):
+            payload = unit.read_text(encoding="utf-8")
+            self.assertNotIn("ExecStart=/opt/vane/bin/", payload, unit)
+            if "ExecStart=/opt/vane/" in payload:
+                self.assertIn("ExecStart=/opt/vane/current/bin/", payload, unit)
+
     def test_server_is_native_and_compose_is_middleware_only(self) -> None:
         dockerfiles = [
             path.relative_to(ROOT).as_posix()
