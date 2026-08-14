@@ -6,6 +6,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "ops/bootstrap/install-broker.sh"
+CLIENT_INSTALLER = ROOT / "ops/bootstrap/install-client.sh"
 
 
 class BrokerBootstrapTest(unittest.TestCase):
@@ -54,6 +55,22 @@ class BrokerBootstrapTest(unittest.TestCase):
             '[[ $expected_digest =~ ^[0-9a-f]{64}$ ]]',
         ):
             self.assertIn(required, source)
+
+    def test_local_client_is_root_owned_and_uses_only_forced_ssh(self) -> None:
+        source = CLIENT_INSTALLER.read_text(encoding="utf-8")
+        for required in (
+            "broker client install requires root",
+            "/usr/local/libexec/vane-broker-submit",
+            "/etc/vane-broker/client.json",
+            '"BatchMode=yes"',
+            '"IdentitiesOnly=yes"',
+            '"StrictHostKeyChecking=yes"',
+            'f"vane-broker@{host}"',
+            "private key must not be group/world accessible",
+        ):
+            self.assertIn(required, source)
+        self.assertNotIn("StrictHostKeyChecking=no", source)
+        self.assertNotIn("vane@{host}", source)
 
 
 if __name__ == "__main__":
