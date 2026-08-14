@@ -9,7 +9,11 @@ Type=simple
 User=vane
 Group=vane
 WorkingDirectory=/opt/vane
-EnvironmentFile=/opt/vane/env/server.env
+# The primary Store is intentionally still on the schema-owner compatibility
+# boundary.  The separate research pools keep their restricted runtime roles;
+# do not point this unit at server.env until the retained owner readers have
+# been removed and the server-runtime Gate is authoritative.
+EnvironmentFile=/opt/vane/env/server-owner-compat.env
 LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url
 ExecStart=/opt/vane/current/bin/vane
 Restart=on-failure
