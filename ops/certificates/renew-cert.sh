@@ -54,7 +54,7 @@ flock 9
 work_dir=$(mktemp -d "$VANE_WORK_ROOT/vane-cert.XXXXXX")
 account_temp=$work_dir/account.conf
 aliyun_config=$work_dir/aliyun-config.json
-# shellcheck disable=SC2317 # Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
 cleanup() {
   local status=$?
   trap - EXIT
