@@ -51,9 +51,13 @@ class ProductionHandlerTest(unittest.TestCase):
     def test_controller_archive_is_content_addressed_and_immutable(self) -> None:
         archive = self.archive(self.valid_members())
         control = self.root / "control"
-        target = production_handler.stage_controller(
-            archive=archive, revision=REVISION, controller_root=control
-        )
+        previous_umask = os.umask(0o077)
+        try:
+            target = production_handler.stage_controller(
+                archive=archive, revision=REVISION, controller_root=control
+            )
+        finally:
+            os.umask(previous_umask)
         self.assertEqual(target, control / "releases" / REVISION)
         marker = target / ".controller-archive.sha256"
         self.assertEqual(
@@ -63,11 +67,20 @@ class ProductionHandlerTest(unittest.TestCase):
         self.assertEqual(control.stat().st_mode & 0o777, 0o755)
         self.assertEqual((control / "releases").stat().st_mode & 0o777, 0o755)
         self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+        self.assertTrue(
+            all(
+                path.stat().st_mode & 0o777 == 0o755
+                for path in target.rglob("*")
+                if path.is_dir()
+            )
+        )
         self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        (target / "ops").chmod(0o700)
         replay = production_handler.stage_controller(
             archive=archive, revision=REVISION, controller_root=control
         )
         self.assertEqual(replay, target)
+        self.assertEqual((target / "ops").stat().st_mode & 0o777, 0o755)
         changed = self.valid_members()
         changed["ops/bin/vane"] = b"changed\n"
         with self.assertRaisesRegex(RuntimeError, "differs"):
