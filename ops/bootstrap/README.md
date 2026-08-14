@@ -59,6 +59,13 @@ it. At the start of the following product release D, the global broker lock may
 promote already-finalized controller C; C can authorize D but never C. No GitHub
 runner or VM participates in this path.
 
+The pre-hardening bootstrap controller is upgraded exactly once with
+`controller_upgrade.py`. Its signed plan CAS-binds the live product/controller
+state, changes only the root-owned controller authority, and records an exact
+archive-bound bootstrap exception. The upgraded controller must publish a
+later SHA; it cannot publish its own product revision. This command is not a
+general controller deployment path.
+
 On the release Mac, install the narrow client once from the merged controller.
 The private transport key remains outside the repository and can invoke only
 the VPS forced command:
