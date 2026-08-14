@@ -300,6 +300,8 @@ def prove_previous_binary_compatibility(
             "HOME": str(runtime / "rollback-base-home"),
             "VANE_DB_URL": runtime_url,
             "VANE_LLM_API_KEY": "rollback-compatibility-not-a-secret",
+            "VANE_LLM_AGENT_PROVIDER": "openai",
+            "VANE_LLM_AGENT_BASE_URL": "https://invalid.example/v1",
             "VANE_LLM_AGENT_API_KEY": "rollback-compatibility-not-a-secret",
         },
         capture_output=True,
