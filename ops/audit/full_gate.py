@@ -372,10 +372,16 @@ def main() -> int:
         build_env = {
             **env, "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"
         }
+        linker_flags = (
+            f"-buildid=vane/{head}/clean "
+            f"-X=github.com/YouToco/vane/server/internal/releaseinfo.revision={head} "
+            "-X=github.com/YouToco/vane/server/internal/releaseinfo.clean=true"
+        )
         for item in inventory:
             subprocess.run(
                 [
                     str(go), "build", "-buildvcs=true", "-trimpath",
+                    "-ldflags", linker_flags,
                     "-o", str(binary_dir / item["name"]), item["package"],
                 ],
                 cwd=SERVER,

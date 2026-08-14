@@ -58,7 +58,7 @@ class ArtifactValidationTest(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             if name.startswith("bin/"):
                 path.write_bytes(
-                    f"fixture vcs.revision={SHA} vcs.modified=false\n".encode()
+                    f"fixture vane/{SHA}/clean\n".encode()
                 )
             else:
                 path.write_text(f"fixture {name}\n", encoding="utf-8")

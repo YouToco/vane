@@ -58,7 +58,7 @@ chore(deps): bump pgx to v5.8
 
 - exact-SHA Gate 直接在当前 Mac 运行固定版本 Go/Node；不经过 runner、VM、构建容器或远端构建机。
 - `GOMODCACHE` / `GOCACHE` 只用于提速，不是制品 authority；发布二进制仍从 clean exact-main
-  交叉编译，并用 build info 证明 SHA 与 `vcs.modified=false`。
+  交叉编译，并用 Go release build ID 证明精确 monorepo SHA 与 clean Gate。
 
 ## 与里程碑排期的对应
 

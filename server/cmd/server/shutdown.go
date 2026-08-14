@@ -5,10 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"runtime/debug"
-	"strings"
 	"time"
 
+	"github.com/YouToco/vane/server/internal/releaseinfo"
 	"go.temporal.io/sdk/worker"
 )
 
@@ -45,31 +44,11 @@ func temporalWorkerOptions() worker.Options {
 }
 
 func temporalWorkerBuildID() string {
-	info, ok := debug.ReadBuildInfo()
+	revision, ok := releaseinfo.Revision()
 	if !ok {
 		return "vane/development"
 	}
-	var revision string
-	modified := false
-	for _, setting := range info.Settings {
-		switch setting.Key {
-		case "vcs.revision":
-			revision = setting.Value
-		case "vcs.modified":
-			modified = setting.Value == "true"
-		}
-	}
-	if modified || len(revision) != 40 || !isLowerHex(revision) {
-		return "vane/development"
-	}
 	return "vane/" + revision
-}
-
-func isLowerHex(value string) bool {
-	return strings.IndexFunc(value, func(current rune) bool {
-		return !('0' <= current && current <= '9') &&
-			!('a' <= current && current <= 'f')
-	}) < 0
 }
 
 func beginHTTPShutdown(srv *http.Server, timeout time.Duration) <-chan error {

@@ -412,10 +412,8 @@ def validate(
                 "agentfirstretention",
             ):
                 data = (output_dir / "bin" / binary).read_bytes()
-                if f"vcs.revision={source_sha}".encode() not in data:
-                    raise ValueError(f"{binary} lacks exact vcs.revision build info")
-                if b"vcs.modified=false" not in data or b"vcs.modified=true" in data:
-                    raise ValueError(f"{binary} was not built from a clean worktree")
+                if f"vane/{source_sha}/clean".encode() not in data:
+                    raise ValueError(f"{binary} lacks exact clean release build ID")
             release_receipt = {
                 "schema_version": "vane.release-receipt/v1",
                 "source_revision": source_sha,

@@ -42,37 +42,18 @@ class CheckGoBuildInfoTests(unittest.TestCase):
                 check=False,
             )
 
-    def test_accepts_gnu_strings_build_prefix(self) -> None:
-        result = self.run_checker(
-            f"build\tvcs.revision={SHA}\n"
-            "build\tvcs.modified=false\n"
-        )
+    def test_accepts_exact_clean_release_build_id(self) -> None:
+        result = self.run_checker(f"vane/{SHA}/clean\n")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_accepts_bsd_strings_without_build_prefix(self) -> None:
-        result = self.run_checker(
-            f"vcs.revision={SHA}\n"
-            "vcs.modified=false\n"
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_rejects_modified_binary(self) -> None:
-        result = self.run_checker(
-            f"build\tvcs.revision={SHA}\n"
-            "build\tvcs.modified=true\n"
-        )
+    def test_rejects_missing_clean_release_build_id(self) -> None:
+        result = self.run_checker(f"vane/{SHA}/dirty\n")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("modified worktree", result.stderr)
-
-    def test_rejects_missing_clean_marker(self) -> None:
-        result = self.run_checker(f"build\tvcs.revision={SHA}\n")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("missing the clean-worktree marker", result.stderr)
+        self.assertIn("wrong or missing release build ID", result.stderr)
 
     def test_rejects_strings_failure(self) -> None:
         result = self.run_checker(
-            f"build\tvcs.revision={SHA}\n"
-            "build\tvcs.modified=false\n",
+            f"vane/{SHA}/clean\n",
             strings_exit=7,
         )
         self.assertNotEqual(result.returncode, 0)
@@ -80,11 +61,10 @@ class CheckGoBuildInfoTests(unittest.TestCase):
 
     def test_rejects_wrong_revision(self) -> None:
         result = self.run_checker(
-            "build\tvcs.revision=0000000000000000000000000000000000000000\n"
-            "build\tvcs.modified=false\n"
+            "vane/0000000000000000000000000000000000000000/clean\n"
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("wrong VCS revision", result.stderr)
+        self.assertIn("wrong or missing release build ID", result.stderr)
 
 
 if __name__ == "__main__":

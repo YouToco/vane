@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"go.temporal.io/sdk/client"
 
 	"github.com/YouToco/vane/server/internal/agentfirstaudit"
+	"github.com/YouToco/vane/server/internal/releaseinfo"
 	"github.com/YouToco/vane/server/store"
 )
 
@@ -190,20 +190,8 @@ func safeCredentialAuthority(info os.FileInfo, directory bool) bool {
 }
 
 func buildSourceRevision() (string, error) {
-	info, ok := debug.ReadBuildInfo()
+	revision, ok := releaseinfo.Revision()
 	if !ok {
-		return "", errors.New("collector build information is unavailable")
-	}
-	revision, modified := "", ""
-	for _, setting := range info.Settings {
-		switch setting.Key {
-		case "vcs.revision":
-			revision = setting.Value
-		case "vcs.modified":
-			modified = setting.Value
-		}
-	}
-	if !validLowerHex(revision, 40) || modified != "false" {
 		return "", errors.New("collector build revision is dirty or invalid")
 	}
 	return revision, nil
