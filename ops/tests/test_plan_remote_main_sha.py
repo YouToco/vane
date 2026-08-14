@@ -79,6 +79,7 @@ class ExactRevisionCLITest(unittest.TestCase):
                 mock.patch.object(controller, "command_full", return_value=0),
                 mock.patch.object(Path, "is_file", return_value=True),
                 mock.patch.object(controller, "build_release_submission", side_effect=lambda **values: values["release_root"]) as build,
+                mock.patch.object(controller, "publish_web_after_server", return_value=work / "web.json"),
                 mock.patch.object(controller.subprocess, "run", return_value=completed) as run,
             ):
                 self.assertEqual(controller.command_release(args), 0)

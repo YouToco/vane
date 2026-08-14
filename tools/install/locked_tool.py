@@ -60,6 +60,8 @@ def safe_members(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
 def install(tool: str, lock_path: Path, cache: Path) -> Path:
     if tool not in INSTALLABLE:
         raise RuntimeError(f"tool is not archive-installable: {tool}")
+    lock_path = lock_path.resolve(strict=True)
+    cache = cache.resolve()
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
     entry = lock["tools"][tool]
     if tool == "govulncheck":

@@ -5,16 +5,22 @@ import unittest
 OPS = pathlib.Path(__file__).resolve().parents[1]
 CLI = OPS / "bin" / "vane"
 CONTROLLER = OPS / "cli" / "controller.py"
-DEPLOY = OPS / "release" / "deploy.sh"
+BROKER = OPS / "broker" / "controller.py"
+WEB_PUBLISHER = OPS / "release" / "publish_web.py"
 CERT = OPS / "certificates" / "renew-cert.sh"
 
 
 class DeployStateOwnerTests(unittest.TestCase):
-    def test_deploy_and_certificate_share_the_durable_lock(self) -> None:
-        for path in (DEPLOY, CERT):
-            source = path.read_text(encoding="utf-8")
-            self.assertIn("$state_dir/control-plane.lock", source, path)
-            self.assertIn("flock 9", source, path)
+    def test_server_web_and_certificate_mutations_are_serialized(self) -> None:
+        broker = BROKER.read_text(encoding="utf-8")
+        web = WEB_PUBLISHER.read_text(encoding="utf-8")
+        certificate = CERT.read_text(encoding="utf-8")
+        self.assertIn('state_root / "release.lock"', broker)
+        self.assertIn("fcntl.flock(lock, fcntl.LOCK_EX)", broker)
+        self.assertIn('state_root / "web-release.lock"', web)
+        self.assertIn("fcntl.flock(state_lock, fcntl.LOCK_EX)", web)
+        self.assertIn('$state_dir/control-plane.lock', certificate)
+        self.assertIn("flock 9", certificate)
 
     def test_repository_cli_has_no_production_mutation_implementation(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
@@ -40,10 +46,14 @@ class DeployStateOwnerTests(unittest.TestCase):
             if path.is_file() and path.suffix in {".sh", ".py"}
             and "tests" not in path.parts
         )
-        for retired in ("RUNNER_TEMP", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
+        for retired in (
+            "RUNNER_TEMP",
+            "GITHUB_RUN_ID",
+            "GITHUB_RUN_ATTEMPT",
+            "ACTIONS_RUNTIME_TOKEN",
+        ):
             self.assertNotIn(retired, active)
         self.assertIn("VANE_WORK_ROOT", active)
-        self.assertIn("VANE_RELEASE_ATTEMPT_ID", active)
 
 
 if __name__ == "__main__":

@@ -127,6 +127,15 @@ class FullGatePolicyTest(unittest.TestCase):
                 expected_database="vane_full_0",
             )
 
+    def test_native_postgres_discovers_keg_only_homebrew_install(self) -> None:
+        fake = Path("/opt/homebrew/opt/postgresql@18/bin")
+        with mock.patch.object(full_gate.shutil, "which", return_value=None), \
+             mock.patch.object(Path, "is_file", return_value=True), \
+             mock.patch.object(full_gate.os, "access", return_value=True), \
+             mock.patch.object(full_gate, "output", return_value="postgres (PostgreSQL) 18.4"):
+            binaries = full_gate.require_native_postgres()
+        self.assertEqual(binaries["postgres"], fake / "postgres")
+
     def test_verified_artifact_tree_digest_detects_post_gate_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)

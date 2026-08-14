@@ -45,8 +45,9 @@ mkdir -p "$state_dir" "$acme_root" "$acme_home" "$acme_config" "$acme_certs"
 chmod 700 "$state_dir" "$acme_root" "$acme_home" "$acme_config" "$acme_certs"
 command -v flock >/dev/null
 
-# deploy.sh uses this same lock. Issuance, upload, edge verification, and state
-# updates are one VM-wide critical section.
+# Certificate issuance, upload, edge verification, and state updates are one
+# host-wide critical section. Web releases use a separate local publication
+# lock because they never pass through this host.
 exec 9>"$state_dir/control-plane.lock"
 flock 9
 

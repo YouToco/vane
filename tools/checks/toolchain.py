@@ -38,7 +38,6 @@ def check(lock_path: Path, cache: Path, repo_root: Path) -> list[str]:
         "govulncheck": ([cache / "govulncheck" / lock["govulncheck"]["version"] / "govulncheck", "-version"], f"v{lock['govulncheck']['version']}"),
         "aliyun_cli": ([cache / "aliyun_cli" / lock["aliyun_cli"]["version"] / "aliyun", "version"], lock["aliyun_cli"]["version"]),
         "ossutil": ([cache / "ossutil" / lock["ossutil"]["version"] / "ossutil", "version"], lock["ossutil"]["version"]),
-        "wrangler": ([cache / "wrangler" / lock["wrangler"]["version"] / "wrangler", "--version"], lock["wrangler"]["version"]),
     }
     for tool, (command, expected) in commands.items():
         binary = Path(command[0])
@@ -56,18 +55,6 @@ def check(lock_path: Path, cache: Path, repo_root: Path) -> list[str]:
             errors.append(f"locked download is missing: {tool}: {path}")
         elif sha256(path) != artifact["sha256"]:
             errors.append(f"locked download checksum mismatch: {tool}: {path}")
-    wrangler_lock = cache / "wrangler" / lock["wrangler"]["version"] / "package-lock.json"
-    if wrangler_lock.is_symlink() or not wrangler_lock.is_file():
-        errors.append(f"installed Wrangler lock is missing: {wrangler_lock}")
-    elif sha256(wrangler_lock) != lock["wrangler"]["package_lock_sha256"]:
-        errors.append(f"installed Wrangler lock checksum mismatch: {wrangler_lock}")
-    acme_root = cache / "acme_sh" / lock["acme_sh"]["version"]
-    acme = acme_root / "acme.sh"
-    marker = acme_root / ".source-commit"
-    if acme.is_symlink() or not acme.is_file() or not os.access(acme, os.X_OK):
-        errors.append(f"locked executable is missing: acme_sh: {acme}")
-    elif marker.is_symlink() or not marker.is_file() or marker.read_text(encoding="ascii").strip() != lock["acme_sh"]["source_commit_sha1"]:
-        errors.append(f"acme.sh source commit manifest mismatch: {marker}")
     compose = (repo_root / "infra/production/compose/docker-compose.yml").read_text(encoding="utf-8")
     for tool in ("postgres", "temporal_server", "temporal_ui", "caddy"):
         expected = f"{lock[tool]['image']}@{lock[tool]['digest']}"

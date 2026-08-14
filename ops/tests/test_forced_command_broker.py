@@ -74,7 +74,6 @@ class ForcedCommandBrokerTest(unittest.TestCase):
         source = self.root / "source"
         for directory in (
             source / "artifacts/backend-pack",
-            source / "artifacts/frontend-pack",
             source / "gate-evidence",
             source / "manifests",
         ):
@@ -122,7 +121,6 @@ class ForcedCommandBrokerTest(unittest.TestCase):
             "evidence": [
                 evidence("artifact", "release-receipt.json", "gate-evidence/release-receipt.json", b"receipt\n"),
                 evidence("artifact", "backend-manifest.json", f"artifacts/backend-pack/backend-{REVISION}.manifest.json", b"backend\n"),
-                evidence("artifact", "frontend-manifest.json", f"artifacts/frontend-pack/frontend-{REVISION}.manifest.json", b"frontend\n"),
                 evidence("artifact", "controller-archive.tar.gz", f"artifacts/controller-{REVISION}.tar.gz", b"controller\n"),
             ],
         }
@@ -133,7 +131,6 @@ class ForcedCommandBrokerTest(unittest.TestCase):
             "deploy_run_id": "123456789",
             "artifact_manifest": "manifests/artifact.json",
             "backend_pack": "artifacts/backend-pack",
-            "frontend_pack": "artifacts/frontend-pack",
             "controller_archive": f"artifacts/controller-{REVISION}.tar.gz",
             "evidence": bound,
         }
@@ -220,6 +217,20 @@ class ForcedCommandBrokerTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 78, result)
         self.assertIn(b"CAS mismatch", result.stderr)
+
+    def test_symlinked_release_lock_fails_before_artifact_validation(self) -> None:
+        request_id = self.upload()
+        digest = hashlib.sha256(self.current.read_bytes()).hexdigest()
+        outside = self.root / "outside.lock"
+        outside.write_text("unchanged\n", encoding="utf-8")
+        (self.state / "release.lock").symlink_to(outside)
+        result = self.run_broker(
+            "vane-broker release",
+            {"request_id": request_id, "expected_current_digest": digest},
+        )
+        self.assertEqual(result.returncode, 78, result)
+        self.assertIn(b"lock must not be a symlink", result.stderr)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "unchanged\n")
 
     def test_legacy_import_cannot_return(self) -> None:
         self.assertFalse((OPS / "legacy-import").exists())

@@ -77,6 +77,12 @@ def require_native_postgres() -> dict[str, Path]:
     binaries: dict[str, Path] = {}
     for name in ("postgres", "initdb", "pg_ctl", "createdb"):
         resolved = shutil.which(name)
+        if not resolved and sys.platform == "darwin":
+            for prefix in (Path("/opt/homebrew"), Path("/usr/local")):
+                candidate = prefix / "opt/postgresql@18/bin" / name
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    resolved = str(candidate)
+                    break
         if not resolved:
             raise PolicyError(f"native PostgreSQL 18 executable is missing: {name}")
         path = Path(resolved)
@@ -259,20 +265,20 @@ def main() -> int:
 
         temporal_port = free_local_port()
         temporal_address = f"127.0.0.1:{temporal_port}"
-        temporal_log = (artifacts / "temporal.log").open("wb")
-        temporal_process = subprocess.Popen(
-            [
-                str(temporal), "server", "start-dev", "--headless",
-                "--ip", "127.0.0.1", "--port", str(temporal_port),
-                "--db-filename", str(runtime / "temporal.db"),
-                "--disable-config-file", "--disable-config-env",
-                "--log-format", "json", "--log-level", "warn",
-            ],
-            cwd=ROOT,
-            env=env,
-            stdout=temporal_log,
-            stderr=subprocess.STDOUT,
-        )
+        with (artifacts / "temporal.log").open("wb") as temporal_log:
+            temporal_process = subprocess.Popen(
+                [
+                    str(temporal), "server", "start-dev", "--headless",
+                    "--ip", "127.0.0.1", "--port", str(temporal_port),
+                    "--db-filename", str(runtime / "temporal.db"),
+                    "--disable-config-file", "--disable-config-env",
+                    "--log-format", "json", "--log-level", "warn",
+                ],
+                cwd=ROOT,
+                env=env,
+                stdout=temporal_log,
+                stderr=subprocess.STDOUT,
+            )
         wait_temporal(temporal, temporal_address, env)
         os.environ["VANE_TEMPORAL_ADDRESS"] = temporal_address
         run_go_tests_no_skips(

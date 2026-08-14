@@ -15,7 +15,7 @@ version=3.4.10
 }
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 selection=$(
-  "$script_dir/select-aliyun-tool-archive.sh" aliyun "$(uname -m)"
+  "$script_dir/select-aliyun-tool-archive.sh" aliyun "$(uname -m)" "$(uname -s)"
 )
 IFS=$'\t' read -r archive_name archive_sha256 <<<"$selection"
 [[ -n "$archive_name" && "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]
@@ -29,7 +29,17 @@ trap 'rm -f "$archive"' EXIT
 curl --fail --silent --show-error --location \
   --proto '=https' --tlsv1.2 \
   --output "$archive" "$archive_url"
-printf '%s  %s\n' "$archive_sha256" "$archive" | sha256sum --check --status
+python3 - "$archive" "$archive_sha256" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+actual = hashlib.sha256(path.read_bytes()).hexdigest()
+if actual != expected:
+    raise SystemExit("Aliyun CLI archive SHA-256 mismatch")
+PY
 tar -xzf "$archive" -C "$install_dir"
 chmod 755 "$install_dir/aliyun"
 

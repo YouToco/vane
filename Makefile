@@ -16,7 +16,7 @@ test-release:
 	python3 -m unittest discover -s ops/tests -p 'test_*.py'
 
 full:
-	./ops/bin/vane full
+	./ops/bin/vane full --sha "$${SHA:-$$(git rev-parse HEAD)}"
 
 release:
 	test -n "$(SHA)"

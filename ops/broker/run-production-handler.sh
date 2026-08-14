@@ -35,10 +35,6 @@ exec systemd-run \
   --property=ReadWritePaths=/opt/vane \
   --property=ReadWritePaths=/opt/vane-control \
   --property=ReadWritePaths=/var/lib/vane-broker \
-  --property=LoadCredential=aliyun_access_key_id:/etc/vane/credentials/aliyun_access_key_id \
-  --property=LoadCredential=aliyun_access_key_secret:/etc/vane/credentials/aliyun_access_key_secret \
-  --property=LoadCredential=cloudflare_api_token:/etc/vane/credentials/cloudflare_api_token \
-  --property=LoadCredential=cloudflare_account_id:/etc/vane/credentials/cloudflare_account_id \
   --property=LoadCredential=uat_session_cookie:/etc/vane/credentials/uat_session_cookie \
   --property=LoadCredential=broker_signing_key:/etc/vane-broker/credentials/broker_signing_key \
   "$script_dir/production_handler.py" "$@"

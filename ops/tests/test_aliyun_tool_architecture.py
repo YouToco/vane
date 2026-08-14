@@ -12,9 +12,9 @@ INSTALLERS = (
 
 
 class AliyunToolArchitectureTests(unittest.TestCase):
-    def select(self, tool: str, machine: str) -> tuple[str, str]:
+    def select(self, tool: str, machine: str, system: str = "Linux") -> tuple[str, str]:
         result = subprocess.run(
-            [str(SELECTOR), tool, machine],
+            [str(SELECTOR), tool, machine, system],
             check=True,
             capture_output=True,
             text=True,
@@ -39,6 +39,13 @@ class AliyunToolArchitectureTests(unittest.TestCase):
                 "349f3d31af9cc85aa2b444899e7d805f6409f5a53d667ce74d00dafbc17f9ae5",
             ),
         )
+        self.assertEqual(
+            self.select("aliyun", "arm64", "Darwin"),
+            (
+                "aliyun-cli-macosx-3.4.10-arm64.tgz",
+                "159787b71bf9dd8efbd110ca2c209f49154a0323b535a215bb471625d58a50aa",
+            ),
+        )
 
     def test_ossutil_archives_are_exactly_pinned(self) -> None:
         self.assertEqual(
@@ -55,15 +62,22 @@ class AliyunToolArchitectureTests(unittest.TestCase):
                 "f6c95ba0c2d2ef30290af686ce4d706c701f4734ce8090bee4288a77e3f1d764",
             ),
         )
+        self.assertEqual(
+            self.select("ossutil", "arm64", "Darwin"),
+            (
+                "ossutil-2.3.0-mac-arm64.zip",
+                "058fd048f321f8c80def8b748030531646eefe3a82837bf16b581ba7d9c84ac7",
+            ),
+        )
 
     def test_unknown_architecture_and_tool_fail_closed(self) -> None:
         for tool, machine, message in (
-            ("aliyun", "riscv64", "unsupported Linux machine architecture"),
+            ("aliyun", "riscv64", "unsupported machine architecture"),
             ("attacker", "x86_64", "unsupported pinned Aliyun tool"),
         ):
             with self.subTest(tool=tool, machine=machine):
                 result = subprocess.run(
-                    [str(SELECTOR), tool, machine],
+                    [str(SELECTOR), tool, machine, "Linux"],
                     check=False,
                     capture_output=True,
                     text=True,
@@ -77,6 +91,7 @@ class AliyunToolArchitectureTests(unittest.TestCase):
                 source = installer.read_text()
                 self.assertIn("select-aliyun-tool-archive.sh", source)
                 self.assertIn('"$(uname -m)"', source)
+                self.assertIn('"$(uname -s)"', source)
                 self.assertNotIn("linux-amd64", source)
                 self.assertNotIn("linux-arm64", source)
 

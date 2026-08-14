@@ -1,16 +1,17 @@
 # Operations control plane
 
 `ops/bin/vane` is the repository's only operator-facing executable. It runs
-local checks and validates immutable release evidence, but it cannot read
-production credentials, acquire the production lock, or mutate production.
-Those capabilities belong to a separately installed, root-owned VPS broker.
+local checks and validates immutable release evidence. The VPS broker alone
+owns Server mutation, its lock, and CAS. The release Mac separately owns the
+narrow Web mutation: verified Vite output goes directly to OSS/CDN and is never
+copied to the VPS.
 
 ## Layout
 
 | Path | Authority |
 | --- | --- |
 | `bin/vane` | Local doctor, test dispatch, manifest audit, and broker request validation |
-| `release/` | Exact-source checkout, deterministic artifacts, SHA-directory cutover, and frontend publication |
+| `release/` | Local exact-source Gate, Server artifact handoff, native SHA-directory cutover, and direct OSS publication |
 | `rollback/` | Whole-release rollback admission; legacy mixed-path logic exists only as a test fixture |
 | `certificates/` | Existing certificate issuance and edge-verification primitive |
 | `audit/` | Binary and release evidence checks |
@@ -53,17 +54,21 @@ versions, canonical production image digests, and the trusted signer policy.
 It refuses release when any required local installation or broker signer is
 missing; versions alone are never treated as integrity pins.
 
-`release --sha` performs doctor, the complete full gate, deterministic backend
-and frontend artifact construction, a signed plan/gate/artifact chain, and one
-submission to the configured root-owned broker. The user does not assemble
+`release --sha` performs doctor, the complete full gate, deterministic Server
+artifact construction, a signed plan/gate/artifact chain, and one Server-only
+submission to the configured root-owned broker. After Server success, the same
+command publishes the verified `dist/` directly from the Mac to OSS: immutable
+assets first, `index.html` last, followed by bounded CDN refresh and public
+marker verification. The user does not assemble
 receipts, current-state documents, manifests, or CAS values. Its non-secret
 local runtime is configured with `VANE_WORK_ROOT`, `VANE_RELEASE_SIGNING_KEY`,
 `VANE_RELEASE_SIGNER`, `VANE_ALLOWED_SIGNERS`, and `VANE_BROKER_SUBMIT`.
-Missing broker installation or signer material fails closed before production
-mutation. Production credentials remain available only to the broker.
+Missing broker installation or signer material fails closed before Server
+mutation. Aliyun credentials remain local and are passed only to the OSS/CDN
+publisher; Server/runtime credentials remain available only to the broker.
 
 `release-receipt.json` is consumed as an exact ten-field object. The durable
-`current-release.json` is also parsed strictly and compared by SHA-256 CAS.
+Server `current-release.json` is also parsed strictly and compared by SHA-256 CAS.
 The candidate N+1 document may be prepared with the artifact, but `audit`
 authorizes its activation only when the same signed chain reaches `finalize`;
 deploy or verify failure therefore leaves N authoritative.
@@ -72,6 +77,6 @@ deploy or verify failure therefore leaves N authoritative.
 
 ```bash
 python3 -m unittest discover -s ops/tests -p 'test_*.py'
-bash -n ops/release/*.sh ops/rollback/*.sh ops/certificates/*.sh \
+bash -n ops/rollback/*.sh ops/certificates/*.sh \
   ops/audit/*.sh ops/bootstrap/*.sh
 ```

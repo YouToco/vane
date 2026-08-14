@@ -196,7 +196,6 @@ def load_submission(request_root: Path) -> dict:
         "deploy_run_id",
         "artifact_manifest",
         "backend_pack",
-        "frontend_pack",
         "controller_archive",
         "evidence",
     }
@@ -295,44 +294,33 @@ def verify_submission_evidence(request_root: Path, submission: dict) -> Path:
 
 def validate_artifacts(
     *, repo: Path, request_root: Path, submission: dict, output_root: Path
-) -> tuple[Path, Path]:
+) -> Path:
     backend_pack = submission_path(request_root, submission["backend_pack"], directory=True)
-    frontend_pack = submission_path(request_root, submission["frontend_pack"], directory=True)
     backend = output_root / "backend"
-    frontend = output_root / "frontend"
     tool = repo / "ops/release/artifact.py"
     if tool.is_symlink() or not tool.is_file():
         raise RuntimeError("fixed artifact validator is unavailable")
-    for component, source, destination in (
-        ("backend", backend_pack, backend),
-        ("frontend", frontend_pack, frontend),
-    ):
-        command = [
-            sys.executable,
-            str(tool),
-            "validate",
-            "--component",
-            component,
-            "--sha",
-            submission["revision"],
-            "--input",
-            str(source),
-            "--output",
-            str(destination),
-        ]
-        if component == "backend":
-            command.extend(
-                [
-                    "--control-plane-revision",
-                    submission["revision"],
-                    "--deploy-run-id",
-                    submission["deploy_run_id"],
-                ]
-            )
-        result = subprocess.run(command, check=False)
-        if result.returncode != 0:
-            raise RuntimeError(f"{component} artifact validation failed")
-    return backend, frontend
+    command = [
+        sys.executable,
+        str(tool),
+        "validate",
+        "--component",
+        "backend",
+        "--sha",
+        submission["revision"],
+        "--input",
+        str(backend_pack),
+        "--output",
+        str(backend),
+        "--control-plane-revision",
+        submission["revision"],
+        "--deploy-run-id",
+        submission["deploy_run_id"],
+    ]
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise RuntimeError("backend artifact validation failed")
+    return backend
 
 
 def invoke_handler(
@@ -411,8 +399,14 @@ def handle(
     if verb == "audit":
         return {"ok": True, "verb": verb}
 
-    lock_path = state_root / "release.lock"
+    if state_root.is_symlink():
+        raise RuntimeError("broker state root must not be a symlink")
     state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not state_root.is_dir():
+        raise RuntimeError("broker state root is unavailable")
+    lock_path = state_root / "release.lock"
+    if lock_path.is_symlink():
+        raise RuntimeError("broker release lock must not be a symlink")
     with lock_path.open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         current = state_root / "current-release.json"
@@ -427,6 +421,8 @@ def handle(
             target_manifest = verify_submission_evidence(target_root, target_submission)
             invoke_cli(repo, ["audit", "--manifest", str(target_manifest)])
         inflight_root = state_root / "inflight"
+        if inflight_root.is_symlink():
+            raise RuntimeError("broker inflight root must not be a symlink")
         inflight_root.mkdir(mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=f"{request['request_id']}.", dir=str(inflight_root)) as temp:
             validated_root = Path(temp)

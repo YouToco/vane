@@ -16,8 +16,6 @@
     "shellcheck": "0.11.0",
     "aliyun_cli": "3.4.10",
     "ossutil": "2.3.0",
-    "wrangler": "4.115.0",
-    "undici": "7.29.0",
     "acme_sh": "3661fd86b6304115e42f43910e6dd452ab9866d6"
   }
 }

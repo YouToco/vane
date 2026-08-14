@@ -22,7 +22,6 @@ import sys
 import tarfile
 import tempfile
 from typing import Any, Optional
-from urllib.request import Request, urlopen
 
 
 def canonical(value: Any) -> bytes:
@@ -90,11 +89,6 @@ def load_config() -> dict:
     value = strict_json(path)
     expected = {
         "schema",
-        "public_origin",
-        "cloudflare_origin",
-        "aliyun_bin",
-        "ossutil_bin",
-        "wrangler_bin",
         "uat_command",
         "evidence_root",
         "signer",
@@ -102,16 +96,7 @@ def load_config() -> dict:
     }
     if set(value) != expected or value.get("schema") != "vane.production-handler/v1":
         raise RuntimeError("production handler configuration keys are not exact")
-    for key in ("public_origin", "cloudflare_origin"):
-        if not isinstance(value[key], str) or not value[key].startswith("https://"):
-            raise RuntimeError(f"production handler {key} is invalid")
-    for key in (
-        "aliyun_bin",
-        "ossutil_bin",
-        "wrangler_bin",
-        "evidence_root",
-        "controller_root",
-    ):
+    for key in ("evidence_root", "controller_root"):
         path_value = Path(value[key])
         if not path_value.is_absolute():
             raise RuntimeError(f"production handler {key} is not absolute")
@@ -126,15 +111,12 @@ def load_config() -> dict:
 
 
 def ensure_provider_state(
-    state_root: Path, *, server_revision: str, web_revision: str
+    state_root: Path, *, server_revision: str
 ) -> Path:
     provider_root = state_root / "provider"
     state = provider_root / "vane-deploy"
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for name, current_revision in (
-        ("deployed-vane.sha", server_revision),
-        ("deployed-vane-web.sha", web_revision),
-    ):
+    for name, current_revision in (("deployed-vane.sha", server_revision),):
         path = state / name
         if path.exists():
             if path.is_symlink() or path.read_text(encoding="ascii").strip() != current_revision:
@@ -143,25 +125,6 @@ def ensure_provider_state(
             path.write_text(current_revision + "\n", encoding="ascii")
             path.chmod(0o600)
     return provider_root
-
-
-def provider_environment(
-    *, config: dict, state_root: Path, receipt_root: Path, expected_revision: str
-) -> dict[str, str]:
-    return {
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME": "/nonexistent",
-        "XDG_STATE_HOME": str(state_root),
-        "EXPECTED_DEPLOYED_SHA": expected_revision,
-        "FRONTEND_RECEIPT_DIR": str(receipt_root),
-        "ALIYUN_BIN": config["aliyun_bin"],
-        "OSSUTIL_BIN": config["ossutil_bin"],
-        "WRANGLER_BIN": config["wrangler_bin"],
-        "ALIYUN_ACCESS_KEY_ID": credential("aliyun_access_key_id"),
-        "ALIYUN_ACCESS_KEY_SECRET": credential("aliyun_access_key_secret"),
-        "CLOUDFLARE_API_TOKEN": credential("cloudflare_api_token"),
-        "CLOUDFLARE_ACCOUNT_ID": credential("cloudflare_account_id"),
-    }
 
 
 def stage_server(validated: Path, revision: str) -> Path:
@@ -187,17 +150,6 @@ def stage_server(validated: Path, revision: str) -> Path:
         shutil.copy2(path, destination)
     shutil.copy2(backend / "release-receipt.json", stage / "release-receipt.json")
     return stage
-
-
-def public_marker(origin: str, revision: str) -> dict:
-    request = Request(origin.rstrip("/") + "/.well-known/vane-release.json")
-    with urlopen(request, timeout=15) as response:
-        if response.status != 200:
-            raise RuntimeError(f"release marker returned HTTP {response.status}")
-        value = json.loads(response.read(64 * 1024))
-    if not isinstance(value, dict) or value.get("source_revision") != revision or value.get("source_dirty") is not False:
-        raise RuntimeError(f"public release marker differs from exact revision at {origin}")
-    return value
 
 
 def run_uat(command: list[str], revision: str, output: Path) -> dict:
@@ -227,26 +179,7 @@ def restore(
     previous: dict,
     candidate_revision: str,
     provider_root: Path,
-    provider_env: dict[str, str],
-    evidence_root: Path,
 ) -> None:
-    previous_revision = previous["web"]["deployed_revision"]
-    previous_frontend = evidence_root / "releases" / previous_revision / "frontend"
-    if previous_frontend.is_symlink() or not previous_frontend.is_dir():
-        raise RuntimeError("previous validated Web artifact is unavailable for recovery")
-    provider_web_state = provider_root / "vane-deploy/deployed-vane-web.sha"
-    if provider_web_state.is_symlink() or not provider_web_state.is_file():
-        raise RuntimeError("provider Web state is unavailable during recovery")
-    provider_expected = provider_web_state.read_text(encoding="ascii").strip()
-    restore_env = {
-        **provider_env,
-        "XDG_STATE_HOME": str(provider_root),
-        "EXPECTED_DEPLOYED_SHA": provider_expected,
-    }
-    deploy = repo / "ops/release/deploy.sh"
-    for component in ("frontend-aliyun-restore", "frontend-cloudflare-restore"):
-        run([str(deploy), component, str(previous_frontend), previous_revision], env=restore_env)
-    run([str(deploy), "frontend-finalize", str(previous_frontend), previous_revision], env=restore_env)
     rollback = repo / "ops/rollback/switch-server-release.sh"
     run([str(rollback), previous["server"]["deployed_revision"], candidate_revision])
     write_revision(
@@ -421,22 +354,12 @@ def release(
     transaction.mkdir(parents=True, mode=0o700)
     manifests = transaction / "manifests"
     shutil.copytree(request_root / "manifests", manifests)
-    receipt_root = transaction / "provider-receipts"
-    receipt_root.mkdir(mode=0o700)
     provider_root = ensure_provider_state(
         state_root,
         server_revision=current["server"]["deployed_revision"],
-        web_revision=current["web"]["deployed_revision"],
-    )
-    environment = provider_environment(
-        config=config,
-        state_root=provider_root,
-        receipt_root=receipt_root,
-        expected_revision=current["web"]["deployed_revision"],
     )
     server_stage = stage_server(validated, revision)
     server_script = repo / "ops/release/remote-atomic-release.sh"
-    deploy_script = repo / "ops/release/deploy.sh"
     server_activated = False
     try:
         run(
@@ -448,9 +371,6 @@ def release(
         )
         server_activated = True
         write_revision(provider_root / "vane-deploy/deployed-vane.sha", revision)
-        run([str(deploy_script), "frontend-aliyun", str(validated / "frontend"), revision], env=environment)
-        run([str(deploy_script), "frontend-cloudflare", str(validated / "frontend"), revision], env=environment)
-        run([str(deploy_script), "frontend-finalize", str(validated / "frontend"), revision], env=environment)
         write_json(
             transaction / "deploy-result.json",
             {
@@ -458,35 +378,23 @@ def release(
                 "revision": revision,
                 "server": "native-systemd",
                 "middleware": "compose-only-if-infra-digest-changed",
-                "web": ["aliyun", "cloudflare"],
+                "web": "published-locally-after-server-finalize",
             },
         )
-        markers = {
-            "aliyun": public_marker(config["public_origin"], revision),
-            "cloudflare": public_marker(config["cloudflare_origin"], revision),
-        }
         write_json(transaction / "machine-verify.json", {
             "schema": "vane.production-verify/v1",
             "revision": revision,
             "ready": True,
-            "markers": markers,
+            "server": "ready-and-gate-passed",
         })
         run_uat(config["uat_command"], revision, transaction / "uat.json")
 
-        aliyun_receipt = receipt_root / "aliyun.sha"
-        cloudflare_receipt = receipt_root / "cloudflare.sha"
         candidate = {
-            "schema": "vane.current-release/v1",
+            "schema": "vane.current-release/v2",
             "monorepo_revision": revision,
             "server": {
                 "tree_digest": gate["server_source_tree_sha256"],
                 "artifact_digest": receipt["backend_archive_sha256"],
-                "deployed_revision": revision,
-            },
-            "web": {
-                "tree_digest": gate["web_tree_sha256"],
-                "aliyun_receipt_digest": digest(aliyun_receipt),
-                "cloudflare_receipt_digest": digest(cloudflare_receipt),
                 "deployed_revision": revision,
             },
             "infra_manifest_digest": gate["infra_tree_sha256"],
@@ -522,8 +430,6 @@ def release(
             signing_key=signing_key,
             evidence={
                 "deploy-result.json": transaction / "deploy-result.json",
-                "aliyun.sha": aliyun_receipt,
-                "cloudflare.sha": cloudflare_receipt,
             },
             parent=artifact_manifest,
         )
@@ -571,7 +477,6 @@ def release(
         if durable.exists() or durable.is_symlink():
             raise RuntimeError("durable release evidence already exists")
         shutil.copytree(transaction, durable / "evidence")
-        shutil.copytree(validated / "frontend", durable / "frontend")
         shutil.copytree(validated / "backend", durable / "backend")
         shutil.copytree(manifests, durable / "manifests")
         shutil.copy2(request_root / "submission.json", durable / "submission.json")
@@ -608,8 +513,6 @@ def release(
                         previous=current,
                         candidate_revision=revision,
                         provider_root=provider_root,
-                        provider_env=environment,
-                        evidence_root=evidence_root,
                     )
                 except BaseException as error:  # recovery must not hide evidence
                     recovery_errors.append(error)

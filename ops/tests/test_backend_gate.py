@@ -1,6 +1,8 @@
 import json
+import os
 import pathlib
 import subprocess
+import tempfile
 import unittest
 
 
@@ -28,13 +30,15 @@ class LocalGatePolicyTests(unittest.TestCase):
         self.assertNotIn("UNRESOLVED", json.dumps(lock))
 
     def test_doctor_checks_real_executables_downloads_and_signer(self) -> None:
-        result = subprocess.run(
-            [str(CLI), "doctor", "--json"],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory() as empty_cache:
+            result = subprocess.run(
+                [str(CLI), "doctor", "--json"],
+                cwd=ROOT,
+                env={**os.environ, "VANE_TOOL_CACHE": empty_cache},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
         self.assertEqual(result.returncode, 78, result)
         report = json.loads(result.stdout)
         self.assertFalse(report["ok"])

@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Publish a verified Vite dist directly from the release Mac to OSS/CDN."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.request import Request, urlopen
+
+
+ROOT = Path(__file__).resolve().parents[2]
+BUCKET = "zhuoqidev-vane-web"
+REGION = "cn-shenzhen"
+OWNER_PREVIEW = "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
+
+
+def sha256(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def run(command: list[str], *, env: dict[str, str], capture: bool = False) -> str:
+    result = subprocess.run(
+        command, env=env, text=True, capture_output=capture, check=False
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() if capture else ""
+        raise RuntimeError(
+            f"Web publication command failed ({result.returncode}): {command[0]} {detail}"
+        )
+    return (result.stdout + result.stderr).strip() if capture else ""
+
+
+def lines(path: Path) -> list[str]:
+    return [value for value in path.read_text(encoding="utf-8").splitlines() if value]
+
+
+def stat_size(ossutil: Path, object_name: str, env: dict[str, str]) -> int:
+    result = run(
+        [str(ossutil), "stat", f"oss://{BUCKET}/{object_name}"],
+        env=env,
+        capture=True,
+    )
+    match = re.search(r"(?im)^Content-Length\s*:\s*([0-9]+)\s*$", result)
+    if match is None:
+        raise RuntimeError(f"OSS stat lacks Content-Length: {object_name}")
+    return int(match.group(1))
+
+
+def verify_marker(origin: str, revision: str) -> dict:
+    target = origin.rstrip("/") + f"/.well-known/vane-release.json?release={revision}"
+    last_error: Exception | None = None
+    for attempt in range(1, 7):
+        try:
+            request = Request(target, headers={"Cache-Control": "no-cache"})
+            with urlopen(request, timeout=15) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"release marker returned HTTP {response.status}")
+                value = json.loads(response.read(64 * 1024))
+            if (
+                not isinstance(value, dict)
+                or value.get("source_revision") != revision
+                or value.get("source_dirty") is not False
+            ):
+                raise RuntimeError("public release marker differs from exact revision")
+            return value
+        except Exception as error:  # network convergence is bounded and evidenced
+            last_error = error
+            if attempt < 6:
+                time.sleep(attempt * 2)
+    raise RuntimeError(f"public release marker did not converge: {last_error}")
+
+
+def publish(
+    *, dist: Path, revision: str, work_root: Path, state_root: Path,
+    tool_cache: Path, origin: str, result_path: Path,
+) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError("Web publication revision is not an exact SHA")
+    for path, subject in (
+        (dist, "dist"), (work_root, "work root"), (state_root, "state root"),
+        (tool_cache, "tool cache"),
+    ):
+        if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"Web publication {subject} is unsafe")
+    if result_path.is_symlink() or result_path.exists():
+        raise RuntimeError("Web publication result path already exists or is unsafe")
+    if not origin.startswith("https://"):
+        raise RuntimeError("Web public origin must use HTTPS")
+    state_file = state_root / "web-current.json"
+    lock_file = state_root / "web-release.lock"
+    if state_file.is_symlink() or lock_file.is_symlink():
+        raise RuntimeError("Web publication state paths must not be symlinks")
+
+    lock = json.loads(
+        (ROOT / "tools/toolchain.lock.json").read_text(encoding="utf-8")
+    )["tools"]
+    aliyun = tool_cache / "aliyun_cli" / lock["aliyun_cli"]["version"] / "aliyun"
+    ossutil = tool_cache / "ossutil" / lock["ossutil"]["version"] / "ossutil"
+    for binary in (aliyun, ossutil):
+        if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
+            raise RuntimeError(f"locked Web publication executable is missing: {binary}")
+    if lock["aliyun_cli"]["version"] not in run([str(aliyun), "version"], env=os.environ.copy(), capture=True):
+        raise RuntimeError("Aliyun CLI version differs from the lock")
+    if run([str(ossutil), "version"], env=os.environ.copy(), capture=True) != lock["ossutil"]["version"]:
+        raise RuntimeError("ossutil version differs from the lock")
+    access_id = os.environ.get("ALIYUN_ACCESS_KEY_ID", "")
+    access_secret = os.environ.get("ALIYUN_ACCESS_KEY_SECRET", "")
+    if not access_id or not access_secret:
+        raise RuntimeError("local OSS publication credentials are unavailable")
+
+    with lock_file.open("a+b") as state_lock:
+        fcntl.flock(state_lock, fcntl.LOCK_EX)
+        with tempfile.TemporaryDirectory(prefix="vane-web-plan-", dir=work_root) as temporary:
+            plan = Path(temporary)
+            run(
+                [
+                    str(ROOT / "ops/release/frontend-release.py"),
+                    "--dist", str(dist), "--sha", revision, "--output", str(plan),
+                ],
+                env=os.environ.copy(),
+                capture=True,
+            )
+            receipt = plan / "release.json"
+            receipt_digest = sha256(receipt)
+            if state_file.is_file() and not state_file.is_symlink():
+                current = json.loads(state_file.read_text(encoding="utf-8"))
+                expected_current = {
+                    "schema": "vane.web-current/v1",
+                    "revision": revision,
+                    "receipt_sha256": receipt_digest,
+                }
+                if current.get("revision") == revision and current != expected_current:
+                    raise RuntimeError(
+                        "same Web revision has a different immutable release receipt"
+                    )
+                if current == expected_current:
+                    marker = verify_marker(origin, revision)
+                    result = {
+                        "schema": "vane.web-publication/v1", "revision": revision,
+                        "receipt_sha256": receipt_digest, "marker": marker,
+                        "status": "already-current",
+                    }
+                    result_path.write_text(
+                        json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
+                    return result
+
+            provider_env = {
+                **os.environ,
+                "OSS_ACCESS_KEY_ID": access_id,
+                "OSS_ACCESS_KEY_SECRET": access_secret,
+                "OSS_REGION": REGION,
+            }
+            for object_name in lines(plan / "assets.list"):
+                run(
+                    [
+                        str(ossutil), "cp", str(dist / object_name),
+                        f"oss://{BUCKET}/{object_name}", "--force",
+                    ],
+                    env=provider_env,
+                )
+            for row in lines(plan / "critical-assets.list"):
+                size, object_name = row.split("\t", 1)
+                if stat_size(ossutil, object_name, provider_env) != int(size):
+                    raise RuntimeError(f"OSS critical asset size differs: {object_name}")
+            for object_name in lines(plan / "html-before-entry.list"):
+                run(
+                    [
+                        str(ossutil), "cp", str(dist / object_name),
+                        f"oss://{BUCKET}/{object_name}", "--force",
+                    ],
+                    env=provider_env,
+                )
+            if (dist / OWNER_PREVIEW).is_file():
+                run(
+                    [
+                        str(ossutil), "set-props",
+                        f"oss://{BUCKET}/{OWNER_PREVIEW}",
+                        "--cache-control", "no-store",
+                        "--metadata-directive", "update", "--force",
+                    ],
+                    env=provider_env,
+                )
+            run(
+                [
+                    str(ossutil), "cp", str(dist / "index.html"),
+                    f"oss://{BUCKET}/index.html", "--force",
+                ],
+                env=provider_env,
+            )
+            if stat_size(ossutil, "index.html", provider_env) != (dist / "index.html").stat().st_size:
+                raise RuntimeError("OSS index.html size differs after atomic cutover")
+
+            aliyun_env = {
+                **os.environ,
+                "ALIBABA_CLOUD_IGNORE_PROFILE": "TRUE",
+                "ALIBABA_CLOUD_ACCESS_KEY_ID": access_id,
+                "ALIBABA_CLOUD_ACCESS_KEY_SECRET": access_secret,
+                "ALIBABA_CLOUD_REGION_ID": REGION,
+            }
+            for refresh_path in lines(plan / "cdn-refresh-paths.list"):
+                url = origin.rstrip("/") + refresh_path
+                for attempt in range(1, 4):
+                    refreshed = subprocess.run(
+                        [
+                            str(aliyun), "cdn", "RefreshObjectCaches",
+                            "--ObjectPath", url, "--ObjectType", "File",
+                        ],
+                        env=aliyun_env,
+                        check=False,
+                    )
+                    if refreshed.returncode == 0:
+                        break
+                    if attempt == 3:
+                        raise RuntimeError(f"CDN refresh failed after three attempts: {url}")
+                    time.sleep(attempt * 5)
+            marker = verify_marker(origin, revision)
+            state = {
+                "schema": "vane.web-current/v1",
+                "revision": revision,
+                "receipt_sha256": receipt_digest,
+            }
+            pending = state_file.with_name(f".{state_file.name}.{os.getpid()}")
+            pending.write_text(
+                json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(pending, state_file)
+            result = {
+                "schema": "vane.web-publication/v1", "revision": revision,
+                "receipt_sha256": receipt_digest, "marker": marker,
+                "status": "published",
+            }
+            result_path.write_text(
+                json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            shutil.copy2(receipt, result_path.with_name("web-release-receipt.json"))
+            return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dist", type=Path, required=True)
+    parser.add_argument("--sha", required=True)
+    parser.add_argument("--work-root", type=Path, required=True)
+    parser.add_argument("--state-root", type=Path, required=True)
+    parser.add_argument("--tool-cache", type=Path, required=True)
+    parser.add_argument("--origin", required=True)
+    parser.add_argument("--result", type=Path, required=True)
+    args = parser.parse_args()
+    result = publish(
+        dist=args.dist, revision=args.sha, work_root=args.work_root,
+        state_root=args.state_root, tool_cache=args.tool_cache,
+        origin=args.origin, result_path=args.result,
+    )
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(f"Web publication refusal: {error}", file=sys.stderr)
+        raise SystemExit(78)

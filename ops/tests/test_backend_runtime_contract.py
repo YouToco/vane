@@ -7,7 +7,6 @@ import unittest
 
 OPS = Path(__file__).resolve().parents[1]
 REPO = OPS.parent
-DEPLOY = OPS / "release/deploy.sh"
 REMOTE = OPS / "release/remote-atomic-release.sh"
 SYSTEMD = REPO / "infra/production/systemd"
 SPEC = importlib.util.spec_from_file_location("artifact", OPS / "release/artifact.py")
@@ -90,7 +89,6 @@ class BackendRuntimeContractTest(unittest.TestCase):
         compose = remote.index("docker compose up -d", guard)
         self.assertGreaterEqual(guard, 0)
         self.assertIn("postgres temporal temporal-ui caddy", remote[compose:])
-        self.assertNotIn("VANE_INFRA_CHANGED", DEPLOY.read_text(encoding="utf-8"))
 
     def test_compose_has_only_pinned_middleware(self) -> None:
         compose = (REPO / "infra/production/compose/docker-compose.yml").read_text(
@@ -144,14 +142,6 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertLess(ready, gate)
         self.assertLess(gate, executable)
         self.assertLess(executable, success)
-
-    def test_deploy_passes_only_verified_payload_to_atomic_remote(self) -> None:
-        deploy = DEPLOY.read_text(encoding="utf-8")
-        self.assertIn('backend_remote_stage="/opt/vane/.deploy-', deploy)
-        self.assertIn('"$payload/bin/$binary"', deploy)
-        self.assertIn('"$payload/release-receipt.json"', deploy)
-        self.assertIn('<"$script_dir/remote-atomic-release.sh"', deploy)
-        self.assertNotIn("legacy-remote-backend-deploy", deploy)
 
     def test_systemd_executes_only_current_release_binaries(self) -> None:
         for unit in SYSTEMD.glob("*.service"):

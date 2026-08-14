@@ -27,9 +27,13 @@ Actions are intentionally absent. A production release must name an exact
 
 `plan -> gate -> artifact -> deploy -> verify -> finalize`
 
-Feature code, tests, and build containers have no production credentials.
-Production mutation, the global lock, CAS state, and durable evidence belong to
-the root-owned VPS broker installed outside this checkout.
+Feature code and tests have no production credentials. Build and Gate run
+directly on the release Mac without a VM or build container. Server mutation,
+the global lock, CAS state, and durable evidence belong to the root-owned VPS
+broker installed outside this checkout. Web publication is the one exception:
+the local release command uses local Aliyun credentials to upload the already
+verified `dist/` directly to OSS and refresh CDN entry paths; Web files never
+pass through or reside on the VPS.
 
 Controller changes are tested in their introducing release but cannot activate
 themselves. The installed controller revision may advance only after the

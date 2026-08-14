@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "vane.current-release/v1",
+  "$id": "vane.current-release/v2",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "monorepo_revision", "server", "web", "infra_manifest_digest", "controller_revision"],
+  "required": ["schema", "monorepo_revision", "server", "infra_manifest_digest", "controller_revision"],
   "properties": {
-    "schema": {"const": "vane.current-release/v1"},
+    "schema": {"const": "vane.current-release/v2"},
     "monorepo_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "server": {
       "type": "object",
@@ -14,17 +14,6 @@
       "properties": {
         "tree_digest": {"$ref": "#/$defs/digest"},
         "artifact_digest": {"$ref": "#/$defs/digest"},
-        "deployed_revision": {"$ref": "#/$defs/revision"}
-      }
-    },
-    "web": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["tree_digest", "aliyun_receipt_digest", "cloudflare_receipt_digest", "deployed_revision"],
-      "properties": {
-        "tree_digest": {"$ref": "#/$defs/digest"},
-        "aliyun_receipt_digest": {"$ref": "#/$defs/digest"},
-        "cloudflare_receipt_digest": {"$ref": "#/$defs/digest"},
         "deployed_revision": {"$ref": "#/$defs/revision"}
       }
     },

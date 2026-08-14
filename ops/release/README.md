@@ -1,7 +1,6 @@
 # Release primitives
 
-These are the imported, reusable release primitives: exact source checkout,
-artifact packing/validation, frontend publication planning, binary receipts,
-and the legacy deployment transaction. They are not independent user-facing
-commands; `../bin/vane` and the external broker are the only supported entry
-points.
+These are internal release primitives: Server artifact packing/validation,
+native atomic cutover, binary receipts, Web publication planning, and direct
+OSS/CDN publication. They are not independent operator commands;
+`../bin/vane` is the only supported entry point.

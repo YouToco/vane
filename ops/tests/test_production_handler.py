@@ -146,21 +146,17 @@ class ProductionHandlerTest(unittest.TestCase):
         self.assertFalse(durable.exists())
         self.assertTrue(transaction.exists())
 
-    def test_handler_orders_native_server_before_both_web_channels_and_uat(self) -> None:
+    def test_handler_is_server_only_and_finishes_uat_before_state(self) -> None:
         source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
             encoding="utf-8"
         )
         server = source.index("remote-atomic-release.sh")
-        aliyun = source.index('"frontend-aliyun"', server)
-        cloudflare = source.index('"frontend-cloudflare"', aliyun)
-        finalize = source.index('"frontend-finalize"', cloudflare)
-        uat = source.index("run_uat", finalize)
+        uat = source.index("run_uat", server)
         state = source.index("atomic_current_release", uat)
-        self.assertLess(server, aliyun)
-        self.assertLess(aliyun, cloudflare)
-        self.assertLess(cloudflare, finalize)
-        self.assertLess(finalize, uat)
+        self.assertLess(server, uat)
         self.assertLess(uat, state)
+        self.assertNotIn('"frontend-aliyun"', source)
+        self.assertNotIn('"frontend-cloudflare"', source)
         self.assertNotIn("docker build", source)
         self.assertNotIn("docker push", source)
 

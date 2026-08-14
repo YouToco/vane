@@ -39,7 +39,7 @@ DIGEST = re.compile(r"^[0-9a-f]{64}$")
 CREATED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 EXIT_POLICY = 78
 RELEASE_RECEIPT_SCHEMA = "vane.release-receipt/v1"
-CURRENT_RELEASE_SCHEMA = "vane.current-release/v1"
+CURRENT_RELEASE_SCHEMA = "vane.current-release/v2"
 RELEASE_RECEIPT_KEYS = {
     "schema_version",
     "source_revision",
@@ -284,7 +284,6 @@ def validate_current_release(path: Path) -> dict[str, Any]:
         "schema",
         "monorepo_revision",
         "server",
-        "web",
         "infra_manifest_digest",
         "controller_revision",
     }
@@ -304,12 +303,6 @@ def validate_current_release(path: Path) -> dict[str, Any]:
     )
     component_keys = {
         "server": {"tree_digest", "artifact_digest", "deployed_revision"},
-        "web": {
-            "tree_digest",
-            "aliyun_receipt_digest",
-            "cloudflare_receipt_digest",
-            "deployed_revision",
-        },
     }
     for component, expected_keys in component_keys.items():
         value = release[component]
@@ -858,7 +851,9 @@ def build_release_submission(
         or sha256_file(server_coverage) != gate["server_coverage_sha256"]
     ):
         raise PolicyError("full gate coverage evidence changed after verification")
-    source = release_root / "artifact-source"
+    handoff = release_root / "server-submission"
+    handoff.mkdir()
+    source = handoff / "artifact-source"
     (source / "server/bin").mkdir(parents=True)
     (source / "infra").mkdir()
     for binary in binary_dir.iterdir():
@@ -866,13 +861,9 @@ def build_release_submission(
             raise PolicyError(f"unsafe full-gate binary: {binary}")
         shutil.copy2(binary, source / "server/bin" / binary.name)
     shutil.copytree(ROOT / "infra/production", source / "infra/production", symlinks=False)
-    web_source = release_root / "web-source"
-    shutil.copytree(web_dist, web_source / "dist", symlinks=False)
-    artifacts = release_root / "artifacts"
+    artifacts = handoff / "artifacts"
     backend_pack = artifacts / "backend-pack"
-    frontend_pack = artifacts / "frontend-pack"
     backend_payload = artifacts / "backend-payload"
-    frontend_payload = artifacts / "frontend-payload"
     controller_archive = artifacts / f"controller-{revision}.tar.gz"
     run_id = str(int(datetime.now(timezone.utc).timestamp() * 1_000_000))
     artifact_tool = ROOT / "ops/release/artifact.py"
@@ -891,19 +882,9 @@ def build_release_submission(
          "--control-plane-revision", revision, "--deploy-run-id", run_id],
         cwd=ROOT,
     )
-    run_checked(
-        [sys.executable, str(artifact_tool), "pack", "--component", "frontend",
-         "--sha", revision, "--source", str(web_source), "--output", str(frontend_pack)],
-        cwd=ROOT,
-    )
-    run_checked(
-        [sys.executable, str(artifact_tool), "validate", "--component", "frontend",
-         "--sha", revision, "--input", str(frontend_pack), "--output", str(frontend_payload)],
-        cwd=ROOT,
-    )
-    manifests = release_root / "manifests"
+    manifests = handoff / "manifests"
     manifests.mkdir()
-    durable_gate = release_root / "gate-evidence"
+    durable_gate = handoff / "gate-evidence"
     durable_gate.mkdir()
     shutil.copy2(web_coverage, durable_gate / web_coverage.name)
     shutil.copy2(server_coverage, durable_gate / server_coverage.name)
@@ -913,6 +894,8 @@ def build_release_submission(
         backend_payload / "release-receipt.json",
         durable_gate / "release-receipt.json",
     )
+    handoff_gate = handoff / "full-gate.json"
+    shutil.copy2(gate_evidence, handoff_gate)
     plan = write_signed_manifest(
         directory=manifests, stage="plan", revision=revision, signer=signer,
         signing_key=signing_key,
@@ -926,7 +909,7 @@ def build_release_submission(
         directory=manifests, stage="gate", revision=revision, signer=signer,
         signing_key=signing_key,
         evidence={
-            "full-gate.json": gate_evidence,
+            "full-gate.json": handoff_gate,
             "server-coverage.out": durable_gate / server_coverage.name,
             "web-coverage-summary.json": durable_gate / web_coverage.name,
         },
@@ -938,7 +921,6 @@ def build_release_submission(
         evidence={
             "release-receipt.json": durable_gate / "release-receipt.json",
             "backend-manifest.json": backend_pack / f"backend-{revision}.manifest.json",
-            "frontend-manifest.json": frontend_pack / f"frontend-{revision}.manifest.json",
             "controller-archive.tar.gz": controller_archive,
         },
         parent=gate_manifest,
@@ -950,7 +932,6 @@ def build_release_submission(
         "deploy_run_id": run_id,
         "artifact_manifest": "manifests/artifact.json",
         "backend_pack": "artifacts/backend-pack",
-        "frontend_pack": "artifacts/frontend-pack",
         "controller_archive": f"artifacts/controller-{revision}.tar.gz",
         "evidence": {
             "plan:release-policy.json": {
@@ -963,7 +944,7 @@ def build_release_submission(
             },
             "gate:full-gate.json": {
                 "path": "full-gate.json",
-                "sha256": sha256_file(gate_evidence),
+                "sha256": sha256_file(handoff_gate),
             },
             "gate:server-coverage.out": {
                 "path": "gate-evidence/coverage.out",
@@ -981,22 +962,48 @@ def build_release_submission(
                 "path": f"artifacts/backend-pack/backend-{revision}.manifest.json",
                 "sha256": sha256_file(backend_pack / f"backend-{revision}.manifest.json"),
             },
-            "artifact:frontend-manifest.json": {
-                "path": f"artifacts/frontend-pack/frontend-{revision}.manifest.json",
-                "sha256": sha256_file(frontend_pack / f"frontend-{revision}.manifest.json"),
-            },
             "artifact:controller-archive.tar.gz": {
                 "path": f"artifacts/controller-{revision}.tar.gz",
                 "sha256": sha256_file(controller_archive),
             },
         },
     }
-    (release_root / "submission.json").write_bytes(canonical_json(submission))
+    (handoff / "submission.json").write_bytes(canonical_json(submission))
     shutil.rmtree(source)
-    shutil.rmtree(web_source)
     shutil.rmtree(backend_payload)
-    shutil.rmtree(frontend_payload)
-    return release_root
+    return handoff
+
+
+def publish_web_after_server(
+    *, revision: str, release_root: Path, gate_evidence: Path
+) -> Path:
+    gate = load_json(gate_evidence)
+    web_dist = Path(gate["web_dist"])
+    if web_dist.is_absolute():
+        raise PolicyError("full gate Web dist path must be relative")
+    web_dist = release_root / web_dist
+    if directory_tree_sha256(web_dist) != gate["web_tree_sha256"]:
+        raise PolicyError("verified Web dist changed before local publication")
+    web_state = Path(
+        os.environ.get("VANE_WEB_STATE_ROOT", str(Path.home() / ".local/state/vane"))
+    )
+    web_state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    web_origin = os.environ.get("VANE_WEB_ORIGIN", "https://vane.zhuoqidev.com")
+    tool_cache = Path(
+        os.environ.get("VANE_TOOL_CACHE", str(ROOT / ".vane/tool-cache"))
+    )
+    web_result = release_root / "web-publication.json"
+    run_checked(
+        [
+            sys.executable, str(ROOT / "ops/release/publish_web.py"),
+            "--dist", str(web_dist), "--sha", revision,
+            "--work-root", str(release_root), "--state-root", str(web_state),
+            "--tool-cache", str(tool_cache), "--origin", web_origin,
+            "--result", str(web_result),
+        ],
+        cwd=ROOT,
+    )
+    return web_result
 
 
 def command_release(args: argparse.Namespace) -> int:
@@ -1044,7 +1051,15 @@ def command_release(args: argparse.Namespace) -> int:
     submitted = subprocess.run([str(broker_submit), str(submission)], check=False)
     if submitted.returncode != 0:
         raise PolicyError(f"broker submission failed with exit {submitted.returncode}")
-    print(json.dumps({"revision": args.sha, "submission": str(submission), "status": "submitted"}, sort_keys=True, separators=(",", ":")))
+    web_result = publish_web_after_server(
+        revision=args.sha, release_root=release_root, gate_evidence=gate_evidence
+    )
+    print(json.dumps({
+        "revision": args.sha,
+        "server_submission": str(submission),
+        "web_evidence": str(web_result),
+        "status": "server-and-web-published",
+    }, sort_keys=True, separators=(",", ":")))
     return 0
 
 

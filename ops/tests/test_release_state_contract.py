@@ -82,17 +82,11 @@ class ReleaseStateContractTest(unittest.TestCase):
     @staticmethod
     def release_state(revision: str, fill: str) -> dict:
         return {
-            "schema": "vane.current-release/v1",
+            "schema": "vane.current-release/v2",
             "monorepo_revision": revision,
             "server": {
                 "tree_digest": fill * 64,
                 "artifact_digest": fill * 64,
-                "deployed_revision": revision,
-            },
-            "web": {
-                "tree_digest": fill * 64,
-                "aliyun_receipt_digest": fill * 64,
-                "cloudflare_receipt_digest": fill * 64,
                 "deployed_revision": revision,
             },
             "infra_manifest_digest": fill * 64,

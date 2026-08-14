@@ -9,6 +9,21 @@ from pathlib import Path
 from generate_contracts import ROOT, OUTPUTS, canonical_json
 
 
+def repository_files() -> list[Path]:
+    """Return tracked plus non-ignored untracked files, never local caches."""
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    return [
+        ROOT / value.decode()
+        for value in result.stdout.split(b"\0")
+        if value and (ROOT / value.decode()).is_file()
+    ]
+
+
 class GeneratedContractsTest(unittest.TestCase):
     def test_generated_contracts_are_current(self) -> None:
         for path, build in OUTPUTS.items():
@@ -45,15 +60,20 @@ class RepositoryPolicyTest(unittest.TestCase):
         self.assertEqual(tracked, [])
 
     def test_module_and_lockfile_authorities(self) -> None:
-        go_modules = sorted(path.relative_to(ROOT).as_posix() for path in ROOT.glob("**/go.mod"))
+        files = repository_files()
+        go_modules = sorted(
+            path.relative_to(ROOT).as_posix() for path in files if path.name == "go.mod"
+        )
         self.assertEqual(
             go_modules,
             ["server/go.mod", "server/third_party/oapi-sdk-go/v3/go.mod"],
         )
         lockfiles = sorted(
-            path.relative_to(ROOT).as_posix() for path in ROOT.glob("**/package-lock.json")
+            path.relative_to(ROOT).as_posix()
+            for path in files
+            if path.name == "package-lock.json"
         )
-        self.assertEqual(lockfiles, ["tools/wrangler/package-lock.json", "web/package-lock.json"])
+        self.assertEqual(lockfiles, ["web/package-lock.json"])
 
     def test_no_ambiguous_root_directories(self) -> None:
         for name in ("scripts", "deploy", "common", "utils", "pkg", "packages"):
@@ -62,7 +82,8 @@ class RepositoryPolicyTest(unittest.TestCase):
     def test_no_production_go_outside_server(self) -> None:
         offenders = [
             path.relative_to(ROOT).as_posix()
-            for path in ROOT.glob("**/*.go")
+            for path in repository_files()
+            if path.suffix == ".go"
             if "server" not in path.relative_to(ROOT).parts
         ]
         self.assertEqual(offenders, [])
