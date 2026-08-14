@@ -53,11 +53,11 @@ func TestMainServerHasNoGatewayDatabaseAuthority(t *testing.T) {
 }
 
 func TestDeploymentTemplatesDoNotLeakOwnerOrGatewaySecretsToServer(t *testing.T) {
-	serverEnv, err := os.ReadFile("../deploy/server.env.example")
+	serverEnv, err := os.ReadFile("../../infra/production/env/server.env.example")
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverUnit, err := os.ReadFile("../deploy/vane.service")
+	serverUnit, err := os.ReadFile("../../infra/production/systemd/vane.service")
 	if err != nil {
 		t.Fatal(err)
 	}

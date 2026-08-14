@@ -37,7 +37,7 @@ func TestMigration047RemainsAuthorityOnly(t *testing.T) {
 }
 
 func TestPushBatchAuthorityRunbookPinsIrreversibleBoundary(t *testing.T) {
-	path := filepath.Join("..", "docs", "push-batch-authority-rollout.md")
+	path := filepath.Join("..", "..", "docs", "runbooks", "push-batch-authority-rollout.md")
 	body, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
