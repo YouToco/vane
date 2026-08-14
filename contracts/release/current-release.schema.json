@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vane.current-release/v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "monorepo_revision", "server", "infra_manifest_digest", "controller_revision"],
+  "properties": {
+    "schema": {"const": "vane.current-release/v2"},
+    "monorepo_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tree_digest", "artifact_digest", "deployed_revision"],
+      "properties": {
+        "tree_digest": {"$ref": "#/$defs/digest"},
+        "artifact_digest": {"$ref": "#/$defs/digest"},
+        "deployed_revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "infra_manifest_digest": {"$ref": "#/$defs/digest"},
+    "controller_revision": {"$ref": "#/$defs/revision"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+  }
+}

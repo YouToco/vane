@@ -36,6 +36,7 @@ Thumbs.db
 # Build artifacts
 /dist/
 /tmp/
+/.vane/
 
 # 编辑前的临时副本（探针/回退用），绝不入库
 *.bak

@@ -1,0 +1,37 @@
+[Unit]
+Description=Vane server (见微)
+After=network-online.target docker.service vane-research-gateway.socket
+Wants=network-online.target
+Requires=vane-research-gateway.socket
+
+[Service]
+Type=simple
+User=vane
+Group=vane
+WorkingDirectory=/opt/vane
+EnvironmentFile=/opt/vane/env/server.env
+LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url
+ExecStart=/opt/vane/current/bin/vane
+Restart=on-failure
+RestartSec=5
+# A5 关停会依次排空 HTTP、飞书回调、deep-dive、Agent 旁路写、创建恢复器、
+# 维护任务与 Temporal worker；A2A 与飞书入口并行排空，Temporal 聚合 worker
+# 的多个子 worker 仍可能分别消耗 stop timeout，显式最坏预算约 12m30s，
+# 再留 2m30s 给调度、连接池回收与 systemd 开销。
+# 不覆盖 systemd 默认 90s 会在安全排空完成前 SIGKILL，破坏本进程的退出协议。
+TimeoutStopSec=15min
+
+# 服务自身零文件系统写入（日志走 stdout→journald），故整个系统只读。
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

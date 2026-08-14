@@ -1,19 +1,23 @@
-.PHONY: build test lint run clean
+.PHONY: quick test-server test-web test-contract test-release full release
 
-build:
-	go build -o bin/vane ./cmd/server
-	go build -o bin/vane-migrate ./cmd/migrate
-	go build -o bin/vane-research-gateway ./cmd/researchgateway
-	go build -o bin/vane-research-prepare ./cmd/researchprepare
+quick:
+	./ops/bin/vane quick --risk "$${RISK:-B}" --base "$${BASE:-origin/main}" --head "$${HEAD:-HEAD}"
 
-test:
-	go test -race -coverprofile=coverage.txt ./...
+test-server:
+	$(MAKE) -C server test
 
-lint:
-	golangci-lint run ./...
+test-web:
+	npm --prefix web test
 
-run:
-	go run ./cmd/server
+test-contract:
+	python3 -m unittest discover -s tests/contract -p 'test_*.py'
 
-clean:
-	rm -rf bin/ coverage.txt
+test-release:
+	python3 -m unittest discover -s ops/tests -p 'test_*.py'
+
+full:
+	./ops/bin/vane full --sha "$${SHA:-$$(git rev-parse HEAD)}"
+
+release:
+	test -n "$(SHA)"
+	./ops/bin/vane release --sha "$(SHA)"

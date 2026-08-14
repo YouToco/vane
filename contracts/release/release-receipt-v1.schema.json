@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vane.release-receipt/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_revision",
+    "control_plane_revision",
+    "deploy_run_id",
+    "build_run_attempt",
+    "backend_archive_sha256",
+    "backend_manifest_sha256",
+    "server_release_contract_sha256",
+    "vane_sha256",
+    "agentfirstretention_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "vane.release-receipt/v1"},
+    "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "control_plane_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "deploy_run_id": {"type": "string", "pattern": "^[0-9]+$"},
+    "build_run_attempt": {"type": "integer", "minimum": 1},
+    "backend_archive_sha256": {"$ref": "#/$defs/digest"},
+    "backend_manifest_sha256": {"$ref": "#/$defs/digest"},
+    "server_release_contract_sha256": {"$ref": "#/$defs/digest"},
+    "vane_sha256": {"$ref": "#/$defs/digest"},
+    "agentfirstretention_sha256": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

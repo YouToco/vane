@@ -1,0 +1,4 @@
+# A2A 发现端点：主域口径保留（2026-07-17 拍板 card 放主域），静态托管无法反代，
+# 302 到 api 子域（真相源仍是后端动态端点，version 不会谎报）。国内线（OSS）由
+# bucket RoutingRules 做同样的重定向，两线行为一致。
+/.well-known/* https://api.vane.zhuoqidev.com/.well-known/:splat 302

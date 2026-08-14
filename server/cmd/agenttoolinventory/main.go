@@ -1,0 +1,141 @@
+package main
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/tikhubcatalog"
+)
+
+type staticTool struct {
+	name, capability, params, risk, exposure, execution, production string
+}
+
+var staticTools = []staticTool{
+	{"query_my_intelligence", "查询本人任务、历史运行、反馈与证据", "数据集、关系过滤、排序与分页", "内部只读", "始终", "无", "启用"},
+	{"manage_tasks", "创建、编辑、运行或批量删除任务", "自然名称、任务手册与变更", "owner 写入/投递", "始终", "语义授权后直接执行", "启用"},
+	{"update_profile", "首次填写画像", "画像字段", "owner 写入", "始终", "语义授权后直接执行", "启用"},
+	{"recall_memory", "召回本人明确保存的长期记忆", "query、limit", "内部只读", "始终", "无", "启用"},
+	{"manage_memory", "记住、纠正或忘记长期记忆", "action、memory_id、text", "owner 写入", "明确记忆意图", "语义授权后直接执行", "启用"},
+	{"web_search", "搜索公开网页", "query、结果数、域名", "外部只读/可能计费", "始终", "无", "条件启用"},
+	{"read_page", "读取公开页面", "url", "外部只读/可能计费", "始终", "无", "条件启用"},
+	{"tool_search", "搜索授权后的社媒查询工具", "query、platform、limit", "本地目录激活", "始终", "无", "条件启用"},
+	{"read_endpoint_result", "续读本轮结果句柄", "handle、path、offset、limit", "外部结果本地续读", "产生句柄后", "无", "条件启用"},
+}
+
+func main() {
+	output := flag.String("out", "../docs/agent-tool-inventory.md", "inventory output")
+	check := flag.Bool("check", false, "fail if the committed inventory differs")
+	flag.Parse()
+
+	content := render()
+	if *check {
+		existing, err := os.ReadFile(*output)
+		if err != nil || !bytes.Equal(existing, content) {
+			fmt.Fprintln(os.Stderr, "agent tool inventory is stale; run: go run ./cmd/agenttoolinventory")
+			os.Exit(1)
+		}
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(*output), 0o755); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(*output, content, 0o644); err != nil {
+		panic(err)
+	}
+}
+
+func render() []byte {
+	assertStaticCatalogMatchesOwnerBuilder()
+	var b strings.Builder
+	b.WriteString("# Agent Tool Inventory\n\n")
+	b.WriteString("Generated from `server/` by `GOWORK=off go run ./cmd/agenttoolinventory`; the local full gate rejects drift. Provider routing, HTTP paths and internal versions are intentionally excluded from this model-facing inventory.\n\n")
+	b.WriteString("## Static production tools\n\n")
+	b.WriteString("| Tool | Capability | Parameters | Risk | Exposure | Execution | Production |\n")
+	b.WriteString("|---|---|---|---|---|---|---|\n")
+	for _, tool := range staticTools {
+		fmt.Fprintf(&b, "| `%s` | %s | %s | %s | %s | %s | %s |\n",
+			tool.name, tool.capability, tool.params, tool.risk,
+			tool.exposure, tool.execution, tool.production)
+	}
+	b.WriteString("\nProduction owner chat has one Agent-first surface. Removed model contracts include the eight narrow task/profile tools, account source/subscription tools, confirmation/proposal tools, `push_now`, `update_schedule`, `edit_task_playbook`, and `set_task_strictness`.\n\n")
+	b.WriteString("## Dynamic social research tools\n\n")
+	fmt.Fprintf(&b, "%d read-only catalog tools are discovered lazily through `tool_search`; schemas are not placed in the first model request.\n\n", tikhubcatalog.AgentLen())
+	b.WriteString("| Tool | Platform | Capability | Parameters | Risk | Exposure | Execution | Production |\n")
+	b.WriteString("|---|---|---|---|---|---|---|---|\n")
+	entries := tikhubcatalog.Entries()
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	for _, entry := range entries {
+		params := make([]string, 0, len(entry.Params))
+		for _, param := range entry.Params {
+			name := param.Name
+			if param.Required {
+				name += "*"
+			}
+			params = append(params, name)
+		}
+		exposure := "搜索命中后"
+		if advanced(entry) {
+			exposure = "明确广告/店铺/创作者分析意图且搜索命中后"
+		}
+		fmt.Fprintf(&b, "| `%s` | %s | %s | %s | 公开数据只读/可能计费 | %s | 无 | 目录启用 |\n",
+			entry.Name, entry.Platform, capability(entry),
+			escape(strings.Join(params, ", ")), exposure)
+	}
+	return []byte(b.String())
+}
+
+func assertStaticCatalogMatchesOwnerBuilder() {
+	endpointTools := agent.NewEndpointTools(nil, nil, 1, 1)
+	exaTools := agent.NewExaTools(nil, nil, nil, 1)
+	actualSpecs := agent.BuildOwnerTools(nil, agent.ManageTasksDeps{}, nil,
+		endpointTools, exaTools)
+	actual := make([]string, 0, len(actualSpecs))
+	for _, spec := range actualSpecs {
+		actual = append(actual, spec.Name())
+	}
+	expected := make([]string, 0, len(staticTools))
+	for _, tool := range staticTools {
+		expected = append(expected, tool.name)
+	}
+	sort.Strings(actual)
+	sort.Strings(expected)
+	if strings.Join(actual, "\x00") != strings.Join(expected, "\x00") {
+		panic(fmt.Sprintf("owner catalog metadata drift: builder=%v inventory=%v",
+			actual, expected))
+	}
+}
+
+func capability(entry tikhubcatalog.Entry) string {
+	text := strings.ToLower(entry.Name + " " + entry.Summary)
+	for _, item := range []struct{ marker, label string }{
+		{"comment", "评论"}, {"search", "搜索"}, {"hot", "热榜/趋势"},
+		{"trend", "趋势"}, {"user", "账号"}, {"detail", "内容详情"},
+		{"list", "内容列表"}, {"analytics", "公开分析"},
+	} {
+		if strings.Contains(text, item.marker) {
+			return item.label
+		}
+	}
+	return "公开数据查询"
+}
+
+func advanced(entry tikhubcatalog.Entry) bool {
+	text := strings.ToLower(entry.Name + " " + entry.Tag + " " + entry.Summary)
+	for _, marker := range []string{"douplus", "xingtu", "广告", "投放", "shop", "commerce", "merchant", "创作者分析", "达人分析"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func escape(value string) string {
+	return strings.ReplaceAll(value, "|", "\\|")
+}

@@ -1,0 +1,82 @@
+{
+  "schema": "vane.legacy-production-baseline/v1",
+  "server_revision": "627e91402f123ba093e7addf5ed614ac16b41413",
+  "server_tree_archive_sha256": "6d89929ab04cbefb4ddca70218c061f845e7c3e4f4362842cefce49f3e9b6466",
+  "web_revision": "aec1cefcd369d50a9cea65d78e5805e24b5e881c",
+  "deploy_run_id": "31798425285",
+  "backend_archive_sha256": "e57caabacae4bb25810b10e926195425c540583edf714a2df3fff8db5986714a",
+  "receipt": {
+    "source": "/opt/vane/releases/6f95d9ba7bcb732c3d5b1f5d10c2d046693b681a2dd2a0b2b33cb425a7874dfe/release-receipt.json",
+    "sha256": "6f95d9ba7bcb732c3d5b1f5d10c2d046693b681a2dd2a0b2b33cb425a7874dfe"
+  },
+  "binaries": {
+    "vane": {
+      "source": "/opt/vane/bin/vane",
+      "sha256": "58bdb761da19b1ae1e8d444e2f840b6ab231cf51977e81b16b8107f5bdcfc713"
+    },
+    "vane-research-gateway": {
+      "source": "/opt/vane/bin/vane-research-gateway",
+      "sha256": "741c1e4ca9fcbf272dcaff0d37d7cf6e115805e8f1bbabcc8e1dceabda01fbe3"
+    },
+    "vane-migrate": {
+      "source": "/opt/vane/bin/vane-migrate",
+      "sha256": "c42ef6acf5214c6f5870eecf8177c368a02c260c9914cd508c87a9bf5eb52f14"
+    },
+    "gate": {
+      "source": "/opt/vane/bin/gate",
+      "sha256": "6cdd49c328eeeaa2707de4cfff718edaf683ee65960a91cb5fe4c57eac0afdfa"
+    },
+    "agentfirstretention": {
+      "source": "/opt/vane/releases/6f95d9ba7bcb732c3d5b1f5d10c2d046693b681a2dd2a0b2b33cb425a7874dfe/agentfirstretention",
+      "sha256": "24d620571376286dead53a29fdfada00c5e30ba7ffa60c49ee4c07aa371e0cbf"
+    }
+  },
+  "infra": {
+    "Caddyfile": {
+      "source": "/opt/vane/Caddyfile",
+      "sha256": "bf2aa6d9cb00dcb5352e086098542ad0eff7255c12c0bd69c37145c827d6ccd3"
+    },
+    "docker-compose.yml": {
+      "source": "/opt/vane/docker-compose.yml",
+      "sha256": "5366d8e7ccc490d24cd848e142308de3511c741259e9dd94ff1649eed7b360cb"
+    },
+    "dynamicconfig/development-sql.yaml": {
+      "source": "/opt/vane/dynamicconfig/development-sql.yaml",
+      "sha256": "d96e989241bcc4948aaea0f429b6281e6c5fb6ba5a56b14271abee80c5a3a4a2"
+    },
+    "vane.service": {
+      "source": "/etc/systemd/system/vane.service",
+      "sha256": "a80b29a9dbea7d0e83c70cf9646906ab3cfa7504aade9f408c83fd33c348e4d2"
+    },
+    "vane-research-gateway.service": {
+      "source": "/etc/systemd/system/vane-research-gateway.service",
+      "sha256": "e23417c79d76fe0af7bba501000a57e8beaf8b1f3973715ac2a96c6798e0680f"
+    },
+    "vane-research-gateway.socket": {
+      "source": "/etc/systemd/system/vane-research-gateway.socket",
+      "sha256": "f96dacee672a284f8531a706ee28ca84076fc54b0ffb5fb2b7db98d7929d8d14"
+    }
+  },
+  "middleware_images": {
+    "vane-caddy-1": {
+      "reference": "caddy:2-alpine",
+      "image_id": "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+    },
+    "vane-postgres-1": {
+      "reference": "postgres:18-alpine",
+      "image_id": "sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
+    },
+    "vane-temporal-1": {
+      "reference": "temporalio/auto-setup:1.29.7",
+      "image_id": "sha256:f14912b699cf73015ad5c4fc18d522d4b014db90e794039214dfb7c022c2644f"
+    },
+    "vane-temporal-ui-1": {
+      "reference": "temporalio/ui:2.52.1",
+      "image_id": "sha256:b839b5c798770896c78058db1647d325a19b3acef7fa1fbd9a23fabb1dd7feb2"
+    }
+  },
+  "uat_identity": {
+    "user_id": 1,
+    "tenant_id": 1
+  }
+}

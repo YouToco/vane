@@ -1,0 +1,7 @@
+{
+  "schema": "vane.temporal-production-history-replay/v1",
+  "histories": [
+    {"workflow": "ResearchScheduledWorkflowV3", "file": "ResearchScheduledWorkflowV3.json", "status": "production"},
+    {"workflow": "ResearchShadowWorkflowV3", "file": "ResearchShadowWorkflowV3.json", "status": "production"}
+  ]
+}
