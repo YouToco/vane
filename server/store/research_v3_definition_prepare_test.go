@@ -123,7 +123,7 @@ func researchV3PrepareFixture(t *testing.T) (*Store, int64, int64, string) {
 
 func TestResearchV3DefinitionPrepareSidecarPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	ctx := t.Context()
@@ -189,7 +189,7 @@ func TestResearchV3DefinitionPrepareSidecarPostgres(t *testing.T) {
 
 func TestResearchV3DefinitionPrepareRequiresOwnerPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	if _, err := st.pool.Exec(t.Context(), `UPDATE memberships SET role='member' WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID); err != nil {
@@ -204,7 +204,7 @@ func TestResearchV3DefinitionPrepareRequiresOwnerPostgres(t *testing.T) {
 
 func TestResearchV3ShadowAdmissionFencesConcurrentOwnerRevocationPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	tests := []struct {
 		name   string
@@ -305,7 +305,7 @@ func TestResearchV3ShadowAdmissionFencesConcurrentOwnerRevocationPostgres(t *tes
 
 func TestResearchV3PreparedBindingRejectsSourceDriftPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	tests := []struct {
 		name   string
@@ -362,7 +362,7 @@ func TestResearchV3PreparedBindingRejectsSourceDriftPostgres(t *testing.T) {
 
 func TestResearchV3CutoverRevalidatesDriftAndFencesPrepareRollbackPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	p := researchV3PreparePolicyForTest()
@@ -410,7 +410,7 @@ func TestResearchV3CutoverRevalidatesDriftAndFencesPrepareRollbackPostgres(t *te
 
 func TestResearchV3CutoverBeginRejectsDriftAfterSuccessfulShadowPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	p := researchV3PreparePolicyForTest()
@@ -448,7 +448,7 @@ func TestResearchV3CutoverBeginRejectsDriftAfterSuccessfulShadowPostgres(t *test
 
 func TestResearchV3PrepareJournalDoesNotBlockTaskDeletionPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	for _, rolledBack := range []bool{false, true} {
 		name := "prepared"
@@ -488,7 +488,7 @@ func TestResearchV3PrepareJournalDoesNotBlockTaskDeletionPostgres(t *testing.T) 
 
 func TestResearchV3CutoverPromotesAndRestoresDefinitionHeadPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	ctx := t.Context()
@@ -562,7 +562,7 @@ func TestResearchV3CutoverPromotesAndRestoresDefinitionHeadPostgres(t *testing.T
 
 func TestResearchV3CutoverKeepsLegacySnapshotPinDormantAndReversiblePostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	fixture := newTaskRunSnapshotCutoverFixture(t)
 	st := fixture.base.st
@@ -646,7 +646,7 @@ func TestResearchV3CutoverKeepsLegacySnapshotPinDormantAndReversiblePostgres(t *
 
 func TestResearchV3PausedCutoverPreservesPausedSchedulePostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	if _, err := st.pool.Exec(t.Context(),

@@ -18,7 +18,7 @@ import (
 func TestMigration056DownStillRefusesDurableFactsPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -73,7 +73,7 @@ func TestMigration056DownStillRefusesDurableFactsPostgres(t *testing.T) {
 func TestMigration056EmptyDownStillWaitsForProfileTransitionLockPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()

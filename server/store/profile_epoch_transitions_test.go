@@ -20,7 +20,7 @@ import (
 func TestProfileEpochResetRestoreRawReplayAndAuthority(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过画像 epoch 真 PostgreSQL 测试")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -291,7 +291,7 @@ func TestProfileEpochResetRestoreRawReplayAndAuthority(t *testing.T) {
 func TestProfileEpochFeedbackIsolationAndPerEpochIdempotency(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过画像 epoch 反馈隔离测试")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -581,7 +581,7 @@ func TestProfileEpochFeedbackIsolationAndPerEpochIdempotency(t *testing.T) {
 func TestProfileEpochRestoreRejectsMissingCancelledLedgerEvents(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过画像 epoch 账本完整性测试")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -720,7 +720,7 @@ func TestProfileEpochRestoreRejectsMissingCancelledLedgerEvents(t *testing.T) {
 func TestProfileEpochResetRejectsOversizedCarriedClaim(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过画像 epoch 单条上限测试")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -814,7 +814,7 @@ func TestProfileEpochResetRejectsOversizedCarriedClaim(t *testing.T) {
 
 func TestProfileEpochTwoEpochTenantPurge(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("未设置 DATABASE_URL，跳过画像 epoch 租户清理测试")
+		requireDatabaseCapability(t)
 	}
 	st := purgeStore(t)
 	tenantID := seedPurgeTenant(t, st)

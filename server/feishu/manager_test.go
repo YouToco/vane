@@ -383,7 +383,7 @@ func TestManagerShutdownRetainsSenderForDownstreamDrain(t *testing.T) {
 func TestManagerReloadDisabledRevokesOutboundClient(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL 未设置，跳过飞书权限撤销真库测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {
@@ -448,7 +448,7 @@ func (f managerRoundTripFunc) RoundTrip(
 func TestPrepareOutboundIsIngressFreeAndConsumedOnceByStart(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL 未设置，跳过飞书 outbound-only 真库测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {
@@ -671,7 +671,7 @@ func TestPrepareOutboundIsIngressFreeAndConsumedOnceByStart(t *testing.T) {
 func TestCaptureOwnerBindsP2PChatToCurrentApp(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL 未设置，跳过 owner chat 真库测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {
@@ -794,7 +794,7 @@ func TestCaptureOwnerBindsP2PChatToCurrentApp(t *testing.T) {
 func TestCaptureOwnerConcurrentGroupAndP2PConvergesToP2P(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL 未设置，跳过 owner chat 并发真库测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {

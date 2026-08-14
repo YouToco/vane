@@ -43,7 +43,7 @@ func TestResearchV3TransactionsUseDedicatedRuntimeGuard(t *testing.T) {
 func TestNewWithResearchRuntimeEmptyURLKeepsLegacyStoreAndFailsV3Postgres(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL is required for research runtime constructor test")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -69,7 +69,7 @@ func TestNewWithResearchRuntimeEmptyURLKeepsLegacyStoreAndFailsV3Postgres(t *tes
 func TestNewWithResearchRuntimeRejectsOwnerSessionPostgres(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL is required for research runtime authority test")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestNewWithResearchRuntimeRejectsOwnerSessionPostgres(t *testing.T) {
 func TestNewWithResearchRuntimeAcceptsRestrictedLoginPostgres(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL is required for research runtime login test")
+		requireDatabaseCapability(t)
 	}
 	fixture := newResearchRunSpendFixtureV3(t, 20_000)
 	admin := fixture.store
@@ -138,7 +138,7 @@ func TestNewWithResearchRuntimeAcceptsRestrictedLoginPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if researchConfig.Scheme != "postgres" && researchConfig.Scheme != "postgresql" {
-		t.Skip("research runtime login test requires a PostgreSQL URL")
+		requirePostgreSQLURLCapability(t)
 	}
 	researchConfig.User = url.UserPassword("vane_research_runtime", password)
 	researchURL := researchConfig.String()

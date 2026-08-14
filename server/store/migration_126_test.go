@@ -64,7 +64,7 @@ func TestMigration126FreezesPlannerToolSearchAuthority(t *testing.T) {
 func TestMigration126CanonicalReceiptParityPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 126 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -128,7 +128,7 @@ func TestMigration126CanonicalReceiptParityPostgres(t *testing.T) {
 func TestMigration126EmptyDownRestoresV125Postgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 126 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

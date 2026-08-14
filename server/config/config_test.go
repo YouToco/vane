@@ -1038,10 +1038,10 @@ func clearVaneEnv(t *testing.T) {
 	}
 }
 
-// skipIfSystemConfigExists 跳过依赖"探测不到任何配置文件"前提的测试：
+// skipIfSystemConfigExists 声明依赖"探测不到任何配置文件"的平台能力：
 // t.Chdir 只能隔离相对路径候选，defaultConfigPaths 里的绝对路径
 // /opt/vane/config/config.yaml 在部署过 Vane 的机器上会被静默读入，
-// 使断言给出误导性结果。
+// 使断言给出误导性结果。quick 可标准化 skip；full gate 必须失败。
 func skipIfSystemConfigExists(t *testing.T) {
 	t.Helper()
 	for _, p := range defaultConfigPaths {
@@ -1049,7 +1049,7 @@ func skipIfSystemConfigExists(t *testing.T) {
 			continue
 		}
 		if _, err := os.Stat(p); err == nil {
-			t.Skipf("检测到系统级配置 %s，本测试前提不成立，跳过", p)
+			requireSystemConfigIsolationCapability(t, p)
 		}
 	}
 }
@@ -1766,7 +1766,7 @@ func TestServerAddrDefaultBindsLoopback(t *testing.T) {
 }
 
 // TestServerAddrEnvOverride 验证逃生阀：确需对外监听时可用 VANE_SERVER_ADDR 覆盖默认
-// loopback 绑定（ServerConfig.Addr 注释与 deploy/README 都指向这条路径，必须真的生效）。
+// loopback 绑定（ServerConfig.Addr 注释与 canonical infra 都指向这条路径，必须真的生效）。
 func TestServerAddrEnvOverride(t *testing.T) {
 	clearVaneEnv(t)
 	skipIfSystemConfigExists(t)

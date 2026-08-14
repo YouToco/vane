@@ -179,7 +179,7 @@ func TestMigration112DatabaseRejectsGroundedFrozenInputMutationPostgres(t *testi
 
 func TestMigration112FunctionACLAndTriggerRoutingPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st := tenantTestStore(t)
 	var publicExecute, securityDefiner, safeConfig bool
@@ -330,7 +330,7 @@ func TestMigration112SQLHasVersionedRouteAndRollbackGuard(t *testing.T) {
 func TestMigration112DowngradeRejectsFrozenV32SnapshotPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -392,7 +392,7 @@ func TestMigration112DowngradeRejectsFrozenV32SnapshotPostgres(t *testing.T) {
 func TestMigration112RetainsInFlightV31FinalizationPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

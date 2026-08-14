@@ -20,7 +20,7 @@ func newResearchProcessBindingFixtureV1(t *testing.T, prompt string) (
 ) {
 	t.Helper()
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL required")
+		requireDatabaseCapability(t)
 	}
 	seed := tenantTestStore(t)
 	ensureResearchLLMPriceV3(t, seed)
@@ -38,7 +38,7 @@ func newResearchProcessBindingServerRuntimeV1(t *testing.T) *Store {
 	t.Helper()
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

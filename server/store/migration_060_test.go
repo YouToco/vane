@@ -181,7 +181,7 @@ func isolatedMigration060(
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	roleName := fmt.Sprintf(
 		"vane_profile_editor_%s_%d", suffix, time.Now().UnixNano())
@@ -243,7 +243,7 @@ func isolatedMigration060FS(t *testing.T, roleName string) fs.FS {
 func TestMigration060ConcurrentAcrossIndependentDatabases(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	roleName := fmt.Sprintf("vane_profile_editor_race_%d", time.Now().UnixNano())
 	admin, err := sql.Open("pgx", dbURL)

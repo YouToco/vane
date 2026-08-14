@@ -12,7 +12,7 @@ import (
 func TestMigration115DownRevokesProjectionAndIdentityFencesPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 115 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

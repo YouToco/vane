@@ -77,7 +77,7 @@ func useOwnerResearchRuntimeForTest(st *Store) {
 
 func TestResearchRunV3PlanAndStepLedgerPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required for V3 research ledger integration test")
+		requireDatabaseCapability(t)
 	}
 	st := tenantTestStore(t)
 	useOwnerResearchRuntimeForTest(st)

@@ -33,7 +33,7 @@ func quotaEnv(t *testing.T) (*store.Store, int64, int64) {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过配额行为测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {

@@ -24,7 +24,7 @@ import (
 func TestTenantDerive_CallTables(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 tenant_id 推导集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := Migrate(ctx, dbURL); err != nil {

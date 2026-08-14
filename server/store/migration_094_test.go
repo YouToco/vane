@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"io/fs"
 	"os"
@@ -10,10 +11,52 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
+// newMigration094GatewayStore creates the explicit historical schema fixture
+// needed by tests for the writable migration-094 gateway. It never points
+// legacy assertions at the current shared schema (097+ intentionally revokes
+// this authority), and the scratch database is dropped as one unit.
+func newMigration094GatewayStore(t *testing.T) *Store {
+	t.Helper()
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		requireDatabaseCapability(t)
+	}
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	database, err := sql.Open("pgx", scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, dir,
+		goose.WithAllowOutofOrder(true))
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 94); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := New(context.WithoutCancel(t.Context()), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	return store
+}
+
 func TestMigration094GatewayAuthorityPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -66,7 +109,7 @@ func TestMigration094GatewayAuthorityPostgres(t *testing.T) {
 func TestMigration094DownRefusesUnsettledGatewayAttemptPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

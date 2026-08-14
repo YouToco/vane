@@ -19,7 +19,7 @@ func quotaStore(t *testing.T) *Store {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过配额集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := Migrate(ctx, dbURL); err != nil {
@@ -535,24 +535,6 @@ func TestQuota_AmbiguousTenantIsRejectedNotWaved(t *testing.T) {
 	}
 	var tenantIDs []int64
 	var codes []string
-	for i := 0; i < 2; i++ {
-		code := uniqueCode(t, "qambig")
-		if _, err := st.IssueInvite(ctx, code, nil, 1, nil); err != nil {
-			t.Fatalf("签发邀请码失败: %v", err)
-		}
-		codes = append(codes, code)
-		tn, err := st.CreateTenantWithInvite(ctx, code, u.ID)
-		if err != nil {
-			// 第二次可能被"一人一租户"约束拦下——若真如此，本用例的前提不成立，
-			// 但那本身是好消息（约束比运行时判定更早拦住），如实跳过而不是假装通过。
-			if i == 1 {
-				t.Skipf("无法构造多租户用户（第二次建租户被拒: %v）—— "+
-					"若这是数据库约束所致，说明归属不明在更早的层被挡住了", err)
-			}
-			t.Fatalf("建租户失败: %v", err)
-		}
-		tenantIDs = append(tenantIDs, tn.ID)
-	}
 	t.Cleanup(func() {
 		c, cancel := cleanupContext()
 		defer cancel()
@@ -568,9 +550,40 @@ func TestQuota_AmbiguousTenantIsRejectedNotWaved(t *testing.T) {
 		}
 		cleanupExec(c, t, st, `DELETE FROM users WHERE id = $1`, u.ID)
 	})
-
+	for i := 0; i < 2; i++ {
+		code := uniqueCode(t, "qambig")
+		if _, err := st.IssueInvite(ctx, code, nil, 1, nil); err != nil {
+			t.Fatalf("签发邀请码失败: %v", err)
+		}
+		codes = append(codes, code)
+		tn, err := st.CreateTenantWithInvite(ctx, code, u.ID)
+		if err != nil {
+			// 如果 schema 已把歧义前移为"一人一租户"约束，就直接证明
+			// 事务 fail-closed（没有第二条 membership，也没有消费邀请码）后通过。
+			if i == 1 {
+				var membershipCount, usedCount int
+				if queryErr := st.pool.QueryRow(ctx,
+					`SELECT count(*) FROM memberships WHERE user_id=$1`, u.ID,
+				).Scan(&membershipCount); queryErr != nil {
+					t.Fatal(queryErr)
+				}
+				if queryErr := st.pool.QueryRow(ctx,
+					`SELECT used_count FROM invites WHERE code=$1`, code,
+				).Scan(&usedCount); queryErr != nil {
+					t.Fatal(queryErr)
+				}
+				if membershipCount != 1 || usedCount != 0 {
+					t.Fatalf("第二租户拒绝后未 fail-closed: memberships=%d invite_used=%d err=%v",
+						membershipCount, usedCount, err)
+				}
+				return
+			}
+			t.Fatalf("建租户失败: %v", err)
+		}
+		tenantIDs = append(tenantIDs, tn.ID)
+	}
 	if len(tenantIDs) != 2 {
-		t.Skip("未能构造出双租户归属")
+		t.Fatal("fixture setup did not create two tenant memberships")
 	}
 
 	err = st.TryConsumeForUser(ctx, u.ID, QuotaLLMTokens, 1)

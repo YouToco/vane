@@ -14,7 +14,7 @@ import (
 
 func TestMigration096RemovesToolQuotaRefundAuthorityPostgres(t *testing.T) {
 	if testing.Short() {
-		t.Skip("PostgreSQL migration authority test")
+		requireLongRunningCapability(t)
 	}
 	st := tenantTestStore(t)
 	ctx := t.Context()
@@ -56,7 +56,7 @@ func TestMigration096RemovesToolQuotaRefundAuthorityPostgres(t *testing.T) {
 func TestMigration096DownRefusesQuotaFloorSettlementPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -102,7 +102,7 @@ func TestMigration096DownRefusesQuotaFloorSettlementPostgres(t *testing.T) {
 func TestMigration096DownRefusesUnsettledQuotaReservationPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

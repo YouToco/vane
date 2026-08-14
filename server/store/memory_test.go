@@ -474,7 +474,7 @@ func memoryTestStore(t *testing.T) *Store {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL is required for long-term memory PostgreSQL tests")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)

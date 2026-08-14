@@ -14,7 +14,7 @@ import (
 func TestListSpanRunStats(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 ListSpanRunStats 集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 

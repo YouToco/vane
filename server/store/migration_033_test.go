@@ -34,7 +34,7 @@ func migration033Scratch(t *testing.T) migration033Fixture {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 033 迁移集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	scratchURL, drop := createScratchDB(ctx, t, dbURL)

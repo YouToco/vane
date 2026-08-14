@@ -486,7 +486,7 @@ func (f *fakeUpstream) last(t *testing.T) capturedReq {
 func TestEvolveIntegration(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 evolver 集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {

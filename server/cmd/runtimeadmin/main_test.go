@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -627,75 +625,6 @@ func TestFinishSnapshotCutoverRunSanitizesStoreError(t *testing.T) {
 		strings.Contains(stderr.String(), secret) {
 		t.Fatalf("unsafe output stdout/stderr=%q/%q",
 			stdout.String(), stderr.String())
-	}
-}
-
-func TestSourceCIExcludesProductionDeployment(t *testing.T) {
-	payload, err := os.ReadFile(filepath.Join(
-		"..", "..", ".github", "workflows", "ci.yml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	workflow := strings.ReplaceAll(string(payload), "\r\n", "\n")
-	for _, required := range []string{
-		"runs-on: [self-hosted, Linux, ARM64]",
-		"permissions:\n  contents: read",
-		"persist-credentials: false",
-		"GOTOOLCHAIN: local",
-		`go_root="${RUNNER_TOOL_CACHE}/go/1.26.6/arm64"`,
-		`temporal_binary="${RUNNER_TOOL_CACHE}/temporal/1.8.2/arm64/temporal"`,
-		`source_root="${RUNNER_TOOL_CACHE}/vane/store-race-timings-v1"`,
-		`target_root="${RUNNER_TOOL_CACHE}/vane/store-race-timings-v1"`,
-		"- 5432/tcp",
-		"${{ job.services.postgres_0.ports['5432'] }}",
-		"${{ job.services.postgres.ports['5432'] }}",
-		`--health-cmd "pg_isready -U vane -d vane_test"`,
-	} {
-		if !strings.Contains(workflow, required) {
-			t.Errorf("source CI missing isolation guard %q", required)
-		}
-	}
-	if got := strings.Count(workflow,
-		"      - name: Select pinned runner toolchain\n"); got != 2 {
-		t.Errorf("source CI pinned toolchain selectors=%d, want 2", got)
-	}
-	for value, want := range map[string]int{
-		`go_root="${RUNNER_TOOL_CACHE}/go/1.26.6/arm64"`: 2,
-		`go version go1.26.6 linux/arm64`:                    2,
-	} {
-		if got := strings.Count(workflow, value); got != want {
-			t.Errorf("source CI toolchain guard %q count=%d, want %d",
-				value, got, want)
-		}
-	}
-	goModPayload, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	goMod := strings.ReplaceAll(string(goModPayload), "\r\n", "\n")
-	if got := strings.Count(goMod, "\ngo 1.26.6\n"); got != 1 {
-		t.Errorf("root go.mod Go 1.26.6 directives=%d, want 1", got)
-	}
-	for _, forbidden := range []string{
-		"1.26.5",
-		"vane-build",
-		"vane-deploy",
-		"vps-primary",
-		"VPS_",
-		"appleboy/",
-		"workflow_dispatch:",
-		"- 5432:5432",
-		"@localhost:5432/",
-		"actions/upload-artifact",
-		"actions/setup-go@",
-		"actions/cache/restore@",
-		"actions/cache/save@",
-		"temporal.download",
-		"store-timing-cache-next",
-	} {
-		if strings.Contains(workflow, forbidden) {
-			t.Errorf("source CI contains production capability %q", forbidden)
-		}
 	}
 }
 

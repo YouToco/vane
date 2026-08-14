@@ -729,7 +729,7 @@ func newCreationCoordinatorPostgreSQLFixture(
 	t.Helper()
 	dbURL := creationCoordinatorTestDatabaseURL()
 	if dbURL == "" {
-		t.Skip("未设置 VANE_TEST_DATABASE_URL 或 DATABASE_URL，跳过 Coordinator 真库测试")
+		requireDatabaseCapability(t)
 	}
 	if err := store.Migrate(t.Context(), dbURL); err != nil {
 		t.Fatalf("store.Migrate(): %v", err)

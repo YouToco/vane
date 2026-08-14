@@ -27,7 +27,7 @@ func ownershipStore(t *testing.T) *Store {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过调度归属集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := Migrate(ctx, dbURL); err != nil {

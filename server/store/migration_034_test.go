@@ -37,7 +37,7 @@ func migration034Scratch(t *testing.T) migration034Fixture {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 034 迁移集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	scratchURL, drop := createScratchDB(ctx, t, dbURL)
@@ -833,7 +833,7 @@ func TestMigration034RestrictedRolesAndRLS(t *testing.T) {
 func TestMigration034ConcurrentFirstRoleCreationIsIdempotent(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 034 首次并发建角色测试")
+		requireDatabaseCapability(t)
 	}
 	rawMigration, err := fs.ReadFile(
 		migrationsFS, "migrations/034_task_definition_edit_store.sql")

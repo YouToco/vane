@@ -103,7 +103,7 @@ func obsUserID() int64 { return 900_000_000 + rand.Int64N(90_000_000) }
 func TestObservabilityStore(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 observability store 集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 

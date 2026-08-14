@@ -16,7 +16,7 @@ func migration035Scratch(t *testing.T) (*sql.DB, *goose.Provider) {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 035 迁移集成测试")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, dbURL)
 	t.Cleanup(drop)

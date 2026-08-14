@@ -163,7 +163,7 @@ func TestCompiledRunSourceQueriesDoNotExpandMutableScope(t *testing.T) {
 func TestCompiledRunSourceQueries(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL is not set; skipping compiled run source integration test")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 

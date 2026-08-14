@@ -51,7 +51,7 @@ func TestMigration117KeepsPausedQuotaReadBoundToPreparedShadow(t *testing.T) {
 func TestMigration117PausedPreparedQuotaProjectionPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, scratchURL := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 116); err != nil {

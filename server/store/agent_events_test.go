@@ -41,7 +41,7 @@ func newAgentEventFixture(t *testing.T) agentEventFixture {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 Agent event ledger 真库测试")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatalf("Migrate() 失败: %v", err)
@@ -710,7 +710,7 @@ func TestCommitAgentSessionTurnRollsBackEventsWhenProjectionUpdateFails(t *testi
 	ctx := t.Context()
 	tooLargeForPostgresInt := int64(1 << 31)
 	if int64(int(tooLargeForPostgresInt)) != tooLargeForPostgresInt {
-		t.Skip("requires an int wider than PostgreSQL int4")
+		requireWideIntegerCapability(t)
 	}
 	projection := agentledger.SessionProjection{
 		Messages:       json.RawMessage(`[{"role":"user","content":"hello"}]`),

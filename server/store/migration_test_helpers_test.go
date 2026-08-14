@@ -27,7 +27,7 @@ func createScratchDB(
 	if _, err := admin.ExecContext(
 		ctx, `CREATE DATABASE `+pgQuoteIdent(name),
 	); err != nil {
-		t.Skipf("database role cannot create scratch database: %v", err)
+		requireCreateDatabaseCapability(t, err)
 	}
 
 	parsed, err := url.Parse(databaseURL)

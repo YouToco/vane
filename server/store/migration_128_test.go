@@ -56,7 +56,7 @@ func TestMigration128RetiresOnlySessionFactContinuation(t *testing.T) {
 func TestMigration128RejectsLiveOutboxAndFreezesTerminalHistoryPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
@@ -131,7 +131,7 @@ func TestMigration128RejectsLiveOutboxAndFreezesTerminalHistoryPostgres(t *testi
 func TestMigration128EmptyDownRestores127AuthorityPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
@@ -169,7 +169,7 @@ func TestMigration128EmptyDownRestores127AuthorityPostgres(t *testing.T) {
 func TestMigration128DownRejectsRetiredProjectorDriftPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
@@ -287,7 +287,7 @@ func TestMigration128DownRejectsRetiredProjectorDriftPostgres(t *testing.T) {
 func TestMigration128SchemaUpDoesNotChangeClusterRuntimeMembershipPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)

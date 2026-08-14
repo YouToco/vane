@@ -14,7 +14,7 @@ import (
 func TestMigration091LLMSpendBoundaryAndEmptyDown(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 091 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -267,7 +267,7 @@ func TestMigration091SQLContainsAtomicFences(t *testing.T) {
 func TestMigration091ExecutorCanInsertExactBoundLLMCall(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 091 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

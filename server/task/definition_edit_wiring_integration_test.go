@@ -207,7 +207,7 @@ func definitionEditIntegrationDatabaseURL(t *testing.T) string {
 		dbURL = os.Getenv("DATABASE_URL")
 	}
 	if dbURL == "" {
-		t.Skip("未设置 VANE_TEST_DATABASE_URL 或 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	return dbURL
 }

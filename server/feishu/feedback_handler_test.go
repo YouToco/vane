@@ -617,7 +617,7 @@ func TestOnFeedbackActionPanic(t *testing.T) {
 // 「Claim 后不可重复、必须补发」的机理刻意不同。
 func TestOnFeedbackActionSyncBudgetTimeout(t *testing.T) {
 	if testing.Short() {
-		t.Skip("-short 跳过 2.5s 预算超时用例")
+		requireLongRunningCapability(t)
 	}
 	m := NewManager(nil, nil, nil)
 	fb := &fakeFeedbackRunner{
@@ -667,7 +667,7 @@ func replyEvent(msgID, text, senderOpenID, parentID, rootID string) *larkim.P2Me
 func TestHandleQuestionWrapping(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 handle 追问集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {
@@ -866,7 +866,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 func TestOnCardActionFeedbackRoute(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过反馈回调集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {

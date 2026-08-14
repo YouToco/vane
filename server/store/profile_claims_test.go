@@ -23,7 +23,7 @@ import (
 func TestProfileClaimAuthorityAndEvolverRegression(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过画像 claim authority 真 PostgreSQL 测试")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -359,7 +359,7 @@ func TestProfileClaimAuthorityAndEvolverRegression(t *testing.T) {
 func TestSummaryClaimSentenceCorrectionsSurviveEvolution(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -475,7 +475,7 @@ func TestSummaryClaimSentenceCorrectionsSurviveEvolution(t *testing.T) {
 func TestProfileClaimRevokeDependencyChain(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -593,7 +593,7 @@ func TestProfileClaimRevokeDependencyChain(t *testing.T) {
 func TestProfileClaimLedgerSurvivesMembershipRevocation(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -696,7 +696,7 @@ func TestProfileClaimLedgerSurvivesMembershipRevocation(t *testing.T) {
 func TestProfileClaimMembershipRevokeSerializesWithScopedTransaction(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -756,7 +756,7 @@ func TestProfileClaimMembershipRevokeSerializesWithScopedTransaction(t *testing.
 func TestProfileClaimMutationSummaryBoundAndDuplicatePin(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -909,7 +909,7 @@ func TestProfileClaimMutationSummaryBoundAndDuplicatePin(t *testing.T) {
 func TestLegacyProfileTenantResolutionFailsClosed(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -989,7 +989,7 @@ func TestLegacyProfileTenantResolutionFailsClosed(t *testing.T) {
 func TestInitialProfileCreateConcurrentSameKeyExactReplay(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -1054,7 +1054,7 @@ func TestInitialProfileCreateConcurrentSameKeyExactReplay(t *testing.T) {
 func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)

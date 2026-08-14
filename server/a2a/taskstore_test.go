@@ -199,7 +199,7 @@ func TestListQueryMapping(t *testing.T) {
 func TestRecoveredTaskStatusVisibleThroughAdapter(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL 未设置，跳过 A2A 恢复适配层真库测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := vanestore.Migrate(ctx, dbURL); err != nil {

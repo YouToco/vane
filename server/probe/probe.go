@@ -9,7 +9,7 @@
 // 单一实现是刻意的：探针 SQL 依赖 scorer 源码里的字面量，一旦有第二份必然漂。
 //
 // 本包只读，不写任何表、不调用任何模型。用模型去查"模型有没有静默骗人"是循环论证：
-// 出问题时它自己也是坏的。这也与 vane-web/docs/ui-interaction-principles.md 的
+// 出问题时它自己也是坏的。这也与 web/docs/ui-interaction-principles.md 的
 // 「状态/成本监控 = 纯固化组件」定调一致。
 package probe
 

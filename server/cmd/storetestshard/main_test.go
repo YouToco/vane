@@ -113,7 +113,7 @@ func TestResolveRepoRelativeFileRejectsResolvedEscape(t *testing.T) {
 	link := filepath.Join(repo, "outside")
 	if err := os.Symlink(outside, link); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "privilege") {
-			t.Skipf("symlink creation unavailable: %v", err)
+			requireSymlinkCapability(t, err)
 		}
 		t.Fatal(err)
 	}

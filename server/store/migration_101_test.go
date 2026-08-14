@@ -67,7 +67,7 @@ func TestMigration101KeepsExactCutoverAuthorityDarkAndTransitionGuarded(t *testi
 
 func TestMigration101CutoverJournalACLPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), os.Getenv("DATABASE_URL")); err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestMigration101CutoverJournalACLPostgres(t *testing.T) {
 
 func TestMigration101ScheduleDeleteSerializesWithExactTaskClaimPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	f := newResearchRunSpendFixtureWithToolBudgetV3(t, 20_000, 1, false)
 	ctx := t.Context()
@@ -246,11 +246,11 @@ func TestMigration101ScheduleDeleteSerializesWithExactTaskClaimPostgres(t *testi
 // down/up. Run it only against a disposable PostgreSQL instance.
 func TestMigration101HardensPreexistingUnsafeOperatorPostgres(t *testing.T) {
 	if os.Getenv("VANE_RUN_DESTRUCTIVE_MIGRATION101_ROLE_TEST") != "1" {
-		t.Skip("set VANE_RUN_DESTRUCTIVE_MIGRATION101_ROLE_TEST=1 on disposable PostgreSQL")
+		requireDestructiveDatabaseCapability(t)
 	}
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), databaseURL); err != nil {
 		t.Fatal(err)

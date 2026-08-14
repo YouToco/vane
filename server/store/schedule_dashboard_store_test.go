@@ -18,7 +18,7 @@ import (
 func TestScheduleDashboardStore(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过任务数据面集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := Migrate(ctx, dbURL); err != nil {

@@ -43,7 +43,7 @@ func TestNativeResearchCreationBoundaryErrorUsesExactSQLState(t *testing.T) {
 func TestNativeResearchTaskCreationV3PostgreSQLAtomicLifecycle(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -357,7 +357,7 @@ func TestNativeResearchTaskCreationV3PostgreSQLAtomicLifecycle(t *testing.T) {
 func TestNativeResearchTaskCreationV3ReplayRejectsMissingOrRevokedAuthority(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -428,7 +428,7 @@ func TestNativeResearchTaskCreationV3ReplayRejectsMissingOrRevokedAuthority(t *t
 func TestNativeResearchTaskCreationV3WaitsForAdvisoryBeforeRowLock(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -516,7 +516,7 @@ func TestNativeResearchTaskCreationV3WaitsForAdvisoryBeforeRowLock(t *testing.T)
 func TestNativeResearchTaskCreationV3ActivationWaitsForAdvisoryBeforeRowLock(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -621,7 +621,7 @@ func TestNativeResearchTaskCreationV3ActivationWaitsForAdvisoryBeforeRowLock(t *
 func TestNativeResearchTaskCreationV3CapacitySerializesConcurrentCommits(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -699,7 +699,7 @@ func TestNativeResearchTaskCreationV3CapacitySerializesConcurrentCommits(t *test
 func TestTaskCreationCapacityIsSymmetricAcrossV1AndV2(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

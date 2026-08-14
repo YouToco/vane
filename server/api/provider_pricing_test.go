@@ -18,7 +18,7 @@ import (
 
 func TestProviderPriceEndpointsOwner(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("未设置 DATABASE_URL，跳过供应商价格 API 集成测试")
+		requireDatabaseCapability(t)
 	}
 	st := inviteAPIStore(t)
 	ctx := t.Context()

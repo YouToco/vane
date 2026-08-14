@@ -141,7 +141,7 @@ func TestAgentFirstRetentionScheduleRequiresExactEnabledV3Authority(t *testing.T
 func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
@@ -416,7 +416,7 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 func TestMigration130PlainUpDoesNotChangeClusterMembershipAndEmptyDownPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)

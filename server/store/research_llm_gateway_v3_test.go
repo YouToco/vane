@@ -28,21 +28,9 @@ func gatewayCommitParamsV3(f researchRunSpendFixtureV3,
 	}
 }
 
-func requireLegacy094WritableGatewayV3(t *testing.T, st *Store) {
-	t.Helper()
-	var processGateway bool
-	if err := st.pool.QueryRow(t.Context(), `SELECT to_regprocedure(
-		'claim_research_llm_gateway_request_v2(bigint,text,text)') IS NOT NULL`).Scan(&processGateway); err != nil {
-		t.Fatal(err)
-	}
-	if processGateway {
-		t.Skip("094 writable signer path is historical-only; 097 process gateway revokes it")
-	}
-}
-
 func TestResearchLLMProcessGatewayV2AtomicClaimPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL required")
+		requireDatabaseCapability(t)
 	}
 	seed := tenantTestStore(t)
 	ensureResearchLLMPriceV3(t, seed)
@@ -137,7 +125,7 @@ func TestResearchLLMProcessGatewayV2AtomicClaimPostgres(t *testing.T) {
 
 func TestResearchLLMGatewayOverrunSettlementPrecedesToolAdmissionPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL required")
+		requireDatabaseCapability(t)
 	}
 	seed := tenantTestStore(t)
 	ensureResearchLLMPriceV3(t, seed)
@@ -272,7 +260,7 @@ func TestResearchLLMGatewayOverrunSettlementPrecedesToolAdmissionPostgres(t *tes
 
 func TestResearchLLMProcessGatewayV2TerminalReplayAndRevocationPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL required")
+		requireDatabaseCapability(t)
 	}
 	for _, test := range []struct {
 		name           string
@@ -372,7 +360,7 @@ func TestResearchLLMProcessGatewayV2TerminalReplayAndRevocationPostgres(t *testi
 
 func TestResearchLLMProcessGatewayV2RecoversRevokedClaimPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL required")
+		requireDatabaseCapability(t)
 	}
 	seed := tenantTestStore(t)
 	ensureResearchLLMPriceV3(t, seed)
@@ -443,7 +431,7 @@ func TestResearchLLMProcessGatewayV2RecoversRevokedClaimPostgres(t *testing.T) {
 
 func TestResearchLLMGatewayRecoveryAndNormalSettlementShareBudgetLockPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL required")
+		requireDatabaseCapability(t)
 	}
 	for _, recoveryFirst := range []bool{false, true} {
 		name := "normal settlement precedes recovery"
@@ -598,13 +586,10 @@ func TestResearchLLMGatewayRecoveryAndNormalSettlementShareBudgetLockPostgres(t 
 }
 
 func TestResearchLLMGatewayAtomicSendClaimPostgres(t *testing.T) {
-	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL required")
-	}
-	seed := tenantTestStore(t)
-	requireLegacy094WritableGatewayV3(t, seed)
+	seed := newMigration094GatewayStore(t)
 	ensureResearchLLMPriceV3(t, seed)
-	f := newResearchRunSpendFixtureWithToolBudgetV3(t, 1_000_000, 16, false)
+	f := newResearchRunSpendFixtureModeV3AtStore(t, seed, false, 1_000_000, 16,
+		false, testResearchModelPolicyStoreV3(t), false, false)
 	f.store.beginGatewayTx = f.store.pool.BeginTx
 	reservation, err := f.store.BeginResearchRunLLMSpendV3(t.Context(),
 		researchPlannerBeginV3(f, 1, "atomic gateway claim"))
@@ -654,7 +639,7 @@ func TestResearchLLMGatewayAtomicSendClaimPostgres(t *testing.T) {
 func TestResearchLLMGatewayRestrictedPoolProbePostgres(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL required")
+		requireDatabaseCapability(t)
 	}
 	admin := tenantTestStore(t)
 	const password = "vane_gateway_test_only_20260801"
@@ -691,10 +676,10 @@ func TestResearchLLMGatewayRestrictedPoolProbePostgres(t *testing.T) {
 }
 
 func TestResearchLLMGatewaySignedSettlementAndAttacksPostgres(t *testing.T) {
-	seed := tenantTestStore(t)
-	requireLegacy094WritableGatewayV3(t, seed)
+	seed := newMigration094GatewayStore(t)
 	ensureResearchLLMPriceV3(t, seed)
-	f := newResearchRunSpendFixtureWithToolBudgetV3(t, 1_000_000, 16, false)
+	f := newResearchRunSpendFixtureModeV3AtStore(t, seed, false, 1_000_000, 16,
+		false, testResearchModelPolicyStoreV3(t), false, false)
 	f.store.beginGatewayTx = f.store.pool.BeginTx
 	if _, err := f.store.pool.Exec(t.Context(), `UPDATE tenant_quota SET tokens=2000000,
 		rate=0,burst=2000000,updated_at=now() WHERE tenant_id=$1 AND bucket='llm_tokens'`,
@@ -801,10 +786,10 @@ func TestResearchLLMGatewaySignedSettlementAndAttacksPostgres(t *testing.T) {
 }
 
 func TestResearchLLMGatewayBackdatingAndRecoveryPostgres(t *testing.T) {
-	seed := tenantTestStore(t)
-	requireLegacy094WritableGatewayV3(t, seed)
+	seed := newMigration094GatewayStore(t)
 	ensureResearchLLMPriceV3(t, seed)
-	f := newResearchRunSpendFixtureWithToolBudgetV3(t, 1_000_000, 16, false)
+	f := newResearchRunSpendFixtureModeV3AtStore(t, seed, false, 1_000_000, 16,
+		false, testResearchModelPolicyStoreV3(t), false, false)
 	f.store.beginGatewayTx = f.store.pool.BeginTx
 	prompt := "recovery prompt"
 	reservation, err := f.store.BeginResearchRunLLMSpendV3(t.Context(), researchPlannerBeginV3(f, 2, prompt))

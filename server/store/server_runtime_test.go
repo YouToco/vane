@@ -26,7 +26,7 @@ import (
 func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -1259,7 +1259,7 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 func TestSchemaMigrationsCoexistWithoutServerRuntimeProvisionPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	admin, err := sql.Open("pgx", databaseURL)
 	if err != nil {
@@ -1273,7 +1273,7 @@ func TestSchemaMigrationsCoexistWithoutServerRuntimeProvisionPostgres(t *testing
 		t.Fatal(err)
 	}
 	if existing != 0 {
-		t.Skip("cluster must be explicitly deprovisioned before fresh-database migration")
+		requireFreshDatabaseCapability(t)
 	}
 	memoryRoleSnapshot := ""
 	snapshotMemoryRole := func() string {

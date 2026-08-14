@@ -56,7 +56,7 @@ func TestMigration124ScopesV35ProjectionAndPreservesV34Admission(t *testing.T) {
 func TestMigration124SQLProjectionBoundaryAndDateParityPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 124 integration tests")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), databaseURL); err != nil {
 		t.Fatal(err)
@@ -101,7 +101,7 @@ func TestMigration124SQLProjectionBoundaryAndDateParityPostgres(t *testing.T) {
 func TestMigration124EmptyDownPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 124 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -156,7 +156,7 @@ func TestMigration124EmptyDownPostgres(t *testing.T) {
 func TestMigration125RetainedV36RefusesDownPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 124 integration tests")
+		requireDatabaseCapability(t)
 	}
 	now := time.Now().UTC()
 	fixture := scopedResearchBriefFixtureV35(t, []byte(canonicalWindowDocumentsV33(t,
@@ -189,7 +189,7 @@ func TestMigration125RetainedV36RefusesDownPostgres(t *testing.T) {
 func TestMigration124PreparedScopedDefinitionRefusesDownPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 124 integration tests")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	policy := researchV3PreparePolicyForTest()

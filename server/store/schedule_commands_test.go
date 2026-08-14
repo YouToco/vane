@@ -26,7 +26,7 @@ func TestAuthorizeNewScheduleCommandAllowsPausedOneOffRun(t *testing.T) {
 func TestScheduleCommands_PostgreSQLLifecycleAndSharedLock(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL 未设置，跳过任务命令真库测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := Migrate(ctx, dbURL); err != nil {

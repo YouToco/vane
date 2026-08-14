@@ -27,7 +27,7 @@ import (
 func TestBackfillOwnerChatBindsHistoricalReceiptToCurrentApp(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL 未设置，跳过 owner chat 历史回填真库测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 	if err := store.Migrate(ctx, dbURL); err != nil {

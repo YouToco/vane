@@ -30,7 +30,7 @@ import (
 func TestEmptyPushBatchStore(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过空批次 store 集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 

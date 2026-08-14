@@ -13,7 +13,7 @@ import (
 func TestMigration090SpendBoundaryAndEmptyDown(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 090 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -166,7 +166,7 @@ func TestMigration090SpendBoundaryAndEmptyDown(t *testing.T) {
 func TestMigration090RefusesExistingStartedSteps(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 090 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -219,7 +219,7 @@ func TestMigration090RefusesExistingStartedSteps(t *testing.T) {
 func TestMigration090DownRefusesSpendEvidence(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 090 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

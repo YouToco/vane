@@ -40,7 +40,7 @@ func TestParseCallCostLedgerQuery(t *testing.T) {
 
 func TestCallCostLedgerEndpointOwnerAndSafeProjection(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("未设置 DATABASE_URL，跳过逐笔调用账单 API 集成测试")
+		requireDatabaseCapability(t)
 	}
 	st := inviteAPIStore(t)
 	ctx := t.Context()

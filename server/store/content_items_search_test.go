@@ -41,7 +41,7 @@ func TestEscapeLike(t *testing.T) {
 func TestSearchContentItems(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 SearchContentItems 集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 

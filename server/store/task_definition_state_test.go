@@ -38,7 +38,7 @@ func newTaskDefinitionStateFixture(t *testing.T) taskDefinitionStateFixture {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 C2a task state 真库测试")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatalf("Migrate: %v", err)

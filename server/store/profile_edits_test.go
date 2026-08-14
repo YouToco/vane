@@ -35,7 +35,7 @@ func profileClaimAuthorityInstalled(t *testing.T, st *Store) bool {
 func TestProfileManualAuthority(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过画像 authority 真 PostgreSQL 测试")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -254,7 +254,7 @@ func TestPublicProfileChangesCreateOmitsSyntheticEmptyFields(t *testing.T) {
 func TestProfileManualAuthorityConcurrentCAS(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -401,7 +401,7 @@ func TestProfileManualAuthorityConcurrentCAS(t *testing.T) {
 func TestProfileManualAuthorityEmptyArraysUndoAndExactUserRLS(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -670,7 +670,7 @@ func TestProfileManualAuthorityEmptyArraysUndoAndExactUserRLS(t *testing.T) {
 func TestProfileManualAuthorityRejectsCrossTenant(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)
@@ -723,7 +723,7 @@ func TestProfileManualAuthorityRejectsCrossTenant(t *testing.T) {
 func TestProfileEditTxPinsSearchPath(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	if err := Migrate(t.Context(), dbURL); err != nil {
 		t.Fatal(err)

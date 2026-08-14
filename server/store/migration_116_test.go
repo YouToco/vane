@@ -61,7 +61,7 @@ func TestMigration116KeepsRecoveryDiscoveryNarrowAndShadowOnly(t *testing.T) {
 func TestMigration116BackfillsHistoricalCutoverJournalPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _ := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 115); err != nil {
@@ -123,7 +123,7 @@ func TestMigration116BackfillsHistoricalCutoverJournalPostgres(t *testing.T) {
 func TestMigration116VaneAppPreparedStatusPrivilegeIsSymmetricPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _ := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 116); err != nil {
@@ -181,7 +181,7 @@ func TestMigration116VaneAppPreparedStatusPrivilegeIsSymmetricPostgres(t *testin
 func TestMigration116RejectsDuplicateDynamicFunctionNeedlePostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _ := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 115); err != nil {
@@ -220,7 +220,7 @@ func TestMigration116RejectsDuplicateDynamicFunctionNeedlePostgres(t *testing.T)
 func TestMigration116DownRejectsDuplicateDynamicFunctionNeedlePostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	database, provider, _ := newMigration116ScratchProvider(t, databaseURL)
 	if _, err := provider.UpTo(t.Context(), 116); err != nil {
@@ -258,7 +258,7 @@ func TestMigration116DownRejectsDuplicateDynamicFunctionNeedlePostgres(t *testin
 
 func TestMigration116PausedScopeAndRecoverySelectorPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	f := newResearchBriefFixtureV3(t,
 		taskstate.NotificationThresholdMajorV3, true)
@@ -324,7 +324,7 @@ func TestMigration116PausedScopeAndRecoverySelectorPostgres(t *testing.T) {
 
 func TestMigration116PausedTaskPreparedWhilePausedCanShadowPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	if _, err := st.pool.Exec(t.Context(),
@@ -396,7 +396,7 @@ func TestMigration116PausedShadowRunsPlannerToolsEffectAndSynthesisDarkPostgres(
 func TestMigration116DownRejectsEnabledAuthorityAndCutoverAuditPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

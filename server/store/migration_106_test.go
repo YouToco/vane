@@ -18,7 +18,7 @@ import (
 func TestMigration106SnapshotFenceACLAndIrreversibleDowngradePostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -77,7 +77,7 @@ func TestMigration106SnapshotFenceACLAndIrreversibleDowngradePostgres(t *testing
 
 func TestResearchShadowSnapshotSerializesRevocationWithoutDeadlockPostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	type mutation struct {
 		name      string
@@ -218,7 +218,7 @@ func TestResearchShadowSnapshotSerializesRevocationWithoutDeadlockPostgres(t *te
 
 func TestMigration106RawRestrictedSnapshotInsertUsesTriggerFencePostgres(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	prepare := researchV3PreparePolicyForTest()

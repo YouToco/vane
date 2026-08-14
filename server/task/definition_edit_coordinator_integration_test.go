@@ -47,7 +47,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 		dbURL = os.Getenv("DATABASE_URL")
 	}
 	if dbURL == "" {
-		t.Skip("未设置 VANE_TEST_DATABASE_URL 或 DATABASE_URL，跳过 C2b3 Coordinator 真库测试")
+		requireDatabaseCapability(t)
 	}
 
 	const (

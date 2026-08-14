@@ -16,7 +16,7 @@ import (
 func TestPostgresRepositoryV1ClaimScansFrozenRoutePostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	admin, err := pgxpool.New(t.Context(), databaseURL)
 	if err != nil {

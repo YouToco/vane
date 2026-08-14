@@ -13,7 +13,7 @@ func migration039Scratch(t *testing.T) (string, *sql.DB, *goose.Provider) {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL is not set; skipping migration 039 test")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, dbURL)
 	t.Cleanup(drop)

@@ -75,7 +75,7 @@ func migration074Scratch(t *testing.T) (*sql.DB, *goose.Provider) {
 	t.Helper()
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for migration 074 integration tests")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

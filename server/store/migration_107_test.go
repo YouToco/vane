@@ -21,7 +21,7 @@ import (
 func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)
@@ -247,7 +247,7 @@ func TestMigration107UpgradesLegacyV3PreparedAndSpendingArtifactsPostgres(t *tes
 func TestMigration107ACLTriggerRoutingAndIrreversibleDowngradePostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		requireDatabaseCapability(t)
 	}
 	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
 	t.Cleanup(drop)

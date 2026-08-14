@@ -76,9 +76,19 @@ func newResearchRunSpendFixtureModeV3(
 ) researchRunSpendFixtureV3 {
 	t.Helper()
 	if os.Getenv("DATABASE_URL") == "" {
-		t.Skip("DATABASE_URL is required for V3 research spend integration tests")
+		requireDatabaseCapability(t)
 	}
 	st := tenantTestStore(t)
+	return newResearchRunSpendFixtureModeV3AtStore(t, st, true, maxRunCostMicroUSD,
+		maxToolCalls, createPlan, modelPolicy, shadow, pausedShadow)
+}
+
+func newResearchRunSpendFixtureModeV3AtStore(
+	t *testing.T, st *Store, cleanRows bool, maxRunCostMicroUSD int64,
+	maxToolCalls int, createPlan bool, modelPolicy runtimepolicy.ResearchModelPolicyV3,
+	shadow, pausedShadow bool,
+) researchRunSpendFixtureV3 {
+	t.Helper()
 	useOwnerResearchRuntimeForTest(st)
 	ctx := t.Context()
 	userID := testUser(t, st)
@@ -88,7 +98,9 @@ func newResearchRunSpendFixtureModeV3(
 	).Scan(&tenantID); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { cleanupResearchRunSpendFixtureV3(t, st, tenantID, userID) })
+	if cleanRows {
+		t.Cleanup(func() { cleanupResearchRunSpendFixtureV3(t, st, tenantID, userID) })
+	}
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO memberships (tenant_id,user_id,role) VALUES ($1,$2,'owner')`,
 		tenantID, userID); err != nil {

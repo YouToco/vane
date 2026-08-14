@@ -263,7 +263,7 @@ func TestProfileEditMigrationHasSafeDowngradeFence(t *testing.T) {
 func TestProfileEditDowngradeFenceLockOrder(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	admin, err := sql.Open("pgx", dbURL)
 	if err != nil {
@@ -272,7 +272,7 @@ func TestProfileEditDowngradeFenceLockOrder(t *testing.T) {
 	name := fmt.Sprintf("vane_profile_down_%d", time.Now().UnixNano())
 	if _, err := admin.ExecContext(t.Context(), "CREATE DATABASE "+name); err != nil {
 		admin.Close()
-		t.Skipf("无 CREATE DATABASE 权限: %v", err)
+		requireCreateDatabaseCapability(t, err)
 	}
 	t.Cleanup(func() {
 		defer admin.Close()
@@ -508,7 +508,7 @@ func freshMigrationDatabase(t *testing.T, prefix string) string {
 	t.Helper()
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL")
+		requireDatabaseCapability(t)
 	}
 	admin, err := sql.Open("pgx", dbURL)
 	if err != nil {
@@ -517,7 +517,7 @@ func freshMigrationDatabase(t *testing.T, prefix string) string {
 	name := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 	if _, err := admin.ExecContext(t.Context(), "CREATE DATABASE "+name); err != nil {
 		admin.Close()
-		t.Skipf("无 CREATE DATABASE 权限: %v", err)
+		requireCreateDatabaseCapability(t, err)
 	}
 	t.Cleanup(func() {
 		defer admin.Close()
@@ -555,7 +555,7 @@ func TestObservationMigrationHasDurableDowngradeFence(t *testing.T) {
 func TestMigrate(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过迁移集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 
@@ -611,7 +611,7 @@ func TestMigrate(t *testing.T) {
 func TestMigrateConcurrentFreshDB(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过迁移集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 
@@ -623,7 +623,7 @@ func TestMigrateConcurrentFreshDB(t *testing.T) {
 	freshName := fmt.Sprintf("vane_migrate_race_%d", time.Now().UnixNano())
 	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+freshName); err != nil {
 		admin.Close()
-		t.Skipf("无 CREATE DATABASE 权限，跳过并发迁移竞态测试: %v", err)
+		requireCreateDatabaseCapability(t, err)
 	}
 	// admin 的关闭放同一个 Cleanup（而非 defer）：defer 先于 Cleanup 执行，
 	// 若在 defer 里关连接，DROP 时连接已不可用。

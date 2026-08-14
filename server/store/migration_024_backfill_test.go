@@ -21,7 +21,7 @@ import (
 func TestMigration024BackfillsCallTables(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过迁移回填集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dbURL)

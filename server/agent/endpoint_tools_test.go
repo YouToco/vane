@@ -1204,7 +1204,7 @@ func TestToolSearch_ResultIncludesDescription(t *testing.T) {
 		}
 	}
 	if target.Name == "" {
-		t.Skip("样本里没有 description 显著长于 summary 的端点")
+		t.Fatal("fixture drift: no endpoint description is materially longer than its summary")
 	}
 	out, _ := ep.SearchTool().Execute(
 		ctxWithRunState(&toolRunState{activation: &activationState{}}, nil), 1,

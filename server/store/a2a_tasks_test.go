@@ -84,7 +84,7 @@ func TestA2ACursorRoundTrip(t *testing.T) {
 func TestA2ATaskStore(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 a2a_tasks store 集成测试")
+		requireDatabaseCapability(t)
 	}
 	ctx := t.Context()
 
