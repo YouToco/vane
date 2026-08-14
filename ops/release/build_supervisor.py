@@ -147,7 +147,7 @@ def main() -> int:
         raise RuntimeError("build supervisor accepts only exact origin/main")
 
     work_root = Path(config["work_root"])
-    run_id = f"vane-build-{uuid.uuid4().hex[:12]}"
+    run_id = f"vane-full-{uuid.uuid4().hex[:12]}"
     transaction = Path(tempfile.mkdtemp(prefix=run_id + ".", dir=str(work_root)))
     source = transaction / "source"
     output = transaction / "output"
