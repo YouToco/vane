@@ -66,6 +66,33 @@ archive-bound bootstrap exception. The upgraded controller must publish a
 later SHA; it cannot publish its own product revision. This command is not a
 general controller deployment path.
 
+Create the one-time plan from a clean exact-main checkout using read-only
+snapshots of the live state, active controller revision, and its signer policy:
+
+```bash
+python3 ops/bootstrap/controller_upgrade.py create-plan \
+  --output /private/controller-bootstrap \
+  --current-release /private/current-release.json \
+  --active-controller-revision <40-character-active-controller-sha> \
+  --allowed-signers /private/current-allowed-signers \
+  --signing-key /private/release-signing-key \
+  --transport-public-key /private/broker-transport-key.pub
+```
+
+Copy the plan, detached signature, and exact controller archive into a
+root-only VPS directory. Extract that archive into a separate root-only
+directory and run its copy of the tool:
+
+```bash
+python3 ops/bootstrap/controller_upgrade.py apply \
+  --plan /root/controller-bootstrap/controller-bootstrap-plan.json \
+  --controller-archive /root/controller-bootstrap/controller-<sha>.tar.gz
+```
+
+Afterward, verify that the controller revision advanced while the product and
+middleware revisions did not. A different exact-main SHA is then released
+through the normal broker path.
+
 On the release Mac, install the narrow client once from the merged controller.
 The private transport key remains outside the repository and can invoke only
 the VPS forced command:
