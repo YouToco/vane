@@ -88,7 +88,7 @@ func TestTaskDefinitionEditEntrypoints_CreateReplayAndValidation(t *testing.T) {
 		f := newTaskDefinitionEditEntrypointFixture(t, true)
 		// Derive the deadline from PostgreSQL itself. Process-local wall clock is
 		// deliberately absent from the rejection oracle.
-		frozen := f.buildProposal(t, f.databaseNow(t).Add(-time.Microsecond),
+		frozen := f.buildProposal(t, f.databaseNow(t).Add(-time.Second),
 			"entrypoint-create-expired")
 		if _, err := f.store.CreateTaskDefinitionEditOperation(
 			t.Context(), taskDefinitionEditCreateParams(frozen),
