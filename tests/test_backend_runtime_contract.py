@@ -4,6 +4,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CONTROL_CI = ROOT / ".github" / "workflows" / "ci.yml"
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
 DEPLOY = ROOT / "scripts" / "deploy.sh"
 REMOTE = ROOT / "scripts" / "remote-backend-deploy.sh"
@@ -17,6 +18,13 @@ SPEC.loader.exec_module(artifact)
 
 
 class BackendRuntimeContractTest(unittest.TestCase):
+    def test_control_and_deploy_use_the_fixed_go_toolchain(self) -> None:
+        for path in (CONTROL_CI, WORKFLOW):
+            workflow = path.read_text(encoding="utf-8")
+            self.assertEqual(workflow.count("actions/setup-go@"), 1, path)
+            self.assertEqual(workflow.count('go-version: "1.26.6"'), 1, path)
+            self.assertNotIn("1.26.5", workflow, path)
+
     def test_artifact_contains_the_complete_process_boundary(self) -> None:
         expected = {
             "bin/vane",
