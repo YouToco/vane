@@ -31,7 +31,9 @@ services:
       - POSTGRES_SEEDS=postgres
       - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
     volumes:
-      - ../temporal/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
+      # The broker installs the release-bound canonical file at this fixed,
+      # root-owned runtime path before applying an infra digest change.
+      - /opt/vane/dynamicconfig/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
     ports:
       - "127.0.0.1:7233:7233"
 
@@ -50,7 +52,9 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # As above, this is the installed copy bound to the active infra digest;
+      # the repository authority remains infra/production/caddy/Caddyfile.
+      - /opt/vane/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
 
