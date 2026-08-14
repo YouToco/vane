@@ -230,7 +230,7 @@ def restore(
     provider_env: dict[str, str],
     evidence_root: Path,
 ) -> None:
-    previous_revision = previous["monorepo_revision"]
+    previous_revision = previous["web"]["deployed_revision"]
     previous_frontend = evidence_root / "releases" / previous_revision / "frontend"
     if previous_frontend.is_symlink() or not previous_frontend.is_dir():
         raise RuntimeError("previous validated Web artifact is unavailable for recovery")
@@ -266,13 +266,6 @@ def atomic_current_release(path: Path, value: dict, expected_digest: str) -> Non
     temporary.chmod(0o600)
     os.replace(temporary, path)
     directory = os.open(str(path.parent), os.O_RDONLY)
-    controller_activated = False
-    durable = evidence_root / "releases" / revision
-    controller_root = Path(config["controller_root"])
-    active_controller = controller_root / "current"
-    if not active_controller.is_symlink():
-        raise RuntimeError("active controller authority is not an atomic symlink")
-    previous_controller_target = active_controller.resolve(strict=True)
     try:
         os.fsync(directory)
     finally:

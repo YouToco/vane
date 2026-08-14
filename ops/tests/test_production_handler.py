@@ -98,6 +98,19 @@ class ProductionHandlerTest(unittest.TestCase):
             )
         self.assertEqual(current.read_bytes(), before)
 
+    def test_atomic_current_release_advances_exact_cas(self) -> None:
+        current = self.root / "current-release.json"
+        current.write_text('{"state":"N"}\n', encoding="utf-8")
+        expected = hashlib.sha256(current.read_bytes()).hexdigest()
+        production_handler.atomic_current_release(
+            current, {"schema": "fixture", "state": "N+1"}, expected
+        )
+        self.assertEqual(
+            json.loads(current.read_text(encoding="utf-8")),
+            {"schema": "fixture", "state": "N+1"},
+        )
+        self.assertEqual(current.stat().st_mode & 0o777, 0o600)
+
     def test_active_controller_is_confined_to_release_authority(self) -> None:
         control = self.root / "control"
         target = control / "releases" / REVISION
