@@ -6,7 +6,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEPLOY = ROOT / "scripts" / "deploy.sh"
+DEPLOY = ROOT / "release" / "deploy.sh"
 BASH = (
     r"C:\Program Files\Git\bin\bash.exe"
     if os.name == "nt"

@@ -6,7 +6,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEPLOY = ROOT / "scripts" / "deploy.sh"
+DEPLOY = ROOT / "release" / "deploy.sh"
 SHA = "290bf2d8264d393116f8a87da461e58f65784844"
 
 

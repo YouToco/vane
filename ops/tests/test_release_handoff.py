@@ -1,92 +1,100 @@
-import re
-import unittest
+from __future__ import annotations
+
+import hashlib
+import json
 from pathlib import Path
+import subprocess
+import tempfile
+import unittest
 
 
-ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
-CACHE_SHA = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+OPS = Path(__file__).resolve().parents[1]
+ROOT = OPS.parent
+CLI = OPS / "bin" / "vane"
+REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
-class ReleaseHandoffTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.workflow = WORKFLOW.read_text(encoding="utf-8")
+def canonical(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
-    def test_release_does_not_depend_on_github_artifact_quota(self) -> None:
-        self.assertNotIn("actions/upload-artifact", self.workflow)
-        self.assertNotIn("actions/download-artifact", self.workflow)
-        self.assertEqual(
-            self.workflow.count(f"actions/cache/save@{CACHE_SHA}"), 2
-        )
-        self.assertEqual(
-            self.workflow.count(f"actions/cache/restore@{CACHE_SHA}"), 4
-        )
 
-    def test_handoffs_are_exact_to_run_component_and_source(self) -> None:
-        for component in ("backend", "frontend"):
-            key = (
-                "vane-release-v2-${{ github.run_id }}-"
-                f"{component}-${{{{ needs.plan.outputs.{component}_sha }}}}"
-            )
-            self.assertEqual(self.workflow.count(f"key: {key}"), 3)
-            self.assertEqual(self.workflow.count(
-                f"path: release-handoff/{component}"
-            ), 3)
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
-        self.assertNotIn("restore-keys:", self.workflow)
-        self.assertNotIn(
-            "vane-release-v2-${{ github.run_id }}-${{ github.run_attempt }}",
-            self.workflow,
-        )
-        self.assertEqual(self.workflow.count("lookup-only: true"), 2)
-        self.assertEqual(self.workflow.count("fail-on-cache-miss: true"), 4)
 
-    def test_restored_bytes_still_cross_strict_validation(self) -> None:
-        for component in ("backend", "frontend"):
-            pattern = re.compile(
-                rf"artifact\.py\" validate[\s\S]*?"
-                rf"--component {component}[\s\S]*?"
-                rf"--input \"\$HANDOFF_ROOT/{component}\"[\s\S]*?"
-                rf"--output \"\$DEPLOY_ROOT/verified/{component}\""
-            )
-            self.assertRegex(self.workflow, pattern)
+class ReleaseManifestChainTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
 
-    def test_both_handoff_peers_fail_fast_when_cache_codec_is_missing(self) -> None:
-        build_prereq = (
-            "- name: Verify build release handoff cache prerequisites"
-        )
-        deploy_prereq = (
-            "- name: Verify deploy release handoff cache prerequisites"
-        )
-        save = "- name: Save backend release handoff"
-        restore = "- name: Restore backend release handoff from this run"
-        self.assertIn(build_prereq, self.workflow)
-        self.assertIn(deploy_prereq, self.workflow)
-        self.assertLess(self.workflow.index(build_prereq), self.workflow.index(save))
-        self.assertLess(self.workflow.index(deploy_prereq), self.workflow.index(restore))
-        self.assertEqual(self.workflow.count("command -v tar >/dev/null"), 2)
-        self.assertEqual(self.workflow.count("command -v zstd >/dev/null"), 2)
-        self.assertEqual(self.workflow.count("zstd --version"), 2)
+    def write_stage(self, stage: str, parent: Path | None) -> Path:
+        path = self.root / f"{stage}.json"
+        parent_value = None
+        if parent is not None:
+            parent_value = {
+                "path": parent.name,
+                "sha256": digest(parent),
+                "stage": json.loads(parent.read_text(encoding="utf-8"))["stage"],
+            }
+        value = {
+            "schema": "vane.ops-manifest/v1",
+            "stage": stage,
+            "revision": REVISION,
+            "created_at": "2026-08-13T12:00:00Z",
+            "parent": parent_value,
+            "signer": "test-validator",
+            "evidence": [{"name": f"{stage}-result", "sha256": "a" * 64}],
+        }
+        path.write_bytes(canonical(value))
+        return path
 
-    def test_self_hosted_handoff_roots_are_recreated_private(self) -> None:
-        self.assertEqual(
-            self.workflow.count('rm -rf -- "$HANDOFF_ROOT"'), 4
-        )
-        self.assertEqual(
-            self.workflow.count('install -d -m 0700 "$HANDOFF_ROOT"'), 2
+    def run_audit(self, path: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(CLI), "audit", "--structural-only", "--manifest", str(path)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
         )
 
-    def test_untrusted_build_job_never_receives_production_secrets(self) -> None:
-        build, deploy = self.workflow.split("\n  deploy:\n", maxsplit=1)
-        for secret in (
-            "VPS_SSH_KEY",
-            "VPS_HOST",
-            "CLOUDFLARE_API_TOKEN",
-            "ALIYUN_ACCESS_KEY_SECRET",
-        ):
-            self.assertNotIn(secret, build)
-            self.assertIn(secret, deploy)
+    def test_complete_plan_gate_artifact_chain_is_accepted_structurally(self) -> None:
+        plan = self.write_stage("plan", None)
+        gate = self.write_stage("gate", plan)
+        artifact = self.write_stage("artifact", gate)
+        result = self.run_audit(artifact)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["stage"], "artifact")
+        self.assertEqual(len(report["chain"]), 3)
+        self.assertFalse(report["signatures_verified"])
+
+    def test_parent_digest_mismatch_fails_closed(self) -> None:
+        plan = self.write_stage("plan", None)
+        gate = self.write_stage("gate", plan)
+        plan.write_text("{}\n", encoding="utf-8")
+        result = self.run_audit(gate)
+        self.assertEqual(result.returncode, 78, result)
+        self.assertIn("parent digest mismatch", result.stderr)
+
+    def test_skipped_stage_is_rejected(self) -> None:
+        plan = self.write_stage("plan", None)
+        artifact = self.write_stage("artifact", plan)
+        result = self.run_audit(artifact)
+        self.assertEqual(result.returncode, 78, result)
+        self.assertIn("skips or reverses", result.stderr)
+
+    def test_unsigned_chain_is_rejected_by_non_structural_audit(self) -> None:
+        plan = self.write_stage("plan", None)
+        result = subprocess.run(
+            [str(CLI), "audit", "--manifest", str(plan)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 78, result)
+        self.assertIn("signature is missing", result.stderr)
 
 
 if __name__ == "__main__":

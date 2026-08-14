@@ -2,6 +2,10 @@
 set -euo pipefail
 umask 077
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd -- "$script_dir/../.." && pwd -P)
+audit_dir=$repo_root/ops/audit
+
 if [[ $# -ne 3 ]]; then
   echo "usage: $0 COMPONENT VERIFIED_PAYLOAD EXACT_SHA" >&2
   exit 2
@@ -113,8 +117,12 @@ deploy_backend() {
 
   require_env \
     VPS_HOST VPS_PORT VPS_USER VPS_SSH_KEY \
-    VPS_SSH_HOST_ED25519_FINGERPRINT RUNNER_TEMP \
-    GITHUB_RUN_ID GITHUB_RUN_ATTEMPT
+    VPS_SSH_HOST_ED25519_FINGERPRINT VANE_WORK_ROOT \
+    VANE_RELEASE_ID VANE_RELEASE_ATTEMPT_ID
+  [[ $VANE_WORK_ROOT == /* && -d $VANE_WORK_ROOT && ! -L $VANE_WORK_ROOT ]] || {
+    echo "VANE_WORK_ROOT must be an existing absolute directory" >&2
+    exit 1
+  }
   [[ $VPS_HOST =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || {
     echo "VPS_HOST must be a DNS name or IPv4 address" >&2
     exit 1
@@ -135,11 +143,11 @@ deploy_backend() {
     echo "VPS Ed25519 fingerprint is malformed" >&2
     exit 1
   }
-  [[ $GITHUB_RUN_ID =~ ^[0-9]+$ && $GITHUB_RUN_ATTEMPT =~ ^[0-9]+$ ]] || {
-    echo "GitHub run ID and attempt must be numeric" >&2
+  [[ $VANE_RELEASE_ID =~ ^[0-9]+$ &&
+     $VANE_RELEASE_ATTEMPT_ID =~ ^[0-9]+$ ]] || {
+    echo "release ID and attempt must be numeric" >&2
     exit 1
   }
-
   local binary infra legacy_compat_unit primary_unit gateway_unit
   for binary in vane useradmin gate runtimeadmin vane-migrate \
     agentfirstretention \
@@ -151,7 +159,7 @@ deploy_backend() {
     }
     # The Python artifact validator performs the same build-info checks without
     # requiring Go on this VM. Keep this assertion close to deployment too.
-    "$(dirname "$0")/check-go-build-info.sh" \
+    "$audit_dir/check-go-build-info.sh" \
       "$payload/bin/$binary" "$source_sha"
   done
   for infra in \
@@ -161,15 +169,19 @@ deploy_backend() {
     vane-migrate.service \
     vane-research-gateway.service \
     vane-research-gateway.socket \
+    vane-legacy-compat.service \
     dynamicconfig/development-sql.yaml; do
     [[ -f $payload/deploy/$infra && ! -L $payload/deploy/$infra ]] || {
       echo "missing verified backend infra file: $infra" >&2
       exit 1
     }
   done
-  legacy_compat_unit=$(dirname "$0")/../deploy/vane-legacy-compat.service
-  primary_unit=$(dirname "$0")/../deploy/vane.service
-  gateway_unit=$(dirname "$0")/../deploy/vane-research-gateway.service
+  "$repo_root/ops/bin/vane" status \
+    --release-receipt "$payload/release-receipt.json" \
+    --sha "$source_sha" >/dev/null
+  legacy_compat_unit=$payload/deploy/vane-legacy-compat.service
+  primary_unit=$payload/deploy/vane.service
+  gateway_unit=$payload/deploy/vane-research-gateway.service
   [[ -f $legacy_compat_unit && ! -L $legacy_compat_unit ]] || {
     echo "audited legacy compatibility unit is unavailable" >&2
     exit 1
@@ -182,8 +194,8 @@ deploy_backend() {
 
   local actual_fingerprint
   local -a scp_opts
-  backend_ssh_dir=$(mktemp -d "$RUNNER_TEMP/vane-ssh.XXXXXX")
-  backend_remote_stage="/opt/vane/.deploy-${source_sha}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+  backend_ssh_dir=$(mktemp -d "$VANE_WORK_ROOT/vane-ssh.XXXXXX")
+  backend_remote_stage="/opt/vane/.deploy-${source_sha}-${VANE_RELEASE_ID}-${VANE_RELEASE_ATTEMPT_ID}"
   backend_ssh_target="$VPS_USER@$VPS_HOST"
   backend_remote_stage_created=false
   backend_ssh_opts=()
@@ -245,7 +257,6 @@ deploy_backend() {
     "$backend_ssh_target:$backend_remote_stage/bin/"
   scp "${scp_opts[@]}" \
     "$payload/release-receipt.json" \
-    "$(dirname "$0")/publish-retention-release.sh" \
     "$backend_ssh_target:$backend_remote_stage/"
   scp "${scp_opts[@]}" \
     "$payload/deploy/Caddyfile" \
@@ -261,8 +272,8 @@ deploy_backend() {
     "$backend_ssh_target:$backend_remote_stage/dynamicconfig/"
 
   ssh "${backend_ssh_opts[@]}" "$backend_ssh_target" \
-    bash -s -- "$backend_remote_stage" \
-    <"$(dirname "$0")/remote-backend-deploy.sh"
+    bash -s -- "$backend_remote_stage" "${EXPECTED_DEPLOYED_SHA:-none}" \
+    <"$script_dir/remote-atomic-release.sh"
   backend_remote_stage=
   backend_remote_stage_created=false
   trap - EXIT
@@ -270,7 +281,7 @@ deploy_backend() {
   backend_ssh_dir=
   backend_ssh_opts=()
 
-  # remote-backend-deploy.sh ends with the production Gate. Only that complete
+  # remote-atomic-release.sh ends with the production Gate. Only that complete
   # success advances durable deployment state.
   write_state "$state_file" "$source_sha"
   echo "backend deployment recorded after Gate: $source_sha"
@@ -472,7 +483,7 @@ deploy_frontend_aliyun() {
       owner_preview_meta=$(
         stat_oss_object_with_size \
           "$owner_preview_object" \
-          "$(wc -c <"$payload/dist/$owner_preview_object")"
+          "$(wc -c <"$payload/dist/$owner_preview_object" | tr -d '[:space:]')"
       )
       if ! printf '%s\n' "$owner_preview_meta" |
         grep -Eiq 'Cache-Control[^[:alnum:]]+no-store'; then
@@ -487,7 +498,7 @@ deploy_frontend_aliyun() {
       --force
     stat_oss_object_with_size \
       index.html \
-      "$(wc -c <"$payload/dist/index.html")" >/dev/null
+      "$(wc -c <"$payload/dist/index.html" | tr -d '[:space:]')" >/dev/null
 
     refresh_urls=()
     while IFS= read -r refresh_path; do

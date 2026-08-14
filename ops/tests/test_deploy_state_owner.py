@@ -1,70 +1,49 @@
 import pathlib
-import re
 import unittest
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
-CERT_WORKFLOW = ROOT / ".github" / "workflows" / "cert-renew.yml"
-ACTIONLINT_CONFIG = ROOT / ".github" / "actionlint.yaml"
-
-EXPECTED_LABELS = {"self-hosted", "Linux", "vps-primary", "vane-deploy"}
-
-
-def job_block(workflow: str, job_name: str) -> str:
-    match = re.search(
-        rf"(?ms)^  {re.escape(job_name)}:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
-        workflow,
-    )
-    if match is None:
-        raise AssertionError(f"job not found: {job_name}")
-    return match.group(1)
-
-
-def runner_labels(block: str) -> set[str]:
-    match = re.search(r"(?m)^    runs-on:\s*\[([^\]]+)\]\s*$", block)
-    if match is None:
-        raise AssertionError("job must use an inline, auditable runs-on label list")
-    return {label.strip().strip("\"'") for label in match.group(1).split(",")}
+OPS = pathlib.Path(__file__).resolve().parents[1]
+CLI = OPS / "bin" / "vane"
+CONTROLLER = OPS / "cli" / "controller.py"
+DEPLOY = OPS / "release" / "deploy.sh"
+CERT = OPS / "certificates" / "renew-cert.sh"
 
 
 class DeployStateOwnerTests(unittest.TestCase):
-    def test_plan_and_deploy_share_one_durable_state_owner(self) -> None:
-        workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    def test_deploy_and_certificate_share_the_durable_lock(self) -> None:
+        for path in (DEPLOY, CERT):
+            source = path.read_text(encoding="utf-8")
+            self.assertIn("$state_dir/control-plane.lock", source, path)
+            self.assertIn("flock 9", source, path)
 
-        self.assertEqual(runner_labels(job_block(workflow, "plan")), EXPECTED_LABELS)
-        self.assertEqual(
-            runner_labels(job_block(workflow, "deploy")), EXPECTED_LABELS
+    def test_repository_cli_has_no_production_mutation_implementation(self) -> None:
+        source = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("root-owned broker", source)
+        self.assertIn("broker_required", source)
+        for forbidden in (
+            "CLOUDFLARE_API_TOKEN",
+            "ALIYUN_ACCESS_KEY_SECRET",
+            "VPS_SSH_KEY",
+            "POSTGRES_PASSWORD",
+        ):
+            self.assertNotIn(forbidden, source)
+
+    def test_only_one_operator_facing_executable_exists(self) -> None:
+        entries = [path for path in (OPS / "bin").iterdir() if path.is_file()]
+        self.assertEqual(entries, [CLI])
+        self.assertLess(len(CLI.read_text(encoding="utf-8").splitlines()), 20)
+
+    def test_active_scripts_do_not_depend_on_actions_environment(self) -> None:
+        active = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in OPS.glob("**/*")
+            if path.is_file() and path.suffix in {".sh", ".py"}
+            and "tests" not in path.parts
         )
-
-    def test_certificate_state_uses_the_same_owner(self) -> None:
-        workflow = CERT_WORKFLOW.read_text(encoding="utf-8")
-
-        self.assertEqual(runner_labels(job_block(workflow, "renew")), EXPECTED_LABELS)
-
-    def test_build_uses_the_isolated_build_role(self) -> None:
-        workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
-        build = job_block(workflow, "build")
-
-        self.assertIn(
-            "    runs-on: [self-hosted, Linux, vane-build]\n", build
-        )
-        self.assertNotIn("ubuntu-24.04", build)
-
-    def test_control_plane_pr_and_main_trust_domains_are_separate(self) -> None:
-        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn('["self-hosted","Linux","vane-test"]', workflow)
-        self.assertIn('["self-hosted","Linux","vane-build"]', workflow)
-        self.assertNotIn("ubuntu-24.04", workflow)
-        self.assertNotIn("hosted-runner-smoke", workflow)
-
-    def test_actionlint_knows_the_primary_runner_label(self) -> None:
-        config = ACTIONLINT_CONFIG.read_text(encoding="utf-8")
-
-        self.assertIn("    - vps-primary\n", config)
+        for retired in ("RUNNER_TEMP", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
+            self.assertNotIn(retired, active)
+        self.assertIn("VANE_WORK_ROOT", active)
+        self.assertIn("VANE_RELEASE_ATTEMPT_ID", active)
 
 
 if __name__ == "__main__":

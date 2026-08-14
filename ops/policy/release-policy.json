@@ -1,0 +1,23 @@
+{
+  "schema": "vane.release-policy/v1",
+  "manifest_schema": "vane.ops-manifest/v1",
+  "manifest_stages": ["plan", "gate", "artifact", "deploy", "verify", "finalize"],
+  "production_mutation_authority": "external-root-owned-broker",
+  "skip_allowlist": [],
+  "required_tool_versions": {
+    "go": "1.26.6",
+    "node": "22.23.2",
+    "temporal_cli": "1.8.2",
+    "govulncheck": "1.7.0",
+    "postgres": "18",
+    "temporal_server": "1.29.7",
+    "temporal_ui": "2.52.1",
+    "caddy": "2.10.2",
+    "shellcheck": "0.11.0",
+    "aliyun_cli": "3.4.10",
+    "ossutil": "2.3.0",
+    "wrangler": "4.115.0",
+    "undici": "7.29.0",
+    "acme_sh": "3661fd86b6304115e42f43910e6dd452ab9866d6"
+  }
+}

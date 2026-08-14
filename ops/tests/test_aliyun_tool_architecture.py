@@ -4,10 +4,10 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SELECTOR = ROOT / "scripts" / "select-aliyun-tool-archive.sh"
+SELECTOR = ROOT / "bootstrap" / "select-aliyun-tool-archive.sh"
 INSTALLERS = (
-    ROOT / "scripts" / "install-aliyun.sh",
-    ROOT / "scripts" / "install-ossutil.sh",
+    ROOT / "bootstrap" / "install-aliyun.sh",
+    ROOT / "bootstrap" / "install-ossutil.sh",
 )
 
 

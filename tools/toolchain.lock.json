@@ -1,0 +1,54 @@
+{
+  "schema": "vane.toolchain-lock/v1",
+  "tools": {
+    "go": {
+      "version": "1.26.6",
+      "checksum_authority": "https://go.dev/dl/?mode=json&include=all",
+      "artifacts": {
+        "linux-amd64": {"filename": "go1.26.6.linux-amd64.tar.gz", "url": "https://go.dev/dl/go1.26.6.linux-amd64.tar.gz", "sha256": "708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89"},
+        "linux-arm64": {"filename": "go1.26.6.linux-arm64.tar.gz", "url": "https://go.dev/dl/go1.26.6.linux-arm64.tar.gz", "sha256": "d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e"}
+      }
+    },
+    "node": {
+      "version": "22.23.2",
+      "checksum_authority": "https://nodejs.org/dist/v22.23.2/SHASUMS256.txt",
+      "artifacts": {
+        "linux-amd64": {"filename": "node-v22.23.2-linux-x64.tar.xz", "url": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz", "sha256": "d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307"},
+        "linux-arm64": {"filename": "node-v22.23.2-linux-arm64.tar.xz", "url": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-arm64.tar.xz", "sha256": "fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8"}
+      }
+    },
+    "temporal_cli": {
+      "version": "1.8.2",
+      "checksum_authority": "https://github.com/temporalio/cli/releases/download/v1.8.2/checksums.txt",
+      "artifacts": {
+        "linux-amd64": {"filename": "temporal_cli_1.8.2_linux_amd64.tar.gz", "url": "https://github.com/temporalio/cli/releases/download/v1.8.2/temporal_cli_1.8.2_linux_amd64.tar.gz", "sha256": "d8421bda989e6514b4bdb4d63a9012a8a05a806892e881a5aad8510496349a94"},
+        "linux-arm64": {"filename": "temporal_cli_1.8.2_linux_arm64.tar.gz", "url": "https://github.com/temporalio/cli/releases/download/v1.8.2/temporal_cli_1.8.2_linux_arm64.tar.gz", "sha256": "83600a8fac6e3da54093e5da6918d399f501532b9f1172235603f9606f4ac6e4"}
+      }
+    },
+    "govulncheck": {
+      "version": "1.7.0",
+      "module": "golang.org/x/vuln",
+      "module_sum": "h1:4MQBuhmXbz2uepNJrf3v+aaZLGDqw1JluwYboegA1qg=",
+      "source_commit": "617f44b718537dccdea1915395650e0529e3b72e",
+      "checksum_authority": "https://sum.golang.org"
+    },
+    "postgres": {"version": "18", "image": "postgres:18-alpine", "digest": "sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15", "authority": "infra/production/compose/docker-compose.yml"},
+    "temporal_server": {"version": "1.29.7", "image": "temporalio/auto-setup:1.29.7", "digest": "sha256:f14912b699cf73015ad5c4fc18d522d4b014db90e794039214dfb7c022c2644f", "authority": "infra/production/compose/docker-compose.yml"},
+    "temporal_ui": {"version": "2.52.1", "image": "temporalio/ui:2.52.1", "digest": "sha256:b839b5c798770896c78058db1647d325a19b3acef7fa1fbd9a23fabb1dd7feb2", "authority": "infra/production/compose/docker-compose.yml"},
+    "caddy": {"version": "2.10.2", "image": "caddy:2-alpine", "digest": "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648", "authority": "infra/production/compose/docker-compose.yml"},
+    "shellcheck": {
+      "version": "0.11.0",
+      "source_commit": "aac0823e6b58f8a499e856e93738082691cbf212",
+      "checksum_authority": "release asset hash verified against tagged source commit",
+      "artifacts": {
+        "linux-amd64": {"filename": "shellcheck-v0.11.0.linux.x86_64.tar.xz", "url": "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz", "sha256": "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"},
+        "linux-arm64": {"filename": "shellcheck-v0.11.0.linux.aarch64.tar.xz", "url": "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.aarch64.tar.xz", "sha256": "12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588"}
+      }
+    },
+    "aliyun_cli": {"version": "3.4.10", "artifacts": {"linux-amd64": {"sha256": "b9edbcc21236f14bfeebbd5e272dde6f36fd946af5802fa677475ff69839ed84"}, "linux-arm64": {"sha256": "349f3d31af9cc85aa2b444899e7d805f6409f5a53d667ce74d00dafbc17f9ae5"}}},
+    "ossutil": {"version": "2.3.0", "artifacts": {"linux-amd64": {"sha256": "3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a"}, "linux-arm64": {"sha256": "f6c95ba0c2d2ef30290af686ce4d706c701f4734ce8090bee4288a77e3f1d764"}}},
+    "wrangler": {"version": "4.115.0", "package_lock_sha256": "6e066aec58ac841c5b1b7b1f4b1ec59a98b4d94f7a53e09ab3ec19c4c5366b9e"},
+    "undici": {"version": "7.29.0", "integrity_authority": "tools/wrangler/package-lock.json"},
+    "acme_sh": {"version": "3661fd86b6304115e42f43910e6dd452ab9866d6", "source_commit_sha1": "3661fd86b6304115e42f43910e6dd452ab9866d6"}
+  }
+}

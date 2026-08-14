@@ -8,13 +8,14 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import tarfile
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("artifact", ROOT / "scripts/artifact.py")
+SPEC = importlib.util.spec_from_file_location("artifact", ROOT / "release/artifact.py")
 assert SPEC and SPEC.loader
 artifact = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(artifact)
@@ -53,7 +54,7 @@ class ArtifactValidationTest(unittest.TestCase):
 
     def _write_backend_source(self, source: Path) -> None:
         for name, mode in artifact.BACKEND_FILES.items():
-            path = source / name
+            path = source / artifact.BACKEND_SOURCE_PATHS[name]
             path.parent.mkdir(parents=True, exist_ok=True)
             if name.startswith("bin/"):
                 path.write_bytes(
@@ -159,6 +160,22 @@ class ArtifactValidationTest(unittest.TestCase):
         self.assertEqual(
             receipt["agentfirstretention_sha256"], collector_entry["sha256"]
         )
+        consumed = subprocess.run(
+            [
+                str(ROOT / "bin/vane"),
+                "status",
+                "--release-receipt",
+                str(output / "release-receipt.json"),
+                "--sha",
+                SHA,
+            ],
+            cwd=ROOT.parent,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(consumed.returncode, 0, consumed.stderr)
+        self.assertEqual(json.loads(consumed.stdout)["revision"], SHA)
 
     def test_backend_pack_is_byte_deterministic(self) -> None:
         source = self.root / "backend-deterministic-source"
@@ -195,7 +212,7 @@ class ArtifactValidationTest(unittest.TestCase):
         for name, mode in artifact.BACKEND_FILES.items():
             if name == "bin/vane-research-prepare":
                 continue
-            path = source / name
+            path = source / artifact.BACKEND_SOURCE_PATHS[name]
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fixture\n", encoding="utf-8")
             path.chmod(mode)
@@ -214,7 +231,7 @@ class ArtifactValidationTest(unittest.TestCase):
     def test_backend_pack_requires_exact_server_release_contract(self) -> None:
         source = self.root / "backend-contract-source"
         for name, mode in artifact.BACKEND_FILES.items():
-            path = source / name
+            path = source / artifact.BACKEND_SOURCE_PATHS[name]
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fixture\n", encoding="utf-8")
             path.chmod(mode)

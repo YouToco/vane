@@ -38,7 +38,31 @@ BACKEND_FILES = {
     "deploy/vane-migrate.service": 0o644,
     "deploy/vane-research-gateway.service": 0o644,
     "deploy/vane-research-gateway.socket": 0o644,
+    "deploy/vane-legacy-compat.service": 0o644,
     "deploy/dynamicconfig/development-sql.yaml": 0o644,
+}
+BACKEND_SOURCE_PATHS = {
+    **{
+        archive_path: f"server/{archive_path}"
+        for archive_path in BACKEND_FILES
+        if archive_path.startswith("bin/")
+    },
+    "deploy/Caddyfile": "infra/production/caddy/Caddyfile",
+    "deploy/docker-compose.yml": "infra/production/compose/docker-compose.yml",
+    "deploy/vane.service": "infra/production/systemd/vane.service",
+    "deploy/vane-migrate.service": "infra/production/systemd/vane-migrate.service",
+    "deploy/vane-research-gateway.service": (
+        "infra/production/systemd/vane-research-gateway.service"
+    ),
+    "deploy/vane-research-gateway.socket": (
+        "infra/production/systemd/vane-research-gateway.socket"
+    ),
+    "deploy/vane-legacy-compat.service": (
+        "infra/production/systemd/vane-legacy-compat.service"
+    ),
+    "deploy/dynamicconfig/development-sql.yaml": (
+        "infra/production/temporal/development-sql.yaml"
+    ),
 }
 
 
@@ -75,7 +99,8 @@ def validate_archive_path(value: str, component: str) -> PurePosixPath:
 def source_files(component: str, source: Path) -> list[tuple[str, Path, int]]:
     if component == "backend":
         candidates = [
-            (name, source / name, mode) for name, mode in BACKEND_FILES.items()
+            (archive_path, source / BACKEND_SOURCE_PATHS[archive_path], mode)
+            for archive_path, mode in BACKEND_FILES.items()
         ]
     else:
         dist = source / "dist"

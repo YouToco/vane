@@ -14,7 +14,15 @@ require_env() {
 
 require_env \
   ALIYUN_BIN ALIYUN_ACCESS_KEY_ID ALIYUN_ACCESS_KEY_SECRET \
-  ACME_ACCOUNT_EMAIL RUNNER_TEMP
+  ACME_ACCOUNT_EMAIL VANE_WORK_ROOT VANE_TOOL_CACHE
+[[ $VANE_WORK_ROOT == /* && -d $VANE_WORK_ROOT && ! -L $VANE_WORK_ROOT ]] || {
+  echo "VANE_WORK_ROOT must be an existing absolute directory" >&2
+  exit 1
+}
+[[ $VANE_TOOL_CACHE == /* && -d $VANE_TOOL_CACHE && ! -L $VANE_TOOL_CACHE ]] || {
+  echo "VANE_TOOL_CACHE must be an existing absolute directory" >&2
+  exit 1
+}
 [[ -x $ALIYUN_BIN ]] || {
   echo "pinned Aliyun CLI is missing" >&2
   exit 1
@@ -42,7 +50,7 @@ command -v flock >/dev/null
 exec 9>"$state_dir/control-plane.lock"
 flock 9
 
-work_dir=$(mktemp -d "$RUNNER_TEMP/vane-cert.XXXXXX")
+work_dir=$(mktemp -d "$VANE_WORK_ROOT/vane-cert.XXXXXX")
 account_temp=$work_dir/account.conf
 aliyun_config=$work_dir/aliyun-config.json
 # shellcheck disable=SC2317 # Invoked indirectly by the EXIT trap.
@@ -60,6 +68,13 @@ git -C "$work_dir/acme-source" remote add origin \
 git -C "$work_dir/acme-source" fetch --quiet --depth 1 origin "$acme_commit"
 git -C "$work_dir/acme-source" checkout --quiet --detach FETCH_HEAD
 [[ $(git -C "$work_dir/acme-source" rev-parse HEAD) == "$acme_commit" ]]
+acme_locked_root=$VANE_TOOL_CACHE/acme_sh/$acme_commit
+if [[ ! -e $acme_locked_root ]]; then
+  install -d -m 0700 "$acme_locked_root"
+  install -m 0700 "$work_dir/acme-source/acme.sh" "$acme_locked_root/acme.sh"
+  printf '%s\n' "$acme_commit" >"$acme_locked_root/.source-commit"
+  chmod 0600 "$acme_locked_root/.source-commit"
+fi
 
 (
   cd "$work_dir/acme-source"

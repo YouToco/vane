@@ -1,0 +1,2 @@
+# Deliberately empty until the external root-owned broker signer is provisioned.
+# Format: PRINCIPAL[,PRINCIPAL...] SSH_PUBLIC_KEY

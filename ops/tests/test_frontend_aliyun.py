@@ -8,7 +8,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEPLOY = ROOT / "scripts" / "deploy.sh"
+DEPLOY = ROOT / "release" / "deploy.sh"
 SHA = "190bf2d8264d393116f8a87da461e58f65784843"
 PREVIEW_OBJECT = (
     "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
@@ -188,7 +188,7 @@ class FrontendAliyunTests(unittest.TestCase):
                     "OSSUTIL_CALL_LOG": str(ossutil_call_log),
                     "OSS_REMOTE": str(remote),
                     "PATH": f"{fake_bin}:/usr/bin:/bin",
-                    "RUNNER_TEMP": str(runner_temp),
+                    "VANE_WORK_ROOT": str(runner_temp),
                 }
             )
             yield {

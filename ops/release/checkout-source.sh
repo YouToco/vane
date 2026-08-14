@@ -23,12 +23,17 @@ destination=$3
   echo "SOURCE_READ_KEY is required" >&2
   exit 1
 }
+[[ -n ${VANE_WORK_ROOT:-} && $VANE_WORK_ROOT == /* &&
+   -d $VANE_WORK_ROOT && ! -L $VANE_WORK_ROOT ]] || {
+  echo "VANE_WORK_ROOT must be an existing absolute directory" >&2
+  exit 1
+}
 [[ ! -e $destination ]] || {
   echo "checkout destination already exists: $destination" >&2
   exit 1
 }
 
-checkout_secret_dir=$(mktemp -d "$RUNNER_TEMP/source-checkout.XXXXXX")
+checkout_secret_dir=$(mktemp -d "$VANE_WORK_ROOT/source-checkout.XXXXXX")
 cleanup() {
   local status=$?
   trap - EXIT

@@ -9,11 +9,21 @@ fi
 
 install_dir=$1
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-lock_source=$script_dir/../tools/wrangler
+lock_source=$script_dir/../../tools/wrangler
 wrangler_version=4.115.0
+[[ -n ${VANE_TOOL_CACHE:-} && $VANE_TOOL_CACHE == /* &&
+   -d $VANE_TOOL_CACHE && ! -L $VANE_TOOL_CACHE ]] || {
+  echo "VANE_TOOL_CACHE must be an existing absolute directory" >&2
+  exit 65
+}
 
-[[ $install_dir == "$RUNNER_TEMP/"* ]] || {
-  echo "Wrangler install directory must be below RUNNER_TEMP" >&2
+[[ -n ${VANE_WORK_ROOT:-} && $VANE_WORK_ROOT == /* &&
+   -d $VANE_WORK_ROOT && ! -L $VANE_WORK_ROOT ]] || {
+  echo "VANE_WORK_ROOT must be an existing absolute directory" >&2
+  exit 65
+}
+[[ $install_dir == "$VANE_TOOL_CACHE/wrangler/$wrangler_version" ]] || {
+  echo "Wrangler install directory is not the locked cache target" >&2
   exit 65
 }
 [[ ! -e $install_dir ]] || {
@@ -24,7 +34,7 @@ wrangler_version=4.115.0
 node_bin=$(command -v node)
 npm_bin=$(command -v npm)
 [[ -x $node_bin && -x $npm_bin ]]
-[[ $("$node_bin" --version) == "v22.23.1" ]] || {
+[[ $("$node_bin" --version) == "v22.23.2" ]] || {
   echo "unexpected deployment Node version" >&2
   exit 67
 }

@@ -6,7 +6,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-CHECKER = ROOT / "scripts" / "check-go-build-info.sh"
+CHECKER = ROOT / "audit" / "check-go-build-info.sh"
 SHA = "ac36c9d967c0815ef1a0df3c7ac722823683b646"
 
 

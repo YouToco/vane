@@ -1,53 +1,57 @@
+import json
 import pathlib
+import subprocess
 import unittest
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
+OPS = pathlib.Path(__file__).resolve().parents[1]
+ROOT = OPS.parent
+CLI = OPS / "bin" / "vane"
 
 
-class BackendGateTests(unittest.TestCase):
-    def test_store_gate_uses_source_authoritative_isolated_shards(self) -> None:
-        workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+class LocalGatePolicyTests(unittest.TestCase):
+    def test_required_release_tool_versions_are_exact(self) -> None:
+        lock = json.loads(
+            (ROOT / "tools/toolchain.lock.json").read_text(encoding="utf-8")
+        )
+        versions = {name: value["version"] for name, value in lock["tools"].items()}
+        self.assertEqual(versions["go"], "1.26.6")
+        self.assertEqual(versions["node"], "22.23.2")
+        self.assertEqual(versions["temporal_cli"], "1.8.2")
+        self.assertEqual(versions["govulncheck"], "1.7.0")
+        self.assertEqual(versions["postgres"], "18")
+        self.assertEqual(versions["temporal_server"], "1.29.7")
+        self.assertEqual(versions["temporal_ui"], "2.52.1")
+        self.assertEqual(versions["caddy"], "2.10.2")
+        self.assertEqual(versions["shellcheck"], "0.11.0")
+        self.assertNotIn("actionlint", versions)
+        self.assertNotIn("UNRESOLVED", json.dumps(lock))
 
-        self.assertIn(
-            "go run ./cmd/storetestshard run \\\n",
-            workflow,
+    def test_doctor_checks_real_executables_downloads_and_signer(self) -> None:
+        result = subprocess.run(
+            [str(CLI), "doctor", "--json"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
         )
-        for shard in range(3):
-            self.assertIn(
-                f"job.services.postgres_{shard}.ports['5432']", workflow
-            )
-        self.assertIn("job.services.postgres_rest.ports['5432']", workflow)
-        self.assertIn(
-            'store_package="$(go list ./store)"', workflow
+        self.assertEqual(result.returncode, 78, result)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("locked executable" in error for error in report["errors"])
         )
-        self.assertIn(
-            'go list ./... | grep -Fvx "$store_package"', workflow
-        )
-        self.assertNotIn(
-            "-coverprofile=coverage.txt -covermode=atomic ./...", workflow
-        )
-        self.assertIn(
-            "- name: Report backend Store shard failure\n"
-            "        if: failure() && needs.plan.outputs.backend_changed == 'true'",
-            workflow,
-        )
-        self.assertIn('store-shard-status.json', workflow)
-        self.assertIn('select(.Action == "fail")', workflow)
-        self.assertIn(
-            'select(.Action == "output" or .Action == "fail")', workflow
-        )
-        self.assertLess(
-            workflow.index("- name: Report backend Store shard failure"),
-            workflow.index("- name: Remove per-attempt build root"),
-        )
+        self.assertTrue(any("locked download" in error for error in report["errors"]))
+        self.assertTrue(any("allowed signer" in error for error in report["errors"]))
 
-    def test_each_postgres_shard_uses_an_ephemeral_host_port(self) -> None:
-        workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
-
-        self.assertEqual(workflow.count("- 5432/tcp"), 4)
-        self.assertNotIn("- 5432:5432", workflow)
+    def test_policy_has_no_skipped_test_allowlist(self) -> None:
+        policy = json.loads(
+            (OPS / "policy/release-policy.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(policy["skip_allowlist"], [])
+        self.assertEqual(
+            policy["production_mutation_authority"], "external-root-owned-broker"
+        )
 
 
 if __name__ == "__main__":

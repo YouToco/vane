@@ -8,7 +8,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 class PythonCompatibilityTests(unittest.TestCase):
     def test_path_write_text_does_not_use_newline_keyword(self) -> None:
-        for path in sorted((ROOT / "scripts").glob("*.py")):
+        for path in sorted(ROOT.glob("**/*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):

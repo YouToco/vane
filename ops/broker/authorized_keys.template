@@ -1,0 +1,1 @@
+restrict,command="/usr/local/libexec/vane-broker" ssh-ed25519 REPLACE_WITH_BROKER_CLIENT_PUBLIC_KEY vane-release-controller
