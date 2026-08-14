@@ -15,7 +15,7 @@
 - **合并方式**：**squash merge**（保持 main 线性历史，React/Next.js 实践），
   squash 后的 commit message 遵循下方提交规范。
 - **生命周期**：分支存活不超过一个里程碑；合完即删。
-- **直推 main 的例外**：≤10 行的紧急修复 / 纯文档改动可直推，CI 必须绿；
+- **直推 main 的例外**：≤10 行的紧急修复 / 纯文档改动可直推，本地必需 Gate 必须通过；
   里程碑级功能一律走分支 + PR。
 - Git Flow 的 release/develop 分支不用——那是为「同时维护多个发布版本」设计的
   （如 Kubernetes 的 release-1.x），SaaS 单版本部署用不上。
