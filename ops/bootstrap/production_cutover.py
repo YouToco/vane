@@ -413,8 +413,11 @@ def verify_broker_key(plan: dict[str, Any], layout: Layout) -> None:
     private = layout.path("/etc/vane-broker/credentials/broker_signing_key")
     if private.is_symlink() or not private.is_file():
         raise BootstrapError("VPS broker signing key is unavailable")
-    actual = command_output(["ssh-keygen", "-y", "-f", str(private)])
-    if actual != plan["broker_signer_public_key"]:
+    fields = command_output(["ssh-keygen", "-y", "-f", str(private)]).split()
+    if len(fields) < 2:
+        raise BootstrapError("VPS broker signing key returned a malformed public key")
+    actual = f"{fields[0]} {fields[1]}"
+    if not PUBLIC_KEY.fullmatch(actual) or actual != plan["broker_signer_public_key"]:
         raise BootstrapError("VPS broker signing key differs from signed bootstrap plan")
 
 
