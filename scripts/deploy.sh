@@ -161,6 +161,7 @@ deploy_backend() {
     vane-migrate.service \
     vane-research-gateway.service \
     vane-research-gateway.socket \
+    agent-first-retention-prepared-control.sh \
     dynamicconfig/development-sql.yaml; do
     [[ -f $payload/deploy/$infra && ! -L $payload/deploy/$infra ]] || {
       echo "missing verified backend infra file: $infra" >&2
@@ -246,6 +247,7 @@ deploy_backend() {
   scp "${scp_opts[@]}" \
     "$payload/release-receipt.json" \
     "$(dirname "$0")/publish-retention-release.sh" \
+    "$payload/deploy/agent-first-retention-prepared-control.sh" \
     "$backend_ssh_target:$backend_remote_stage/"
   scp "${scp_opts[@]}" \
     "$payload/deploy/Caddyfile" \

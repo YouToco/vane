@@ -26,6 +26,7 @@ preserve_vane_snapshot=false
 gateway_recovery_required=false
 previous_gateway_snapshot_ready=false
 preserve_gateway_snapshot=false
+release_commit_complete=false
 rollback_dir=/opt/vane/.rollback-vane-${stage##*/.deploy-}
 research_legacy_env_keys=(
   VANE_DB_RESEARCH_RUNTIME_URL
@@ -51,7 +52,7 @@ snapshot_previous_vane_release() {
   local live_binary=/opt/vane/bin/vane
   local live_unit=/etc/systemd/system/vane.service
   local runtime_env_path environment_count server_env_state legacy_env_state
-  local owner_compat_env_state
+  local owner_compat_env_state retention_release_state retention_release_digest
 
   [[ ! -e $rollback_dir && ! -L $rollback_dir ]] || {
     echo "vane rollback snapshot path already exists" >&2
@@ -111,6 +112,23 @@ snapshot_previous_vane_release() {
   else
     owner_compat_env_state=absent
   fi
+  if [[ -e /opt/vane/active-retention-release ||
+        -L /opt/vane/active-retention-release ]]; then
+    [[ -f /opt/vane/active-retention-release &&
+       ! -L /opt/vane/active-retention-release &&
+       $(stat -c '%U:%G:%a' /opt/vane/active-retention-release) == root:root:600 ]] || {
+      echo "active retention release marker cannot be snapshotted safely" >&2
+      return 1
+    }
+    retention_release_digest=$(tr -d '\r\n' </opt/vane/active-retention-release)
+    [[ $retention_release_digest =~ ^[0-9a-f]{64}$ ]] || {
+      echo "active retention release marker is invalid" >&2
+      return 1
+    }
+    retention_release_state=present
+  else
+    retention_release_state=absent
+  fi
 
   install -d -o root -g root -m 0700 "$rollback_dir"
   cp --archive --reflink=auto -- "$live_binary" "$rollback_dir/vane"
@@ -121,6 +139,12 @@ snapshot_previous_vane_release() {
   printf '%s\n' "$legacy_env_state" >"$rollback_dir/legacy-env-state"
   printf '%s\n' "$owner_compat_env_state" \
     >"$rollback_dir/owner-compat-env-state"
+  printf '%s\n' "$retention_release_state" \
+    >"$rollback_dir/active-retention-release-state"
+  if [[ $retention_release_state == present ]]; then
+    cp --archive --reflink=auto -- /opt/vane/active-retention-release \
+      "$rollback_dir/active-retention-release"
+  fi
   if [[ $server_env_state == present &&
         $runtime_env_path != /opt/vane/env/server.env ]]; then
     cp --archive --reflink=auto -- /opt/vane/env/server.env \
@@ -1113,13 +1137,15 @@ commit_legacy_primary_release() {
 restore_previous_vane_release() (
   set -euo pipefail
   local runtime_env_path server_env_state legacy_env_state state attempt
-  local owner_compat_env_state
+  local owner_compat_env_state retention_release_state
   [[ $previous_vane_snapshot_ready == true && -d $rollback_dir &&
      ! -L $rollback_dir ]] || return 1
   read -r runtime_env_path <"$rollback_dir/runtime-env-path"
   read -r server_env_state <"$rollback_dir/server-env-state"
   read -r legacy_env_state <"$rollback_dir/legacy-env-state"
   read -r owner_compat_env_state <"$rollback_dir/owner-compat-env-state"
+  read -r retention_release_state \
+    <"$rollback_dir/active-retention-release-state"
   case "$runtime_env_path" in
     /opt/vane/.env|/opt/vane/env/server.env|/opt/vane/env/server-owner-compat.env) ;;
     *) echo "rollback snapshot has an unsafe runtime environment path" >&2; return 1 ;;
@@ -1135,6 +1161,11 @@ restore_previous_vane_release() (
   [[ $owner_compat_env_state == present ||
      $owner_compat_env_state == absent ]] || {
     echo "rollback snapshot has an invalid owner-compatible environment state" >&2
+    return 1
+  }
+  [[ $retention_release_state == present ||
+     $retention_release_state == absent ]] || {
+    echo "rollback snapshot has an invalid retention release marker state" >&2
     return 1
   }
   [[ -f $rollback_dir/vane && ! -L $rollback_dir/vane &&
@@ -1173,6 +1204,13 @@ restore_previous_vane_release() (
       return 1
     }
   fi
+  if [[ $retention_release_state == present ]]; then
+    [[ -f $rollback_dir/active-retention-release &&
+       ! -L $rollback_dir/active-retention-release ]] || {
+      echo "rollback retention release marker is unavailable" >&2
+      return 1
+    }
+  fi
 
   # Stop all restart attempts before replacing any member of the runtime
   # contract. If a later filesystem operation fails, the service stays down;
@@ -1193,7 +1231,8 @@ restore_previous_vane_release() (
     "$runtime_env_path.rollback-next" \
     /opt/vane/env/server.env.rollback-next \
     /opt/vane/.env.rollback-next \
-    /opt/vane/env/server-owner-compat.env.rollback-next
+    /opt/vane/env/server-owner-compat.env.rollback-next \
+    /opt/vane/active-retention-release.rollback-next
   cp --archive --reflink=auto -- "$rollback_dir/vane" \
     /opt/vane/bin/vane.rollback-next
   cp --archive --reflink=auto -- "$rollback_dir/vane.service" \
@@ -1213,6 +1252,10 @@ restore_previous_vane_release() (
         $runtime_env_path != /opt/vane/env/server-owner-compat.env ]]; then
     cp --archive --reflink=auto -- "$rollback_dir/owner-compat.env" \
       /opt/vane/env/server-owner-compat.env.rollback-next
+  fi
+  if [[ $retention_release_state == present ]]; then
+    cp --archive --reflink=auto -- "$rollback_dir/active-retention-release" \
+      /opt/vane/active-retention-release.rollback-next
   fi
 
   mv -f -- /opt/vane/bin/vane.rollback-next /opt/vane/bin/vane
@@ -1242,6 +1285,12 @@ restore_previous_vane_release() (
       rm -f -- /opt/vane/env/server-owner-compat.env
     fi
   fi
+  if [[ $retention_release_state == present ]]; then
+    mv -f -- /opt/vane/active-retention-release.rollback-next \
+      /opt/vane/active-retention-release
+  else
+    rm -f -- /opt/vane/active-retention-release
+  fi
 
   systemctl daemon-reload
   if [[ $previous_vane_restart_expected != true ]]; then
@@ -1265,7 +1314,8 @@ cleanup_remote_deploy() {
   local status=$?
   trap - EXIT
   set +e
-  if [[ $status -ne 0 && $gateway_recovery_required == true ]]; then
+  if [[ $status -ne 0 && $release_commit_complete != true &&
+        $gateway_recovery_required == true ]]; then
     if [[ $previous_gateway_snapshot_ready == true ]]; then
       echo "deployment failed after research gateway promotion;" \
         "restoring its previous runtime contract" >&2
@@ -1278,7 +1328,8 @@ cleanup_remote_deploy() {
       echo "research gateway promotion has no trusted rollback snapshot; automatic recovery is refused" >&2
     fi
   fi
-  if [[ $old_vane_recovery_required == true ]]; then
+  if [[ $status -ne 0 && $release_commit_complete != true &&
+        $old_vane_recovery_required == true ]]; then
     if [[ $old_vane_restart_safe == true &&
           $previous_vane_snapshot_ready == true ]]; then
       echo "deployment failed after a proven clean drain;" \
@@ -1320,7 +1371,8 @@ cleanup_remote_deploy() {
     /etc/vane/credentials/research_llm_api_key_gen1.rollback-next \
     /opt/vane/env/server-owner-compat.env.release-next \
     /opt/vane/env/server.env.release-next \
-    /opt/vane/env/server.env.release-next.stage-next
+    /opt/vane/env/server.env.release-next.stage-next \
+    /opt/vane/active-retention-release.rollback-next
   rm -rf -- "$stage"
   exit "$status"
 }
@@ -1508,6 +1560,15 @@ provision_native_v3_edit_recovery_runtime() {
   rm -rf -- "$pending"
 }
 
+# Serialize every VPS-side backend mutation with the offline retention
+# collector. The runner-local lock cannot protect a separately invoked
+# prepared audit or an operator shell on the production host. Acquire it only
+# after defining recovery helpers, but before the first host mutation.
+command -v flock >/dev/null
+install -d -o root -g root -m 0755 /run/lock
+exec 8>/run/lock/vane-backend-control-plane.lock
+flock 8
+
 ensure_system_user vane
 ensure_system_user vane-migrate
 ensure_system_user vane-research-gateway
@@ -1598,6 +1659,9 @@ actual_server_release_contract=$(
 }
 [[ -f $stage/bin/agentfirstretention && ! -L $stage/bin/agentfirstretention &&
    -x $stage/bin/agentfirstretention &&
+   -f $stage/agent-first-retention-prepared-control.sh &&
+   ! -L $stage/agent-first-retention-prepared-control.sh &&
+   -x $stage/agent-first-retention-prepared-control.sh &&
    -f $stage/release-receipt.json && ! -L $stage/release-receipt.json ]] || {
   echo "incoming Agent-first collector release authority is incomplete" >&2
   exit 1
@@ -1690,6 +1754,63 @@ chown vane-migrate:vane-migrate /etc/vane/credentials/migration_db_url.next
 chmod 0400 /etc/vane/credentials/migration_db_url.next
 mv -f /etc/vane/credentials/migration_db_url.next \
   /etc/vane/credentials/migration_db_url
+
+# Stop the only application writer before migration 132 can install its
+# physical legacy protocol fence. A worker checkpointing PostgreSQL and then
+# reaching Temporal must not straddle the schema commit. The existing rollback
+# snapshot is already complete at this point, so any migration failure can
+# restore the exact prior runtime contract.
+if systemctl is-active --quiet vane.service; then
+  [[ $previous_vane_snapshot_ready == true ]] || {
+    echo "active vane release has no complete rollback snapshot before migration" >&2
+    exit 1
+  }
+  migration_drain_invocation=$(
+    systemctl show vane.service --property=InvocationID --value
+  )
+  migration_drain_started_at=$(date +%s)
+  test -n "$migration_drain_invocation"
+  old_vane_recovery_required=true
+  systemctl stop vane.service
+  [[ $(systemctl is-active vane.service 2>/dev/null || true) == inactive ]] || {
+    echo "vane did not become inactive before migration" >&2
+    exit 1
+  }
+  migration_drain_log=$(
+    journalctl "_SYSTEMD_INVOCATION_ID=$migration_drain_invocation" \
+      --no-pager -o cat
+  )
+  grep -Fq "关停完成" <<<"$migration_drain_log" || {
+    echo "pre-migration vane drain has no graceful-shutdown proof" >&2
+    exit 1
+  }
+  migration_stop_log=$(
+    journalctl -u vane.service --since "@$migration_drain_started_at" \
+      --no-pager -o cat
+  )
+  if grep -Eiq \
+    "(stop-sigterm.*timed out|timed out.*killing|signal SIGKILL|status=9/KILL|code=killed.*KILL)" \
+    <<<"$migration_drain_log"$'\n'"$migration_stop_log"; then
+    echo "pre-migration vane drain hit a timeout or SIGKILL" >&2
+    exit 1
+  fi
+  old_vane_restart_safe=true
+fi
+migration_leftover_pids=
+for process_exe in /proc/[0-9]*/exe; do
+  executable=$(readlink "$process_exe" 2>/dev/null || true)
+  case "$executable" in
+    "/opt/vane/bin/vane"|"/opt/vane/bin/vane (deleted)")
+      pid=${process_exe#/proc/}
+      pid=${pid%/exe}
+      migration_leftover_pids="$migration_leftover_pids $pid"
+      ;;
+  esac
+done
+[[ -z $migration_leftover_pids ]] || {
+  echo "vane processes remain before migration:$migration_leftover_pids" >&2
+  exit 1
+}
 
 # test-anchor: gateway-migration-gate-begin
 # Migration is a deploy-time gate, never a boot dependency or enabled unit.
@@ -2211,7 +2332,19 @@ cmp -s -- /proc/"$vane_pid"/exe /opt/vane/bin/vane &&
   echo "retention release publisher is unavailable" >&2
   exit 1
 }
-bash "$stage/publish-retention-release.sh" /opt/vane/releases \
-  "$stage/bin/agentfirstretention" "$stage/release-receipt.json" >/dev/null
-old_vane_recovery_required=false
-gateway_recovery_required=false
+published_retention_release=$(
+  bash "$stage/publish-retention-release.sh" /opt/vane/releases \
+    "$stage/bin/agentfirstretention" "$stage/release-receipt.json" \
+    "$stage/agent-first-retention-prepared-control.sh"
+)
+[[ $published_retention_release == \
+   /opt/vane/releases/$release_receipt_digest ]] || {
+  echo "published retention release path differs" >&2
+  exit 1
+}
+active_retention_next=$(mktemp /opt/vane/.active-retention-release.XXXXXX)
+printf '%s\n' "$release_receipt_digest" >"$active_retention_next"
+chown root:root "$active_retention_next"
+chmod 0600 "$active_retention_next"
+mv -f -- "$active_retention_next" /opt/vane/active-retention-release
+release_commit_complete=true

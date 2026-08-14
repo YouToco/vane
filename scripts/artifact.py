@@ -38,6 +38,7 @@ BACKEND_FILES = {
     "deploy/vane-migrate.service": 0o644,
     "deploy/vane-research-gateway.service": 0o644,
     "deploy/vane-research-gateway.socket": 0o644,
+    "deploy/agent-first-retention-prepared-control.sh": 0o755,
     "deploy/dynamicconfig/development-sql.yaml": 0o644,
 }
 

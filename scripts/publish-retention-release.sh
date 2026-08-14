@@ -2,17 +2,19 @@
 set -euo pipefail
 umask 077
 
-if [[ $# -ne 3 ]]; then
-  echo "usage: $0 RELEASE_ROOT COLLECTOR RECEIPT" >&2
+if [[ $# -ne 4 ]]; then
+  echo "usage: $0 RELEASE_ROOT COLLECTOR RECEIPT CONTROL" >&2
   exit 2
 fi
 
 release_root=$1
 collector=$2
 receipt=$3
+control=$4
 [[ $release_root == /* && $release_root != / &&
    -f $collector && ! -L $collector && -x $collector &&
-   -f $receipt && ! -L $receipt ]] || {
+   -f $receipt && ! -L $receipt &&
+   -f $control && ! -L $control && -x $control ]] || {
   echo "retention release publication input is unsafe" >&2
   exit 1
 }
@@ -53,8 +55,10 @@ validate_release() {
   trusted_directory "$release_dir" 755 &&
     trusted_file "$release_dir/agentfirstretention" 755 &&
     trusted_file "$release_dir/release-receipt.json" 644 &&
+    trusted_file "$release_dir/agent-first-retention-prepared-control" 755 &&
     cmp -s -- "$collector" "$release_dir/agentfirstretention" &&
     cmp -s -- "$receipt" "$release_dir/release-receipt.json" &&
+    cmp -s -- "$control" "$release_dir/agent-first-retention-prepared-control" &&
     [[ $(sha256sum "$release_dir/release-receipt.json" | awk '{print $1}') == \
        "$receipt_digest" ]]
 }
@@ -79,6 +83,7 @@ trap cleanup EXIT
 chmod 0755 "$pending"
 install -m 0755 "$collector" "$pending/agentfirstretention"
 install -m 0644 "$receipt" "$pending/release-receipt.json"
+install -m 0755 "$control" "$pending/agent-first-retention-prepared-control"
 
 won_publication=true
 if ! mv -T -- "$pending" "$release_dir"; then

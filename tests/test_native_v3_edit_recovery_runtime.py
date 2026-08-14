@@ -20,7 +20,9 @@ def extract_function(script: str, name: str, next_name: str) -> str:
 def extracted_runtime(root: Path) -> str:
     script = REMOTE.read_text(encoding="utf-8")
     provision_start = script.index("provision_native_v3_edit_recovery_runtime() {")
-    provision_finish = script.index("\nensure_system_user vane", provision_start)
+    provision_finish = script.index(
+        "\n# Serialize every VPS-side backend mutation", provision_start
+    )
     functions = (
         extract_function(script, "read_hex_secret", "assert_native_v3_edit_recovery_credential")
         + extract_function(
@@ -228,7 +230,9 @@ fi
         )
         provision_start = script.index("provision_native_v3_edit_recovery_runtime() {")
         provision = script[
-            provision_start : script.index("\nensure_system_user vane", provision_start)
+            provision_start : script.index(
+                "\n# Serialize every VPS-side backend mutation", provision_start
+            )
         ]
         self.assertIn("printf \"ALTER ROLE", provision)
         self.assertIn("|\n      docker compose exec", provision)

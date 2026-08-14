@@ -18,6 +18,60 @@ SPEC.loader.exec_module(artifact)
 
 
 class BackendRuntimeContractTest(unittest.TestCase):
+    def test_remote_backend_serializes_with_retention_control_plane(self) -> None:
+        remote = REMOTE.read_text(encoding="utf-8")
+        self.assertEqual(
+            remote.count('exec 8>/run/lock/vane-backend-control-plane.lock'), 1
+        )
+        self.assertEqual(remote.count("flock 8"), 1)
+        self.assertLess(
+            remote.index('exec 8>/run/lock/vane-backend-control-plane.lock'),
+            remote.index("ensure_system_user vane"),
+        )
+
+    def test_primary_writer_is_gracefully_drained_before_schema_migration(self) -> None:
+        remote = REMOTE.read_text(encoding="utf-8")
+        credential = remote.index(
+            "mv -f /etc/vane/credentials/migration_db_url.next"
+        )
+        migration = remote.index("# test-anchor: gateway-migration-gate-begin")
+        drain = remote[credential:migration]
+
+        self.assertEqual(drain.count("systemctl stop vane.service"), 1)
+        self.assertIn('grep -Fq "关停完成"', drain)
+        self.assertIn("pre-migration vane drain hit a timeout or SIGKILL", drain)
+        self.assertIn("for process_exe in /proc/[0-9]*/exe", drain)
+        self.assertIn("vane processes remain before migration", drain)
+        self.assertLess(
+            remote.index("systemctl stop vane.service", credential, migration),
+            migration,
+        )
+
+    def test_active_retention_release_marker_is_part_of_runtime_rollback(self) -> None:
+        remote = REMOTE.read_text(encoding="utf-8")
+        self.assertIn(
+            '>"$rollback_dir/active-retention-release-state"', remote
+        )
+        self.assertIn(
+            '"$rollback_dir/active-retention-release"', remote
+        )
+        self.assertIn(
+            "mv -f -- /opt/vane/active-retention-release.rollback-next",
+            remote,
+        )
+        marker_commit = remote.rindex(
+            "mv -f -- \"$active_retention_next\" /opt/vane/active-retention-release"
+        )
+        recovery_commit = remote.rindex("release_commit_complete=true")
+        self.assertLess(marker_commit, recovery_commit)
+        self.assertEqual(remote.count("release_commit_complete=true"), 1)
+        cleanup = remote[
+            remote.index("cleanup_remote_deploy()") : remote.index(
+                "trap cleanup_remote_deploy EXIT"
+            )
+        ]
+        self.assertEqual(cleanup.count("release_commit_complete != true"), 2)
+
     def test_control_and_deploy_use_the_fixed_go_toolchain(self) -> None:
         for path in (CONTROL_CI, WORKFLOW):
             workflow = path.read_text(encoding="utf-8")
@@ -43,6 +97,7 @@ class BackendRuntimeContractTest(unittest.TestCase):
             "deploy/vane-migrate.service",
             "deploy/vane-research-gateway.service",
             "deploy/vane-research-gateway.socket",
+            "deploy/agent-first-retention-prepared-control.sh",
             "deploy/dynamicconfig/development-sql.yaml",
         }
         self.assertEqual(set(artifact.BACKEND_FILES), expected)
@@ -72,6 +127,8 @@ class BackendRuntimeContractTest(unittest.TestCase):
             self.assertIn(unit, remote)
         self.assertIn("vane-legacy-compat.service", deploy)
         self.assertIn("vane-legacy-compat.service", remote)
+        self.assertIn("agent-first-retention-prepared-control.sh", deploy)
+        self.assertIn("agent-first-retention-prepared-control", remote)
         self.assertIn('"$payload/release-receipt.json"', deploy)
         self.assertIn(
             "incoming Agent-first release receipt differs from staged binaries",
@@ -92,6 +149,13 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertIn('trusted_directory "$release_root" 755', publisher)
         self.assertIn('trusted_file "$release_dir/agentfirstretention" 755', publisher)
         self.assertIn('trusted_file "$release_dir/release-receipt.json" 644', publisher)
+        self.assertIn(
+            'trusted_file "$release_dir/agent-first-retention-prepared-control" 755',
+            publisher,
+        )
+        self.assertNotIn(
+            "/opt/vane/bin/agent-first-retention-prepared-control", remote
+        )
         receipt_publish = remote.rindex('bash "$stage/publish-retention-release.sh"')
         final_gate = remote.rindex(
             "/opt/vane/bin/gate -env /opt/vane/env/server.env"
@@ -196,7 +260,7 @@ class BackendRuntimeContractTest(unittest.TestCase):
             cleanup.index("restore_previous_vane_release"),
         )
         self.assertGreater(
-            remote.rindex("gateway_recovery_required=false"),
+            remote.rindex("release_commit_complete=true"),
             remote.rindex("/opt/vane/bin/gate -env /opt/vane/env/server.env"),
         )
 
@@ -350,7 +414,7 @@ class BackendRuntimeContractTest(unittest.TestCase):
             remote.index("/opt/vane/env/server.env.next"),
         )
         self.assertGreater(
-            remote.rindex("old_vane_recovery_required=false"),
+            remote.rindex("release_commit_complete=true"),
             remote.rindex("/opt/vane/bin/gate -env /opt/vane/env/server.env"),
         )
         rollforward = remote[remote.index(

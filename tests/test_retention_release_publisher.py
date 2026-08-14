@@ -20,17 +20,21 @@ class RetentionReleasePublisherTest(unittest.TestCase):
         self.releases = self.root / "releases"
         self.collector = self.root / "agentfirstretention"
         self.receipt = self.root / "release-receipt.json"
+        self.control = self.root / "agent-first-retention-prepared-control"
         self.collector.write_bytes(b"collector-v1")
         self.collector.chmod(0o755)
         self.receipt.write_bytes(b'{"schema_version":"fixture/v1"}')
         self.receipt.chmod(0o644)
+        self.control.write_bytes(b"#!/bin/sh\nexit 0\n")
+        self.control.chmod(0o755)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
     def publish(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(PUBLISHER), str(self.releases), str(self.collector), str(self.receipt)],
+            [str(PUBLISHER), str(self.releases), str(self.collector), str(self.receipt),
+             str(self.control)],
             text=True, capture_output=True, check=False,
         )
 
@@ -46,6 +50,14 @@ class RetentionReleasePublisherTest(unittest.TestCase):
         self.assertEqual((release / "agentfirstretention").read_bytes(), b"collector-v1")
         self.assertEqual((release / "agentfirstretention").stat().st_mode & 0o777, 0o755)
         self.assertEqual((release / "release-receipt.json").stat().st_mode & 0o777, 0o644)
+        self.assertEqual(
+            (release / "agent-first-retention-prepared-control").read_bytes(),
+            b"#!/bin/sh\nexit 0\n",
+        )
+        self.assertEqual(
+            (release / "agent-first-retention-prepared-control").stat().st_mode & 0o777,
+            0o755,
+        )
         second = self.publish()
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(list(self.releases.glob(".*")), [])
@@ -78,17 +90,17 @@ class RetentionReleasePublisherTest(unittest.TestCase):
         for target, mutation in (
             (release / "release-receipt.json", lambda path: path.chmod(0o666)),
             (release / "agentfirstretention", lambda path: path.write_bytes(b"changed")),
+            (release / "agent-first-retention-prepared-control",
+             lambda path: path.write_bytes(b"changed-control")),
         ):
             with self.subTest(target=target.name):
-                if target.name == "release-receipt.json":
-                    mutation(target)
-                    result = self.publish()
-                    self.assertNotEqual(result.returncode, 0)
-                    target.chmod(0o644)
-                else:
-                    mutation(target)
-                    result = self.publish()
-                    self.assertNotEqual(result.returncode, 0)
+                original = target.read_bytes()
+                mode = target.stat().st_mode & 0o777
+                mutation(target)
+                result = self.publish()
+                self.assertNotEqual(result.returncode, 0)
+                target.write_bytes(original)
+                target.chmod(mode)
 
     def test_symlinked_or_writable_release_root_is_rejected(self) -> None:
         real = self.root / "real"

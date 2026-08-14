@@ -272,6 +272,8 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
         restart_safe: bool,
         snapshot_ready: bool,
         restore_succeeds: bool,
+        gateway_required: bool = False,
+        release_committed: bool = False,
     ) -> tuple[subprocess.CompletedProcess[bytes], str]:
         with tempfile.TemporaryDirectory() as tempdir:
             log = Path(tempdir) / "recovery.log"
@@ -281,9 +283,16 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                 f"stage={shlex.quote(stage)}\n"
                 f"{extract_recovery()}\n"
                 "old_vane_recovery_required=true\n"
+                f"gateway_recovery_required={'true' if gateway_required else 'false'}\n"
+                f"release_commit_complete={'true' if release_committed else 'false'}\n"
                 f"old_vane_restart_safe={'true' if restart_safe else 'false'}\n"
                 "previous_vane_snapshot_ready="
                 f"{'true' if snapshot_ready else 'false'}\n"
+                "previous_gateway_snapshot_ready=true\n"
+                "restore_previous_gateway_release() {\n"
+                "  printf 'restore gateway contract\\n' >>\"$LOG\"\n"
+                f"  {'return 0' if restore_succeeds else 'return 17'}\n"
+                "}\n"
                 "restore_previous_vane_release() {\n"
                 "  printf 'restore runtime contract\\n' >>\"$LOG\"\n"
                 f"  {'return 0' if restore_succeeds else 'return 17'}\n"
@@ -300,7 +309,31 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
             )
             return result, log.read_text(encoding="utf-8")
 
-    def runtime_fixture_script(self, root: Path, environment: str) -> str:
+    def test_release_commit_is_the_single_recovery_disarm_point(self) -> None:
+        interrupted, interrupted_log = self.run_cleanup(
+            restart_safe=True,
+            snapshot_ready=True,
+            restore_succeeds=True,
+            gateway_required=True,
+        )
+        committed, committed_log = self.run_cleanup(
+            restart_safe=True,
+            snapshot_ready=True,
+            restore_succeeds=True,
+            gateway_required=True,
+            release_committed=True,
+        )
+
+        self.assertEqual(interrupted.returncode, 23, interrupted.stderr.decode())
+        self.assertIn("restore gateway contract", interrupted_log)
+        self.assertIn("restore runtime contract", interrupted_log)
+        self.assertEqual(committed.returncode, 23, committed.stderr.decode())
+        self.assertNotIn("restore gateway contract", committed_log)
+        self.assertNotIn("restore runtime contract", committed_log)
+
+    def runtime_fixture_script(
+        self, root: Path, environment: str, marker_present: bool = True
+    ) -> str:
         opt = (root / "opt/vane").as_posix()
         systemd = (root / "etc/systemd/system").as_posix()
         transformed = extract_recovery().replace("/opt/vane", opt).replace(
@@ -352,6 +385,7 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
             "sleep() { :; }\n"
             "stat() {\n"
             "  case \"$2\" in\n"
+            "    %U:%G:%a) printf 'root:root:600\\n' ;;\n"
             "    %U) printf 'root\\n' ;;\n"
             "    %a) printf '600\\n' ;;\n"
             "    *) command stat \"$@\" ;;\n"
@@ -372,11 +406,20 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                 f"printf 'VANE_DB_URL=postgres://vane:fixture@db/vane\\n"
                 f"legacy owner env\\n' >{shlex.quote(opt + '/.env')}\n"
                 if environment != "legacy"
+            else ""
+            )
+            +
+            (
+                f"printf '{('a' * 64)}\\n' >"
+                f"{shlex.quote(opt + '/active-retention-release')}\n"
+                if marker_present
                 else ""
             )
             +
             "snapshot_previous_vane_release\n"
             "previous_vane_restart_expected=true\n"
+            f"printf '{('b' * 64)}\\n' >"
+            f"{shlex.quote(opt + '/active-retention-release')}\n"
             + (
                 f"printf 'changed owner compat env\\n' "
                 f">{shlex.quote(opt + '/env/server-owner-compat.env')}\n"
@@ -396,16 +439,24 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
         environment: str,
         *,
         fail_unit_move: bool = False,
+        fail_marker_move: bool = False,
+        marker_present: bool = True,
         assert_primary_fence: bool = False,
     ) -> tuple[subprocess.CompletedProcess[bytes], dict[str, str | bool]]:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             log = root / "commands.log"
-            script = self.runtime_fixture_script(root, environment)
-            if fail_unit_move:
+            script = self.runtime_fixture_script(root, environment, marker_present)
+            if fail_unit_move or fail_marker_move:
                 script += (
                     "mv() {\n"
-                    "  if [[ $* == *vane.service.rollback-next* ]]; then return 17; fi\n"
+                    "  if [[ $* == *"
+                    + (
+                        "active-retention-release.rollback-next"
+                        if fail_marker_move
+                        else "vane.service.rollback-next"
+                    )
+                    + "* ]]; then return 17; fi\n"
                     "  command mv \"$@\"\n"
                     "}\n"
                     "set +e\n"
@@ -445,6 +496,14 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
                     else ""
                 ),
                 "log": log.read_text(encoding="utf-8") if log.exists() else "",
+                "retention_marker_present": (
+                    opt / "active-retention-release"
+                ).exists(),
+                "retention_marker": (
+                    (opt / "active-retention-release").read_text(encoding="utf-8")
+                    if (opt / "active-retention-release").exists()
+                    else ""
+                ),
             }
             return result, state
 
@@ -643,6 +702,8 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
             "VANE_DB_URL=postgres://vane:fixture@db/vane\nold runtime env\n",
         )
         self.assertFalse(state["server_env_present"])
+        self.assertTrue(state["retention_marker_present"])
+        self.assertEqual(state["retention_marker"], "a" * 64 + "\n")
         self.assertIn("systemctl stop vane.service", state["log"])
         self.assertIn("systemctl start vane.service", state["log"])
 
@@ -688,6 +749,22 @@ class RemoteBackendRecoveryTest(unittest.TestCase):
 
     def test_partial_restore_failure_never_restarts_mixed_release(self) -> None:
         result, state = self.run_runtime_restore("split", fail_unit_move=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("systemctl stop vane.service", state["log"])
+        self.assertIn("systemctl disable vane.service", state["log"])
+        self.assertNotIn("systemctl start vane.service", state["log"])
+
+    def test_absent_retention_marker_is_removed_by_runtime_rollback(self) -> None:
+        result, state = self.run_runtime_restore("split", marker_present=False)
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertFalse(state["retention_marker_present"])
+
+    def test_retention_marker_restore_failure_never_restarts_old_runtime(self) -> None:
+        result, state = self.run_runtime_restore(
+            "split", fail_marker_move=True
+        )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("systemctl stop vane.service", state["log"])
