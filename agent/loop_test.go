@@ -435,7 +435,7 @@ func TestAgentThinkingPolicyAndReasoningContinuationStayTransient(t *testing.T) 
 		t.Fatalf("requests=%d, want 2", len(chat.requests))
 	}
 	for i, request := range chat.requests {
-		if request.MaxTokens == nil || *request.MaxTokens != 4096 ||
+		if request.MaxTokens != nil ||
 			!request.EnableThinking || request.DisableThinking ||
 			request.ReasoningEffort != llm.ReasoningEffortHigh {
 			t.Fatalf("request %d policy = %+v", i, request)
@@ -454,6 +454,74 @@ func TestAgentThinkingPolicyAndReasoningContinuationStayTransient(t *testing.T) 
 		strings.Contains(string(store.lastMessages), "private final chain") ||
 		strings.Contains(string(store.lastMessages), "reasoning_content") {
 		t.Fatalf("reasoning leaked into session persistence: %s", store.lastMessages)
+	}
+}
+
+func TestAgentPreservesCompleteSessionHistoryAndOmitsCompletionCap(t *testing.T) {
+	const middleSentinel = "middle-history-must-survive"
+	history := make([]llm.ChatMessage, 70)
+	for i := range history {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		history[i] = llm.ChatMessage{
+			Role: role, Content: fmt.Sprintf("history-%02d", i),
+		}
+	}
+	history[30].Content = middleSentinel
+	raw, err := json.Marshal(history)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := newFakeStore()
+	sess, err := store.CreateAgentSession(t.Context(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.sessions[sess.ID].Messages = raw
+	store.mu.Unlock()
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		Content: "complete", FinishReason: "stop",
+	}}}
+	loop := newTestLoop(t, store, chat.fn)
+
+	outcome, err := loop.HandleMessage(t.Context(), 7, "current-question")
+	if err != nil || outcome.Reply != "complete" {
+		t.Fatalf("outcome=%+v err=%v", outcome, err)
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("requests=%d want=1", len(chat.requests))
+	}
+	request := chat.requests[0]
+	if request.MaxTokens != nil {
+		t.Fatalf("interactive max_tokens=%v want omitted", *request.MaxTokens)
+	}
+	if len(request.Messages) != len(history)+2 {
+		t.Fatalf("request messages=%d want=%d", len(request.Messages), len(history)+2)
+	}
+	if request.Messages[31].Content != middleSentinel {
+		t.Fatalf("middle history missing: %+v", request.Messages[31])
+	}
+
+	var persisted []llm.ChatMessage
+	if err := json.Unmarshal(store.lastMessages, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != len(history)+2 {
+		t.Fatalf("persisted messages=%d want=%d", len(persisted), len(history)+2)
+	}
+	if persisted[30].Content != middleSentinel ||
+		persisted[len(persisted)-2].Content != "current-question" ||
+		persisted[len(persisted)-1].Content != "complete" {
+		t.Fatalf("complete history not persisted: first=%+v middle=%+v last=%+v",
+			persisted[0], persisted[30], persisted[len(persisted)-1])
+	}
+	if len(store.eventBatches) != 1 ||
+		len(store.eventBatches[0].Events) != len(persisted)+2 {
+		t.Fatalf("ledger batch does not retain full history: %+v", store.eventBatches)
 	}
 }
 

@@ -115,16 +115,6 @@ const (
 	defaultMaxTurns   = 20
 	defaultSessionTTL = 30 * time.Minute
 
-	// 会话消息截断阈值（契约 §10）：超过 maxSessionMessages 时
-	// 保留最早 1 条 user + 最近 keepRecentMessages 条，防上下文无限膨胀。
-	maxSessionMessages = 60
-	keepRecentMessages = 40
-
-	// replyMaxTokens is the interactive Agent's bounded completion budget.
-	// Production-shaped thinking-mode evaluation showed that 2048 can truncate
-	// otherwise valid summaries while 4096 closes the tested tool/recovery set.
-	// Dedicated strict-JSON authorizers retain their smaller independent caps.
-	replyMaxTokens = 4096
 	// These are hidden execution fuses, not model-visible planning quotas.
 	// The loop preserves a final tool-free turn to synthesize partial evidence.
 	// Eight executions cover the complete intelligence catalog lookup plus
@@ -679,7 +669,7 @@ func (l *Loop) handleGroundedMessage(
 		{Role: "user", Content: question},
 		{Role: "assistant", Content: outcome.Reply},
 	}
-	persisted := truncateMessages(append(history, visible...))
+	persisted := append(history, visible...)
 	if err := l.saveSession(
 		ctx, sess, persisted, turns, state, turnID,
 	); err != nil {
@@ -758,7 +748,6 @@ func (l *Loop) handleMessage(
 		modelHistory = nil
 	}
 	msgs := append(modelHistory, llm.ChatMessage{Role: "user", Content: text})
-	msgs = truncateMessages(msgs)
 
 	// 端点注册表契约 §4：激活集随会话持久化，本条消息的工具运行状态经 ctx 旁路
 	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
@@ -816,7 +805,7 @@ func (l *Loop) handleMessage(
 		// 调工具也必须把整轮压平。不能依赖文本前缀：调用者已经通过类型化入口
 		// 给出了信任标签，未来包装文案改名也不能让原文漏进持久化历史。
 		externalTurn := redactLatestExternalInput(msgs)
-		msgs = truncateMessages(append(history, externalTurn...))
+		msgs = append(history, externalTurn...)
 	} else if state.compartmentedResearch != nil &&
 		state.compartmentedResearch.visibleTurn {
 		// Compartmented synthesis deliberately returns only the safe visible
@@ -826,7 +815,7 @@ func (l *Loop) handleMessage(
 			{Role: "user", Content: text},
 			{Role: "assistant", Content: outcome.Reply},
 		}
-		msgs = truncateMessages(append(history, visible...))
+		msgs = append(history, visible...)
 	}
 	// 纵深：当前产品没有确认卡，模型也不得口头声称已经发送旧卡片。
 	scrubbed := rejectRetiredConfirmationClaim(outcome.Reply)
@@ -870,7 +859,6 @@ func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMess
 	msgs := make([]llm.ChatMessage, 0, len(history)+1)
 	msgs = append(msgs, history...)
 	msgs = append(msgs, llm.ChatMessage{Role: "user", Content: text})
-	msgs = truncateMessages(msgs)
 
 	turnID := uuid.NewString()
 	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{
@@ -1030,7 +1018,6 @@ func (l *Loop) converse(
 			// 每轮现算工具面：静态声明 + 会话已激活端点声明（tool_search 本轮
 			// 激活的端点，下一轮就出现在这里——检索后注入的核心闭环）。
 			Tools:           tools,
-			MaxTokens:       iptr(replyMaxTokens),
 			EnableThinking:  true,
 			ReasoningEffort: llm.ReasoningEffortHigh,
 		}
@@ -2428,36 +2415,6 @@ func decodeMessages(sess *types.AgentSession) []llm.ChatMessage {
 		return nil
 	}
 	return msgs
-}
-
-// truncateMessages 按契约 §10 简单截断：超过 60 条时保留最早 1 条 user +
-// 最近 40 条。截断边界可能切断 assistant(tool_calls) 与其 tool 回执的配对
-// （契约明确要求"简单截断"，配对风险已记录到交付报告）。
-func truncateMessages(msgs []llm.ChatMessage) []llm.ChatMessage {
-	if len(msgs) <= maxSessionMessages {
-		return msgs
-	}
-	cut := len(msgs) - keepRecentMessages
-	// 截断边界向后推进到下一条 user 消息：任意切点可能落在 assistant(tool_calls)
-	// 与其 role=tool 回执之间，产生以孤儿 tool 消息开头的历史——OpenAI 兼容上游会
-	// 直接拒绝该请求。以 user 开头的保留段永远是合法前缀。
-	for cut < len(msgs) && msgs[cut].Role != "user" {
-		cut++
-	}
-	if cut >= len(msgs) {
-		// 最近段里连一条 user 都没有（几乎不可能：每轮都以 user 开始），
-		// 退化为只保留最早意图，宁短勿坏。
-		cut = len(msgs)
-	}
-	out := make([]llm.ChatMessage, 0, len(msgs)-cut+1)
-	// 最早 1 条 user 保底：保留会话最初的意图（只在被截掉的前段里找，避免重复）。
-	for _, m := range msgs[:cut] {
-		if m.Role == "user" {
-			out = append(out, m)
-			break
-		}
-	}
-	return append(out, msgs[cut:]...)
 }
 
 // scrubUntrustedHistory 把每个含外部结果的 user turn 压成「原 user + 固定占位」。
