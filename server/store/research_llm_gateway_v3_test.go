@@ -730,8 +730,11 @@ func TestResearchLLMGatewaySignedSettlementAndAttacksPostgres(t *testing.T) {
 	if provenance != "verified_gateway" {
 		t.Fatalf("provenance=%q", provenance)
 	}
-	if replay, err := f.store.CommitResearchRunLLMReceiptV3(t.Context(), gatewayCommitParamsV3(f, reservation, signed)); err != nil || replay.LLMCallID != settled.LLMCallID {
-		t.Fatalf("replay=%+v err=%v", replay, err)
+	// The compatibility fixture temporarily restores only the old signer
+	// grants. Once the exact call has settled, the current capability fence must
+	// refuse a second direct-signer settlement instead of reopening authority.
+	if replay, err := f.store.CommitResearchRunLLMReceiptV3(t.Context(), gatewayCommitParamsV3(f, reservation, signed)); err == nil {
+		t.Fatalf("retired direct-signer replay accepted: %+v", replay)
 	}
 
 	// Signature covers completion/usage/provider model; any mutation is rejected.

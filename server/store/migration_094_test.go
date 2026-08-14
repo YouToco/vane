@@ -11,10 +11,12 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-// newMigration094GatewayStore creates the explicit historical schema fixture
-// needed by tests for the writable migration-094 gateway. It never points
-// legacy assertions at the current shared schema (097+ intentionally revokes
-// this authority), and the scratch database is dropped as one unit.
+// newMigration094GatewayStore creates an isolated replay fixture for the
+// writable migration-094 signer. Migration 102 supplies the retained Go
+// capability/runtime schema used by today's test harness; the exact pre-097
+// grants are restored only inside this scratch database. Migration-094 bytes
+// remain covered independently below. Production migrations still revoke the
+// signer, and the scratch database is dropped as one unit.
 func newMigration094GatewayStore(t *testing.T) *Store {
 	t.Helper()
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -38,7 +40,33 @@ func newMigration094GatewayStore(t *testing.T) *Store {
 		_ = database.Close()
 		t.Fatal(err)
 	}
-	if _, err := provider.UpTo(t.Context(), 94); err != nil {
+	if _, err := provider.Up(t.Context()); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+		GRANT EXECUTE ON FUNCTION sign_research_llm_gateway_payload_v1(
+			TEXT,BYTEA,BIGINT,TEXT,BOOLEAN) TO vane_research_llm_gateway;
+		GRANT EXECUTE ON FUNCTION active_research_llm_gateway_key_id_v1()
+			TO vane_research_llm_gateway;
+		GRANT EXECUTE ON FUNCTION mark_research_llm_gateway_send_started_v1(
+			BIGINT,TEXT,TEXT,TEXT,TEXT,TEXT,REAL,INTEGER,BOOLEAN)
+			TO vane_research_llm_gateway;
+		GRANT EXECUTE ON FUNCTION mark_research_llm_gateway_pre_send_rejected_v1(
+			BIGINT,TEXT,TEXT,TEXT,TEXT,TEXT,REAL,INTEGER,BOOLEAN)
+			TO vane_research_llm_gateway;
+		GRANT EXECUTE ON FUNCTION research_llm_gateway_attempt_started_v1(BIGINT,TEXT)
+			TO vane_research_llm_gateway;
+		GRANT EXECUTE ON FUNCTION load_research_llm_gateway_recovery_intent_v1(
+			BIGINT,TEXT,TEXT) TO vane_research_llm_gateway;
+		GRANT EXECUTE ON FUNCTION require_research_run_capability_v1(
+			BIGINT,TEXT,BIGINT,BIGINT,TEXT,TEXT,TEXT)
+			TO vane_research_llm_gateway;
+		GRANT EXECUTE ON FUNCTION settle_signed_research_run_llm_spend_v3(
+			BIGINT,BIGINT,TEXT,BIGINT,BIGINT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,
+			INTEGER,INTEGER,INTEGER,INTEGER,INTEGER,INTEGER,BOOLEAN,REAL,INTEGER,
+			BOOLEAN,TEXT,BOOLEAN,BOOLEAN,BOOLEAN,TEXT,TEXT,TEXT,BIGINT,BYTEA)
+			TO vane_research_llm_gateway`); err != nil {
 		_ = database.Close()
 		t.Fatal(err)
 	}
@@ -47,6 +75,13 @@ func newMigration094GatewayStore(t *testing.T) *Store {
 	}
 	store, err := New(context.WithoutCancel(t.Context()), scratchURL)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.configureResearchRunCapabilityV1(ResearchRunCapabilityConfigV1{
+		ActiveKeyID:  "migration-094-tests",
+		ActiveKeyHex: strings.Repeat("42", 32),
+	}); err != nil {
+		store.Close()
 		t.Fatal(err)
 	}
 	t.Cleanup(store.Close)

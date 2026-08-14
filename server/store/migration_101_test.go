@@ -252,10 +252,9 @@ func TestMigration101HardensPreexistingUnsafeOperatorPostgres(t *testing.T) {
 	if databaseURL == "" {
 		requireDatabaseCapability(t)
 	}
-	if err := Migrate(t.Context(), databaseURL); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("pgx", databaseURL)
+	scratchURL, drop := createScratchDB(t.Context(), t, databaseURL)
+	t.Cleanup(drop)
+	db, err := sql.Open("pgx", scratchURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +267,7 @@ func TestMigration101HardensPreexistingUnsafeOperatorPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.DownTo(t.Context(), 100); err != nil {
+	if _, err := provider.UpTo(t.Context(), 100); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
