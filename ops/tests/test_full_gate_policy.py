@@ -180,6 +180,76 @@ class FullGatePolicyTest(unittest.TestCase):
             with self.assertRaisesRegex(controller.PolicyError, "unsafe member"):
                 controller.directory_tree_sha256(root)
 
+    def test_rollback_proof_is_exact_and_digest_bound(self) -> None:
+        revision = "a" * 40
+        base = "b" * 40
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            gate_evidence = root / "full-gate.json"
+            gate_evidence.write_text("{}\n", encoding="utf-8")
+            proof = root / "proof.json"
+            value = {
+                "schema": "vane.server-rollback-compatibility/v1",
+                "base_revision": base,
+                "current_revision": revision,
+                "mode": "previous-binary-on-upgraded-schema",
+                "added_migrations": [{
+                    "path": "132_fence.sql",
+                    "git_blob": "c" * 40,
+                    "sha256": "d" * 64,
+                }],
+                "previous_gate_sha256": "e" * 64,
+                "previous_gate_output_sha256": "f" * 64,
+                "status": "passed",
+            }
+            proof.write_bytes(controller.canonical_json(value))
+            gate = {
+                "server_rollback_safe": True,
+                "rollback_base_revision": base,
+                "rollback_compatibility_path": proof.name,
+                "rollback_compatibility_sha256": controller.sha256_file(proof),
+            }
+            self.assertEqual(
+                controller.validate_rollback_compatibility_proof(
+                    gate=gate, gate_evidence=gate_evidence, revision=revision
+                ),
+                proof,
+            )
+            proof.write_bytes(controller.canonical_json({**value, "status": "failed"}))
+            with self.assertRaisesRegex(controller.PolicyError, "changed"):
+                controller.validate_rollback_compatibility_proof(
+                    gate=gate, gate_evidence=gate_evidence, revision=revision
+                )
+
+    def test_identical_migration_proof_rejects_fake_gate_digests(self) -> None:
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            gate_evidence = root / "full-gate.json"
+            gate_evidence.write_text("{}\n", encoding="utf-8")
+            proof = root / "proof.json"
+            value = {
+                "schema": "vane.server-rollback-compatibility/v1",
+                "base_revision": "b" * 40,
+                "current_revision": revision,
+                "mode": "identical-migration-history",
+                "added_migrations": [],
+                "previous_gate_sha256": "e" * 64,
+                "previous_gate_output_sha256": None,
+                "status": "passed",
+            }
+            proof.write_bytes(controller.canonical_json(value))
+            gate = {
+                "server_rollback_safe": True,
+                "rollback_base_revision": "b" * 40,
+                "rollback_compatibility_path": proof.name,
+                "rollback_compatibility_sha256": controller.sha256_file(proof),
+            }
+            with self.assertRaisesRegex(controller.PolicyError, "contradictory"):
+                controller.validate_rollback_compatibility_proof(
+                    gate=gate, gate_evidence=gate_evidence, revision=revision
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

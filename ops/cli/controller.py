@@ -820,6 +820,82 @@ def write_signed_manifest(
     return path
 
 
+def validate_rollback_compatibility_proof(
+    *, gate: dict[str, Any], gate_evidence: Path, revision: str
+) -> Path:
+    if gate.get("server_rollback_safe") is not True:
+        raise PolicyError("release lacks previous-binary rollback compatibility proof")
+    base_revision = gate.get("rollback_base_revision")
+    if not isinstance(base_revision, str) or not EXACT_SHA.fullmatch(base_revision):
+        raise PolicyError("full gate rollback base is not an exact revision")
+    proof_value = gate.get("rollback_compatibility_path")
+    if not isinstance(proof_value, str):
+        raise PolicyError("full gate rollback proof path is not a string")
+    rollback_proof = Path(proof_value)
+    if rollback_proof.is_absolute():
+        raise PolicyError("full gate rollback proof path must be relative")
+    rollback_proof = gate_evidence.parent / rollback_proof
+    try:
+        rollback_proof.resolve(strict=True).relative_to(gate_evidence.parent.resolve())
+    except (OSError, ValueError) as error:
+        raise PolicyError("full gate rollback proof escapes the evidence root") from error
+    if rollback_proof.is_symlink() or not rollback_proof.is_file():
+        raise PolicyError("full gate rollback proof is unavailable")
+    proof_digest = gate.get("rollback_compatibility_sha256")
+    if not isinstance(proof_digest, str):
+        raise PolicyError("full gate rollback compatibility digest is not a string")
+    digest_value(proof_digest, field="full gate rollback compatibility digest")
+    if sha256_file(rollback_proof) != proof_digest:
+        raise PolicyError("full gate rollback proof changed after verification")
+    proof = load_json(rollback_proof)
+    expected_keys = {
+        "schema", "base_revision", "current_revision", "mode",
+        "added_migrations", "previous_gate_sha256",
+        "previous_gate_output_sha256", "status",
+    }
+    if not isinstance(proof, dict) or set(proof) != expected_keys:
+        raise PolicyError("rollback compatibility proof shape is not exact")
+    mode = proof["mode"]
+    added = proof["added_migrations"]
+    if (
+        proof["schema"] != "vane.server-rollback-compatibility/v1"
+        or proof["base_revision"] != base_revision
+        or proof["current_revision"] != revision
+        or proof["status"] != "passed"
+        or mode not in {
+            "identical-migration-history", "previous-binary-on-upgraded-schema"
+        }
+        or not isinstance(added, list)
+    ):
+        raise PolicyError("rollback compatibility proof does not bind the release")
+    if mode == "identical-migration-history":
+        if added or proof["previous_gate_sha256"] is not None or proof[
+            "previous_gate_output_sha256"
+        ] is not None:
+            raise PolicyError("identical migration proof contains contradictory evidence")
+    else:
+        if not added:
+            raise PolicyError("upgraded-schema proof does not name added migrations")
+        for item in added:
+            if not isinstance(item, dict) or set(item) != {"path", "git_blob", "sha256"}:
+                raise PolicyError("added migration proof entry shape is not exact")
+            if (
+                not isinstance(item["path"], str)
+                or not re.fullmatch(r"[0-9]{3}_[a-z0-9_]+\.sql", item["path"])
+                or not isinstance(item["git_blob"], str)
+                or not re.fullmatch(r"[0-9a-f]{40,64}", item["git_blob"])
+                or not isinstance(item["sha256"], str)
+            ):
+                raise PolicyError("added migration proof entry is invalid")
+            digest_value(item["sha256"], field="added migration proof digest")
+        for field in ("previous_gate_sha256", "previous_gate_output_sha256"):
+            value = proof[field]
+            if not isinstance(value, str):
+                raise PolicyError(f"rollback compatibility {field} is not a string")
+            digest_value(value, field=f"rollback compatibility {field}")
+    return rollback_proof
+
+
 def build_release_submission(
     *, revision: str, release_root: Path, gate_evidence: Path,
     signing_key: Path, signer: str, allowed_signers: Path,
@@ -845,48 +921,9 @@ def build_release_submission(
         if not isinstance(gate[field], str):
             raise PolicyError(f"full gate {field} is not a string")
         digest_value(gate[field], field=f"full gate {field}")
-    if gate["server_rollback_safe"] is not True:
-        raise PolicyError("release lacks previous-binary rollback compatibility proof")
-    if (
-        not isinstance(gate["rollback_base_revision"], str)
-        or not EXACT_SHA.fullmatch(gate["rollback_base_revision"])
-    ):
-        raise PolicyError("full gate rollback base is not an exact revision")
-    rollback_proof = Path(gate["rollback_compatibility_path"])
-    if rollback_proof.is_absolute():
-        raise PolicyError("full gate rollback proof path must be relative")
-    rollback_proof = gate_evidence.parent / rollback_proof
-    try:
-        rollback_proof.resolve(strict=True).relative_to(gate_evidence.parent.resolve())
-    except (OSError, ValueError) as error:
-        raise PolicyError("full gate rollback proof escapes the evidence root") from error
-    if rollback_proof.is_symlink() or not rollback_proof.is_file():
-        raise PolicyError("full gate rollback proof is unavailable")
-    digest_value(
-        gate["rollback_compatibility_sha256"],
-        field="full gate rollback compatibility digest",
+    rollback_proof = validate_rollback_compatibility_proof(
+        gate=gate, gate_evidence=gate_evidence, revision=revision
     )
-    if sha256_file(rollback_proof) != gate["rollback_compatibility_sha256"]:
-        raise PolicyError("full gate rollback proof changed after verification")
-    rollback_value = load_json(rollback_proof)
-    expected_rollback_keys = {
-        "schema", "base_revision", "current_revision", "mode",
-        "added_migrations", "previous_gate_sha256",
-        "previous_gate_output_sha256", "status",
-    }
-    if not isinstance(rollback_value, dict) or set(rollback_value) != expected_rollback_keys:
-        raise PolicyError("rollback compatibility proof shape is not exact")
-    if (
-        rollback_value["schema"] != "vane.server-rollback-compatibility/v1"
-        or rollback_value["base_revision"] != gate["rollback_base_revision"]
-        or rollback_value["current_revision"] != revision
-        or rollback_value["status"] != "passed"
-        or rollback_value["mode"] not in {
-            "identical-migration-history", "previous-binary-on-upgraded-schema"
-        }
-        or not isinstance(rollback_value["added_migrations"], list)
-    ):
-        raise PolicyError("rollback compatibility proof does not bind the release")
     binary_dir = Path(gate["binary_dir"])
     web_dist = Path(gate["web_dist"])
     if binary_dir.is_absolute() or web_dist.is_absolute():
