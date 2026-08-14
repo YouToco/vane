@@ -216,7 +216,7 @@ def main() -> int:
             "docker", "run", "--rm", "--read-only", "--network", network,
             "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=2g",
-            "--tmpfs", "/home/vane-build:rw,noexec,nosuid,nodev,size=64m",
+            "--tmpfs", "/home/vane-build:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700",
             "-v", f"{source}:/workspace:rw",
             "-v", f"{CONTROL_ROOT}:/control:ro",
             "-v", f"{tool_cache}:/toolcache:ro",

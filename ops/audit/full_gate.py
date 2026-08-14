@@ -264,7 +264,7 @@ def main() -> int:
             temporal_address = f"127.0.0.1:{temporal_port}"
         for _ in range(90):
             health = subprocess.run(
-                [str(temporal), "operator", "cluster", "health", "--address", temporal_address],
+                [str(temporal), "operator", "cluster", "health", "--address", temporal_address, "--disable-config-file", "--disable-config-env"],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -275,7 +275,7 @@ def main() -> int:
             time.sleep(1)
         else:
             raise PolicyError("canonical Temporal Server did not become healthy")
-        run_checked([str(temporal), "operator", "cluster", "system-info", "--address", temporal_address], cwd=ROOT)
+        run_checked([str(temporal), "operator", "cluster", "system-info", "--address", temporal_address, "--disable-config-file", "--disable-config-env"], cwd=ROOT)
         os.environ["VANE_TEMPORAL_ADDRESS"] = temporal_address
         run_go_tests_no_skips(
             [
