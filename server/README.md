@@ -24,6 +24,11 @@ The migration preserves the existing domain-first package structure. Do not
 introduce generic `common`, `helpers`, or `pkg` packages; add code to the domain
 that owns its invariant.
 
+Production ships these commands as native Linux/amd64 binaries and runs them
+under systemd. Do not add a server Dockerfile or application image: Compose is
+owned by `infra/` and is limited to PostgreSQL, Temporal, Temporal UI, and
+Caddy middleware.
+
 Run independently of any optional root workspace:
 
 ```bash

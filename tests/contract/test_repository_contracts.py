@@ -102,6 +102,26 @@ class RepositoryPolicyTest(unittest.TestCase):
         )
         self.assertNotIn("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL=", environment)
 
+    def test_server_is_native_and_compose_is_middleware_only(self) -> None:
+        dockerfiles = [
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "server").glob("**/Dockerfile*")
+        ]
+        self.assertEqual(dockerfiles, [])
+        compose = (ROOT / "infra/production/compose/docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotRegex(compose, r"(?m)^\s+build:")
+        services = set(re.findall(r"(?m)^  ([a-z0-9-]+):\n    image:", compose))
+        self.assertEqual(services, {"postgres", "temporal", "temporal-ui", "caddy"})
+        operations = "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for directory in (ROOT / "ops/release", ROOT / "ops/rollback")
+            for path in directory.glob("**/*")
+            if path.is_file()
+        )
+        self.assertNotIn("docker build", operations)
+
 
 if __name__ == "__main__":
     unittest.main()

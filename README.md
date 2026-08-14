@@ -39,3 +39,10 @@ workspace paths. It starts from an exact remote-main revision:
 The local command can submit immutable evidence, but only the externally
 installed root-owned broker can acquire the production lock, read credentials,
 mutate providers, or finalize durable state.
+
+The single VPS runs every Vane server release as native Go binaries supervised
+by systemd under `/opt/vane/releases/<sha>/`; the `current` symlink is the
+application switch. There is no server container image build, registry push,
+or deployment pull. Compose is reserved for the independently pinned
+PostgreSQL, Temporal, Temporal UI, and Caddy middleware, and a server-only
+release must not recreate or restart them.
