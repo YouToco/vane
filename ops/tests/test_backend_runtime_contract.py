@@ -86,8 +86,8 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertIn("candidate_infra_digest", remote)
         self.assertIn("current_infra_digest", remote)
         self.assertIn("infra-manifest.sha256", remote)
-        compose = remote.index("docker compose up -d")
-        guard = remote.rfind('if [[ $infra_changed == true ]]', 0, compose)
+        guard = remote.index('if [[ $infra_changed == true ]]')
+        compose = remote.index("docker compose up -d", guard)
         self.assertGreaterEqual(guard, 0)
         self.assertIn("postgres temporal temporal-ui caddy", remote[compose:])
         self.assertNotIn("VANE_INFRA_CHANGED", DEPLOY.read_text(encoding="utf-8"))
@@ -116,11 +116,15 @@ class BackendRuntimeContractTest(unittest.TestCase):
     def test_failure_after_switch_restores_whole_previous_release(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")
         cleanup = remote[remote.index("cleanup() {") : remote.index("trap cleanup EXIT")]
-        self.assertIn('if (( status != 0 )) && [[ $switched == true ]]', cleanup)
+        self.assertIn("if (( status != 0 )); then", cleanup)
+        self.assertIn('if [[ $switched == true ]]; then', cleanup)
         self.assertIn('ln -s "$current_target" "$rollback_link"', cleanup)
         self.assertIn('mv -Tf "$rollback_link" "$current_link"', cleanup)
         self.assertIn("systemctl daemon-reload", cleanup)
         self.assertIn("systemctl restart vane-research-gateway.socket", cleanup)
+        self.assertIn('if [[ $infra_applied == true ]]; then', cleanup)
+        self.assertIn('"$runtime_backup/docker-compose.yml"', cleanup)
+        self.assertIn("postgres temporal temporal-ui caddy", cleanup)
 
     def test_stage_and_existing_release_are_fail_closed(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")

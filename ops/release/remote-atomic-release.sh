@@ -58,29 +58,39 @@ done
 
 pending=$(mktemp -d "$release_root/.pending-$release_sha.XXXXXX")
 unit_backup=$(mktemp -d "/etc/systemd/system/.vane-release-backup.XXXXXX")
+runtime_backup=$(mktemp -d "/opt/vane/.runtime-backup.XXXXXX")
 switched=false
+infra_applied=false
 cleanup() {
   status=$?
   trap - EXIT
-  if (( status != 0 )) && [[ $switched == true ]]; then
-    if [[ -n $current_target ]]; then
-      rollback_link=$release_root/.current-rollback.$$
-      ln -s "$current_target" "$rollback_link"
-      mv -Tf "$rollback_link" "$current_link"
-    else
-      rm -f -- "$current_link"
-    fi
-    for unit in vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket; do
-      if [[ -f $unit_backup/$unit ]]; then
-        install -m 0644 "$unit_backup/$unit" "/etc/systemd/system/$unit"
+  if (( status != 0 )); then
+    if [[ $switched == true ]]; then
+      if [[ -n $current_target ]]; then
+        rollback_link=$release_root/.current-rollback.$$
+        ln -s "$current_target" "$rollback_link"
+        mv -Tf "$rollback_link" "$current_link"
       else
-        rm -f -- "/etc/systemd/system/$unit"
+        rm -f -- "$current_link"
       fi
-    done
-    systemctl daemon-reload || true
-    systemctl restart vane-research-gateway.socket vane-research-gateway.service vane.service || true
+      for unit in vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket; do
+        if [[ -f $unit_backup/$unit ]]; then
+          install -m 0644 "$unit_backup/$unit" "/etc/systemd/system/$unit"
+        else
+          rm -f -- "/etc/systemd/system/$unit"
+        fi
+      done
+      systemctl daemon-reload || true
+      systemctl restart vane-research-gateway.socket vane-research-gateway.service vane.service || true
+    fi
+    if [[ $infra_applied == true ]]; then
+      install -m 0644 "$runtime_backup/Caddyfile" /opt/vane/Caddyfile
+      install -m 0644 "$runtime_backup/docker-compose.yml" /opt/vane/docker-compose.yml
+      install -m 0644 "$runtime_backup/development-sql.yaml" /opt/vane/dynamicconfig/development-sql.yaml
+      (cd /opt/vane && docker compose up -d postgres temporal temporal-ui caddy) || true
+    fi
   fi
-  rm -rf -- "$pending" "$unit_backup"
+  rm -rf -- "$pending" "$unit_backup" "$runtime_backup"
   exit "$status"
 }
 trap cleanup EXIT
@@ -124,6 +134,19 @@ if [[ $candidate_infra_digest != "$current_infra_digest" ]]; then
 fi
 
 if [[ $infra_changed == true ]]; then
+  for runtime_file in \
+    /opt/vane/Caddyfile \
+    /opt/vane/docker-compose.yml \
+    /opt/vane/dynamicconfig/development-sql.yaml; do
+    [[ -f $runtime_file && ! -L $runtime_file ]] || {
+      echo "cannot atomically change infra without a canonical prior runtime file: $runtime_file" >&2
+      exit 1
+    }
+  done
+  cp --archive /opt/vane/Caddyfile "$runtime_backup/Caddyfile"
+  cp --archive /opt/vane/docker-compose.yml "$runtime_backup/docker-compose.yml"
+  cp --archive /opt/vane/dynamicconfig/development-sql.yaml "$runtime_backup/development-sql.yaml"
+  infra_applied=true
   install -m 0644 "$release_dir/deploy/Caddyfile" /opt/vane/Caddyfile
   install -m 0644 "$release_dir/deploy/docker-compose.yml" /opt/vane/docker-compose.yml
   install -m 0644 "$release_dir/deploy/dynamicconfig/development-sql.yaml" /opt/vane/dynamicconfig/development-sql.yaml
@@ -164,6 +187,6 @@ pid=$(systemctl show vane.service --property=MainPID --value)
   echo "live process is not bound to candidate SHA release" >&2; exit 1;
 }
 switched=false
-rm -rf -- "$pending" "$unit_backup" "$stage"
+rm -rf -- "$pending" "$unit_backup" "$runtime_backup" "$stage"
 trap - EXIT
 echo "atomic release activated: $release_sha"

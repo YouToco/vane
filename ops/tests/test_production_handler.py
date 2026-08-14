@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import tarfile
+import tempfile
+import unittest
+
+from ops.broker import production_handler
+
+
+REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
+class ProductionHandlerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def archive(self, members: dict[str, bytes]) -> Path:
+        path = self.root / f"archive-{len(list(self.root.glob('archive-*')))}.tar.gz"
+        with tarfile.open(path, mode="w:gz") as bundle:
+            for name, data in members.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mode = 0o755 if name.endswith(("/vane", ".py")) else 0o644
+                bundle.addfile(info, io.BytesIO(data))
+        return path
+
+    def valid_members(self) -> dict[str, bytes]:
+        return {
+            "ops/bin/vane": b"#!/bin/sh\n",
+            "ops/broker/forced_command.py": b"pass\n",
+            "ops/broker/production_handler.py": b"pass\n",
+            "ops/release/artifact.py": b"pass\n",
+            "tools/toolchain.lock.json": b"{}\n",
+            "server/go.mod": b"module example.invalid/control\n",
+            "server/internal/testgate/cmd/testpolicyscan/main.go": b"package main\n",
+        }
+
+    def test_controller_archive_is_content_addressed_and_immutable(self) -> None:
+        archive = self.archive(self.valid_members())
+        control = self.root / "control"
+        target = production_handler.stage_controller(
+            archive=archive, revision=REVISION, controller_root=control
+        )
+        self.assertEqual(target, control / "releases" / REVISION)
+        marker = target / ".controller-archive.sha256"
+        self.assertEqual(
+            marker.read_text(encoding="ascii").strip(),
+            hashlib.sha256(archive.read_bytes()).hexdigest(),
+        )
+        replay = production_handler.stage_controller(
+            archive=archive, revision=REVISION, controller_root=control
+        )
+        self.assertEqual(replay, target)
+        changed = self.valid_members()
+        changed["ops/bin/vane"] = b"changed\n"
+        with self.assertRaisesRegex(RuntimeError, "differs"):
+            production_handler.stage_controller(
+                archive=self.archive(changed),
+                revision=REVISION,
+                controller_root=control,
+            )
+
+    def test_controller_archive_rejects_traversal_and_links(self) -> None:
+        traversal = self.archive({"../escape": b"x"})
+        with self.assertRaisesRegex(RuntimeError, "unsafe"):
+            production_handler.stage_controller(
+                archive=traversal,
+                revision=REVISION,
+                controller_root=self.root / "traversal-control",
+            )
+        link = self.root / "link.tar.gz"
+        with tarfile.open(link, mode="w:gz") as bundle:
+            info = tarfile.TarInfo("ops/bin/vane")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "/bin/sh"
+            bundle.addfile(info)
+        with self.assertRaisesRegex(RuntimeError, "unsafe"):
+            production_handler.stage_controller(
+                archive=link,
+                revision=REVISION,
+                controller_root=self.root / "link-control",
+            )
+
+    def test_atomic_current_release_refuses_stale_cas(self) -> None:
+        current = self.root / "current-release.json"
+        current.write_text('{"state":"N"}\n', encoding="utf-8")
+        before = current.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "CAS"):
+            production_handler.atomic_current_release(
+                current, {"state": "N+1"}, "f" * 64
+            )
+        self.assertEqual(current.read_bytes(), before)
+
+    def test_handler_orders_native_server_before_both_web_channels_and_uat(self) -> None:
+        source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
+            encoding="utf-8"
+        )
+        server = source.index("remote-atomic-release.sh")
+        aliyun = source.index('"frontend-aliyun"', server)
+        cloudflare = source.index('"frontend-cloudflare"', aliyun)
+        finalize = source.index('"frontend-finalize"', cloudflare)
+        uat = source.index("run_uat", finalize)
+        state = source.index("atomic_current_release", uat)
+        self.assertLess(server, aliyun)
+        self.assertLess(aliyun, cloudflare)
+        self.assertLess(cloudflare, finalize)
+        self.assertLess(finalize, uat)
+        self.assertLess(uat, state)
+        self.assertNotIn("docker build", source)
+        self.assertNotIn("docker push", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

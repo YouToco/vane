@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from typing import Any
 
 
@@ -111,6 +113,52 @@ def directory_tree_sha256(root: Path) -> str:
     if not entries:
         raise PolicyError(f"artifact tree is empty: {root}")
     return hashlib.sha256(canonical_json({"schema": "vane.directory-tree/v1", "files": entries})).hexdigest()
+
+
+def tracked_control_plane_files() -> list[Path]:
+    result = subprocess.run(
+        [
+            "git", "ls-files", "-z", "--",
+            "ops", "contracts", "infra", "tools",
+            "server/go.mod", "server/go.sum", "server/internal/testgate",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PolicyError("cannot enumerate tracked control-plane files")
+    files: list[Path] = []
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        relative = Path(os.fsdecode(raw))
+        source = ROOT / relative
+        if source.is_symlink() or not source.is_file():
+            raise PolicyError(f"tracked control-plane member is unsafe: {relative}")
+        files.append(relative)
+    if not files:
+        raise PolicyError("tracked control-plane inventory is empty")
+    return sorted(files, key=lambda value: value.as_posix())
+
+
+def write_control_plane_archive(output: Path) -> str:
+    with output.open("xb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+                for relative in tracked_control_plane_files():
+                    source = ROOT / relative
+                    info = tarfile.TarInfo(relative.as_posix())
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = "root"
+                    info.gname = "root"
+                    info.mtime = 0
+                    info.mode = source.stat().st_mode & 0o777
+                    info.size = source.stat().st_size
+                    with source.open("rb") as handle:
+                        archive.addfile(info, handle)
+    return sha256_file(output)
 
 
 def exact_sha(value: str) -> str:
@@ -701,15 +749,17 @@ def broker_required(operation: str) -> int:
     return EXIT_POLICY
 
 
-def require_release_runtime() -> tuple[Path, Path, str, Path]:
+def require_release_runtime() -> tuple[Path, Path, str, Path, Path]:
     work_root = Path(os.environ.get("VANE_WORK_ROOT", ""))
     signing_key = Path(os.environ.get("VANE_RELEASE_SIGNING_KEY", ""))
     signer = os.environ.get("VANE_RELEASE_SIGNER", "").strip()
     broker_submit = Path(os.environ.get("VANE_BROKER_SUBMIT", ""))
+    build_supervisor = Path(os.environ.get("VANE_BUILD_SUPERVISOR", ""))
     for name, path, executable in (
         ("VANE_WORK_ROOT", work_root, False),
         ("VANE_RELEASE_SIGNING_KEY", signing_key, False),
         ("VANE_BROKER_SUBMIT", broker_submit, True),
+        ("VANE_BUILD_SUPERVISOR", build_supervisor, True),
     ):
         valid = path.is_absolute() and not path.is_symlink()
         valid = valid and (path.is_dir() if name == "VANE_WORK_ROOT" else path.is_file())
@@ -719,7 +769,7 @@ def require_release_runtime() -> tuple[Path, Path, str, Path]:
             raise PolicyError(f"{name} must name a safe existing absolute path")
     if not signer or not signer.isascii() or any(char.isspace() for char in signer):
         raise PolicyError("VANE_RELEASE_SIGNER must be a non-empty ASCII principal")
-    return work_root, signing_key, signer, broker_submit
+    return work_root, signing_key, signer, broker_submit, build_supervisor
 
 
 def write_signed_manifest(
@@ -774,13 +824,28 @@ def build_release_submission(
         "schema", "revision", "binary_dir", "web_dist",
         "binary_tree_sha256", "web_tree_sha256", "web_coverage_sha256",
         "server_coverage_sha256", "release_marker_sha256",
+        "server_source_tree_sha256", "infra_tree_sha256",
+        "migration_tree_object", "server_rollback_safe",
     }
     if not isinstance(gate, dict) or set(gate) != expected_gate_keys:
         raise PolicyError("full gate evidence shape is not exact")
     if gate["schema"] != "vane.full-gate-evidence/v1" or gate["revision"] != revision:
         raise PolicyError("full gate evidence does not bind the release revision")
+    for field in (
+        "server_source_tree_sha256",
+        "infra_tree_sha256",
+    ):
+        if not isinstance(gate[field], str):
+            raise PolicyError(f"full gate {field} is not a string")
+        digest_value(gate[field], field=f"full gate {field}")
+    if gate["server_rollback_safe"] is not True:
+        raise PolicyError("release lacks previous-binary rollback compatibility proof")
     binary_dir = Path(gate["binary_dir"])
     web_dist = Path(gate["web_dist"])
+    if binary_dir.is_absolute() or web_dist.is_absolute():
+        raise PolicyError("full gate artifact paths must be relative to the evidence root")
+    binary_dir = gate_evidence.parent / binary_dir
+    web_dist = gate_evidence.parent / web_dist
     if binary_dir.is_symlink() or not binary_dir.is_dir() or web_dist.is_symlink() or not web_dist.is_dir():
         raise PolicyError("full gate artifact directories are unavailable")
     if directory_tree_sha256(binary_dir) != gate["binary_tree_sha256"]:
@@ -810,6 +875,7 @@ def build_release_submission(
     frontend_pack = artifacts / "frontend-pack"
     backend_payload = artifacts / "backend-payload"
     frontend_payload = artifacts / "frontend-payload"
+    controller_archive = artifacts / f"controller-{revision}.tar.gz"
     run_id = str(int(datetime.now(timezone.utc).timestamp() * 1_000_000))
     artifact_tool = ROOT / "ops/release/artifact.py"
     run_checked(
@@ -820,6 +886,7 @@ def build_release_submission(
          "--build-run-attempt", "1"],
         cwd=ROOT,
     )
+    write_control_plane_archive(controller_archive)
     run_checked(
         [sys.executable, str(artifact_tool), "validate", "--component", "backend",
          "--sha", revision, "--input", str(backend_pack), "--output", str(backend_payload),
@@ -842,10 +909,19 @@ def build_release_submission(
     durable_gate.mkdir()
     shutil.copy2(web_coverage, durable_gate / web_coverage.name)
     shutil.copy2(server_coverage, durable_gate / server_coverage.name)
+    shutil.copy2(DEFAULT_POLICY, durable_gate / "release-policy.json")
+    shutil.copy2(DEFAULT_LOCK, durable_gate / "toolchain.lock.json")
+    shutil.copy2(
+        backend_payload / "release-receipt.json",
+        durable_gate / "release-receipt.json",
+    )
     plan = write_signed_manifest(
         directory=manifests, stage="plan", revision=revision, signer=signer,
         signing_key=signing_key,
-        evidence={"release-policy.json": DEFAULT_POLICY, "toolchain.lock.json": DEFAULT_LOCK},
+        evidence={
+            "release-policy.json": durable_gate / "release-policy.json",
+            "toolchain.lock.json": durable_gate / "toolchain.lock.json",
+        },
         parent=None,
     )
     gate_manifest = write_signed_manifest(
@@ -862,15 +938,66 @@ def build_release_submission(
         directory=manifests, stage="artifact", revision=revision, signer=signer,
         signing_key=signing_key,
         evidence={
-            "release-receipt.json": backend_payload / "release-receipt.json",
+            "release-receipt.json": durable_gate / "release-receipt.json",
             "backend-manifest.json": backend_pack / f"backend-{revision}.manifest.json",
             "frontend-manifest.json": frontend_pack / f"frontend-{revision}.manifest.json",
+            "controller-archive.tar.gz": controller_archive,
         },
         parent=gate_manifest,
     )
     require_release_chain(artifact_manifest, revision, "artifact", allowed_signers)
+    submission = {
+        "schema": "vane.broker-submission/v1",
+        "revision": revision,
+        "deploy_run_id": run_id,
+        "artifact_manifest": "manifests/artifact.json",
+        "backend_pack": "artifacts/backend-pack",
+        "frontend_pack": "artifacts/frontend-pack",
+        "controller_archive": f"artifacts/controller-{revision}.tar.gz",
+        "evidence": {
+            "plan:release-policy.json": {
+                "path": "gate-evidence/release-policy.json",
+                "sha256": sha256_file(durable_gate / "release-policy.json"),
+            },
+            "plan:toolchain.lock.json": {
+                "path": "gate-evidence/toolchain.lock.json",
+                "sha256": sha256_file(durable_gate / "toolchain.lock.json"),
+            },
+            "gate:full-gate.json": {
+                "path": "full-gate.json",
+                "sha256": sha256_file(gate_evidence),
+            },
+            "gate:server-coverage.out": {
+                "path": "gate-evidence/coverage.out",
+                "sha256": sha256_file(durable_gate / server_coverage.name),
+            },
+            "gate:web-coverage-summary.json": {
+                "path": "gate-evidence/web-coverage-summary.json",
+                "sha256": sha256_file(durable_gate / web_coverage.name),
+            },
+            "artifact:release-receipt.json": {
+                "path": "gate-evidence/release-receipt.json",
+                "sha256": sha256_file(durable_gate / "release-receipt.json"),
+            },
+            "artifact:backend-manifest.json": {
+                "path": f"artifacts/backend-pack/backend-{revision}.manifest.json",
+                "sha256": sha256_file(backend_pack / f"backend-{revision}.manifest.json"),
+            },
+            "artifact:frontend-manifest.json": {
+                "path": f"artifacts/frontend-pack/frontend-{revision}.manifest.json",
+                "sha256": sha256_file(frontend_pack / f"frontend-{revision}.manifest.json"),
+            },
+            "artifact:controller-archive.tar.gz": {
+                "path": f"artifacts/controller-{revision}.tar.gz",
+                "sha256": sha256_file(controller_archive),
+            },
+        },
+    }
+    (release_root / "submission.json").write_bytes(canonical_json(submission))
     shutil.rmtree(source)
     shutil.rmtree(web_source)
+    shutil.rmtree(backend_payload)
+    shutil.rmtree(frontend_payload)
     return release_root
 
 
@@ -884,27 +1011,33 @@ def command_release(args: argparse.Namespace) -> int:
     )
     if dirty.returncode != 0 or dirty.stdout:
         raise PolicyError("release requires a clean exact-source worktree")
-    work_root, signing_key, signer, broker_submit = require_release_runtime()
-    if command_doctor(args) != 0:
-        raise PolicyError("release doctor failed")
+    work_root, signing_key, signer, broker_submit, build_supervisor = require_release_runtime()
+    preflight_errors = validate_toolchain(args.lock, args.policy)
+    if not signer_entries(args.allowed_signers):
+        preflight_errors.append(f"allowed signer policy has no trusted keys: {args.allowed_signers}")
+    if preflight_errors:
+        raise PolicyError("release preflight failed: " + "; ".join(preflight_errors))
     release_root = work_root / f"release-{args.sha}"
     if release_root.exists() or release_root.is_symlink():
         raise PolicyError(f"release evidence path already exists: {release_root}")
     release_root.mkdir(mode=0o700)
+    build_output = release_root / "build-output"
+    supervised = subprocess.run(
+        [str(build_supervisor), "--sha", args.sha, "--output", str(build_output)],
+        check=False,
+    )
+    if supervised.returncode != 0:
+        raise PolicyError(f"root-owned build supervisor failed with exit {supervised.returncode}")
+    supervised_evidence = build_output / "full-gate.json"
+    if supervised_evidence.is_symlink() or not supervised_evidence.is_file():
+        raise PolicyError("root-owned build supervisor returned no gate evidence")
     gate_evidence = release_root / "full-gate.json"
-    old_gate_evidence = os.environ.get("VANE_FULL_GATE_EVIDENCE")
-    os.environ["VANE_FULL_GATE_EVIDENCE"] = str(gate_evidence)
-    try:
-        command_full(args)
-    finally:
-        if old_gate_evidence is None:
-            os.environ.pop("VANE_FULL_GATE_EVIDENCE", None)
-        else:
-            os.environ["VANE_FULL_GATE_EVIDENCE"] = old_gate_evidence
+    shutil.copy2(supervised_evidence, gate_evidence)
     submission = build_release_submission(
         revision=args.sha, release_root=release_root, gate_evidence=gate_evidence,
         signing_key=signing_key, signer=signer, allowed_signers=args.allowed_signers,
     )
+    shutil.rmtree(build_output)
     submitted = subprocess.run([str(broker_submit), str(submission)], check=False)
     if submitted.returncode != 0:
         raise PolicyError(f"broker submission failed with exit {submitted.returncode}")

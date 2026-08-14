@@ -22,24 +22,60 @@ from ops.cli.controller import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[2]
+CONTROL_ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("VANE_SOURCE_ROOT", str(CONTROL_ROOT))).resolve()
 SERVER = ROOT / "server"
 WEB = ROOT / "web"
-LOCK = json.loads((ROOT / "tools/toolchain.lock.json").read_text(encoding="utf-8"))["tools"]
+LOCK = json.loads((CONTROL_ROOT / "tools/toolchain.lock.json").read_text(encoding="utf-8"))["tools"]
 
 
-def assert_disposable_database(*, container_name: str, database_url: str, container_id: str) -> None:
+def assert_disposable_database(
+    *, container_name: str, database_url: str, container_id: str, expected_host: str = "127.0.0.1"
+) -> None:
     """Prove a destructive store target is a localhost port of this Docker run."""
     parsed = urlparse(database_url)
     if (
         not container_name.startswith("vane-full-")
         or parsed.scheme not in ("postgres", "postgresql")
-        or parsed.hostname != "127.0.0.1"
+        or parsed.hostname != expected_host
         or not parsed.port
         or len(container_id) != 64
         or any(char not in "0123456789abcdef" for char in container_id)
     ):
-        raise PolicyError("destructive migration test requires proven disposable localhost containers")
+        raise PolicyError("destructive migration test requires a proven disposable supervisor container")
+
+
+def load_external_dependencies(path: Path) -> tuple[list[str], list[dict[str, str]], str]:
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise PolicyError("external dependency manifest must be a safe absolute file")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or set(value) != {"schema", "postgres", "temporal_address"}:
+        raise PolicyError("external dependency manifest keys are not exact")
+    if value["schema"] != "vane.full-gate-dependencies/v1":
+        raise PolicyError("external dependency manifest schema is unsupported")
+    postgres = value["postgres"]
+    if not isinstance(postgres, list) or len(postgres) != 5:
+        raise PolicyError("external dependency manifest requires five PostgreSQL 18 instances")
+    urls: list[str] = []
+    bindings: list[dict[str, str]] = []
+    for index, item in enumerate(postgres):
+        if not isinstance(item, dict) or set(item) != {"container_name", "container_id", "host", "url"}:
+            raise PolicyError("external PostgreSQL binding keys are not exact")
+        expected_host = f"pg-{index}"
+        if item["host"] != expected_host:
+            raise PolicyError("external PostgreSQL binding host order is invalid")
+        assert_disposable_database(
+            container_name=item["container_name"],
+            database_url=item["url"],
+            container_id=item["container_id"],
+            expected_host=expected_host,
+        )
+        urls.append(item["url"])
+        bindings.append(item)
+    temporal_address = value["temporal_address"]
+    if temporal_address != "temporal:7233":
+        raise PolicyError("external Temporal address is not the isolated canonical service")
+    return urls, bindings, temporal_address
 
 
 def output(command: list[str], *, cwd: Path, env: dict[str, str]) -> str:
@@ -55,6 +91,17 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def migration_tree_object(*, revision: str, path: str, env: dict[str, str]) -> str:
+    value = output(
+        ["git", "rev-parse", "--verify", f"{revision}:{path}"],
+        cwd=ROOT,
+        env=env,
+    )
+    if not re.fullmatch(r"[0-9a-f]{40,64}", value):
+        raise PolicyError("migration tree object is not an exact Git object ID")
+    return value
 
 
 def main() -> int:
@@ -119,6 +166,25 @@ def main() -> int:
         cwd=ROOT,
         env=os.environ.copy(),
     )
+    base_migration_path = (
+        "server/store/migrations"
+        if previous_has_server_coverage_policy
+        else "store/migrations"
+    )
+    current_migration_tree = migration_tree_object(
+        revision=head, path="server/store/migrations", env=os.environ.copy()
+    )
+    base_migration_tree = migration_tree_object(
+        revision=server_coverage_base,
+        path=base_migration_path,
+        env=os.environ.copy(),
+    )
+    server_rollback_safe = current_migration_tree == base_migration_tree
+    if not server_rollback_safe:
+        raise PolicyError(
+            "migration bytes changed; release requires an explicit previous-binary/"
+            "upgraded-schema compatibility gate before server rollback is permitted"
+        )
     env = {
         **os.environ,
         "GOWORK": "off",
@@ -139,49 +205,63 @@ def main() -> int:
     original_environment = os.environ.copy()
     os.environ.update(env)
     try:
-        subprocess.run(["docker", "network", "create", network], check=True, stdout=subprocess.DEVNULL)
-        urls = []
-        for index in range(5):
-            name = f"{run_id}-pg-{index}"
+        external_raw = os.environ.get("VANE_FULL_GATE_DEPENDENCIES", "")
+        bindings: list[dict[str, str]] = []
+        if external_raw:
+            urls, bindings, temporal_address = load_external_dependencies(Path(external_raw))
+        else:
+            subprocess.run(["docker", "network", "create", network], check=True, stdout=subprocess.DEVNULL)
+            urls = []
+            for index in range(5):
+                name = f"{run_id}-pg-{index}"
+                subprocess.run(
+                    [
+                        "docker", "run", "-d", "--name", name,
+                        "--network", network, "--network-alias", f"pg-{index}",
+                        "-e", "POSTGRES_DB=vane_test", "-e", "POSTGRES_USER=vane",
+                        "-e", "POSTGRES_PASSWORD=vane_test", "-p", "127.0.0.1::5432",
+                        "--health-cmd", "pg_isready -U vane -d vane_test",
+                        "--health-interval", "2s", "--health-timeout", "2s", "--health-retries", "30",
+                        image,
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
+                containers.append(name)
+            for index, name in enumerate(containers):
+                for _ in range(60):
+                    if output(["docker", "inspect", "-f", "{{.State.Health.Status}}", name], cwd=ROOT, env=env) == "healthy":
+                        break
+                    time.sleep(1)
+                else:
+                    raise PolicyError(f"PostgreSQL 18 container did not become healthy: {name}")
+                port = output(["docker", "port", name, "5432/tcp"], cwd=ROOT, env=env).rsplit(":", 1)[-1]
+                url = f"postgres://vane:vane_test@127.0.0.1:{port}/vane_test?sslmode=disable"
+                urls.append(url)
+                bindings.append(
+                    {
+                        "container_name": name,
+                        "container_id": output(["docker", "inspect", "-f", "{{.Id}}", name], cwd=ROOT, env=env),
+                        "host": "127.0.0.1",
+                        "url": url,
+                    }
+                )
+
+            temporal_name = f"{run_id}-temporal"
+            temporal_image = f"{LOCK['temporal_server']['image']}@{LOCK['temporal_server']['digest']}"
             subprocess.run(
                 [
-                    "docker", "run", "-d", "--name", name,
-                    "--network", network, "--network-alias", f"pg-{index}",
-                    "-e", "POSTGRES_DB=vane_test", "-e", "POSTGRES_USER=vane",
-                    "-e", "POSTGRES_PASSWORD=vane_test", "-p", "127.0.0.1::5432",
-                    "--health-cmd", "pg_isready -U vane -d vane_test",
-                    "--health-interval", "2s", "--health-timeout", "2s", "--health-retries", "30",
-                    image,
+                    "docker", "run", "-d", "--name", temporal_name, "--network", network,
+                    "-e", "DB=postgres12", "-e", "DB_PORT=5432",
+                    "-e", "POSTGRES_USER=vane", "-e", "POSTGRES_PWD=vane_test",
+                    "-e", "POSTGRES_SEEDS=pg-4", "-p", "127.0.0.1::7233", temporal_image,
                 ],
                 check=True,
                 stdout=subprocess.DEVNULL,
             )
-            containers.append(name)
-        for name in containers:
-            for _ in range(60):
-                if output(["docker", "inspect", "-f", "{{.State.Health.Status}}", name], cwd=ROOT, env=env) == "healthy":
-                    break
-                time.sleep(1)
-            else:
-                raise PolicyError(f"PostgreSQL 18 container did not become healthy: {name}")
-            port = output(["docker", "port", name, "5432/tcp"], cwd=ROOT, env=env).rsplit(":", 1)[-1]
-            urls.append(f"postgres://vane:vane_test@127.0.0.1:{port}/vane_test?sslmode=disable")
-
-        temporal_name = f"{run_id}-temporal"
-        temporal_image = f"{LOCK['temporal_server']['image']}@{LOCK['temporal_server']['digest']}"
-        subprocess.run(
-            [
-                "docker", "run", "-d", "--name", temporal_name, "--network", network,
-                "-e", "DB=postgres12", "-e", "DB_PORT=5432",
-                "-e", "POSTGRES_USER=vane", "-e", "POSTGRES_PWD=vane_test",
-                "-e", "POSTGRES_SEEDS=pg-4", "-p", "127.0.0.1::7233", temporal_image,
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-        containers.append(temporal_name)
-        temporal_port = output(["docker", "port", temporal_name, "7233/tcp"], cwd=ROOT, env=env).rsplit(":", 1)[-1]
-        temporal_address = f"127.0.0.1:{temporal_port}"
+            containers.append(temporal_name)
+            temporal_port = output(["docker", "port", temporal_name, "7233/tcp"], cwd=ROOT, env=env).rsplit(":", 1)[-1]
+            temporal_address = f"127.0.0.1:{temporal_port}"
         for _ in range(90):
             health = subprocess.run(
                 [str(temporal), "operator", "cluster", "health", "--address", temporal_address],
@@ -213,12 +293,14 @@ def main() -> int:
         store_artifacts = artifacts / "store"
         # Keep this Python 3.9 compatible: the controller is deliberately usable
         # on the Ubuntu 24.04 broker before its locked Python is provisioned.
-        if len(containers[:3]) != len(urls[:3]):
+        if len(bindings[:3]) != len(urls[:3]):
             raise PolicyError("store shard container/database URL cardinality differs")
-        for name, url in zip(containers[:3], urls[:3]):
-            container_id = output(["docker", "inspect", "-f", "{{.Id}}", name], cwd=ROOT, env=env)
+        for binding, url in zip(bindings[:3], urls[:3]):
             assert_disposable_database(
-                container_name=name, database_url=url, container_id=container_id
+                container_name=binding["container_name"],
+                database_url=url,
+                container_id=binding["container_id"],
+                expected_host=binding["host"],
             )
         os.environ["VANE_RUN_DESTRUCTIVE_MIGRATION101_ROLE_TEST"] = "1"
         run_checked(
@@ -256,7 +338,7 @@ def main() -> int:
         run_checked(
             [
                 sys.executable,
-                str(ROOT / "tools/checks/server_coverage.py"),
+                str(CONTROL_ROOT / "tools/checks/server_coverage.py"),
                 "--profile", str(server_coverage),
                 "--baseline", str(ROOT / "tools/checks/server-coverage-baseline.json"),
                 "--repo-root", str(ROOT),
@@ -273,7 +355,7 @@ def main() -> int:
         for item in inventory:
             subprocess.run([str(go), "build", "-buildvcs=true", "-o", str(binary_dir / item["name"]), item["package"]], cwd=SERVER, env=build_env, check=True)
         for binary in binary_dir.iterdir():
-            run_checked([str(ROOT / "ops/audit/check-go-build-info.sh"), str(binary), output(["git", "rev-parse", "HEAD"], cwd=ROOT, env=env)], cwd=ROOT)
+            run_checked([str(CONTROL_ROOT / "ops/audit/check-go-build-info.sh"), str(binary), output(["git", "rev-parse", "HEAD"], cwd=ROOT, env=env)], cwd=ROOT)
 
         scripts = [str(path) for path in (ROOT / "ops").glob("**/*.sh")]
         run_checked([str(shellcheck), *scripts], cwd=ROOT)
@@ -322,13 +404,17 @@ def main() -> int:
             evidence = {
                 "schema": "vane.full-gate-evidence/v1",
                 "revision": head,
-                "binary_dir": str(binary_dir.resolve()),
-                "web_dist": str(verified_web_dist.resolve()),
+                "binary_dir": binary_dir.resolve().relative_to(work_root.resolve()).as_posix(),
+                "web_dist": verified_web_dist.resolve().relative_to(work_root.resolve()).as_posix(),
                 "binary_tree_sha256": directory_tree_sha256(binary_dir),
                 "web_tree_sha256": directory_tree_sha256(verified_web_dist),
                 "web_coverage_sha256": file_sha256(web_coverage),
                 "server_coverage_sha256": file_sha256(server_coverage),
                 "release_marker_sha256": file_sha256(marker),
+                "server_source_tree_sha256": directory_tree_sha256(SERVER),
+                "infra_tree_sha256": directory_tree_sha256(ROOT / "infra/production"),
+                "migration_tree_object": current_migration_tree,
+                "server_rollback_safe": server_rollback_safe,
             }
             evidence_path.write_text(
                 json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
@@ -338,7 +424,8 @@ def main() -> int:
     finally:
         for name in reversed(containers):
             subprocess.run(["docker", "rm", "-f", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["docker", "network", "rm", network], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if containers:
+            subprocess.run(["docker", "network", "rm", network], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.environ.clear()
         os.environ.update(original_environment)
 

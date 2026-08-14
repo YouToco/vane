@@ -15,7 +15,7 @@ component=$1
 payload=$2
 source_sha=$3
 case "$component" in
-  backend|frontend-aliyun|frontend-cloudflare|frontend-finalize) ;;
+  backend|frontend-aliyun|frontend-cloudflare|frontend-finalize|frontend-aliyun-restore|frontend-cloudflare-restore) ;;
   *)
     echo "invalid component: $component" >&2
     exit 2
@@ -291,6 +291,13 @@ frontend_state_check() {
   local state_file=$state_dir/deployed-vane-web.sha
   current_state=
   current_state=$(read_state "$state_file")
+  if [[ $component == frontend-aliyun-restore || $component == frontend-cloudflare-restore ]]; then
+    [[ ${EXPECTED_DEPLOYED_SHA+x} == x && $current_state == "$EXPECTED_DEPLOYED_SHA" ]] || {
+      echo "frontend restore request is stale against durable provider state" >&2
+      exit 1
+    }
+    return 0
+  fi
   if [[ $current_state == "$source_sha" ]]; then
     return 10
   fi
@@ -622,7 +629,7 @@ finalize_frontend() {
 
 case "$component" in
   backend) deploy_backend ;;
-  frontend-aliyun) deploy_frontend_aliyun ;;
-  frontend-cloudflare) deploy_frontend_cloudflare ;;
+  frontend-aliyun|frontend-aliyun-restore) deploy_frontend_aliyun ;;
+  frontend-cloudflare|frontend-cloudflare-restore) deploy_frontend_cloudflare ;;
   frontend-finalize) finalize_frontend ;;
 esac
