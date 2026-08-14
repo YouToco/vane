@@ -274,7 +274,7 @@ func TestCommitAgentSessionTurnAtomicProjectionAndShadowResync(t *testing.T) {
 	}
 }
 
-func TestCommitAgentSessionAppendExactReplayTruncationAndScope(t *testing.T) {
+func TestCommitAgentSessionAppendExactReplayCompleteHistoryAndScope(t *testing.T) {
 	f := newAgentEventFixture(t)
 	ctx := t.Context()
 	messages := make([]map[string]string, 60)
@@ -322,10 +322,11 @@ func TestCommitAgentSessionAppendExactReplayTruncationAndScope(t *testing.T) {
 	).Scan(&stored, &turnCount, &activated); err != nil {
 		t.Fatal(err)
 	}
-	if len(stored) > 41 ||
+	if len(stored) != 61 ||
 		stored[0]["content"] != "message-0" ||
+		stored[30]["content"] != "message-30" ||
 		stored[len(stored)-1]["content"] != "[卡片回调] exact" {
-		t.Fatalf("side-writer truncation=%+v", stored)
+		t.Fatalf("side-writer complete history=%+v", stored)
 	}
 	if turnCount != 9 || !slices.Equal(activated, []string{"endpoint-a"}) {
 		t.Fatalf("side writer changed retained state: turn=%d tools=%v",
@@ -1556,20 +1557,29 @@ func TestAgentEventsScopeAndAtomicValidation(t *testing.T) {
 		}
 	}
 
-	tooMany := make([]agentledger.Input, maxAgentEventBatchSize+1)
-	for i := range tooMany {
-		tooMany[i] = valid
-	}
 	bounds := []agentledger.AppendBatch{
 		{Scope: f.scopeA(), IdempotencyKey: "", Events: []agentledger.Input{valid}},
 		{Scope: f.scopeA(), IdempotencyKey: strings.Repeat("x", maxAgentEventKeyBytes+1), Events: []agentledger.Input{valid}},
 		{Scope: f.scopeA(), IdempotencyKey: "empty", Events: nil},
-		{Scope: f.scopeA(), IdempotencyKey: "too-many", Events: tooMany},
 	}
 	for i, batch := range bounds {
 		if _, err := f.store.AppendAgentEvents(ctx, batch); !errors.Is(err, types.ErrValidation) {
 			t.Fatalf("bound %d error=%v", i, err)
 		}
+	}
+
+	wide := make([]agentledger.Input, 65)
+	for i := range wide {
+		wide[i] = valid
+	}
+	stored, err := f.store.AppendAgentEvents(ctx, agentledger.AppendBatch{
+		Scope: f.scopeA(), IdempotencyKey: "wide-projection", Events: wide,
+	})
+	if err != nil {
+		t.Fatalf("65-event batch rejected: %v", err)
+	}
+	if len(stored) != len(wide) {
+		t.Fatalf("stored wide batch=%d want=%d", len(stored), len(wide))
 	}
 }
 

@@ -585,9 +585,9 @@ func TestCompartmentedResearchRetriesTruncatedRefHeavySummary(t *testing.T) {
 		requests++
 		switch requests {
 		case 1:
-			if len(req.Tools) != 0 ||
+			if len(req.Tools) != 0 || req.MaxTokens != nil ||
 				!strings.Contains(req.Messages[0].Content, "完整 JSON 最多 1800 bytes") ||
-				req.MaxTokens == nil || *req.MaxTokens < maxPublicEvidenceSummaryBytes {
+				!req.EnableThinking {
 				t.Fatalf("retry request lacks bounded contract: %+v", req)
 			}
 			return &llm.ChatResponse{Content: `{"schema":"vane.public-evidence-summary/v1","as_of":"unknown","claims":[{"statement":"历史证据显示仅可预约","status":"supported","public_evidence_refs":["pe_retry"]}],"gaps":[]}`}, nil

@@ -16,7 +16,9 @@
 > 事实基准（均已实测）：deepseek-v4-pro function calling 60/60 全过（6 场景）；
 > lark-oapi-go v3.9.9 WS 支持 OnP2CardActionTrigger（callback.CardActionTriggerEvent，
 > action.Value 为 map[string]interface{}，返回 *callback.CardActionTriggerResponse 可原地更新卡片）；
-> DeepSeek V4 默认思维链，结构化输出必须 thinking:{type:"disabled"}（llm.Request.DisableThinking 已存在）。
+> DeepSeek V4 专用 strict-JSON 授权器等小型结构化输出仍使用
+> `thinking:{type:"disabled"}` 与各自的有界协议预算。交互式 Agent 不属于该类轨道：
+> 它开启高思考，不发送 `max_tokens`，也不以消息条数裁掉会话历史。
 
 ## 0. 产品行为（当前基线：意图工具包 + 同轮 grounded research）
 
@@ -215,10 +217,12 @@ wire 漂移时先追加脱敏样本，再修改适配规则。
 3. 更新旧 JSONB 投影；
 4. 只取最后一个完整 snapshot generation 重放，与旧投影做 digest/count shadow 对账。
 
-每个 generation 为 `turn_started → 最多 60 条 user_message/assistant_message/tool_call/
-tool_result → 可选 confirmation_requested → turn_completed`，总数最多 63，低于 migration 035
-冻结的 64 条上限。任一消息、payload、batch 或投影非法时整笔事务失败；不得裁掉事件后仍报告
-match。日志只记录 scope、固定 reason 和数量，不记录 payload、消息、工具参数或卡片正文。
+每个 generation 为 `turn_started → 完整的
+user_message/assistant_message/tool_call/tool_result 投影 → 可选
+confirmation_requested → turn_completed`。migration 131 移除 migration 035 的 64 条
+batch 上限，不再以会话消息数量限制 Agent 上下文。任一消息、payload、batch
+或投影非法时整笔事务失败；不得裁掉事件后仍报告 match。日志只记录
+scope、固定 reason 和数量，不记录 payload、消息、工具参数或卡片正文。
 
 卡片确认回调、feedback `NotifyEvent`、task creation receipt 与 definition-edit receipt 也必须
 在 Store 内持 exact session 根行锁后，以当前旧投影构造同样的 full snapshot generation，并在
@@ -229,8 +233,8 @@ callback/Notify=`session`，creation/definition receipt=`receipt → session`。
 带 domain separator 的 SHA-256，禁止随机数、时间或消息正文 hash 充当来源身份。相同来源+不同
 消息必须 conflict，相同来源+相同消息不得重复追加。
 
-side writer 沿用会话的 60 条裁剪纪律：在根锁事务内保留最早 user 意图，并把最近段边界推进到
-user 消息，避免孤儿 tool result；不得在 Loop 预读后拼 projection。旧
+side writer 在根锁事务内把新消息追加到完整会话投影，不做条数裁剪；
+不得在 Loop 预读后拼 projection。旧
 `AppendAgentSessionMessages` 生产入口已经退役。definition-edit receipt 角色只额外获得
 `agent_sessions.turn_count/activated_tools` 读取和 `agent_events` immutable SELECT/INSERT +
 sequence USAGE，不得获得 event UPDATE/DELETE、session 其他列写入或 owner/app 绕行。
@@ -338,9 +342,11 @@ Loop 行为细则：
   **§7.1 增补（2026-07-18 PR-4）**：`Deps.SystemPrompt` 可覆盖该常量（零值回落，飞书轨零行为变化）；
   [用户画像] 段只跟随默认 prompt 渲染（自定义 prompt 的 A2A 轨不渲染——画像是 A2A 非目标）。
 - 会话消息即 []llm.ChatMessage 的 JSON；system 消息**不入库**，每次调用时动态前置。
-- 模型调用：DoChat，SpanName="agent"，DisableThinking=**true**（实测思维链会与 content
-  共享 MaxTokens 并导致复杂 FC 空输出；工具选择在关闭后无退化），MaxTokens 2048，
-  Temperature nil（默认）。
+- 交互式模型调用：DoChat，SpanName="agent"，`EnableThinking=true`、
+  `ReasoningEffort=high`，Temperature nil（默认），`MaxTokens=nil`。wire 必须省略
+  `max_tokens`；输入与输出只受当前 provider/model 的物理协议能力约束，Vane 不叠加
+  2048/4096 等固定 completion cap。思考段只在同一次 tool-call continuation 内回传，
+  不进入会话持久化。
 - 模型返回未注册工具名：以 role=tool 回错误文本"工具 X 不存在"，继续循环（模型自纠）。
 - 一轮多个纯公开只读 tool_calls 可按序执行；公开研究与内部读取/写操作混在同批时整批拒绝。
   普通 owner 直写进入各自幂等执行入口。`create_schedule` / `edit_task_definition` 由专用
@@ -485,7 +491,9 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
 - 工具注册表是唯一可调用面（白名单）；未注册名一律拒绝。
 - ExecuteAction/CancelAction 必须校验 pending_action.user_id == 请求 userID。
 - 确认卡按钮 value 只携带 action_id；参数以库中为准，杜绝客户端篡改。
-- agent 会话 messages 上限 60 条：超过时保留最早 1 条 user + 最近 40 条（简单截断，防上下文无限膨胀）。
+- Agent 会话不设应用级消息条数上限；TTL 内的完整已清洗历史同时进入模型请求、
+  `agent_sessions` 投影和 Agent event ledger。外部不可信正文的固定占位清洗、每条消息/
+  event 的安全边界、工具执行次数和 loop fuse 仍保留；它们不得被当成模型上下文容量限制。
 - 所有新增 SQL 走参数化（与现有 store 一致）；不引入新依赖。
 
 ## 11. 测试要求（每包与现有测试风格一致）
