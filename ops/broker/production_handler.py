@@ -425,6 +425,23 @@ def make_tree_durable(root: Path) -> None:
         fsync_directory(directory)
 
 
+def make_controller_tree_traversable(root: Path) -> None:
+    """Keep root ownership while allowing the broker admission user to execute it."""
+    directories = [root]
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise RuntimeError("controller permission walk found a symlink")
+        if path.is_dir():
+            directories.append(path)
+        elif not path.is_file():
+            raise RuntimeError("controller permission walk found an unsafe member")
+    for directory in directories:
+        # mkdir(2) applies the root service's restrictive umask.  Normalize all
+        # synthetic archive directories before this tree can become `current`;
+        # files retain their signed archive modes and remain root-owned.
+        directory.chmod(0o755)
+
+
 def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> Path:
     controller_root.mkdir(parents=True, exist_ok=True, mode=0o755)
     if controller_root.is_symlink() or not controller_root.is_dir():
@@ -441,6 +458,7 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
     if target.is_dir() and not target.is_symlink():
         marker = target / marker_name
         if marker.is_file() and not marker.is_symlink() and marker.read_text(encoding="ascii") == archive_digest + "\n":
+            make_controller_tree_traversable(target)
             make_tree_durable(target)
             fsync_directory(releases)
             return target
@@ -508,7 +526,7 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
                 raise RuntimeError(f"controller archive lacks required member: {required}")
         (pending / marker_name).write_text(archive_digest + "\n", encoding="ascii")
         (pending / marker_name).chmod(0o600)
-        pending.chmod(0o755)
+        make_controller_tree_traversable(pending)
         make_tree_durable(pending)
         os.replace(pending, target)
         fsync_directory(releases)
