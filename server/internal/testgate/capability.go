@@ -38,13 +38,6 @@ func PostgreSQLURL(t testing.TB) {
 	unavailable(t, "postgresql-url", "test database URL is not postgres/postgresql")
 }
 
-// FreshDatabase reports that the selected cluster is already provisioned and
-// therefore cannot prove a from-empty-cluster migration invariant.
-func FreshDatabase(t testing.TB) {
-	t.Helper()
-	unavailable(t, "fresh-database", "cluster must be explicitly deprovisioned")
-}
-
 // Symlink reports that the host filesystem cannot create the symlink required
 // by a filesystem-behavior test.
 func Symlink(t testing.TB, err error) {

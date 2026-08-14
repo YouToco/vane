@@ -26,11 +26,6 @@ func requirePostgreSQLURLCapability(t testing.TB) {
 	testgate.PostgreSQLURL(t)
 }
 
-func requireFreshDatabaseCapability(t testing.TB) {
-	t.Helper()
-	testgate.FreshDatabase(t)
-}
-
 func requireWideIntegerCapability(t testing.TB) {
 	t.Helper()
 	testgate.WideInteger(t)

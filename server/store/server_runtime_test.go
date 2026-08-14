@@ -1272,9 +1272,6 @@ func TestSchemaMigrationsCoexistWithoutServerRuntimeProvisionPostgres(t *testing
 		&existing); err != nil {
 		t.Fatal(err)
 	}
-	if existing != 0 {
-		requireFreshDatabaseCapability(t)
-	}
 	memoryRoleSnapshot := ""
 	snapshotMemoryRole := func() string {
 		t.Helper()
@@ -1313,8 +1310,9 @@ func TestSchemaMigrationsCoexistWithoutServerRuntimeProvisionPostgres(t *testing
 				&count); err != nil {
 				t.Fatal(err)
 			}
-			if count != 0 {
-				t.Fatal("ordinary schema migration leaked server runtime into cluster")
+			if count != existing {
+				t.Fatalf("ordinary schema migration changed server runtime role count: before=%d after=%d",
+					existing, count)
 			}
 			gotMemoryRole := snapshotMemoryRole()
 			if index == 0 {
