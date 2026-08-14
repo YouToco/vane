@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BUCKET = "zhuoqidev-vane-web"
 REGION = "cn-shenzhen"
 OWNER_PREVIEW = "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
+RELEASE_MARKER_PATH = "vane-release.json"
 
 
 def sha256(path: Path) -> str:
@@ -30,6 +31,25 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             value.update(chunk)
     return value.hexdigest()
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"Web publication evidence path is a symlink: {path}")
+    pending = path.with_name(f".{path.name}.{os.getpid()}")
+    pending.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(pending, path)
+
+
+def atomic_copy(source: Path, destination: Path) -> None:
+    if destination.is_symlink():
+        raise RuntimeError(f"Web publication evidence path is a symlink: {destination}")
+    pending = destination.with_name(f".{destination.name}.{os.getpid()}")
+    shutil.copy2(source, pending)
+    os.replace(pending, destination)
 
 
 def run(command: list[str], *, env: dict[str, str], capture: bool = False) -> str:
@@ -60,28 +80,87 @@ def stat_size(ossutil: Path, object_name: str, env: dict[str, str]) -> int:
     return int(match.group(1))
 
 
-def verify_marker(origin: str, revision: str) -> dict:
-    target = origin.rstrip("/") + f"/.well-known/vane-release.json?release={revision}"
+def verify_public_release(
+    origin: str,
+    revision: str,
+    *,
+    expected_marker: bytes,
+    expected_index_sha256: str,
+) -> dict:
+    def strict_pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in items:
+            if key in value:
+                raise RuntimeError(f"duplicate local Web release marker key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        marker_value = json.loads(expected_marker, object_pairs_hook=strict_pairs)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("local Web release marker is invalid") from error
+    if (
+        not isinstance(marker_value, dict)
+        or set(marker_value)
+        != {"schema", "source_revision", "source_dirty", "tree_sha256", "file_count"}
+        or marker_value.get("schema") != "vane.web-release/v1"
+        or marker_value.get("source_revision") != revision
+        or marker_value.get("source_dirty") is not False
+        or not re.fullmatch(r"[0-9a-f]{64}", marker_value.get("tree_sha256", ""))
+        or type(marker_value.get("file_count")) is not int
+        or marker_value["file_count"] <= 0
+    ):
+        raise RuntimeError("local Web release marker is not exact clean evidence")
+    marker_target = origin.rstrip("/") + f"/{RELEASE_MARKER_PATH}?release={revision}"
+    index_target = origin.rstrip("/") + f"/index.html?release={revision}"
     last_error: Exception | None = None
     for attempt in range(1, 7):
         try:
-            request = Request(target, headers={"Cache-Control": "no-cache"})
+            request = Request(marker_target, headers={"Cache-Control": "no-cache"})
             with urlopen(request, timeout=15) as response:
                 if response.status != 200:
                     raise RuntimeError(f"release marker returned HTTP {response.status}")
-                value = json.loads(response.read(64 * 1024))
-            if (
-                not isinstance(value, dict)
-                or value.get("source_revision") != revision
-                or value.get("source_dirty") is not False
-            ):
-                raise RuntimeError("public release marker differs from exact revision")
-            return value
+                public_marker = response.read(64 * 1024 + 1)
+            if public_marker != expected_marker:
+                raise RuntimeError("public release marker differs from exact artifact bytes")
+            request = Request(index_target, headers={"Cache-Control": "no-cache"})
+            with urlopen(request, timeout=15) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Web entrypoint returned HTTP {response.status}")
+                public_index = response.read(8 * 1024 * 1024 + 1)
+            if hashlib.sha256(public_index).hexdigest() != expected_index_sha256:
+                raise RuntimeError("public Web entrypoint differs from exact artifact bytes")
+            return marker_value
         except Exception as error:  # network convergence is bounded and evidenced
             last_error = error
             if attempt < 6:
                 time.sleep(attempt * 2)
-    raise RuntimeError(f"public release marker did not converge: {last_error}")
+    raise RuntimeError(f"public Web release did not converge: {last_error}")
+
+
+def verify_oss_object(
+    ossutil: Path,
+    object_name: str,
+    expected: Path,
+    env: dict[str, str],
+    readback_root: Path,
+) -> None:
+    destination = readback_root / object_name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            str(ossutil),
+            "cp",
+            f"oss://{BUCKET}/{object_name}",
+            str(destination),
+            "--force",
+        ],
+        env=env,
+    )
+    if destination.is_symlink() or not destination.is_file():
+        raise RuntimeError(f"OSS readback is unsafe or missing: {object_name}")
+    if destination.stat().st_size != expected.stat().st_size or sha256(destination) != sha256(expected):
+        raise RuntimeError(f"OSS object differs from exact artifact bytes: {object_name}")
 
 
 def publish(
@@ -136,6 +215,11 @@ def publish(
             )
             receipt = plan / "release.json"
             receipt_digest = sha256(receipt)
+            marker_path = dist / RELEASE_MARKER_PATH
+            if marker_path.is_symlink() or not marker_path.is_file():
+                raise RuntimeError("Web release marker is missing or unsafe")
+            expected_marker = marker_path.read_bytes()
+            expected_index_sha256 = sha256(dist / "index.html")
             if state_file.is_file() and not state_file.is_symlink():
                 current = json.loads(state_file.read_text(encoding="utf-8"))
                 expected_current = {
@@ -148,16 +232,21 @@ def publish(
                         "same Web revision has a different immutable release receipt"
                     )
                 if current == expected_current:
-                    marker = verify_marker(origin, revision)
+                    marker = verify_public_release(
+                        origin,
+                        revision,
+                        expected_marker=expected_marker,
+                        expected_index_sha256=expected_index_sha256,
+                    )
                     result = {
                         "schema": "vane.web-publication/v1", "revision": revision,
                         "receipt_sha256": receipt_digest, "marker": marker,
                         "status": "already-current",
                     }
-                    result_path.write_text(
-                        json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
-                        encoding="utf-8",
+                    atomic_copy(
+                        receipt, result_path.with_name("web-release-receipt.json")
                     )
+                    atomic_json(result_path, result)
                     return result
 
             provider_env = {
@@ -174,10 +263,18 @@ def publish(
                     ],
                     env=provider_env,
                 )
+            readback_root = plan / "provider-readback"
             for row in lines(plan / "critical-assets.list"):
                 size, object_name = row.split("\t", 1)
                 if stat_size(ossutil, object_name, provider_env) != int(size):
                     raise RuntimeError(f"OSS critical asset size differs: {object_name}")
+                verify_oss_object(
+                    ossutil,
+                    object_name,
+                    dist / object_name,
+                    provider_env,
+                    readback_root,
+                )
             for object_name in lines(plan / "html-before-entry.list"):
                 run(
                     [
@@ -205,6 +302,32 @@ def publish(
             )
             if stat_size(ossutil, "index.html", provider_env) != (dist / "index.html").stat().st_size:
                 raise RuntimeError("OSS index.html size differs after atomic cutover")
+            verify_oss_object(
+                ossutil,
+                "index.html",
+                dist / "index.html",
+                provider_env,
+                readback_root,
+            )
+            # Commit the public revision only after every earlier provider
+            # object and the entrypoint have exact-byte readback evidence.
+            run(
+                [
+                    str(ossutil),
+                    "cp",
+                    str(marker_path),
+                    f"oss://{BUCKET}/{RELEASE_MARKER_PATH}",
+                    "--force",
+                ],
+                env=provider_env,
+            )
+            verify_oss_object(
+                ossutil,
+                RELEASE_MARKER_PATH,
+                marker_path,
+                provider_env,
+                readback_root,
+            )
 
             aliyun_env = {
                 **os.environ,
@@ -229,28 +352,25 @@ def publish(
                     if attempt == 3:
                         raise RuntimeError(f"CDN refresh failed after three attempts: {url}")
                     time.sleep(attempt * 5)
-            marker = verify_marker(origin, revision)
+            marker = verify_public_release(
+                origin,
+                revision,
+                expected_marker=expected_marker,
+                expected_index_sha256=expected_index_sha256,
+            )
             state = {
                 "schema": "vane.web-current/v1",
                 "revision": revision,
                 "receipt_sha256": receipt_digest,
             }
-            pending = state_file.with_name(f".{state_file.name}.{os.getpid()}")
-            pending.write_text(
-                json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(pending, state_file)
             result = {
                 "schema": "vane.web-publication/v1", "revision": revision,
                 "receipt_sha256": receipt_digest, "marker": marker,
                 "status": "published",
             }
-            result_path.write_text(
-                json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            shutil.copy2(receipt, result_path.with_name("web-release-receipt.json"))
+            atomic_copy(receipt, result_path.with_name("web-release-receipt.json"))
+            atomic_json(state_file, state)
+            atomic_json(result_path, result)
             return result
 
 

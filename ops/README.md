@@ -58,8 +58,9 @@ missing; versions alone are never treated as integrity pins.
 artifact construction, a signed plan/gate/artifact chain, and one Server-only
 submission to the configured root-owned broker. After Server success, the same
 command publishes the verified `dist/` directly from the Mac to OSS: immutable
-assets first, `index.html` last, followed by bounded CDN refresh and public
-marker verification. The user does not assemble
+assets first, then exact-byte provider readback, `index.html`, and finally the
+root `vane-release.json` commit object. Bounded CDN refresh is followed by
+exact public marker and entrypoint verification. The user does not assemble
 receipts, current-state documents, manifests, or CAS values. Its non-secret
 local runtime is configured with `VANE_WORK_ROOT`, `VANE_RELEASE_SIGNING_KEY`,
 `VANE_RELEASE_SIGNER`, `VANE_ALLOWED_SIGNERS`, and `VANE_BROKER_SUBMIT`.
@@ -72,6 +73,12 @@ Server `current-release.json` is also parsed strictly and compared by SHA-256 CA
 The candidate N+1 document may be prepared with the artifact, but `audit`
 authorizes its activation only when the same signed chain reaches `finalize`;
 deploy or verify failure therefore leaves N authoritative.
+
+Controller code is deliberately one product release behind. Release M stages
+controller M but remains authorized by the previously finalized controller.
+Only when the following product release begins may the broker lock promote M;
+the promotion is idempotent across a crash immediately after the symlink swap.
+Candidate product helpers are never executed as root with broker credentials.
 
 ## Tests
 

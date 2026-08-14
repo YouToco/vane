@@ -354,7 +354,9 @@ def invoke_handler(
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"production handler failed with exit {result.returncode}: {result.stderr.strip()}")
+        # The SSH caller receives only protocol state, never privileged child
+        # output. Detailed diagnostics remain in root-owned handler evidence.
+        raise RuntimeError(f"production handler failed with exit {result.returncode}")
     try:
         value = json.loads(result.stdout, object_pairs_hook=lambda pairs: _strict_pairs(pairs))
     except json.JSONDecodeError as error:
@@ -468,5 +470,6 @@ def handle(
         if not current.is_file() or current.is_symlink():
             raise RuntimeError("production handler removed current-release authority")
         if verb in {"release", "retry"} and sha256(current) == expected_digest:
-            raise RuntimeError("production handler succeeded without advancing current-release CAS")
+            if result.get("status") != "already-current":
+                raise RuntimeError("production handler succeeded without advancing current-release CAS")
         return {"ok": True, "verb": verb, "admitted": True, "result": result}

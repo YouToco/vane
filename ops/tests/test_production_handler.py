@@ -28,7 +28,7 @@ class ProductionHandlerTest(unittest.TestCase):
             for name, data in members.items():
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
-                info.mode = 0o755 if name.endswith(("/vane", ".py")) else 0o644
+                info.mode = 0o755 if name.endswith(("/vane", ".py", ".sh")) else 0o644
                 bundle.addfile(info, io.BytesIO(data))
         return path
 
@@ -37,7 +37,12 @@ class ProductionHandlerTest(unittest.TestCase):
             "ops/bin/vane": b"#!/bin/sh\n",
             "ops/broker/forced_command.py": b"pass\n",
             "ops/broker/production_handler.py": b"pass\n",
+            "ops/broker/promote_finalized_controller.py": b"#!/usr/bin/env python3\n",
+            "ops/broker/run-production-handler.sh": b"#!/bin/sh\n",
+            "ops/audit/production-uat.py": b"#!/usr/bin/env python3\n",
             "ops/release/artifact.py": b"pass\n",
+            "ops/release/remote-atomic-release.sh": b"#!/bin/sh\n",
+            "ops/rollback/switch-server-release.sh": b"#!/bin/sh\n",
             "tools/toolchain.lock.json": b"{}\n",
             "server/go.mod": b"module example.invalid/control\n",
             "server/internal/testgate/cmd/testpolicyscan/main.go": b"package main\n",
@@ -148,6 +153,95 @@ class ProductionHandlerTest(unittest.TestCase):
 
         self.assertEqual(current.stat().st_mode & 0o777, 0o640)
 
+    def test_retry_restores_candidate_left_active_before_durable_cas(self) -> None:
+        provider = self.root / "provider"
+        state = provider / "vane-deploy"
+        state.mkdir(parents=True)
+        (state / "deployed-vane.sha").write_text(REVISION + "\n", encoding="ascii")
+        previous_revision = "f" * 40
+        current = {"server": {"deployed_revision": previous_revision}}
+
+        def restored(**kwargs):
+            production_handler.write_revision(
+                provider / "vane-deploy/deployed-vane.sha", previous_revision
+            )
+
+        with mock.patch.object(
+            production_handler, "active_server_revision", return_value=REVISION
+        ), mock.patch.object(
+            production_handler, "restore", side_effect=restored
+        ) as restore:
+            production_handler.reconcile_server_before_release(
+                repo=self.root,
+                current=current,
+                candidate_revision=REVISION,
+                provider_root=provider,
+            )
+        restore.assert_called_once()
+        self.assertEqual(
+            (provider / "vane-deploy/deployed-vane.sha").read_text().strip(),
+            previous_revision,
+        )
+
+    def test_retry_refuses_unknown_active_server_revision(self) -> None:
+        provider = self.root / "provider"
+        state = provider / "vane-deploy"
+        state.mkdir(parents=True)
+        (state / "deployed-vane.sha").write_text("f" * 40 + "\n", encoding="ascii")
+        with mock.patch.object(
+            production_handler, "active_server_revision", return_value="e" * 40
+        ):
+            with self.assertRaisesRegex(RuntimeError, "differs from both"):
+                production_handler.reconcile_server_before_release(
+                    repo=self.root,
+                    current={"server": {"deployed_revision": "f" * 40}},
+                    candidate_revision=REVISION,
+                    provider_root=provider,
+                )
+
+    def test_retry_restarts_and_verifies_server_when_provider_was_advanced(self) -> None:
+        provider = self.root / "provider"
+        state = provider / "vane-deploy"
+        state.mkdir(parents=True)
+        (state / "deployed-vane.sha").write_text(REVISION + "\n", encoding="ascii")
+        previous_revision = "f" * 40
+        with mock.patch.object(
+            production_handler, "active_server_revision", return_value=previous_revision
+        ), mock.patch.object(production_handler, "restore") as restore:
+            production_handler.reconcile_server_before_release(
+                repo=self.root,
+                current={"server": {"deployed_revision": previous_revision}},
+                candidate_revision=REVISION,
+                provider_root=provider,
+            )
+        restore.assert_called_once()
+
+    def test_recovery_requires_every_systemd_unit_to_be_active(self) -> None:
+        calls: list[list[str]] = []
+
+        def command(arguments, **_):
+            calls.append(arguments)
+            if arguments[-1] == "vane-research-gateway.socket":
+                raise RuntimeError("fixture inactive unit")
+
+        with mock.patch.object(
+            production_handler, "active_server_revision", return_value=REVISION
+        ), mock.patch.object(production_handler, "run", side_effect=command):
+            with self.assertRaisesRegex(RuntimeError, "inactive unit"):
+                production_handler.verify_active_server(REVISION)
+        self.assertEqual(
+            calls,
+            [
+                ["/usr/bin/systemctl", "is-active", "--quiet", "vane.service"],
+                [
+                    "/usr/bin/systemctl",
+                    "is-active",
+                    "--quiet",
+                    "vane-research-gateway.socket",
+                ],
+            ],
+        )
+
     def test_active_controller_is_confined_to_release_authority(self) -> None:
         control = self.root / "control"
         target = control / "releases" / REVISION
@@ -162,6 +256,23 @@ class ProductionHandlerTest(unittest.TestCase):
         (control / "current").symlink_to(outside)
         with self.assertRaisesRegex(RuntimeError, "escapes"):
             production_handler.active_controller_target(control)
+
+    def test_active_server_revision_is_confined_to_release_authority(self) -> None:
+        release_root = self.root / "server-releases"
+        target = release_root / REVISION
+        target.mkdir(parents=True)
+        current = self.root / "server-current"
+        current.symlink_to(target)
+        self.assertEqual(
+            production_handler.active_server_revision(current, release_root),
+            REVISION,
+        )
+        current.unlink()
+        outside = self.root / "outside-server"
+        outside.mkdir()
+        current.symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "unsafe target"):
+            production_handler.active_server_revision(current, release_root)
 
     def test_failed_evidence_prefers_partial_durable_tree(self) -> None:
         evidence = self.root / "evidence"
@@ -183,6 +294,32 @@ class ProductionHandlerTest(unittest.TestCase):
         self.assertFalse(durable.exists())
         self.assertTrue(transaction.exists())
 
+    def test_pre_cas_durable_and_transaction_are_both_archivable_for_retry(self) -> None:
+        evidence = self.root / "evidence"
+        transaction = evidence / "inflight" / REVISION
+        durable = evidence / "releases" / REVISION
+        transaction.mkdir(parents=True)
+        durable.mkdir(parents=True)
+        (transaction / "early").write_text("early", encoding="utf-8")
+        (durable / "late").write_text("late", encoding="utf-8")
+        first = production_handler.preserve_failed_evidence(
+            revision=REVISION,
+            evidence_root=evidence,
+            durable=durable,
+            transaction=transaction,
+        )
+        second = production_handler.preserve_failed_evidence(
+            revision=REVISION,
+            evidence_root=evidence,
+            durable=transaction,
+            transaction=transaction,
+        )
+        assert first is not None and second is not None
+        self.assertEqual((first / "late").read_text(), "late")
+        self.assertEqual((second / "early").read_text(), "early")
+        self.assertFalse(durable.exists())
+        self.assertFalse(transaction.exists())
+
     def test_handler_is_server_only_and_finishes_uat_before_state(self) -> None:
         source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
             encoding="utf-8"
@@ -196,6 +333,32 @@ class ProductionHandlerTest(unittest.TestCase):
         self.assertNotIn('"frontend-cloudflare"', source)
         self.assertNotIn("docker build", source)
         self.assertNotIn("docker push", source)
+
+    def test_production_commands_cannot_pollute_broker_json_stdout(self) -> None:
+        executable = self.root / "verbose-success.sh"
+        executable.write_text(
+            "#!/bin/sh\nprintf 'child stdout\\n'\nprintf 'child stderr\\n' >&2\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            production_handler.run([str(executable)])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_production_command_failure_never_returns_child_output(self) -> None:
+        executable = self.root / "verbose-failure.sh"
+        executable.write_text(
+            "#!/bin/sh\nprintf 'do-not-copy-stdout\\n'\nprintf 'useful stderr\\n' >&2\nexit 23\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError, "exit 23") as raised:
+            production_handler.run([str(executable)])
+        self.assertNotIn("do-not-copy-stdout", str(raised.exception))
+        self.assertNotIn("useful stderr", str(raised.exception))
 
     def test_current_state_uses_the_activated_release_manifest_digest(self) -> None:
         source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
@@ -214,6 +377,19 @@ class ProductionHandlerTest(unittest.TestCase):
         )
         self.assertIn('verb not in {"release", "retry"}', source)
         self.assertEqual(source.count("result = release("), 1)
+        stale = source.index("if transaction.exists():")
+        archive = source.index("preserve_failed_evidence(", stale)
+        recreate = source.index("transaction.mkdir(", archive)
+        provider = source.index("provider_root = ensure_provider_state(", recreate)
+        recovery = source.index("except BaseException as release_error:", provider)
+        already_current = source.index('if revision == current["monorepo_revision"]:')
+        remote = source.index("server_stage = stage_server", already_current)
+        self.assertLess(stale, archive)
+        self.assertLess(archive, recreate)
+        self.assertLess(recreate, provider)
+        self.assertLess(provider, recovery)
+        self.assertLess(already_current, stale)
+        self.assertLess(already_current, remote)
 
     def test_handler_sandbox_can_install_canonical_systemd_units(self) -> None:
         launcher = (Path(__file__).parents[1] / "broker/run-production-handler.sh").read_text(

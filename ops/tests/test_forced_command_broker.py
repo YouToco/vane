@@ -231,6 +231,25 @@ class ForcedCommandBrokerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(json.loads(result.stdout)["result"]["stage"], "finalize")
 
+    def test_exact_same_finalized_request_may_return_idempotent_success(self) -> None:
+        request_id = self.upload()
+        digest = hashlib.sha256(self.current.read_bytes()).hexdigest()
+        self.handler.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'ok':True,'stage':'finalize','status':'already-current'}))\n",
+            encoding="utf-8",
+        )
+        self.handler.chmod(0o755)
+        result = self.run_broker(
+            "vane-broker retry",
+            {"request_id": request_id, "expected_current_digest": digest},
+            handler=self.handler,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(json.loads(result.stdout)["result"]["status"], "already-current")
+        self.assertEqual(self.current.read_bytes(), self.initial_current)
+
     def test_stale_cas_fails_before_artifact_validation(self) -> None:
         request_id = self.upload()
         result = self.run_broker(

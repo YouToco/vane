@@ -361,8 +361,15 @@ def validate_current_release_transition(
         raise PolicyError("current-release transition does not advance N to N+1")
     if candidate["monorepo_revision"] != revision:
         raise PolicyError("candidate current-release differs from manifest revision")
-    if candidate["controller_revision"] != receipt["control_plane_revision"]:
-        raise PolicyError("candidate controller revision differs from release receipt")
+    if receipt["control_plane_revision"] != revision:
+        raise PolicyError("release receipt candidate controller revision differs from manifest")
+    if candidate["controller_revision"] not in {
+        current["monorepo_revision"],
+        current["controller_revision"],
+    } or candidate["controller_revision"] == revision:
+        raise PolicyError(
+            "candidate active controller is not an eligible previously finalized revision"
+        )
     if candidate["server"]["deployed_revision"] != receipt["source_revision"]:
         raise PolicyError("candidate server revision differs from release receipt")
     if candidate["server"]["artifact_digest"] != receipt["backend_archive_sha256"]:

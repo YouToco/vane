@@ -28,6 +28,11 @@ class BrokerBootstrapTest(unittest.TestCase):
             "NOPASSWD: /opt/vane-control/current/ops/broker/run-production-handler.sh *",
             source,
         )
+        self.assertIn(
+            "NOPASSWD: /usr/local/libexec/vane-broker-promote",
+            source,
+        )
+        self.assertIn("/usr/local/libexec/vane-broker-promote", source)
         self.assertNotIn("NOPASSWD: ALL", source)
         self.assertNotIn("passwd -d", source)
         self.assertNotIn("authorized_keys.template", source)
@@ -40,6 +45,11 @@ class BrokerBootstrapTest(unittest.TestCase):
         )
         self.assertIn("/var/lib/vane-broker/state/broker-work", source)
         self.assertIn("-o vane-broker -g vane-broker -m 0700", source)
+        self.assertIn(
+            'install -o vane-broker -g vane-broker -m 0600 /dev/null "$release_lock"',
+            source,
+        )
+        self.assertIn('chown vane-broker:vane-broker "$release_lock"', source)
         self.assertIn("-o root -g root -m 0700 /var/lib/vane-broker/evidence", source)
 
     def test_privileged_launcher_confines_every_caller_controlled_path(self) -> None:
@@ -55,6 +65,15 @@ class BrokerBootstrapTest(unittest.TestCase):
             '[[ $expected_digest =~ ^[0-9a-f]{64}$ ]]',
         ):
             self.assertIn(required, source)
+
+    def test_stable_shim_promotes_before_loading_admission_code(self) -> None:
+        source = (ROOT / "ops/broker/broker-shim.sh").read_text(encoding="utf-8")
+        promotion = source.index("/usr/local/libexec/vane-broker-promote")
+        forced = source.index("forced_command.py")
+        execute = source.index('exec "$broker"')
+        self.assertLess(promotion, forced)
+        self.assertLess(forced, execute)
+        self.assertIn("/opt/vane-control/releases/", source)
 
     def test_local_client_is_root_owned_and_uses_only_forced_ssh(self) -> None:
         source = CLIENT_INSTALLER.read_text(encoding="utf-8")

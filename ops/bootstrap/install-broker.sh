@@ -37,10 +37,14 @@ passwd -l vane-broker >/dev/null
 
 install -d -o root -g root -m 0755 /usr/local/libexec
 install -o root -g root -m 0755 "$broker_dir/broker-shim.sh" /usr/local/libexec/vane-broker
+install -o root -g root -m 0755 \
+  "$broker_dir/promote_finalized_controller.py" \
+  /usr/local/libexec/vane-broker-promote
 
 install -d -o root -g root -m 0755 /etc/sudoers.d
 sudoers=$(mktemp /etc/sudoers.d/.vane-broker.XXXXXX)
 printf '%s\n' \
+  'vane-broker ALL=(root) NOPASSWD: /usr/local/libexec/vane-broker-promote' \
   'vane-broker ALL=(root) NOPASSWD: /opt/vane-control/current/ops/broker/run-production-handler.sh *' \
   >"$sudoers"
 chown root:root "$sudoers"
@@ -54,6 +58,16 @@ install -d -o vane-broker -g vane-broker -m 0700 \
   /var/lib/vane-broker/.ssh \
   /var/lib/vane-broker/requests \
   /var/lib/vane-broker/state/broker-work
+release_lock=/var/lib/vane-broker/state/broker-work/release.lock
+if [[ ! -e $release_lock ]]; then
+  install -o vane-broker -g vane-broker -m 0600 /dev/null "$release_lock"
+fi
+[[ -f $release_lock && ! -L $release_lock ]] || {
+  echo "broker release lock is unsafe" >&2
+  exit 1
+}
+chown vane-broker:vane-broker "$release_lock"
+chmod 0600 "$release_lock"
 install -d -o root -g root -m 0700 /var/lib/vane-broker/evidence
 authorized_keys=$(mktemp /var/lib/vane-broker/.ssh/.authorized-keys.XXXXXX)
 printf 'restrict,command="/usr/local/libexec/vane-broker" %s %s vane-release-controller\n' \

@@ -16,7 +16,7 @@ current=/opt/vane/current
   echo "rollback target or current authority is unavailable" >&2; exit 1;
 }
 current_target=$(readlink "$current")
-[[ $current_target == "$release_root/$expected_current" ]] || {
+[[ $current_target == "$target" || $current_target == "$release_root/$expected_current" ]] || {
   echo "server rollback CAS mismatch" >&2; exit 1;
 }
 for required in \
@@ -43,18 +43,18 @@ cleanup() {
 trap cleanup EXIT
 
 systemctl stop vane.service vane-research-gateway.service vane-research-gateway.socket
-next=$release_root/.rollback-$target_sha.$$
-ln -s "$target" "$next"
-mv -Tf "$next" "$current"
-switched=true
+if [[ $current_target != "$target" ]]; then
+  next=$release_root/.rollback-$target_sha.$$
+  ln -s "$target" "$next"
+  mv -Tf "$next" "$current"
+  switched=true
+fi
 systemctl start vane-research-gateway.socket vane-research-gateway.service vane.service
 for _ in {1..90}; do
   curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/readyz >/dev/null && break
   sleep 2
 done
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/readyz >/dev/null
-env -i PATH=/usr/bin:/bin CREDENTIALS_DIRECTORY=/etc/vane/credentials \
-  "$current/bin/gate" -env /opt/vane/env/server-owner-compat.env
 pid=$(systemctl show vane.service --property=MainPID --value)
 [[ $pid =~ ^[1-9][0-9]*$ && $(readlink /proc/"$pid"/exe) == "$target/bin/vane" ]] || {
   echo "rollback process is not bound to the target release" >&2; exit 1;

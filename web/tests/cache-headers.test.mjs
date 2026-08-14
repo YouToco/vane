@@ -19,3 +19,12 @@ test("production headers revalidate HTML and keep hashed assets immutable", asyn
     /\/_preview\/\*\s+! Cache-Control\s+Cache-Control: no-store/,
   );
 });
+
+test("A2A keeps the well-known redirect while the release marker stays at root", async () => {
+  const redirects = await readFile(resolve("public/_redirects"), "utf8");
+  assert.match(
+    redirects,
+    /^\/\.well-known\/\* https:\/\/api\.vane\.zhuoqidev\.com\/\.well-known\/:splat 302$/m,
+  );
+  assert.doesNotMatch(redirects, /vane-release\.json/);
+});

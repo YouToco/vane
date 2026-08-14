@@ -129,6 +129,16 @@ class ProductionCutoverTest(unittest.TestCase):
         config = production_cutover.write_production_config(self.baseline, self.layout)
         value = json.loads(config.read_text(encoding="utf-8"))
         self.assertEqual(value["uat_identity"], self.baseline["uat_identity"])
+        self.assertEqual(
+            value["uat_command"],
+            [
+                "/opt/vane-control/current/ops/audit/production-uat.py",
+                "--api-origin",
+                "https://api.vane.zhuoqidev.com",
+                "--web-origin",
+                "https://vane.zhuoqidev.com",
+            ],
+        )
         self.assertEqual(config.stat().st_mode & 0o777, 0o600)
         self.assertNotIn("uat_session_cookie", config.read_text(encoding="utf-8"))
 
@@ -188,7 +198,12 @@ class ProductionCutoverTest(unittest.TestCase):
             "ops/bin/vane": b"#!/bin/sh\n",
             "ops/broker/forced_command.py": b"pass\n",
             "ops/broker/production_handler.py": b"pass\n",
+            "ops/broker/promote_finalized_controller.py": b"#!/usr/bin/env python3\n",
+            "ops/broker/run-production-handler.sh": b"#!/bin/sh\n",
+            "ops/audit/production-uat.py": b"#!/usr/bin/env python3\n",
             "ops/release/artifact.py": b"pass\n",
+            "ops/release/remote-atomic-release.sh": b"#!/bin/sh\n",
+            "ops/rollback/switch-server-release.sh": b"#!/bin/sh\n",
             "tools/toolchain.lock.json": b"{}\n",
             "server/go.mod": b"module example.invalid/control\n",
             "server/internal/testgate/cmd/testpolicyscan/main.go": b"package main\n",
@@ -197,7 +212,7 @@ class ProductionCutoverTest(unittest.TestCase):
             for name, payload in members.items():
                 info = tarfile.TarInfo(name)
                 info.size = len(payload)
-                info.mode = 0o755 if name.endswith(("/vane", ".py")) else 0o644
+                info.mode = 0o755 if name.endswith(("/vane", ".py", ".sh")) else 0o644
                 bundle.addfile(info, io.BytesIO(payload))
         plan = {
             "controller_revision": revision,

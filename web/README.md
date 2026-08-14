@@ -30,7 +30,7 @@ npm run typecheck
 npm run build
 ```
 
-`npm run build` 会在 `dist/.well-known/vane-release.json` 写入 monorepo Git SHA、
+`npm run build` 会在 `dist/vane-release.json` 写入 monorepo Git SHA、
 dirty 状态和排除 marker 自身后的确定性 tree SHA-256，并立即重新计算验证。
 生产发布必须从 clean exact SHA 构建，并设置
 `VANE_RELEASE_SHA=<exact-sha> VANE_REQUIRE_CLEAN_RELEASE=1`；本地 dirty 构建会被如实标记，

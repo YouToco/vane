@@ -75,7 +75,6 @@ class BackendRuntimeContractTest(unittest.TestCase):
             "current release CAS mismatch",
             'mv -T "$pending" "$release_dir"',
             'mv -Tf "$next_link" "$current_link"',
-            '"$current_link/bin/gate"',
             'readlink /proc/"$pid"/exe',
         ):
             self.assertIn(required, remote)
@@ -150,18 +149,14 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertIn('if [[ $infra_applied == true ]]; then', cleanup)
         self.assertIn('"$runtime_backup/docker-compose.yml"', cleanup)
         self.assertIn("postgres temporal temporal-ui caddy", cleanup)
+        self.assertIn("atomic release recovery was incomplete", cleanup)
+        self.assertNotIn("|| true", cleanup)
 
-    def test_live_gate_uses_the_same_primary_database_boundary_as_server(self) -> None:
-        for path, gate in (
-            (REMOTE, '"$current_link/bin/gate"'),
-            (OPS / "rollback/switch-server-release.sh", '"$current/bin/gate"'),
-        ):
+    def test_candidate_gate_never_crosses_the_root_broker_boundary(self) -> None:
+        for path in (REMOTE, OPS / "rollback/switch-server-release.sh"):
             payload = path.read_text(encoding="utf-8")
-            self.assertIn(gate, payload, path)
-            self.assertIn(
-                "-env /opt/vane/env/server-owner-compat.env", payload, path
-            )
-            self.assertNotIn(' -env /opt/vane/env/server.env', payload, path)
+            self.assertNotIn("/bin/gate", payload, path)
+            self.assertNotIn("CREDENTIALS_DIRECTORY=/etc/vane/credentials", payload, path)
 
     def test_stage_and_existing_release_are_fail_closed(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")
@@ -172,14 +167,12 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertIn("current release symlink has unsafe target", remote)
         self.assertIn("current release authority is not a symlink", remote)
 
-    def test_live_gate_and_exact_executable_precede_success(self) -> None:
+    def test_ready_and_exact_executable_precede_success(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")
         ready = remote.rindex("/readyz")
-        gate = remote.rindex('"$current_link/bin/gate"')
         executable = remote.rindex('readlink /proc/"$pid"/exe')
         success = remote.rindex("atomic release activated")
-        self.assertLess(ready, gate)
-        self.assertLess(gate, executable)
+        self.assertLess(ready, executable)
         self.assertLess(executable, success)
 
     def test_systemd_executes_only_current_release_binaries(self) -> None:

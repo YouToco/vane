@@ -719,7 +719,7 @@ def main() -> int:
         run_checked([str(npm), "audit", "--audit-level=high"], cwd=WEB)
         for command in ("test:coverage", "typecheck", "prototype:p0a:build", "build"):
             run_checked([str(npm), "run", command], cwd=WEB)
-        marker = WEB / "dist/.well-known/vane-release.json"
+        marker = WEB / "dist/vane-release.json"
         if marker.is_symlink() or not marker.is_file():
             raise PolicyError("Web release marker evidence is missing")
         marker_value = json.loads(marker.read_text(encoding="utf-8"))

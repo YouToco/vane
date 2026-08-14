@@ -64,33 +64,39 @@ infra_applied=false
 cleanup() {
   status=$?
   trap - EXIT
+  set +e
+  recovery_status=0
   if (( status != 0 )); then
     if [[ $switched == true ]]; then
       if [[ -n $current_target ]]; then
         rollback_link=$release_root/.current-rollback.$$
-        ln -s "$current_target" "$rollback_link"
-        mv -Tf "$rollback_link" "$current_link"
+        ln -s "$current_target" "$rollback_link" || recovery_status=70
+        mv -Tf "$rollback_link" "$current_link" || recovery_status=70
       else
-        rm -f -- "$current_link"
+        rm -f -- "$current_link" || recovery_status=70
       fi
       for unit in vane.service vane-research-gateway.service vane-research-gateway.socket; do
         if [[ -f $unit_backup/$unit ]]; then
-          install -m 0644 "$unit_backup/$unit" "/etc/systemd/system/$unit"
+          install -m 0644 "$unit_backup/$unit" "/etc/systemd/system/$unit" || recovery_status=70
         else
-          rm -f -- "/etc/systemd/system/$unit"
+          rm -f -- "/etc/systemd/system/$unit" || recovery_status=70
         fi
       done
-      systemctl daemon-reload || true
-      systemctl restart vane-research-gateway.socket vane-research-gateway.service vane.service || true
+      systemctl daemon-reload || recovery_status=70
+      systemctl restart vane-research-gateway.socket vane-research-gateway.service vane.service || recovery_status=70
     fi
     if [[ $infra_applied == true ]]; then
-      install -m 0644 "$runtime_backup/Caddyfile" /opt/vane/Caddyfile
-      install -m 0644 "$runtime_backup/docker-compose.yml" /opt/vane/docker-compose.yml
-      install -m 0644 "$runtime_backup/development-sql.yaml" /opt/vane/dynamicconfig/development-sql.yaml
-      (cd /opt/vane && docker compose up -d postgres temporal temporal-ui caddy) || true
+      install -m 0644 "$runtime_backup/Caddyfile" /opt/vane/Caddyfile || recovery_status=70
+      install -m 0644 "$runtime_backup/docker-compose.yml" /opt/vane/docker-compose.yml || recovery_status=70
+      install -m 0644 "$runtime_backup/development-sql.yaml" /opt/vane/dynamicconfig/development-sql.yaml || recovery_status=70
+      (cd /opt/vane && docker compose up -d postgres temporal temporal-ui caddy) || recovery_status=70
     fi
   fi
   rm -rf -- "$pending" "$unit_backup" "$runtime_backup"
+  if (( recovery_status != 0 )); then
+    echo "atomic release recovery was incomplete" >&2
+    exit "$recovery_status"
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -199,8 +205,6 @@ for _ in {1..90}; do
   sleep 2
 done
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/readyz >/dev/null
-env -i PATH=/usr/bin:/bin CREDENTIALS_DIRECTORY=/etc/vane/credentials \
-  "$current_link/bin/gate" -env /opt/vane/env/server-owner-compat.env
 pid=$(systemctl show vane.service --property=MainPID --value)
 [[ $pid =~ ^[1-9][0-9]*$ && $(readlink /proc/"$pid"/exe) == "$release_dir/bin/vane" ]] || {
   echo "live process is not bound to candidate SHA release" >&2; exit 1;
