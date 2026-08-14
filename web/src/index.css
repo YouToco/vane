@@ -1,0 +1,245 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/noto-serif-sc";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: 'Noto Serif SC Variable', 'Songti SC', 'SimSun', Georgia, serif;
+    --font-sans: 'Geist Variable', sans-serif;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --color-brand: var(--brand);
+    --color-brand-strong: var(--brand-strong);
+    --color-brand-foreground: var(--brand-foreground);
+    --color-signal: var(--signal);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/*
+ * 见微 Vane 设计系统 v3「天青雾 / Celadon Mist」（2026-07-19 三改）
+ *
+ * Logo 是相风铜乌（汉代风向铜鸟，vane 的中华本尊），印章色写死在
+ * Logo.tsx / vane.svg，跨主题恒定。
+ *
+ * 界面色系「汝窑天青」：底色纯净（light 近纯白 / dark 近黑），
+ * 色彩只活在大面积柔雾渐变里——天蓝→天青→碧（雨过天青云破处）。
+ * 参照 OpenAI 官网插图的清透 pastel blur 气质：UI 本身黑白克制，
+ * 氛围感全部交给光晕、渐变字与鼠标光斑。
+ *
+ * 层次：
+ *   primary        — 界面主操作。light=近黑，dark=纯白（OpenAI 式克制）。
+ *   brand / signal — 天青（brand）与碧/薄荷（signal），只做点缀。
+ *   --grad-a/b/c   — 「雨过天青」渐变三停（天蓝→天青→碧）。
+ *   --glow-a/b/c   — 彩雾光晕；--glow-spot 鼠标光斑；--grid-line 网格线。
+ *   --font-heading — 衬线标题（Noto Serif SC），仅标题层使用。
+ */
+:root {
+    --background: oklch(0.99 0.002 240);
+    --foreground: oklch(0.185 0.008 240);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.185 0.008 240);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.185 0.008 240);
+    --primary: oklch(0.205 0.01 240);
+    --primary-foreground: oklch(0.985 0.002 240);
+    --secondary: oklch(0.962 0.004 240);
+    --secondary-foreground: oklch(0.205 0.01 240);
+    --muted: oklch(0.962 0.004 240);
+    --muted-foreground: oklch(0.50 0.015 230);
+    --accent: oklch(0.945 0.015 210);
+    --accent-foreground: oklch(0.205 0.01 240);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.915 0.006 230);
+    --input: oklch(0.915 0.006 230);
+    --ring: oklch(0.72 0.10 200);
+    --brand: oklch(0.70 0.11 195);
+    --brand-strong: oklch(0.48 0.09 205);
+    --brand-foreground: oklch(0.14 0.02 220);
+    --signal: oklch(0.78 0.13 160);
+    --grad-a: oklch(0.62 0.10 245);
+    --grad-b: oklch(0.62 0.11 200);
+    --grad-c: oklch(0.66 0.12 160);
+    --glow-a: oklch(0.72 0.12 240 / 0.16);
+    --glow-b: oklch(0.75 0.12 195 / 0.15);
+    --glow-c: oklch(0.80 0.12 155 / 0.14);
+    --glow-spot: oklch(0.75 0.12 200 / 0.10);
+    --grid-line: oklch(0.5 0.01 230 / 0.07);
+    --chart-1: oklch(0.70 0.11 195);
+    --chart-2: oklch(0.78 0.13 160);
+    --chart-3: oklch(0.62 0.10 245);
+    --chart-4: oklch(0.66 0.015 230);
+    --chart-5: oklch(0.32 0.02 235);
+    --radius: 0.625rem;
+    --sidebar: oklch(0.975 0.003 240);
+    --sidebar-foreground: oklch(0.185 0.008 240);
+    --sidebar-primary: oklch(0.205 0.01 240);
+    --sidebar-primary-foreground: oklch(0.985 0.002 240);
+    --sidebar-accent: oklch(0.945 0.015 210);
+    --sidebar-accent-foreground: oklch(0.205 0.01 240);
+    --sidebar-border: oklch(0.915 0.006 230);
+    --sidebar-ring: oklch(0.72 0.10 200);
+}
+
+.dark {
+    --background: oklch(0.135 0.006 250);
+    --foreground: oklch(0.965 0.003 240);
+    --card: oklch(0.175 0.008 248);
+    --card-foreground: oklch(0.965 0.003 240);
+    --popover: oklch(0.175 0.008 248);
+    --popover-foreground: oklch(0.965 0.003 240);
+    --primary: oklch(0.965 0.003 240);
+    --primary-foreground: oklch(0.155 0.008 245);
+    --secondary: oklch(0.225 0.01 245);
+    --secondary-foreground: oklch(0.965 0.003 240);
+    --muted: oklch(0.225 0.01 245);
+    --muted-foreground: oklch(0.70 0.012 235);
+    --accent: oklch(0.25 0.015 235);
+    --accent-foreground: oklch(0.965 0.003 240);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(0.95 0.01 240 / 10%);
+    --input: oklch(0.95 0.01 240 / 14%);
+    --ring: oklch(0.72 0.10 200);
+    --brand: oklch(0.75 0.11 195);
+    --brand-strong: oklch(0.82 0.10 190);
+    --brand-foreground: oklch(0.14 0.02 220);
+    --signal: oklch(0.83 0.13 160);
+    --grad-a: oklch(0.72 0.11 245);
+    --grad-b: oklch(0.78 0.11 198);
+    --grad-c: oklch(0.84 0.12 158);
+    --glow-a: oklch(0.70 0.13 245 / 0.16);
+    --glow-b: oklch(0.75 0.13 198 / 0.15);
+    --glow-c: oklch(0.80 0.13 158 / 0.13);
+    --glow-spot: oklch(0.75 0.13 200 / 0.09);
+    --grid-line: oklch(0.9 0.01 240 / 0.05);
+    --chart-1: oklch(0.75 0.11 195);
+    --chart-2: oklch(0.83 0.13 160);
+    --chart-3: oklch(0.72 0.11 245);
+    --chart-4: oklch(0.70 0.012 235);
+    --chart-5: oklch(0.45 0.02 240);
+    --sidebar: oklch(0.155 0.007 249);
+    --sidebar-foreground: oklch(0.965 0.003 240);
+    --sidebar-primary: oklch(0.965 0.003 240);
+    --sidebar-primary-foreground: oklch(0.155 0.008 245);
+    --sidebar-accent: oklch(0.225 0.01 245);
+    --sidebar-accent-foreground: oklch(0.965 0.003 240);
+    --sidebar-border: oklch(0.95 0.01 240 / 10%);
+    --sidebar-ring: oklch(0.72 0.10 200);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  button:not(:disabled), [role="button"]:not(:disabled) {
+    cursor: pointer;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+
+/* ---- Landing 页动画（仅 .landing-root 内使用） ---- */
+@keyframes vane-drift-a {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(56px, -42px) scale(1.08); }
+  66% { transform: translate(-38px, 28px) scale(0.95); }
+}
+@keyframes vane-drift-b {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-64px, 46px) scale(1.1); }
+}
+@keyframes vane-caret {
+  0%, 45% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+@keyframes vane-flow {
+  0% { left: 0%; opacity: 0; }
+  15% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { left: calc(100% - 6px); opacity: 0; }
+}
+@keyframes vane-ping-slow {
+  0% { transform: scale(1); opacity: 0.5; }
+  80%, 100% { transform: scale(1.85); opacity: 0; }
+}
+/* Login 品牌面板 aurora（缓慢的位移+缩放+微旋转，10s+ 周期避免焦虑感） */
+@keyframes vane-aurora {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1) rotate(0deg); }
+  33% { transform: translate3d(44px, -34px, 0) scale(1.16) rotate(7deg); }
+  66% { transform: translate3d(-34px, 28px, 0) scale(0.9) rotate(-6deg); }
+}
+
+/* Chrome 自动填充不应把登录字段染成默认蓝色；保持与瓷白卡片同一材质。 */
+.auth-root {
+  --auth-field: oklch(0.985 0.004 225 / 0.92);
+}
+
+.dark .auth-root {
+  --auth-field: oklch(0.16 0.008 248 / 0.92);
+}
+
+.auth-input:-webkit-autofill,
+.auth-input:-webkit-autofill:hover {
+  -webkit-text-fill-color: var(--foreground);
+  caret-color: var(--foreground);
+  -webkit-box-shadow: 0 0 0 1000px var(--auth-field) inset;
+  box-shadow: 0 0 0 1000px var(--auth-field) inset;
+}
+
+.auth-input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--foreground);
+  -webkit-box-shadow:
+    0 0 0 1000px var(--auth-field) inset,
+    0 0 0 3px color-mix(in oklch, var(--brand-strong) 25%, transparent);
+  box-shadow:
+    0 0 0 1000px var(--auth-field) inset,
+    0 0 0 3px color-mix(in oklch, var(--brand-strong) 25%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing-root [class*="animate-"],
+  .auth-root [class*="animate-"] {
+    animation: none !important;
+  }
+}
