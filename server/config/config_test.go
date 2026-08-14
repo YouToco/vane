@@ -1422,7 +1422,7 @@ func TestDefaults(t *testing.T) {
 		{"llm.model", cfg.LLM.Model, "deepseek-v4-flash"},
 		{"llm.agent_provider", cfg.LLM.AgentProvider, ""},
 		{"llm.agent_base_url", cfg.LLM.AgentBaseURL, ""},
-		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-pro"},
+		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-flash"},
 		{"llm.research_model", cfg.LLM.ResearchModel, "deepseek-v4-flash"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 32},
 		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(1)},
@@ -1481,7 +1481,7 @@ func TestLLMConfigAgentClientConfig(t *testing.T) {
 		BaseURL:       "https://api.deepseek.com",
 		APIKey:        "deepseek-key",
 		Model:         "deepseek-v4-flash",
-		AgentModel:    "deepseek-v4-pro",
+		AgentModel:    "deepseek-v4-flash",
 		MaxConcurrent: 32,
 	}
 
@@ -1491,7 +1491,7 @@ func TestLLMConfigAgentClientConfig(t *testing.T) {
 			t.Fatalf("AgentClientConfig() error = %v", err)
 		}
 		if got.Provider != "deepseek" || got.BaseURL != "https://api.deepseek.com" ||
-			got.APIKey != "deepseek-key" || got.Model != "deepseek-v4-pro" {
+			got.APIKey != "deepseek-key" || got.Model != "deepseek-v4-flash" {
 			t.Fatalf("legacy agent route = %+v", got)
 		}
 	})

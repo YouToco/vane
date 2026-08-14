@@ -33,7 +33,7 @@ llm:
   agent_provider: ""
   agent_base_url: ""
   agent_api_key: "" # VANE_LLM_AGENT_API_KEY
-  agent_model: "deepseek-v4-pro"   # Agent/DeepDive/A2A 质量档
+  agent_model: "deepseek-v4-flash" # Agent/DeepDive/A2A：thinking/high 性价比档
   # V3 planner/synthesis/verifier/corrector 统一走 flash；必须有有效价格规则。
   research_model: "deepseek-v4-flash"
   max_concurrent: 32            # 实测定值：45 条批次 5 并发 5.7s → 32 并发 1.25s（v4-flash 官方限额 2500）
