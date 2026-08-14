@@ -688,8 +688,18 @@ def command_full(args: argparse.Namespace) -> int:
     )
     if dirty.returncode != 0 or dirty.stdout:
         raise PolicyError("full requires a clean exact-source worktree")
+    work_root = Path(
+        os.environ.get("VANE_WORK_ROOT", str(ROOT / ".vane" / "work"))
+    )
+    if not work_root.is_absolute() or work_root.is_symlink():
+        raise PolicyError("VANE_WORK_ROOT must be a safe absolute directory")
+    work_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not work_root.is_dir():
+        raise PolicyError("VANE_WORK_ROOT is unavailable")
     old_full_sha = os.environ.get("VANE_FULL_SHA")
+    old_work_root = os.environ.get("VANE_WORK_ROOT")
     os.environ["VANE_FULL_SHA"] = args.sha
+    os.environ["VANE_WORK_ROOT"] = str(work_root)
     try:
         run_checked([str(scanner)], cwd=ROOT)
         run_checked([sys.executable, str(ROOT / "ops/audit/full_gate.py")], cwd=ROOT)
@@ -698,6 +708,10 @@ def command_full(args: argparse.Namespace) -> int:
             os.environ.pop("VANE_FULL_SHA", None)
         else:
             os.environ["VANE_FULL_SHA"] = old_full_sha
+        if old_work_root is None:
+            os.environ.pop("VANE_WORK_ROOT", None)
+        else:
+            os.environ["VANE_WORK_ROOT"] = old_work_root
     run_checked(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests/contract", "-p", "test_*.py"],
         cwd=ROOT,
