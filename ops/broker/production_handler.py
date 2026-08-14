@@ -638,8 +638,11 @@ def main() -> int:
         )
         return 2
     _, verb, request_raw, validated_raw, state_raw, repo_raw, expected = sys.argv
-    if verb != "release":
+    if verb not in {"release", "retry"}:
         raise RuntimeError(f"production handler verb is not implemented safely: {verb}")
+    # Retry deliberately restarts the immutable, content-addressed request from
+    # pre-deploy admission. It never resumes from caller-selected loose files or
+    # an unverified intermediate stage.
     result = release(
         request_root=Path(request_raw),
         validated=Path(validated_raw),

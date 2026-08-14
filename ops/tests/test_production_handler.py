@@ -164,6 +164,13 @@ class ProductionHandlerTest(unittest.TestCase):
         self.assertNotIn("docker build", source)
         self.assertNotIn("docker push", source)
 
+    def test_retry_restarts_the_same_atomic_release_state_machine(self) -> None:
+        source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('verb not in {"release", "retry"}', source)
+        self.assertEqual(source.count("result = release("), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
