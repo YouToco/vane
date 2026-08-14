@@ -35,6 +35,7 @@ exec systemd-run \
   --property=ReadWritePaths=/opt/vane \
   --property=ReadWritePaths=/opt/vane-control \
   --property=ReadWritePaths=/var/lib/vane-broker \
+  --property=ReadWritePaths=/etc/systemd/system \
   --property=LoadCredential=uat_session_cookie:/etc/vane/credentials/uat_session_cookie \
   --property=LoadCredential=broker_signing_key:/etc/vane-broker/credentials/broker_signing_key \
   "$script_dir/production_handler.py" "$@"

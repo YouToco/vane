@@ -167,6 +167,15 @@ class ProductionHandlerTest(unittest.TestCase):
         self.assertIn('verb not in {"release", "retry"}', source)
         self.assertEqual(source.count("result = release("), 1)
 
+    def test_handler_sandbox_can_install_canonical_systemd_units(self) -> None:
+        launcher = (Path(__file__).parents[1] / "broker/run-production-handler.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--property=ProtectSystem=strict", launcher)
+        self.assertEqual(
+            launcher.count("--property=ReadWritePaths=/etc/systemd/system"), 1
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
