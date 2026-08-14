@@ -20,8 +20,13 @@ class GeneratedContractsTest(unittest.TestCase):
             (ROOT / "contracts/release/server-binaries.json").read_text(encoding="utf-8")
         )
         entries = contract["binaries"]
-        self.assertEqual(len(entries), 10)
-        self.assertEqual(len({entry["name"] for entry in entries}), 10)
+        self.assertEqual(contract["schema"], "vane.server-binaries/v2")
+        self.assertEqual(len(entries), 5)
+        self.assertEqual(len({entry["name"] for entry in entries}), 5)
+        self.assertEqual(
+            {entry["role"] for entry in entries},
+            {"service", "migration", "verification", "maintenance"},
+        )
         makefile = (ROOT / "server/Makefile").read_text(encoding="utf-8")
         for entry in entries:
             self.assertTrue((ROOT / "server" / entry["package"].removeprefix("./")).is_dir())

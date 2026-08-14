@@ -20,12 +20,14 @@ INSTALLABLE = {"go", "node", "temporal_cli", "shellcheck", "govulncheck"}
 
 
 def arch() -> str:
+    system = platform.system().lower()
     machine = platform.machine().lower()
-    if machine in {"x86_64", "amd64"}:
-        return "linux-amd64"
-    if machine in {"aarch64", "arm64"}:
-        return "linux-arm64"
-    raise RuntimeError(f"unsupported architecture: {machine}")
+    architecture = "amd64" if machine in {"x86_64", "amd64"} else (
+        "arm64" if machine in {"aarch64", "arm64"} else ""
+    )
+    if system not in {"linux", "darwin"} or not architecture:
+        raise RuntimeError(f"unsupported platform: {system}/{machine}")
+    return f"{system}-{architecture}"
 
 
 def digest(path: Path) -> str:
@@ -153,6 +155,13 @@ def install(tool: str, lock_path: Path, cache: Path) -> Path:
             "temporal_cli": staging / "temporal",
             "shellcheck": staging / "shellcheck",
         }[tool]
+        if tool == "shellcheck" and not binary.is_file():
+            candidates = [
+                path for path in staging.rglob("shellcheck")
+                if path.is_file() and path.parent.name == "bin"
+            ]
+            if len(candidates) == 1:
+                shutil.copy2(candidates[0], binary)
         if not binary.is_file():
             raise RuntimeError(f"installed archive lacks expected executable: {binary}")
         os.chmod(binary, 0o755)

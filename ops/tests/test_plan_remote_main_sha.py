@@ -60,12 +60,9 @@ class ExactRevisionCLITest(unittest.TestCase):
             work = Path(temporary)
             key = work / "signing-key"
             broker = work / "broker-submit"
-            supervisor = work / "build-supervisor"
             key.write_text("fixture", encoding="utf-8")
             broker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             broker.chmod(0o755)
-            supervisor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            supervisor.chmod(0o755)
             args = argparse.Namespace(
                 sha=revision,
                 lock=controller.DEFAULT_LOCK,
@@ -76,13 +73,12 @@ class ExactRevisionCLITest(unittest.TestCase):
             with (
                 mock.patch.object(controller, "assert_origin_main"),
                 mock.patch.object(controller, "git_revision", return_value=revision),
-                mock.patch.object(controller, "require_release_runtime", return_value=(work, key, "release-test", broker, supervisor)),
+                mock.patch.object(controller, "require_release_runtime", return_value=(work, key, "release-test", broker)),
                 mock.patch.object(controller, "validate_toolchain", return_value=[]),
                 mock.patch.object(controller, "signer_entries", return_value=["fixture"]),
-                mock.patch.object(controller.shutil, "copy2"),
+                mock.patch.object(controller, "command_full", return_value=0),
                 mock.patch.object(Path, "is_file", return_value=True),
                 mock.patch.object(controller, "build_release_submission", side_effect=lambda **values: values["release_root"]) as build,
-                mock.patch.object(controller.shutil, "rmtree"),
                 mock.patch.object(controller.subprocess, "run", return_value=completed) as run,
             ):
                 self.assertEqual(controller.command_release(args), 0)

@@ -1,15 +1,10 @@
 {
-  "schema": "vane.server-binaries/v1",
+  "schema": "vane.server-binaries/v2",
   "binaries": [
-    {"name": "vane", "package": "./cmd/server"},
-    {"name": "useradmin", "package": "./cmd/useradmin"},
-    {"name": "gate", "package": "./cmd/gate"},
-    {"name": "runtimeadmin", "package": "./cmd/runtimeadmin"},
-    {"name": "vane-migrate", "package": "./cmd/migrate"},
-    {"name": "agentfirstretention", "package": "./cmd/agentfirstretention"},
-    {"name": "vane-research-gateway", "package": "./cmd/researchgateway"},
-    {"name": "vane-research-prepare", "package": "./cmd/researchprepare"},
-    {"name": "researchshadow", "package": "./cmd/researchshadow"},
-    {"name": "researchcutover", "package": "./cmd/researchcutover"}
+    {"name": "vane", "package": "./cmd/server", "role": "service"},
+    {"name": "vane-research-gateway", "package": "./cmd/researchgateway", "role": "service"},
+    {"name": "vane-migrate", "package": "./cmd/migrate", "role": "migration"},
+    {"name": "gate", "package": "./cmd/gate", "role": "verification"},
+    {"name": "agentfirstretention", "package": "./cmd/agentfirstretention", "role": "maintenance"}
   ]
 }

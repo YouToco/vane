@@ -106,7 +106,7 @@ def main() -> int:
         print("usage: vane-broker-submit ABSOLUTE_RELEASE_DIRECTORY", file=sys.stderr)
         return 2
     release = Path(sys.argv[1])
-    config_path = Path("/etc/vane-build/broker-client.json")
+    config_path = Path("/etc/vane-broker/client.json")
     testing = os.environ.get("VANE_BROKER_CLIENT_TESTING") == "1" and os.geteuid() != 0
     if testing:
         config_path = Path(os.environ.get("VANE_BROKER_CLIENT_CONFIG", ""))

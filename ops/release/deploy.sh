@@ -149,10 +149,7 @@ deploy_backend() {
     exit 1
   }
   local binary infra legacy_compat_unit primary_unit gateway_unit
-  for binary in vane useradmin gate runtimeadmin vane-migrate \
-    agentfirstretention \
-    vane-research-gateway vane-research-prepare researchshadow \
-    researchcutover; do
+  for binary in vane vane-research-gateway vane-migrate gate agentfirstretention; do
     [[ -x $payload/bin/$binary ]] || {
       echo "missing verified backend binary: $binary" >&2
       exit 1
@@ -245,15 +242,10 @@ deploy_backend() {
   backend_remote_stage_created=true
   scp "${scp_opts[@]}" \
     "$payload/bin/vane" \
-    "$payload/bin/useradmin" \
-    "$payload/bin/gate" \
-    "$payload/bin/runtimeadmin" \
-    "$payload/bin/vane-migrate" \
-    "$payload/bin/agentfirstretention" \
     "$payload/bin/vane-research-gateway" \
-    "$payload/bin/vane-research-prepare" \
-    "$payload/bin/researchshadow" \
-    "$payload/bin/researchcutover" \
+    "$payload/bin/vane-migrate" \
+    "$payload/bin/gate" \
+    "$payload/bin/agentfirstretention" \
     "$backend_ssh_target:$backend_remote_stage/bin/"
   scp "${scp_opts[@]}" \
     "$payload/release-receipt.json" \

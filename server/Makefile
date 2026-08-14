@@ -2,20 +2,16 @@
 
 RELEASE_BINARIES := \
 	vane=./cmd/server \
-	useradmin=./cmd/useradmin \
-	gate=./cmd/gate \
-	runtimeadmin=./cmd/runtimeadmin \
-	vane-migrate=./cmd/migrate \
-	agentfirstretention=./cmd/agentfirstretention \
 	vane-research-gateway=./cmd/researchgateway \
-	vane-research-prepare=./cmd/researchprepare \
-	researchshadow=./cmd/researchshadow \
-	researchcutover=./cmd/researchcutover
+	vane-migrate=./cmd/migrate \
+	gate=./cmd/gate \
+	agentfirstretention=./cmd/agentfirstretention
 
 build:
 	@set -eu; for entry in $(RELEASE_BINARIES); do \
 		name=$${entry%%=*}; package=$${entry#*=}; \
-		GOWORK=off go build -buildvcs=true -o "bin/$$name" "$$package"; \
+		GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+			go build -buildvcs=true -trimpath -o "bin/$$name" "$$package"; \
 	done
 
 test:

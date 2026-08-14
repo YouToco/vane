@@ -40,7 +40,7 @@ fi
   exit 1
 }
 
-binaries=(vane useradmin gate runtimeadmin vane-migrate agentfirstretention vane-research-gateway vane-research-prepare researchshadow researchcutover)
+binaries=(vane vane-research-gateway vane-migrate gate agentfirstretention)
 infra_files=(Caddyfile docker-compose.yml vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket vane-legacy-compat.service dynamicconfig/development-sql.yaml)
 for binary in "${binaries[@]}"; do
   [[ -f $stage/bin/$binary && ! -L $stage/bin/$binary && -x $stage/bin/$binary ]] || {

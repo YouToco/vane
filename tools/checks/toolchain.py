@@ -20,7 +20,10 @@ def sha256(path: Path) -> str:
 
 
 def machine_arch() -> str:
-    return "linux-arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "linux-amd64"
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    architecture = "arm64" if machine in {"arm64", "aarch64"} else "amd64"
+    return f"{system}-{architecture}"
 
 
 def check(lock_path: Path, cache: Path, repo_root: Path) -> list[str]:

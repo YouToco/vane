@@ -77,20 +77,19 @@ class FullGatePolicyTest(unittest.TestCase):
             "agenttoolinventory",
             "TestRetentionClockEvidenceRealTemporalHistory",
             "TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges",
-            "TestProductionHistoryReplay",
-            "temporal_server",
-            "operator\", \"cluster\", \"system",
+            "server\", \"start-dev",
             "TestCanonicalTemporalServerPostgreSQLRoundTrip",
             "server-binaries.json",
             "check-go-build-info.sh",
             "audit-level=high",
-            "docker\", \"rm\", \"-f",
+            "require_native_postgres",
+            "pg_ctl",
+            "createdb",
             '"GOWORK": "off"',
             '"VANE_FULL_GATE": "1"',
             '"VANE_REQUIRE_CLEAN_RELEASE": "1"',
             "VANE_RUN_DESTRUCTIVE_MIGRATION101_ROLE_TEST",
             "assert_disposable_database",
-            '"{{.Id}}"',
             "test:coverage",
             '"VANE_COVERAGE_HEAD_SHA": head',
             '"VANE_COVERAGE_BASE_SHA": coverage_base',
@@ -103,20 +102,30 @@ class FullGatePolicyTest(unittest.TestCase):
     def test_destructive_role_test_rejects_production_looking_database(self) -> None:
         with self.assertRaisesRegex(controller.PolicyError, "proven disposable"):
             full_gate.assert_disposable_database(
-                container_name="vane-full-0123456789ab-pg-0",
+                data_dir=Path("/var/lib/postgresql/18/main"),
                 database_url="postgres://vane@db.production.internal:5432/vane",
-                container_id="a" * 64,
+                owner_root=Path("/tmp/vane-full-fixture"),
+                expected_database="vane_full_0",
             )
         self.assertNotEqual(
             os.environ.get("VANE_RUN_DESTRUCTIVE_MIGRATION101_ROLE_TEST"), "1"
         )
 
-    def test_destructive_role_test_accepts_bound_local_container(self) -> None:
-        full_gate.assert_disposable_database(
-            container_name="vane-full-0123456789ab-pg-0",
-            database_url="postgres://vane@127.0.0.1:49152/vane_test?sslmode=disable",
-            container_id="b" * 64,
-        )
+    def test_destructive_role_test_accepts_bound_native_cluster(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "postgres"
+            data.mkdir()
+            (data / "PG_VERSION").write_text("18\n", encoding="ascii")
+            full_gate.assert_disposable_database(
+                data_dir=data,
+                database_url=(
+                    "postgres://vane@127.0.0.1:49152/"
+                    "vane_full_0?sslmode=disable"
+                ),
+                owner_root=root,
+                expected_database="vane_full_0",
+            )
 
     def test_verified_artifact_tree_digest_detects_post_gate_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

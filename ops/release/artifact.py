@@ -23,15 +23,10 @@ SERVER_RELEASE_CONTRACT = (
 )
 BACKEND_FILES = {
     "bin/vane": 0o755,
-    "bin/useradmin": 0o755,
-    "bin/gate": 0o755,
-    "bin/runtimeadmin": 0o755,
-    "bin/vane-migrate": 0o755,
-    "bin/agentfirstretention": 0o755,
     "bin/vane-research-gateway": 0o755,
-    "bin/vane-research-prepare": 0o755,
-    "bin/researchshadow": 0o755,
-    "bin/researchcutover": 0o755,
+    "bin/vane-migrate": 0o755,
+    "bin/gate": 0o755,
+    "bin/agentfirstretention": 0o755,
     "deploy/Caddyfile": 0o644,
     "deploy/docker-compose.yml": 0o644,
     "deploy/vane.service": 0o644,
@@ -413,10 +408,8 @@ def validate(
 
         if component == "backend":
             for binary in (
-                "vane", "useradmin", "gate", "runtimeadmin", "vane-migrate",
+                "vane", "vane-research-gateway", "vane-migrate", "gate",
                 "agentfirstretention",
-                "vane-research-gateway", "vane-research-prepare",
-                "researchshadow", "researchcutover",
             ):
                 data = (output_dir / "bin" / binary).read_bytes()
                 if f"vcs.revision={source_sha}".encode() not in data:

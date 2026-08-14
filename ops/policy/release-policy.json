@@ -13,7 +13,6 @@
     "temporal_server": "1.29.7",
     "temporal_ui": "2.52.1",
     "caddy": "2.10.2",
-    "gate_runner": "24.04-v1",
     "shellcheck": "0.11.0",
     "aliyun_cli": "3.4.10",
     "ossutil": "2.3.0",

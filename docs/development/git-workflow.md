@@ -54,11 +54,11 @@ chore(deps): bump pgx to v5.8
 - 本地 exact-SHA Gate + self-review 后合并；GitHub 免费版私有仓库无强制
   branch protection，因此 broker 仍必须独立重验 revision、manifest、锁和 CAS。
 
-### 本地 build supervisor 的 Go cache
+### 本地构建缓存
 
-- build supervisor 可在宿主上维护可重建的 `GOMODCACHE` / `GOCACHE`，但每次
-  exact-SHA Gate 必须在无 Home、无 Docker socket、无生产凭证的一次性容器内运行。
-- cache 不是 authority；损坏、不完整或版本不符时必须丢弃并重建，不得降级 Gate。
+- exact-SHA Gate 直接在当前 Mac 运行固定版本 Go/Node；不经过 runner、VM、构建容器或远端构建机。
+- `GOMODCACHE` / `GOCACHE` 只用于提速，不是制品 authority；发布二进制仍从 clean exact-main
+  交叉编译，并用 build info 证明 SHA 与 `vcs.modified=false`。
 
 ## 与里程碑排期的对应
 

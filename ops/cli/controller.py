@@ -749,17 +749,15 @@ def broker_required(operation: str) -> int:
     return EXIT_POLICY
 
 
-def require_release_runtime() -> tuple[Path, Path, str, Path, Path]:
+def require_release_runtime() -> tuple[Path, Path, str, Path]:
     work_root = Path(os.environ.get("VANE_WORK_ROOT", ""))
     signing_key = Path(os.environ.get("VANE_RELEASE_SIGNING_KEY", ""))
     signer = os.environ.get("VANE_RELEASE_SIGNER", "").strip()
     broker_submit = Path(os.environ.get("VANE_BROKER_SUBMIT", ""))
-    build_supervisor = Path(os.environ.get("VANE_BUILD_SUPERVISOR", ""))
     for name, path, executable in (
         ("VANE_WORK_ROOT", work_root, False),
         ("VANE_RELEASE_SIGNING_KEY", signing_key, False),
         ("VANE_BROKER_SUBMIT", broker_submit, True),
-        ("VANE_BUILD_SUPERVISOR", build_supervisor, True),
     ):
         valid = path.is_absolute() and not path.is_symlink()
         valid = valid and (path.is_dir() if name == "VANE_WORK_ROOT" else path.is_file())
@@ -769,7 +767,7 @@ def require_release_runtime() -> tuple[Path, Path, str, Path, Path]:
             raise PolicyError(f"{name} must name a safe existing absolute path")
     if not signer or not signer.isascii() or any(char.isspace() for char in signer):
         raise PolicyError("VANE_RELEASE_SIGNER must be a non-empty ASCII principal")
-    return work_root, signing_key, signer, broker_submit, build_supervisor
+    return work_root, signing_key, signer, broker_submit
 
 
 def write_signed_manifest(
@@ -1011,7 +1009,7 @@ def command_release(args: argparse.Namespace) -> int:
     )
     if dirty.returncode != 0 or dirty.stdout:
         raise PolicyError("release requires a clean exact-source worktree")
-    work_root, signing_key, signer, broker_submit, build_supervisor = require_release_runtime()
+    work_root, signing_key, signer, broker_submit = require_release_runtime()
     preflight_errors = validate_toolchain(args.lock, args.policy)
     if not signer_entries(args.allowed_signers):
         preflight_errors.append(f"allowed signer policy has no trusted keys: {args.allowed_signers}")
@@ -1021,23 +1019,28 @@ def command_release(args: argparse.Namespace) -> int:
     if release_root.exists() or release_root.is_symlink():
         raise PolicyError(f"release evidence path already exists: {release_root}")
     release_root.mkdir(mode=0o700)
-    build_output = release_root / "build-output"
-    supervised = subprocess.run(
-        [str(build_supervisor), "--sha", args.sha, "--output", str(build_output)],
-        check=False,
-    )
-    if supervised.returncode != 0:
-        raise PolicyError(f"root-owned build supervisor failed with exit {supervised.returncode}")
-    supervised_evidence = build_output / "full-gate.json"
-    if supervised_evidence.is_symlink() or not supervised_evidence.is_file():
-        raise PolicyError("root-owned build supervisor returned no gate evidence")
     gate_evidence = release_root / "full-gate.json"
-    shutil.copy2(supervised_evidence, gate_evidence)
+    prior_work_root = os.environ.get("VANE_WORK_ROOT")
+    prior_gate_evidence = os.environ.get("VANE_FULL_GATE_EVIDENCE")
+    os.environ["VANE_WORK_ROOT"] = str(release_root)
+    os.environ["VANE_FULL_GATE_EVIDENCE"] = str(gate_evidence)
+    try:
+        command_full(argparse.Namespace(sha=args.sha))
+    finally:
+        if prior_work_root is None:
+            os.environ.pop("VANE_WORK_ROOT", None)
+        else:
+            os.environ["VANE_WORK_ROOT"] = prior_work_root
+        if prior_gate_evidence is None:
+            os.environ.pop("VANE_FULL_GATE_EVIDENCE", None)
+        else:
+            os.environ["VANE_FULL_GATE_EVIDENCE"] = prior_gate_evidence
+    if gate_evidence.is_symlink() or not gate_evidence.is_file():
+        raise PolicyError("local exact-SHA full gate returned no evidence")
     submission = build_release_submission(
         revision=args.sha, release_root=release_root, gate_evidence=gate_evidence,
         signing_key=signing_key, signer=signer, allowed_signers=args.allowed_signers,
     )
-    shutil.rmtree(build_output)
     submitted = subprocess.run([str(broker_submit), str(submission)], check=False)
     if submitted.returncode != 0:
         raise PolicyError(f"broker submission failed with exit {submitted.returncode}")

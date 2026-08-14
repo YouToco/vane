@@ -22,12 +22,12 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertEqual(lock["tools"]["go"]["version"], "1.26.6")
         self.assertNotIn("1.26.5", json.dumps(lock))
 
-    def test_artifact_is_the_complete_ten_binary_process_boundary(self) -> None:
+    def test_artifact_is_the_minimal_runtime_process_boundary(self) -> None:
         inventory = json.loads(
             (REPO / "contracts/release/server-binaries.json").read_text(encoding="utf-8")
         )["binaries"]
         binaries = {f"bin/{entry['name']}" for entry in inventory}
-        self.assertEqual(len(binaries), 10)
+        self.assertEqual(len(binaries), 5)
         self.assertEqual(
             binaries,
             {name for name in artifact.BACKEND_FILES if name.startswith("bin/")},

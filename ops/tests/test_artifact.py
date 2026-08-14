@@ -111,7 +111,7 @@ class ArtifactValidationTest(unittest.TestCase):
             control_plane_revision=CONTROL_SHA,
             deploy_run_id="123456",
         )
-        self.assertTrue((output / "bin/vane-research-prepare").is_file())
+        self.assertTrue((output / "bin/vane-research-gateway").is_file())
         self.assertTrue((output / "bin/agentfirstretention").is_file())
         receipt_raw = (output / "release-receipt.json").read_text(encoding="utf-8")
         receipt = json.loads(receipt_raw, object_pairs_hook=artifact.strict_object)
@@ -146,12 +146,12 @@ class ArtifactValidationTest(unittest.TestCase):
         manifest = json.loads(
             (packed / f"backend-{SHA}.manifest.json").read_text(encoding="utf-8")
         )
-        prepare_entry = next(
+        gateway_entry = next(
             entry
             for entry in manifest["files"]
-            if entry["path"] == "bin/vane-research-prepare"
+            if entry["path"] == "bin/vane-research-gateway"
         )
-        self.assertEqual(prepare_entry["mode"], 0o755)
+        self.assertEqual(gateway_entry["mode"], 0o755)
         collector_entry = next(
             entry
             for entry in manifest["files"]
@@ -207,10 +207,10 @@ class ArtifactValidationTest(unittest.TestCase):
                     control_plane_revision=control,
                     deploy_run_id=run_id,
                 )
-    def test_backend_pack_fails_without_research_prepare(self) -> None:
+    def test_backend_pack_fails_without_research_gateway(self) -> None:
         source = self.root / "backend-incomplete"
         for name, mode in artifact.BACKEND_FILES.items():
-            if name == "bin/vane-research-prepare":
+            if name == "bin/vane-research-gateway":
                 continue
             path = source / artifact.BACKEND_SOURCE_PATHS[name]
             path.parent.mkdir(parents=True, exist_ok=True)
