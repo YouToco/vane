@@ -153,6 +153,26 @@ class ProductionCutoverTest(unittest.TestCase):
         with self.assertRaisesRegex(production_cutover.BootstrapError, "different"):
             production_cutover.validate_plan(plan, digest)
 
+    def test_broker_key_comparison_ignores_only_public_comment(self) -> None:
+        private = self.layout.path(
+            "/etc/vane-broker/credentials/broker_signing_key"
+        )
+        private.parent.mkdir(parents=True)
+        private.write_text("private fixture\n", encoding="ascii")
+        plan = {"broker_signer_public_key": "ssh-ed25519 AAAA"}
+        with mock.patch.object(
+            production_cutover,
+            "command_output",
+            return_value="ssh-ed25519 AAAA vane-production-broker",
+        ):
+            production_cutover.verify_broker_key(plan, self.layout)
+        with mock.patch.object(
+            production_cutover,
+            "command_output",
+            return_value="ssh-ed25519 BBBB vane-production-broker",
+        ), self.assertRaisesRegex(production_cutover.BootstrapError, "differs"):
+            production_cutover.verify_broker_key(plan, self.layout)
+
     def test_live_baseline_refuses_preexisting_new_authority(self) -> None:
         production_cutover.verify_live_baseline(self.baseline, self.layout)
         current = self.layout.path("/opt/vane/current")
