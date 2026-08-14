@@ -124,6 +124,7 @@ func BuildBaselineManifest(input BaselineManifestInput) (BaselineManifest, error
 	if temporal.HistoryArchivalState != temporal.VisibilityArchivalState {
 		return BaselineManifest{}, fmt.Errorf("baseline archival modes are mixed")
 	}
+	seenRuns := make(map[string]struct{}, input.StandardWorkflows.Count+input.ArchivedWorkflows.Count)
 	for _, run := range append(append([]LegacyWorkflowRun(nil),
 		input.StandardWorkflows.Runs...), input.ArchivedWorkflows.Runs...) {
 		if !boundedCanonicalTemporalText(run.WorkflowID, maxTemporalAuthorityTextBytes) ||
@@ -133,6 +134,11 @@ func BuildBaselineManifest(input BaselineManifestInput) (BaselineManifest, error
 			!validLowerHex(run.HistoryDigest, sha256.Size) || run.HistoryEvents <= 0 {
 			return BaselineManifest{}, fmt.Errorf("baseline workflow item is invalid")
 		}
+		key := run.WorkflowID + "\x00" + run.RunID
+		if _, duplicate := seenRuns[key]; duplicate {
+			return BaselineManifest{}, fmt.Errorf("baseline workflow item is duplicated across inventories")
+		}
+		seenRuns[key] = struct{}{}
 	}
 	for _, schedule := range input.Schedules.Items {
 		if !boundedCanonicalTemporalText(schedule.ScheduleID, maxTemporalAuthorityTextBytes) ||

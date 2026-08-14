@@ -103,9 +103,11 @@ def deterministic_tar(root: Path, output: Path) -> tuple[str, int]:
 
 def main() -> int:
     if len(sys.argv) != 2:
-        print("usage: vane-broker-submit ABSOLUTE_RELEASE_DIRECTORY", file=sys.stderr)
+        print(
+            "usage: vane-broker-submit ABSOLUTE_RELEASE_DIRECTORY|--status",
+            file=sys.stderr,
+        )
         return 2
-    release = Path(sys.argv[1])
     config_path = Path("/etc/vane-broker/client.json")
     testing = os.environ.get("VANE_BROKER_CLIENT_TESTING") == "1" and os.geteuid() != 0
     if testing:
@@ -122,24 +124,41 @@ def main() -> int:
         or any(not isinstance(item, str) or not item for item in command)
     ):
         raise RuntimeError("broker client SSH command is invalid")
+    status = subprocess.run(
+        [*command, "vane-broker status"],
+        input=b"{}",
+        capture_output=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise RuntimeError(f"broker status failed with exit {status.returncode}")
+    try:
+        current = json.loads(status.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("broker status returned invalid JSON") from error
+    expected = current.get("current_digest") if isinstance(current, dict) else None
+    server_revision = current.get("server_revision") if isinstance(current, dict) else None
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise RuntimeError("broker status did not return an exact current CAS digest")
+    if (
+        not isinstance(server_revision, str)
+        or len(server_revision) != 40
+        or any(character not in "0123456789abcdef" for character in server_revision)
+    ):
+        raise RuntimeError("broker status did not return an exact server revision")
+    if sys.argv[1] == "--status":
+        print(
+            json.dumps(
+                {"current_digest": expected, "server_revision": server_revision},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    release = Path(sys.argv[1])
     with tempfile.TemporaryDirectory(prefix="vane-submit-") as temp:
         archive = Path(temp) / "submission.tar"
         digest, size = deterministic_tar(release, archive)
-        status = subprocess.run(
-            [*command, "vane-broker status"],
-            input=b"{}",
-            capture_output=True,
-            check=False,
-        )
-        if status.returncode != 0:
-            raise RuntimeError(f"broker status failed with exit {status.returncode}")
-        try:
-            current = json.loads(status.stdout)
-        except json.JSONDecodeError as error:
-            raise RuntimeError("broker status returned invalid JSON") from error
-        expected = current.get("current_digest") if isinstance(current, dict) else None
-        if not isinstance(expected, str) or len(expected) != 64:
-            raise RuntimeError("broker status did not return an exact current CAS digest")
         with archive.open("rb") as handle:
             upload = subprocess.run(
                 [*command, f"vane-broker upload {digest} {size}"],

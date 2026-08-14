@@ -110,6 +110,11 @@ func run() int {
 		return exitFailure
 	}
 	defer st.Close()
+	if _, err := st.AssertAgentFirstLegacyWriteFence(ctx); err != nil {
+		slog.Error("gate: Agent-first legacy 写入冻结验证失败", "err", err)
+		fmt.Fprintln(os.Stderr, "gate: Agent-first legacy 写入冻结不完整")
+		return exitFailure
+	}
 
 	var principal auth.Principal
 	if *userID == 0 {

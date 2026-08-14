@@ -139,6 +139,32 @@ class FullGatePolicyTest(unittest.TestCase):
              mock.patch.object(full_gate, "output", return_value="postgres (PostgreSQL) 18.4"):
             binaries = full_gate.require_native_postgres()
         self.assertEqual(binaries["postgres"], fake / "postgres")
+        self.assertEqual(binaries["psql"], fake / "psql")
+
+    def test_migration_delta_accepts_only_forward_additions(self) -> None:
+        base = {
+            "130_retained.sql": "a" * 40,
+            "131_projection.sql": "b" * 40,
+        }
+        current = {**base, "132_fence.sql": "c" * 40}
+        self.assertEqual(
+            full_gate.additive_migration_delta(base=base, current=current),
+            {"132_fence.sql": "c" * 40},
+        )
+
+    def test_migration_delta_rejects_mutation_deletion_and_backfill(self) -> None:
+        base = {
+            "130_retained.sql": "a" * 40,
+            "131_projection.sql": "b" * 40,
+        }
+        cases = (
+            {"130_retained.sql": "c" * 40, "131_projection.sql": "b" * 40},
+            {"131_projection.sql": "b" * 40},
+            {**base, "129_late_backfill.sql": "d" * 40},
+        )
+        for current in cases:
+            with self.subTest(current=current), self.assertRaises(controller.PolicyError):
+                full_gate.additive_migration_delta(base=base, current=current)
 
     def test_verified_artifact_tree_digest_detects_post_gate_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -126,6 +126,10 @@ func run() error {
 	}
 	var researchControlStore *store.Store
 	closeStores := func() { closeServerStores(st, researchControlStore) }
+	if _, err := st.AssertAgentFirstLegacyWriteFence(ctx); err != nil {
+		closeStores()
+		return fmt.Errorf("验证 Agent-first legacy 写入冻结: %w", err)
+	}
 	legacyStore, err := store.NewLegacyAdmissionFencedStore(st)
 	if err != nil {
 		closeStores()

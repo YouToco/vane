@@ -519,6 +519,10 @@
     {
       "path": "131_agent_session_projection_unbounded_messages.sql",
       "sha256": "c608183c3d462faff3a7acc90bae09d4407551ac3188af8e41d883d49f107bfd"
+    },
+    {
+      "path": "132_agent_first_legacy_protocol_write_fence.sql",
+      "sha256": "23986419faf563c7436e9aed699bfba53d9a018177553306bea76d3dba7ed555"
     }
   ],
   "schema": "vane.migrations/v1"

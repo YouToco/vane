@@ -290,7 +290,11 @@ func newTaskDefinitionEditEntrypointFixture(
 func taskDefinitionEditEntrypointTestStore(t *testing.T) *Store {
 	t.Helper()
 	dbURL, _, provider := migration039Scratch(t)
-	if _, err := provider.Up(t.Context()); err != nil {
+	// These fixtures intentionally exercise the retained protocol-1 edit
+	// reader/entrypoint contract. Migration 132 physically freezes new
+	// protocol-1 writes, so the retained-history suite must stop at the last
+	// schema where constructing those historical rows remains authorized.
+	if _, err := provider.UpTo(t.Context(), 131); err != nil {
 		t.Fatalf("migrate retained entrypoint scratch DB: %v", err)
 	}
 	st, err := New(t.Context(), dbURL)

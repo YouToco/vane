@@ -388,7 +388,24 @@ def handle(
     if verb == "status":
         current = state_root / "current-release.json"
         invoke_cli(repo, ["status", "--current-release", str(current)], quiet=True)
-        return {"ok": True, "verb": verb, "current_digest": sha256(current)}
+        release = json.loads(
+            current.read_text(encoding="utf-8"),
+            object_pairs_hook=lambda pairs: _strict_pairs(pairs),
+        )
+        server = release.get("server") if isinstance(release, dict) else None
+        server_revision = (
+            server.get("deployed_revision") if isinstance(server, dict) else None
+        )
+        if not isinstance(server_revision, str) or not re.fullmatch(
+            r"[0-9a-f]{40}", server_revision
+        ):
+            raise RuntimeError("broker current server revision is invalid")
+        return {
+            "ok": True,
+            "verb": verb,
+            "current_digest": sha256(current),
+            "server_revision": server_revision,
+        }
     if verb == "cert-check":
         certificate = request_file(root, request["certificate"])
         days = request["min_days"]

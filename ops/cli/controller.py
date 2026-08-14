@@ -830,7 +830,9 @@ def build_release_submission(
         "binary_tree_sha256", "web_tree_sha256", "web_coverage_sha256",
         "server_coverage_sha256", "release_marker_sha256",
         "server_source_tree_sha256", "infra_tree_sha256",
-        "migration_tree_object", "server_rollback_safe",
+        "migration_tree_object", "rollback_base_revision",
+        "rollback_compatibility_path", "rollback_compatibility_sha256",
+        "server_rollback_safe",
     }
     if not isinstance(gate, dict) or set(gate) != expected_gate_keys:
         raise PolicyError("full gate evidence shape is not exact")
@@ -845,6 +847,46 @@ def build_release_submission(
         digest_value(gate[field], field=f"full gate {field}")
     if gate["server_rollback_safe"] is not True:
         raise PolicyError("release lacks previous-binary rollback compatibility proof")
+    if (
+        not isinstance(gate["rollback_base_revision"], str)
+        or not EXACT_SHA.fullmatch(gate["rollback_base_revision"])
+    ):
+        raise PolicyError("full gate rollback base is not an exact revision")
+    rollback_proof = Path(gate["rollback_compatibility_path"])
+    if rollback_proof.is_absolute():
+        raise PolicyError("full gate rollback proof path must be relative")
+    rollback_proof = gate_evidence.parent / rollback_proof
+    try:
+        rollback_proof.resolve(strict=True).relative_to(gate_evidence.parent.resolve())
+    except (OSError, ValueError) as error:
+        raise PolicyError("full gate rollback proof escapes the evidence root") from error
+    if rollback_proof.is_symlink() or not rollback_proof.is_file():
+        raise PolicyError("full gate rollback proof is unavailable")
+    digest_value(
+        gate["rollback_compatibility_sha256"],
+        field="full gate rollback compatibility digest",
+    )
+    if sha256_file(rollback_proof) != gate["rollback_compatibility_sha256"]:
+        raise PolicyError("full gate rollback proof changed after verification")
+    rollback_value = load_json(rollback_proof)
+    expected_rollback_keys = {
+        "schema", "base_revision", "current_revision", "mode",
+        "added_migrations", "previous_gate_sha256",
+        "previous_gate_output_sha256", "status",
+    }
+    if not isinstance(rollback_value, dict) or set(rollback_value) != expected_rollback_keys:
+        raise PolicyError("rollback compatibility proof shape is not exact")
+    if (
+        rollback_value["schema"] != "vane.server-rollback-compatibility/v1"
+        or rollback_value["base_revision"] != gate["rollback_base_revision"]
+        or rollback_value["current_revision"] != revision
+        or rollback_value["status"] != "passed"
+        or rollback_value["mode"] not in {
+            "identical-migration-history", "previous-binary-on-upgraded-schema"
+        }
+        or not isinstance(rollback_value["added_migrations"], list)
+    ):
+        raise PolicyError("rollback compatibility proof does not bind the release")
     binary_dir = Path(gate["binary_dir"])
     web_dist = Path(gate["web_dist"])
     if binary_dir.is_absolute() or web_dist.is_absolute():
@@ -902,6 +944,7 @@ def build_release_submission(
     durable_gate.mkdir()
     shutil.copy2(web_coverage, durable_gate / web_coverage.name)
     shutil.copy2(server_coverage, durable_gate / server_coverage.name)
+    shutil.copy2(rollback_proof, durable_gate / rollback_proof.name)
     shutil.copy2(DEFAULT_POLICY, durable_gate / "release-policy.json")
     shutil.copy2(DEFAULT_LOCK, durable_gate / "toolchain.lock.json")
     shutil.copy2(
@@ -925,6 +968,7 @@ def build_release_submission(
         evidence={
             "full-gate.json": handoff_gate,
             "server-coverage.out": durable_gate / server_coverage.name,
+            "server-rollback-compatibility.json": durable_gate / rollback_proof.name,
             "web-coverage-summary.json": durable_gate / web_coverage.name,
         },
         parent=plan,
@@ -963,6 +1007,10 @@ def build_release_submission(
             "gate:server-coverage.out": {
                 "path": "gate-evidence/coverage.out",
                 "sha256": sha256_file(durable_gate / server_coverage.name),
+            },
+            "gate:server-rollback-compatibility.json": {
+                "path": "gate-evidence/server-rollback-compatibility.json",
+                "sha256": sha256_file(durable_gate / rollback_proof.name),
             },
             "gate:web-coverage-summary.json": {
                 "path": "gate-evidence/web-coverage-summary.json",
@@ -1036,6 +1084,27 @@ def command_release(args: argparse.Namespace) -> int:
         preflight_errors.append(f"allowed signer policy has no trusted keys: {args.allowed_signers}")
     if preflight_errors:
         raise PolicyError("release preflight failed: " + "; ".join(preflight_errors))
+    broker_status = subprocess.run(
+        [str(broker_submit), "--status"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if broker_status.returncode != 0:
+        raise PolicyError(
+            f"broker status failed before local Gate: {broker_status.stderr.strip()}"
+        )
+    try:
+        current = json.loads(broker_status.stdout)
+    except json.JSONDecodeError as error:
+        raise PolicyError("broker status returned invalid JSON before local Gate") from error
+    if not isinstance(current, dict) or set(current) != {
+        "current_digest", "server_revision"
+    }:
+        raise PolicyError("broker status shape is not exact before local Gate")
+    rollback_base = current["server_revision"]
+    if not isinstance(rollback_base, str) or not EXACT_SHA.fullmatch(rollback_base):
+        raise PolicyError("broker status lacks an exact deployed server revision")
     release_root = work_root / f"release-{args.sha}"
     if release_root.exists() or release_root.is_symlink():
         raise PolicyError(f"release evidence path already exists: {release_root}")
@@ -1043,8 +1112,10 @@ def command_release(args: argparse.Namespace) -> int:
     gate_evidence = release_root / "full-gate.json"
     prior_work_root = os.environ.get("VANE_WORK_ROOT")
     prior_gate_evidence = os.environ.get("VANE_FULL_GATE_EVIDENCE")
+    prior_rollback_base = os.environ.get("VANE_ROLLBACK_BASE_SHA")
     os.environ["VANE_WORK_ROOT"] = str(release_root)
     os.environ["VANE_FULL_GATE_EVIDENCE"] = str(gate_evidence)
+    os.environ["VANE_ROLLBACK_BASE_SHA"] = rollback_base
     try:
         command_full(argparse.Namespace(sha=args.sha))
     finally:
@@ -1056,6 +1127,10 @@ def command_release(args: argparse.Namespace) -> int:
             os.environ.pop("VANE_FULL_GATE_EVIDENCE", None)
         else:
             os.environ["VANE_FULL_GATE_EVIDENCE"] = prior_gate_evidence
+        if prior_rollback_base is None:
+            os.environ.pop("VANE_ROLLBACK_BASE_SHA", None)
+        else:
+            os.environ["VANE_ROLLBACK_BASE_SHA"] = prior_rollback_base
     if gate_evidence.is_symlink() or not gate_evidence.is_file():
         raise PolicyError("local exact-SHA full gate returned no evidence")
     submission = build_release_submission(

@@ -164,7 +164,7 @@ func (s *createResearchV3ResponseLossStore) CreateResearchTaskCreationOperationV
 // JSONB: PostgreSQL rewrites their object bytes, so raw-byte identity checks
 // would reject both the first proposal and the terminal replay.
 func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
-	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	st, tenantID, userID := newRetainedCreationCoordinatorPostgreSQLFixture(t)
 
 	t.Run("complete confirm and terminal replay survive JSONB rewrite", func(t *testing.T) {
 		schedules := &creationSagaFakeScheduler{}
@@ -664,7 +664,7 @@ func TestCreationCoordinator_NativeV3PostgreSQLStaleRecoveryExecutesLifecycle(t 
 }
 
 func TestResearchCreationCoordinatorV3PostgreSQLIgnoresStaleV1Journal(t *testing.T) {
-	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
+	st, tenantID, userID := newRetainedCreationCoordinatorPostgreSQLFixture(t)
 	schedules := &creationSagaFakeScheduler{}
 	legacy := NewCreationCoordinator(st, schedules, nil)
 	actionID := "retained-v1-stale-" + uuid.NewString()
@@ -685,7 +685,7 @@ func TestResearchCreationCoordinatorV3PostgreSQLIgnoresStaleV1Journal(t *testing
 		}); err != nil {
 		t.Fatalf("acquire retained V1 operation: %v", err)
 	}
-	dbURL := creationCoordinatorTestDatabaseURL()
+	dbURL := retainedTaskSchemaURL
 	conn, err := pgx.Connect(t.Context(), dbURL)
 	if err != nil {
 		t.Fatal(err)
@@ -734,6 +734,24 @@ func newCreationCoordinatorPostgreSQLFixture(
 	if err := store.Migrate(t.Context(), dbURL); err != nil {
 		t.Fatalf("store.Migrate(): %v", err)
 	}
+	return newCreationCoordinatorPostgreSQLFixtureAt(t, dbURL)
+}
+
+func newRetainedCreationCoordinatorPostgreSQLFixture(
+	t *testing.T,
+) (*store.Store, int64, int64) {
+	t.Helper()
+	if retainedTaskSchemaURL == "" {
+		requireDatabaseCapability(t)
+	}
+	return newCreationCoordinatorPostgreSQLFixtureAt(t, retainedTaskSchemaURL)
+}
+
+func newCreationCoordinatorPostgreSQLFixtureAt(
+	t *testing.T,
+	dbURL string,
+) (*store.Store, int64, int64) {
+	t.Helper()
 	st, err := store.New(t.Context(), dbURL)
 	if err != nil {
 		t.Fatalf("store.New(): %v", err)

@@ -1,5 +1,7 @@
-from pathlib import Path
 import argparse
+import json
+import os
+from pathlib import Path
 import subprocess
 import tempfile
 import unittest
@@ -69,22 +71,41 @@ class ExactRevisionCLITest(unittest.TestCase):
                 policy=controller.DEFAULT_POLICY,
                 allowed_signers=controller.DEFAULT_SIGNERS,
             )
-            completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if command == [str(broker), "--status"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=json.dumps({
+                            "current_digest": "f" * 64,
+                            "server_revision": "b" * 40,
+                        }),
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            observed_base: list[str] = []
+
+            def full(_: argparse.Namespace) -> int:
+                observed_base.append(os.environ["VANE_ROLLBACK_BASE_SHA"])
+                return 0
+
             with (
                 mock.patch.object(controller, "assert_origin_main"),
                 mock.patch.object(controller, "git_revision", return_value=revision),
                 mock.patch.object(controller, "require_release_runtime", return_value=(work, key, "release-test", broker)),
                 mock.patch.object(controller, "validate_toolchain", return_value=[]),
                 mock.patch.object(controller, "signer_entries", return_value=["fixture"]),
-                mock.patch.object(controller, "command_full", return_value=0),
+                mock.patch.object(controller, "command_full", side_effect=full),
                 mock.patch.object(Path, "is_file", return_value=True),
                 mock.patch.object(controller, "build_release_submission", side_effect=lambda **values: values["release_root"]) as build,
                 mock.patch.object(controller, "publish_web_after_server", return_value=work / "web.json"),
-                mock.patch.object(controller.subprocess, "run", return_value=completed) as run,
+                mock.patch.object(controller.subprocess, "run", side_effect=run) as run_mock,
             ):
                 self.assertEqual(controller.command_release(args), 0)
             build.assert_called_once()
-            self.assertEqual(run.call_args_list[-1].args[0], [str(broker), str(work / f"release-{revision}")])
+            self.assertEqual(observed_base, ["b" * 40])
+            self.assertEqual(run_mock.call_args_list[-1].args[0], [str(broker), str(work / f"release-{revision}")])
 
 
 if __name__ == "__main__":

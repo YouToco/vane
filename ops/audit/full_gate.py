@@ -11,11 +11,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from urllib.parse import urlparse
@@ -67,6 +69,287 @@ def migration_tree_object(*, revision: str, path: str, env: dict[str, str]) -> s
     return value
 
 
+def git_path_exists(*, revision: str, path: str) -> bool:
+    return subprocess.run(
+        ["git", "cat-file", "-e", f"{revision}:{path}"],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+
+def migration_inventory(*, revision: str, path: str) -> dict[str, str]:
+    result = subprocess.run(
+        [
+            "git", "ls-tree", "-r", "-z", "--full-tree",
+            "--format=%(objectname)%x09%(path)", revision, "--", path,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PolicyError(f"cannot inventory migrations at {revision}:{path}")
+    prefix = path.rstrip("/") + "/"
+    inventory: dict[str, str] = {}
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            object_id_raw, file_raw = raw.split(b"\t", 1)
+            object_id = object_id_raw.decode("ascii")
+            file_name = file_raw.decode("utf-8")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise PolicyError("migration inventory contains an invalid Git entry") from error
+        if not file_name.startswith(prefix):
+            raise PolicyError("migration inventory escaped its canonical directory")
+        relative = file_name[len(prefix):]
+        if (
+            not relative
+            or "/" in relative
+            or not relative.endswith(".sql")
+            or not re.fullmatch(r"[0-9]{3}_[a-z0-9_]+\.sql", relative)
+            or not re.fullmatch(r"[0-9a-f]{40,64}", object_id)
+            or relative in inventory
+        ):
+            raise PolicyError(f"migration inventory entry is not canonical: {relative!r}")
+        inventory[relative] = object_id
+    if not inventory:
+        raise PolicyError(f"migration inventory is empty: {revision}:{path}")
+    return inventory
+
+
+def additive_migration_delta(
+    *, base: dict[str, str], current: dict[str, str]
+) -> dict[str, str]:
+    removed = sorted(set(base) - set(current))
+    changed = sorted(name for name in set(base) & set(current) if base[name] != current[name])
+    if removed or changed:
+        raise PolicyError(
+            "migration history is not append-only: "
+            f"removed={removed} changed={changed}"
+        )
+    added = {name: current[name] for name in sorted(set(current) - set(base))}
+    if added:
+        highest_base = max(int(name[:3]) for name in base)
+        non_forward = [name for name in added if int(name[:3]) <= highest_base]
+        if non_forward:
+            raise PolicyError(
+                "new migrations must advance beyond the retained migration history: "
+                f"{non_forward}"
+            )
+    return added
+
+
+def extract_git_revision(*, revision: str, destination: Path) -> None:
+    destination.mkdir(mode=0o700)
+    archive = subprocess.Popen(
+        ["git", "archive", "--format=tar", revision],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert archive.stdout is not None
+    assert archive.stderr is not None
+    try:
+        with tarfile.open(fileobj=archive.stdout, mode="r|") as payload:
+            for member in payload:
+                name = PurePosixPath(member.name)
+                if (
+                    name.is_absolute()
+                    or not name.parts
+                    or any(part in {"", ".", ".."} for part in name.parts)
+                    or not (member.isdir() or member.isreg())
+                    or member.mode & 0o7000
+                ):
+                    raise PolicyError("previous revision archive contains an unsafe member")
+                target = destination.joinpath(*name.parts)
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if member.isdir():
+                    target.mkdir(exist_ok=True, mode=0o700)
+                    continue
+                source = payload.extractfile(member)
+                if source is None:
+                    raise PolicyError("cannot read previous revision archive member")
+                with target.open("xb") as output_file:
+                    shutil.copyfileobj(source, output_file)
+                target.chmod(0o755 if member.mode & 0o111 else 0o600)
+    finally:
+        archive.stdout.close()
+    stderr = archive.stderr.read().decode("utf-8", errors="replace")
+    if archive.wait() != 0:
+        raise PolicyError(f"cannot extract rollback base revision: {stderr.strip()}")
+
+
+def run_psql(*, psql: Path, database_url: str, script: str, cwd: Path) -> str:
+    result = subprocess.run(
+        [str(psql), database_url, "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"],
+        cwd=cwd,
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PolicyError(
+            "rollback compatibility database fixture failed: "
+            + result.stderr.strip()
+        )
+    return result.stdout.strip()
+
+
+def prove_previous_binary_compatibility(
+    *,
+    base_revision: str,
+    current_revision: str,
+    added_migrations: dict[str, str],
+    database_url: str,
+    runtime: Path,
+    artifacts: Path,
+    go: Path,
+    postgres: dict[str, Path],
+    env: dict[str, str],
+) -> tuple[Path, bool]:
+    proof_path = artifacts / "server-rollback-compatibility.json"
+    if not added_migrations:
+        proof = {
+            "schema": "vane.server-rollback-compatibility/v1",
+            "base_revision": base_revision,
+            "current_revision": current_revision,
+            "mode": "identical-migration-history",
+            "added_migrations": [],
+            "previous_gate_sha256": None,
+            "previous_gate_output_sha256": None,
+            "status": "passed",
+        }
+        proof_path.write_text(
+            json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return proof_path, True
+
+    migrate_env = {**env, "VANE_MIGRATION_DB_URL": database_url}
+    migration = subprocess.run(
+        [str(go), "run", "./cmd/migrate"],
+        cwd=SERVER,
+        env=migrate_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if migration.returncode != 0:
+        raise PolicyError(
+            "current migrations failed in rollback compatibility database: "
+            + migration.stderr.strip()
+        )
+
+    password = "vane-full-compat-" + uuid.uuid4().hex
+    user_value = run_psql(
+        psql=postgres["psql"],
+        database_url=database_url,
+        cwd=ROOT,
+        script=(
+            "ALTER ROLE vane_server_runtime LOGIN PASSWORD '" + password + "';\n"
+            "WITH inserted AS (\n"
+            "  INSERT INTO users(feishu_open_id,name)\n"
+            "  VALUES ('vane-full-rollback-compat','rollback compatibility')\n"
+            "  RETURNING id\n"
+            ")\n"
+            "INSERT INTO memberships(tenant_id,user_id,role)\n"
+            "SELECT 1,id,'owner' FROM inserted RETURNING user_id;\n"
+        ),
+    )
+    if not re.fullmatch(r"[1-9][0-9]*", user_value):
+        raise PolicyError("rollback compatibility fixture did not return one exact user")
+
+    previous_source = runtime / "rollback-base-source"
+    extract_git_revision(revision=base_revision, destination=previous_source)
+    if (previous_source / "server/go.mod").is_file():
+        previous_module = previous_source / "server"
+    elif (previous_source / "go.mod").is_file():
+        previous_module = previous_source
+    else:
+        raise PolicyError("rollback base has no supported Go server module")
+    previous_gate = runtime / "rollback-base-gate"
+    build = subprocess.run(
+        [str(go), "build", "-trimpath", "-o", str(previous_gate), "./cmd/gate"],
+        cwd=previous_module,
+        env={**env, "GOWORK": "off", "GOTOOLCHAIN": "local"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if build.returncode != 0:
+        raise PolicyError(
+            "rollback base gate does not build with the locked toolchain: "
+            + build.stderr.strip()
+        )
+
+    parsed = urlparse(database_url)
+    runtime_url = (
+        f"postgres://vane_server_runtime:{password}@127.0.0.1:{parsed.port}"
+        f"{parsed.path}?sslmode=disable"
+    )
+    (runtime / "rollback-base-home").mkdir(mode=0o700)
+    gate = subprocess.run(
+        [str(previous_gate), "-user", user_value, "-json"],
+        cwd=runtime,
+        env={
+            **env,
+            "HOME": str(runtime / "rollback-base-home"),
+            "VANE_DB_URL": runtime_url,
+            "VANE_LLM_API_KEY": "rollback-compatibility-not-a-secret",
+            "VANE_LLM_AGENT_API_KEY": "rollback-compatibility-not-a-secret",
+        },
+        capture_output=True,
+        check=False,
+    )
+    if gate.returncode != 0:
+        raise PolicyError(
+            "rollback base gate failed against the upgraded schema: "
+            + gate.stderr.decode("utf-8", errors="replace").strip()
+        )
+    try:
+        gate_output = json.loads(gate.stdout)
+    except json.JSONDecodeError as error:
+        raise PolicyError("rollback base gate returned invalid JSON") from error
+    if not isinstance(gate_output, dict):
+        raise PolicyError("rollback base gate JSON root is not an object")
+
+    added = []
+    current_path = "server/store/migrations"
+    for name, object_id in added_migrations.items():
+        blob = subprocess.run(
+            ["git", "show", f"{current_revision}:{current_path}/{name}"],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+        )
+        if blob.returncode != 0:
+            raise PolicyError(f"cannot read added migration bytes: {name}")
+        added.append({
+            "path": name,
+            "git_blob": object_id,
+            "sha256": hashlib.sha256(blob.stdout).hexdigest(),
+        })
+    proof = {
+        "schema": "vane.server-rollback-compatibility/v1",
+        "base_revision": base_revision,
+        "current_revision": current_revision,
+        "mode": "previous-binary-on-upgraded-schema",
+        "added_migrations": added,
+        "previous_gate_sha256": file_sha256(previous_gate),
+        "previous_gate_output_sha256": hashlib.sha256(gate.stdout).hexdigest(),
+        "status": "passed",
+    }
+    proof_path.write_text(
+        json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return proof_path, True
+
+
 def free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -75,7 +358,7 @@ def free_local_port() -> int:
 
 def require_native_postgres() -> dict[str, Path]:
     binaries: dict[str, Path] = {}
-    for name in ("postgres", "initdb", "pg_ctl", "createdb"):
+    for name in ("postgres", "initdb", "pg_ctl", "createdb", "psql"):
         resolved = shutil.which(name)
         if not resolved and sys.platform == "darwin":
             for prefix in (Path("/opt/homebrew"), Path("/usr/local")):
@@ -195,19 +478,41 @@ def main() -> int:
     server_coverage_base = (
         f"{head}^1" if previous_server_policy else "legacy/vane/pre-monorepo"
     )
-    base_migration_path = "server/store/migrations" if previous_server_policy else "store/migrations"
+    rollback_base = os.environ.get("VANE_ROLLBACK_BASE_SHA", f"{head}^1")
+    rollback_base = output(
+        ["git", "rev-parse", "--verify", f"{rollback_base}^{{commit}}"],
+        cwd=ROOT,
+        env=os.environ.copy(),
+    )
+    if not re.fullmatch(r"[0-9a-f]{40}", rollback_base):
+        raise PolicyError("rollback base is not an exact Git commit")
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", rollback_base, head],
+        cwd=ROOT,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise PolicyError("rollback base is not an ancestor of the release revision")
+    base_migration_path = (
+        "server/store/migrations"
+        if git_path_exists(revision=rollback_base, path="server/store/migrations")
+        else "store/migrations"
+    )
     current_migration_tree = migration_tree_object(
         revision=head, path="server/store/migrations", env=os.environ.copy()
     )
     base_migration_tree = migration_tree_object(
-        revision=server_coverage_base, path=base_migration_path, env=os.environ.copy()
+        revision=rollback_base, path=base_migration_path, env=os.environ.copy()
     )
-    server_rollback_safe = current_migration_tree == base_migration_tree
-    if not server_rollback_safe:
-        raise PolicyError(
-            "migration bytes changed; release requires explicit previous-binary/"
-            "upgraded-schema compatibility before rollback is permitted"
-        )
+    base_migrations = migration_inventory(
+        revision=rollback_base, path=base_migration_path
+    )
+    current_migrations = migration_inventory(
+        revision=head, path="server/store/migrations"
+    )
+    added_migrations = additive_migration_delta(
+        base=base_migrations, current=current_migrations
+    )
 
     env = {
         **os.environ,
@@ -228,7 +533,7 @@ def main() -> int:
     try:
         os.environ.update(env)
         urls: list[str] = []
-        for index in range(4):
+        for index in range(5):
             # Store migration tests create and revoke cluster-wide roles. A
             # separate database in one cluster is not isolation: parallel
             # shards would race through pg_authid. Give each shard its own
@@ -268,6 +573,18 @@ def main() -> int:
                 expected_database=database,
             )
             urls.append(url)
+
+        rollback_proof, server_rollback_safe = prove_previous_binary_compatibility(
+            base_revision=rollback_base,
+            current_revision=head,
+            added_migrations=added_migrations,
+            database_url=urls[4],
+            runtime=runtime,
+            artifacts=artifacts,
+            go=go,
+            postgres=postgres,
+            env=env,
+        )
 
         temporal_port = free_local_port()
         temporal_address = f"127.0.0.1:{temporal_port}"
@@ -445,6 +762,11 @@ def main() -> int:
                 "server_source_tree_sha256": directory_tree_sha256(SERVER),
                 "infra_tree_sha256": directory_tree_sha256(ROOT / "infra/production"),
                 "migration_tree_object": current_migration_tree,
+                "rollback_base_revision": rollback_base,
+                "rollback_compatibility_path": rollback_proof.resolve().relative_to(
+                    work_root.resolve()
+                ).as_posix(),
+                "rollback_compatibility_sha256": file_sha256(rollback_proof),
                 "server_rollback_safe": server_rollback_safe,
             }
             evidence_path.write_text(

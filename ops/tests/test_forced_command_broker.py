@@ -46,7 +46,18 @@ class ForcedCommandBrokerTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.current = self.state / "current-release.json"
-        self.current.write_text('{"fixture":"N"}\n', encoding="utf-8")
+        self.initial_current = canonical({
+            "schema": "vane.current-release/v2",
+            "monorepo_revision": REVISION,
+            "server": {
+                "tree_digest": "1" * 64,
+                "artifact_digest": "2" * 64,
+                "deployed_revision": REVISION,
+            },
+            "infra_manifest_digest": "3" * 64,
+            "controller_revision": REVISION,
+        })
+        self.current.write_bytes(self.initial_current)
         self.handler = self.root / "handler.py"
 
     def run_broker(
@@ -108,6 +119,7 @@ class ForcedCommandBrokerTest(unittest.TestCase):
             "evidence": [
                 evidence("gate", "full-gate.json", "full-gate.json", b"gate\n"),
                 evidence("gate", "server-coverage.out", "gate-evidence/coverage.out", b"coverage\n"),
+                evidence("gate", "server-rollback-compatibility.json", "gate-evidence/server-rollback-compatibility.json", b"rollback\n"),
                 evidence("gate", "web-coverage-summary.json", "gate-evidence/web-coverage-summary.json", b"web\n"),
             ],
         }
@@ -188,7 +200,16 @@ class ForcedCommandBrokerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 78, result)
         self.assertIn(b"production handler", result.stderr)
         self.assertTrue((self.state / "broker-work/release.lock").is_file())
-        self.assertEqual(self.current.read_text(encoding="utf-8"), '{"fixture":"N"}\n')
+        self.assertEqual(self.current.read_bytes(), self.initial_current)
+
+    def test_status_returns_cas_and_exact_deployed_server_revision(self) -> None:
+        result = self.run_broker("vane-broker status", {})
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        value = json.loads(result.stdout)
+        self.assertEqual(value["server_revision"], REVISION)
+        self.assertEqual(
+            value["current_digest"], hashlib.sha256(self.initial_current).hexdigest()
+        )
 
     def test_successful_handler_must_advance_current_release(self) -> None:
         request_id = self.upload()

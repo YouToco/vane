@@ -50,6 +50,21 @@ func TestBuildBaselineManifestBindsEveryInventoryItem(t *testing.T) {
 		{"disabled archive inventory", func(in *BaselineManifestInput) {
 			in.ArchivedWorkflows.Digest = strings.Repeat("4", 64)
 		}},
+		{"cross inventory duplicate", func(in *BaselineManifestInput) {
+			run := validBaselineWorkflowRun()
+			standardDigest, _ := digestLegacyWorkflowInventory(false, []LegacyWorkflowRun{run})
+			archiveDigest, _ := digestLegacyWorkflowInventory(true, []LegacyWorkflowRun{run})
+			in.Temporal.HistoryArchivalState = "enabled"
+			in.Temporal.VisibilityArchivalState = "enabled"
+			in.Temporal.HistoryArchiveURIDigest = strings.Repeat("5", 64)
+			in.Temporal.VisibilityArchiveURIDigest = strings.Repeat("6", 64)
+			in.StandardWorkflows = LegacyWorkflowInventory{
+				Count: 1, Digest: standardDigest, Runs: []LegacyWorkflowRun{run},
+			}
+			in.ArchivedWorkflows = LegacyWorkflowInventory{
+				Archived: true, Count: 1, Digest: archiveDigest, Runs: []LegacyWorkflowRun{run},
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate := validBaselineManifestInput(t)

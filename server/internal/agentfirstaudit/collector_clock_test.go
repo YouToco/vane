@@ -60,6 +60,32 @@ func TestProductionClockRunnerAdoptsExactAlreadyStartedRun(t *testing.T) {
 	}
 }
 
+func TestPrimeRetentionClockCannotBypassProductionStartContract(t *testing.T) {
+	request := newBaselineCollectorFixture(t).request
+	workflowID := "agent-first-retention-clock-" + request.OperationID
+	stop := errors.New("stop after primed workflow result read")
+	run := sdkmocks.NewWorkflowRun(t)
+	run.On("Get", mock.Anything, mock.Anything).Return(stop).Once()
+	clientMock := sdkmocks.NewClient(t)
+	clientMock.On("ExecuteWorkflow", mock.Anything,
+		mock.MatchedBy(func(options client.StartWorkflowOptions) bool {
+			return options.ID == workflowID && options.TaskQueue == request.TaskQueue &&
+				options.WorkflowExecutionTimeout == 5*time.Minute &&
+				options.WorkflowTaskTimeout == time.Minute &&
+				options.WorkflowIDReusePolicy ==
+					enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE
+		}),
+		vaneworkflow.AgentFirstRetentionClockWorkflowNameV1,
+		vaneworkflow.AgentFirstRetentionClockRequestV1{
+			Nonce: request.OperationID, SourceRevision: request.SourceRevision,
+		}).Return(run, nil).Once()
+
+	_, err := PrimeRetentionClock(t.Context(), clientMock, request)
+	if !errors.Is(err, stop) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func clockRunnerRequest() BaselineCollectorRequest {
 	return BaselineCollectorRequest{
 		Namespace: "vane", TaskQueue: "vane-push",
