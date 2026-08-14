@@ -140,6 +140,18 @@ func TestCollectBaselineRejectsMismatchedCommittedEvent(t *testing.T) {
 	}
 }
 
+func TestCollectBaselineDoesNotReviveStaleExactEvent(t *testing.T) {
+	fixture := newBaselineCollectorFixture(t)
+	fixture.database.loadErr = store.ErrAgentFirstRetentionAttestationStale
+	if _, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
+		fixture.clock, fixture.request); !errors.Is(err, store.ErrAgentFirstRetentionAttestationStale) {
+		t.Fatalf("stale baseline error=%v", err)
+	}
+	if fixture.database.appendCalls != 0 {
+		t.Fatal("stale exact baseline authorized a replacement append")
+	}
+}
+
 type baselineCollectorFixture struct {
 	database *baselineStoreFake
 	temporal *baselineTemporalFake
@@ -227,16 +239,32 @@ type baselineTemporalFake struct {
 
 type baselineStoreFake struct {
 	snapshot        *store.AgentFirstRetentionAuditSnapshot
+	fenceCalls      int
+	fenceErr        error
 	readCalls       int
 	appendCalls     int
 	loadCalls       int
 	driftSecondRead bool
 	appendErr       error
+	loadErr         error
 	appendHook      func()
 	loadContextErr  error
 	committed       *store.AgentFirstRetentionAttestationEvent
 	events          map[string]*store.AgentFirstRetentionAttestationEvent
 	mutateCommitted func(*store.AgentFirstRetentionAttestationEvent)
+}
+
+func (fake *baselineStoreFake) AssertAgentFirstLegacyWriteFence(
+	context.Context,
+) (*store.AgentFirstLegacyWriteFence, error) {
+	fake.fenceCalls++
+	if fake.fenceErr != nil {
+		return nil, fake.fenceErr
+	}
+	return &store.AgentFirstLegacyWriteFence{
+		InstalledAt:      time.Date(2026, 8, 13, 17, 0, 0, 0, time.UTC),
+		DescriptorDigest: strings.Repeat("f", 64),
+	}, nil
 }
 
 func (fake *baselineStoreFake) ReadAgentFirstRetentionAuditSnapshot(
@@ -253,9 +281,10 @@ func (fake *baselineStoreFake) ReadAgentFirstRetentionAuditSnapshot(
 	return &result, nil
 }
 
-func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
+func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestationV132(
 	_ context.Context,
 	input store.AgentFirstRetentionAttestationInput,
+	_ string,
 ) (*store.AgentFirstRetentionAttestationEvent, error) {
 	fake.appendCalls++
 	canonicalPayload, _ := json.Marshal(struct {
@@ -307,6 +336,13 @@ func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
 	return fake.committed, nil
 }
 
+func (fake *baselineStoreFake) AppendAgentFirstRetentionAttestation(
+	ctx context.Context,
+	input store.AgentFirstRetentionAttestationInput,
+) (*store.AgentFirstRetentionAttestationEvent, error) {
+	return fake.AppendAgentFirstRetentionAttestationV132(ctx, input, fake.snapshot.LegacyDBSnapshotDigest)
+}
+
 func (fake *baselineStoreFake) LoadAgentFirstRetentionAttestationByDigest(
 	_ context.Context,
 	digest string,
@@ -317,12 +353,16 @@ func (fake *baselineStoreFake) LoadAgentFirstRetentionAttestationByDigest(
 	return nil, store.ErrAgentFirstRetentionAttestationNotFound
 }
 
-func (fake *baselineStoreFake) LoadAgentFirstRetentionAttestation(
+func (fake *baselineStoreFake) LoadAgentFirstRetentionAttestationV132(
 	ctx context.Context,
 	input store.AgentFirstRetentionAttestationInput,
+	_ string,
 ) (*store.AgentFirstRetentionAttestationEvent, error) {
 	fake.loadCalls++
 	fake.loadContextErr = ctx.Err()
+	if fake.loadErr != nil {
+		return nil, fake.loadErr
+	}
 	if fake.committed == nil {
 		return nil, store.ErrAgentFirstRetentionAttestationNotFound
 	}

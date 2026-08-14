@@ -61,6 +61,9 @@ func collectPreparedWithClock(
 		!validLowerHex(base.Release.DeployDigest(), sha256.Size) {
 		return PreparedCollectorResult{}, fmt.Errorf("prepared collector request is invalid")
 	}
+	if _, err := database.AssertAgentFirstLegacyWriteFence(ctx); err != nil {
+		return PreparedCollectorResult{}, fmt.Errorf("assert prepared legacy write fence: %w", err)
+	}
 	parent, err := database.LoadAgentFirstRetentionAttestationByDigest(ctx, request.ParentDigest)
 	if err != nil {
 		return PreparedCollectorResult{}, fmt.Errorf("load prepared parent baseline: %w", err)
@@ -205,7 +208,11 @@ func collectPreparedWithClock(
 		TemporalEvidenceDigest:     manifest.Digest,
 		SourceRevision:             base.SourceRevision, DeployDigest: base.Release.DeployDigest(),
 	}
-	event, loadErr := database.LoadAgentFirstRetentionAttestation(ctx, input)
+	if _, err := database.AssertAgentFirstLegacyWriteFence(ctx); err != nil {
+		return PreparedCollectorResult{}, fmt.Errorf("reassert prepared legacy write fence: %w", err)
+	}
+	event, loadErr := database.LoadAgentFirstRetentionAttestationV132(
+		ctx, input, afterDB.LegacyDBSnapshotDigest)
 	if loadErr == nil {
 		if err := validateCommittedPrepared(event, input, afterDB); err != nil {
 			return PreparedCollectorResult{}, fmt.Errorf("existing prepared event differs from collected evidence")
@@ -215,11 +222,13 @@ func collectPreparedWithClock(
 	if !errors.Is(loadErr, store.ErrAgentFirstRetentionAttestationNotFound) {
 		return PreparedCollectorResult{}, fmt.Errorf("load exact prepared event before append: %w", loadErr)
 	}
-	event, appendErr := database.AppendAgentFirstRetentionAttestation(ctx, input)
+	event, appendErr := database.AppendAgentFirstRetentionAttestationV132(
+		ctx, input, afterDB.LegacyDBSnapshotDigest)
 	if appendErr != nil {
 		adoptionContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
-		event, err = database.LoadAgentFirstRetentionAttestation(adoptionContext, input)
+		event, err = database.LoadAgentFirstRetentionAttestationV132(
+			adoptionContext, input, afterDB.LegacyDBSnapshotDigest)
 		if err != nil {
 			return PreparedCollectorResult{}, fmt.Errorf(
 				"append prepared attestation: %w; exact adoption: %v", appendErr, err)

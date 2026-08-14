@@ -70,19 +70,10 @@ func run(arguments []string) error {
 	if release.SourceRevision() != sourceRevision {
 		return errors.New("release receipt source differs from collector build")
 	}
-	databaseURL, err := migrationDatabaseURL()
-	if err != nil {
-		return err
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, collectorTimeout)
 	defer cancel()
-	database, err := store.New(ctx, databaseURL)
-	if err != nil {
-		return fmt.Errorf("open migration-owner Store: %w", err)
-	}
-	defer database.Close()
 	temporalClient, err := client.Dial(client.Options{
 		HostPort: parsed.temporalHost, Namespace: parsed.temporalNamespace,
 	})
@@ -95,6 +86,31 @@ func run(arguments []string) error {
 		OperationID: parsed.operationID, SourceRevision: sourceRevision,
 		Release: release, EvidenceDirectory: parsed.evidenceDirectory,
 	}
+	if parsed.command == "prime-clock" {
+		clock, err := agentfirstaudit.PrimeRetentionClock(ctx, temporalClient, baseRequest)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			SchemaVersion string `json:"schema_version"`
+			WorkflowID    string `json:"workflow_id"`
+			RunID         string `json:"run_id"`
+			ObservedAtUTC string `json:"observed_at_utc"`
+		}{
+			SchemaVersion: "vane.agent-first-retention-clock-prime-result/v1",
+			WorkflowID:    clock.WorkflowID, RunID: clock.RunID,
+			ObservedAtUTC: clock.ObservedAtUTC.UTC().Format(time.RFC3339Nano),
+		})
+	}
+	databaseURL, err := migrationDatabaseURL()
+	if err != nil {
+		return err
+	}
+	database, err := store.New(ctx, databaseURL)
+	if err != nil {
+		return fmt.Errorf("open migration-owner Store: %w", err)
+	}
+	defer database.Close()
 	var event *store.AgentFirstRetentionAttestationEvent
 	var manifest agentfirstaudit.BaselineManifest
 	var evidencePath, schemaVersion string
@@ -106,8 +122,7 @@ func run(arguments []string) error {
 		}
 		event, manifest, evidencePath = result.Event, result.Manifest, result.EvidencePath
 		schemaVersion = "vane.agent-first-retention-baseline-result/v1"
-		notBefore = event.TemporalServerWitness.Add(
-			time.Duration(event.RetentionSeconds) * time.Second)
+		notBefore = retentionNotBefore(event)
 	} else {
 		result, err := agentfirstaudit.CollectPrepared(ctx, database, temporalClient,
 			agentfirstaudit.PreparedCollectorRequest{
@@ -137,10 +152,22 @@ func run(arguments []string) error {
 	})
 }
 
+func retentionNotBefore(event *store.AgentFirstRetentionAttestationEvent) time.Time {
+	if event == nil {
+		return time.Time{}
+	}
+	anchor := event.IssuedAt
+	if event.TemporalServerWitness.After(anchor) {
+		anchor = event.TemporalServerWitness
+	}
+	return anchor.Add(time.Duration(event.RetentionSeconds) * time.Second)
+}
+
 func parseOptions(arguments []string) (options, error) {
 	var parsed options
-	if len(arguments) == 0 || (arguments[0] != "baseline" && arguments[0] != "prepared") {
-		return options{}, errors.New("baseline or prepared subcommand is required")
+	if len(arguments) == 0 || (arguments[0] != "baseline" &&
+		arguments[0] != "prepared" && arguments[0] != "prime-clock") {
+		return options{}, errors.New("baseline, prepared or prime-clock subcommand is required")
 	}
 	parsed.command = arguments[0]
 	set := flag.NewFlagSet("agentfirstretention", flag.ContinueOnError)
@@ -164,7 +191,8 @@ func parseOptions(arguments []string) (options, error) {
 		!canonicalAbsolute(parsed.releaseReceipt) ||
 		!canonicalAbsolute(parsed.evidenceDirectory) ||
 		!canonicalAbsolute(parsed.liveVaneBinary) ||
-		(parsed.command == "baseline" && parsed.parentDigest != "") ||
+		((parsed.command == "baseline" || parsed.command == "prime-clock") &&
+			parsed.parentDigest != "") ||
 		(parsed.command == "prepared" && !validLowerHex(parsed.parentDigest, 64)) {
 		return options{}, errors.New("retention collector options are invalid")
 	}

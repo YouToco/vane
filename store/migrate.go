@@ -26,7 +26,18 @@ var migrationsFS embed.FS
 // VPS 开机时序上 Postgres 容器可能晚于本进程就绪，先以退避重试等待
 // 数据库可达（网络类错误重试、由 ctx 决定放弃），再执行迁移——
 // 这样"数据库还没起来"和"迁移 SQL 真的坏了"在日志形态上可区分。
+var migrationTargetVersionForTesting int64
+
 func Migrate(ctx context.Context, dbURL string) error {
+	return migrate(ctx, dbURL, migrationTargetVersionForTesting)
+}
+
+// migrate is split from Migrate so the Store package's retained-history test
+// suite can stay pinned immediately before the physical legacy write fence,
+// while dedicated scratch-database migration tests still exercise the exact
+// production path through the latest migration. Production binaries never set
+// migrationTargetVersionForTesting and therefore always execute provider.Up.
+func migrate(ctx context.Context, dbURL string, targetVersion int64) error {
 	db, err := sql.Open("pgx", dbURL)
 	if err != nil {
 		return fmt.Errorf("store: 打开迁移连接: %w", err)
@@ -59,8 +70,14 @@ func Migrate(ctx context.Context, dbURL string) error {
 	if err != nil {
 		return fmt.Errorf("store: 初始化 goose provider: %w", err)
 	}
-	if _, err := provider.Up(ctx); err != nil {
-		return fmt.Errorf("store: 执行迁移: %w", err)
+	var migrateErr error
+	if targetVersion > 0 {
+		_, migrateErr = provider.UpTo(ctx, targetVersion)
+	} else {
+		_, migrateErr = provider.Up(ctx)
+	}
+	if migrateErr != nil {
+		return fmt.Errorf("store: 执行迁移: %w", migrateErr)
 	}
 	return nil
 }

@@ -247,6 +247,10 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.LoadAgentFirstRetentionAttestation(
+		t.Context(), firstInput); !errors.Is(err, ErrAgentFirstRetentionAttestationStale) {
+		t.Fatalf("superseded baseline adoption error=%v", err)
+	}
 	tooEarly := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
 		secondBaseline.PayloadDigest, time.Now().UTC())
 	if _, err := st.AppendAgentFirstRetentionAttestation(t.Context(), tooEarly); err == nil ||

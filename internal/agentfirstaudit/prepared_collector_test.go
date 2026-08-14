@@ -73,6 +73,26 @@ func TestCollectPreparedRejectsWrongReleaseAndMissingEvidence(t *testing.T) {
 	}
 }
 
+func TestCollectPreparedDoesNotReviveStaleExactEvent(t *testing.T) {
+	fixture := newBaselineCollectorFixture(t)
+	baseline, err := collectBaselineWithClock(t.Context(), fixture.database, fixture.temporal,
+		fixture.clock, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.database.loadErr = store.ErrAgentFirstRetentionAttestationStale
+	if _, err := collectPreparedWithClock(t.Context(), fixture.database, fixture.temporal,
+		fixture.clock, PreparedCollectorRequest{
+			BaselineCollectorRequest: fixture.request,
+			ParentDigest:             baseline.Event.PayloadDigest,
+		}); !errors.Is(err, store.ErrAgentFirstRetentionAttestationStale) {
+		t.Fatalf("stale prepared error=%v", err)
+	}
+	if fixture.database.appendCalls != 1 {
+		t.Fatal("stale exact prepared authorized a replacement append")
+	}
+}
+
 func TestDecodeBaselineEvidenceRejectsRepresentationMutation(t *testing.T) {
 	manifest, err := BuildBaselineManifest(validBaselineManifestInput(t))
 	if err != nil {

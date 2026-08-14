@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 131
+const latestMigrationVersion int64 = 132
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -172,6 +172,8 @@ var wantTables = []string{
 	"memory_authorizations",
 	// 130 deployment-bound Agent-first retention attestation foundation.
 	"agent_first_retention_attestation_events",
+	// 132 immutable epoch proving physical legacy-protocol fencing predates evidence.
+	"agent_first_legacy_protocol_write_fence_v132",
 	// 131 only widens the retained agent_events batch cardinality constraint.
 }
 
@@ -559,12 +561,14 @@ func TestMigrate(t *testing.T) {
 		t.Skip("未设置 DATABASE_URL，跳过迁移集成测试")
 	}
 	ctx := t.Context()
+	_, _, scratchURL, drop := migration128Scratch(t, dbURL)
+	t.Cleanup(drop)
 
-	if err := Migrate(ctx, dbURL); err != nil {
+	if err := migrate(ctx, scratchURL, 0); err != nil {
 		t.Fatalf("Migrate() 执行失败: %v", err)
 	}
 
-	st, err := New(ctx, dbURL)
+	st, err := New(ctx, scratchURL)
 	if err != nil {
 		t.Fatalf("New() 建池失败: %v", err)
 	}
@@ -576,7 +580,7 @@ func TestMigrate(t *testing.T) {
 	}
 
 	// 迁移必须幂等：重复执行不报错，且不重复应用（goose 版本号不变）。
-	if err := Migrate(ctx, dbURL); err != nil {
+	if err := migrate(ctx, scratchURL, 0); err != nil {
 		t.Fatalf("Migrate() 重复执行失败（应幂等）: %v", err)
 	}
 	if v := gooseVersion(t, st); v != versionAfterFirst {
@@ -664,7 +668,7 @@ func TestMigrateConcurrentFreshDB(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = Migrate(ctx, freshURL)
+			errs[i] = migrate(ctx, freshURL, 0)
 		}()
 	}
 	// 并发 Migrate 同时首建版本表会冲突，goose 内部按 1s 间隔重试；等一轮
