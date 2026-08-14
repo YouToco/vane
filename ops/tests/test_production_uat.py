@@ -45,8 +45,20 @@ class ProductionUATTest(unittest.TestCase):
             "fixture-cookie\n", encoding="ascii"
         )
 
-    def run_main(self, origin: str = "https://vane.example") -> int:
-        argv = ["production-uat.py", "--origin", origin, "--sha", REVISION]
+    def run_main(
+        self,
+        api_origin: str = "https://api.vane.example",
+        web_origin: str = "https://vane.example",
+    ) -> int:
+        argv = [
+            "production-uat.py",
+            "--api-origin",
+            api_origin,
+            "--web-origin",
+            web_origin,
+            "--sha",
+            REVISION,
+        ]
         with mock.patch.object(production_uat.sys, "argv", argv), mock.patch.dict(
             os.environ,
             {"CREDENTIALS_DIRECTORY": str(self.credentials)},
@@ -76,11 +88,25 @@ class ProductionUATTest(unittest.TestCase):
         self.assertTrue(
             all(request.get_header("Cookie") == "vane_session=fixture-cookie" for request, _ in requests)
         )
+        self.assertTrue(
+            all(request.get_header("Origin") == "https://vane.example" for request, _ in requests)
+        )
+        self.assertTrue(
+            all(request.full_url.startswith("https://api.vane.example/") for request, _ in requests)
+        )
 
     def test_uat_rejects_non_origin_url_and_bad_revision(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "HTTPS origin"):
-            self.run_main("https://vane.example/path")
-        argv = ["production-uat.py", "--origin", "https://vane.example", "--sha", "main"]
+            self.run_main("https://api.vane.example/path")
+        argv = [
+            "production-uat.py",
+            "--api-origin",
+            "https://api.vane.example",
+            "--web-origin",
+            "https://vane.example",
+            "--sha",
+            "main",
+        ]
         with mock.patch.object(production_uat.sys, "argv", argv):
             with self.assertRaisesRegex(RuntimeError, "exact SHA"):
                 production_uat.main()

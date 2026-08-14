@@ -35,17 +35,24 @@ def strict_json(payload: bytes) -> object:
     return json.loads(payload, object_pairs_hook=pairs)
 
 
-def request_json(origin: str, path: str, *, cookie: str, method: str = "GET") -> object:
+def request_json(
+    api_origin: str,
+    web_origin: str,
+    path: str,
+    *,
+    cookie: str,
+    method: str = "GET",
+) -> object:
     headers = {
         "Accept": "application/json",
         "Cookie": f"vane_session={cookie}",
-        "Origin": origin,
+        "Origin": web_origin,
         "User-Agent": "vane-production-uat/1",
     }
     data = b"{}" if method == "POST" else None
     if data is not None:
         headers["Content-Type"] = "application/json"
-    request = Request(origin.rstrip("/") + path, data=data, headers=headers, method=method)
+    request = Request(api_origin.rstrip("/") + path, data=data, headers=headers, method=method)
     with OPENER.open(request, timeout=20) as response:
         if response.status != 200:
             raise RuntimeError(f"{path} returned HTTP {response.status}")
@@ -54,20 +61,22 @@ def request_json(origin: str, path: str, *, cookie: str, method: str = "GET") ->
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--origin", required=True)
+    parser.add_argument("--api-origin", required=True)
+    parser.add_argument("--web-origin", required=True)
     parser.add_argument("--sha", required=True)
     args = parser.parse_args()
-    parsed = urlsplit(args.origin)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or parsed.path not in {"", "/"}
-    ):
-        raise RuntimeError("UAT origin must be an HTTPS origin")
+    for name, origin in (("API", args.api_origin), ("Web", args.web_origin)):
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise RuntimeError(f"UAT {name} origin must be an HTTPS origin")
     if not re.fullmatch(r"[0-9a-f]{40}", args.sha):
         raise RuntimeError("UAT revision is not an exact SHA")
     credentials = Path(os.environ.get("CREDENTIALS_DIRECTORY", ""))
@@ -78,7 +87,9 @@ def main() -> int:
     if not cookie or any(character.isspace() for character in cookie):
         raise RuntimeError("UAT session credential is malformed")
 
-    me = request_json(args.origin, "/api/auth/me", cookie=cookie)
+    me = request_json(
+        args.api_origin, args.web_origin, "/api/auth/me", cookie=cookie
+    )
     if (
         not isinstance(me, dict)
         or not isinstance(me.get("email"), str)
@@ -87,10 +98,18 @@ def main() -> int:
         or me["tenant_id"] <= 0
     ):
         raise RuntimeError("authenticated /api/auth/me response is incomplete")
-    schedules = request_json(args.origin, "/api/schedules/summary", cookie=cookie)
+    schedules = request_json(
+        args.api_origin, args.web_origin, "/api/schedules/summary", cookie=cookie
+    )
     if not isinstance(schedules, dict) or not isinstance(schedules.get("items"), list):
         raise RuntimeError("authenticated task summary response is incomplete")
-    canary = request_json(args.origin, "/api/feishu/test", cookie=cookie, method="POST")
+    canary = request_json(
+        args.api_origin,
+        args.web_origin,
+        "/api/feishu/test",
+        cookie=cookie,
+        method="POST",
+    )
     if not isinstance(canary, dict) or canary.get("ok") is not True:
         raise RuntimeError("Feishu canary did not report success")
     print(

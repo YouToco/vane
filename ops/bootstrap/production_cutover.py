@@ -428,7 +428,9 @@ def write_production_config(baseline: dict[str, Any], layout: Layout) -> Path:
         "schema": "vane.production-handler/v1",
         "uat_command": [
             "/opt/vane-control/current/ops/audit/production-uat.py",
-            "--origin",
+            "--api-origin",
+            "https://api.vane.zhuoqidev.com",
+            "--web-origin",
             "https://vane.zhuoqidev.com",
         ],
         "evidence_root": "/var/lib/vane-broker/evidence",
@@ -492,6 +494,9 @@ def apply(plan_path: Path, archive: Path, layout: Layout) -> dict[str, Any]:
             else:
                 state = layout.path("/var/lib/vane-broker/state")
                 (state / "broker-work").mkdir(parents=True, exist_ok=True)
+                release_lock = state / "broker-work/release.lock"
+                release_lock.write_bytes(b"")
+                release_lock.chmod(0o600)
                 layout.path("/var/lib/vane-broker/evidence").mkdir(parents=True, exist_ok=True)
         finally:
             transport.unlink(missing_ok=True)

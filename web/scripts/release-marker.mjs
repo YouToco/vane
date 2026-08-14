@@ -6,7 +6,7 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const RELEASE_MARKER_SCHEMA = "vane.web-release/v1";
-export const RELEASE_MARKER_RELATIVE_PATH = ".well-known/vane-release.json";
+export const RELEASE_MARKER_RELATIVE_PATH = "vane-release.json";
 
 function sha256(payload) {
   return createHash("sha256").update(payload).digest("hex");

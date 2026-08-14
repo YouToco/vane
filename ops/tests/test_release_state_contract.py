@@ -13,7 +13,6 @@ ROOT = OPS.parent
 CLI = OPS / "bin" / "vane"
 CURRENT_REVISION = "1" * 40
 CANDIDATE_REVISION = "2" * 40
-CONTROL_REVISION = "3" * 40
 
 
 def canonical(value: object) -> bytes:
@@ -33,7 +32,7 @@ class ReleaseStateContractTest(unittest.TestCase):
         self.receipt_value = {
             "schema_version": "vane.release-receipt/v1",
             "source_revision": CANDIDATE_REVISION,
-            "control_plane_revision": CONTROL_REVISION,
+            "control_plane_revision": CANDIDATE_REVISION,
             "deploy_run_id": "12345",
             "build_run_attempt": 1,
             "backend_archive_sha256": "a" * 64,
@@ -47,7 +46,7 @@ class ReleaseStateContractTest(unittest.TestCase):
         self.current.write_bytes(canonical(self.release_state(CURRENT_REVISION, "4")))
         self.candidate = self.root / "candidate-release.json"
         candidate = self.release_state(CANDIDATE_REVISION, "5")
-        candidate["controller_revision"] = CONTROL_REVISION
+        candidate["controller_revision"] = CURRENT_REVISION
         candidate["server"]["artifact_digest"] = "a" * 64
         self.candidate.write_bytes(canonical(candidate))
         self.manifests: dict[str, Path] = {}
@@ -179,6 +178,14 @@ class ReleaseStateContractTest(unittest.TestCase):
         report = json.loads(finalized.stdout)
         self.assertEqual(report["activation"]["current_revision"], CURRENT_REVISION)
         self.assertEqual(report["activation"]["candidate_revision"], CANDIDATE_REVISION)
+
+    def test_candidate_controller_cannot_authorize_its_own_product_release(self) -> None:
+        candidate = json.loads(self.candidate.read_text(encoding="utf-8"))
+        candidate["controller_revision"] = CANDIDATE_REVISION
+        self.candidate.write_bytes(canonical(candidate))
+        result = self.run_cli(*self.activation_args("finalize"))
+        self.assertEqual(result.returncode, 78, result)
+        self.assertIn("previously finalized revision", result.stderr)
 
 
 def stage_digest(stage: str) -> str:

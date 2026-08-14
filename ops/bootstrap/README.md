@@ -54,9 +54,10 @@ it even when UAT fails.
 
 B must never publish product revision B through the broker it introduces. A
 later exact-main revision C is the first normal `./ops/bin/vane release --sha C`:
-installed B validates and mutates C, then activates controller C only after
-Server verification and UAT. Old GitHub runners remain online until this B→C
-rehearsal and production cutover both succeed.
+installed B validates and mutates C, then stages controller C without activating
+it. At the start of the following product release D, the global broker lock may
+promote already-finalized controller C; C can authorize D but never C. No GitHub
+runner or VM participates in this path.
 
 On the release Mac, install the narrow client once from the merged controller.
 The private transport key remains outside the repository and can invoke only

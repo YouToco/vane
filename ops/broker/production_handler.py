@@ -58,9 +58,21 @@ def strict_json(path: Path) -> dict:
 
 
 def run(command: list[str], *, env: Optional[dict[str, str]] = None) -> None:
-    result = subprocess.run(command, env=env, check=False)
+    # The forced-command broker stdout is a machine-only JSON protocol.  Child
+    # commands must never inherit it, even when a successful deploy script is
+    # verbose, or the broker response becomes unparsable after mutation.
+    result = subprocess.run(
+        command,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
     if result.returncode != 0:
-        raise RuntimeError(f"production command failed with exit {result.returncode}: {command[0]}")
+        raise RuntimeError(
+            f"production command failed with exit {result.returncode}: "
+            f"{command[0]}"
+        )
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -119,7 +131,7 @@ def load_config() -> dict:
 
 
 def ensure_provider_state(
-    state_root: Path, *, server_revision: str
+    state_root: Path, *, server_revision: str, candidate_revision: Optional[str] = None
 ) -> Path:
     provider_root = state_root / "provider"
     state = provider_root / "vane-deploy"
@@ -127,12 +139,31 @@ def ensure_provider_state(
     for name, current_revision in (("deployed-vane.sha", server_revision),):
         path = state / name
         if path.exists():
-            if path.is_symlink() or path.read_text(encoding="ascii").strip() != current_revision:
+            allowed = {current_revision}
+            if candidate_revision is not None:
+                allowed.add(candidate_revision)
+            if path.is_symlink() or path.read_text(encoding="ascii").strip() not in allowed:
                 raise RuntimeError(f"provider compatibility state differs from current-release: {name}")
         else:
             path.write_text(current_revision + "\n", encoding="ascii")
             path.chmod(0o600)
     return provider_root
+
+
+def active_server_revision(
+    current_link: Path = Path("/opt/vane/current"),
+    release_root: Path = Path("/opt/vane/releases"),
+) -> str:
+    if not current_link.is_symlink():
+        raise RuntimeError("active Server authority is not a symlink")
+    target = os.readlink(current_link)
+    match = re.fullmatch(re.escape(str(release_root)) + r"/([0-9a-f]{40})", target)
+    if match is None:
+        raise RuntimeError("active Server authority has an unsafe target")
+    resolved = current_link.resolve(strict=True)
+    if resolved.is_symlink() or not resolved.is_dir():
+        raise RuntimeError("active Server release is unavailable")
+    return match.group(1)
 
 
 def stage_server(validated: Path, revision: str) -> Path:
@@ -246,7 +277,13 @@ def run_uat(command: list[str], revision: str, output: Path, identity: dict) -> 
                 env=environment,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"production UAT failed with exit {result.returncode}")
+                detail = result.stderr.strip()
+                if len(detail) > 2000:
+                    detail = detail[-2000:]
+                suffix = f": {detail}" if detail else ""
+                raise RuntimeError(
+                    f"production UAT failed with exit {result.returncode}{suffix}"
+                )
             value = json.loads(result.stdout)
             if (
                 not isinstance(value, dict)
@@ -270,10 +307,68 @@ def restore(
 ) -> None:
     rollback = repo / "ops/rollback/switch-server-release.sh"
     run([str(rollback), previous["server"]["deployed_revision"], candidate_revision])
+    verify_active_server(previous["server"]["deployed_revision"])
     write_revision(
         provider_root / "vane-deploy/deployed-vane.sha",
         previous["server"]["deployed_revision"],
     )
+
+
+def verify_active_server(revision: str) -> None:
+    if active_server_revision() != revision:
+        raise RuntimeError("active Server revision differs after recovery")
+    for unit in (
+        "vane.service",
+        "vane-research-gateway.socket",
+        "vane-research-gateway.service",
+    ):
+        # systemctl's aggregate exit status for multiple units is successful
+        # when any unit is active. Probe each authority separately so one dead
+        # companion cannot masquerade as complete recovery.
+        run(["/usr/bin/systemctl", "is-active", "--quiet", unit])
+    run(
+        [
+            "/usr/bin/curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "5",
+            "http://127.0.0.1:8080/readyz",
+        ]
+    )
+    pid = subprocess.run(
+        ["/usr/bin/systemctl", "show", "vane.service", "--property=MainPID", "--value"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    value = pid.stdout.strip()
+    if pid.returncode != 0 or not re.fullmatch(r"[1-9][0-9]*", value):
+        raise RuntimeError("active Server process ID is unavailable after recovery")
+    executable = Path(f"/proc/{value}/exe")
+    if os.readlink(executable) != f"/opt/vane/releases/{revision}/bin/vane":
+        raise RuntimeError("active Server process is not bound to the recovered revision")
+
+
+def reconcile_server_before_release(
+    *, repo: Path, current: dict, candidate_revision: str, provider_root: Path
+) -> None:
+    expected = current["server"]["deployed_revision"]
+    provider_revision_path = provider_root / "vane-deploy/deployed-vane.sha"
+    actual = active_server_revision()
+    provider_revision = provider_revision_path.read_text(encoding="ascii").strip()
+    if actual == candidate_revision or provider_revision == candidate_revision:
+        # A previous process died after the product link moved but before the
+        # durable CAS. Restore N first, then restart the immutable request.
+        restore(
+            repo=repo,
+            previous=current,
+            candidate_revision=candidate_revision,
+            provider_root=provider_root,
+        )
+    elif actual != expected:
+        raise RuntimeError("active Server differs from both current state and candidate")
 
 
 def atomic_current_release(
@@ -348,17 +443,38 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
                 with destination.open("xb") as output:
                     shutil.copyfileobj(source, output, length=1024 * 1024)
                 destination.chmod(info.mode & 0o777)
-        for required in (
+        required_files = (
             "ops/bin/vane",
             "ops/broker/forced_command.py",
             "ops/broker/production_handler.py",
+            "ops/broker/promote_finalized_controller.py",
+            "ops/broker/run-production-handler.sh",
+            "ops/audit/production-uat.py",
             "ops/release/artifact.py",
+            "ops/release/remote-atomic-release.sh",
+            "ops/rollback/switch-server-release.sh",
             "tools/toolchain.lock.json",
             "server/go.mod",
             "server/internal/testgate/cmd/testpolicyscan/main.go",
-        ):
+        )
+        required_executables = {
+            "ops/bin/vane",
+            "ops/broker/forced_command.py",
+            "ops/broker/production_handler.py",
+            "ops/broker/promote_finalized_controller.py",
+            "ops/broker/run-production-handler.sh",
+            "ops/audit/production-uat.py",
+            "ops/release/artifact.py",
+            "ops/release/remote-atomic-release.sh",
+            "ops/rollback/switch-server-release.sh",
+        }
+        for required in required_files:
             path = pending / required
-            if path.is_symlink() or not path.is_file():
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or (required in required_executables and not os.access(path, os.X_OK))
+            ):
                 raise RuntimeError(f"controller archive lacks required member: {required}")
         (pending / marker_name).write_text(archive_digest + "\n", encoding="ascii")
         (pending / marker_name).chmod(0o600)
@@ -368,15 +484,6 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
         shutil.rmtree(pending, ignore_errors=True)
         raise
     return target
-
-
-def activate_controller(*, target: Path, controller_root: Path) -> None:
-    current = controller_root / "current"
-    next_link = controller_root / f".current-{target.name}.{os.getpid()}"
-    if next_link.exists() or next_link.is_symlink():
-        raise RuntimeError("controller activation staging link already exists")
-    next_link.symlink_to(target)
-    os.replace(next_link, current)
 
 
 def active_controller_target(controller_root: Path) -> Path:
@@ -407,7 +514,11 @@ def preserve_failed_evidence(
     failed_root = evidence_root / "failed"
     failed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     failed = failed_root / (
-        revision + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        revision
+        + "-"
+        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        + "-"
+        + secrets.token_hex(4)
     )
     if failed.exists() or failed.is_symlink():
         raise RuntimeError("failed release evidence destination already exists")
@@ -450,23 +561,100 @@ def release(
     evidence_root = Path(config["evidence_root"])
     evidence_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     controller_root = Path(config["controller_root"])
-    previous_controller_target = active_controller_target(controller_root)
-    controller_activated = False
+    active_controller = active_controller_target(controller_root)
+    active_controller_revision = active_controller.name
+    finalized_product_controller = controller_root / "releases" / current["monorepo_revision"]
+    required_active_revision = (
+        current["monorepo_revision"]
+        if finalized_product_controller.is_dir() and not finalized_product_controller.is_symlink()
+        else current["controller_revision"]
+    )
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", active_controller_revision)
+        or active_controller_revision != required_active_revision
+    ):
+        raise RuntimeError("active controller is not the eligible finalized revision")
     durable = evidence_root / "releases" / revision
     transaction = evidence_root / "inflight" / revision
-    if transaction.exists() or transaction.is_symlink():
-        raise RuntimeError("production evidence transaction already exists")
+    if revision == current["monorepo_revision"]:
+        if durable.is_symlink() or not durable.is_dir():
+            raise RuntimeError("current release lacks durable idempotency evidence")
+        durable_submission = durable / "submission.json"
+        durable_receipt = durable / "backend/release-receipt.json"
+        durable_finalize = durable / "manifests/finalize.json"
+        if (
+            durable_submission.is_symlink()
+            or not durable_submission.is_file()
+            or digest(durable_submission) != digest(request_root / "submission.json")
+            or durable_receipt.is_symlink()
+            or not durable_receipt.is_file()
+            or digest(durable_receipt)
+            != digest(validated / "backend/release-receipt.json")
+            or current["server"]["artifact_digest"]
+            != validate_release_receipt(durable_receipt)["backend_archive_sha256"]
+        ):
+            raise RuntimeError("current release differs from the immutable retry request")
+        require_release_chain(
+            durable_finalize,
+            revision,
+            "finalize",
+            DEFAULT_SIGNERS,
+        )
+        provider_root = ensure_provider_state(
+            state_root,
+            server_revision=revision,
+        )
+        verify_active_server(revision)
+        return {
+            "ok": True,
+            "stage": "finalize",
+            "status": "already-current",
+            "revision": revision,
+            "current_digest": digest(current_path),
+        }
+    if durable.is_symlink() or transaction.is_symlink():
+        raise RuntimeError("production evidence transaction is unsafe")
+    if durable.exists():
+        # A kill after durable evidence copy but before the one CAS leaves a
+        # complete-looking release tree that is not authoritative. Archive it
+        # before reconciling the product link and restarting the request.
+        preserve_failed_evidence(
+            revision=revision,
+            evidence_root=evidence_root,
+            durable=durable,
+            transaction=transaction,
+        )
+    if transaction.exists():
+        # A process can fail after creating the transaction but before the
+        # main recovery try block (older controllers did this during provider
+        # compatibility admission).  Preserve that evidence and restart the
+        # same immutable request from pre-deploy admission.
+        preserve_failed_evidence(
+            revision=revision,
+            evidence_root=evidence_root,
+            durable=transaction,
+            transaction=transaction,
+        )
     transaction.mkdir(parents=True, mode=0o700)
-    manifests = transaction / "manifests"
-    shutil.copytree(request_root / "manifests", manifests)
-    provider_root = ensure_provider_state(
-        state_root,
-        server_revision=current["server"]["deployed_revision"],
-    )
-    server_stage = stage_server(validated, revision)
     server_script = repo / "ops/release/remote-atomic-release.sh"
-    server_activated = False
+    server_may_have_changed = False
+    provider_root: Optional[Path] = None
     try:
+        manifests = transaction / "manifests"
+        shutil.copytree(request_root / "manifests", manifests)
+        provider_root = ensure_provider_state(
+            state_root,
+            server_revision=current["server"]["deployed_revision"],
+            candidate_revision=revision,
+        )
+        reconcile_server_before_release(
+            repo=repo,
+            current=current,
+            candidate_revision=revision,
+            provider_root=provider_root,
+        )
+        server_stage = stage_server(validated, revision)
+        server_may_have_changed = True
         run(
             [
                 str(server_script),
@@ -474,7 +662,6 @@ def release(
                 current["server"]["deployed_revision"],
             ]
         )
-        server_activated = True
         write_revision(provider_root / "vane-deploy/deployed-vane.sha", revision)
         write_json(
             transaction / "deploy-result.json",
@@ -490,7 +677,7 @@ def release(
             "schema": "vane.production-verify/v1",
             "revision": revision,
             "ready": True,
-            "server": "ready-and-gate-passed",
+            "server": "ready-and-exact-process-bound",
         })
         run_uat(
             config["uat_command"],
@@ -512,7 +699,10 @@ def release(
                 "deployed_revision": revision,
             },
             "infra_manifest_digest": digest(infra_manifest),
-            "controller_revision": revision,
+            # Controller M is staged now but cannot authorize M.  The active
+            # controller is the already-finalized product N and advances only
+            # when the following product release begins.
+            "controller_revision": active_controller_revision,
         }
         write_json(transaction / "candidate-current-release.json", candidate)
         controller_archive = request_root / submission["controller_archive"]
@@ -522,14 +712,14 @@ def release(
             controller_root=controller_root,
         )
         write_json(
-            transaction / "controller-activation.json",
+            transaction / "controller-staging.json",
             {
-                "schema": "vane.controller-activation/v1",
-                "from_revision": current["controller_revision"],
-                "to_revision": revision,
+                "schema": "vane.controller-staging/v1",
+                "active_revision": active_controller_revision,
+                "candidate_revision": revision,
                 "archive_sha256": digest(controller_archive),
                 "target": str(controller_target),
-                "activation": "after-product-verify-before-next-request",
+                "activation": "at-start-of-following-product-release",
             },
         )
         signing_key = Path(os.environ.get("CREDENTIALS_DIRECTORY", "")) / "broker_signing_key"
@@ -567,7 +757,7 @@ def release(
             signing_key=signing_key,
             evidence={
                 "candidate-current-release.json": transaction / "candidate-current-release.json",
-                "controller-activation.json": transaction / "controller-activation.json",
+                "controller-staging.json": transaction / "controller-staging.json",
             },
             parent=verify_manifest,
         )
@@ -585,8 +775,8 @@ def release(
             chain=chain,
             activation=True,
         )
-        # Product mutation and UAT are complete. Persist recovery artifacts and
-        # the old-controller-signed activation before exposing controller M.
+        # Product mutation and UAT are complete. Persist the candidate
+        # controller as data; it is not exposed during its own product release.
         durable.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if durable.exists() or durable.is_symlink():
             raise RuntimeError("durable release evidence already exists")
@@ -595,8 +785,6 @@ def release(
         shutil.copytree(manifests, durable / "manifests")
         shutil.copy2(request_root / "submission.json", durable / "submission.json")
         shutil.copy2(controller_archive, durable / controller_archive.name)
-        activate_controller(target=controller_target, controller_root=controller_root)
-        controller_activated = True
         atomic_current_release(
             current_path,
             candidate,
@@ -612,29 +800,43 @@ def release(
             "finalized_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     except BaseException as release_error:
-        # Any failure before the one durable CAS restores both product
-        # components and the previously active controller.  Failed evidence is
-        # retained separately without blocking a clean retry of the same SHA.
+        # Any failure before the one durable CAS restores the product release.
+        # The candidate controller was only staged, never activated. Failed
+        # evidence is retained without blocking a clean retry of the same SHA.
         recovery_errors: list[BaseException] = []
         if current_path.is_file() and digest(current_path) == expected_digest:
-            if controller_activated:
+            if server_may_have_changed:
                 try:
-                    activate_controller(
-                        target=previous_controller_target,
-                        controller_root=controller_root,
-                    )
+                    if provider_root is None:
+                        raise RuntimeError("provider recovery authority is unavailable")
+                    actual_server_revision = active_server_revision()
+                    if actual_server_revision in {
+                        revision,
+                        current["server"]["deployed_revision"],
+                    }:
+                        restore(
+                            repo=repo,
+                            previous=current,
+                            candidate_revision=revision,
+                            provider_root=provider_root,
+                        )
+                    else:
+                        raise RuntimeError("Server recovery found an unknown active revision")
                 except BaseException as error:  # recovery must not hide evidence
                     recovery_errors.append(error)
-            if server_activated:
-                try:
-                    restore(
-                        repo=repo,
-                        previous=current,
-                        candidate_revision=revision,
-                        provider_root=provider_root,
-                    )
-                except BaseException as error:  # recovery must not hide evidence
-                    recovery_errors.append(error)
+        try:
+            if transaction.is_dir() and not transaction.is_symlink():
+                write_json(
+                    transaction / "failure.json",
+                    {
+                        "schema": "vane.production-failure/v1",
+                        "revision": revision,
+                        "error": str(release_error)[-4000:],
+                        "recovery_errors": [str(error)[-2000:] for error in recovery_errors],
+                    },
+                )
+        except BaseException as error:
+            recovery_errors.append(error)
         try:
             preserve_failed_evidence(
                 revision=revision,

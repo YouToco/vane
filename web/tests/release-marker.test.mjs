@@ -13,6 +13,10 @@ import {
 const fixtures = [];
 after(async () => Promise.all(fixtures.map((path) => rm(path, { recursive: true, force: true }))));
 
+test("release marker uses the CDN-safe root commit path", () => {
+  assert.equal(RELEASE_MARKER_RELATIVE_PATH, "vane-release.json");
+});
+
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "vane-web-release-"));
   fixtures.push(root);

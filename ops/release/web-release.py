@@ -15,6 +15,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 RECEIPT_SCHEMA = "vane.web.aliyun-release/v1"
 BUCKET = "zhuoqidev-vane-web"
+RELEASE_MARKER_PATH = "vane-release.json"
 MANIFEST_SUFFIXES = (".webmanifest", ".json")
 MANIFEST_NAMES = ("manifest",)
 RUNTIME_HASH_RE = re.compile(
@@ -258,7 +259,16 @@ def plan(dist: Path, source_sha: str, output: Path) -> None:
     html_files = sorted(
         path for path in files if PurePosixPath(path).suffix.lower() in (".htm", ".html")
     )
-    assets = sorted(path for path in files if path not in html_files)
+    if RELEASE_MARKER_PATH not in files:
+        raise ValueError(f"Web dist/{RELEASE_MARKER_PATH} is missing")
+    # The release marker is the public commit object.  It is intentionally not
+    # a normal asset: the publisher uploads it only after the entrypoint and
+    # all exact-byte provider checks have passed.
+    assets = sorted(
+        path
+        for path in files
+        if path not in html_files and path != RELEASE_MARKER_PATH
+    )
     html_before_entry = [path for path in html_files if path != "index.html"]
 
     referenced: set[str] = set()
@@ -332,7 +342,9 @@ def plan(dist: Path, source_sha: str, output: Path) -> None:
         for path in assets
         if not path.startswith(".vite/") and not is_content_addressed(path)
     )
-    refresh_objects = sorted(set(html_files + stable_public_objects))
+    refresh_objects = sorted(
+        set(html_files + stable_public_objects + [RELEASE_MARKER_PATH])
+    )
     cdn_refresh_paths = ["/"] + [
         f"/{quote(path, safe='/-._~')}" for path in refresh_objects
     ]

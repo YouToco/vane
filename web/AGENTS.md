@@ -16,7 +16,7 @@
 - 修改 TypeScript/React：至少运行 `npm run audit`、`npm test`、`npm run typecheck`、`npm run build`。
 - 涉及共享逻辑或覆盖率：再运行 `npm run test:coverage`。
 - 涉及原型：同时运行 `npm run prototype:p0a:build`，并保持 isolation tests 通过。
-- 发布只接受 clean exact monorepo SHA；`dist/.well-known/vane-release.json` 的 revision、
+- 发布只接受 clean exact monorepo SHA；`dist/vane-release.json` 的 revision、
   dirty 标志和 tree digest 必须由固定脚本生成、复验，不能手工编辑；生产 Gate 必须设置
   `VANE_RELEASE_SHA` 和 `VANE_REQUIRE_CLEAN_RELEASE=1`。
 
