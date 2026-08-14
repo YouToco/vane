@@ -98,6 +98,41 @@ class ProductionHandlerTest(unittest.TestCase):
             )
         self.assertEqual(current.read_bytes(), before)
 
+    def test_active_controller_is_confined_to_release_authority(self) -> None:
+        control = self.root / "control"
+        target = control / "releases" / REVISION
+        target.mkdir(parents=True)
+        (control / "current").symlink_to(target)
+        self.assertEqual(
+            production_handler.active_controller_target(control), target.resolve()
+        )
+        (control / "current").unlink()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (control / "current").symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "escapes"):
+            production_handler.active_controller_target(control)
+
+    def test_failed_evidence_prefers_partial_durable_tree(self) -> None:
+        evidence = self.root / "evidence"
+        transaction = evidence / "inflight" / REVISION
+        durable = evidence / "releases" / REVISION
+        transaction.mkdir(parents=True)
+        durable.mkdir(parents=True)
+        (transaction / "early").write_text("early", encoding="utf-8")
+        (durable / "late").write_text("late", encoding="utf-8")
+        failed = production_handler.preserve_failed_evidence(
+            revision=REVISION,
+            evidence_root=evidence,
+            durable=durable,
+            transaction=transaction,
+        )
+        self.assertIsNotNone(failed)
+        assert failed is not None
+        self.assertEqual((failed / "late").read_text(encoding="utf-8"), "late")
+        self.assertFalse(durable.exists())
+        self.assertTrue(transaction.exists())
+
     def test_handler_orders_native_server_before_both_web_channels_and_uat(self) -> None:
         source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
             encoding="utf-8"

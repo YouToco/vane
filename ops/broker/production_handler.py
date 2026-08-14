@@ -348,6 +348,42 @@ def activate_controller(*, target: Path, controller_root: Path) -> None:
     os.replace(next_link, current)
 
 
+def active_controller_target(controller_root: Path) -> Path:
+    """Resolve the installed N controller without accepting an arbitrary link."""
+    releases = controller_root / "releases"
+    current = controller_root / "current"
+    if not current.is_symlink() or not releases.is_dir() or releases.is_symlink():
+        raise RuntimeError("active controller authority is unavailable")
+    try:
+        target = current.resolve(strict=True)
+        target.relative_to(releases.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise RuntimeError("active controller escapes the release authority") from error
+    if target.is_symlink() or not target.is_dir():
+        raise RuntimeError("active controller target is unsafe")
+    return target
+
+
+def preserve_failed_evidence(
+    *, revision: str, evidence_root: Path, durable: Path, transaction: Path
+) -> Optional[Path]:
+    """Move the most complete failed transaction aside, even after recovery errors."""
+    source = durable if durable.exists() and not durable.is_symlink() else transaction
+    if not source.exists():
+        return None
+    if source.is_symlink() or not source.is_dir():
+        raise RuntimeError("failed release evidence source is unsafe")
+    failed_root = evidence_root / "failed"
+    failed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    failed = failed_root / (
+        revision + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    )
+    if failed.exists() or failed.is_symlink():
+        raise RuntimeError("failed release evidence destination already exists")
+    os.replace(source, failed)
+    return failed
+
+
 def release(
     *,
     request_root: Path,
@@ -382,6 +418,10 @@ def release(
         raise RuntimeError("validated server receipt differs from release revision")
     evidence_root = Path(config["evidence_root"])
     evidence_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    controller_root = Path(config["controller_root"])
+    previous_controller_target = active_controller_target(controller_root)
+    controller_activated = False
+    durable = evidence_root / "releases" / revision
     transaction = evidence_root / "inflight" / revision
     if transaction.exists() or transaction.is_symlink():
         raise RuntimeError("production evidence transaction already exists")
@@ -554,34 +594,46 @@ def release(
             "current_digest": digest(current_path),
             "finalized_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
-    except BaseException:
+    except BaseException as release_error:
         # Any failure before the one durable CAS restores both product
         # components and the previously active controller.  Failed evidence is
         # retained separately without blocking a clean retry of the same SHA.
+        recovery_errors: list[BaseException] = []
         if current_path.is_file() and digest(current_path) == expected_digest:
             if controller_activated:
-                activate_controller(
-                    target=previous_controller_target,
-                    controller_root=controller_root,
-                )
+                try:
+                    activate_controller(
+                        target=previous_controller_target,
+                        controller_root=controller_root,
+                    )
+                except BaseException as error:  # recovery must not hide evidence
+                    recovery_errors.append(error)
             if server_activated:
-                restore(
-                    repo=repo,
-                    previous=current,
-                    candidate_revision=revision,
-                    provider_root=provider_root,
-                    provider_env=environment,
-                    evidence_root=evidence_root,
-                )
-        failed_root = evidence_root / "failed"
-        failed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        failed = failed_root / (
-            revision + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        )
-        if durable.exists() and not durable.is_symlink():
-            os.replace(durable, failed)
-        elif transaction.exists() and not transaction.is_symlink():
-            os.replace(transaction, failed)
+                try:
+                    restore(
+                        repo=repo,
+                        previous=current,
+                        candidate_revision=revision,
+                        provider_root=provider_root,
+                        provider_env=environment,
+                        evidence_root=evidence_root,
+                    )
+                except BaseException as error:  # recovery must not hide evidence
+                    recovery_errors.append(error)
+        try:
+            preserve_failed_evidence(
+                revision=revision,
+                evidence_root=evidence_root,
+                durable=durable,
+                transaction=transaction,
+            )
+        except BaseException as error:
+            recovery_errors.append(error)
+        if recovery_errors:
+            details = "; ".join(str(error) for error in recovery_errors)
+            raise RuntimeError(
+                f"production release failed and recovery was incomplete: {details}"
+            ) from release_error
         raise
 
 
