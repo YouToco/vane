@@ -515,6 +515,10 @@
     {
       "path": "130_agent_first_retention_attestation.sql",
       "sha256": "ee523d9873199739d5968bce762414a7aa92090a44118448d8d3e868a624f9b0"
+    },
+    {
+      "path": "131_agent_session_projection_unbounded_messages.sql",
+      "sha256": "c608183c3d462faff3a7acc90bae09d4407551ac3188af8e41d883d49f107bfd"
     }
   ],
   "schema": "vane.migrations/v1"

@@ -6,7 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/agentledger"
+	"github.com/YouToco/vane/server/agentledger"
+	"github.com/YouToco/vane/server/internal/testgate"
 )
 
 func TestMigration131RemovesOnlyAgentEventBatchUpperBound(t *testing.T) {
@@ -46,7 +47,7 @@ func TestMigration131RemovesOnlyAgentEventBatchUpperBound(t *testing.T) {
 func TestMigration131WideBatchAndDowngradeFencePostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required")
+		testgate.Database(t)
 	}
 	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
