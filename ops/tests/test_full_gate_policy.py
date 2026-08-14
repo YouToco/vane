@@ -42,7 +42,9 @@ class FullGatePolicyTest(unittest.TestCase):
     def test_full_calls_static_scanner_before_dynamic_go_gate(self) -> None:
         source = (ROOT / "ops/cli/controller.py").read_text(encoding="utf-8")
         body = source[source.index("def command_full"):source.index("def default_manifest")]
-        self.assertLess(body.index("check-go-skips.sh"), body.index("full_gate.py"))
+        self.assertLess(
+            body.index("check-go-skips.sh"), body.index("ops.audit.full_gate")
+        )
 
     def test_full_allows_clean_exact_non_main_rehearsal(self) -> None:
         revision = "b" * 40

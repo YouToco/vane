@@ -702,7 +702,7 @@ def command_full(args: argparse.Namespace) -> int:
     os.environ["VANE_WORK_ROOT"] = str(work_root)
     try:
         run_checked([str(scanner)], cwd=ROOT)
-        run_checked([sys.executable, str(ROOT / "ops/audit/full_gate.py")], cwd=ROOT)
+        run_checked([sys.executable, "-m", "ops.audit.full_gate"], cwd=ROOT)
     finally:
         if old_full_sha is None:
             os.environ.pop("VANE_FULL_SHA", None)
