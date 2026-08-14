@@ -130,17 +130,27 @@ else
 fi
 
 candidate_infra_digest=$(sha256sum "$release_dir/infra-manifest.sha256" | awk '{print $1}')
-current_infra_digest=none
-if [[ -n $current_target ]]; then
-  [[ -f $current_target/infra-manifest.sha256 && ! -L $current_target/infra-manifest.sha256 ]] || {
-    echo "current release lacks bound infra manifest" >&2; exit 1;
-  }
-  current_infra_digest=$(sha256sum "$current_target/infra-manifest.sha256" | awk '{print $1}')
-fi
 infra_changed=false
-if [[ $candidate_infra_digest != "$current_infra_digest" ]]; then
-  infra_changed=true
-fi
+# Product and middleware have independent lifecycles.  Compare the candidate
+# with the files actually installed on the VPS; tying this decision to the
+# current product release would recreate PostgreSQL/Temporal on every product
+# rollback or on the first release after importing a legacy product SHA.
+declare -a infra_runtime_pairs=(
+  "$release_dir/deploy/Caddyfile:/opt/vane/Caddyfile"
+  "$release_dir/deploy/docker-compose.yml:/opt/vane/docker-compose.yml"
+  "$release_dir/deploy/dynamicconfig/development-sql.yaml:/opt/vane/dynamicconfig/development-sql.yaml"
+  "$release_dir/deploy/vane.service:/etc/systemd/system/vane.service"
+  "$release_dir/deploy/vane-research-gateway.service:/etc/systemd/system/vane-research-gateway.service"
+  "$release_dir/deploy/vane-research-gateway.socket:/etc/systemd/system/vane-research-gateway.socket"
+)
+for pair in "${infra_runtime_pairs[@]}"; do
+  candidate=${pair%%:*}
+  installed=${pair#*:}
+  if [[ ! -f $installed || -L $installed ]] || ! cmp --silent "$candidate" "$installed"; then
+    infra_changed=true
+    break
+  fi
+done
 
 if [[ $infra_changed == true ]]; then
   for runtime_file in \
@@ -190,7 +200,7 @@ for _ in {1..90}; do
 done
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/readyz >/dev/null
 env -i PATH=/usr/bin:/bin CREDENTIALS_DIRECTORY=/etc/vane/credentials \
-  "$current_link/bin/gate" -env /opt/vane/env/server.env
+  "$current_link/bin/gate" -env /opt/vane/env/server-owner-compat.env
 pid=$(systemctl show vane.service --property=MainPID --value)
 [[ $pid =~ ^[1-9][0-9]*$ && $(readlink /proc/"$pid"/exe) == "$release_dir/bin/vane" ]] || {
   echo "live process is not bound to candidate SHA release" >&2; exit 1;
@@ -198,4 +208,4 @@ pid=$(systemctl show vane.service --property=MainPID --value)
 switched=false
 rm -rf -- "$pending" "$unit_backup" "$runtime_backup" "$stage"
 trap - EXIT
-echo "atomic release activated: $release_sha"
+echo "atomic release activated: $release_sha infra=$candidate_infra_digest"

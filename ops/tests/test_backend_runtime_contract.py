@@ -97,8 +97,9 @@ class BackendRuntimeContractTest(unittest.TestCase):
     def test_server_only_release_does_not_touch_middleware(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")
         self.assertIn("candidate_infra_digest", remote)
-        self.assertIn("current_infra_digest", remote)
-        self.assertIn("infra-manifest.sha256", remote)
+        self.assertIn("infra_runtime_pairs", remote)
+        self.assertIn('cmp --silent "$candidate" "$installed"', remote)
+        self.assertNotIn("current_infra_digest", remote)
         guard = remote.index('if [[ $infra_changed == true ]]')
         compose = remote.index("docker compose up -d", guard)
         self.assertGreaterEqual(guard, 0)
@@ -107,12 +108,10 @@ class BackendRuntimeContractTest(unittest.TestCase):
         rollback = (OPS / "rollback/switch-server-release.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("target_infra_digest", rollback)
-        self.assertIn("current_infra_digest", rollback)
-        rollback_guard = rollback.index('if [[ $infra_changed == true ]]')
-        rollback_compose = rollback.index("docker compose up -d", rollback_guard)
-        self.assertGreaterEqual(rollback_guard, 0)
-        self.assertIn("postgres temporal temporal-ui caddy", rollback[rollback_compose:])
+        self.assertNotIn("infra_changed", rollback)
+        self.assertNotIn("docker compose", rollback)
+        self.assertNotIn("/opt/vane/Caddyfile", rollback)
+        self.assertNotIn("/etc/systemd/system", rollback)
 
     def test_compose_has_only_pinned_middleware(self) -> None:
         compose = (REPO / "infra/production/compose/docker-compose.yml").read_text(
@@ -151,6 +150,18 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertIn('if [[ $infra_applied == true ]]; then', cleanup)
         self.assertIn('"$runtime_backup/docker-compose.yml"', cleanup)
         self.assertIn("postgres temporal temporal-ui caddy", cleanup)
+
+    def test_live_gate_uses_the_same_primary_database_boundary_as_server(self) -> None:
+        for path, gate in (
+            (REMOTE, '"$current_link/bin/gate"'),
+            (OPS / "rollback/switch-server-release.sh", '"$current/bin/gate"'),
+        ):
+            payload = path.read_text(encoding="utf-8")
+            self.assertIn(gate, payload, path)
+            self.assertIn(
+                "-env /opt/vane/env/server-owner-compat.env", payload, path
+            )
+            self.assertNotIn(' -env /opt/vane/env/server.env', payload, path)
 
     def test_stage_and_existing_release_are_fail_closed(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")
