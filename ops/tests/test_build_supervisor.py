@@ -21,6 +21,11 @@ class BuildSupervisorPolicyTest(unittest.TestCase):
             '"--tmpfs", "/home/vane-build:',
             '"VANE_FULL_GATE_DEPENDENCIES=/dependencies.json"',
             '"VANE_SOURCE_ROOT=/workspace"',
+            '"GOMODCACHE=/gomodcache"',
+            '"GOCACHE=/gocache"',
+            '"GOPROXY=off"',
+            '"npm_config_cache=/npmcache"',
+            '[str(go), "mod", "verify"]',
             '"/control/ops/audit/full_gate.py"',
             '"/control-bin/testpolicyscan"',
         ):

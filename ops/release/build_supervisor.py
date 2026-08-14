@@ -151,8 +151,14 @@ def main() -> int:
     transaction = Path(tempfile.mkdtemp(prefix=run_id + ".", dir=str(work_root)))
     source = transaction / "source"
     output = transaction / "output"
+    go_mod_cache = transaction / "go-mod-cache"
+    go_build_cache = transaction / "go-build-cache"
+    npm_cache = transaction / "npm-cache"
     dependencies = transaction / "dependencies.json"
     output.mkdir(mode=0o777)
+    go_mod_cache.mkdir()
+    go_build_cache.mkdir()
+    npm_cache.mkdir()
     network = run_id
     containers: list[str] = []
     try:
@@ -160,7 +166,13 @@ def main() -> int:
         command(["git", "-C", str(source), "checkout", "--detach", args.sha])
         if command(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"], capture=True):
             raise RuntimeError("supervisor exact checkout is dirty")
-        command(["chown", "-R", "10001:10001", str(source), str(output)])
+        command(
+            [
+                "chown", "-R", "10001:10001",
+                str(source), str(output), str(go_mod_cache),
+                str(go_build_cache), str(npm_cache),
+            ]
+        )
         command(["docker", "network", "create", network])
         lock = strict_json(CONTROL_ROOT / "tools/toolchain.lock.json")["tools"]
         postgres_image = f"{lock['postgres']['image']}@{lock['postgres']['digest']}"
@@ -203,6 +215,33 @@ def main() -> int:
             "GOTOOLCHAIN": "local",
             "CGO_ENABLED": "0",
         }
+        download_env = {
+            **build_env,
+            "GOMODCACHE": str(go_mod_cache),
+            "GOCACHE": str(go_build_cache),
+        }
+        result = subprocess.run(
+            [str(go), "mod", "download"],
+            cwd=source / "server",
+            env=download_env,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("fixed supervisor could not prefetch exact go.sum dependencies")
+        result = subprocess.run(
+            [str(go), "mod", "verify"],
+            cwd=source / "server",
+            env=download_env,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("fixed supervisor rejected prefetched Go module content")
+        command(
+            [
+                "chown", "-R", "10001:10001",
+                str(go_mod_cache), str(go_build_cache),
+            ]
+        )
         result = subprocess.run(
             [str(go), "build", "-o", str(scanner), "./internal/testgate/cmd/testpolicyscan"],
             cwd=CONTROL_ROOT / "server",
@@ -220,6 +259,9 @@ def main() -> int:
             "-v", f"{source}:/workspace:rw",
             "-v", f"{CONTROL_ROOT}:/control:ro",
             "-v", f"{tool_cache}:/toolcache:ro",
+            "-v", f"{go_mod_cache}:/gomodcache:rw",
+            "-v", f"{go_build_cache}:/gocache:rw",
+            "-v", f"{npm_cache}:/npmcache:rw",
             "-v", f"{config['history_dir']}:/histories:ro",
             "-v", f"{output}:/output:rw",
             "-v", f"{dependencies}:/dependencies.json:ro",
@@ -242,6 +284,10 @@ def main() -> int:
                 "-e", "VANE_TOOL_CACHE=/toolcache",
                 "-e", "VANE_TEMPORAL_HISTORY_DIR=/histories",
                 "-e", "VANE_FULL_GATE_DEPENDENCIES=/dependencies.json",
+                "-e", "GOMODCACHE=/gomodcache",
+                "-e", "GOCACHE=/gocache",
+                "-e", "GOPROXY=off",
+                "-e", "npm_config_cache=/npmcache",
                 "-e", f"VANE_FULL_SHA={args.sha}",
                 "-e", "VANE_FULL_GATE_EVIDENCE=/output/full-gate.json",
                 config["runner_image"],
