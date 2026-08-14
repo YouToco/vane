@@ -12,6 +12,7 @@ import re
 
 
 EXACT_SHA = re.compile(r"^[0-9a-f]{40}$")
+DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 def strict_json(path: Path) -> dict:
@@ -39,6 +40,36 @@ def revision_from_target(target: Path, releases: Path) -> str:
     if len(relative.parts) != 1 or EXACT_SHA.fullmatch(relative.name) is None:
         raise RuntimeError("active controller target is not an exact revision")
     return relative.name
+
+
+def bootstrap_authorizes_active(
+    *, evidence_root: Path, product_revision: str, controller_revision: str, marker: Path
+) -> bool:
+    """Recognize the single root-owned controller-bootstrap exception."""
+    evidence = evidence_root / "controller-bootstrap" / f"{controller_revision}.json"
+    if not evidence.exists() and not evidence.is_symlink():
+        return False
+    value = strict_json(evidence)
+    if set(value) != {
+        "schema",
+        "product_revision",
+        "controller_revision",
+        "controller_archive_sha256",
+    } or value.get("schema") != "vane.controller-bootstrap-evidence/v1":
+        raise RuntimeError("controller bootstrap evidence shape is invalid")
+    evidence_product = value.get("product_revision")
+    archive_digest = value.get("controller_archive_sha256")
+    if (
+        not isinstance(evidence_product, str)
+        or EXACT_SHA.fullmatch(evidence_product) is None
+        or value.get("controller_revision") != controller_revision
+        or not isinstance(archive_digest, str)
+        or DIGEST.fullmatch(archive_digest) is None
+    ):
+        raise RuntimeError("controller bootstrap evidence binding is invalid")
+    if marker.read_text(encoding="ascii") != archive_digest + "\n":
+        raise RuntimeError("controller bootstrap archive binding is invalid")
+    return evidence_product == product_revision
 
 
 def promote(*, state: Path, control_root: Path, evidence_root: Path) -> Path:
@@ -70,6 +101,13 @@ def promote(*, state: Path, control_root: Path, evidence_root: Path) -> Path:
         return active_launcher
     if active_revision != controller:
         raise RuntimeError("active controller and durable state are inconsistent")
+    if bootstrap_authorizes_active(
+        evidence_root=evidence_root,
+        product_revision=monorepo,
+        controller_revision=controller,
+        marker=active_marker,
+    ):
+        return active_launcher
 
     target_path = releases / monorepo
     finalize = evidence_root / "releases" / monorepo / "manifests/finalize.json"

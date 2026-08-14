@@ -96,6 +96,61 @@ class ControllerPromotionTest(unittest.TestCase):
         self.assertEqual(launcher, (self.releases / OLD / "ops/broker/run-production-handler.sh").resolve())
         self.assertEqual((self.control / "current").resolve(), (self.releases / OLD).resolve())
 
+    def test_controller_only_bootstrap_does_not_downgrade_to_product(self) -> None:
+        legacy = "4" * 40
+        self.make_controller(legacy)
+        self.write_state(monorepo=legacy, controller=OLD)
+        bootstrap = self.evidence / "controller-bootstrap" / f"{OLD}.json"
+        bootstrap.parent.mkdir(parents=True)
+        bootstrap.write_text(
+            json.dumps({
+                "schema": "vane.controller-bootstrap-evidence/v1",
+                "product_revision": legacy,
+                "controller_revision": OLD,
+                "controller_archive_sha256": "a" * 64,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        launcher = self.promote()
+        self.assertEqual(launcher, (self.releases / OLD / "ops/broker/run-production-handler.sh").resolve())
+        self.assertEqual((self.control / "current").resolve(), (self.releases / OLD).resolve())
+
+    def test_controller_bootstrap_evidence_is_bound_to_product(self) -> None:
+        bootstrap = self.evidence / "controller-bootstrap" / f"{OLD}.json"
+        bootstrap.parent.mkdir(parents=True)
+        bootstrap.write_text(
+            json.dumps({
+                "schema": "vane.controller-bootstrap-evidence/v1",
+                "product_revision": UNKNOWN,
+                "controller_revision": OLD,
+                "controller_archive_sha256": "a" * 64,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        self.promote()
+        self.assertEqual((self.control / "current").resolve(), (self.releases / FINALIZED).resolve())
+
+    def test_bootstrap_then_two_normal_releases_resume_delayed_promotion(self) -> None:
+        legacy = "4" * 40
+        self.make_controller(legacy)
+        self.write_state(monorepo=legacy, controller=OLD)
+        bootstrap = self.evidence / "controller-bootstrap" / f"{OLD}.json"
+        bootstrap.parent.mkdir(parents=True)
+        bootstrap.write_text(
+            json.dumps({
+                "schema": "vane.controller-bootstrap-evidence/v1",
+                "product_revision": legacy,
+                "controller_revision": OLD,
+                "controller_archive_sha256": "a" * 64,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        self.promote()
+        self.assertEqual((self.control / "current").resolve(), (self.releases / OLD).resolve())
+        self.write_state(monorepo=FINALIZED, controller=OLD)
+        self.promote()
+        self.assertEqual((self.control / "current").resolve(), (self.releases / FINALIZED).resolve())
+
     def test_promoter_refuses_to_create_a_missing_lock_as_root(self) -> None:
         self.lock.unlink()
         argv = [

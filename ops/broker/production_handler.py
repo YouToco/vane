@@ -397,6 +397,34 @@ def atomic_current_release(
         os.close(directory)
 
 
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def make_tree_durable(root: Path) -> None:
+    """Persist every extracted controller byte before publishing its dirname."""
+    directories = [root]
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise RuntimeError("controller durability walk found a symlink")
+        if path.is_file():
+            descriptor = os.open(str(path), os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        elif path.is_dir():
+            directories.append(path)
+        else:
+            raise RuntimeError("controller durability walk found an unsafe member")
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        fsync_directory(directory)
+
+
 def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> Path:
     controller_root.mkdir(parents=True, exist_ok=True, mode=0o755)
     if controller_root.is_symlink() or not controller_root.is_dir():
@@ -413,6 +441,8 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
     if target.is_dir() and not target.is_symlink():
         marker = target / marker_name
         if marker.is_file() and not marker.is_symlink() and marker.read_text(encoding="ascii") == archive_digest + "\n":
+            make_tree_durable(target)
+            fsync_directory(releases)
             return target
         raise RuntimeError("existing controller release differs from candidate archive")
     pending = Path(tempfile.mkdtemp(prefix=f".controller-{revision}.", dir=str(releases)))
@@ -479,7 +509,9 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
         (pending / marker_name).write_text(archive_digest + "\n", encoding="ascii")
         (pending / marker_name).chmod(0o600)
         pending.chmod(0o755)
+        make_tree_durable(pending)
         os.replace(pending, target)
+        fsync_directory(releases)
     except BaseException:
         shutil.rmtree(pending, ignore_errors=True)
         raise
