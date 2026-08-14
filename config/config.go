@@ -106,8 +106,9 @@ type LLMConfig struct {
 	AgentBaseURL  string `mapstructure:"agent_base_url"`
 	AgentAPIKey   string `mapstructure:"agent_api_key"`
 	// AgentModel 是 agent loop（function calling）使用的模型，与 Model
-	//（摘要/评分等高频便宜档）分离：FC 多轮决策的质量依赖高档模型
-	//（v4-pro 实测 60/60 全过，M4 事实基准），成本按调用面分账。
+	//（摘要/评分等固定流水线）保持独立配置和调用面分账。2026-08-14
+	// production-shaped thinking/high 评测中 v4-flash 60/60，通过率不低于
+	// v4-pro，但延迟和成本显著更低，因此默认选择 flash。
 	AgentModel string `mapstructure:"agent_model"`
 	// ResearchModel is the dedicated strong model for V3 planner/synthesis.
 	// It deliberately does not inherit AgentModel: the paid research ledger
@@ -388,9 +389,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("llm.model", "deepseek-v4-flash")
 	v.SetDefault("llm.agent_provider", "")
 	v.SetDefault("llm.agent_base_url", "")
-	v.SetDefault("llm.agent_model", "deepseek-v4-pro")
+	v.SetDefault("llm.agent_model", "deepseek-v4-flash")
 	// Research V3 is intentionally pinned to the same economical DeepSeek
-	// flash tier as the fixed pipeline. Agent conversations retain v4-pro;
+	// flash tier as the fixed pipeline. Agent conversations also default to flash;
 	// content-addressed Research snapshots keep their already-frozen model.
 	v.SetDefault("llm.research_model", "deepseek-v4-flash")
 	// max_concurrent 32：真实 API 受控实验定的值（2026-07-18），不是拍脑袋。

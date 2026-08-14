@@ -25,10 +25,11 @@ import (
 // agent_sessions.messages 里的持久化格式（契约 §1/§7），字段增删要
 // 考虑历史会话数据的兼容性，不可随意改名。
 type ChatMessage struct {
-	Role       string     `json:"role"` // system|user|assistant|tool
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // role=assistant 且有调用时
-	ToolCallID string     `json:"tool_call_id,omitempty"` // role=tool 必填
+	Role             string     `json:"role"` // system|user|assistant|tool
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"-"`                      // 仅当前模型轮次回传，禁止进入会话/调用账本
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`   // role=assistant 且有调用时
+	ToolCallID       string     `json:"tool_call_id,omitempty"` // role=tool 必填
 }
 
 // ToolCall 模型发起的一次工具调用。Arguments 保留原始 JSON 字符串不解析：
@@ -61,13 +62,19 @@ const (
 // 可带 tools、可按次覆盖模型——agent 用 cfg.LLM.AgentModel（推理型），
 // 其余调用仍走 Client 默认 model，避免为一个调用面再建一个 Client。
 type ChatRequest struct {
-	Model           string // 空串用 Client 默认 model；agent 传 cfg.LLM.AgentModel
-	Messages        []ChatMessage
-	Tools           []ToolDef
-	ToolChoice      ToolChoice
-	Temperature     *float32 // nil = 不传该字段
-	MaxTokens       *int     // nil = 不传该字段
-	DisableThinking bool     // 语义同 Request.DisableThinking（见 client.go 的事故注释）
+	Model       string // 空串用 Client 默认 model；agent 传 cfg.LLM.AgentModel
+	Messages    []ChatMessage
+	Tools       []ToolDef
+	ToolChoice  ToolChoice
+	Temperature *float32 // nil = 不传该字段
+	MaxTokens   *int     // nil = 不传该字段
+	// EnableThinking asks the provider to expose its native reasoning lane.
+	// ReasoningEffort is meaningful only with EnableThinking and is serialized
+	// only for DeepSeek; callers must echo response ReasoningContent on a tool
+	// continuation through ChatMessage.
+	EnableThinking  bool
+	ReasoningEffort ReasoningEffort
+	DisableThinking bool // 语义同 Request.DisableThinking（见 client.go 的事故注释）
 	// beforeSend is installed only by DoChat after it estimates this request.
 	// Keeping it private prevents callers from replacing the quota gate.
 	beforeSend func(context.Context) error
@@ -77,6 +84,7 @@ type ChatRequest struct {
 // provider-neutral 校验的 AssistantTurn 投影而来。
 type ChatResponse struct {
 	Content                 string
+	ReasoningContent        string
 	ToolCalls               []ToolCall
 	FinishReason            string
 	PromptTokens            int
@@ -94,10 +102,11 @@ type ChatResponse struct {
 // 与导出的 ChatMessage/ToolCall 刻意分离：导出形态是扁平的易用/持久化格式，
 // 线协议要求 tool_calls 嵌套 function 对象且带 type 字段，Chat 做双向转换。
 type wireChatMessage struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content"`
-	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Role             string         `json:"role"`
+	Content          string         `json:"content"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	ToolCalls        []wireToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
 }
 
 type wireToolCall struct {
@@ -124,14 +133,24 @@ type wireFunctionDef struct {
 }
 
 type wireChatRequest struct {
-	Model       string            `json:"model"`
-	Messages    []wireChatMessage `json:"messages"`
-	Tools       []wireToolDef     `json:"tools,omitempty"`
-	ToolChoice  ToolChoice        `json:"tool_choice,omitempty"`
-	Temperature *float32          `json:"temperature,omitempty"`
-	MaxTokens   *int              `json:"max_tokens,omitempty"`
-	Thinking    *thinkingConfig   `json:"thinking,omitempty"`
+	Model           string            `json:"model"`
+	Messages        []wireChatMessage `json:"messages"`
+	Tools           []wireToolDef     `json:"tools,omitempty"`
+	ToolChoice      ToolChoice        `json:"tool_choice,omitempty"`
+	Temperature     *float32          `json:"temperature,omitempty"`
+	MaxTokens       *int              `json:"max_tokens,omitempty"`
+	Thinking        *thinkingConfig   `json:"thinking,omitempty"`
+	ReasoningEffort ReasoningEffort   `json:"reasoning_effort,omitempty"`
 }
+
+// ReasoningEffort is the bounded reasoning policy supported by the DeepSeek
+// V4 chat endpoint. The zero value leaves provider defaults untouched.
+type ReasoningEffort string
+
+const (
+	ReasoningEffortHigh ReasoningEffort = "high"
+	ReasoningEffortMax  ReasoningEffort = "max"
+)
 
 type wireChatResponse struct {
 	Model   string           `json:"model"`
@@ -165,6 +184,9 @@ func (c *Client) requestModel(override string) string {
 // 不合法时，会返回只含计费元数据的 response + error；业务调用必须按 error
 // 失败关闭，DoChat 会消费元数据完成记账后再向外隐藏 partial response。
 func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	if err := validateChatThinkingRequest(req); err != nil {
+		return nil, err
+	}
 	// 与 Complete 共用同一信号量：并发上限约束的是对上游的总请求数，
 	// 不区分调用形态。排队期间 ctx 取消要能立刻退出。
 	select {
@@ -180,7 +202,11 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	safeMessages, redactedHistory := redactLeakedDSMLMessages(req.Messages)
 	messages := make([]wireChatMessage, 0, len(safeMessages))
 	for _, m := range safeMessages {
-		wm := wireChatMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		wm := wireChatMessage{
+			Role: m.Role, Content: m.Content,
+			ReasoningContent: m.ReasoningContent,
+			ToolCallID:       m.ToolCallID,
+		}
 		// assistant 历史消息的 tool_calls 必须原样回传（协议要求：每个
 		// tool 消息都要能对上 assistant 侧的 tool_call_id），丢弃会 400。
 		for _, tc := range m.ToolCalls {
@@ -218,17 +244,27 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	}
 
 	var thinking *thinkingConfig
-	if req.DisableThinking {
+	switch {
+	case req.EnableThinking:
+		thinking = &thinkingConfig{Type: "enabled"}
+	case req.DisableThinking:
 		thinking = &thinkingConfig{Type: "disabled"}
 	}
+	reasoningEffort := req.ReasoningEffort
+	if !strings.EqualFold(strings.TrimSpace(c.provider), "deepseek") {
+		// reasoning_effort is a DeepSeek policy field. Other OpenAI-compatible
+		// providers may support thinking but must not receive an unknown option.
+		reasoningEffort = ""
+	}
 	payload, err := json.Marshal(wireChatRequest{
-		Model:       model,
-		Messages:    messages,
-		Tools:       tools,
-		ToolChoice:  req.ToolChoice,
-		Temperature: c.requestTemperature(model, req.Temperature),
-		MaxTokens:   req.MaxTokens,
-		Thinking:    thinking,
+		Model:           model,
+		Messages:        messages,
+		Tools:           tools,
+		ToolChoice:      req.ToolChoice,
+		Temperature:     c.requestTemperature(model, req.Temperature),
+		MaxTokens:       req.MaxTokens,
+		Thinking:        thinking,
+		ReasoningEffort: reasoningEffort,
 	})
 	if err != nil {
 		// ToolDef.Parameters 是 RawMessage：调用方传入非法 JSON 会在这里暴露。
@@ -315,10 +351,11 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return resp, types.NewAppError(types.CodeLLMUnavailable, "llm: 响应缺少 choices", nil)
 	}
 	turn, err := adaptAssistantTurn(cr.Choices[0], assistantTurnOptions{
-		Provider:      c.provider,
-		RequestModel:  model,
-		ResponseModel: respModel,
-		ToolsDeclared: len(req.Tools) > 0,
+		Provider:        c.provider,
+		RequestModel:    model,
+		ResponseModel:   respModel,
+		ToolsDeclared:   len(req.Tools) > 0,
+		ThinkingEnabled: req.EnableThinking,
 	})
 	if err != nil {
 		slog.Warn("llm: 上游工具协议响应不合法",
@@ -329,7 +366,17 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 			"native_tool_calls", len(cr.Choices[0].Message.ToolCalls))
 		return resp, err
 	}
+	if req.EnableThinking && (turn.StopReason != StopReasonStop &&
+		turn.StopReason != StopReasonToolCalls ||
+		(turn.Content == "" && len(turn.ToolCalls) == 0)) {
+		slog.Warn("llm: 思考模式响应未完整收敛",
+			"model", respModel,
+			"finish_reason", cr.Choices[0].FinishReason.Value,
+			"completion_tokens", cr.Usage.CompletionTokens)
+		return resp, newToolProtocolResponseError()
+	}
 	resp.Content = turn.Content
+	resp.ReasoningContent = turn.ReasoningContent
 	resp.ToolCalls = turn.ToolCalls
 	resp.FinishReason = turn.StopReason.String()
 
@@ -342,6 +389,24 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 			"completion_tokens", cr.Usage.CompletionTokens)
 	}
 	return resp, nil
+}
+
+func validateChatThinkingRequest(req ChatRequest) error {
+	if req.EnableThinking && req.DisableThinking {
+		return types.NewAppError(types.CodeLLMBadRequest,
+			"llm: thinking 不能同时启用和禁用", nil)
+	}
+	if req.ReasoningEffort != "" && !req.EnableThinking {
+		return types.NewAppError(types.CodeLLMBadRequest,
+			"llm: reasoning_effort 仅可用于启用的 thinking", nil)
+	}
+	switch req.ReasoningEffort {
+	case "", ReasoningEffortHigh, ReasoningEffortMax:
+		return nil
+	default:
+		return types.NewAppError(types.CodeLLMBadRequest,
+			"llm: reasoning_effort 不受支持", nil)
+	}
 }
 
 var errChatRequestNotSent = errors.New("llm: chat request not sent")
@@ -382,6 +447,7 @@ func chatPromptRunes(req ChatRequest) int {
 	n := 0
 	for _, m := range req.Messages {
 		n += utf8.RuneCountInString(m.Content)
+		n += utf8.RuneCountInString(m.ReasoningContent)
 	}
 	for _, t := range req.Tools {
 		n += utf8.RuneCountInString(t.Name) + utf8.RuneCountInString(t.Description)
