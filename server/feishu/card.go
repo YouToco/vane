@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/types"
 )
 
 // cardTitle 是所有回复卡片的统一标题：让用户在会话流里一眼认出这是 Vane 的回复。

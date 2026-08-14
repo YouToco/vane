@@ -12,8 +12,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/pressly/goose/v3"
 
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/types"
 )
 
 type pushEffectFixture struct {

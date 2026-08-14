@@ -12,11 +12,11 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
-	"github.com/YouToco/vane/executivebrief"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/executivebrief"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 const WorkflowNameV1 = "PeriodicBriefWorkflowV1"

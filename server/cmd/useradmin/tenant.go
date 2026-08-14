@@ -7,8 +7,8 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/store"
 )
 
 // runTenant 处理租户注销与恢复（契约 §1.3 / D9 的软删除半边）。

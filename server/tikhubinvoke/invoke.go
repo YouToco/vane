@@ -21,9 +21,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/tikhubcatalog"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/tikhubcatalog"
+	"github.com/YouToco/vane/server/types"
 )
 
 const (

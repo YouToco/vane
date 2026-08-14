@@ -12,7 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pressly/goose/v3"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestMigration113TombstonesExpiredLegacyCreationWithoutDeletingAudit(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // Store 是画像读取的窄接口，生产实现为 *store.Store。

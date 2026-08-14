@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/YouToco/vane/feishu"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feishu"
+	"github.com/YouToco/vane/server/types"
 )
 
 // feishuCredentials 是 verify / config 共用的请求体。

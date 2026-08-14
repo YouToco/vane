@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/task"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/task"
+	"github.com/YouToco/vane/server/types"
 )
 
 type fakeResearchTaskCreationV3Controller struct {

@@ -216,7 +216,7 @@ func (s *Scheduler) AdvanceEdit() {
 
 	consumerPath := filepath.Clean("/repo/cmd/server/main.go")
 	consumer, err := parser.ParseFile(fset, consumerPath, `package main
-import schedulerpkg "github.com/YouToco/vane/scheduler"
+import schedulerpkg "github.com/YouToco/vane/server/scheduler"
 func run(s *schedulerpkg.Scheduler) { s.AdvanceEdit() }
 `, parser.ParseComments)
 	if err != nil {

@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestEffectGateDeniesEveryPrimaryUpstreamCall(t *testing.T) {

@@ -3,7 +3,7 @@ package scheduler
 import (
 	"strings"
 
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 // WithExecutiveBriefRollout selects P2-D for one exact structured-event task

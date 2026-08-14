@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 // AuthorizeAndConsumeTaskRunLLMQuotaV1 is the compiled runtime's final paid

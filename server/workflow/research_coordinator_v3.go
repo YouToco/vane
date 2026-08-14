@@ -8,14 +8,14 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/researchgateway"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimepolicy"
-	storepkg "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/researchgateway"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	storepkg "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 const researchPlannerOutputSchemaV3 = "vane.research-planner-output/v3"

@@ -10,7 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // UpsertContentItem 按 canonical_key 全局去重地落内容，并登记本次出现的源。

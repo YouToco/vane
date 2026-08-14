@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/types"
 )
 
 // MaterializeApprovedToolCallV1 is a current-write compiler: it converts the

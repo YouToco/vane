@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/taskstate"
+	"github.com/YouToco/vane/server/taskstate"
 	"github.com/pressly/goose/v3"
 )
 

@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestResearchSnapshotV3CanonicalRoundTrip(t *testing.T) {

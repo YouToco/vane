@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 共享测试脚手架：D2′ 换掉共享密码后，需要鉴权的用例改用**真会话**。

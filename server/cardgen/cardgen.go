@@ -12,10 +12,10 @@ import (
 	"context"
 	"strings"
 
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/promptguard"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/promptguard"
+	"github.com/YouToco/vane/server/types"
 )
 
 // maxContentRunes 截断喂给模型的正文：生成解读只需主旨，全文徒增 token。

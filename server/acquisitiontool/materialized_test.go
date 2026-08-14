@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestValidateMaterializedRoundTripsEveryAvailableCapability(t *testing.T) {

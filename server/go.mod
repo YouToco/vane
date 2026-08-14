@@ -1,4 +1,4 @@
-module github.com/YouToco/vane
+module github.com/YouToco/vane/server
 
 go 1.26.6
 

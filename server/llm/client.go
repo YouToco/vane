@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/types"
 )
 
 // Client 是 DeepSeek chat completions 客户端。

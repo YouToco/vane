@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/YouToco/vane/taskstate"
+	"github.com/YouToco/vane/server/taskstate"
 )
 
 // ResearchV3DefinitionEditInput is the complete target requested by the

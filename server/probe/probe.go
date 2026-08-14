@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/types"
 )
 
 // Status 是单条探针的判定结果。

@@ -18,11 +18,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/tikhubcatalog"
-	"github.com/YouToco/vane/tikhubinvoke"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/tikhubcatalog"
+	"github.com/YouToco/vane/server/tikhubinvoke"
+	"github.com/YouToco/vane/server/types"
 )
 
 // These markers identify direct X/Twitter providers or X-specific credentials.
@@ -250,7 +250,7 @@ func scanProductionGoFile(path string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if importPath != "github.com/YouToco/vane/tikhubinvoke" {
+		if importPath != "github.com/YouToco/vane/server/tikhubinvoke" {
 			continue
 		}
 		alias := "tikhubinvoke"

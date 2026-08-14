@@ -7,8 +7,8 @@ package pusher
 import (
 	"context"
 
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/types"
 )
 
 // FeishuSender 抽象"主动发一张卡片"的能力。接口定义在消费方（本包）：

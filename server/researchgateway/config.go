@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 type ProcessRouteV1 struct {

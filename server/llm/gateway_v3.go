@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // GatewayReceiptSignerV3 is implemented by the separately authenticated

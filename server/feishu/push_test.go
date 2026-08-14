@@ -16,8 +16,8 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/types"
 )
 
 type pushTestLogger struct {

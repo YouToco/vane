@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 type contextCheckingToolCallInserter struct {

@@ -14,7 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 type AgentFirstRetentionPhase string

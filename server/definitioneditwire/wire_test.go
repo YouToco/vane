@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/workflowruntime"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/workflowruntime"
 )
 
 type componentFixtureV1 struct {

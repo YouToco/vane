@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/promptguard"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/promptguard"
+	"github.com/YouToco/vane/server/types"
 )
 
 const (

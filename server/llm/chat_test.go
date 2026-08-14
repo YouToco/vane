@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/types"
 )
 
 // chatOKBody 模拟纯文本回复（无 tool_calls）的正常响应。

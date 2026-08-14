@@ -183,7 +183,7 @@ func f(q interface{ QualifyObservationShadow() }) { q.QualifyObservationShadow()
 		{
 			name: "selector function value alias",
 			source: `package eventqualifier
-import "github.com/YouToco/vane/llm"
+import "github.com/YouToco/vane/server/llm"
 var shadow = llm.DoObservationShadow`,
 			want: []observationShadowReference{{
 				file: "mutation.go", symbol: "DoObservationShadow", kind: "selector",

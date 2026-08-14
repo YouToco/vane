@@ -6,11 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimeconfig"
-	"github.com/YouToco/vane/runtimepolicy"
-	storepkg "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimeconfig"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	storepkg "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 func plannerToolSearchSealV33(t *testing.T) (

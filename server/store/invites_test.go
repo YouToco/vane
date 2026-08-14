@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // uniqueEmail 生成本次测试专属的邮箱（uq_users_email_lower 按小写唯一）。

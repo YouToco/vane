@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/YouToco/vane/tikhubcatalog"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/tikhubcatalog"
+	"github.com/YouToco/vane/server/types"
 )
 
 // retainedBindingCatalogV1 is the transport subset required by the immutable

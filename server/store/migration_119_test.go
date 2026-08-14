@@ -3,8 +3,8 @@ package store
 import (
 	"testing"
 
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestMigration119ResearchBriefReceiptProjectionPostgres(t *testing.T) {

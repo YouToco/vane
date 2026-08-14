@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // tenantTestStore 建库连接；未设 DATABASE_URL 时跳过（与其余 store 集成测试同模式）。

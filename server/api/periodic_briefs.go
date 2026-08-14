@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/store"
 )
 
 const reportSettingsBodyLimit = 4 << 10

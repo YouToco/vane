@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 const (

@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestScheduleDashboardStore 是 DATABASE_URL 门控的集成测试（M7 功能 6.6/6.7）：

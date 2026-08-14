@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/runtimeconfig"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/runtimeconfig"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 // This is an intentional release fence, not the end-state architecture.  The

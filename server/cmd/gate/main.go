@@ -42,12 +42,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/feishu"
-	"github.com/YouToco/vane/probe"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/feishu"
+	"github.com/YouToco/vane/server/probe"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 退出码，见文件头注释。

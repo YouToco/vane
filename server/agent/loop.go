@@ -22,12 +22,12 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/agentcontext"
-	"github.com/YouToco/vane/agentledger"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agentcontext"
+	"github.com/YouToco/vane/server/agentledger"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // systemPrompt 是 agent loop 的 system 常量（契约 §7）。不入库、每次调用动态前置，

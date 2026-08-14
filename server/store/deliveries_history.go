@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // DeliveryHistoryQuery 是 ListDeliveryHistory 的过滤条件。

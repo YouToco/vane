@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/store"
 )
 
 var internalReferenceFields = map[string]struct{}{

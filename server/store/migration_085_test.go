@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestMigration085AgentIntelligenceEvidenceAndIsolation(t *testing.T) {

@@ -4,7 +4,7 @@ package a2a
 import (
 	"errors"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // internalErrorText 是非 AppError 的固定对外文案。

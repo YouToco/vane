@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/store"
 )
 
 func TestExistingPeriodicBriefRunBindingIsIdempotent(t *testing.T) {

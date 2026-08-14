@@ -27,10 +27,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/tikhubcatalog"
-	"github.com/YouToco/vane/tikhubinvoke"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/tikhubcatalog"
+	"github.com/YouToco/vane/server/tikhubinvoke"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ────────── 模板 spec 类型（纯数据，契约 §1）──────────

@@ -13,8 +13,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/promptguard"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/promptguard"
+	"github.com/YouToco/vane/server/types"
 )
 
 // newTraceID 单次交互的 trace（deep_dive/追问不在 pipeline 的 trace 链上）。

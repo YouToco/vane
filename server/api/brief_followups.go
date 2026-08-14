@@ -13,11 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 const (

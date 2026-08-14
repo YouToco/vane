@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/types"
 )
 
 // okResponseBody 模拟 DeepSeek 正常响应：usage 顶层带缓存字段，

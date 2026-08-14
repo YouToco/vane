@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/taskstate"
+	"github.com/YouToco/vane/server/taskstate"
 )
 
 // ToolAdaptiveStateRecord is the V2 invocation-digest-scoped view stored in

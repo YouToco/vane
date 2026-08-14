@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 type taskDefinitionEditProposalComponentFixtureV1 struct {

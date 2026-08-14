@@ -14,8 +14,8 @@ import (
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
-	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/store"
 )
 
 func cardEvent(operatorOpenID string, value map[string]interface{}) *callback.CardActionTriggerEvent {

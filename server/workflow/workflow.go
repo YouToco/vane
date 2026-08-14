@@ -9,7 +9,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // PushPipelineWorkflow 是推送管道的编排：EvolveProfile 前置步（失败只 Warn 不阻断）

@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/types"
 )
 
 type capturingExternalFollowupToolCalls struct {

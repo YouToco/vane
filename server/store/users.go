@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // UpsertUserByOpenID 按 feishu_open_id 幂等 upsert 用户。

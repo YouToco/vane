@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // AggregateCardMaxBytesV1 is the provider-safe hard limit shared by initial

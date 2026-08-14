@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestEmptyPushBatchStore 是 DATABASE_URL 门控的集成测试（无则跳过，与

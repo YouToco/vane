@@ -15,9 +15,9 @@
 package workflow
 
 import (
-	cardgenpkg "github.com/YouToco/vane/cardgen"
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflowruntime"
+	cardgenpkg "github.com/YouToco/vane/server/cardgen"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflowruntime"
 )
 
 // defaultTopN 是每批默认推送条数（PushScope.TopN 为 0 时取此值，见规格 B1）。

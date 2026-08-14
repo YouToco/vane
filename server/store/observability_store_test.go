@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestObservabilityStore 是 DATABASE_URL 门控的集成测试（无则跳过，与

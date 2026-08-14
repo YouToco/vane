@@ -26,9 +26,9 @@ import (
 	"go.temporal.io/sdk/testsuite"
 	"google.golang.org/grpc"
 
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) {

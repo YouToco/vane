@@ -3,11 +3,11 @@ package workflow
 import (
 	"context"
 
-	"github.com/YouToco/vane/executivebrief"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/runtimepolicy"
-	storepkg "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/executivebrief"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	storepkg "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // SynthesizeExecutiveBriefV1 performs at most one paid issue-level model call.

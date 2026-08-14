@@ -12,8 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ListPushEffectsForBatch loads the immutable effect plan for one exact batch.

@@ -3,8 +3,8 @@ package api
 import (
 	"net/http"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/types"
 )
 
 // platformOwnerTenantID 是承载存量数据与平台级配置的租户号

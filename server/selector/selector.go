@@ -10,7 +10,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 新鲜度衰减常量（M5 契约 §6，Boss 拍板④）：每 6 小时衰减 1 分、封顶 12 分

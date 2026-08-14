@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 const ResearchGroundingVerdictSchemaV1 = "vane.research-grounding-verdict/v1"

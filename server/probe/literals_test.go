@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 字面量漂移守卫：直接读源码文本做断言。

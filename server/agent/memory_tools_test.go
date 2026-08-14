@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/agentcontext"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agentcontext"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/types"
 )
 
 type fakeAgentMemoryStore struct {

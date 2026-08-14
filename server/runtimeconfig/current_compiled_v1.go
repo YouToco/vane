@@ -6,15 +6,15 @@ package runtimeconfig
 import (
 	"fmt"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/cardgen"
-	"github.com/YouToco/vane/evolver"
-	"github.com/YouToco/vane/executivebrief"
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/scorer"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/cardgen"
+	"github.com/YouToco/vane/server/evolver"
+	"github.com/YouToco/vane/server/executivebrief"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/scorer"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // CurrentCompiledV1Input contains the complete variable, non-secret input for

@@ -10,8 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/types"
 )
 
 // LoadContentObservationForTaskRunV2 recovers an already-committed atomic

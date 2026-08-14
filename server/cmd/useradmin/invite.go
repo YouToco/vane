@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/store"
 )
 
 // runInvite 签发一个邀请码并打印。

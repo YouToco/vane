@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 // CanonicalizeToolArgumentsV1 is the exact current-write boundary for

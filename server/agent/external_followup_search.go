@@ -7,8 +7,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/llm"
 )
 
 const (

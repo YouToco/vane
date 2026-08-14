@@ -14,7 +14,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 // TestTaskScheduleIntegration_RealDevServerLifecycle proves the A3 contract

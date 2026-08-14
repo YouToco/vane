@@ -27,10 +27,10 @@ import (
 	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
-	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/types"
 )
 
 // chatSystemPrompt 是 chat_reply 环节的 system prompt（契约 §4 原文）。

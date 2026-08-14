@@ -19,8 +19,8 @@ import (
 
 	"github.com/mmcdole/gofeed"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/types"
 )
 
 // requireAllKindArticle 断言产出的每条 item 都是 Kind=article。空批直接 Fatal：

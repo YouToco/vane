@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestSettings 是集成测试：依赖真实 Postgres（CI 的 test job 提供 DATABASE_URL）。

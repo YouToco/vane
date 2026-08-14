@@ -10,7 +10,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 const ResearchPlannerToolSearchReceiptSchemaV1 = "vane.research-planner-tool-search-receipt/v1"

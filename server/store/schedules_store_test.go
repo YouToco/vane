@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestUpdateScheduleSpecStore 是 DATABASE_URL 门控的集成测试，钉死 UpdateScheduleSpec

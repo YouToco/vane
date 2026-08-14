@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestInvariant_DoMeasuredV3HasOneUpstreamAttemptAndNoLegacyAccounting(t *testing.T) {

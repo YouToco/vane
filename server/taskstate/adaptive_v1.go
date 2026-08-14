@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"slices"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/types"
 )
 
 // AdaptiveStateSchemaVersionV1 identifies the retained V1 adaptive-state

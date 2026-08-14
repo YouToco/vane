@@ -10,8 +10,8 @@ import (
 
 	"net/http"
 
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/types"
 )
 
 // seedDeepDive 预置一条"当初已生成成功"的 deep_dive 行。

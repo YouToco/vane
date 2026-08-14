@@ -11,8 +11,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/types"
 )
 
 // maxSourceParamRunes 是 query/keyword/title 的长度上限（字符数）。

@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/YouToco/vane/scheduler"
+	"github.com/YouToco/vane/server/scheduler"
 )
 
 type definitionEditProposalActorLayoutV2 struct {

@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/feishu"
-	"github.com/YouToco/vane/probe"
-	"github.com/YouToco/vane/pusher"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/feishu"
+	"github.com/YouToco/vane/server/probe"
+	"github.com/YouToco/vane/server/pusher"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestNextDailyProbeAt(t *testing.T) {

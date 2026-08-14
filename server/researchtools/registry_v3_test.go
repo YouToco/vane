@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 func exaCatalogForTest(t *testing.T) runtimepolicy.CapabilityCatalogV1 {

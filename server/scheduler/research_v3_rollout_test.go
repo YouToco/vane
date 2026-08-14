@@ -11,8 +11,8 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 func TestResearchRuntimeV3AuthorityCanaryCannotRewriteNormalActions(t *testing.T) {

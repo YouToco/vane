@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 const (

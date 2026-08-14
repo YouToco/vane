@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // agentSessionColumns 是 agent_sessions 表全列，SELECT 与 scanAgentSession 一一对应。

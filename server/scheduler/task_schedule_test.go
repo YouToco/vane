@@ -39,8 +39,8 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 // taskScheduleFakeClient 是 A3 专用的有状态 Temporal 替身。它刻意模拟服务端而非

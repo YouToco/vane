@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sort"
 
-	vaneworkflow "github.com/YouToco/vane/workflow"
+	vaneworkflow "github.com/YouToco/vane/server/workflow"
 )
 
 type BaselineManifestInput struct {

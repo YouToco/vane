@@ -328,7 +328,7 @@ func (s *Store) AdvanceEdit() { EscapeDefinitionEditOperation(s) }
 	}
 
 	consumer, err := parser.ParseFile(fset, "cmd/server/main.go", `package main
-import storepkg "github.com/YouToco/vane/store"
+import storepkg "github.com/YouToco/vane/server/store"
 func run(s *storepkg.Store) {
 	storepkg.EscapeDefinitionEditOperation(s)
 	s.AdvanceEdit()
@@ -402,7 +402,7 @@ func (s *Store) AdvanceEdit() error {
 
 	consumerPath := filepath.Clean("/repo/cmd/server/main.go")
 	consumer, err := parser.ParseFile(fset, consumerPath, `package main
-import storepkg "github.com/YouToco/vane/store"
+import storepkg "github.com/YouToco/vane/server/store"
 func run(s *storepkg.Store) { _ = s.AdvanceEdit() }
 `, parser.ParseComments)
 	if err != nil {

@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/tikhubcatalog"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/tikhubcatalog"
 )
 
 func TestGroundedResearchCompletesSearchReadAndAnswerInOneMessage(t *testing.T) {

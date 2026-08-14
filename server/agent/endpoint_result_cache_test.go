@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/server/llm"
 )
 
 // testLimits 与生产同源：按 agent 模型（deepseek-v4-pro，1M 窗口）派生。

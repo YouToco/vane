@@ -8,11 +8,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/observation"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/observation"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 // CreateOrGetCompiledTaskRunSnapshotV2Params freezes one Source-free task run.

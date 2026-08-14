@@ -12,7 +12,7 @@ import (
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 
-	vaneworkflow "github.com/YouToco/vane/workflow"
+	vaneworkflow "github.com/YouToco/vane/server/workflow"
 )
 
 func TestRetentionClockEvidenceRealTemporalHistory(t *testing.T) {

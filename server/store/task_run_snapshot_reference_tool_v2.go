@@ -3,7 +3,7 @@ package store
 import (
 	"crypto/subtle"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func validateTaskRunSnapshotReferenceForExpectedV2(

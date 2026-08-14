@@ -3,7 +3,7 @@ package runtimepolicy
 import (
 	"encoding/json"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 const maxEncodedPolicyBytes = 256 << 10

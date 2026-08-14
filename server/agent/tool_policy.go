@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/server/llm"
 )
 
 // Effect describes a locally trusted execution effect. Values are bits so one

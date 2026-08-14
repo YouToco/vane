@@ -9,8 +9,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/tikhubcatalog"
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/tikhubcatalog"
 )
 
 type staticTool struct {

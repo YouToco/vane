@@ -17,10 +17,10 @@ import (
 
 	"go.temporal.io/sdk/client"
 
-	"github.com/YouToco/vane/internal/researchoperator"
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/researchoperator"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 type cutoverArgs struct {

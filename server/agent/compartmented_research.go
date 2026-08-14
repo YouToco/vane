@@ -15,11 +15,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 const (

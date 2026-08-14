@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/promptguard"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/promptguard"
+	"github.com/YouToco/vane/server/types"
 )
 
 const (

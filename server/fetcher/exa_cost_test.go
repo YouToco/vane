@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/types"
 )
 
 // mockRecorder captures tool_calls written by the Exa fetchers.

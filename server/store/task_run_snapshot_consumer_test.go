@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestLoadCompiledTaskRunSnapshotV1_BindsCallerIdentityAndSealedReference(t *testing.T) {

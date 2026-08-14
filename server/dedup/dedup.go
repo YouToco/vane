@@ -15,7 +15,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ContentHash 计算精确去重键 = hex(sha256(title + "\n" + url))。

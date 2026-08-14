@@ -9,7 +9,7 @@ import (
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
-	vaneworkflow "github.com/YouToco/vane/workflow"
+	vaneworkflow "github.com/YouToco/vane/server/workflow"
 )
 
 func ReplayLegacyPushPipeline(

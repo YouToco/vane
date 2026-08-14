@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/agentcontext"
-	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/server/agentcontext"
+	"github.com/YouToco/vane/server/llm"
 )
 
 var errAgentContextShadow = errors.New("agent: context shadow unavailable")

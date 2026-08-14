@@ -24,8 +24,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/types"
 )
 
 // webSearcher / pageReader 收窄两工具依赖的 fetcher 能力（*fetcher.ExaFetcher /

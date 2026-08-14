@@ -11,9 +11,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 type ResearchTaskDefinitionEditProposalInputV3 struct {

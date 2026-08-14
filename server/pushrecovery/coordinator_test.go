@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/pusheffect"
+	"github.com/YouToco/vane/server/pusheffect"
 )
 
 type fakeStore struct {

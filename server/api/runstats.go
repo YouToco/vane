@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // runstatsResp 是 GET /api/admin/runstats 的响应体。

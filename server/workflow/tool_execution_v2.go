@@ -6,9 +6,9 @@ import (
 
 	"go.temporal.io/sdk/activity"
 
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ExecuteToolInvocationV2 is the Source-free data-plane Activity. It is

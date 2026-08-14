@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 本文件锁定 7 条判定的边界，**不需要 DB**：Store 是定义在消费方的窄接口

@@ -19,8 +19,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 type scheduleCommandTimeoutClient struct {

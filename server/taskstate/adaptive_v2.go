@@ -8,7 +8,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 const AdaptiveStateSchemaVersionV2 = "vane.task-adaptive-state/v2"

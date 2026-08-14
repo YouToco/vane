@@ -11,11 +11,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 // fakeProfileStore 实现 profilehint.Store：profile 为 nil 时返回 CodeNotFound

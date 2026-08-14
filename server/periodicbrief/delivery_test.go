@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 type periodicDeliveryStoreFake struct {

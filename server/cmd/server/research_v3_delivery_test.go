@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 type researchV3UserTargetStoreFake struct {

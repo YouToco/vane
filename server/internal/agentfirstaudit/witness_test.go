@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	vaneworkflow "github.com/YouToco/vane/workflow"
+	vaneworkflow "github.com/YouToco/vane/server/workflow"
 )
 
 type historyReaderFunc func(*workflowservice.GetWorkflowExecutionHistoryRequest) (

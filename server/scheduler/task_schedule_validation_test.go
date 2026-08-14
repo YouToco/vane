@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 func TestValidateTaskScheduleSpec_UsesCompleteA3TimingContract(t *testing.T) {

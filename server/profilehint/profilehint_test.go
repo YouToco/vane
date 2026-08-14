@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestBuild_Empty(t *testing.T) {

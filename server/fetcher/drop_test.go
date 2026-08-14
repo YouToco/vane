@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // feedWithItems 拼一份 RSS，itemBody 是每条 <item> 的内部 XML。

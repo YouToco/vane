@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const maxTaskDefinitionEditPreflightOperationIDBytes = 512

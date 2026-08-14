@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestRegisterWithInvite_Success(t *testing.T) {

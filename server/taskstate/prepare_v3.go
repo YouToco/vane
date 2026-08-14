@@ -1,6 +1,6 @@
 package taskstate
 
-import "github.com/YouToco/vane/types"
+import "github.com/YouToco/vane/server/types"
 
 // ResearchV3DefinitionPrepareParams carries authenticated operation scope and
 // explicit V3 policies. Task text and timing are deliberately absent: Store

@@ -5,10 +5,10 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/taskhealth"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/taskhealth"
+	"github.com/YouToco/vane/server/types"
 )
 
 // handleListTaskBriefs returns immutable whole Briefs for one exact task.

@@ -13,7 +13,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
-	vaneworkflow "github.com/YouToco/vane/workflow"
+	vaneworkflow "github.com/YouToco/vane/server/workflow"
 )
 
 const (

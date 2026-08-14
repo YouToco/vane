@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ModelToolDefinitionV1 is the one model-visible definition for a scheduled

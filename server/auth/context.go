@@ -3,7 +3,7 @@ package auth
 import (
 	"context"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // principalCtxKey 是 principal 在 context 里的键。私有类型防跨包碰撞。

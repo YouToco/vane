@@ -13,8 +13,8 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
-	"github.com/YouToco/vane/store"
-	vaneworkflow "github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/store"
+	vaneworkflow "github.com/YouToco/vane/server/workflow"
 )
 
 type BaselineTemporalReader interface {

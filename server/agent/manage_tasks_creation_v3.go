@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/task"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/task"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ResearchTaskCreationV3Controller is the narrow native lifecycle consumed by

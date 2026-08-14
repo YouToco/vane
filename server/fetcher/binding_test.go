@@ -20,11 +20,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/tikhubcatalog"
-	"github.com/YouToco/vane/tikhubinvoke"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/tikhubcatalog"
+	"github.com/YouToco/vane/server/tikhubinvoke"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ────────── 测试基建 ──────────

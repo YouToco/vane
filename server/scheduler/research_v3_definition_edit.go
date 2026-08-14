@@ -14,8 +14,8 @@ import (
 	schedulepb "go.temporal.io/api/schedule/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/taskstate"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/taskstate"
 )
 
 const (

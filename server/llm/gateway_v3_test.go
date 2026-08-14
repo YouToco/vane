@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 type fixedGatewayKeyV3 struct{ key []byte }

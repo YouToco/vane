@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ============================================================

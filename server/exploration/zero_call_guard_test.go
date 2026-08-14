@@ -31,12 +31,12 @@ func TestExplorationHasNoProductionImportV1(t *testing.T) {
 	forbidden, err := forbiddenPackageImportsV1(
 		filepath.Join(root, "exploration"),
 		[]string{
-			"github.com/YouToco/vane/api",
-			"github.com/YouToco/vane/feishu",
-			"github.com/YouToco/vane/llm",
-			"github.com/YouToco/vane/pusher",
-			"github.com/YouToco/vane/store",
-			"github.com/YouToco/vane/workflow",
+			"github.com/YouToco/vane/server/api",
+			"github.com/YouToco/vane/server/feishu",
+			"github.com/YouToco/vane/server/llm",
+			"github.com/YouToco/vane/server/pusher",
+			"github.com/YouToco/vane/server/store",
+			"github.com/YouToco/vane/server/workflow",
 		},
 	)
 	if err != nil {
@@ -54,7 +54,7 @@ func TestExplorationZeroCallGuardDetectsProductionImportV1(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte(`package feishu
-import _ "github.com/YouToco/vane/exploration"
+import _ "github.com/YouToco/vane/server/exploration"
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ import _ "github.com/YouToco/vane/exploration"
 }
 
 func productionExplorationImportsV1(root string) ([]string, error) {
-	const packagePath = "github.com/YouToco/vane/exploration"
+	const packagePath = "github.com/YouToco/vane/server/exploration"
 	var imports []string
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {

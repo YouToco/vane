@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 生产实测形态的固定样本。用真实 url 而非 https://example.com/x 是刻意的：

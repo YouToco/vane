@@ -11,10 +11,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 func researchProviderCallV3ForTest(traceID string, costMicroUSD int64) ResearchProviderCallV3 {

@@ -14,13 +14,13 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/testsuite"
 
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/observation"
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/observation"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 type compiledToolRunStoreFake struct {

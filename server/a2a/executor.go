@@ -14,8 +14,8 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
-	"github.com/YouToco/vane/promptguard"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/promptguard"
+	"github.com/YouToco/vane/server/types"
 )
 
 // SDK 内部对 artifact 做 gob DeepCopy：data part 接口位里的具体类型必须注册，

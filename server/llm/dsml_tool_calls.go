@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const dsmlSafeContent = "模型返回了无法安全解析的内部协议；原文已移除，且没有据此执行任何操作。"

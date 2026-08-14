@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 // capturedPrompts 记录仿真上游收到的最后一次 system/user prompt，

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const goldenAdaptiveStateV1 = `{"schema_version":"vane.task-adaptive-state/v1","tenant_id":7,"user_id":11,"task_id":"task-adaptive-v1","query_variants":[{"source_id":1,"query":"AI \"新品\" 🚀"},{"source_id":1,"query":"AI official releases"}],"capability_order":[{"platform":"web","capability":"search"},{"platform":"web","capability":"feed"}],"source_order":[1],"run_stats":{"attempted_runs":8,"successful_runs":5,"empty_runs":1,"failed_runs":2,"consecutive_failures":1}}`

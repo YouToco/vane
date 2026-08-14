@@ -75,7 +75,7 @@ func TestDefinitionEditProposalDarkGuardCatchesFunctionValues(t *testing.T) {
 	t.Parallel()
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "function_value_probe.go", `package probe
-import taskpkg "github.com/YouToco/vane/task"
+import taskpkg "github.com/YouToco/vane/server/task"
 var build = taskpkg.BuildFrozenTaskDefinitionEditProposal
 func probe() { decode := taskpkg.DecodeFrozenTaskDefinitionEditProposal; _ = decode }
 `, 0)

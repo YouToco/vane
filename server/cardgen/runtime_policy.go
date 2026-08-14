@@ -6,9 +6,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 // RendererVersionV1 identifies the deterministic card-generation user-prompt

@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/YouToco/vane/auth"
+	"github.com/YouToco/vane/server/auth"
 )
 
 func setAdminTraceNoStore(w http.ResponseWriter) {

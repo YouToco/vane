@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/promptguard"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/promptguard"
+	"github.com/YouToco/vane/server/types"
 )
 
 // Store 是 feedback 所需 store 方法的窄接口（契约 §10.4），与 *store.Store

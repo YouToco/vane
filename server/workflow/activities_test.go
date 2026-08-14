@@ -12,8 +12,8 @@ import (
 
 	"go.temporal.io/sdk/temporal"
 
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ============================================================

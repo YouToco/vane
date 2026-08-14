@@ -7,8 +7,8 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/store"
 )
 
 // runQuota 查看与调整租户额度（契约 §2.7）。

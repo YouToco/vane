@@ -12,10 +12,10 @@ import (
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 
-	"github.com/YouToco/vane/executivebrief"
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/executivebrief"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 type periodicRecoveryStoreFake struct {

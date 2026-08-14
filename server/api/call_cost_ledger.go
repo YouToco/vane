@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"strconv"
 
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/store"
 )
 
 type callCostLedgerResponse struct {

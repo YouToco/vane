@@ -3,7 +3,7 @@ package scheduler
 import (
 	"testing"
 
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 func TestExecutiveBriefRolloutIsNestedInsideStructuredEventEvidence(

@@ -11,9 +11,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/internal/credentialguard"
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/credentialguard"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/types"
 )
 
 const (

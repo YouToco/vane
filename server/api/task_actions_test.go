@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/agent"
+	"github.com/YouToco/vane/server/agent"
 )
 
 type fakeTaskActionAgent struct {

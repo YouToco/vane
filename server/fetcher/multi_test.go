@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestMulti_DispatchesByType(t *testing.T) {

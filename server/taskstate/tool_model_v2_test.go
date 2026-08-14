@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestToolInvocationV1DigestCanonicalAndVersioned(t *testing.T) {

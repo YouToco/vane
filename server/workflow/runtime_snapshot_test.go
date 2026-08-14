@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const workflowSnapshotTestDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

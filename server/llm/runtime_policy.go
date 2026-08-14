@@ -3,7 +3,7 @@ package llm
 import (
 	"fmt"
 
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 type runtimeModelRouteKeyV1 struct {

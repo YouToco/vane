@@ -11,7 +11,7 @@ import (
 
 	"github.com/pressly/goose/v3"
 
-	"github.com/YouToco/vane/runcontext"
+	"github.com/YouToco/vane/server/runcontext"
 )
 
 func TestMigration126FreezesPlannerToolSearchAuthority(t *testing.T) {

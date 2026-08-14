@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/store"
 )
 
 const providerPriceBodyLimit = 16 << 10

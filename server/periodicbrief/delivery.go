@@ -9,10 +9,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/feishu"
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feishu"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 type DeliverySender interface {

@@ -12,9 +12,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/types"
 )
 
 const compiledToolPushBatchKeyNamespaceV2 = "compiled-tool/v2/"

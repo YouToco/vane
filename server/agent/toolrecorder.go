@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const toolCallRecordTimeout = 5 * time.Second

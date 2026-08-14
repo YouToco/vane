@@ -31,9 +31,9 @@ import (
 
 	"github.com/mmcdole/gofeed"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/dedup"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/dedup"
+	"github.com/YouToco/vane/server/types"
 )
 
 var htmlTagRe = regexp.MustCompile(`<[a-zA-Z/!]`)

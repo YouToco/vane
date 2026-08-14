@@ -10,9 +10,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/pusheffect"
-	storepkg "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/pusheffect"
+	storepkg "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 const (

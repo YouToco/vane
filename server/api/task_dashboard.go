@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // schedulePlaybookDTO 是详情页手册块：只回正文与更新时间。fetch_plan 是编译产物

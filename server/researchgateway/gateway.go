@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 const ExecutePathV1 = "/v1/research/llm/execute"

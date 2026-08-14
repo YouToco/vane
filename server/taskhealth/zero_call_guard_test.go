@@ -18,7 +18,7 @@ func TestTaskHealthProductionImportIsLimitedToBriefWebProjectionV1(t *testing.T)
 		t.Fatal("locate task health guard")
 	}
 	root := filepath.Clean(filepath.Join(filepath.Dir(currentFile), ".."))
-	const packagePath = "github.com/YouToco/vane/taskhealth"
+	const packagePath = "github.com/YouToco/vane/server/taskhealth"
 	var imports []string
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {

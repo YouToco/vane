@@ -13,7 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/pusheffect"
+	"github.com/YouToco/vane/server/pusheffect"
 )
 
 const (

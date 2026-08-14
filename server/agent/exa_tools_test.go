@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ============================================================

@@ -8,8 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/agentcontext"
-	"github.com/YouToco/vane/agentledger"
+	"github.com/YouToco/vane/server/agentcontext"
+	"github.com/YouToco/vane/server/agentledger"
 )
 
 // SealAgentTurnContextSnapshot writes an immutable shadow candidate only when

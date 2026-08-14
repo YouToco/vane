@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestResearchGroundingCorrectionV1PostgresAllowsExactlyOneRepairAndReverification(

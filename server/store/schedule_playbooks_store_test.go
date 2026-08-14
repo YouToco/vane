@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestSchedulePlaybookStore 是任务手册 P0 存取层的 DATABASE_URL 门控集成测试：

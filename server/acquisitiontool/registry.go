@@ -21,8 +21,8 @@
 package acquisitiontool
 
 import (
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 // Status 是一个 (平台, 能力) 条目的可用状态。

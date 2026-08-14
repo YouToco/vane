@@ -10,13 +10,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/researchgateway"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimeconfig"
-	"github.com/YouToco/vane/runtimepolicy"
-	storepkg "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/researchgateway"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimeconfig"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	storepkg "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 type coordinatorStoreFakeV3 struct {

@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 // spyScheduler 记录是否真的对 Temporal 下了手。

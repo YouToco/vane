@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/researchgateway"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/researchgateway"
 )
 
 func main() {

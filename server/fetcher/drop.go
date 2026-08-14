@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // dropReason 是一条内容**被丢弃的原因**，用于把「本轮全灭」的诊断信息一路带到用户面前。

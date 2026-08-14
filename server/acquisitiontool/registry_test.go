@@ -3,7 +3,7 @@ package acquisitiontool
 import (
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestInvariant_UnavailableEntriesHaveReason 锁死契约 §2.2 的核心不变量：

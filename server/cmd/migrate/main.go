@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/store"
 )
 
 const (

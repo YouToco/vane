@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/taskstate"
+	"github.com/YouToco/vane/server/taskstate"
 )
 
 func TestMigration118ProjectionMatchesStoreAndRejectsForgedContextPostgres(t *testing.T) {

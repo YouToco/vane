@@ -8,7 +8,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 type assistantTurnFixture struct {

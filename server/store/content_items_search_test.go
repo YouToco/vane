@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestEscapeLike 纯单测（无 DB）：\、%、_ 依序转义（a2a-contract §4.2）。

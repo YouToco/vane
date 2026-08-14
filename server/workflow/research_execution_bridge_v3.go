@@ -1,10 +1,10 @@
 package workflow
 
 import (
-	"github.com/YouToco/vane/fetcher"
-	"github.com/YouToco/vane/runtimepolicy"
-	storepkg "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/fetcher"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	storepkg "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // researchStepPersistenceV3 is the only adapter from a provider execution

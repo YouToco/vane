@@ -706,7 +706,7 @@ func TestBuildInputV1_HasTypedNonConfigBoundary(t *testing.T) {
 			t.Fatalf("BuildInputV1 field %d = %s %s json:%q, want %s %s json:\"-\"",
 				i, field.Name, field.Type, field.Tag.Get("json"), expected.name, expected.typ)
 		}
-		if field.Type.PkgPath() == "github.com/YouToco/vane/config" {
+		if field.Type.PkgPath() == "github.com/YouToco/vane/server/config" {
 			t.Fatalf("BuildInputV1.%s accepts config type %s", field.Name, field.Type)
 		}
 	}

@@ -3,7 +3,7 @@ package taskstate
 import (
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // This table is intentionally independent of application enum validators.

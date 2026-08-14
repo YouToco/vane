@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // Cache 按 traceID 缓存画像提示：同一 pipeline（Score 50 次 + CardGen 5 次）

@@ -1,6 +1,6 @@
 package runcontext
 
-import "github.com/YouToco/vane/types"
+import "github.com/YouToco/vane/server/types"
 
 // ToolCandidateV1 carries observation provenance through the in-memory and
 // Temporal pipeline. It is a wire wrapper, not a persisted or user-managed

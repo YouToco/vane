@@ -21,8 +21,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/agentledger"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agentledger"
+	"github.com/YouToco/vane/server/types"
 )
 
 type agentEventFixture struct {
@@ -2058,7 +2058,7 @@ func TestAgentEventLedgerContextSnapshotGuardRejectsEscapes(t *testing.T) {
 	t.Parallel()
 	mutations := map[string]string{
 		"method value": `package store
-import "github.com/YouToco/vane/agentledger"
+import "github.com/YouToco/vane/server/agentledger"
 type Store struct{}
 func (s *Store) SealAgentTurnContextSnapshot() {
 	loadAuthoritativeAgentSessionProjectionForUpdate()
@@ -2072,7 +2072,7 @@ func verifyStoredAgentTurnContextSnapshot(_ []agentledger.Event) {
 	_, _ = agentledger.ProjectionDigest(nil)
 }`,
 		"wrapper": `package store
-import "github.com/YouToco/vane/agentledger"
+import "github.com/YouToco/vane/server/agentledger"
 type Store struct{}
 func (s *Store) SealAgentTurnContextSnapshot() {
 	loadAuthoritativeAgentSessionProjectionForUpdate()
@@ -2108,7 +2108,7 @@ func TestAgentEventLedgerGuardRejectsImportOutsideExactFiles(t *testing.T) {
 	t.Parallel()
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "escape.go", `package escape
-import "github.com/YouToco/vane/agentledger"
+import "github.com/YouToco/vane/server/agentledger"
 var _ = agentledger.Scope{}
 `, 0)
 	if err != nil {
@@ -2609,7 +2609,7 @@ func agentEventLedgerForbiddenImports(
 	var violations []string
 	for _, imported := range file.Imports {
 		if strings.Trim(imported.Path.Value, `"`) !=
-			"github.com/YouToco/vane/agentledger" {
+			"github.com/YouToco/vane/server/agentledger" {
 			continue
 		}
 		violations = append(violations,

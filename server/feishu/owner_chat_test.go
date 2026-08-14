@@ -20,8 +20,8 @@ import (
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestBackfillOwnerChatBindsHistoricalReceiptToCurrentApp(t *testing.T) {

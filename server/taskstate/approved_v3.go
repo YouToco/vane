@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/types"
 	"github.com/robfig/cron"
 )
 

@@ -16,8 +16,8 @@ import (
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 
-	"github.com/YouToco/vane/store"
-	vaneworkflow "github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/store"
+	vaneworkflow "github.com/YouToco/vane/server/workflow"
 )
 
 func TestCollectBaselineClosesAuditAndAdoptsLostAppendResponse(t *testing.T) {

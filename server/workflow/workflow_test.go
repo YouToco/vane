@@ -13,7 +13,7 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/testsuite"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 本文件测的是**编排**：各处"无内容可推"闸门各自留下一行空批次（009 /

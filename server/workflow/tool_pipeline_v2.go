@@ -13,16 +13,16 @@ import (
 
 	"go.temporal.io/sdk/activity"
 
-	cardgenpkg "github.com/YouToco/vane/cardgen"
-	"github.com/YouToco/vane/dedup"
-	"github.com/YouToco/vane/eventqualifier"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/observation"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/selector"
-	storepkg "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	cardgenpkg "github.com/YouToco/vane/server/cardgen"
+	"github.com/YouToco/vane/server/dedup"
+	"github.com/YouToco/vane/server/eventqualifier"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/observation"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/selector"
+	storepkg "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // CompiledToolRunInputV2 is intentionally disjoint from CompiledRunInputV1.

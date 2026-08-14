@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/internal/testshard"
+	"github.com/YouToco/vane/server/internal/testshard"
 )
 
 func TestFinalizeRunStatusRecordsFailure(t *testing.T) {

@@ -13,12 +13,12 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/researchtools"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/researchtools"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ResearchExecutionStatusV3 is deliberately independent from provider and

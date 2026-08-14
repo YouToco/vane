@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"strconv"
 
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/store"
 )
 
 // deliveriesResp 是 GET /api/deliveries 的响应体。

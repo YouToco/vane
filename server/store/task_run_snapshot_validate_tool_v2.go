@@ -3,7 +3,7 @@ package store
 import (
 	"bytes"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func validateStoredTaskRunSnapshotV2(

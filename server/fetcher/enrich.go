@@ -7,7 +7,7 @@ import (
 
 	"github.com/mmcdole/gofeed"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ============================================================

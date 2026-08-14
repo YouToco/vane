@@ -7,7 +7,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // InviteWithConsumer 是管理面列表项：邀请码本体 + 最近一次消费租户的 owner 邮箱。

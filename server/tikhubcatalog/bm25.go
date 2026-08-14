@@ -17,7 +17,7 @@ package tikhubcatalog
 import (
 	"strings"
 
-	"github.com/YouToco/vane/toolsearch"
+	"github.com/YouToco/vane/server/toolsearch"
 )
 
 // docText 拼接一个端点的可检索文本。各域直接连接：BM25F 分域加权对这个体量是

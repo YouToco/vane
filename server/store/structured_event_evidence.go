@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"strconv"
 
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/types"
 )
 
 // StructuredEventEvidenceContentV1 is an Activity-only view of one content row

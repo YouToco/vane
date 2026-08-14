@@ -7,9 +7,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/YouToco/vane/agentcontext"
-	"github.com/YouToco/vane/agentledger"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agentcontext"
+	"github.com/YouToco/vane/server/agentledger"
+	"github.com/YouToco/vane/server/types"
 	"github.com/jackc/pgx/v5"
 )
 

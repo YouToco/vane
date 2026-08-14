@@ -9,10 +9,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/tikhubinvoke"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/tikhubinvoke"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestRuntimeFetchRegistryRoutesExactExaGeneration(t *testing.T) {

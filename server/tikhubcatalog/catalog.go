@@ -21,7 +21,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/YouToco/vane/toolsearch"
+	"github.com/YouToco/vane/server/toolsearch"
 )
 
 //go:embed catalog.json

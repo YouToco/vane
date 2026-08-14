@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 func researchToolV3ForTest(

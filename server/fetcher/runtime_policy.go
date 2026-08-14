@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/tikhubcatalog"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/tikhubcatalog"
+	"github.com/YouToco/vane/server/types"
 )
 
 type runtimeFetchExecutorKindV1 uint8

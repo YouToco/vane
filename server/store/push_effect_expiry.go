@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 
-	"github.com/YouToco/vane/pusheffect"
+	"github.com/YouToco/vane/server/pusheffect"
 )
 
 // BlockExpiredUnclaimedPushEffect makes one database-clock decision for an

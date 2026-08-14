@@ -10,7 +10,7 @@ import (
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // legacyResearchStepReceiptV3 is the exact pre-terminal-union Activity wire.

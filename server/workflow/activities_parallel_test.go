@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ctrlScorer 是可编排的打分假件：按条目 ID 定制延迟与成败，并记录并发峰值。

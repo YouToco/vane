@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 // RendererVersionV1 identifies the deterministic profile-evolution prompt

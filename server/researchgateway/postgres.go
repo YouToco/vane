@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/store"
 )
 
 const gatewayDBRoleV1 = "vane_research_llm_gateway"

@@ -17,7 +17,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 func TestTaskDefinitionEditIntegration_RealDevServerLifecycle(t *testing.T) {

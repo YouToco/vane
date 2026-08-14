@@ -5,7 +5,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // handleListSchedules 读 Postgres 镜像返回当前 owner 的调度列表。

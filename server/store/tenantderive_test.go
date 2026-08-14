@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestTenantDerive_CallTables 锁死 llm_calls / tool_calls 的 tenant_id 写入。

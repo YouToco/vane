@@ -12,10 +12,10 @@ import (
 
 	enums "go.temporal.io/api/enums/v1"
 
-	"github.com/YouToco/vane/observation"
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/observation"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 func TestNormalizeCreateScheduleCommandObservationWindows(t *testing.T) {

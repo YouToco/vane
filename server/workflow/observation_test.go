@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/eventqualifier"
-	"github.com/YouToco/vane/observation"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/eventqualifier"
+	"github.com/YouToco/vane/server/observation"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestValidateQualifiedEventsRejectsForgedTimeAndEvidence(t *testing.T) {

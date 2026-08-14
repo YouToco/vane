@@ -14,11 +14,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/YouToco/vane/internal/researchoperator"
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/researchoperator"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 type argsV3 struct {

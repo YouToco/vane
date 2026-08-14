@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/agentledger"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agentledger"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestAgentSessionProjectionAuthorityLifecycleAndExactReplay(t *testing.T) {

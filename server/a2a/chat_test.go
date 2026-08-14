@@ -12,10 +12,10 @@ import (
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 
-	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/types"
 )
 
 // fakeChat 是 ChatRunner 替身：留痕入参、可注入错误。

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/store"
 )
 
 func TestPeriodicSynthesisSpendClaimPrecedesProviderCall(t *testing.T) {

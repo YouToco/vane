@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/types"
 )
 
 // xhsTokenURL 带 xsec_token 访问票据的真实形状小红书 URL。规格 A.3 硬约束：

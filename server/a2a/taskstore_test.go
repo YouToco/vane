@@ -13,8 +13,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	vanestore "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	vanestore "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 func newTask(id string, state a2a.TaskState) *a2a.Task {

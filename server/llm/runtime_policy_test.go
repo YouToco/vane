@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 func validRuntimeModelPolicyV1() runtimepolicy.ModelPolicyV1 {

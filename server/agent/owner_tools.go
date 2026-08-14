@@ -6,9 +6,9 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TaskRunTrigger is the task-scoped run-now control plane used by manage_tasks.

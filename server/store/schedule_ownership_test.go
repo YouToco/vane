@@ -7,7 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 契约 §2.8「已知越权洞」点名了两处：api/schedules.go 的 handleDeleteSchedule 与

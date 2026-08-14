@@ -14,8 +14,8 @@ import (
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 
-	"github.com/YouToco/vane/definitioneditwire"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/definitioneditwire"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 const taskDefinitionEditPausedNote = "operator-paused-before-edit"

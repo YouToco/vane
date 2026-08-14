@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // fakeEnricher 记录被请求过哪些 URL——**调用次数是成本，必须逐次可断言**。

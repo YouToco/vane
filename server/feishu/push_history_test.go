@@ -6,7 +6,7 @@ import (
 
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
-	"github.com/YouToco/vane/pusheffect"
+	"github.com/YouToco/vane/server/pusheffect"
 )
 
 func TestPushHistoryItemMatchesRequiresExactPositiveEvidence(t *testing.T) {

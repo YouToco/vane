@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestAuthorizeAndConsumeTaskRunLLMQuotaV1_IsAtomicAndExactTenant(t *testing.T) {

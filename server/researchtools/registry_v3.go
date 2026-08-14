@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 type RegistryV3 struct {

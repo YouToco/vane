@@ -16,8 +16,8 @@ import (
 
 	"go.temporal.io/sdk/client"
 
-	"github.com/YouToco/vane/internal/agentfirstaudit"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/internal/agentfirstaudit"
+	"github.com/YouToco/vane/server/store"
 )
 
 const (

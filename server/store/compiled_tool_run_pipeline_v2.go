@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ListRecentSimhashesForTaskRunV2 reads user-level delivered/content history

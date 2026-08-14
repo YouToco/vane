@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/promptguard"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/promptguard"
+	"github.com/YouToco/vane/server/types"
 )
 
 const structuredEventEvidenceMaxRunesV1 = 800

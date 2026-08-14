@@ -9,8 +9,8 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 
-	storepkg "github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	storepkg "github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ResearchRuntimeCoordinatorV3 is the non-Temporal implementation boundary.

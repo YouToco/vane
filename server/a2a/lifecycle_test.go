@@ -14,9 +14,9 @@ import (
 	protocol "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
-	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/types"
 )
 
 type cancelAwareChat struct {

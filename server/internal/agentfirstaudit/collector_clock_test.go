@@ -13,7 +13,7 @@ import (
 	"go.temporal.io/sdk/client"
 	sdkmocks "go.temporal.io/sdk/mocks"
 
-	vaneworkflow "github.com/YouToco/vane/workflow"
+	vaneworkflow "github.com/YouToco/vane/server/workflow"
 )
 
 func TestProductionClockRunnerBindsStartContract(t *testing.T) {

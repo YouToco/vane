@@ -11,7 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestClampA2APageSize 纯单测：PageSize 钳制 [1,200]、<=0 → 50（契约 §3）。

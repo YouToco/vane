@@ -47,7 +47,7 @@ func TestPushRecoveryLifecycleHasNarrowProductionWiring(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if value == "github.com/YouToco/vane/pushrecovery" {
+			if value == "github.com/YouToco/vane/server/pushrecovery" {
 				clean := filepath.ToSlash(path)
 				if !strings.HasSuffix(clean, "/cmd/server/main.go") {
 					t.Errorf("recovery import outside composition root: %s", path)
@@ -71,7 +71,7 @@ func TestPushRecoveryDarkGuardRejectsSamePackageWrapperMutation(t *testing.T) {
 import (
 	"context"
 	"time"
-	"github.com/YouToco/vane/pusheffect"
+	"github.com/YouToco/vane/server/pusheffect"
 )
 func (c *Coordinator) Run(ctx context.Context) {
 	go func() {}()

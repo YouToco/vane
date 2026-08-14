@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 func TestResearchPlannerToolSearchReceiptV1BindsSearchAndFinalPlanPostgres(t *testing.T) {

@@ -16,7 +16,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/YouToco/vane/probe"
+	"github.com/YouToco/vane/server/probe"
 )
 
 // window_hours 的合法区间。

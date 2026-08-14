@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ListFeedbacksForEvolution 慢通道输入：取该用户 id > afterID 的反馈（id 升序，

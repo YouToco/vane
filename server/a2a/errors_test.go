@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestSanitize 对外文案翻译逐字钉死（契约 §9.1）。

@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/observation"
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/observation"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 // Retained test adapter: older fixtures describe the same acquisition calls

@@ -3,7 +3,7 @@ package dedup
 import (
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestContentHash(t *testing.T) {

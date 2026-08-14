@@ -19,11 +19,11 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
-	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // AgentRunner is the Feishu natural-language message boundary.

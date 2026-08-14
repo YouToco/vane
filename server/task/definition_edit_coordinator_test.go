@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 var testTaskDefinitionEditReceiptTarget = TaskDefinitionEditReceiptTarget{

@@ -32,7 +32,7 @@ func TestPushPipelineWorkflow_ImportsOnlyDeterministicDependencies(t *testing.T)
 		"github.com/google/uuid":        {},
 		"go.temporal.io/sdk/temporal":   {},
 		"go.temporal.io/sdk/workflow":   {},
-		"github.com/YouToco/vane/types": {},
+		"github.com/YouToco/vane/server/types": {},
 	}
 	for _, spec := range parsed.Imports {
 		path, err := strconv.Unquote(spec.Path.Value)

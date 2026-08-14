@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestHistoryCursorRoundtrip 纯单测（无 DB）：游标编解码往返无损 + 非法输入拒收。

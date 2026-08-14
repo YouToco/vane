@@ -6,7 +6,7 @@ import (
 	"go/token"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestGateUsesNonOwnerServerRuntimeStore(t *testing.T) {

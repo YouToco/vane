@@ -11,7 +11,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // storeAdapter 把 store 层（types.A2ATask + 哨兵 AppError）适配到 SDK taskstore.Store。

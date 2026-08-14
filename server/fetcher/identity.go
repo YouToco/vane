@@ -17,7 +17,7 @@ package fetcher
 import (
 	"strings"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // CanonicalKey 算出内容的全局身份（content_items.canonical_key，UNIQUE）。

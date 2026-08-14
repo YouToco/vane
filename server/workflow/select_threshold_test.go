@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 本文件锁任务门槛过滤（契约 §6.1，2026-07-19 拍板）：Select 的过滤行为、

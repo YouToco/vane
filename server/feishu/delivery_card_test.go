@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/types"
 )
 
 // deliveryCard 是推送卡的顶层解析结构。elements 用 RawMessage 承接：

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/server/llm"
 )
 
 // newRunOnceLoop 构造 A2A 轨形态的 Loop：Store/Profiles 均 nil（RunOnce 不碰会话

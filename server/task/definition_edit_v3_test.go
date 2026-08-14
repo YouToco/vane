@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestBuildResearchV3DefinitionEditTargetReplacesCompleteOwnerSurfaceOnly(

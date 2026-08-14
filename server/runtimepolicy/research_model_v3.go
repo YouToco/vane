@@ -8,7 +8,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 const ResearchModelPolicySchemaVersionV3 = "vane.runtime-research-model-policy/v3"

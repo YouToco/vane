@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/probe"
+	"github.com/YouToco/vane/server/probe"
 )
 
 const obsPath = "/api/admin/observability"

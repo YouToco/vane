@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestToolCalls_InsertAndCount 是 tool_calls 的库内往返 + 每日限额口径测试

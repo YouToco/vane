@@ -19,8 +19,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
 
-	"github.com/YouToco/vane/probe"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/probe"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestServerRuntimeBoundaryPostgres(t *testing.T) {

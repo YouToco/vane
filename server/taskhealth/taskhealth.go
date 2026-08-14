@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const SchemaVersionV1 = "vane.task-health/v1"

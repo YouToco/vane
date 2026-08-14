@@ -9,11 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/observation"
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/observation"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 const taskDefinitionEditOperationRefPrefix = "definition-edit:"

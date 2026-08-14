@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
 const pausedCompiledTaskDefinitionDigestVersion = "vane.paused-compiled-task-definition/v1"

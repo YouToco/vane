@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 func TestEncodePolicyBundleV1_PreservesWideGenerations(t *testing.T) {

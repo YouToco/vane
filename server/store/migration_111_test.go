@@ -13,8 +13,8 @@ import (
 
 	"github.com/pressly/goose/v3"
 
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestMigration111FencesConcurrentTenantRegistrationPostgres(t *testing.T) {

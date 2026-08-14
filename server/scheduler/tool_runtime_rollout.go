@@ -3,7 +3,7 @@ package scheduler
 import (
 	"strings"
 
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 // toolRuntimeRollout is intentionally single-task only. A Tool task is not

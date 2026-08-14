@@ -20,9 +20,9 @@ import (
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
-	cardgenpkg "github.com/YouToco/vane/cardgen"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/types"
+	cardgenpkg "github.com/YouToco/vane/server/cardgen"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 本文件把契约 §8.2 的重放兼容性从**散文**变成**测试**。

@@ -14,8 +14,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/observation"
 )
 
 const goldenTaskRunSnapshotPayloadV1 = `{"schema_version":"vane.task-run-snapshot-payload/v1","tenant_id":7,"user_id":11,"task_id":"golden-task","run_kind":"scheduled","mode":"compiled","adaptive_version":0,"policies":{"capability_catalog":{"capabilities":["web/search"]},"tool_policy":{"allow":["fetch"]},"prompt_policy":{"score":"v1"},"model_policy":{"model":"m1","provider":"test"},"quota_policy":{"bucket":"fetch","limit":7}},"budget":{"max_planner_rounds":0,"max_tool_calls":0,"max_tokens":0,"max_cost_micro_usd":0,"duration_ms":0},"definition":{"task_id":"golden-task","tenant_id":7,"user_id":11,"nl_description":"monitor status","spec_json":{"cron":"0 8 * * *","tz":"UTC"},"scope_json":{"max_items":3},"playbook_content":"trusted only","strictness":"normal","source_scope":"approved_plan","fetch_plan":{"sources":[{"platform":"web","capability":"search","title":"Official","url":"https://example.test/status","config":{"query":"status"}}]},"sources":[{"source_id":42,"platform":"web","capability":"search","title":"Official","url":"https://example.test/status","config":{"query":"status"}}]},"reference_schema_version":"vane.run-snapshot-ref/v1"}`

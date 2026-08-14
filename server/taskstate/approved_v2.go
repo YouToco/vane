@@ -7,9 +7,9 @@ import (
 	"encoding/json"
 	"slices"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/internal/strictjson"
+	"github.com/YouToco/vane/server/types"
 )
 
 const ApprovedDefinitionSchemaVersionV2 = "vane.task-approved-definition/v2"

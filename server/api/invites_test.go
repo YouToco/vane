@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
 
 // TestToInviteItem 钉住 DTO 的状态语义与 types.Invite 对齐。

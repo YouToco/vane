@@ -9,8 +9,8 @@ import (
 
 	"go.temporal.io/sdk/converter"
 
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 // These mirrors freeze the current structs that definition-edit/v1 embeds.

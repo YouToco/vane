@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/YouToco/vane/toolsearch"
+	"github.com/YouToco/vane/server/toolsearch"
 )
 
 // fcNameRe 是 FC 工具名约束（DeepSeek/OpenAI 兼容面，与 gen 的硬校验同一正则）。

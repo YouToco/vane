@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // scheduleColumns 是 schedules 表全列，SELECT 与 scanSchedule 一一对应。

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/observation"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/observation"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestCanonicalBriefStagePromotesAtomicallyAndReplays(t *testing.T) {

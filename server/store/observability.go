@@ -9,8 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/profilehint"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/profilehint"
+	"github.com/YouToco/vane/server/types"
 )
 
 // withTenantObservabilityRead installs the tenant RLS identity on the same

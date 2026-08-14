@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/agentledger"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agentledger"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ============================================================

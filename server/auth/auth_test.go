@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const testKey = "feishu_owner"

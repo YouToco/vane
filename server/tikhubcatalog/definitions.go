@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/toolsearch"
+	"github.com/YouToco/vane/server/toolsearch"
 )
 
 const modelDescriptionMaxRunes = 300

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestLegacyAdmissionFencedStoreRejectsSourceProductWriters(t *testing.T) {

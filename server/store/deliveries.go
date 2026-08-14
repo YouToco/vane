@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // deliveryColumns 是 deliveries 表全列，SELECT 与 scanDelivery 一一对应。

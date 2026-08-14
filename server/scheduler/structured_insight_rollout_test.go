@@ -3,8 +3,8 @@ package scheduler
 import (
 	"testing"
 
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 func TestStructuredInsightRolloutIsNestedInsideCanonicalBrief(t *testing.T) {

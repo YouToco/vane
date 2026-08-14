@@ -4,7 +4,7 @@ import (
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/workflow"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // ResearchShadowInputV3 identifies one already-approved scheduled task. It is

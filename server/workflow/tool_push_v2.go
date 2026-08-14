@@ -6,11 +6,11 @@ import (
 	"reflect"
 	"strings"
 
-	cardgenpkg "github.com/YouToco/vane/cardgen"
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/runcontext"
-	"github.com/YouToco/vane/types"
+	cardgenpkg "github.com/YouToco/vane/server/cardgen"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/runcontext"
+	"github.com/YouToco/vane/server/types"
 )
 
 type PushToolCardsV2Input struct {

@@ -14,10 +14,10 @@ import (
 
 	"go.temporal.io/sdk/testsuite"
 
-	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/feedback"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestPRBCompletePushEffectPlan(t *testing.T) {

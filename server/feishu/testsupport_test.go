@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/store"
 )
 
 // 本文件是 store/testsupport_test.go 的同构副本，服务本包 DATABASE_URL 门控的

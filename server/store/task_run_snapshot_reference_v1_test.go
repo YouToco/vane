@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const goldenTaskRunSnapshotReferenceEnvelopeV1 = `{"schema_version":"vane.run-snapshot-ref/v1","snapshot_id":41,"identity":{"temporal_workflow_id":"wf-task-golden","temporal_run_id":"run-golden","run_kind":"scheduled","tenant_id":7,"user_id":11,"task_id":"task-golden"},"mode":"compiled","definition_digest":"1111111111111111111111111111111111111111111111111111111111111111","plan_digest":"2222222222222222222222222222222222222222222222222222222222222222","adaptive_version":0,"policy":{"capability_catalog_digest":"3333333333333333333333333333333333333333333333333333333333333333","tool_policy_digest":"4444444444444444444444444444444444444444444444444444444444444444","prompt_policy_digest":"5555555555555555555555555555555555555555555555555555555555555555","model_policy_digest":"6666666666666666666666666666666666666666666666666666666666666666","quota_policy_digest":"7777777777777777777777777777777777777777777777777777777777777777"},"planner_budget":{"max_planner_rounds":0,"max_tool_calls":0,"max_tokens":0,"max_cost_micro_usd":0,"duration_ms":0},"payload_digest":"8888888888888888888888888888888888888888888888888888888888888888"}`

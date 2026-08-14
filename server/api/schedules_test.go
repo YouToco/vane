@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/scheduler"
+	"github.com/YouToco/vane/server/scheduler"
 )
 
 type fakeScheduler struct {

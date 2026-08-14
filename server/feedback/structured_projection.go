@@ -3,7 +3,7 @@ package feedback
 import (
 	"strings"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // CanonicalInsightBodyMDV1 projects one immutable Brief insight into the

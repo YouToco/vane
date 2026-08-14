@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/YouToco/vane/feishu"
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/feishu"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 type researchV3UserTargetStore interface {

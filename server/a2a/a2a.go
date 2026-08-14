@@ -15,10 +15,10 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/limiter"
 
-	"github.com/YouToco/vane/agent"
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/types"
 )
 
 // 配额默认值（契约 §5.7，Boss 拍板"契约给默认值再核"）。

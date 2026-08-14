@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/types"
 )
 
 const sampleRSS = `<?xml version="1.0" encoding="UTF-8"?>

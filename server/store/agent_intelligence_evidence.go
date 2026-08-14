@@ -13,7 +13,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 	"github.com/jackc/pgx/v5"
 )
 

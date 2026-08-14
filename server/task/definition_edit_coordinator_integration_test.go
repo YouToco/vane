@@ -18,11 +18,11 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 )
 
 type researchV3EditCreateResponseLossStore struct {

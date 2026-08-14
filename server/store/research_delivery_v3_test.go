@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/pusheffect"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/pusheffect"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
 	"github.com/google/uuid"
 )
 

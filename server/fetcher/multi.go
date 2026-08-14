@@ -12,10 +12,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/runtimepolicy"
+	"github.com/YouToco/vane/server/types"
 )
 
 // Multi 持有各类型抓取器。零外部状态，多 goroutine 可并发复用。

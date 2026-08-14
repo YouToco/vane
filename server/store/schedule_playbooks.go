@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // UpsertSchedulePlaybook 写入/更新某定时任务的手册正文（P0 只管 content）。

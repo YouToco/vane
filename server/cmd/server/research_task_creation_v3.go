@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/task"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/task"
+	"github.com/YouToco/vane/server/types"
 )
 
 // requireOwnerAgentResearchV3Runtime is the process-level startup gate for the

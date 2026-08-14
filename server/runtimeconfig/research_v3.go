@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/YouToco/vane/acquisitiontool"
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/acquisitiontool"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 const researchExaCallCapMicroUSDV3 = 10_000

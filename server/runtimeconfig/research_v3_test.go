@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/server/runtimepolicy"
 )
 
 func TestBuildResearchRuntimeV3HasOnlyPublicReadToolsAndRetainedRoutes(t *testing.T) {

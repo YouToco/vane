@@ -9,7 +9,7 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/testsuite"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // activityInputCapture 钉住 Workflow 发给两个 LLM Activity 的载荷。capture 发生在

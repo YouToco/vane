@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // fakeContent 是 ContentStore 替身（仿 agent loop_test.go fakeStore：错误注入位 + 调用留痕）。

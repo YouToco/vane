@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 // fakeStore 可数调用次数的 Store 桩，err 非 nil 时恒返回该错误。

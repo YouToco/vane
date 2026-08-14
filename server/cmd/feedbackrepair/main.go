@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/config"
+	"github.com/YouToco/vane/server/store"
 )
 
 func main() {

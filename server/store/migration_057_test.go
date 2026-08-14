@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/definitioneditwire"
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/definitioneditwire"
+	"github.com/YouToco/vane/server/types"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 

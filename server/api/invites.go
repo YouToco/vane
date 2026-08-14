@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/YouToco/vane/auth"
-	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/store"
 )
 
 // inviteItem 是管理面的邀请码 DTO（与前端 feat/admin-polish 的对接约定）。

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/server/types"
 )
 
 const goldenApprovedDefinitionV1 = `{"schema_version":"vane.task-approved-definition/v1","tenant_id":7,"user_id":11,"task_id":"task-approved-v1","intent":"追踪 \"AI\" 🚀","nl_description":"每天 08:00\n推送","spec_json":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},"scope_json":{"emoji":"🌬️","max_items":3},"playbook_content":"只选官方\t来源。","source_scope":"approved_plan","fetch_plan":{"sources":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI","config":{"query":"AI"}}]},"strictness":"normal","sources":[{"source_id":1,"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI","config":{"query":"AI"}}],"execution_mode":"compiled","delivery_policy":"owner_feishu","budget_policy":"inherit_tenant_quota"}`

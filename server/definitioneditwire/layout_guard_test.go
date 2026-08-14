@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/definitioneditwire"
-	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/task"
-	"github.com/YouToco/vane/taskstate"
-	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/definitioneditwire"
+	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/task"
+	"github.com/YouToco/vane/server/taskstate"
+	"github.com/YouToco/vane/server/types"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 // The retained reader deliberately duplicates only JSON layout, not runtime

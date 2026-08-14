@@ -15,10 +15,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/YouToco/vane/internal/testshard"
+	"github.com/YouToco/vane/server/internal/testshard"
 )
 
-const storePackage = "github.com/YouToco/vane/store"
+const storePackage = "github.com/YouToco/vane/server/store"
 
 type stringList []string
 

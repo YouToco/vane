@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/YouToco/vane/runcontext"
+	"github.com/YouToco/vane/server/runcontext"
 )
 
 func TestResearchRuntimeFailsClosedWithoutDedicatedPool(t *testing.T) {

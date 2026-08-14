@@ -3,7 +3,7 @@ package scheduler
 import (
 	"strings"
 
-	"github.com/YouToco/vane/workflow"
+	"github.com/YouToco/vane/server/workflow"
 )
 
 type structuredInsightRollout struct {
