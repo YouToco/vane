@@ -44,7 +44,10 @@ func temporalWorkerOptions() worker.Options {
 }
 
 func temporalWorkerBuildID() string {
-	revision, ok := releaseinfo.Revision()
+	return temporalWorkerBuildIDForRevision(releaseinfo.Revision())
+}
+
+func temporalWorkerBuildIDForRevision(revision string, ok bool) string {
 	if !ok {
 		return "vane/development"
 	}
