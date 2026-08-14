@@ -179,5 +179,12 @@ class BackendRuntimeContractTest(unittest.TestCase):
                 if line.startswith("ExecStart=/opt/vane/"):
                     self.assertTrue(line.startswith("ExecStart=/opt/vane/current/bin/"), unit)
 
+    def test_primary_server_keeps_owner_compatibility_database_boundary(self) -> None:
+        payload = (SYSTEMD / "vane.service").read_text(encoding="utf-8")
+        self.assertIn(
+            "EnvironmentFile=/opt/vane/env/server-owner-compat.env", payload
+        )
+        self.assertNotIn("EnvironmentFile=/opt/vane/env/server.env", payload)
+
 if __name__ == "__main__":
     unittest.main()
