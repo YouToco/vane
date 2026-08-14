@@ -56,7 +56,11 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 	if roleCount != 0 {
 		t.Fatal("migration 098 provisioned a cluster-global runtime implicitly")
 	}
-	if _, err := provider.UpTo(t.Context(), latestMigrationVersion); err != nil {
+	// The compatibility cases below deliberately construct retained V1
+	// creation/edit history. Keep this first phase at schema 131; migration
+	// 132 has its own isolated runtime/fence matrix and correctly rejects any
+	// attempt to create those rows.
+	if _, err := provider.UpTo(t.Context(), 131); err != nil {
 		t.Fatal(err)
 	}
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
@@ -219,10 +223,11 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		}
 	})
 
-	// The compatibility cases above deliberately exercise schema 108. The
-	// recovery catalog and every remaining runtime boundary use the current
-	// contract, including the durable schedule-command recovery cursor.
-	if _, err := provider.UpTo(t.Context(), latestMigrationVersion); err != nil {
+	// The compatibility and recovery cases in this test construct retained V1
+	// operations. Keep the whole retained runtime-boundary suite at schema 131;
+	// migration 132's isolated fresh-database matrix separately proves the
+	// current runtime role, V3 pass-through and physical write fence.
+	if _, err := provider.UpTo(t.Context(), 131); err != nil {
 		t.Fatal(err)
 	}
 

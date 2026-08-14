@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -37,12 +38,31 @@ const (
 	maxAgentFirstNamespaceBytes   = 255
 	maxAgentFirstAuditSchedules   = 100000
 	agentFirstEmptyDigest         = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	// These hashes bootstrap trust in the two catalog verifiers themselves.
+	// All other v130/v132 functions, triggers, policies and ACLs are covered by
+	// the descriptor. Keeping these two expected definitions in the binary
+	// prevents a replaced database verifier from approving its own drift.
+	agentFirstFenceDescriptorDefinitionSHA256 = "80c91011df44a29d84f4ed2760153921eb8addd7592dedb0f08e145eed403f4d"
+	agentFirstFenceAssertionDefinitionSHA256  = "d9c29f2f930beacfb11280165bde7c01787d893b57e6509e21640151bed1157f"
 )
 
 var agentFirstSourceRevisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var agentFirstDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var agentFirstNamespaceIDPattern = regexp.MustCompile(
 	`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// ErrAgentFirstRetentionAttestationNotFound lets the offline collector
+// distinguish a first append from an unavailable or ambiguous adoption read.
+// It is deliberately returned only after an exact external-evidence or
+// canonical payload-digest lookup.
+var ErrAgentFirstRetentionAttestationNotFound = errors.New(
+	"Agent-first retention attestation not found")
+
+// ErrAgentFirstRetentionAttestationStale means an exact immutable event
+// exists but is expired or no longer belongs to the latest baseline chain. A
+// caller must not turn this into a new append or report it as consumable.
+var ErrAgentFirstRetentionAttestationStale = errors.New(
+	"Agent-first retention attestation is stale")
 
 // AgentFirstRetentionAttestationInput contains only evidence observed outside
 // PostgreSQL. The append function supplies database identity, the semantic DB
@@ -93,6 +113,12 @@ type AgentFirstRetentionAttestationEvent struct {
 	PayloadDigest              string
 	IssuedAt                   time.Time
 	ExpiresAt                  time.Time
+}
+
+type AgentFirstLegacyWriteFence struct {
+	InstalledAt                 time.Time
+	PreexistingAttestationMaxID int64
+	DescriptorDigest            string
 }
 
 type AgentFirstRetentionAuditSnapshot struct {
@@ -187,6 +213,59 @@ const agentFirstRetentionEventColumnsV130 = `
 	temporal_evidence_digest,source_revision,deploy_digest,database_identity,
 	legacy_db_snapshot,legacy_db_snapshot_digest,canonical_payload,payload_digest,
 	issued_at,expires_at`
+
+type agentFirstFenceCatalogQueryer interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func verifyAgentFirstFenceVerifierCatalog(
+	ctx context.Context,
+	queryer agentFirstFenceCatalogQueryer,
+) error {
+	var descriptorDefinition, assertionDefinition string
+	if err := queryer.QueryRow(ctx, `SELECT
+		encode(sha256(convert_to(pg_get_functiondef(
+		 'public.agent_first_legacy_write_fence_descriptor_v132()'::regprocedure),
+		 'UTF8')),'hex'),
+		encode(sha256(convert_to(pg_get_functiondef(
+		 'public.assert_agent_first_legacy_write_fence_v132()'::regprocedure),
+		 'UTF8')),'hex')`).Scan(&descriptorDefinition, &assertionDefinition); err != nil {
+		return fmt.Errorf("read Agent-first fence verifier catalog: %w", err)
+	}
+	if descriptorDefinition != agentFirstFenceDescriptorDefinitionSHA256 ||
+		assertionDefinition != agentFirstFenceAssertionDefinitionSHA256 {
+		return fmt.Errorf("Agent-first fence verifier catalog drifted")
+	}
+	return nil
+}
+
+// AssertAgentFirstLegacyWriteFence proves that migration 132's four physical
+// protocol fences are installed and ENABLE ALWAYS. The retention collector is
+// owner-operated, but it still refuses to attest an interval after catalog
+// drift or a partially applied migration.
+func (s *Store) AssertAgentFirstLegacyWriteFence(
+	ctx context.Context,
+) (*AgentFirstLegacyWriteFence, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store: Agent-first legacy write fence is unavailable")
+	}
+	if err := verifyAgentFirstFenceVerifierCatalog(ctx, s.pool); err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	var fence AgentFirstLegacyWriteFence
+	if err := s.pool.QueryRow(ctx,
+		`SELECT installed_at,preexisting_attestation_max_id,descriptor_digest
+		   FROM public.assert_agent_first_legacy_write_fence_v132()`).Scan(
+		&fence.InstalledAt, &fence.PreexistingAttestationMaxID,
+		&fence.DescriptorDigest); err != nil {
+		return nil, fmt.Errorf("store: assert Agent-first legacy write fence: %w", err)
+	}
+	if fence.InstalledAt.IsZero() || fence.PreexistingAttestationMaxID < 0 ||
+		!agentFirstDigestPattern.MatchString(fence.DescriptorDigest) {
+		return nil, fmt.Errorf("store: Agent-first legacy write fence is invalid")
+	}
+	return &fence, nil
+}
 
 // ReadAgentFirstRetentionAuditSnapshot reads the exact v130 semantic snapshot
 // and the per-schedule V3 Action authority from one owner-only, repeatable-read
@@ -344,6 +423,56 @@ func (s *Store) AppendAgentFirstRetentionAttestation(
 	return event, nil
 }
 
+// AppendAgentFirstRetentionAttestationV132 appends through the physical
+// legacy-protocol fence and CASes the semantic database snapshot observed by
+// the offline collector. It preserves the canonical v130 event bytes.
+func (s *Store) AppendAgentFirstRetentionAttestationV132(
+	ctx context.Context,
+	in AgentFirstRetentionAttestationInput,
+	expectedLegacyDBSnapshotDigest string,
+) (*AgentFirstRetentionAttestationEvent, error) {
+	if err := validateAgentFirstRetentionInput(in); err != nil {
+		return nil, err
+	}
+	if !agentFirstDigestPattern.MatchString(expectedLegacyDBSnapshotDigest) {
+		return nil, fmt.Errorf("store: expected Agent-first database snapshot digest is invalid")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin fenced Agent-first retention attestation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := verifyAgentFirstFenceVerifierCatalog(ctx, tx); err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	var parent any
+	if in.ParentDigest != "" {
+		parent = in.ParentDigest
+	}
+	row := tx.QueryRow(ctx, `SELECT `+agentFirstRetentionEventColumnsV130+`
+		FROM append_agent_first_retention_attestation_v132(
+		 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+		string(in.Phase), parent, in.TemporalClusterID,
+		in.TemporalNamespace, in.TemporalNamespaceID, in.RetentionSeconds,
+		string(in.HistoryArchivalState), in.HistoryArchiveURIDigest,
+		string(in.VisibilityArchivalState), in.VisibilityArchiveURIDigest,
+		in.TemporalServerWitness, in.WorkflowInventoryDigest,
+		in.ScheduleInventoryDigest, in.ArchiveInventoryDigest,
+		in.TemporalEvidenceDigest, in.SourceRevision, in.DeployDigest,
+		expectedLegacyDBSnapshotDigest)
+	event, err := scanAgentFirstRetentionEvent(row)
+	if err != nil {
+		return nil, fmt.Errorf("store: append fenced Agent-first retention attestation: %w", err)
+	}
+	if err := validateAgentFirstRetentionEvent(event); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("store: commit fenced Agent-first retention attestation: %w", err)
+	}
+	return event, nil
+}
+
 // LoadAgentFirstRetentionAttestation adopts a committed event after a lost
 // append response. Every caller-supplied external evidence field participates
 // in the lookup; zero or multiple matches fail closed.
@@ -354,11 +483,103 @@ func (s *Store) LoadAgentFirstRetentionAttestation(
 	if err := validateAgentFirstRetentionInput(in); err != nil {
 		return nil, err
 	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin Agent-first retention adoption: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	// Serialize the chain-head decision with the append function. This is not a
+	// replacement for migration132's live cross-system re-audit; it only keeps
+	// response-loss adoption from reviving an expired or superseded event.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(6215335020355474130)`); err != nil {
+		return nil, fmt.Errorf("store: lock Agent-first retention adoption: %w", err)
+	}
+	event, err := loadAgentFirstRetentionAttestationTx(ctx, tx, in)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("store: commit Agent-first retention adoption: %w", err)
+	}
+	return event, nil
+}
+
+// LoadAgentFirstRetentionAttestationV132 adopts an exact committed event only
+// while the physical legacy write fence and the collector's final semantic DB
+// snapshot remain true in the same transaction. This is the response-loss
+// counterpart of AppendAgentFirstRetentionAttestationV132.
+func (s *Store) LoadAgentFirstRetentionAttestationV132(
+	ctx context.Context,
+	in AgentFirstRetentionAttestationInput,
+	expectedLegacyDBSnapshotDigest string,
+) (*AgentFirstRetentionAttestationEvent, error) {
+	if err := validateAgentFirstRetentionInput(in); err != nil {
+		return nil, err
+	}
+	if !agentFirstDigestPattern.MatchString(expectedLegacyDBSnapshotDigest) {
+		return nil, fmt.Errorf("store: expected Agent-first snapshot digest is invalid")
+	}
+	// Read Committed is intentional: the advisory lock can wait behind an
+	// append whose commit is the response we are adopting. A Repeatable Read
+	// snapshot would be frozen before that wait and could never see the row.
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin fenced Agent-first retention adoption: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(6215335020355474130)`); err != nil {
+		return nil, fmt.Errorf("store: lock fenced Agent-first retention adoption: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `LOCK TABLE public.schedules,
+		public.research_v3_delivery_authorities IN SHARE MODE NOWAIT`); err != nil {
+		return nil, fmt.Errorf("store: lock fenced Agent-first live authority: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `LOCK TABLE
+		public.agent_first_retention_attestation_events,
+		public.task_creation_operations,public.task_creation_receipts,
+		public.task_definition_edit_operations,public.task_definition_edit_receipts
+		IN ACCESS SHARE MODE`); err != nil {
+		return nil, fmt.Errorf("store: lock fenced Agent-first adoption authority: %w", err)
+	}
+	if err := verifyAgentFirstFenceVerifierCatalog(ctx, tx); err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	var fence AgentFirstLegacyWriteFence
+	if err := tx.QueryRow(ctx, `SELECT installed_at,preexisting_attestation_max_id,
+		descriptor_digest FROM public.assert_agent_first_legacy_write_fence_v132()`).Scan(
+		&fence.InstalledAt, &fence.PreexistingAttestationMaxID,
+		&fence.DescriptorDigest); err != nil {
+		return nil, fmt.Errorf("store: assert fenced Agent-first adoption: %w", err)
+	}
+	var actualSnapshotDigest string
+	if err := tx.QueryRow(ctx, `SELECT encode(sha256(
+		public.agent_first_legacy_db_snapshot_v130()),'hex')`).Scan(
+		&actualSnapshotDigest); err != nil {
+		return nil, fmt.Errorf("store: recompute fenced Agent-first adoption snapshot: %w", err)
+	}
+	if actualSnapshotDigest != expectedLegacyDBSnapshotDigest {
+		return nil, ErrAgentFirstRetentionAttestationStale
+	}
+	event, err := loadAgentFirstRetentionAttestationTx(ctx, tx, in)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("store: commit fenced Agent-first retention adoption: %w", err)
+	}
+	return event, nil
+}
+
+func loadAgentFirstRetentionAttestationTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	in AgentFirstRetentionAttestationInput,
+) (*AgentFirstRetentionAttestationEvent, error) {
 	var parent any
 	if in.ParentDigest != "" {
 		parent = in.ParentDigest
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+agentFirstRetentionEventColumnsV130+`
+	rows, err := tx.Query(ctx, `SELECT `+agentFirstRetentionEventColumnsV130+`
 		  FROM public.agent_first_retention_attestation_events
 		 WHERE phase=$1 AND parent_digest IS NOT DISTINCT FROM $2
 		   AND temporal_cluster_id=$3 AND temporal_namespace=$4
@@ -394,8 +615,111 @@ func (s *Store) LoadAgentFirstRetentionAttestation(
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: iterate Agent-first retention attestation: %w", err)
 	}
+	if len(found) == 0 {
+		return nil, ErrAgentFirstRetentionAttestationNotFound
+	}
 	if len(found) != 1 {
 		return nil, fmt.Errorf("store: exact Agent-first retention attestation count is %d", len(found))
+	}
+	event := found[0]
+	var databaseNow time.Time
+	var latestBaseline *string
+	var parentID *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT clock_timestamp(),(
+			SELECT payload_digest
+			  FROM public.agent_first_retention_attestation_events
+			 WHERE temporal_cluster_id=$1 AND temporal_namespace=$2
+			   AND temporal_namespace_id=$3 AND phase='baseline'
+			 ORDER BY id DESC LIMIT 1),(
+			SELECT id FROM public.agent_first_retention_attestation_events
+			 WHERE payload_digest=$4)`, event.TemporalClusterID,
+		event.TemporalNamespace, event.TemporalNamespaceID, event.ParentDigest).Scan(
+		&databaseNow, &latestBaseline, &parentID); err != nil {
+		return nil, fmt.Errorf("store: read Agent-first retention chain head: %w", err)
+	}
+	var fenceCutoff int64
+	var fenceAvailable bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass(
+		'public.agent_first_legacy_protocol_write_fence_v132') IS NOT NULL`).Scan(
+		&fenceAvailable); err != nil {
+		return nil, fmt.Errorf("store: inspect Agent-first retention fence epoch: %w", err)
+	}
+	if fenceAvailable {
+		if err := tx.QueryRow(ctx, `SELECT preexisting_attestation_max_id
+			FROM public.agent_first_legacy_protocol_write_fence_v132
+			WHERE singleton`).Scan(&fenceCutoff); err != nil {
+			return nil, fmt.Errorf("store: read Agent-first retention fence epoch: %w", err)
+		}
+	}
+	if err := validateAgentFirstRetentionAdoption(
+		event, databaseNow, latestBaseline, fenceCutoff, parentID); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+func validateAgentFirstRetentionAdoption(
+	event *AgentFirstRetentionAttestationEvent,
+	databaseNow time.Time,
+	latestBaseline *string,
+	fenceCutoff int64,
+	parentID *int64,
+) error {
+	if event == nil || databaseNow.IsZero() || latestBaseline == nil ||
+		!event.ExpiresAt.After(databaseNow) {
+		return ErrAgentFirstRetentionAttestationStale
+	}
+	if event.Phase == AgentFirstRetentionPhaseBaseline {
+		if *latestBaseline != event.PayloadDigest || event.ID <= fenceCutoff {
+			return ErrAgentFirstRetentionAttestationStale
+		}
+		return nil
+	}
+	if event.Phase != AgentFirstRetentionPhasePrepared || event.ParentDigest == nil ||
+		*latestBaseline != *event.ParentDigest || parentID == nil || *parentID <= fenceCutoff {
+		return ErrAgentFirstRetentionAttestationStale
+	}
+	return nil
+}
+
+// LoadAgentFirstRetentionAttestationByDigest loads one immutable ledger event
+// by its database-generated canonical payload digest. The offline prepared
+// collector uses this to bind a content-addressed evidence file to the exact
+// baseline row; it does not grant any server or Agent runtime authority.
+func (s *Store) LoadAgentFirstRetentionAttestationByDigest(
+	ctx context.Context,
+	payloadDigest string,
+) (*AgentFirstRetentionAttestationEvent, error) {
+	if !agentFirstDigestPattern.MatchString(payloadDigest) {
+		return nil, fmt.Errorf("store: Agent-first retention payload digest is invalid")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+agentFirstRetentionEventColumnsV130+`
+		  FROM public.agent_first_retention_attestation_events
+		 WHERE payload_digest=$1 ORDER BY id DESC LIMIT 2`, payloadDigest)
+	if err != nil {
+		return nil, fmt.Errorf("store: load Agent-first retention attestation by digest: %w", err)
+	}
+	defer rows.Close()
+	var found []*AgentFirstRetentionAttestationEvent
+	for rows.Next() {
+		event, err := scanAgentFirstRetentionEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan Agent-first retention attestation by digest: %w", err)
+		}
+		if err := validateAgentFirstRetentionEvent(event); err != nil {
+			return nil, err
+		}
+		found = append(found, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate Agent-first retention attestation by digest: %w", err)
+	}
+	if len(found) == 0 {
+		return nil, ErrAgentFirstRetentionAttestationNotFound
+	}
+	if len(found) != 1 {
+		return nil, fmt.Errorf("store: Agent-first retention payload digest count is %d", len(found))
 	}
 	return found[0], nil
 }

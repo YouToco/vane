@@ -222,10 +222,19 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 	if err != nil || loaded.PayloadDigest != firstBaseline.PayloadDigest {
 		t.Fatalf("adopt exact baseline loaded=%+v err=%v", loaded, err)
 	}
+	loadedByDigest, err := st.LoadAgentFirstRetentionAttestationByDigest(
+		t.Context(), firstBaseline.PayloadDigest)
+	if err != nil || loadedByDigest.ID != firstBaseline.ID {
+		t.Fatalf("load by digest=%+v err=%v", loadedByDigest, err)
+	}
+	if _, err := st.LoadAgentFirstRetentionAttestationByDigest(
+		t.Context(), strings.Repeat("8", 64)); !errors.Is(err, ErrAgentFirstRetentionAttestationNotFound) {
+		t.Fatalf("missing digest error=%v", err)
+	}
 	wrongEvidence := firstInput
 	wrongEvidence.TemporalEvidenceDigest = strings.Repeat("9", 64)
-	if _, err := st.LoadAgentFirstRetentionAttestation(t.Context(), wrongEvidence); err == nil {
-		t.Fatal("adopted baseline with different external evidence")
+	if _, err := st.LoadAgentFirstRetentionAttestation(t.Context(), wrongEvidence); !errors.Is(err, ErrAgentFirstRetentionAttestationNotFound) {
+		t.Fatalf("different external evidence error=%v", err)
 	}
 	auditSnapshot, err := st.ReadAgentFirstRetentionAuditSnapshot(t.Context())
 	if err != nil || auditSnapshot.LegacyDBSnapshotDigest !=
@@ -237,6 +246,10 @@ func TestMigration130AttestationChainAuthorityAndDownGuardPostgres(t *testing.T)
 		agentFirstRetentionTestInput(AgentFirstRetentionPhaseBaseline, "", time.Now().UTC()))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := st.LoadAgentFirstRetentionAttestation(
+		t.Context(), firstInput); !errors.Is(err, ErrAgentFirstRetentionAttestationStale) {
+		t.Fatalf("superseded baseline adoption error=%v", err)
 	}
 	tooEarly := agentFirstRetentionTestInput(AgentFirstRetentionPhasePrepared,
 		secondBaseline.PayloadDigest, time.Now().UTC())

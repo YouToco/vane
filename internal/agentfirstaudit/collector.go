@@ -24,11 +24,12 @@ type BaselineTemporalReader interface {
 }
 
 type BaselineStore interface {
+	AssertAgentFirstLegacyWriteFence(context.Context) (*store.AgentFirstLegacyWriteFence, error)
 	ReadAgentFirstRetentionAuditSnapshot(context.Context) (*store.AgentFirstRetentionAuditSnapshot, error)
-	AppendAgentFirstRetentionAttestation(context.Context,
-		store.AgentFirstRetentionAttestationInput) (*store.AgentFirstRetentionAttestationEvent, error)
-	LoadAgentFirstRetentionAttestation(context.Context,
-		store.AgentFirstRetentionAttestationInput) (*store.AgentFirstRetentionAttestationEvent, error)
+	AppendAgentFirstRetentionAttestationV132(context.Context,
+		store.AgentFirstRetentionAttestationInput, string) (*store.AgentFirstRetentionAttestationEvent, error)
+	LoadAgentFirstRetentionAttestationV132(context.Context,
+		store.AgentFirstRetentionAttestationInput, string) (*store.AgentFirstRetentionAttestationEvent, error)
 }
 
 type BaselineClockRunner func(context.Context, TemporalAuthority) (RetentionClockEvidence, error)
@@ -61,6 +62,29 @@ func CollectBaseline(
 		productionClockRunner(temporalClient, request), request)
 }
 
+// PrimeRetentionClock starts (or exactly adopts) the retention witness before
+// a deployment control plane drains the production worker. The subsequent
+// prepared collection uses the same operation ID under
+// WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, so it can validate the immutable
+// server history while no application writer is running. Priming never writes
+// the attestation ledger.
+func PrimeRetentionClock(
+	ctx context.Context,
+	temporalClient client.Client,
+	request BaselineCollectorRequest,
+) (RetentionClockEvidence, error) {
+	if temporalClient == nil ||
+		!boundedCanonicalTemporalText(request.Namespace, 255) ||
+		!boundedCanonicalTemporalText(request.TaskQueue, 255) ||
+		!canonicalUUID(request.OperationID) ||
+		!validSourceRevision(request.SourceRevision) || request.Release.validate() != nil ||
+		request.Release.SourceRevision() != request.SourceRevision ||
+		!validLowerHex(request.Release.DeployDigest(), 32) {
+		return RetentionClockEvidence{}, fmt.Errorf("retention clock request is invalid")
+	}
+	return productionClockRunner(temporalClient, request)(ctx, TemporalAuthority{})
+}
+
 func collectBaselineWithClock(
 	ctx context.Context,
 	database BaselineStore,
@@ -76,6 +100,9 @@ func collectBaselineWithClock(
 		request.Release.SourceRevision() != request.SourceRevision ||
 		!validLowerHex(request.Release.DeployDigest(), 32) {
 		return BaselineCollectorResult{}, fmt.Errorf("baseline collector request is invalid")
+	}
+	if _, err := database.AssertAgentFirstLegacyWriteFence(ctx); err != nil {
+		return BaselineCollectorResult{}, fmt.Errorf("assert baseline legacy write fence: %w", err)
 	}
 	beforeDB, err := database.ReadAgentFirstRetentionAuditSnapshot(ctx)
 	if err != nil {
@@ -181,19 +208,47 @@ func collectBaselineWithClock(
 		HistoryArchiveURIDigest:    afterTemporal.HistoryArchiveURIDigest,
 		VisibilityArchivalState:    store.AgentFirstArchivalState(afterTemporal.VisibilityArchivalState),
 		VisibilityArchiveURIDigest: afterTemporal.VisibilityArchiveURIDigest,
-		TemporalServerWitness:      clock.ObservedAtUTC,
-		WorkflowInventoryDigest:    afterStandard.Digest,
-		ScheduleInventoryDigest:    afterSchedules.Digest,
-		ArchiveInventoryDigest:     afterArchive.Digest,
-		TemporalEvidenceDigest:     manifest.Digest,
-		SourceRevision:             request.SourceRevision, DeployDigest: request.Release.DeployDigest(),
+		// PostgreSQL timestamptz has microsecond precision. Normalize before the
+		// exact adoption key is built so a real Temporal nanosecond timestamp
+		// round-trips through the immutable ledger without weakening the raw
+		// history digest or the canonical evidence file.
+		TemporalServerWitness:   clock.ObservedAtUTC.UTC().Truncate(time.Microsecond),
+		WorkflowInventoryDigest: afterStandard.Digest,
+		ScheduleInventoryDigest: afterSchedules.Digest,
+		ArchiveInventoryDigest:  afterArchive.Digest,
+		TemporalEvidenceDigest:  manifest.Digest,
+		SourceRevision:          request.SourceRevision, DeployDigest: request.Release.DeployDigest(),
 	}
-	event, appendErr := database.AppendAgentFirstRetentionAttestation(ctx, input)
+	if _, err := database.AssertAgentFirstLegacyWriteFence(ctx); err != nil {
+		return BaselineCollectorResult{}, fmt.Errorf("reassert baseline legacy write fence: %w", err)
+	}
+	// A prior attempt can commit the append and then lose its response (or fail
+	// a caller-side post-commit check). Adopt the exact immutable event before
+	// authorizing another append. Only an exact not-found result may proceed.
+	event, loadErr := database.LoadAgentFirstRetentionAttestationV132(
+		ctx, input, afterDB.LegacyDBSnapshotDigest)
+	if loadErr == nil {
+		if err := validateCommittedBaseline(event, input, afterDB); err != nil {
+			return BaselineCollectorResult{}, fmt.Errorf(
+				"existing baseline differs from collected evidence")
+		}
+		return BaselineCollectorResult{
+			Event: event, Manifest: manifest, EvidencePath: evidencePath,
+		}, nil
+	}
+	if !errors.Is(loadErr, store.ErrAgentFirstRetentionAttestationNotFound) {
+		return BaselineCollectorResult{}, fmt.Errorf(
+			"load exact baseline before append: %w", loadErr)
+	}
+
+	event, appendErr := database.AppendAgentFirstRetentionAttestationV132(
+		ctx, input, afterDB.LegacyDBSnapshotDigest)
 	if appendErr != nil {
 		adoptionContext, cancelAdoption := context.WithTimeout(
 			context.WithoutCancel(ctx), 10*time.Second)
 		defer cancelAdoption()
-		event, err = database.LoadAgentFirstRetentionAttestation(adoptionContext, input)
+		event, err = database.LoadAgentFirstRetentionAttestationV132(
+			adoptionContext, input, afterDB.LegacyDBSnapshotDigest)
 		if err != nil {
 			return BaselineCollectorResult{}, fmt.Errorf(
 				"append baseline attestation: %w; exact adoption: %v", appendErr, err)
