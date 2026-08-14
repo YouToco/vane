@@ -47,7 +47,14 @@ class GeneratedContractsTest(unittest.TestCase):
 
 class RepositoryPolicyTest(unittest.TestCase):
     def test_no_github_actions(self) -> None:
-        self.assertFalse(any(ROOT.glob("**/.github/workflows/*")))
+        tracked = subprocess.run(
+            ["git", "ls-files", "*/.github/workflows/*", ".github/workflows/*"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertEqual(tracked, [])
 
     def test_module_and_lockfile_authorities(self) -> None:
         go_modules = sorted(path.relative_to(ROOT).as_posix() for path in ROOT.glob("**/go.mod"))
@@ -88,6 +95,29 @@ class RepositoryPolicyTest(unittest.TestCase):
             if path.is_file() and (path.name in forbidden or path.suffix in {".service", ".socket"})
         ]
         self.assertEqual(offenders, [])
+
+    def test_research_gateway_runtime_permissions(self) -> None:
+        systemd = ROOT / "infra/production/systemd"
+        socket = (systemd / "vane-research-gateway.socket").read_text(encoding="utf-8")
+        for required in (
+            "SocketUser=vane-research-gateway",
+            "SocketGroup=vane",
+            "SocketMode=0660",
+            "DirectoryMode=0711",
+        ):
+            self.assertIn(required, socket)
+        self.assertNotIn("SocketMode=0666", socket)
+
+        service = (systemd / "vane.service").read_text(encoding="utf-8")
+        self.assertIn(
+            "LoadCredential=native_v3_edit_recovery_db_url:"
+            "/etc/vane/credentials/native_v3_edit_recovery_db_url",
+            service,
+        )
+        environment = (ROOT / "infra/production/env/server.env.example").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("VANE_DB_NATIVE_V3_EDIT_RECOVERY_RUNTIME_URL=", environment)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 [Unit]
 Description=Vane isolated research provider gateway
-After=network-online.target docker.service
+After=network-online.target docker.service vane-migrate.service
 Wants=network-online.target
-Requires=vane-research-gateway.socket
+Requires=vane-migrate.service vane-research-gateway.socket
 
 [Service]
 Type=simple

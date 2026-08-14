@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:18-alpine
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     restart: unless-stopped
     environment:
       POSTGRES_USER: vane
@@ -18,7 +18,7 @@ services:
       retries: 5
 
   temporal:
-    image: temporalio/auto-setup:1.29.7
+    image: temporalio/auto-setup:1.29.7@sha256:f14912b699cf73015ad5c4fc18d522d4b014db90e794039214dfb7c022c2644f
     restart: unless-stopped
     depends_on:
       postgres:
@@ -31,12 +31,12 @@ services:
       - POSTGRES_SEEDS=postgres
       - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
     volumes:
-      - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+      - ../temporal/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
     ports:
       - "127.0.0.1:7233:7233"
 
   temporal-ui:
-    image: temporalio/ui:2.52.1
+    image: temporalio/ui:2.52.1@sha256:b839b5c798770896c78058db1647d325a19b3acef7fa1fbd9a23fabb1dd7feb2
     restart: unless-stopped
     depends_on:
       - temporal
@@ -46,11 +46,11 @@ services:
       - "127.0.0.1:8233:8080"
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
 
