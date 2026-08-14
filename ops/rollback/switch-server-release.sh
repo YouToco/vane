@@ -23,13 +23,20 @@ for required in \
   bin/vane bin/gate \
   deploy/Caddyfile deploy/docker-compose.yml \
   deploy/dynamicconfig/development-sql.yaml \
-  deploy/vane.service deploy/vane-migrate.service \
+  deploy/vane.service \
   deploy/vane-research-gateway.service deploy/vane-research-gateway.socket \
   infra-manifest.sha256; do
   [[ -f $target/$required && ! -L $target/$required ]] || {
     echo "rollback target lacks bound member: $required" >&2; exit 1;
   }
 done
+
+target_infra_digest=$(sha256sum "$target/infra-manifest.sha256" | awk '{print $1}')
+current_infra_digest=$(sha256sum "$current_target/infra-manifest.sha256" | awk '{print $1}')
+infra_changed=false
+if [[ $target_infra_digest != "$current_infra_digest" ]]; then
+  infra_changed=true
+fi
 
 backup=$(mktemp -d /opt/vane/.rollback-backup.XXXXXX)
 switched=false
@@ -40,13 +47,15 @@ cleanup() {
     rescue=$release_root/.rollback-rescue.$$
     ln -s "$current_target" "$rescue"
     mv -Tf "$rescue" "$current"
-    cp --archive "$backup/Caddyfile" /opt/vane/Caddyfile
-    cp --archive "$backup/docker-compose.yml" /opt/vane/docker-compose.yml
-    cp --archive "$backup/development-sql.yaml" /opt/vane/dynamicconfig/development-sql.yaml
-    for unit in vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket; do
+    if [[ $infra_changed == true ]]; then
+      cp --archive "$backup/Caddyfile" /opt/vane/Caddyfile
+      cp --archive "$backup/docker-compose.yml" /opt/vane/docker-compose.yml
+      cp --archive "$backup/development-sql.yaml" /opt/vane/dynamicconfig/development-sql.yaml
+      (cd /opt/vane && docker compose up -d postgres temporal temporal-ui caddy) || true
+    fi
+    for unit in vane.service vane-research-gateway.service vane-research-gateway.socket; do
       cp --archive "$backup/$unit" "/etc/systemd/system/$unit"
     done
-    (cd /opt/vane && docker compose up -d postgres temporal temporal-ui caddy) || true
     systemctl daemon-reload || true
     systemctl restart vane-research-gateway.socket vane-research-gateway.service vane.service || true
   fi
@@ -55,25 +64,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp --archive /opt/vane/Caddyfile "$backup/Caddyfile"
-cp --archive /opt/vane/docker-compose.yml "$backup/docker-compose.yml"
-cp --archive /opt/vane/dynamicconfig/development-sql.yaml "$backup/development-sql.yaml"
-for unit in vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket; do
+if [[ $infra_changed == true ]]; then
+  cp --archive /opt/vane/Caddyfile "$backup/Caddyfile"
+  cp --archive /opt/vane/docker-compose.yml "$backup/docker-compose.yml"
+  cp --archive /opt/vane/dynamicconfig/development-sql.yaml "$backup/development-sql.yaml"
+fi
+for unit in vane.service vane-research-gateway.service vane-research-gateway.socket; do
   cp --archive "/etc/systemd/system/$unit" "$backup/$unit"
 done
 
 systemctl stop vane.service vane-research-gateway.service vane-research-gateway.socket
-install -m 0644 "$target/deploy/Caddyfile" /opt/vane/Caddyfile
-install -m 0644 "$target/deploy/docker-compose.yml" /opt/vane/docker-compose.yml
-install -m 0644 "$target/deploy/dynamicconfig/development-sql.yaml" /opt/vane/dynamicconfig/development-sql.yaml
-for unit in vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket; do
+if [[ $infra_changed == true ]]; then
+  install -m 0644 "$target/deploy/Caddyfile" /opt/vane/Caddyfile
+  install -m 0644 "$target/deploy/docker-compose.yml" /opt/vane/docker-compose.yml
+  install -m 0644 "$target/deploy/dynamicconfig/development-sql.yaml" /opt/vane/dynamicconfig/development-sql.yaml
+fi
+for unit in vane.service vane-research-gateway.service vane-research-gateway.socket; do
   install -m 0644 "$target/deploy/$unit" "/etc/systemd/system/$unit"
 done
 next=$release_root/.rollback-$target_sha.$$
 ln -s "$target" "$next"
 mv -Tf "$next" "$current"
 switched=true
-(cd /opt/vane && docker compose up -d postgres temporal temporal-ui caddy)
+if [[ $infra_changed == true ]]; then
+  (cd /opt/vane && docker compose up -d postgres temporal temporal-ui caddy)
+fi
 systemctl daemon-reload
 systemctl start vane-research-gateway.socket vane-research-gateway.service vane.service
 for _ in {1..90}; do

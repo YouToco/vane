@@ -30,10 +30,8 @@ BACKEND_FILES = {
     "deploy/Caddyfile": 0o644,
     "deploy/docker-compose.yml": 0o644,
     "deploy/vane.service": 0o644,
-    "deploy/vane-migrate.service": 0o644,
     "deploy/vane-research-gateway.service": 0o644,
     "deploy/vane-research-gateway.socket": 0o644,
-    "deploy/vane-legacy-compat.service": 0o644,
     "deploy/dynamicconfig/development-sql.yaml": 0o644,
 }
 BACKEND_SOURCE_PATHS = {
@@ -45,15 +43,11 @@ BACKEND_SOURCE_PATHS = {
     "deploy/Caddyfile": "infra/production/caddy/Caddyfile",
     "deploy/docker-compose.yml": "infra/production/compose/docker-compose.yml",
     "deploy/vane.service": "infra/production/systemd/vane.service",
-    "deploy/vane-migrate.service": "infra/production/systemd/vane-migrate.service",
     "deploy/vane-research-gateway.service": (
         "infra/production/systemd/vane-research-gateway.service"
     ),
     "deploy/vane-research-gateway.socket": (
         "infra/production/systemd/vane-research-gateway.socket"
-    ),
-    "deploy/vane-legacy-compat.service": (
-        "infra/production/systemd/vane-legacy-compat.service"
     ),
     "deploy/dynamicconfig/development-sql.yaml": (
         "infra/production/temporal/development-sql.yaml"
@@ -76,6 +70,8 @@ def validate_sha(value: str) -> str:
 
 
 def validate_archive_path(value: str, component: str) -> PurePosixPath:
+    if component != "backend":
+        raise ValueError(f"unsupported artifact component: {component!r}")
     path = PurePosixPath(value)
     if (
         any(ord(char) < 32 or ord(char) == 127 for char in value)
@@ -86,31 +82,16 @@ def validate_archive_path(value: str, component: str) -> PurePosixPath:
         or any(part in ("", ".", "..") for part in path.parts)
     ):
         raise ValueError(f"unsafe archive path: {value!r}")
-    if component == "frontend" and path.parts[0] != "dist":
-        raise ValueError(f"frontend path is outside dist/: {value!r}")
     return path
 
 
 def source_files(component: str, source: Path) -> list[tuple[str, Path, int]]:
-    if component == "backend":
-        candidates = [
-            (archive_path, source / BACKEND_SOURCE_PATHS[archive_path], mode)
-            for archive_path, mode in BACKEND_FILES.items()
-        ]
-    else:
-        dist = source / "dist"
-        if not (dist / "index.html").is_file():
-            raise ValueError("frontend dist/index.html is missing")
-        candidates = []
-        for file_path in sorted(dist.rglob("*")):
-            if file_path.is_symlink():
-                raise ValueError(f"frontend artifact contains symlink: {file_path}")
-            if file_path.is_dir():
-                continue
-            if not file_path.is_file():
-                raise ValueError(f"frontend artifact contains non-file: {file_path}")
-            archive_path = file_path.relative_to(source).as_posix()
-            candidates.append((archive_path, file_path, 0o644))
+    if component != "backend":
+        raise ValueError(f"unsupported artifact component: {component!r}")
+    candidates = [
+        (archive_path, source / BACKEND_SOURCE_PATHS[archive_path], mode)
+        for archive_path, mode in BACKEND_FILES.items()
+    ]
 
     if not candidates:
         raise ValueError(f"{component} artifact has no files")
@@ -140,18 +121,17 @@ def pack(
     build_run_attempt: int | None = None,
 ) -> None:
     source_sha = validate_sha(source_sha)
-    if component == "backend":
-        if server_release_contract != SERVER_RELEASE_CONTRACT:
-            raise ValueError("backend server release contract is not exact")
-        if control_plane_revision is None:
-            raise ValueError("backend control-plane revision is required")
-        control_plane_revision = validate_sha(control_plane_revision)
-        if not deploy_run_id or not deploy_run_id.isascii() or not deploy_run_id.isdigit():
-            raise ValueError("backend deploy run ID is invalid")
-        if not isinstance(build_run_attempt, int) or build_run_attempt <= 0:
-            raise ValueError("backend deploy run attempt is invalid")
-    elif server_release_contract is not None:
-        raise ValueError("frontend artifact cannot carry a server release contract")
+    if component != "backend":
+        raise ValueError(f"unsupported artifact component: {component!r}")
+    if server_release_contract != SERVER_RELEASE_CONTRACT:
+        raise ValueError("backend server release contract is not exact")
+    if control_plane_revision is None:
+        raise ValueError("backend control-plane revision is required")
+    control_plane_revision = validate_sha(control_plane_revision)
+    if not deploy_run_id or not deploy_run_id.isascii() or not deploy_run_id.isdigit():
+        raise ValueError("backend deploy run ID is invalid")
+    if not isinstance(build_run_attempt, int) or build_run_attempt <= 0:
+        raise ValueError("backend deploy run attempt is invalid")
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -195,11 +175,10 @@ def pack(
         "archive_size": archive_path.stat().st_size,
         "files": manifest_files,
     }
-    if component == "backend":
-        manifest["server_release_contract"] = server_release_contract
-        manifest["control_plane_revision"] = control_plane_revision
-        manifest["deploy_run_id"] = deploy_run_id
-        manifest["build_run_attempt"] = build_run_attempt
+    manifest["server_release_contract"] = server_release_contract
+    manifest["control_plane_revision"] = control_plane_revision
+    manifest["deploy_run_id"] = deploy_run_id
+    manifest["build_run_attempt"] = build_run_attempt
     manifest_path = output / f"{component}-{source_sha}.manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -232,6 +211,8 @@ def validate(
     deploy_run_id: str | None = None,
 ) -> None:
     source_sha = validate_sha(source_sha)
+    if component != "backend":
+        raise ValueError(f"unsupported artifact component: {component!r}")
     archive_name = f"{component}-{source_sha}.tar.gz"
     manifest_name = f"{component}-{source_sha}.manifest.json"
     checksum_name = f"{component}-{source_sha}.sha256"
@@ -270,41 +251,33 @@ def validate(
         "archive_size",
         "files",
     ]
-    if component == "backend":
-        manifest_keys.extend((
-            "server_release_contract", "control_plane_revision",
-            "deploy_run_id", "build_run_attempt",
-        ))
+    manifest_keys.extend((
+        "server_release_contract", "control_plane_revision",
+        "deploy_run_id", "build_run_attempt",
+    ))
     exact_keys(manifest, manifest_keys, "manifest")
     if manifest["schema"] != SCHEMA:
         raise ValueError("unsupported manifest schema")
     if manifest["component"] != component or manifest["source_sha"] != source_sha:
         raise ValueError("manifest component or source SHA does not match the plan")
-    if component == "backend" and (
-        manifest["server_release_contract"] != SERVER_RELEASE_CONTRACT
-    ):
+    if manifest["server_release_contract"] != SERVER_RELEASE_CONTRACT:
         raise ValueError("backend server release contract is not exact")
-    if component == "backend":
-        if control_plane_revision is None:
-            raise ValueError("backend expected control-plane revision is required")
-        control_plane_revision = validate_sha(control_plane_revision)
-        if (
-            not isinstance(manifest["deploy_run_id"], str)
-            or not manifest["deploy_run_id"].isascii()
-            or not manifest["deploy_run_id"].isdigit()
-            or not isinstance(manifest["build_run_attempt"], int)
-            or manifest["build_run_attempt"] <= 0
-        ):
-            raise ValueError("backend deployment identity is invalid")
-        if (
-            manifest["control_plane_revision"] != control_plane_revision
-            or manifest["deploy_run_id"] != deploy_run_id
-        ):
-            raise ValueError("backend deployment identity differs from this run")
-    elif any(value is not None for value in (
-        control_plane_revision, deploy_run_id
-    )):
-        raise ValueError("frontend validation cannot carry deployment identity")
+    if control_plane_revision is None:
+        raise ValueError("backend expected control-plane revision is required")
+    control_plane_revision = validate_sha(control_plane_revision)
+    if (
+        not isinstance(manifest["deploy_run_id"], str)
+        or not manifest["deploy_run_id"].isascii()
+        or not manifest["deploy_run_id"].isdigit()
+        or not isinstance(manifest["build_run_attempt"], int)
+        or manifest["build_run_attempt"] <= 0
+    ):
+        raise ValueError("backend deployment identity is invalid")
+    if (
+        manifest["control_plane_revision"] != control_plane_revision
+        or manifest["deploy_run_id"] != deploy_run_id
+    ):
+        raise ValueError("backend deployment identity differs from this run")
     if manifest["archive"] != archive_name:
         raise ValueError("manifest archive name is not exact")
     archive_path = input_dir / archive_name
@@ -355,14 +328,11 @@ def validate(
         manifest_files[path] = entry
     if total_size > MAX_TOTAL_SIZE:
         raise ValueError("manifest content is oversized")
-    if component == "backend":
-        if set(manifest_files) != set(BACKEND_FILES):
-            raise ValueError("backend allowlist is not exact")
-        for path, expected_mode in BACKEND_FILES.items():
-            if manifest_files[path]["mode"] != expected_mode:
-                raise ValueError(f"backend mode is not exact: {path}")
-    elif "dist/index.html" not in manifest_files:
-        raise ValueError("frontend allowlist lacks dist/index.html")
+    if set(manifest_files) != set(BACKEND_FILES):
+        raise ValueError("backend allowlist is not exact")
+    for path, expected_mode in BACKEND_FILES.items():
+        if manifest_files[path]["mode"] != expected_mode:
+            raise ValueError(f"backend mode is not exact: {path}")
 
     if output_dir.exists():
         raise ValueError(f"validation output already exists: {output_dir}")
@@ -406,35 +376,34 @@ def validate(
             if seen != set(manifest_files):
                 raise ValueError("tar is missing allowlisted files")
 
-        if component == "backend":
-            for binary in (
-                "vane", "vane-research-gateway", "vane-migrate", "gate",
-                "agentfirstretention",
-            ):
-                data = (output_dir / "bin" / binary).read_bytes()
-                if f"vane/{source_sha}/clean".encode() not in data:
-                    raise ValueError(f"{binary} lacks exact clean release build ID")
-            release_receipt = {
-                "schema_version": "vane.release-receipt/v1",
-                "source_revision": source_sha,
-                "control_plane_revision": manifest["control_plane_revision"],
-                "deploy_run_id": manifest["deploy_run_id"],
-                "build_run_attempt": manifest["build_run_attempt"],
-                "backend_archive_sha256": archive_sha256,
-                "backend_manifest_sha256": sha256_file(input_dir / manifest_name),
-                "server_release_contract_sha256": hashlib.sha256(
-                    SERVER_RELEASE_CONTRACT.encode("utf-8")
-                ).hexdigest(),
-                "vane_sha256": manifest_files["bin/vane"]["sha256"],
-                "agentfirstretention_sha256": manifest_files[
-                    "bin/agentfirstretention"
-                ]["sha256"],
-            }
-            (output_dir / "release-receipt.json").write_text(
-                json.dumps(release_receipt, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            os.chmod(output_dir / "release-receipt.json", 0o644)
+        for binary in (
+            "vane", "vane-research-gateway", "vane-migrate", "gate",
+            "agentfirstretention",
+        ):
+            data = (output_dir / "bin" / binary).read_bytes()
+            if f"vane/{source_sha}/clean".encode() not in data:
+                raise ValueError(f"{binary} lacks exact clean release build ID")
+        release_receipt = {
+            "schema_version": "vane.release-receipt/v1",
+            "source_revision": source_sha,
+            "control_plane_revision": manifest["control_plane_revision"],
+            "deploy_run_id": manifest["deploy_run_id"],
+            "build_run_attempt": manifest["build_run_attempt"],
+            "backend_archive_sha256": archive_sha256,
+            "backend_manifest_sha256": sha256_file(input_dir / manifest_name),
+            "server_release_contract_sha256": hashlib.sha256(
+                SERVER_RELEASE_CONTRACT.encode("utf-8")
+            ).hexdigest(),
+            "vane_sha256": manifest_files["bin/vane"]["sha256"],
+            "agentfirstretention_sha256": manifest_files[
+                "bin/agentfirstretention"
+            ]["sha256"],
+        }
+        (output_dir / "release-receipt.json").write_text(
+            json.dumps(release_receipt, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.chmod(output_dir / "release-receipt.json", 0o644)
     except Exception:
         shutil.rmtree(output_dir)
         raise
@@ -445,7 +414,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("pack", "validate"):
         sub = subparsers.add_parser(command)
-        sub.add_argument("--component", choices=("backend", "frontend"), required=True)
+        sub.add_argument("--component", choices=("backend",), required=True)
         sub.add_argument("--sha", required=True)
         if command == "pack":
             sub.add_argument("--source", type=Path, required=True)

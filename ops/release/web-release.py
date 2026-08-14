@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan a safe frontend publication and build its deterministic release receipt."""
+"""Plan a safe Web publication and build its deterministic release receipt."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import stat
 from urllib.parse import quote, unquote, urlsplit
 
 
-RECEIPT_SCHEMA = "vane.frontend.aliyun-release/v1"
+RECEIPT_SCHEMA = "vane.web.aliyun-release/v1"
 BUCKET = "zhuoqidev-vane-web"
 MANIFEST_SUFFIXES = (".webmanifest", ".json")
 MANIFEST_NAMES = ("manifest",)
@@ -59,7 +59,7 @@ def validate_relative_path(value: str) -> PurePosixPath:
         or not path.parts
         or any(part in ("", ".", "..") for part in path.parts)
     ):
-        raise ValueError(f"unsafe frontend path: {value!r}")
+        raise ValueError(f"unsafe Web path: {value!r}")
     return path
 
 
@@ -190,7 +190,7 @@ def resolve_reference(reference: str, source: str) -> str | None:
         if part == "..":
             if not normalized_parts:
                 raise ValueError(
-                    f"frontend reference escapes dist/: {reference!r} from {source!r}"
+                    f"Web reference escapes dist/: {reference!r} from {source!r}"
                 )
             normalized_parts.pop()
         else:
@@ -240,17 +240,17 @@ def plan(dist: Path, source_sha: str, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     entry_path = dist / "index.html"
     if not entry_path.is_file() or entry_path.is_symlink():
-        raise ValueError("frontend dist/index.html is missing or unsafe")
+        raise ValueError("Web dist/index.html is missing or unsafe")
 
     files: dict[str, Path] = {}
     for file_path in sorted(dist.rglob("*")):
         file_stat = file_path.lstat()
         if stat.S_ISLNK(file_stat.st_mode):
-            raise ValueError(f"frontend dist contains symlink: {file_path}")
+            raise ValueError(f"Web dist contains symlink: {file_path}")
         if stat.S_ISDIR(file_stat.st_mode):
             continue
         if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError(f"frontend dist contains non-file: {file_path}")
+            raise ValueError(f"Web dist contains non-file: {file_path}")
         relative = file_path.relative_to(dist).as_posix()
         validate_relative_path(relative)
         files[relative] = file_path
@@ -284,7 +284,7 @@ def plan(dist: Path, source_sha: str, output: Path) -> None:
         try:
             manifest = json.loads(files[manifest_path].read_text(encoding="utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"invalid frontend manifest: {manifest_path}") from error
+            raise ValueError(f"invalid Web manifest: {manifest_path}") from error
         if is_vite_manifest(manifest_path, manifest):
             raw_references, raw_runtime_references = vite_manifest_references(
                 manifest_path, manifest
@@ -310,14 +310,14 @@ def plan(dist: Path, source_sha: str, output: Path) -> None:
     critical_assets: list[str] = []
     for reference in sorted(referenced):
         if reference not in files:
-            raise ValueError(f"referenced frontend file is missing: {reference}")
+            raise ValueError(f"referenced Web file is missing: {reference}")
         if reference in assets:
             critical_assets.append(reference)
 
     for reference in sorted(runtime_referenced):
         if reference not in files:
             raise ValueError(
-                f"referenced frontend runtime file is missing: {reference}"
+                f"referenced Web runtime file is missing: {reference}"
             )
         if PurePosixPath(reference).suffix.lower() not in (".css", ".js"):
             continue

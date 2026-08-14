@@ -30,13 +30,12 @@ class ArtifactValidationTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         source = self.root / "source"
-        (source / "dist/assets").mkdir(parents=True)
-        (source / "dist/index.html").write_text("<html></html>\n", encoding="utf-8")
-        (source / "dist/assets/app.js").write_text(
-            "console.log(1)\n", encoding="utf-8"
-        )
+        self._write_backend_source(source)
         self.good = self.root / "good"
-        artifact.pack("frontend", source, SHA, self.good)
+        artifact.pack(
+            "backend", source, SHA, self.good,
+            artifact.SERVER_RELEASE_CONTRACT, CONTROL_SHA, "123456", 2,
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -47,10 +46,10 @@ class ArtifactValidationTest(unittest.TestCase):
         return destination
 
     def manifest_path(self, case: Path) -> Path:
-        return case / f"frontend-{SHA}.manifest.json"
+        return case / f"backend-{SHA}.manifest.json"
 
     def archive_path(self, case: Path) -> Path:
-        return case / f"frontend-{SHA}.tar.gz"
+        return case / f"backend-{SHA}.tar.gz"
 
     def _write_backend_source(self, source: Path) -> None:
         for name, mode in artifact.BACKEND_FILES.items():
@@ -72,21 +71,28 @@ class ArtifactValidationTest(unittest.TestCase):
         manifest["archive_sha256"] = digest
         manifest["archive_size"] = archive_path.stat().st_size
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        (case / f"frontend-{SHA}.sha256").write_text(
+        (case / f"backend-{SHA}.sha256").write_text(
             f"{digest}  {archive_path.name}\n", encoding="ascii"
         )
 
     def assert_rejected(self, case: Path, sha: str = SHA) -> None:
         with self.assertRaises((ValueError, OSError, json.JSONDecodeError)):
-            artifact.validate("frontend", sha, case, self.root / f"out-{case.name}")
+            artifact.validate(
+                "backend", sha, case, self.root / f"out-{case.name}",
+                control_plane_revision=CONTROL_SHA, deploy_run_id="123456",
+            )
 
     def test_valid_round_trip(self) -> None:
         output = self.root / "verified"
-        artifact.validate("frontend", SHA, self.good, output)
-        self.assertEqual(
-            (output / "dist/index.html").read_text(encoding="utf-8"),
-            "<html></html>\n",
+        artifact.validate(
+            "backend", SHA, self.good, output,
+            control_plane_revision=CONTROL_SHA, deploy_run_id="123456",
         )
+        self.assertTrue((output / "bin/vane").is_file())
+
+    def test_frontend_tar_artifact_is_not_a_supported_release_path(self) -> None:
+        with self.assertRaises(ValueError):
+            artifact.pack("frontend", self.root / "source", SHA, self.root / "frontend")
 
     def test_wrong_source_sha_is_rejected(self) -> None:
         self.assert_rejected(self.good, OTHER_SHA)
@@ -252,14 +258,14 @@ class ArtifactValidationTest(unittest.TestCase):
 
     def test_symlink_artifact_input_is_rejected(self) -> None:
         case = self.copy_case("symlink-input")
-        checksum = case / f"frontend-{SHA}.sha256"
+        checksum = case / f"backend-{SHA}.sha256"
         checksum.unlink()
         checksum.symlink_to(self.good / checksum.name)
         self.assert_rejected(case)
 
     def test_fifo_artifact_input_is_rejected(self) -> None:
         case = self.copy_case("fifo-input")
-        checksum = case / f"frontend-{SHA}.sha256"
+        checksum = case / f"backend-{SHA}.sha256"
         checksum.unlink()
         os.mkfifo(checksum)
         self.assertTrue(stat.S_ISFIFO(checksum.lstat().st_mode))
@@ -291,24 +297,41 @@ class ArtifactValidationTest(unittest.TestCase):
     def test_extra_tar_member_is_rejected(self) -> None:
         case = self.copy_case("extra-tar")
         archive_path = self.archive_path(case)
+        members = []
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive.getmembers():
+                source = archive.extractfile(member)
+                self.assertIsNotNone(source)
+                members.append((member, source.read()))
         with tarfile.open(archive_path, "w:gz") as archive:
-            for name in ("dist/index.html", "dist/assets/app.js", "dist/extra"):
-                data = b"x"
-                info = tarfile.TarInfo(name)
-                info.size = len(data)
-                info.mode = 0o644
-                archive.addfile(info, io.BytesIO(data))
+            for member, data in members:
+                archive.addfile(member, io.BytesIO(data))
+            data = b"x"
+            info = tarfile.TarInfo("unexpected")
+            info.size = len(data)
+            info.mode = 0o644
+            archive.addfile(info, io.BytesIO(data))
         self.refresh_archive_metadata(case)
         self.assert_rejected(case)
 
     def test_tar_symlink_is_rejected(self) -> None:
         case = self.copy_case("tar-symlink")
         archive_path = self.archive_path(case)
+        members = []
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive.getmembers():
+                source = archive.extractfile(member)
+                self.assertIsNotNone(source)
+                members.append((member, source.read()))
         with tarfile.open(archive_path, "w:gz") as archive:
-            info = tarfile.TarInfo("dist/index.html")
-            info.type = tarfile.SYMTYPE
-            info.linkname = "/etc/passwd"
-            archive.addfile(info)
+            for member, data in members:
+                if member.name == "bin/vane":
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = "/etc/passwd"
+                    member.size = 0
+                    archive.addfile(member)
+                else:
+                    archive.addfile(member, io.BytesIO(data))
         self.refresh_archive_metadata(case)
         self.assert_rejected(case)
 

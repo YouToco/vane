@@ -37,10 +37,8 @@ class BackendRuntimeContractTest(unittest.TestCase):
                 "deploy/Caddyfile",
                 "deploy/docker-compose.yml",
                 "deploy/vane.service",
-                "deploy/vane-migrate.service",
                 "deploy/vane-research-gateway.service",
                 "deploy/vane-research-gateway.socket",
-                "deploy/vane-legacy-compat.service",
                 "deploy/dynamicconfig/development-sql.yaml",
             },
         )
@@ -90,6 +88,16 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertGreaterEqual(guard, 0)
         self.assertIn("postgres temporal temporal-ui caddy", remote[compose:])
 
+        rollback = (OPS / "rollback/switch-server-release.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("target_infra_digest", rollback)
+        self.assertIn("current_infra_digest", rollback)
+        rollback_guard = rollback.index('if [[ $infra_changed == true ]]')
+        rollback_compose = rollback.index("docker compose up -d", rollback_guard)
+        self.assertGreaterEqual(rollback_guard, 0)
+        self.assertIn("postgres temporal temporal-ui caddy", rollback[rollback_compose:])
+
     def test_compose_has_only_pinned_middleware(self) -> None:
         compose = (REPO / "infra/production/compose/docker-compose.yml").read_text(
             encoding="utf-8"
@@ -110,6 +118,10 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertLess(migrate, switch)
         self.assertLess(switch, start)
         self.assertIn('"$release_dir/bin/vane-migrate"', remote[migrate:switch])
+        for unit in ("vane.service", "vane-research-gateway.service"):
+            payload = (SYSTEMD / unit).read_text(encoding="utf-8")
+            self.assertNotIn("vane-migrate.service", payload)
+        self.assertFalse((SYSTEMD / "vane-migrate.service").exists())
 
     def test_failure_after_switch_restores_whole_previous_release(self) -> None:
         remote = REMOTE.read_text(encoding="utf-8")
@@ -150,20 +162,6 @@ class BackendRuntimeContractTest(unittest.TestCase):
             for line in payload.splitlines():
                 if line.startswith("ExecStart=/opt/vane/"):
                     self.assertTrue(line.startswith("ExecStart=/opt/vane/current/bin/"), unit)
-
-    def test_legacy_compat_unit_remains_non_root_and_explicit(self) -> None:
-        unit = (SYSTEMD / "vane-legacy-compat.service").read_text(encoding="utf-8")
-        for required in (
-            "User=vane",
-            "Group=vane",
-            "EnvironmentFile=/opt/vane/env/server-owner-compat.env",
-            "ExecStart=/opt/vane/current/bin/vane",
-            "NoNewPrivileges=yes",
-            "ProtectSystem=strict",
-        ):
-            self.assertEqual(unit.splitlines().count(required), 1)
-        self.assertNotIn("User=root", unit)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -128,7 +128,7 @@ def publish(
             plan = Path(temporary)
             run(
                 [
-                    str(ROOT / "ops/release/frontend-release.py"),
+                    str(ROOT / "ops/release/web-release.py"),
                     "--dist", str(dist), "--sha", revision, "--output", str(plan),
                 ],
                 env=os.environ.copy(),

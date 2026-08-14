@@ -41,7 +41,7 @@ fi
 }
 
 binaries=(vane vane-research-gateway vane-migrate gate agentfirstretention)
-infra_files=(Caddyfile docker-compose.yml vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket vane-legacy-compat.service dynamicconfig/development-sql.yaml)
+infra_files=(Caddyfile docker-compose.yml vane.service vane-research-gateway.service vane-research-gateway.socket dynamicconfig/development-sql.yaml)
 for binary in "${binaries[@]}"; do
   [[ -f $stage/bin/$binary && ! -L $stage/bin/$binary && -x $stage/bin/$binary ]] || {
     echo "candidate release lacks binary: $binary" >&2; exit 1;
@@ -73,7 +73,7 @@ cleanup() {
       else
         rm -f -- "$current_link"
       fi
-      for unit in vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket; do
+      for unit in vane.service vane-research-gateway.service vane-research-gateway.socket; do
         if [[ -f $unit_backup/$unit ]]; then
           install -m 0644 "$unit_backup/$unit" "/etc/systemd/system/$unit"
         else
@@ -160,11 +160,11 @@ systemd-run --quiet --wait --collect --unit="vane-migrate-$release_sha" \
   --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes \
   --property=TimeoutStartSec=6min "$release_dir/bin/vane-migrate"
 
-for unit in vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket; do
+for unit in vane.service vane-research-gateway.service vane-research-gateway.socket; do
   [[ ! -f /etc/systemd/system/$unit ]] || cp --archive "/etc/systemd/system/$unit" "$unit_backup/$unit"
 done
 systemctl stop vane.service vane-research-gateway.service vane-research-gateway.socket
-for unit in vane.service vane-migrate.service vane-research-gateway.service vane-research-gateway.socket; do
+for unit in vane.service vane-research-gateway.service vane-research-gateway.socket; do
   install -m 0644 "$release_dir/deploy/$unit" "/etc/systemd/system/$unit"
 done
 next_link=$release_root/.current-$release_sha.$$
