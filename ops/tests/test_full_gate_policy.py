@@ -87,6 +87,8 @@ class FullGatePolicyTest(unittest.TestCase):
             "require_native_postgres",
             "pg_ctl",
             "createdb",
+            'runtime / f"postgres-{index}"',
+            'f"postgres-{index}.log"',
             '"GOWORK": "off"',
             '"VANE_FULL_GATE": "1"',
             '"VANE_REQUIRE_CLEAN_RELEASE": "1"',

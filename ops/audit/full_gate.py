@@ -224,28 +224,34 @@ def main() -> int:
     }
     original_environment = os.environ.copy()
     temporal_process: subprocess.Popen[bytes] | None = None
-    postgres_started = False
-    data_dir = runtime / "postgres"
+    postgres_clusters: list[Path] = []
     try:
         os.environ.update(env)
-        run_checked(
-            [
-                str(postgres["initdb"]), "-D", str(data_dir),
-                "--no-locale", "--encoding=UTF8", "--auth=trust", "--username=vane",
-            ],
-            cwd=ROOT,
-        )
-        pg_port = free_local_port()
-        run_checked(
-            [
-                str(postgres["pg_ctl"]), "-D", str(data_dir),
-                "-o", f"-h 127.0.0.1 -p {pg_port}", "-w", "start",
-            ],
-            cwd=ROOT,
-        )
-        postgres_started = True
         urls: list[str] = []
         for index in range(4):
+            # Store migration tests create and revoke cluster-wide roles. A
+            # separate database in one cluster is not isolation: parallel
+            # shards would race through pg_authid. Give each shard its own
+            # short-lived native PostgreSQL cluster instead.
+            data_dir = runtime / f"postgres-{index}"
+            run_checked(
+                [
+                    str(postgres["initdb"]), "-D", str(data_dir),
+                    "--no-locale", "--encoding=UTF8", "--auth=trust",
+                    "--username=vane",
+                ],
+                cwd=ROOT,
+            )
+            pg_port = free_local_port()
+            run_checked(
+                [
+                    str(postgres["pg_ctl"]), "-D", str(data_dir),
+                    "-l", str(artifacts / f"postgres-{index}.log"),
+                    "-o", f"-h 127.0.0.1 -p {pg_port}", "-w", "start",
+                ],
+                cwd=ROOT,
+            )
+            postgres_clusters.append(data_dir)
             database = f"vane_full_{index}"
             run_checked(
                 [
@@ -449,7 +455,7 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 temporal_process.kill()
                 temporal_process.wait(timeout=5)
-        if postgres_started:
+        for data_dir in reversed(postgres_clusters):
             subprocess.run(
                 [str(postgres["pg_ctl"]), "-D", str(data_dir), "-m", "fast", "-w", "stop"],
                 check=False,
