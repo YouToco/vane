@@ -1,6 +1,6 @@
 module github.com/YouToco/vane
 
-go 1.26.5
+go 1.26.6
 
 // SDK v3.9.9 WS 模式静默丢弃 MessageTypeCard，卡片回调永远到达不了应用层。
 // 本地 patch：third_party/oapi-sdk-go/v3/ws/client.go 将 card 消息路由到 eventHandler.Do()。

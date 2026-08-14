@@ -642,7 +642,7 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		"permissions:\n  contents: read",
 		"persist-credentials: false",
 		"GOTOOLCHAIN: local",
-		`go_root="${RUNNER_TOOL_CACHE}/go/1.26.5/arm64"`,
+		`go_root="${RUNNER_TOOL_CACHE}/go/1.26.6/arm64"`,
 		`temporal_binary="${RUNNER_TOOL_CACHE}/temporal/1.8.2/arm64/temporal"`,
 		`source_root="${RUNNER_TOOL_CACHE}/vane/store-race-timings-v1"`,
 		`target_root="${RUNNER_TOOL_CACHE}/vane/store-race-timings-v1"`,
@@ -659,7 +659,25 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		"      - name: Select pinned runner toolchain\n"); got != 2 {
 		t.Errorf("source CI pinned toolchain selectors=%d, want 2", got)
 	}
+	for value, want := range map[string]int{
+		`go_root="${RUNNER_TOOL_CACHE}/go/1.26.6/arm64"`: 2,
+		`go version go1.26.6 linux/arm64`:                    2,
+	} {
+		if got := strings.Count(workflow, value); got != want {
+			t.Errorf("source CI toolchain guard %q count=%d, want %d",
+				value, got, want)
+		}
+	}
+	goModPayload, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goMod := strings.ReplaceAll(string(goModPayload), "\r\n", "\n")
+	if got := strings.Count(goMod, "\ngo 1.26.6\n"); got != 1 {
+		t.Errorf("root go.mod Go 1.26.6 directives=%d, want 1", got)
+	}
 	for _, forbidden := range []string{
+		"1.26.5",
 		"vane-build",
 		"vane-deploy",
 		"vps-primary",
