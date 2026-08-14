@@ -257,6 +257,46 @@ class ProductionHandlerTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "escapes"):
             production_handler.active_controller_target(control)
 
+    def test_controller_bootstrap_can_authorize_only_its_bound_product_successor(self) -> None:
+        product = "a" * 40
+        controller = "b" * 40
+        control = self.root / "bootstrap-control"
+        for revision in (product, controller):
+            target = control / "releases" / revision
+            target.mkdir(parents=True)
+            (target / ".controller-archive.sha256").write_text(
+                "c" * 64 + "\n", encoding="ascii"
+            )
+        (control / "current").symlink_to(control / "releases" / controller)
+        evidence = self.root / "bootstrap-evidence"
+        marker = evidence / "controller-bootstrap" / f"{controller}.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(
+            json.dumps({
+                "schema": "vane.controller-bootstrap-evidence/v1",
+                "product_revision": product,
+                "controller_revision": controller,
+                "controller_archive_sha256": "c" * 64,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        current = {
+            "monorepo_revision": product,
+            "controller_revision": controller,
+        }
+        self.assertEqual(
+            production_handler.active_controller_revision_for_release(
+                current=current, controller_root=control, evidence_root=evidence
+            ),
+            controller,
+        )
+        current["monorepo_revision"] = "d" * 40
+        (control / "releases" / ("d" * 40)).mkdir()
+        with self.assertRaisesRegex(RuntimeError, "eligible finalized"):
+            production_handler.active_controller_revision_for_release(
+                current=current, controller_root=control, evidence_root=evidence
+            )
+
     def test_active_server_revision_is_confined_to_release_authority(self) -> None:
         release_root = self.root / "server-releases"
         target = release_root / REVISION

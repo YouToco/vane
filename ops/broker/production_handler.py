@@ -534,6 +534,40 @@ def active_controller_target(controller_root: Path) -> Path:
     return target
 
 
+def active_controller_revision_for_release(
+    *, current: dict, controller_root: Path, evidence_root: Path
+) -> str:
+    """Require normal delayed authority or the exact one-time bootstrap pair."""
+    active_controller = active_controller_target(controller_root)
+    active_revision = active_controller.name
+    if re.fullmatch(r"[0-9a-f]{40}", active_revision) is None:
+        raise RuntimeError("active controller revision is invalid")
+    if active_revision == current["controller_revision"]:
+        from ops.broker.promote_finalized_controller import (  # pylint: disable=import-outside-toplevel
+            bootstrap_authorizes_active,
+        )
+
+        if bootstrap_authorizes_active(
+            evidence_root=evidence_root,
+            product_revision=current["monorepo_revision"],
+            controller_revision=current["controller_revision"],
+            marker=active_controller / ".controller-archive.sha256",
+        ):
+            return active_revision
+    finalized_product_controller = (
+        controller_root / "releases" / current["monorepo_revision"]
+    )
+    required = (
+        current["monorepo_revision"]
+        if finalized_product_controller.is_dir()
+        and not finalized_product_controller.is_symlink()
+        else current["controller_revision"]
+    )
+    if active_revision != required:
+        raise RuntimeError("active controller is not the eligible finalized revision")
+    return active_revision
+
+
 def preserve_failed_evidence(
     *, revision: str, evidence_root: Path, durable: Path, transaction: Path
 ) -> Optional[Path]:
@@ -593,19 +627,11 @@ def release(
     evidence_root = Path(config["evidence_root"])
     evidence_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     controller_root = Path(config["controller_root"])
-    active_controller = active_controller_target(controller_root)
-    active_controller_revision = active_controller.name
-    finalized_product_controller = controller_root / "releases" / current["monorepo_revision"]
-    required_active_revision = (
-        current["monorepo_revision"]
-        if finalized_product_controller.is_dir() and not finalized_product_controller.is_symlink()
-        else current["controller_revision"]
+    active_controller_revision = active_controller_revision_for_release(
+        current=current,
+        controller_root=controller_root,
+        evidence_root=evidence_root,
     )
-    if (
-        not re.fullmatch(r"[0-9a-f]{40}", active_controller_revision)
-        or active_controller_revision != required_active_revision
-    ):
-        raise RuntimeError("active controller is not the eligible finalized revision")
     durable = evidence_root / "releases" / revision
     transaction = evidence_root / "inflight" / revision
     if revision == current["monorepo_revision"]:
