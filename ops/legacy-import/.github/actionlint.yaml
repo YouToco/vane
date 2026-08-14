@@ -1,6 +1,0 @@
-self-hosted-runner:
-  labels:
-    - vps-primary
-    - vane-test
-    - vane-build
-    - vane-deploy

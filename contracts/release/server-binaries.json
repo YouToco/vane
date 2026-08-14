@@ -1,0 +1,15 @@
+{
+  "schema": "vane.server-binaries/v1",
+  "binaries": [
+    {"name": "vane", "package": "./cmd/server"},
+    {"name": "useradmin", "package": "./cmd/useradmin"},
+    {"name": "gate", "package": "./cmd/gate"},
+    {"name": "runtimeadmin", "package": "./cmd/runtimeadmin"},
+    {"name": "vane-migrate", "package": "./cmd/migrate"},
+    {"name": "agentfirstretention", "package": "./cmd/agentfirstretention"},
+    {"name": "vane-research-gateway", "package": "./cmd/researchgateway"},
+    {"name": "vane-research-prepare", "package": "./cmd/researchprepare"},
+    {"name": "researchshadow", "package": "./cmd/researchshadow"},
+    {"name": "researchcutover", "package": "./cmd/researchcutover"}
+  ]
+}

@@ -1,19 +1,31 @@
 .PHONY: build test lint run clean
 
+RELEASE_BINARIES := \
+	vane=./cmd/server \
+	useradmin=./cmd/useradmin \
+	gate=./cmd/gate \
+	runtimeadmin=./cmd/runtimeadmin \
+	vane-migrate=./cmd/migrate \
+	agentfirstretention=./cmd/agentfirstretention \
+	vane-research-gateway=./cmd/researchgateway \
+	vane-research-prepare=./cmd/researchprepare \
+	researchshadow=./cmd/researchshadow \
+	researchcutover=./cmd/researchcutover
+
 build:
-	go build -o bin/vane ./cmd/server
-	go build -o bin/vane-migrate ./cmd/migrate
-	go build -o bin/vane-research-gateway ./cmd/researchgateway
-	go build -o bin/vane-research-prepare ./cmd/researchprepare
+	@set -eu; for entry in $(RELEASE_BINARIES); do \
+		name=$${entry%%=*}; package=$${entry#*=}; \
+		GOWORK=off go build -buildvcs=true -o "bin/$$name" "$$package"; \
+	done
 
 test:
-	go test -race -coverprofile=coverage.txt ./...
+	GOWORK=off go test -race -coverprofile=coverage.txt ./...
 
 lint:
 	golangci-lint run ./...
 
 run:
-	go run ./cmd/server
+	GOWORK=off go run ./cmd/server
 
 clean:
 	rm -rf bin/ coverage.txt

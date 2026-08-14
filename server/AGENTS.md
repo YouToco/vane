@@ -1,25 +1,25 @@
 # 见微 Vane — AI 协作入口
 
 > Boss 自研的 AI 个性化信息推送产品（Go + Temporal + Postgres + 飞书）。
-> 本文件是薄入口：只放指针、红线和流程约定，内容以 docs/ 契约为准。
+> 本文件是薄入口：只放指针、红线和流程约定，内容以根目录 `docs/` 契约为准。
 
 ## 必读文档（按任务对号入座）
 
-- 分支/提交/PR 规范：[docs/git-workflow.md](docs/git-workflow.md)（trunk-based、squash merge、Conventional Commits）
-- 内容身份与去重：[docs/content-identity-contract.md](docs/content-identity-contract.md)（身份是 canonical_key，不是 external_id）
-- M4 agent loop 历史契约：[docs/m4-agent-contract.md](docs/m4-agent-contract.md)（冻结 v1 读协议）
-- 当前任务/Tool 运行契约：[docs/task-manual-tool-runtime.md](docs/task-manual-tool-runtime.md)
-- 任务 Tool 调用隔离迁移：[docs/task-tool-invocation-isolation.md](docs/task-tool-invocation-isolation.md)
-- M5 画像+反馈闭环契约：[docs/m5-profile-contract.md](docs/m5-profile-contract.md)（17 节签名级；第 16 节是 Gate 验证清单）
-- 双轨 Agent Runtime：[docs/agent-runtime-contract.md](docs/agent-runtime-contract.md)（ExecutionMode、运行快照、PlanFetch、预算与发布列车）
-- Phase 2 结构化 Insight：[docs/structured-insight-contract.md](docs/structured-insight-contract.md)（单次 CardGen、引用校验、Brief 冻结、Temporal/rollout 边界）
-- Phase 2 事件证据地基：[docs/structured-event-evidence-contract.md](docs/structured-event-evidence-contract.md)（零调用点 observed-event provenance、first-writer replay 与后续接线边界）
+- 分支/提交/PR 规范：[git workflow](../docs/development/git-workflow.md)（trunk-based、squash merge、Conventional Commits）
+- 内容身份与去重：[content identity](../docs/contracts/content-identity-contract.md)（身份是 canonical_key，不是 external_id）
+- M4 agent loop 历史契约：[M4](../docs/contracts/m4-agent-contract.md)（冻结 v1 读协议）
+- 当前任务/Tool 运行契约：[task manual runtime](../docs/architecture/task-manual-tool-runtime.md)
+- 任务 Tool 调用隔离迁移：[tool isolation](../docs/architecture/task-tool-invocation-isolation.md)
+- M5 画像+反馈闭环契约：[M5](../docs/contracts/m5-profile-contract.md)（17 节签名级；第 16 节是 Gate 验证清单）
+- 双轨 Agent Runtime：[agent runtime](../docs/contracts/agent-runtime-contract.md)（ExecutionMode、运行快照、PlanFetch、预算与发布列车）
+- Phase 2 结构化 Insight：[structured insight](../docs/contracts/structured-insight-contract.md)（单次 CardGen、引用校验、Brief 冻结、Temporal/rollout 边界）
+- Phase 2 事件证据地基：[event evidence](../docs/contracts/structured-event-evidence-contract.md)（零调用点 observed-event provenance、first-writer replay 与后续接线边界）
 
 ## 构建 / 测试 / 部署
 
 - `make build` / `make test`（全仓 -race）/ `make lint` 是合并与发布入口；开发过程中按下方 S/A/B
   风险分级先跑受影响包，不得每次小改都机械重跑全仓。
-- push 到 main 自动 CI → 部署 VPS（systemd `vane.service`，`/opt/vane`，Docker 栈：Postgres 18 / Temporal / Caddy）
+- GitHub Actions 已退役；根 `./ops/bin/vane release --sha <origin/main SHA>` 提交 exact-main 发布，VPS root-owned broker 才拥有最终 mutation 权限。
 - VPS：ssh alias `vane`（凭证在 my-credentials，不在本仓库）；域名 https://vane.zhuoqidev.com
 - 每日推送调度：00:30 UTC（北京 08:30；VPS 本地 EDT 为前一天 20:30）
 - LLM 调用明细（打分 prompt/completion/token）落 DB `llm_calls` 表，不在系统日志里

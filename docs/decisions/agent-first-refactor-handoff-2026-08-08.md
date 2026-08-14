@@ -1,8 +1,8 @@
 # Agent-first 重构换机交接（2026-08-08）
 
 本文只记录可由 Git 远端恢复的开发事实和不含凭证的生产状态。完整设计与安全边界见
-[Agent-first 用户情报与证据契约](agent-first-intelligence-contract.md)，V3 操作约束见
-[Research V3 shadow runbook](research-v3-shadow-runbook.md)。
+[Agent-first 用户情报与证据契约](../contracts/agent-first-intelligence-contract.md)，V3 操作约束见
+[Research V3 shadow runbook](../runbooks/research-v3-shadow-runbook.md)。
 
 ## 远端恢复入口
 
