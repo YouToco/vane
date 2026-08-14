@@ -57,3 +57,14 @@ later exact-main revision C is the first normal `./ops/bin/vane release --sha C`
 installed B validates and mutates C, then activates controller C only after
 Server verification and UAT. Old GitHub runners remain online until this B→C
 rehearsal and production cutover both succeed.
+
+On the release Mac, install the narrow client once from the merged controller.
+The private transport key remains outside the repository and can invoke only
+the VPS forced command:
+
+```bash
+sudo ./ops/bootstrap/install-client.sh \
+  /absolute/path/to/broker_transport_key broker.example 22 \
+  /absolute/path/to/known_hosts
+/usr/local/libexec/vane-broker-submit --status
+```
