@@ -40,9 +40,9 @@ workspace paths. It starts from an exact remote-main revision:
 
 The local command tests and builds both components directly on the Mac. It
 submits only the native Server bundle to the externally installed root-owned
-broker; after Server ready/Gate/UAT succeeds, it uploads the verified Web
-`dist/` directly to OSS and refreshes the CDN. Web files never pass through or
-reside on the VPS.
+broker; after Server ready/Gate/UAT succeeds, it publishes the same verified
+Web `dist/` first to Cloudflare Pages and then to OSS plus Ali CDN. Web files
+never pass through or reside on the VPS.
 
 The single VPS runs every Vane server release as native Go binaries supervised
 by systemd under `/opt/vane/releases/<sha>/`; the `current` symlink is the
@@ -51,6 +51,11 @@ or deployment pull. Compose is reserved for the independently pinned
 PostgreSQL, Temporal, Temporal UI, and Caddy middleware, and a server-only
 release must not recreate or restart them.
 
-The browser application is served only by OSS plus CDN. Content-hashed assets
-are uploaded first, `index.html` is replaced last, old hashed assets are kept,
-and only mutable entry paths are refreshed.
+AliDNS remains authoritative for the browser hostname: the default/domestic
+line targets Ali CDN backed by OSS, while the overseas line targets Cloudflare
+Pages. Both providers must prove the same exact release before one combined
+publication can finalize. On Aliyun, content-hashed assets are uploaded first,
+`index.html` and the release marker are committed last, old hashed assets are
+kept, and mutable paths are refreshed. Cloudflare deployment retention is a
+separate fail-closed operation and never deletes the active deployment, its
+designated rollback deployment, the Pages project, the custom domain, or DNS.

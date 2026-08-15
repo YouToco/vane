@@ -1,10 +1,12 @@
 """The single repository-side Vane operations CLI.
 
-This command never reads production credentials and never mutates production.
-Production operations are submitted to the separately installed, root-owned
-broker only after this CLI has verified an exact revision and signed manifest
-chain. The repository contains the audited forced-command broker source, while
-its root-owned installed copy and production handlers remain outside checkout.
+Server production mutations are submitted to the separately installed,
+root-owned broker only after this CLI has verified an exact revision and signed
+manifest chain.  Web publication and Cloudflare cleanup are the explicit local
+release-Mac exceptions: this controller reads their isolated provider
+credentials and performs only those Web provider mutations.  The repository
+contains the audited forced-command broker source, while its root-owned
+installed copy and Server production handlers remain outside checkout.
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ import tarfile
 from typing import Any
 
 from ops.broker import submit as broker_client
+from ops.release import prune_cloudflare_pages as cloudflare_pruner
+from ops.release import publish_web as web_publisher
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +49,15 @@ BROKER_HOST = "188.253.125.238"
 BROKER_PORT = 10058
 BROKER_KNOWN_HOSTS_SHA256 = "755558dd29ed29400289842f639f31856f12eb0c25654a6d9007fd572163e5d3"
 WEB_ORIGIN = "https://vane.zhuoqidev.com"
+WEB_PROVIDER_CREDENTIALS = {
+    "ALIYUN_" + "ACCESS_KEY_ID", "ALIYUN_" + "ACCESS_KEY_SECRET",
+    "CLOUDFLARE_" + "API_TOKEN", "CLOUDFLARE_" + "ACCOUNT_ID",
+}
+BROKER_ENV_SECRETS = WEB_PROVIDER_CREDENTIALS | {"VANE_RELEASE_SIGNING_KEY"}
+BROKER_ENV_ALLOWLIST = {
+    "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "SHELL",
+    "TEMP", "TERM", "TMP", "TMPDIR", "USER",
+}
 GATE_ENV_ALLOWLIST = {
     "ALL_PROXY", "DOCKER_CONTEXT", "DOCKER_HOST", "GOPROXY", "HTTP_PROXY",
     "HTTPS_PROXY", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "NO_PROXY",
@@ -81,6 +94,13 @@ FULL_GATE_KEYS = {
 
 class PolicyError(RuntimeError):
     """A fail-closed policy rejection."""
+
+
+def sanitized_broker_environment() -> dict[str, str]:
+    return {
+        name: value for name, value in os.environ.items()
+        if name in BROKER_ENV_ALLOWLIST
+    }
 
 
 def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -576,9 +596,11 @@ def load_manifest_chain(
     return chain
 
 
-def run_checked(command: list[str], *, cwd: Path) -> None:
+def run_checked(
+    command: list[str], *, cwd: Path, env: dict[str, str] | None = None
+) -> None:
     print("+", " ".join(command), flush=True)
-    result = subprocess.run(command, cwd=cwd, check=False)
+    result = subprocess.run(command, cwd=cwd, check=False, env=env)
     if result.returncode != 0:
         raise PolicyError(f"local check failed with exit {result.returncode}: {' '.join(command)}")
 
@@ -875,6 +897,136 @@ def validate_broker_submitter(
         raise PolicyError("broker submitter differs from exact release source")
 
 
+def broker_client_authority_files() -> tuple[Path, Path, Path]:
+    config_path = broker_client.default_config_path()
+    try:
+        broker_client.validate_config_file(config_path)
+        config = broker_client.strict_json(config_path)
+        if config.get("host") != BROKER_HOST or config.get("port") != BROKER_PORT:
+            raise PolicyError("broker client endpoint differs from exact release policy")
+        if broker_client.KNOWN_HOSTS_SHA256 != BROKER_KNOWN_HOSTS_SHA256:
+            raise PolicyError("broker client known-hosts authority differs from controller")
+        broker_client.fixed_ssh_command(config)
+        identity = Path(config["identity_file"])
+        known_hosts = Path(config["known_hosts_file"])
+    except (KeyError, TypeError, RuntimeError) as error:
+        if isinstance(error, PolicyError):
+            raise
+        raise PolicyError("broker client authority is invalid") from error
+    return config_path, identity, known_hosts
+
+
+def post_gate_authority_paths(
+    *, signing_key: Path, allowed_signers: Path, broker_submit: Path
+) -> tuple[Path, ...]:
+    validate_broker_submitter(broker_submit)
+    config_path, identity, known_hosts = broker_client_authority_files()
+    return (
+        ROOT / "ops/cli/controller.py",
+        ROOT / "ops/release/publish_web.py",
+        ROOT / "ops/release/web-release.py",
+        ROOT / "tools/toolchain.lock.json",
+        DEFAULT_POLICY,
+        allowed_signers,
+        ROOT / "ops/broker/submit.py",
+        signing_key,
+        broker_submit,
+        config_path,
+        identity,
+        known_hosts,
+    )
+
+
+def resume_web_authority_paths() -> tuple[Path, ...]:
+    config_path, identity, known_hosts = broker_client_authority_files()
+    return (
+        ROOT / "ops/cli/controller.py",
+        ROOT / "ops/release/publish_web.py",
+        ROOT / "ops/release/web-release.py",
+        ROOT / "tools/toolchain.lock.json",
+        config_path,
+        identity,
+        known_hosts,
+    )
+
+
+def prune_authority_paths() -> tuple[Path, ...]:
+    broker_submit = default_broker_submit_path()
+    validate_broker_submitter(broker_submit)
+    config_path, identity, known_hosts = broker_client_authority_files()
+    return (
+        ROOT / "ops/cli/controller.py",
+        ROOT / "ops/release/prune_cloudflare_pages.py",
+        ROOT / "ops/release/publish_web.py",
+        ROOT / "ops/release/web-release.py",
+        ROOT / "tools/toolchain.lock.json",
+        DEFAULT_POLICY,
+        DEFAULT_SIGNERS,
+        ROOT / "ops/broker/submit.py",
+        broker_submit,
+        config_path,
+        identity,
+        known_hosts,
+    )
+
+
+def capture_release_authority(
+    revision: str,
+    paths: tuple[Path, ...],
+    *,
+    repository: Path = ROOT,
+) -> dict[str, str]:
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository,
+        text=True, capture_output=True, check=False,
+    )
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repository, text=True, capture_output=True, check=False,
+    )
+    if head.returncode != 0 or head.stdout.strip() != revision:
+        raise PolicyError("release authority checkout is not the requested exact SHA")
+    if dirty.returncode != 0 or dirty.stdout:
+        raise PolicyError("release authority checkout is not clean")
+    snapshot: dict[str, str] = {}
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise PolicyError(f"release authority file is unavailable: {path}") from error
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise PolicyError(f"release authority path is unsafe: {path}")
+        snapshot[str(path)] = sha256_file(path)
+    return snapshot
+
+
+def validate_release_authority_after_gate(
+    revision: str,
+    snapshot: dict[str, str],
+    *,
+    signing_key: Path | None = None,
+    allowed_signers: Path | None = None,
+    broker_submit: Path | None = None,
+    repository: Path = ROOT,
+    paths: tuple[Path, ...] | None = None,
+) -> None:
+    if paths is None:
+        if signing_key is None or allowed_signers is None or broker_submit is None:
+            raise PolicyError("post-Gate release authority inputs are incomplete")
+        current_paths = post_gate_authority_paths(
+            signing_key=signing_key,
+            allowed_signers=allowed_signers,
+            broker_submit=broker_submit,
+        )
+    else:
+        current_paths = paths
+    current = capture_release_authority(
+        revision, current_paths, repository=repository
+    )
+    if current != snapshot:
+        raise PolicyError("release authority changed while the credential-free Gate ran")
+
+
 def verify_production_revision(revision: str) -> str:
     config_path = broker_client.default_config_path()
     broker_client.validate_config_file(config_path)
@@ -889,6 +1041,7 @@ def verify_production_revision(revision: str) -> str:
         input=b"{}",
         capture_output=True,
         check=False,
+        env=sanitized_broker_environment(),
     )
     if status.returncode != 0:
         raise PolicyError("independent production status verification failed")
@@ -1316,6 +1469,20 @@ def preflight_web_publication() -> None:
     )
 
 
+def verify_web_toolchain_integrity() -> None:
+    _, tool_cache, _ = web_publication_context()
+    run_checked(
+        [
+            sys.executable,
+            str(ROOT / "ops/release/publish_web.py"),
+            "--toolchain-check",
+            "--tool-cache", str(tool_cache),
+        ],
+        cwd=ROOT,
+        env=sanitized_broker_environment(),
+    )
+
+
 def validated_web_dist(
     *, revision: str, release_root: Path, gate_evidence: Path
 ) -> Path:
@@ -1363,6 +1530,7 @@ def publish_web_after_server(
     web_dist = validated_web_dist(
         revision=revision, release_root=release_root, gate_evidence=gate_evidence
     )
+    gate = load_json(gate_evidence)
     web_state, tool_cache, web_origin = web_publication_context()
     web_state.mkdir(parents=True, exist_ok=True, mode=0o700)
     web_result = release_root / "web-publication.json"
@@ -1372,6 +1540,7 @@ def publish_web_after_server(
             "--dist", str(web_dist), "--sha", revision,
             "--work-root", str(release_root), "--state-root", str(web_state),
             "--tool-cache", str(tool_cache), "--origin", web_origin,
+            "--expected-web-tree-sha256", gate["web_tree_sha256"],
             "--result", str(web_result),
         ],
         cwd=ROOT,
@@ -1395,8 +1564,10 @@ def verify_web_after_server(
             "--sha", revision,
             "--tool-cache", str(tool_cache),
             "--origin", web_origin,
+            "--publication-result", str(release_root / "web-publication.json"),
         ],
         cwd=ROOT,
+        env=sanitized_broker_environment(),
     )
 
 
@@ -1482,20 +1653,56 @@ def validate_existing_web_result(
     result = load_json(result_path)
     if (
         not isinstance(result, dict)
-        or set(result) != {"schema", "revision", "receipt_sha256", "marker", "status"}
-        or result.get("schema") != "vane.web-publication/v1"
+        or set(result) != {
+            "schema", "revision", "artifact_receipt_sha256", "marker",
+            "providers", "status",
+        }
+        or result.get("schema") != "vane.web-publication/v2"
         or result.get("revision") != revision
         or result.get("status")
-        not in {"published", "provider-already-current", "already-current"}
-        or not isinstance(result.get("receipt_sha256"), str)
+        not in {
+            "published", "recovered", "provider-already-current", "already-current"
+        }
+        or not isinstance(result.get("artifact_receipt_sha256"), str)
+        or not isinstance(result.get("providers"), dict)
+        or set(result["providers"]) != {"aliyun", "cloudflare_pages"}
     ):
         raise PolicyError("existing Web publication result is not exact")
-    digest_value(result["receipt_sha256"], field="Web publication receipt_sha256")
+    digest_value(
+        result["artifact_receipt_sha256"],
+        field="Web publication artifact_receipt_sha256",
+    )
     receipt = release_root / "web-release-receipt.json"
     if receipt.is_symlink() or not receipt.is_file():
         raise PolicyError("existing Web publication receipt is missing or unsafe")
-    if sha256_file(receipt) != result["receipt_sha256"]:
+    if sha256_file(receipt) != result["artifact_receipt_sha256"]:
         raise PolicyError("existing Web publication receipt digest differs from its result")
+    for provider, filename in (
+        ("aliyun", "web-aliyun-receipt.json"),
+        ("cloudflare_pages", "web-cloudflare-receipt.json"),
+    ):
+        provider_value = result["providers"].get(provider)
+        if not isinstance(provider_value, dict) or not isinstance(
+            provider_value.get("receipt_sha256"), str
+        ):
+            raise PolicyError("existing Web provider result is not exact")
+        digest_value(
+            provider_value["receipt_sha256"],
+            field=f"Web {provider} receipt_sha256",
+        )
+        provider_receipt = release_root / filename
+        if provider_receipt.is_symlink() or not provider_receipt.is_file():
+            raise PolicyError("existing Web provider receipt is missing or unsafe")
+        if sha256_file(provider_receipt) != provider_value["receipt_sha256"]:
+            raise PolicyError("existing Web provider receipt digest differs from result")
+        receipt_value = load_json(provider_receipt)
+        if provider_value != {
+            **receipt_value,
+            "receipt_sha256": sha256_file(provider_receipt),
+        }:
+            raise PolicyError(
+                "existing Web provider result differs from its exact receipt"
+            )
     web_dist = validated_web_dist(
         revision=revision, release_root=release_root, gate_evidence=gate_evidence
     )
@@ -1508,6 +1715,8 @@ def command_resume_web(args: argparse.Namespace) -> int:
     if args.allowed_signers != DEFAULT_SIGNERS:
         raise PolicyError("Web resume signer authority must be the repository default")
     assert_resume_source(args.sha)
+    authority_paths = resume_web_authority_paths()
+    authority_snapshot = capture_release_authority(args.sha, authority_paths)
     release_root = validate_resume_release_root(args.release_root, args.sha)
     gate_evidence = signed_web_gate(
         revision=args.sha,
@@ -1527,7 +1736,12 @@ def command_resume_web(args: argparse.Namespace) -> int:
     else:
         preflight_web_publication()
         status = "web-published"
-    verify_production_revision(args.sha)
+    server_digest = verify_production_revision(args.sha)
+    validate_release_authority_after_gate(
+        args.sha,
+        authority_snapshot,
+        paths=authority_paths,
+    )
     if status == "already-published":
         verify_web_after_server(
             revision=args.sha,
@@ -1535,23 +1749,114 @@ def command_resume_web(args: argparse.Namespace) -> int:
             gate_evidence=gate_evidence,
         )
     else:
+        verify_web_toolchain_integrity()
         web_result = publish_web_after_server(
             revision=args.sha,
             release_root=release_root,
             gate_evidence=gate_evidence,
         )
-    verify_production_revision(args.sha)
+    if verify_production_revision(args.sha) != server_digest:
+        raise PolicyError("Server current digest changed during Web recovery")
+    web_publication_sha256 = sha256_file(web_result)
     print(
         json.dumps(
             {
                 "revision": args.sha,
                 "web_evidence": str(web_result),
+                "server_current_digest": server_digest,
+                "web_publication_sha256": web_publication_sha256,
                 "status": status,
             },
             sort_keys=True,
             separators=(",", ":"),
         )
     )
+    return 0
+
+
+def command_prune_cloudflare_pages(args: argparse.Namespace) -> int:
+    assert_origin_main(args.sha)
+    if git_revision("HEAD") != args.sha:
+        raise PolicyError("Cloudflare prune checkout is not exact origin/main")
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT,
+        text=True, capture_output=True, check=False,
+    )
+    if dirty.returncode != 0 or dirty.stdout:
+        raise PolicyError("Cloudflare prune requires a clean exact-source worktree")
+    authority_paths = prune_authority_paths()
+    authority_snapshot = capture_release_authority(args.sha, authority_paths)
+    release_root = validate_resume_release_root(args.release_root, args.sha)
+    gate_evidence = signed_web_gate(
+        revision=args.sha,
+        release_root=release_root,
+        allowed_signers=DEFAULT_SIGNERS,
+    )
+    validate_existing_web_result(
+        revision=args.sha,
+        release_root=release_root,
+        gate_evidence=gate_evidence,
+    )
+    publication = load_json(release_root / "web-publication.json")
+    cloudflare = publication["providers"]["cloudflare_pages"]
+    new_canonical_id = cloudflare.get("deployment_id")
+    previous_canonical_id = cloudflare.get(
+        "previous_canonical_deployment_id"
+    )
+    if not isinstance(new_canonical_id, str) or cloudflare.get("source_sha") != args.sha:
+        raise PolicyError("combined Web result lacks the exact Cloudflare deployment")
+    if not isinstance(previous_canonical_id, str):
+        raise PolicyError(
+            "combined Web result does not prove a previous canonical deployment"
+        )
+
+    server_digest = verify_production_revision(args.sha)
+    verify_web_after_server(
+        revision=args.sha,
+        release_root=release_root,
+        gate_evidence=gate_evidence,
+    )
+    if verify_production_revision(args.sha) != server_digest:
+        raise PolicyError("Server current digest changed before Cloudflare pruning")
+    preflight_web_publication()
+    if args.execute:
+        try:
+            web_publisher.machine_arch()
+        except RuntimeError as error:
+            raise PolicyError(
+                "Cloudflare prune execution requires the darwin-arm64 release Mac"
+            ) from error
+
+    try:
+        api = cloudflare_pruner.CloudflarePagesAPI(
+            os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""),
+            os.environ.get("CLOUDFLARE_API_TOKEN", ""),
+        )
+        validate_release_authority_after_gate(
+            args.sha,
+            authority_snapshot,
+            paths=authority_paths,
+        )
+        result = cloudflare_pruner.run_prune(
+            api,
+            new_canonical_id=new_canonical_id,
+            previous_canonical_id=previous_canonical_id,
+            expected_revision=args.sha,
+            expected_total=args.expected_total,
+            expected_candidate_count=args.expected_candidate_count,
+            expected_manifest_sha256=args.expected_manifest_sha256,
+            execute=args.execute,
+            emit=lambda value: print(json.dumps(
+                value, sort_keys=True, separators=(",", ":")
+            ), flush=True),
+        )
+    except cloudflare_pruner.PruneError as error:
+        raise PolicyError(f"Cloudflare Pages prune failed: {error}") from error
+    if result["status"] == "planned":
+        print(
+            "dry-run only; review the manifest and repeat with --execute",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -1585,6 +1890,7 @@ def command_release(args: argparse.Namespace) -> int:
         text=True,
         capture_output=True,
         check=False,
+        env=sanitized_broker_environment(),
     )
     if broker_status.returncode != 0:
         raise PolicyError(
@@ -1608,6 +1914,14 @@ def command_release(args: argparse.Namespace) -> int:
     gate_evidence = release_root / "full-gate.json"
     gate_home = release_root / "gate-home"
     gate_home.mkdir(mode=0o700)
+    authority_paths = post_gate_authority_paths(
+        signing_key=signing_key,
+        allowed_signers=args.allowed_signers,
+        broker_submit=broker_submit,
+    )
+    authority_snapshot = capture_release_authority(
+        args.sha, authority_paths
+    )
     prior_environment = dict(os.environ)
     gate_environment = sanitized_gate_environment(
         prior_environment,
@@ -1620,27 +1934,50 @@ def command_release(args: argparse.Namespace) -> int:
     os.environ.update(gate_environment)
     try:
         command_full(argparse.Namespace(sha=args.sha))
+        # Revalidate while the process still has the credential-free Gate
+        # environment. Provider/signing secrets are restored only afterward.
+        validate_release_authority_after_gate(
+            args.sha,
+            authority_snapshot,
+            signing_key=signing_key,
+            allowed_signers=args.allowed_signers,
+            broker_submit=broker_submit,
+        )
+        verify_web_toolchain_integrity()
     finally:
         os.environ.clear()
         os.environ.update(prior_environment)
+    # The credential-free Gate can take long enough for either provider route
+    # or data plane to drift after the initial preflight.  Re-prove both Web
+    # providers only after local source/tool authority has survived the Gate
+    # and provider credentials have been restored, but before the broker is
+    # allowed to mutate Server production.
+    preflight_web_publication()
     if gate_evidence.is_symlink() or not gate_evidence.is_file():
         raise PolicyError("local exact-SHA full gate returned no evidence")
     submission = build_release_submission(
         revision=args.sha, release_root=release_root, gate_evidence=gate_evidence,
         signing_key=signing_key, signer=signer, allowed_signers=args.allowed_signers,
     )
-    submitted = subprocess.run([str(broker_submit), str(submission)], check=False)
+    submitted = subprocess.run(
+        [str(broker_submit), str(submission)], check=False,
+        env=sanitized_broker_environment(),
+    )
     if submitted.returncode != 0:
         raise PolicyError(f"broker submission failed with exit {submitted.returncode}")
-    verify_production_revision(args.sha)
+    server_digest = verify_production_revision(args.sha)
     web_result = publish_web_after_server(
         revision=args.sha, release_root=release_root, gate_evidence=gate_evidence
     )
-    verify_production_revision(args.sha)
+    if verify_production_revision(args.sha) != server_digest:
+        raise PolicyError("Server current digest changed during Web publication")
+    web_publication_sha256 = sha256_file(web_result)
     print(json.dumps({
         "revision": args.sha,
         "server_submission": str(submission),
         "web_evidence": str(web_result),
+        "server_current_digest": server_digest,
+        "web_publication_sha256": web_publication_sha256,
         "status": "server-and-web-published",
     }, sort_keys=True, separators=(",", ":")))
     return 0
@@ -1827,6 +2164,20 @@ def parser() -> argparse.ArgumentParser:
         handler=command_resume_web,
         allowed_signers=DEFAULT_SIGNERS,
     )
+
+    prune_cloudflare = commands.add_parser(
+        "prune-cloudflare-pages",
+        help="plan or execute receipt-bound Cloudflare Pages retention",
+    )
+    prune_cloudflare.add_argument("--sha", type=exact_sha, required=True)
+    prune_cloudflare.add_argument("--release-root", type=Path, required=True)
+    prune_cloudflare.add_argument("--expected-total", type=int, required=True)
+    prune_cloudflare.add_argument(
+        "--expected-candidate-count", type=int, required=True
+    )
+    prune_cloudflare.add_argument("--expected-manifest-sha256")
+    prune_cloudflare.add_argument("--execute", action="store_true")
+    prune_cloudflare.set_defaults(handler=command_prune_cloudflare_pages)
 
     status = commands.add_parser("status", help="read local release evidence")
     status_inputs = status.add_mutually_exclusive_group()

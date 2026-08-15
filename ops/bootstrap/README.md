@@ -5,6 +5,12 @@ caller-owned private temporary directory. Version-only or unresolved pins are
 not sufficient for release; `vane doctor` enforces
 `tools/toolchain.lock.json`.
 
+For production Web publication, install Aliyun CLI, ossutil, Node, and Wrangler
+from their locked archives/package graph. The publisher validates the actual
+platform entry SHA-256 values and canonical Wrangler installed-tree digest
+before loading provider credentials, so the Mac's caller-owned cache is usable
+without treating ownership or version output as integrity evidence.
+
 ## One-time production control-plane cutover
 
 `production_cutover.py` is the only exception to normal broker admission. It

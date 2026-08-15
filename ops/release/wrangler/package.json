@@ -1,0 +1,11 @@
+{
+  "name": "vane-locked-wrangler",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {
+    "node": "22.23.2"
+  },
+  "dependencies": {
+    "wrangler": "4.115.0"
+  }
+}

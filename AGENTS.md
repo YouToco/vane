@@ -31,9 +31,12 @@ Feature code and tests have no production credentials. Build and Gate run
 directly on the release Mac without a VM or build container. Server mutation,
 the global lock, CAS state, and durable evidence belong to the root-owned VPS
 broker installed outside this checkout. Web publication is the one exception:
-the local release command uses local Aliyun credentials to upload the already
-verified `dist/` directly to OSS and refresh CDN entry paths; Web files never
-pass through or reside on the VPS.
+the local release command uses isolated Aliyun and Cloudflare credentials to
+publish one already verified `dist/` to Cloudflare Pages for the overseas DNS
+line and to OSS plus Ali CDN for the default/domestic line. Web files never
+pass through or reside on the VPS. Neither provider is allowed to finalize as
+the sole Web authority; the combined receipt exists only after both providers
+serve the same exact artifact and the GeoDNS route contract is revalidated.
 
 The local Mac intentionally uses one ordinary OS account, so same-UID code is
 not claimed as a hostile-code security boundary. Exact merged main is the local

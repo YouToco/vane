@@ -13,8 +13,7 @@ import stat
 from urllib.parse import quote, unquote, urlsplit
 
 
-RECEIPT_SCHEMA = "vane.web.aliyun-release/v1"
-BUCKET = "zhuoqidev-vane-web"
+RECEIPT_SCHEMA = "vane.web-artifact/v1"
 RELEASE_MARKER_PATH = "vane-release.json"
 MANIFEST_SUFFIXES = (".webmanifest", ".json")
 MANIFEST_NAMES = ("manifest",)
@@ -360,7 +359,6 @@ def plan(dist: Path, source_sha: str, output: Path) -> None:
         )
     entry = next(item for item in receipt_files if item["path"] == "index.html")
     receipt = {
-        "bucket": BUCKET,
         "entry_path": "index.html",
         "entry_sha256": entry["sha256"],
         "files": receipt_files,

@@ -38,6 +38,11 @@ def check(lock_path: Path, cache: Path, repo_root: Path) -> list[str]:
         "govulncheck": ([cache / "govulncheck" / lock["govulncheck"]["version"] / "govulncheck", "-version"], f"v{lock['govulncheck']['version']}"),
         "aliyun_cli": ([cache / "aliyun_cli" / lock["aliyun_cli"]["version"] / "aliyun", "version"], lock["aliyun_cli"]["version"]),
         "ossutil": ([cache / "ossutil" / lock["ossutil"]["version"] / "ossutil", "version"], lock["ossutil"]["version"]),
+        "wrangler": ([
+            cache / "node" / lock["wrangler"]["node_version"] / "bin/node",
+            cache / "wrangler" / lock["wrangler"]["version"] / "node_modules/wrangler/bin/wrangler.js",
+            "--version",
+        ], lock["wrangler"]["version"]),
     }
     for tool, (command, expected) in commands.items():
         binary = Path(command[0])
@@ -48,6 +53,29 @@ def check(lock_path: Path, cache: Path, repo_root: Path) -> list[str]:
         output = result.stdout + result.stderr
         if result.returncode != 0 or expected not in output:
             errors.append(f"locked executable version mismatch: {tool}: {output.strip()!r}")
+    wrangler_js = Path(commands["wrangler"][0][1])
+    if wrangler_js.is_symlink() or not wrangler_js.is_file():
+        errors.append(f"locked executable is missing: wrangler: {wrangler_js}")
+    wrangler_lock = repo_root / lock["wrangler"]["package_lock"]
+    if wrangler_lock.is_symlink() or not wrangler_lock.is_file():
+        errors.append(f"Wrangler package lock is missing: {wrangler_lock}")
+    elif sha256(wrangler_lock) != lock["wrangler"]["package_lock_sha256"]:
+        errors.append("Wrangler package lock checksum differs from the toolchain lock")
+    else:
+        package_lock = json.loads(wrangler_lock.read_text(encoding="utf-8"))
+        packages = package_lock.get("packages")
+        wrangler = packages.get("node_modules/wrangler") if isinstance(packages, dict) else None
+        if (
+            not isinstance(wrangler, dict)
+            or wrangler.get("version") != lock["wrangler"]["version"]
+            or wrangler.get("integrity") != lock["wrangler"]["package_integrity"]
+            or any(
+                path and not value.get("link") and not isinstance(value.get("integrity"), str)
+                for path, value in packages.items()
+                if isinstance(value, dict)
+            )
+        ):
+            errors.append("Wrangler transitive package integrity lock is incomplete")
     for tool in ("go", "node", "temporal_cli", "shellcheck"):
         artifact = lock[tool]["artifacts"][arch]
         path = cache / "downloads" / artifact["filename"]
