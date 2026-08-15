@@ -741,17 +741,20 @@ func verifyWorkspaceMemoryRuntimeAuthority(
            WHERE relation.relname IN('workspace_memory_authorizations',
              'workspace_memory_records','workspace_memory_events','workspace_memory_receipts')
         )
-        SELECT count(*)=4
-          AND array_agg(relname||':'||polname ORDER BY relname)=ARRAY[
-            'workspace_memory_authorizations:workspace_memory_authorization_actor',
+        SELECT count(*)=6
+          AND array_agg(relname||':'||polname ORDER BY relname,polname)=ARRAY[
+            'workspace_memory_authorizations:workspace_memory_authorization_insert',
+            'workspace_memory_authorizations:workspace_memory_authorization_select',
+            'workspace_memory_authorizations:workspace_memory_authorization_update',
             'workspace_memory_events:workspace_memory_event_tenant',
             'workspace_memory_receipts:workspace_memory_receipt_actor',
             'workspace_memory_records:workspace_memory_record_tenant']::text[]
-          AND bool_and(polpermissive AND polcmd='*'
+          AND bool_and(polpermissive
             AND polroles=ARRAY[(SELECT oid FROM role_row)]::oid[])
           AND md5(string_agg(relname||'|'||polname||'|'||polpermissive::text||'|'||
-            polcmd::text||'|'||using_expr||'|'||check_expr,E'\n' ORDER BY relname))=
-            '88ffa5376feae12d0db8c0145bc15dfc'
+            polcmd::text||'|'||COALESCE(using_expr,'<null>')||'|'||
+            COALESCE(check_expr,'<null>'),E'\n' ORDER BY relname,polname))=
+            '6917d270023b8fb464af8bc03d56ba2f'
           FROM policies
     `).Scan(&policiesSafe); err != nil {
 		return fmt.Errorf("verify workspace memory RLS policies: %w", err)

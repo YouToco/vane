@@ -323,11 +323,47 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 	driftBase := migration138Apply(t, st, team, creator,
 		sessions[team<<32|creator], strings.Repeat("7", 64),
 		migration138Action(types.MemoryActionRemember, 0, "role-drift-boundary"))
+	for _, mutation := range []struct {
+		name  string
+		value any
+	}{{"clear", nil}, {"change", driftBase.Event.ID}} {
+		mutationTx, err := database.BeginTx(t.Context(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		migration138EnterWorkspaceRole(t, mutationTx, team, creator, "member")
+		tag, err := mutationTx.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations
+			SET consumed_event_id=$3 WHERE tenant_id=$1 AND actor_user_id=$2 AND id=$4`,
+			team, creator, mutation.value, remembered.Memory.Evidence.AuthorizationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rowsAffected, err := tag.RowsAffected()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rowsAffected != 0 {
+			t.Fatalf("restricted role could %s consumed authorization", mutation.name)
+		}
+		if err := mutationTx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var retainedConsumed int64
+	if err := database.QueryRowContext(t.Context(), `SELECT consumed_event_id
+		FROM workspace_memory_authorizations WHERE tenant_id=$1 AND id=$2`, team,
+		remembered.Memory.Evidence.AuthorizationID).Scan(&retainedConsumed); err != nil {
+		t.Fatal(err)
+	}
+	if retainedConsumed != remembered.Event.ID {
+		t.Fatalf("consumed binding changed=%d want=%d", retainedConsumed, remembered.Event.ID)
+	}
+	// Independently mutate below RLS as the migration owner: the composite
+	// deferred FK, not the policy, must reject swapping A/B consumed events.
 	swapTx, err := database.BeginTx(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	migration138EnterWorkspaceRole(t, swapTx, team, creator, "member")
 	if _, err := swapTx.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations
 		SET consumed_event_id=NULL WHERE tenant_id=$1 AND actor_user_id=$2
 		AND id IN($3::uuid,$4::uuid)`, team, creator,
@@ -344,7 +380,7 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 	}
 	if _, err := swapTx.ExecContext(t.Context(),
 		`SET CONSTRAINTS fk_workspace_memory_authorization_consumed IMMEDIATE`); err == nil {
-		t.Fatal("consumed event authorization binding accepted swapped events")
+		t.Fatal("composite consumed FK accepted swapped authorization events")
 	}
 	if err := swapTx.Rollback(); err != nil {
 		t.Fatal(err)
@@ -546,13 +582,14 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 	if err := database.QueryRowContext(t.Context(), `SELECT md5(string_agg(
 		relation.relname||'|'||policy.polname||'|'||policy.polpermissive::text||'|'||
 		policy.polcmd::text||'|'||
-		pg_get_expr(policy.polqual,policy.polrelid)||'|'||
-		pg_get_expr(policy.polwithcheck,policy.polrelid),E'\n' ORDER BY relation.relname))
+		COALESCE(pg_get_expr(policy.polqual,policy.polrelid),'<null>')||'|'||
+		COALESCE(pg_get_expr(policy.polwithcheck,policy.polrelid),'<null>'),E'\n'
+		ORDER BY relation.relname,policy.polname))
 		FROM pg_policy policy JOIN pg_class relation ON relation.oid=policy.polrelid
 		WHERE relation.relname LIKE 'workspace_memory_%'`).Scan(&policyContract); err != nil {
 		t.Fatal(err)
 	}
-	if policyContract != "88ffa5376feae12d0db8c0145bc15dfc" {
+	if policyContract != "6917d270023b8fb464af8bc03d56ba2f" {
 		t.Fatalf("workspace memory policy contract=%s", policyContract)
 	}
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
