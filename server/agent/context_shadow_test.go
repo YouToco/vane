@@ -132,7 +132,7 @@ func TestContextShadowDoesNotChangeLegacyRequestOrOutcome(t *testing.T) {
 			return &llm.ChatResponse{Content: "legacy reply"}, nil
 		},
 	)
-	outcome, err := loop.HandleMessage(t.Context(), 7, "hello")
+	outcome, err := loop.HandleMessage(t.Context(), testPrincipal(7), "hello")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestContextShadowSlowStoreCannotDelayOrCancelLegacyCall(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		outcome, err := loop.HandleMessage(parent, 7, "hello")
+		outcome, err := loop.HandleMessage(parent, testPrincipal(7), "hello")
 		done <- result{outcome: outcome, err: err}
 	}()
 
@@ -237,7 +237,7 @@ func TestContextShadowTracksToolsetTransitionAndRedactsTaintedStep(t *testing.T)
 		},
 		tool,
 	)
-	if _, err := loop.HandleMessage(t.Context(), 7, "research"); err != nil {
+	if _, err := loop.HandleMessage(t.Context(), testPrincipal(7), "research"); err != nil {
 		t.Fatal(err)
 	}
 	snapshots := drainContextShadows(t, loop, store)
@@ -300,7 +300,7 @@ func TestContextShadowCompletionOrderDoesNotDefineContextIdentity(t *testing.T) 
 		},
 		tool,
 	)
-	if _, err := loop.HandleMessage(t.Context(), 7, "research"); err != nil {
+	if _, err := loop.HandleMessage(t.Context(), testPrincipal(7), "research"); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)
@@ -351,7 +351,7 @@ func TestContextShadowCandidateMessagesExactlyMirrorProfileRequest(t *testing.T)
 			return &llm.ChatResponse{Content: "reply"}, nil
 		},
 	)
-	if _, err := loop.HandleMessage(t.Context(), 7, "question"); err != nil {
+	if _, err := loop.HandleMessage(t.Context(), testPrincipal(7), "question"); err != nil {
 		t.Fatal(err)
 	}
 	snapshots := drainContextShadows(t, loop, store)
@@ -449,7 +449,7 @@ func TestRunOnceContextShadowNeverPersistsOwnerSnapshot(t *testing.T) {
 		},
 	)
 	if _, _, err := loop.RunOnce(
-		t.Context(), 7, nil, "a2a question",
+		t.Context(), testPrincipal(7), nil, "a2a question",
 	); err != nil {
 		t.Fatal(err)
 	}

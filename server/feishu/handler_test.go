@@ -15,6 +15,7 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/store"
 )
 
@@ -240,7 +241,7 @@ type fakeRunner struct {
 	external []bool
 }
 
-func (f *fakeRunner) HandleMessage(_ context.Context, _ int64, text string) (agent.Outcome, error) {
+func (f *fakeRunner) HandleMessage(_ context.Context, _ auth.Principal, text string) (agent.Outcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.texts = append(f.texts, text)
@@ -248,7 +249,7 @@ func (f *fakeRunner) HandleMessage(_ context.Context, _ int64, text string) (age
 	return agent.Outcome{Reply: "ok"}, nil
 }
 
-func (f *fakeRunner) HandleExternalContextMessage(_ context.Context, _ int64, text string) (agent.Outcome, error) {
+func (f *fakeRunner) HandleExternalContextMessage(_ context.Context, _ auth.Principal, text string) (agent.Outcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.texts = append(f.texts, text)

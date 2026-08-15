@@ -224,7 +224,7 @@ func TestNativeResearchV3EditServerRuntimeLifecycleAndACLPostgres(t *testing.T) 
 		`INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'owner')`, tenantID, user.ID); err != nil {
 		t.Fatal(err)
 	}
-	session, err := owner.CreateAgentSession(t.Context(), user.ID)
+	session, err := owner.CreateAgentSession(t.Context(), tenantID, user.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

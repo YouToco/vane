@@ -68,7 +68,7 @@ func TestInvariant_TenantDerivedOnWrite(t *testing.T) {
 	if _, err := st.CreatePushBatch(ctx, uid); err != nil {
 		t.Fatalf("建批次失败: %v", err)
 	}
-	if _, err := st.CreateAgentSession(ctx, uid); err != nil {
+	if _, err := st.CreateAgentSession(ctx, 1, uid); err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
 

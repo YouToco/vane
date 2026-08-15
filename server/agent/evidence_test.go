@@ -59,7 +59,7 @@ func TestWebTaskActionReplaysCompletedTurnWithoutModelCall(t *testing.T) {
 		return nil, nil
 	}
 	out, err := loop.HandleWebTaskActionMessage(
-		t.Context(), 7, "a58d8934-3b23-420c-b58a-93c0208e186d", "",
+		t.Context(), testPrincipal(7), "a58d8934-3b23-420c-b58a-93c0208e186d", "",
 		"创建 Kimi 套餐监控",
 	)
 	if err != nil || out.Reply != "任务已创建。" || reader.calls != 1 {
@@ -77,7 +77,7 @@ func TestWebTaskActionRejectsRequestIDReusedWithDifferentMessage(t *testing.T) {
 		TurnReplay: reader, OwnerAgent: true,
 	})
 	_, err := loop.HandleWebTaskActionMessage(
-		t.Context(), 7, "d364eb61-a52c-4ddb-8efa-b47fb8c23dc7", "", "创建 B",
+		t.Context(), testPrincipal(7), "d364eb61-a52c-4ddb-8efa-b47fb8c23dc7", "", "创建 B",
 	)
 	if !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("err=%v, want conflict", err)
@@ -99,7 +99,7 @@ func TestWebTaskActionUsesStableActionIDAsEvidenceTrace(t *testing.T) {
 		return &llm.ChatResponse{Content: "请补充监控频率？"}, nil
 	}
 	out, err := loop.HandleWebTaskActionMessage(
-		t.Context(), 7, actionID, "", "创建 Kimi 套餐监控",
+		t.Context(), testPrincipal(7), actionID, "", "创建 Kimi 套餐监控",
 	)
 	if err != nil || out.Reply == "" || writer.record.TurnID != actionID {
 		t.Fatalf("out=%+v trace=%q err=%v", out, writer.record.TurnID, err)
@@ -265,7 +265,7 @@ func TestGroundedGuardedReplyIsTheExactPersistedEvidence(t *testing.T) {
 	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
 		return &llm.ChatResponse{Content: "raw reply"}, nil
 	}
-	outcome, err := loop.HandleGroundedMessageGuarded(t.Context(), 42,
+	outcome, err := loop.HandleGroundedMessageGuarded(t.Context(), testPrincipal(42),
 		"发生了什么？", "frozen brief", func(reply string) (string, error) {
 			return "guarded: " + reply, nil
 		})

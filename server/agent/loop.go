@@ -25,6 +25,7 @@ import (
 	"github.com/YouToco/vane/server/agentcontext"
 	"github.com/YouToco/vane/server/agentledger"
 	"github.com/YouToco/vane/server/agentpolicy"
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/profilehint"
 	"github.com/YouToco/vane/server/store"
@@ -140,8 +141,8 @@ const (
 // 与 *store.Store 签名逐字一致）。
 // 收窄的目的：agent 单测用内存假实现即可，不依赖数据库；生产由 *store.Store 满足。
 type Store interface {
-	GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error)
-	CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error)
+	GetActiveAgentSession(ctx context.Context, tenantID, userID int64, since time.Time) (*types.AgentSession, error)
+	CreateAgentSession(ctx context.Context, tenantID, userID int64) (*types.AgentSession, error)
 	CommitAgentSessionTurn(ctx context.Context, projection agentledger.SessionProjection, batch agentledger.AppendBatch) (agentledger.ProjectionShadowAudit, error)
 	CommitAgentSessionAppend(ctx context.Context, userID int64, sessionID int64, operationIdentity string, msgs json.RawMessage) (agentledger.ProjectionShadowAudit, error)
 }
@@ -278,8 +279,12 @@ type Loop struct {
 	contextShadowSlots chan struct{}
 }
 
-func (l *Loop) lockForUser(userID int64) *userTurnLock {
-	return l.sessionAdmission.lockForUser(userID)
+func (l *Loop) lockForPrincipal(principal auth.Principal) *userTurnLock {
+	return l.sessionAdmission.lockForPrincipal(int64(principal.TenantID), principal.UserID)
+}
+
+func (l *Loop) lockForScope(tenantID, userID int64) *userTurnLock {
+	return l.sessionAdmission.lockForPrincipal(tenantID, userID)
 }
 
 // chatMetaKey/chatMeta 经 ctx 旁路传递记账元信息：chatFn 的签名由契约固定、
@@ -514,8 +519,8 @@ func retryAgentChat(
 // 读工具直接执行、写工具通过耐久操作直接执行 → 持久化会话 → 返回。
 // 全部 LLM 错误向上抛（feishu 层 humanize）；LLM 出错路径不持久化本轮消息——
 // 半截上下文对下一轮没有价值，行为与现 chat_reply 的无状态失败一致。
-func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Outcome, error) {
-	return l.handleMessage(ctx, userID, "", "", text, false)
+func (l *Loop) HandleMessage(ctx context.Context, principal auth.Principal, text string) (Outcome, error) {
+	return l.handleMessage(ctx, principal, "", "", text, false)
 }
 
 // HandleWebTaskActionMessage runs the Dashboard's natural-language create or
@@ -525,7 +530,7 @@ func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Ou
 // completed retry is served from AgentTurnRecordV1 before any LLM/tool call.
 func (l *Loop) HandleWebTaskActionMessage(
 	ctx context.Context,
-	userID int64,
+	principal auth.Principal,
 	actionID string,
 	selectedTaskRef string,
 	text string,
@@ -536,7 +541,7 @@ func (l *Loop) HandleWebTaskActionMessage(
 		return Outcome{}, types.NewAppError(
 			types.CodeValidation, "Web 任务请求标识无效", types.ErrValidation)
 	}
-	return l.handleMessage(ctx, userID, actionID, selectedTaskRef, text, false)
+	return l.handleMessage(ctx, principal, actionID, selectedTaskRef, text, false)
 }
 
 // HandleExternalContextMessage 处理「用户文字 + 外部内容」的合成输入（当前由飞书
@@ -544,8 +549,8 @@ func (l *Loop) HandleWebTaskActionMessage(
 // 才 taint：本入口从第一轮起不读画像/历史，不声明内部或写工具。唯一例外是当前用户
 // 自己的后缀明确要求最新核验时，可暴露一次 query 字节被本地固定的 web_search；
 // 引用正文不能改变查询，也不能触发第二次网络读取。
-func (l *Loop) HandleExternalContextMessage(ctx context.Context, userID int64, text string) (Outcome, error) {
-	return l.handleMessage(ctx, userID, "", "", text, true)
+func (l *Loop) HandleExternalContextMessage(ctx context.Context, principal auth.Principal, text string) (Outcome, error) {
+	return l.handleMessage(ctx, principal, "", "", text, true)
 }
 
 const groundedBriefSystemNote = `
@@ -559,11 +564,11 @@ const groundedBriefSystemNote = `
 
 func (l *Loop) HandleGroundedMessage(
 	ctx context.Context,
-	userID int64,
+	principal auth.Principal,
 	question string,
 	grounding string,
 ) (Outcome, error) {
-	return l.handleGroundedMessage(ctx, userID, question, grounding, nil)
+	return l.handleGroundedMessage(ctx, principal, question, grounding, nil)
 }
 
 // HandleGroundedMessageGuarded applies the caller-owned presentation guard
@@ -571,7 +576,7 @@ func (l *Loop) HandleGroundedMessage(
 // fail-closed projection from diverging from the durable Agent session.
 func (l *Loop) HandleGroundedMessageGuarded(
 	ctx context.Context,
-	userID int64,
+	principal auth.Principal,
 	question string,
 	grounding string,
 	replyGuard func(string) (string, error),
@@ -581,12 +586,12 @@ func (l *Loop) HandleGroundedMessageGuarded(
 			types.CodeValidation, "简报追问回复护栏无效", types.ErrValidation)
 	}
 	return l.handleGroundedMessage(
-		ctx, userID, question, grounding, replyGuard)
+		ctx, principal, question, grounding, replyGuard)
 }
 
 func (l *Loop) handleGroundedMessage(
 	ctx context.Context,
-	userID int64,
+	principal auth.Principal,
 	question string,
 	grounding string,
 	replyGuard func(string) (string, error),
@@ -596,7 +601,11 @@ func (l *Loop) handleGroundedMessage(
 		return Outcome{}, types.NewAppError(
 			types.CodeValidation, "简报追问输入无效", types.ErrValidation)
 	}
-	mu := l.lockForUser(userID)
+	if err := validatePrincipal(principal); err != nil {
+		return Outcome{}, err
+	}
+	userID := principal.UserID
+	mu := l.lockForPrincipal(principal)
 	if err := mu.Lock(ctx); err != nil {
 		return Outcome{}, err
 	}
@@ -604,7 +613,7 @@ func (l *Loop) handleGroundedMessage(
 	if err := ctx.Err(); err != nil {
 		return Outcome{}, err
 	}
-	sess, err := l.loadOrCreateSession(ctx, userID)
+	sess, err := l.loadOrCreateSession(ctx, principal)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -673,14 +682,18 @@ func (l *Loop) handleGroundedMessage(
 
 func (l *Loop) handleMessage(
 	ctx context.Context,
-	userID int64,
+	principal auth.Principal,
 	webActionID string,
 	webSelectedTaskRef string,
 	text string,
 	externalInput bool,
 ) (Outcome, error) {
+	if err := validatePrincipal(principal); err != nil {
+		return Outcome{}, err
+	}
+	userID := principal.UserID
 	// per-user 串行化整个 load→loop→save（跨所有共享 session admission 的 Loop）。
-	mu := l.lockForUser(userID)
+	mu := l.lockForPrincipal(principal)
 	if err := mu.Lock(ctx); err != nil {
 		return Outcome{}, err
 	}
@@ -689,7 +702,7 @@ func (l *Loop) handleMessage(
 		return Outcome{}, err
 	}
 
-	sess, err := l.loadOrCreateSession(ctx, userID)
+	sess, err := l.loadOrCreateSession(ctx, principal)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -834,6 +847,16 @@ func validDirectActionID(actionID string) bool {
 	return err == nil && parsed.String() == actionID
 }
 
+func validatePrincipal(principal auth.Principal) error {
+	if principal.TenantID <= 0 || principal.UserID <= 0 || !principal.Role.Valid() ||
+		(principal.ActorType != types.ActorTypeUser &&
+			principal.ActorType != types.ActorTypeServiceAccount) {
+		return types.NewAppError(
+			types.CodeValidation, "Agent 请求身份不完整", types.ErrValidation)
+	}
+	return nil
+}
+
 // RunOnce 在给定历史上执行一轮多轮 FC（M4 契约 §7.1，A2A 轨 / a2a-contract §12 P2）：
 // 不读写会话存储、不持 session admission 锁、不注入画像——历史与并发语义完全由调用方管理
 // （A2A 侧按 contextId 重建历史；外部 agent 的会话不该与 owner 飞书轨互相排队）。
@@ -843,7 +866,11 @@ func validDirectActionID(actionID string) bool {
 // 写工具调用时走"工具不存在"自纠（该工具在本实例未注册）。sessionID 传 nil：
 // A2A 轨工具记账 session_id 落 NULL
 // （不污染 tool_calls 的会话维度），且端点激活不持久化（空 state 每次重建）。
-func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMessage, text string) (Outcome, []llm.ChatMessage, error) {
+func (l *Loop) RunOnce(ctx context.Context, principal auth.Principal, history []llm.ChatMessage, text string) (Outcome, []llm.ChatMessage, error) {
+	if err := validatePrincipal(principal); err != nil {
+		return Outcome{}, nil, err
+	}
+	userID := principal.UserID
 	history = l.scrubUntrustedHistory(history)
 	msgs := make([]llm.ChatMessage, 0, len(history)+1)
 	msgs = append(msgs, history...)
@@ -852,6 +879,9 @@ func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMess
 	turnID := uuid.NewString()
 	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{
 		traceID: turnID, userID: userID,
+		scope: agentcontext.Scope{
+			TenantID: int64(principal.TenantID), UserID: userID,
+		},
 	})
 	state := &toolRunState{
 		activation:        &activationState{},
@@ -1950,7 +1980,7 @@ func (l *Loop) RecordCreationReceiptSession(
 	if !ok {
 		return errors.New("agent: task creation receipt session store is unavailable")
 	}
-	mu := l.lockForUser(receipt.UserID)
+	mu := l.lockForScope(receipt.TenantID, receipt.UserID)
 	// A normal Agent turn may hold this lock for its full model/tool budget.
 	// The receipt dispatcher must not block an entire tenant scan (or shutdown)
 	// behind that turn. A busy lock is a retryable outbox outcome; the immutable
@@ -1984,7 +2014,7 @@ func (l *Loop) RecordDefinitionEditReceiptSession(
 			"agent: task definition edit receipt session store is unavailable",
 		)
 	}
-	admission := l.lockForUser(receipt.UserID)
+	admission := l.lockForScope(receipt.TenantID, receipt.UserID)
 	if !admission.TryLock() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -2007,17 +2037,22 @@ func (l *Loop) RecordDefinitionEditReceiptSession(
 // 在抢锁期间被换代（TTL 边界上 HandleMessage 新开会话），通告会写进过期会话。
 func (l *Loop) NotifyEvent(
 	ctx context.Context,
-	userID int64,
+	principal auth.Principal,
 	sourceIdentity string,
 	notice string,
 ) {
+	if err := validatePrincipal(principal); err != nil {
+		slog.Warn("agent: 事件通告身份无效，通告丢弃", "err", err)
+		return
+	}
+	tenantID, userID := int64(principal.TenantID), principal.UserID
 	raw, err := json.Marshal([]llm.ChatMessage{{Role: "user", Content: notice}})
 	if err != nil {
 		slog.Error("agent: 事件通告序列化失败", "user_id", userID, "err", err)
 		return
 	}
-	l.asyncSessionWrite(ctx, userID, func(dbCtx context.Context) {
-		sess, err := l.store.GetActiveAgentSession(dbCtx, userID, time.Now().Add(-l.sessionTTL))
+	l.asyncSessionWrite(ctx, principal, func(dbCtx context.Context) {
+		sess, err := l.store.GetActiveAgentSession(dbCtx, tenantID, userID, time.Now().Add(-l.sessionTTL))
 		if err != nil {
 			if !errors.Is(err, types.ErrNotFound) {
 				slog.Warn("agent: 事件通告查询会话失败，通告丢弃", "user_id", userID, "err", err)
@@ -2046,10 +2081,11 @@ func (l *Loop) NotifyEvent(
 //     有界（锁等待 ≤ 对端消息预算），DB 预算（5s）在拿到锁后才起算，WithoutCancel
 //     只保留调用方 ctx 的 values、脱离其 deadline。
 //   - write 内部自行落日志、不上抛：旁路回写失败不放大成用户可见错误。
-func (l *Loop) asyncSessionWrite(ctx context.Context, userID int64, write func(dbCtx context.Context)) {
+func (l *Loop) asyncSessionWrite(ctx context.Context, principal auth.Principal, write func(dbCtx context.Context)) {
 	if l == nil {
 		return
 	}
+	userID := principal.UserID
 	l.sessionWriteMu.Lock()
 	if !l.sessionWriteAccepting {
 		l.sessionWriteMu.Unlock()
@@ -2069,7 +2105,7 @@ func (l *Loop) asyncSessionWrite(ctx context.Context, userID int64, write func(d
 				slog.Error("agent: 会话旁路回写 panic（已兜住，仅丢本条）", "user_id", userID, "recover", r)
 			}
 		}()
-		mu := l.lockForUser(userID)
+		mu := l.lockForPrincipal(principal)
 		// Side-writes intentionally survive the originating callback context;
 		// their lifecycle is owned by sessionWriteWG/DrainSessionWrites.
 		if err := mu.Lock(context.Background()); err != nil {
@@ -2109,15 +2145,20 @@ func (l *Loop) DrainSessionWrites(ctx context.Context) error {
 
 // loadOrCreateSession 取该用户 TTL 内的 active 会话；不存在或已过期就新开
 // （契约 §0：同一 owner 30 分钟内共享一个会话，超时新开）。
-func (l *Loop) loadOrCreateSession(ctx context.Context, userID int64) (*types.AgentSession, error) {
-	sess, err := l.store.GetActiveAgentSession(ctx, userID, time.Now().Add(-l.sessionTTL))
+func (l *Loop) loadOrCreateSession(ctx context.Context, principal auth.Principal) (*types.AgentSession, error) {
+	tenantID, userID := int64(principal.TenantID), principal.UserID
+	sess, err := l.store.GetActiveAgentSession(ctx, tenantID, userID, time.Now().Add(-l.sessionTTL))
 	if err == nil {
+		if sess.TenantID != tenantID || sess.UserID != userID {
+			return nil, types.NewAppError(types.CodeForbidden,
+				"Agent 会话身份与当前工作区不一致", types.ErrForbidden)
+		}
 		return sess, nil
 	}
 	if !errors.Is(err, types.ErrNotFound) {
 		return nil, err
 	}
-	return l.store.CreateAgentSession(ctx, userID)
+	return l.store.CreateAgentSession(ctx, tenantID, userID)
 }
 
 // saveSession 持久化会话（system 不入库；契约 §7：每次 HandleMessage 结束都要写，

@@ -15,6 +15,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/types"
 )
@@ -24,7 +25,7 @@ type cancelAwareChat struct {
 	once    sync.Once
 }
 
-func (c *cancelAwareChat) RunOnce(ctx context.Context, _ int64, _ []llm.ChatMessage, _ string) (agent.Outcome, []llm.ChatMessage, error) {
+func (c *cancelAwareChat) RunOnce(ctx context.Context, _ auth.Principal, _ []llm.ChatMessage, _ string) (agent.Outcome, []llm.ChatMessage, error) {
 	c.once.Do(func() { close(c.entered) })
 	<-ctx.Done()
 	return agent.Outcome{}, nil, context.Cause(ctx)

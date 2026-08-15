@@ -110,7 +110,7 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 		f.tenantID, sessionOwner); err != nil {
 		t.Fatal(err)
 	}
-	session, err := st.CreateAgentSession(ctx, sessionOwner)
+	session, err := st.CreateAgentSession(ctx, f.tenantID, sessionOwner)
 	if err != nil {
 		t.Fatal(err)
 	}

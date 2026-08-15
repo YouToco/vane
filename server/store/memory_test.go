@@ -27,7 +27,7 @@ func authorizeMemoryAction(
 	t *testing.T, st *Store, tenantID, userID int64, action types.MemoryAction,
 ) types.MemoryAction {
 	t.Helper()
-	session, err := st.CreateAgentSession(t.Context(), userID)
+	session, err := st.CreateAgentSession(t.Context(), tenantID, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,7 @@ func TestMemoryActiveCorpusAndCountBoundsPostgres(t *testing.T) {
 	t.Cleanup(func() { cleanupMemoryUsers(t, st, corpusUser, countUser, damagedUser) })
 	seed := func(userID int64, count, textBytes int) {
 		t.Helper()
-		session, err := st.CreateAgentSession(t.Context(), userID)
+		session, err := st.CreateAgentSession(t.Context(), 1, userID)
 		if err != nil {
 			t.Fatal(err)
 		}

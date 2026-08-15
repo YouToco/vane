@@ -125,6 +125,15 @@ var purgeOrder = []purgeStep{
 	{"memory_events", "tenant_id = $1"},
 	{"memory_records", "tenant_id = $1"},
 	{"memory_authorizations", "tenant_id = $1"},
+	// User-configured capabilities are immutable, tenant-scoped artifacts. Their
+	// event and subtype rows reference the shared version/root identities, so
+	// explicit tenant erasure must preserve this child-first order.
+	{"user_capability_events", "tenant_id = $1"},
+	{"skill_capability_files", "tenant_id = $1"},
+	{"skill_capability_versions", "tenant_id = $1"},
+	{"mcp_connection_versions", "tenant_id = $1"},
+	{"user_capability_versions", "tenant_id = $1"},
+	{"user_capabilities", "tenant_id = $1"},
 	// V3 delivery anchors reference the effect and projections, so they are the
 	// first child in the durable delivery chain.
 	{"research_brief_deliveries", "tenant_id = $1"},
@@ -221,6 +230,10 @@ var purgeOrder = []purgeStep{
 	// and deletes the now-unreferenced immutable events explicitly.
 	{"task_run_snapshot_v2_cutover_events", "tenant_id = $1"},
 	{"user_sessions", "tenant_id = $1"},
+	// Workspace invitation and role-change audit ledgers are tenant-owned
+	// control-plane children and must precede membership/tenant deletion.
+	{"workspace_audit_events", "tenant_id = $1"},
+	{"workspace_invites", "tenant_id = $1"},
 
 	// tenant_quota 与 memberships 一样是纯租户所有的行，无子表引用它，位置随意；
 	// 放在 memberships 前只是为了让"归属类"的几张挨在一起。

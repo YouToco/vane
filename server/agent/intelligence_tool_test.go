@@ -200,7 +200,7 @@ func TestHistoricalRunComparisonUsesActualOutcomeSemantics(t *testing.T) {
 	})
 	loop.chatFn = chat.fn
 
-	out, err := loop.HandleMessage(t.Context(), 42, userRequest)
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), userRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestHistoricalRunComparisonStopsWhenBothLatestRunsAreUnavailable(t *testing
 	})
 	loop.chatFn = chat.fn
 
-	out, err := loop.HandleMessage(t.Context(), 42, userRequest)
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), userRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestHistoricalRunComparisonDoesNotWidenAfterEmptyScopedBriefs(t *testing.T)
 	})
 	loop.chatFn = chat.fn
 
-	out, err := loop.HandleMessage(t.Context(), 42, userRequest)
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), userRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,7 +519,7 @@ func TestHistoricalUpdateQuestionReplaysTasksRunsAndBriefsBeforeAnswer(t *testin
 	})
 	loop.chatFn = chat.fn
 
-	out, err := loop.HandleMessage(t.Context(), 42, userRequest)
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), userRequest)
 	if err != nil {
 		t.Fatal(err)
 	}

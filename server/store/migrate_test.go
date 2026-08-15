@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 133
+const latestMigrationVersion int64 = 135
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -175,6 +175,16 @@ var wantTables = []string{
 	// 132 immutable epoch proving physical legacy-protocol fencing predates evidence.
 	"agent_first_legacy_protocol_write_fence_v132",
 	// 131 only widens the retained agent_events batch cardinality constraint.
+	// 134 multi-workspace identity control plane.
+	"workspace_invites",
+	"workspace_audit_events",
+	// 135 immutable, tenant/user-isolated Skill and remote MCP capabilities.
+	"user_capabilities",
+	"user_capability_versions",
+	"skill_capability_versions",
+	"skill_capability_files",
+	"mcp_connection_versions",
+	"user_capability_events",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
