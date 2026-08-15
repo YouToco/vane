@@ -346,6 +346,15 @@ const (
 	ScheduleStatusPaused ScheduleStatus = "paused" // 已暂停
 )
 
+// TaskVisibility records whether a task is visible only in a personal
+// workspace or to every current member of its team workspace.
+type TaskVisibility string
+
+const (
+	TaskVisibilityPersonal  TaskVisibility = "personal"
+	TaskVisibilityWorkspace TaskVisibility = "workspace"
+)
+
 // Schedule 定时推送调度（schedules 表，M3 migration 003）。
 // 真源在 Temporal（schedule_id 即本表主键 ID），本表是 Postgres 侧镜像，
 // 供 /api/schedules 列表读取与对账；scheduler 在 Temporal Create 成功后写入。
@@ -356,12 +365,21 @@ type Schedule struct {
 	// TenantID is an internal execution-boundary field. Public schedule APIs
 	// remain user-scoped and must not acquire a new wire field just because the
 	// worker needs an explicit tenant identity in its durable Action input.
-	TenantID      int64           `json:"-"`
-	UserID        int64           `json:"user_id"`        // 归属用户
-	NLDescription string          `json:"nl_description"` // 用户原话/展示名，DEFAULT ''
-	SpecJSON      json.RawMessage `json:"spec_json"`      // JSONB：{cron,tz} 或 {every_seconds}
-	ScopeJSON     json.RawMessage `json:"scope_json"`     // JSONB：PushScope 序列化
-	Status        ScheduleStatus  `json:"status"`         // active/paused
+	TenantID int64 `json:"-"`
+	// UserID remains the frozen execution identity used by immutable task
+	// definitions, snapshots and Temporal workflow IDs. It must never be
+	// rewritten when the product assignee changes.
+	UserID int64 `json:"-"`
+	// AssigneeUserID is the product-visible responsible member. Keep its wire
+	// name as user_id for backwards-compatible clients while retaining the
+	// frozen execution identity above as an internal-only field.
+	AssigneeUserID int64           `json:"user_id"`
+	CreatorUserID  int64           `json:"creator_user_id"`
+	Visibility     TaskVisibility  `json:"visibility"`
+	NLDescription  string          `json:"nl_description"` // 用户原话/展示名，DEFAULT ''
+	SpecJSON       json.RawMessage `json:"spec_json"`      // JSONB：{cron,tz} 或 {every_seconds}
+	ScopeJSON      json.RawMessage `json:"scope_json"`     // JSONB：PushScope 序列化
+	Status         ScheduleStatus  `json:"status"`         // active/paused
 	// ExecutionMode is an internal Approved Definition field. It is deliberately
 	// excluded from the current public schedule wire until the durable-control-
 	// plane cutover; C2a only makes the persisted compatibility mode explicit.

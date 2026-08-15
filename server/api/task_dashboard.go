@@ -57,7 +57,7 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "缺少 schedule id")
 		return
 	}
-	userID, err := s.ownerUserID(r.Context())
+	principal, err := s.deps.Principal.FromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
@@ -65,18 +65,20 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 
 	// 归属与存在性由 GetSchedule 一次把关（「不存在」与「不属于你」统一 404），
 	// 后续查询全部带 userID 谓词，纵深防御但不再产生 404 分叉。
-	sched, err := s.deps.Store.GetSchedule(r.Context(), id, userID)
+	sched, err := s.deps.Store.GetScheduleForMember(
+		r.Context(), int64(principal.TenantID), principal.UserID, id)
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
 
-	summary, err := s.deps.Store.GetScheduleRunSummary(r.Context(), userID, id)
+	executionUserID := sched.UserID
+	summary, err := s.deps.Store.GetScheduleRunSummary(r.Context(), executionUserID, id)
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
-	cost, err := s.deps.Store.GetScheduleRunCost(r.Context(), userID, id)
+	cost, err := s.deps.Store.GetScheduleRunCost(r.Context(), executionUserID, id)
 	if err != nil {
 		writeAppError(w, err)
 		return
@@ -93,14 +95,14 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 			r.Context(),
 			"api: read schedule next run",
 			"schedule_id", id,
-			"user_id", userID,
+			"user_id", executionUserID,
 			"err", nextRunErr,
 		)
 	}
 
 	// 手册是可选块：老任务/空手册任务没有行，NotFound 不是错误，整块缺省。
 	var playbook *schedulePlaybookDTO
-	pb, err := s.deps.Store.GetSchedulePlaybook(r.Context(), userID, id)
+	pb, err := s.deps.Store.GetSchedulePlaybook(r.Context(), executionUserID, id)
 	switch {
 	case err == nil:
 		playbook = &schedulePlaybookDTO{Content: pb.Content, UpdatedAt: pb.UpdatedAt}
@@ -176,18 +178,20 @@ func (s *server) handleListScheduleBatches(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, errMsg)
 		return
 	}
-	userID, err := s.ownerUserID(r.Context())
+	principal, err := s.deps.Principal.FromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
 	// 404 语义与详情页一致：先证明任务可见，再翻它的历史。
-	if _, err := s.deps.Store.GetSchedule(r.Context(), id, userID); err != nil {
+	task, err := s.deps.Store.GetScheduleForMember(
+		r.Context(), int64(principal.TenantID), principal.UserID, id)
+	if err != nil {
 		writeAppError(w, err)
 		return
 	}
 
-	items, total, next, err := s.deps.Store.ListScheduleBatches(r.Context(), userID, id,
+	items, total, next, err := s.deps.Store.ListScheduleBatches(r.Context(), task.UserID, id,
 		store.BatchHistoryQuery{PageSize: q.PageSize, PageToken: q.PageToken})
 	if err != nil {
 		writeAppError(w, err)
@@ -208,15 +212,26 @@ type scheduleSummariesResp struct {
 // 上次运行/近 7 天批次、空批与推送数）。与 GET /api/schedules 同序，前端按 schedule_id 装配。
 // GET /api/schedules/summary → 200 scheduleSummariesResp
 func (s *server) handleListScheduleSummaries(w http.ResponseWriter, r *http.Request) {
-	userID, err := s.ownerUserID(r.Context())
+	principal, err := s.deps.Principal.FromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
-	items, err := s.deps.Store.ListScheduleRunSummaries(r.Context(), userID)
+	tasks, err := s.deps.Store.ListSchedulesForMember(
+		r.Context(), int64(principal.TenantID), principal.UserID)
 	if err != nil {
 		writeAppError(w, err)
 		return
+	}
+	items := make([]store.ScheduleRunSummary, 0, len(tasks))
+	for i := range tasks {
+		summary, summaryErr := s.deps.Store.GetScheduleRunSummary(
+			r.Context(), tasks[i].UserID, tasks[i].ID)
+		if summaryErr != nil {
+			writeAppError(w, summaryErr)
+			return
+		}
+		items = append(items, *summary)
 	}
 	if items == nil {
 		items = []store.ScheduleRunSummary{}

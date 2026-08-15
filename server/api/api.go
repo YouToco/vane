@@ -65,6 +65,15 @@ type scheduleNextRunReader interface {
 	NextRun(ctx context.Context, schedID string, userID int64) (*time.Time, error)
 }
 
+type teamTaskAccessStore interface {
+	AuthorizeScheduleMutation(
+		context.Context, int64, int64, string, store.TaskMutation,
+	) (*types.Schedule, error)
+	TransferScheduleAssignee(
+		context.Context, int64, int64, string, int64,
+	) (*types.Schedule, error)
+}
+
 // TaskAgent is the direct natural-language task control plane exposed to Web.
 type TaskAgent interface {
 	HandleMessage(
@@ -133,6 +142,9 @@ type WorkspaceStore interface {
 // Deps 是 Mount 所需的全部依赖，由 main.go 注入。
 type Deps struct {
 	Store *store.Store
+	// TeamTasks is independently injectable for HTTP authorization tests.
+	// Production leaves it nil and uses Store.
+	TeamTasks teamTaskAccessStore
 	// Auth 是认证路径的窄接口；生产与 Store 同为 *store.Store。
 	Auth AuthStore
 	// Workspaces can be injected independently in tests. Production falls back
@@ -160,6 +172,13 @@ type Deps struct {
 	// 前端迁 OSS+CDN 后与 API 跨源（vane.* → api.*），凭证请求要求逐字匹配的
 	// Allow-Origin + Allow-Credentials，不允许通配符。为空 = 不放行任何跨源。
 	Origin string
+}
+
+func (s *server) teamTaskAccess() teamTaskAccessStore {
+	if s.deps.TeamTasks != nil {
+		return s.deps.TeamTasks
+	}
+	return s.deps.Store
 }
 
 type server struct {
@@ -217,6 +236,7 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)
 	inner.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
+	inner.HandleFunc("PATCH /api/schedules/{id}/assignee", s.handleTransferScheduleAssignee)
 
 	// M7 任务数据面端点（功能 6.6/6.7）：只读，任务详情/运行历史/简报/列表概览。
 	// "summary" 是字面段，ServeMux 精确度规则保证它优先于 {id} 通配匹配。

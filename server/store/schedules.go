@@ -111,6 +111,12 @@ func scanSchedule(row pgx.Row, sc *types.Schedule) error {
 		return fmt.Errorf("store: schedule %q has invalid execution mode: %w", sc.ID, err)
 	}
 	sc.ExecutionMode = mode
+	// Retained-schema/internal readers predate the transferable product
+	// assignee. Their rows are necessarily self-owned; team-facing readers use
+	// scanTeamSchedule below and load the explicit identities from migration 136.
+	sc.AssigneeUserID = sc.UserID
+	sc.CreatorUserID = sc.UserID
+	sc.Visibility = types.TaskVisibilityPersonal
 	return nil
 }
 
