@@ -762,6 +762,19 @@ def command_full(args: argparse.Namespace) -> int:
     work_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not work_root.is_dir():
         raise PolicyError("VANE_WORK_ROOT is unavailable")
+    # Run the cheap repository/control-plane gates before provisioning native
+    # PostgreSQL and executing the expensive product Gate. full_gate is last so
+    # its exact-main timing seed publication can only occur after every earlier
+    # full-command stage has succeeded.
+    run_checked([str(scanner)], cwd=ROOT)
+    run_checked(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests/contract", "-p", "test_*.py"],
+        cwd=ROOT,
+    )
+    run_checked(
+        [sys.executable, "-m", "unittest", "discover", "-s", "ops/tests", "-p", "test_*.py"],
+        cwd=ROOT,
+    )
     old_full_sha = os.environ.get("VANE_FULL_SHA")
     old_work_root = os.environ.get("VANE_WORK_ROOT")
     old_gate_cache_root = os.environ.get("VANE_GATE_CACHE_ROOT")
@@ -769,7 +782,6 @@ def command_full(args: argparse.Namespace) -> int:
     os.environ["VANE_WORK_ROOT"] = str(work_root)
     os.environ["VANE_GATE_CACHE_ROOT"] = str(GATE_CACHE_ROOT)
     try:
-        run_checked([str(scanner)], cwd=ROOT)
         run_checked([sys.executable, "-m", "ops.audit.full_gate"], cwd=ROOT)
     finally:
         if old_full_sha is None:
@@ -784,14 +796,6 @@ def command_full(args: argparse.Namespace) -> int:
             os.environ.pop("VANE_GATE_CACHE_ROOT", None)
         else:
             os.environ["VANE_GATE_CACHE_ROOT"] = old_gate_cache_root
-    run_checked(
-        [sys.executable, "-m", "unittest", "discover", "-s", "tests/contract", "-p", "test_*.py"],
-        cwd=ROOT,
-    )
-    run_checked(
-        [sys.executable, "-m", "unittest", "discover", "-s", "ops/tests", "-p", "test_*.py"],
-        cwd=ROOT,
-    )
     return 0
 
 

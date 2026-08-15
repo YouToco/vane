@@ -73,10 +73,10 @@ class FullGatePolicyTest(unittest.TestCase):
     def test_full_ignores_caller_timing_cache_override_and_restores_it(self) -> None:
         revision = "b" * 40
         clean = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        observed: list[str | None] = []
+        observed: list[tuple[list[str], str | None]] = []
 
-        def capture_environment(*_args: object, **_kwargs: object) -> None:
-            observed.append(os.environ.get("VANE_GATE_CACHE_ROOT"))
+        def capture_environment(command: list[str], **_kwargs: object) -> None:
+            observed.append((command, os.environ.get("VANE_GATE_CACHE_ROOT")))
 
         with mock.patch.dict(
             os.environ, {"VANE_GATE_CACHE_ROOT": "/tmp/candidate-cache"}
@@ -84,16 +84,42 @@ class FullGatePolicyTest(unittest.TestCase):
              mock.patch.object(controller.subprocess, "run", return_value=clean), \
              mock.patch.object(controller, "run_checked", side_effect=capture_environment):
             self.assertEqual(controller.command_full(argparse.Namespace(sha=revision)), 0)
-            self.assertGreaterEqual(len(observed), 2)
-            self.assertTrue(
-                all(
-                    value == str(controller.GATE_CACHE_ROOT)
-                    for value in observed[:2]
-                )
+            full_gate_call = next(
+                value for command, value in observed
+                if "ops.audit.full_gate" in command
             )
+            self.assertEqual(full_gate_call, str(controller.GATE_CACHE_ROOT))
             self.assertEqual(
                 os.environ["VANE_GATE_CACHE_ROOT"], "/tmp/candidate-cache"
             )
+
+    def test_full_runs_cheap_policy_gates_before_expensive_product_gate(self) -> None:
+        revision = "b" * 40
+        clean = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(controller, "git_revision", return_value=revision), \
+             mock.patch.object(controller.subprocess, "run", return_value=clean), \
+             mock.patch.object(controller, "run_checked") as checked:
+            self.assertEqual(controller.command_full(argparse.Namespace(sha=revision)), 0)
+        commands = [call.args[0] for call in checked.call_args_list]
+        scanner_index = next(
+            index for index, command in enumerate(commands)
+            if "check-go-skips.sh" in command[0]
+        )
+        contract_index = next(
+            index for index, command in enumerate(commands)
+            if "tests/contract" in command
+        )
+        ops_index = next(
+            index for index, command in enumerate(commands)
+            if "ops/tests" in command
+        )
+        product_index = next(
+            index for index, command in enumerate(commands)
+            if "ops.audit.full_gate" in command
+        )
+        self.assertLess(scanner_index, contract_index)
+        self.assertLess(contract_index, ops_index)
+        self.assertLess(ops_index, product_index)
 
     def test_full_rejects_wrong_or_dirty_exact_checkout(self) -> None:
         with mock.patch.object(controller, "git_revision", return_value="c" * 40):

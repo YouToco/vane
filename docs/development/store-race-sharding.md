@@ -35,6 +35,9 @@ After a successful exact-main full run, the local controller projects verified
 terminal events to a canonical timing seed under the exact commit key in the
 owner-private `.vane/gate-cache`. A subsequent run first looks for its own exact
 SHA (idempotent retry), then its exact rollback-base SHA (next main revision).
+Static skip policy, repository contracts, and control-plane tests run before
+the expensive product Gate, so seed publication is the final full-command
+stage rather than an intermediate success marker.
 Branch rehearsals may read a merged base seed but never publish into the trusted
 namespace. Historical longest-processing-time balancing is used only when
 every current top-level test has authoritative timing. Missing, corrupt, empty,
