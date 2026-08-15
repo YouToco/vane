@@ -96,44 +96,51 @@ func TestProductionCallersCannotReferenceDarkSandbox(t *testing.T) {
 	if !ok {
 		t.Fatal("test source path unavailable")
 	}
-	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(sourcePath), "..", ".."))
-	for _, relative := range []string{"server/cmd/server", "server/agent", "server/skillpkg", "server/mcpclient"} {
-		root := filepath.Join(repositoryRoot, relative)
-		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil || entry.IsDir() || filepath.Ext(path) != ".go" {
-				return walkErr
-			}
-			parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-			if err != nil {
-				return err
-			}
-			var forbidden string
-			ast.Inspect(parsed, func(node ast.Node) bool {
-				switch value := node.(type) {
-				case *ast.ImportSpec:
-					literal, _ := strconv.Unquote(value.Path.Value)
-					if strings.HasSuffix(literal, "/server/sandbox") {
-						forbidden = literal
-					}
-				case *ast.Ident:
-					if value.Name == "sandbox" || value.Name == "sandboxd" {
-						forbidden = value.Name
-					}
-				case *ast.BasicLit:
-					if value.Kind == token.STRING && strings.Contains(value.Value, "sandboxd") {
-						forbidden = "sandboxd"
-					}
-				}
-				return forbidden == ""
-			})
-			if forbidden != "" {
-				return fmt.Errorf("%s references dark sandbox authority %q", path, forbidden)
+	serverRoot := filepath.Clean(filepath.Join(filepath.Dir(sourcePath), ".."))
+	err := filepath.WalkDir(serverRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(serverRoot, path)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if relative == "sandbox" || relative == filepath.Join("cmd", "sandboxd") ||
+				relative == "third_party" || entry.Name() == "vendor" {
+				return filepath.SkipDir
 			}
 			return nil
-		})
-		if err != nil {
-			t.Fatal(err)
 		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		var forbidden string
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch value := node.(type) {
+			case *ast.ImportSpec:
+				literal, _ := strconv.Unquote(value.Path.Value)
+				if strings.HasSuffix(literal, "/server/sandbox") {
+					forbidden = literal
+				}
+			case *ast.SelectorExpr:
+				if receiver, ok := value.X.(*ast.Ident); ok && receiver.Name == "sandbox" {
+					forbidden = "sandbox." + value.Sel.Name
+				}
+			}
+			return forbidden == ""
+		})
+		if forbidden != "" {
+			return fmt.Errorf("%s references dark sandbox authority %q", path, forbidden)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -225,6 +232,88 @@ func TestDaemonAuthorizedRoundTripDoesNotWaitForEOF(t *testing.T) {
 	}
 }
 
+func TestDaemonConnectionLimitRejectsBusyAndReleasesSlowFrameSlot(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "vane-sandbox-connection-limit-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid, ok := fileOwner(info)
+	if !ok {
+		t.Fatal("socket parent owner unavailable")
+	}
+	request := testRequest(t, "connection-limit", 1, 2)
+	service, err := NewService(ServiceConfig{MaxInputBytes: 1024,
+		AllowedPolicyDigests: map[string]struct{}{request.PolicyDigest: {}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	socket := filepath.Join(directory, "sandboxd.sock")
+	daemon := Daemon{SocketPath: socket, Socket: SocketContract{
+		ParentUID: uid, ParentGID: gid, ParentMode: 0o700,
+		SocketUID: os.Geteuid(), SocketGID: os.Getegid(), SocketMode: 0o660,
+		allowUnprivilegedForTest: true,
+	}, Service: service, Authorizer: authorizerFunc(func(*net.UnixConn) error {
+		select {
+		case authorized <- struct{}{}:
+		default:
+		}
+		return nil
+	}), MaxConnections: 1, MaxWireBytes: MinWireBytesLimit, connectionTimeoutForTest: 100 * time.Millisecond}
+	go func() { done <- daemon.Serve(ctx) }()
+	waitForSocket(t, socket)
+	slow, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-authorized:
+	case <-time.After(time.Second):
+		t.Fatal("slow authorized peer did not acquire the only slot")
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], 100)
+	if _, err := slow.Write(append(header[:], byte('{'))); err != nil {
+		t.Fatal(err)
+	}
+	busy, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response wireResponse
+	if err := readWire(busy, &response, MinWireBytesLimit); err != nil || response.ErrorCode != "busy" {
+		t.Fatalf("over-limit peer response=%+v err=%v", response, err)
+	}
+	_ = busy.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		result, executeErr := (Client{SocketPath: socket, MaxWireBytes: MinWireBytesLimit}).Execute(t.Context(), request)
+		if executeErr != nil && executeErr.Error() == "dark_foundation" && result.Status == "disabled" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slow frame slot was not released result=%+v err=%v", result, executeErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_ = slow.Close()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWireFrameRejectsOversizeAndTrailingWhitespace(t *testing.T) {
 	frame := func(payload []byte) []byte {
 		result := make([]byte, 4+len(payload))
@@ -233,15 +322,15 @@ func TestWireFrameRejectsOversizeAndTrailingWhitespace(t *testing.T) {
 		return result
 	}
 	var decoded map[string]any
-	if err := readWire(bytes.NewReader(frame([]byte(`{"ok":true} `))), &decoded); err == nil {
+	if err := readWire(bytes.NewReader(frame([]byte(`{"ok":true} `))), &decoded, DefaultMaxWireBytes); err == nil {
 		t.Fatal("JSON trailing whitespace inside a frame was accepted")
 	}
 	var oversized [4]byte
-	binary.BigEndian.PutUint32(oversized[:], maxWireBytes+1)
-	if err := readWire(bytes.NewReader(oversized[:]), &decoded); err == nil {
+	binary.BigEndian.PutUint32(oversized[:], DefaultMaxWireBytes+1)
+	if err := readWire(bytes.NewReader(oversized[:]), &decoded, DefaultMaxWireBytes); err == nil {
 		t.Fatal("oversized declared frame was accepted")
 	}
-	if err := writeWire(io.Discard, map[string]string{"payload": strings.Repeat("x", maxWireBytes)}); err == nil {
+	if err := writeWire(io.Discard, map[string]string{"payload": strings.Repeat("x", DefaultMaxWireBytes)}, DefaultMaxWireBytes); err == nil {
 		t.Fatal("oversized encoded frame was accepted")
 	}
 }

@@ -15,7 +15,14 @@ import (
 	"time"
 )
 
-const maxWireBytes = 18 << 20
+const (
+	DefaultMaxConnections = 16
+	MaxConnectionsLimit   = 64
+	DefaultMaxWireBytes   = 256 << 10
+	MaxWireBytesLimit     = 256 << 10
+	MinWireBytesLimit     = 4 << 10
+	darkConnectionTimeout = 30 * time.Second
+)
 
 type wireResponse struct {
 	Result    Result `json:"result"`
@@ -40,10 +47,13 @@ func (a UIDAuthorizer) Authorize(conn *net.UnixConn) error {
 }
 
 type Daemon struct {
-	SocketPath string
-	Socket     SocketContract
-	Service    *Service
-	Authorizer PeerAuthorizer
+	SocketPath               string
+	Socket                   SocketContract
+	Service                  *Service
+	Authorizer               PeerAuthorizer
+	MaxConnections           int
+	MaxWireBytes             int
+	connectionTimeoutForTest time.Duration
 }
 
 type SocketContract struct {
@@ -66,6 +76,11 @@ func (d *Daemon) Serve(ctx context.Context) (returnErr error) {
 	if err := rejectUnsafeSocketPath(d.SocketPath, d.Socket); err != nil {
 		return err
 	}
+	maxConnections, maxWireBytes, err := normalizeDaemonLimits(d.MaxConnections, d.MaxWireBytes)
+	if err != nil {
+		return err
+	}
+	d.MaxConnections, d.MaxWireBytes = maxConnections, maxWireBytes
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: d.SocketPath, Net: "unix"})
 	if err != nil {
 		return fmt.Errorf("listen sandbox socket: %w", err)
@@ -101,6 +116,7 @@ func (d *Daemon) Serve(ctx context.Context) (returnErr error) {
 		<-ctx.Done()
 		_ = listener.Close()
 	}()
+	connectionSlots := make(chan struct{}, d.MaxConnections)
 	for {
 		conn, err := listener.AcceptUnix()
 		if err != nil {
@@ -109,20 +125,34 @@ func (d *Daemon) Serve(ctx context.Context) (returnErr error) {
 			}
 			return fmt.Errorf("accept sandbox socket: %w", err)
 		}
-		go d.handle(ctx, conn)
+		select {
+		case connectionSlots <- struct{}{}:
+			go func() {
+				defer func() { <-connectionSlots }()
+				d.handle(ctx, conn)
+			}()
+		default:
+			_ = conn.SetDeadline(time.Now().Add(time.Second))
+			_ = writeWire(conn, wireResponse{ErrorCode: "busy"}, d.MaxWireBytes)
+			_ = conn.Close()
+		}
 	}
 }
 
 func (d *Daemon) handle(ctx context.Context, conn *net.UnixConn) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Minute))
+	timeout := darkConnectionTimeout
+	if d.connectionTimeoutForTest > 0 {
+		timeout = d.connectionTimeoutForTest
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if err := d.Authorizer.Authorize(conn); err != nil {
-		_ = writeWire(conn, wireResponse{ErrorCode: "unauthorized_peer"})
+		_ = writeWire(conn, wireResponse{ErrorCode: "unauthorized_peer"}, d.MaxWireBytes)
 		return
 	}
 	var request Request
-	if err := readWire(conn, &request); err != nil {
-		_ = writeWire(conn, wireResponse{ErrorCode: "invalid_request"})
+	if err := readWire(conn, &request, d.MaxWireBytes); err != nil {
+		_ = writeWire(conn, wireResponse{ErrorCode: "invalid_request"}, d.MaxWireBytes)
 		return
 	}
 	result, err := d.Service.Execute(ctx, request)
@@ -130,10 +160,13 @@ func (d *Daemon) handle(ctx context.Context, conn *net.UnixConn) {
 	if err != nil {
 		response.ErrorCode = publicErrorCode(err)
 	}
-	_ = writeWire(conn, response)
+	_ = writeWire(conn, response, d.MaxWireBytes)
 }
 
-type Client struct{ SocketPath string }
+type Client struct {
+	SocketPath   string
+	MaxWireBytes int
+}
 
 func (c Client) Execute(ctx context.Context, request Request) (Result, error) {
 	dialer := net.Dialer{}
@@ -145,11 +178,18 @@ func (c Client) Execute(ctx context.Context, request Request) (Result, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
-	if err := writeWire(conn, request); err != nil {
+	maxWireBytes := c.MaxWireBytes
+	if maxWireBytes == 0 {
+		maxWireBytes = DefaultMaxWireBytes
+	}
+	if maxWireBytes < MinWireBytesLimit || maxWireBytes > MaxWireBytesLimit {
+		return Result{}, errors.New("sandbox client wire limit is outside the closed range")
+	}
+	if err := writeWire(conn, request, maxWireBytes); err != nil {
 		return Result{}, err
 	}
 	var response wireResponse
-	if err := readWire(conn, &response); err != nil {
+	if err := readWire(conn, &response, maxWireBytes); err != nil {
 		return Result{}, err
 	}
 	if response.ErrorCode != "" {
@@ -158,13 +198,13 @@ func (c Client) Execute(ctx context.Context, request Request) (Result, error) {
 	return response.Result, nil
 }
 
-func readWire(reader io.Reader, target any) error {
+func readWire(reader io.Reader, target any, maxBytes int) error {
 	var header [4]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return fmt.Errorf("read sandbox frame length: %w", err)
 	}
 	length := binary.BigEndian.Uint32(header[:])
-	if length == 0 || length > maxWireBytes {
+	if length == 0 || uint64(length) > uint64(maxBytes) {
 		return errors.New("sandbox frame length is outside the closed limit")
 	}
 	payload := make([]byte, int(length))
@@ -182,12 +222,12 @@ func readWire(reader io.Reader, target any) error {
 	return nil
 }
 
-func writeWire(writer io.Writer, value any) error {
+func writeWire(writer io.Writer, value any, maxBytes int) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("encode sandbox message: %w", err)
 	}
-	if len(payload) == 0 || len(payload) > maxWireBytes {
+	if len(payload) == 0 || len(payload) > maxBytes {
 		return errors.New("sandbox frame exceeds the closed wire limit")
 	}
 	var header [4]byte
@@ -199,6 +239,20 @@ func writeWire(writer io.Writer, value any) error {
 		return fmt.Errorf("write sandbox frame payload: %w", err)
 	}
 	return nil
+}
+
+func normalizeDaemonLimits(maxConnections, maxWireBytes int) (int, int, error) {
+	if maxConnections == 0 {
+		maxConnections = DefaultMaxConnections
+	}
+	if maxWireBytes == 0 {
+		maxWireBytes = DefaultMaxWireBytes
+	}
+	if maxConnections < 1 || maxConnections > MaxConnectionsLimit ||
+		maxWireBytes < MinWireBytesLimit || maxWireBytes > MaxWireBytesLimit {
+		return 0, 0, errors.New("sandbox daemon resource limits are outside the closed range")
+	}
+	return maxConnections, maxWireBytes, nil
 }
 
 func writeFull(writer io.Writer, payload []byte) error {

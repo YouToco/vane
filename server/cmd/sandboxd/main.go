@@ -35,6 +35,8 @@ type config struct {
 	SocketMode           uint32                    `json:"socket_mode"`
 	VaneServerUID        uint32                    `json:"vane_server_uid"`
 	MaxInputBytes        int                       `json:"max_input_bytes"`
+	MaxConnections       int                       `json:"max_connections"`
+	MaxWireBytes         int                       `json:"max_wire_bytes"`
 	AllowedPolicyDigests []string                  `json:"allowed_policy_sha256"`
 	Firecracker          sandbox.FirecrackerConfig `json:"firecracker"`
 }
@@ -92,7 +94,8 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) int 
 				ParentMode: os.FileMode(configuration.SocketParentMode),
 				SocketUID:  configuration.SocketUID, SocketGID: configuration.SocketGID,
 				SocketMode: os.FileMode(configuration.SocketMode),
-			}, Service: service, Authorizer: sandbox.UIDAuthorizer{UID: configuration.VaneServerUID}}
+			}, Service: service, Authorizer: sandbox.UIDAuthorizer{UID: configuration.VaneServerUID},
+			MaxConnections: configuration.MaxConnections, MaxWireBytes: configuration.MaxWireBytes}
 		if err := daemon.Serve(ctx); err != nil {
 			fmt.Fprintf(stderr, "sandboxd stopped unsafely: %v\n", err)
 			return 1
@@ -140,6 +143,9 @@ func loadConfig(path string, requireRoot bool) (config, error) {
 	if !filepath.IsAbs(value.SocketPath) || value.SocketParentUID != 0 || value.SocketUID != 0 ||
 		value.SocketGID < 0 || (value.SocketParentMode != 0o700 && value.SocketParentMode != 0o750) ||
 		value.SocketMode != 0o660 || value.MaxInputBytes < 1 ||
+		value.MaxConnections < 1 || value.MaxConnections > sandbox.MaxConnectionsLimit ||
+		value.MaxWireBytes < sandbox.MinWireBytesLimit || value.MaxWireBytes > sandbox.MaxWireBytesLimit ||
+		value.MaxInputBytes > value.MaxWireBytes ||
 		value.VaneServerUID == 0 || len(value.AllowedPolicyDigests) == 0 {
 		return value, errors.New("sandboxd authority or resource contract is incomplete")
 	}
