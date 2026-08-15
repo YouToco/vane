@@ -9,7 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -25,8 +25,15 @@ BUCKET = "zhuoqidev-vane-web"
 REGION = "cn-shenzhen"
 OWNER_PREVIEW = "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
 RELEASE_MARKER_PATH = "vane-release.json"
+RECEIPT_SCHEMA = "vane.web.aliyun-release/v1"
+CURRENT_SCHEMA = "vane.web-current/v1"
+PROOF_SCHEMA = "vane.web-provider-proof/v1"
 OSS_WORKERS = 8
 CDN_WORKERS = 4
+DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+CONTENT_HASH_RE = re.compile(
+    r"^.+[._-][A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9]+)+$"
+)
 
 
 def sha256(path: Path) -> str:
@@ -102,25 +109,10 @@ def parallel_apply(
         raise RuntimeError(f"{label} failed for {first}: {failures[first]}")
 
 
-def verify_public_release(
-    origin: str,
-    revision: str,
-    *,
-    expected_marker: bytes,
-    expected_index_sha256: str,
-    attempts: int = 6,
-) -> dict:
-    def strict_pairs(items: list[tuple[str, object]]) -> dict[str, object]:
-        value: dict[str, object] = {}
-        for key, item in items:
-            if key in value:
-                raise RuntimeError(f"duplicate local Web release marker key: {key}")
-            value[key] = item
-        return value
-
+def validate_release_marker(expected_marker: bytes, revision: str) -> dict:
     try:
         marker_value = json.loads(expected_marker, object_pairs_hook=strict_pairs)
-    except json.JSONDecodeError as error:
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError("local Web release marker is invalid") from error
     if (
         not isinstance(marker_value, dict)
@@ -129,11 +121,24 @@ def verify_public_release(
         or marker_value.get("schema") != "vane.web-release/v1"
         or marker_value.get("source_revision") != revision
         or marker_value.get("source_dirty") is not False
-        or not re.fullmatch(r"[0-9a-f]{64}", marker_value.get("tree_sha256", ""))
+        or not isinstance(marker_value.get("tree_sha256"), str)
+        or DIGEST_RE.fullmatch(marker_value["tree_sha256"]) is None
         or type(marker_value.get("file_count")) is not int
         or marker_value["file_count"] <= 0
     ):
         raise RuntimeError("local Web release marker is not exact clean evidence")
+    return marker_value
+
+
+def verify_public_release(
+    origin: str,
+    revision: str,
+    *,
+    expected_marker: bytes,
+    expected_index_sha256: str,
+    attempts: int = 6,
+) -> dict:
+    marker_value = validate_release_marker(expected_marker, revision)
     last_error: Exception | None = None
     if attempts < 1 or attempts > 6:
         raise RuntimeError("public Web verification attempt count is invalid")
@@ -199,6 +204,220 @@ def verify_oss_object(
         raise RuntimeError(f"OSS object differs from exact artifact bytes: {object_name}")
 
 
+def strict_pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in items:
+        if key in value:
+            raise RuntimeError(f"duplicate Web publication evidence key: {key}")
+        value[key] = item
+    return value
+
+
+def load_strict_json(path: Path, subject: str) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"{subject} is missing or unsafe")
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=strict_pairs
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"{subject} is invalid JSON") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{subject} is not an object")
+    return value
+
+
+def validate_object_path(value: object) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("Web provider proof contains a non-string object path")
+    path = PurePosixPath(value)
+    if (
+        any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or "\\" in value
+        or path.is_absolute()
+        or str(path) != value
+        or not path.parts
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise RuntimeError(f"Web provider proof contains an unsafe path: {value!r}")
+    return value
+
+
+def validate_file_record(value: object, subject: str) -> dict:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256", "size"}:
+        raise RuntimeError(f"{subject} file record has an invalid shape")
+    path = validate_object_path(value["path"])
+    digest = value["sha256"]
+    size = value["size"]
+    if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
+        raise RuntimeError(f"{subject} file digest is invalid: {path}")
+    if type(size) is not int or size < 0:
+        raise RuntimeError(f"{subject} file size is invalid: {path}")
+    return {"path": path, "sha256": digest, "size": size}
+
+
+def validate_receipt(value: dict, revision: str) -> dict[str, dict]:
+    if set(value) != {
+        "schema", "bucket", "source_sha", "entry_path", "entry_sha256", "files"
+    }:
+        raise RuntimeError("Web release receipt has an invalid shape")
+    if (
+        value.get("schema") != RECEIPT_SCHEMA
+        or value.get("bucket") != BUCKET
+        or value.get("source_sha") != revision
+        or value.get("entry_path") != "index.html"
+        or not isinstance(value.get("entry_sha256"), str)
+        or DIGEST_RE.fullmatch(value["entry_sha256"]) is None
+        or not isinstance(value.get("files"), list)
+        or not value["files"]
+    ):
+        raise RuntimeError("Web release receipt is not exact publication evidence")
+    records = [validate_file_record(item, "Web release receipt") for item in value["files"]]
+    paths = [record["path"] for record in records]
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise RuntimeError("Web release receipt files are not unique and sorted")
+    by_path = {record["path"]: record for record in records}
+    if (
+        "index.html" not in by_path
+        or by_path["index.html"]["sha256"] != value["entry_sha256"]
+        or RELEASE_MARKER_PATH not in by_path
+    ):
+        raise RuntimeError("Web release receipt is missing its exact entry or marker")
+    return by_path
+
+
+def validate_current(value: dict) -> dict:
+    if set(value) != {"schema", "revision", "receipt_sha256"}:
+        raise RuntimeError("Web current state has an invalid shape")
+    if (
+        value.get("schema") != CURRENT_SCHEMA
+        or not isinstance(value.get("revision"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", value["revision"]) is None
+        or not isinstance(value.get("receipt_sha256"), str)
+        or DIGEST_RE.fullmatch(value["receipt_sha256"]) is None
+    ):
+        raise RuntimeError("Web current state is invalid")
+    return value
+
+
+def proof_directory(state_root: Path, receipt_digest: str) -> Path:
+    return state_root / "web-proofs" / receipt_digest
+
+
+def validate_proof_destination(state_root: Path, receipt_digest: str) -> None:
+    proof_root = state_root / "web-proofs"
+    if proof_root.is_symlink() or (proof_root.exists() and not proof_root.is_dir()):
+        raise RuntimeError("Web provider proof root is unsafe")
+    destination = proof_directory(state_root, receipt_digest)
+    if destination.is_symlink() or (
+        destination.exists() and not destination.is_dir()
+    ):
+        raise RuntimeError("Web provider proof directory is unsafe")
+    if destination.is_dir():
+        for name in ("receipt.json", "marker.json", "proof.json"):
+            evidence = destination / name
+            if evidence.is_symlink() or (evidence.exists() and not evidence.is_file()):
+                raise RuntimeError("Web provider proof evidence path is unsafe")
+
+
+def persist_provider_proof(
+    *,
+    state_root: Path,
+    revision: str,
+    receipt: Path,
+    receipt_digest: str,
+    receipt_files: dict[str, dict],
+    marker_path: Path,
+    critical_objects: list[str],
+) -> None:
+    proof_root = state_root / "web-proofs"
+    if proof_root.is_symlink():
+        raise RuntimeError("Web provider proof root is a symlink")
+    proof_root.mkdir(mode=0o700, exist_ok=True)
+    destination = proof_directory(state_root, receipt_digest)
+    if destination.is_symlink():
+        raise RuntimeError("Web provider proof directory is a symlink")
+    destination.mkdir(mode=0o700, exist_ok=True)
+    records = [
+        receipt_files[path]
+        for path in sorted(critical_objects)
+        if CONTENT_HASH_RE.fullmatch(PurePosixPath(path).name) is not None
+    ]
+    proof = {
+        "schema": PROOF_SCHEMA,
+        "revision": revision,
+        "receipt_sha256": receipt_digest,
+        "marker_sha256": sha256(marker_path),
+        "index_sha256": receipt_files["index.html"]["sha256"],
+        "verified_objects": records,
+    }
+    atomic_copy(receipt, destination / "receipt.json")
+    atomic_copy(marker_path, destination / "marker.json")
+    atomic_json(destination / "proof.json", proof)
+
+
+def load_provider_proof(
+    *, state_root: Path, current: dict, origin: str
+) -> dict[str, dict]:
+    destination = proof_directory(state_root, current["receipt_sha256"])
+    if not destination.exists():
+        return {}
+    proof_root = destination.parent
+    if proof_root.is_symlink() or destination.is_symlink() or not destination.is_dir():
+        raise RuntimeError("Web provider proof path is unsafe")
+    receipt_path = destination / "receipt.json"
+    marker_path = destination / "marker.json"
+    proof_path = destination / "proof.json"
+    receipt = load_strict_json(receipt_path, "Web provider proof receipt")
+    if sha256(receipt_path) != current["receipt_sha256"]:
+        raise RuntimeError("Web provider proof receipt differs from current state")
+    receipt_files = validate_receipt(receipt, current["revision"])
+    proof = load_strict_json(proof_path, "Web provider proof")
+    if set(proof) != {
+        "schema", "revision", "receipt_sha256", "marker_sha256",
+        "index_sha256", "verified_objects",
+    }:
+        raise RuntimeError("Web provider proof has an invalid shape")
+    if (
+        proof.get("schema") != PROOF_SCHEMA
+        or proof.get("revision") != current["revision"]
+        or proof.get("receipt_sha256") != current["receipt_sha256"]
+        or not isinstance(proof.get("marker_sha256"), str)
+        or DIGEST_RE.fullmatch(proof["marker_sha256"]) is None
+        or proof.get("index_sha256") != receipt_files["index.html"]["sha256"]
+        or not isinstance(proof.get("verified_objects"), list)
+    ):
+        raise RuntimeError("Web provider proof is inconsistent with current state")
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise RuntimeError("Web provider proof marker is missing or unsafe")
+    marker = marker_path.read_bytes()
+    if (
+        hashlib.sha256(marker).hexdigest() != proof["marker_sha256"]
+        or proof["marker_sha256"] != receipt_files[RELEASE_MARKER_PATH]["sha256"]
+    ):
+        raise RuntimeError("Web provider proof marker digest is invalid")
+    records = [
+        validate_file_record(item, "Web provider proof")
+        for item in proof["verified_objects"]
+    ]
+    paths = [record["path"] for record in records]
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise RuntimeError("Web provider proof objects are not unique and sorted")
+    for record in records:
+        path = record["path"]
+        if receipt_files.get(path) != record:
+            raise RuntimeError(f"Web provider proof object differs from receipt: {path}")
+        if CONTENT_HASH_RE.fullmatch(PurePosixPath(path).name) is None:
+            raise RuntimeError(f"Web provider proof object is not content-addressed: {path}")
+    verify_public_release(
+        origin,
+        current["revision"],
+        expected_marker=marker,
+        expected_index_sha256=proof["index_sha256"],
+    )
+    return {record["path"]: record for record in records}
+
+
 def publish(
     *, dist: Path, revision: str, work_root: Path, state_root: Path,
     tool_cache: Path, origin: str, result_path: Path,
@@ -217,8 +436,13 @@ def publish(
         raise RuntimeError("Web public origin must use HTTPS")
     state_file = state_root / "web-current.json"
     lock_file = state_root / "web-release.lock"
-    if state_file.is_symlink() or lock_file.is_symlink():
-        raise RuntimeError("Web publication state paths must not be symlinks")
+    if (
+        state_file.is_symlink()
+        or lock_file.is_symlink()
+        or (state_file.exists() and not state_file.is_file())
+        or (lock_file.exists() and not lock_file.is_file())
+    ):
+        raise RuntimeError("Web publication state paths are unsafe")
 
     lock = json.loads(
         (ROOT / "tools/toolchain.lock.json").read_text(encoding="utf-8")
@@ -251,15 +475,47 @@ def publish(
             )
             receipt = plan / "release.json"
             receipt_digest = sha256(receipt)
+            validate_proof_destination(state_root, receipt_digest)
+            receipt_value = load_strict_json(receipt, "Web release receipt")
+            receipt_files = validate_receipt(receipt_value, revision)
             marker_path = dist / RELEASE_MARKER_PATH
             if marker_path.is_symlink() or not marker_path.is_file():
                 raise RuntimeError("Web release marker is missing or unsafe")
             expected_marker = marker_path.read_bytes()
+            validate_release_marker(expected_marker, revision)
             expected_index_sha256 = sha256(dist / "index.html")
+            if expected_index_sha256 != receipt_files["index.html"]["sha256"]:
+                raise RuntimeError("Web entrypoint differs from its release receipt")
+            asset_objects = lines(plan / "assets.list")
+            if len(asset_objects) != len(set(asset_objects)):
+                raise RuntimeError("Web asset plan contains duplicate objects")
+            critical_objects: list[str] = []
+            for row in lines(plan / "critical-assets.list"):
+                size, object_name = row.split("\t", 1)
+                record = receipt_files.get(object_name)
+                if record is None:
+                    raise RuntimeError(
+                        f"critical asset is absent from its receipt: {object_name}"
+                    )
+                local = dist / object_name
+                if (
+                    int(size) != record["size"]
+                    or int(size) != local.stat().st_size
+                    or sha256(local) != record["sha256"]
+                ):
+                    raise RuntimeError(f"local critical asset differs: {object_name}")
+                critical_objects.append(object_name)
+            if len(critical_objects) != len(set(critical_objects)):
+                raise RuntimeError("Web critical asset plan contains duplicate objects")
+            if any(object_name not in receipt_files for object_name in asset_objects):
+                raise RuntimeError("Web asset plan contains an object absent from its receipt")
+            current: dict | None = None
             if state_file.is_file() and not state_file.is_symlink():
-                current = json.loads(state_file.read_text(encoding="utf-8"))
+                current = validate_current(
+                    load_strict_json(state_file, "Web current state")
+                )
                 expected_current = {
-                    "schema": "vane.web-current/v1",
+                    "schema": CURRENT_SCHEMA,
                     "revision": revision,
                     "receipt_sha256": receipt_digest,
                 }
@@ -273,6 +529,15 @@ def publish(
                         revision,
                         expected_marker=expected_marker,
                         expected_index_sha256=expected_index_sha256,
+                    )
+                    persist_provider_proof(
+                        state_root=state_root,
+                        revision=revision,
+                        receipt=receipt,
+                        receipt_digest=receipt_digest,
+                        receipt_files=receipt_files,
+                        marker_path=marker_path,
+                        critical_objects=critical_objects,
                     )
                     result = {
                         "schema": "vane.web-publication/v1", "revision": revision,
@@ -300,7 +565,7 @@ def publish(
                 marker = None
             if marker is not None:
                 state = {
-                    "schema": "vane.web-current/v1",
+                    "schema": CURRENT_SCHEMA,
                     "revision": revision,
                     "receipt_sha256": receipt_digest,
                 }
@@ -309,10 +574,44 @@ def publish(
                     "receipt_sha256": receipt_digest, "marker": marker,
                     "status": "provider-already-current",
                 }
+                persist_provider_proof(
+                    state_root=state_root,
+                    revision=revision,
+                    receipt=receipt,
+                    receipt_digest=receipt_digest,
+                    receipt_files=receipt_files,
+                    marker_path=marker_path,
+                    critical_objects=critical_objects,
+                )
                 atomic_copy(receipt, result_path.with_name("web-release-receipt.json"))
                 atomic_json(state_file, state)
                 atomic_json(result_path, result)
                 return result
+
+            prior_verified: dict[str, dict] = {}
+            if current is not None:
+                prior_verified = load_provider_proof(
+                    state_root=state_root,
+                    current=current,
+                    origin=origin,
+                )
+            reusable = {
+                object_name
+                for object_name in critical_objects
+                if (
+                    CONTENT_HASH_RE.fullmatch(PurePosixPath(object_name).name)
+                    is not None
+                    and prior_verified.get(object_name) == receipt_files[object_name]
+                )
+            }
+            upload_objects = [
+                object_name for object_name in asset_objects
+                if object_name not in reusable
+            ]
+            readback_objects = [
+                object_name for object_name in critical_objects
+                if object_name not in reusable
+            ]
 
             provider_env = {
                 **os.environ,
@@ -321,8 +620,12 @@ def publish(
                 "OSS_REGION": REGION,
             }
             publication_started = time.monotonic()
-            timings: dict[str, float] = {}
-            asset_objects = lines(plan / "assets.list")
+            timings: dict[str, float | int] = {
+                "asset_total": len(asset_objects),
+                "reused_immutable": len(reusable),
+                "uploaded": len(upload_objects),
+                "readback": len(readback_objects),
+            }
 
             def upload_asset(object_name: str) -> None:
                 run(
@@ -336,7 +639,7 @@ def publish(
             phase_started = time.monotonic()
             parallel_apply(
                 "OSS immutable upload",
-                asset_objects,
+                upload_objects,
                 upload_asset,
                 workers=OSS_WORKERS,
             )
@@ -344,12 +647,6 @@ def publish(
                 time.monotonic() - phase_started, 3
             )
             readback_root = plan / "provider-readback"
-            critical_objects: list[str] = []
-            for row in lines(plan / "critical-assets.list"):
-                size, object_name = row.split("\t", 1)
-                if int(size) != (dist / object_name).stat().st_size:
-                    raise RuntimeError(f"local critical asset size differs: {object_name}")
-                critical_objects.append(object_name)
 
             def readback_asset(object_name: str) -> None:
                 verify_oss_object(
@@ -363,7 +660,7 @@ def publish(
             phase_started = time.monotonic()
             parallel_apply(
                 "OSS critical readback",
-                critical_objects,
+                readback_objects,
                 readback_asset,
                 workers=OSS_WORKERS,
             )
@@ -477,7 +774,7 @@ def publish(
             )
             timings["total"] = round(time.monotonic() - publication_started, 3)
             state = {
-                "schema": "vane.web-current/v1",
+                "schema": CURRENT_SCHEMA,
                 "revision": revision,
                 "receipt_sha256": receipt_digest,
             }
@@ -486,6 +783,15 @@ def publish(
                 "receipt_sha256": receipt_digest, "marker": marker,
                 "status": "published",
             }
+            persist_provider_proof(
+                state_root=state_root,
+                revision=revision,
+                receipt=receipt,
+                receipt_digest=receipt_digest,
+                receipt_files=receipt_files,
+                marker_path=marker_path,
+                critical_objects=critical_objects,
+            )
             atomic_copy(receipt, result_path.with_name("web-release-receipt.json"))
             atomic_json(state_file, state)
             atomic_json(result_path, result)
