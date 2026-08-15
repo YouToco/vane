@@ -764,8 +764,10 @@ def command_full(args: argparse.Namespace) -> int:
         raise PolicyError("VANE_WORK_ROOT is unavailable")
     old_full_sha = os.environ.get("VANE_FULL_SHA")
     old_work_root = os.environ.get("VANE_WORK_ROOT")
+    old_gate_cache_root = os.environ.get("VANE_GATE_CACHE_ROOT")
     os.environ["VANE_FULL_SHA"] = args.sha
     os.environ["VANE_WORK_ROOT"] = str(work_root)
+    os.environ["VANE_GATE_CACHE_ROOT"] = str(GATE_CACHE_ROOT)
     try:
         run_checked([str(scanner)], cwd=ROOT)
         run_checked([sys.executable, "-m", "ops.audit.full_gate"], cwd=ROOT)
@@ -778,6 +780,10 @@ def command_full(args: argparse.Namespace) -> int:
             os.environ.pop("VANE_WORK_ROOT", None)
         else:
             os.environ["VANE_WORK_ROOT"] = old_work_root
+        if old_gate_cache_root is None:
+            os.environ.pop("VANE_GATE_CACHE_ROOT", None)
+        else:
+            os.environ["VANE_GATE_CACHE_ROOT"] = old_gate_cache_root
     run_checked(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests/contract", "-p", "test_*.py"],
         cwd=ROOT,
@@ -954,6 +960,7 @@ def sanitized_gate_environment(
         "PATH": f"{locked_go.parent}:{source.get('PATH', '')}",
         "VANE_WORK_ROOT": str(release_root),
         "VANE_FULL_GATE_EVIDENCE": str(gate_evidence),
+        "VANE_GATE_CACHE_ROOT": str(shared_cache),
         "VANE_ROLLBACK_BASE_SHA": rollback_base,
     })
     return result

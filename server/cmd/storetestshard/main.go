@@ -86,6 +86,10 @@ func run(args []string) (runErr error) {
 	flags.Var(&databaseURLs, "database-url", "independent PostgreSQL URL; repeat once per shard")
 	artifactDir := flags.String("artifacts", "tmp/store-sharding/run", "artifact directory")
 	timingPath := flags.String("timings", "", "optional prior go test -json timing artifact")
+	timingRoot := flags.String(
+		"timing-root", "",
+		"optional absolute trusted root for the relative timing artifact",
+	)
 	repoDir := flags.String("repo", ".", "repository root")
 	timeout := flags.Duration("timeout", 20*time.Minute, "timeout for each shard")
 	if err := flags.Parse(args); err != nil {
@@ -188,7 +192,7 @@ func run(args []string) (runErr error) {
 	}
 	status.ExpectedTests = len(tests)
 
-	timing, err := loadOptionalTimings(repo, *timingPath)
+	timing, err := loadOptionalTimings(repo, *timingRoot, *timingPath)
 	if err != nil {
 		return err
 	}
@@ -370,11 +374,22 @@ func timingSeed(args []string) error {
 	return json.NewEncoder(os.Stdout).Encode(summary)
 }
 
-func loadOptionalTimings(repo, path string) (timingInput, error) {
+func loadOptionalTimings(repo, timingRoot, path string) (timingInput, error) {
 	if path == "" {
 		return timingInput{status: "not_provided"}, nil
 	}
-	resolved, err := resolveRepoRelativeFile(repo, path)
+	root := repo
+	if timingRoot != "" {
+		if !filepath.IsAbs(timingRoot) {
+			return timingInput{}, errors.New("timing root must be absolute")
+		}
+		var err error
+		root, err = filepath.EvalSymlinks(timingRoot)
+		if err != nil {
+			return timingInput{}, fmt.Errorf("resolve timing root: %w", err)
+		}
+	}
+	resolved, err := resolveRepoRelativeFile(root, path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			fmt.Fprintln(os.Stderr, "timing input missing; using stable FNV-1a fallback")

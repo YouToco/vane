@@ -31,20 +31,18 @@ profiles with the three Store shard profiles before enforcing coverage policy.
 6. requires the three coverage profiles to contain identical block sets before
    summing their atomic counters.
 
-After a successful full run, the supervisor projects verified terminal events
-to a canonical timing seed under the exact commit key. A candidate may restore
-only its exact trusted base SHA. Historical longest-processing-time balancing is used only
-when every current top-level test has authoritative timing. Missing, corrupt,
-empty, or incomplete timing data falls back to stable FNV-1a assignment and is
-reported in `store-shard-status.json`. Cache restore, seed construction, and
-cache save are best-effort and cannot turn a correct test run red.
-
-The cache restore and save steps deliberately declare the same
-`tmp/store-timing-cache` path. GitHub includes the declared path in the cache
-version fingerprint, so using a different staging directory for save creates a
-valid-looking exact key that can never be restored. Main run `31364677761`
-bootstrapped the first same-path seed for commit `c27d018` after this boundary
-was corrected.
+After a successful exact-main full run, the local controller projects verified
+terminal events to a canonical timing seed under the exact commit key in the
+owner-private `.vane/gate-cache`. A subsequent run first looks for its own exact
+SHA (idempotent retry), then its exact rollback-base SHA (next main revision).
+Branch rehearsals may read a merged base seed but never publish into the trusted
+namespace. Historical longest-processing-time balancing is used only when
+every current top-level test has authoritative timing. Missing, corrupt, empty,
+or incomplete timing data falls back to stable FNV-1a assignment and is
+reported in `store-shard-status.json`. Seed construction and cache save remain
+best-effort and cannot turn an otherwise correct Gate red; path, ownership,
+permission, symlink, size, test-count, and terminal-event violations are never
+silently accepted as trusted cache authority.
 
 The same historical balancing remains available to explicit callers that
 provide the timing file inside the checkout:

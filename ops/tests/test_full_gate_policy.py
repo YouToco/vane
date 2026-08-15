@@ -70,6 +70,31 @@ class FullGatePolicyTest(unittest.TestCase):
             self.assertEqual(controller.command_full(argparse.Namespace(sha=revision)), 0)
         self.assertGreaterEqual(checked.call_count, 4)
 
+    def test_full_ignores_caller_timing_cache_override_and_restores_it(self) -> None:
+        revision = "b" * 40
+        clean = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        observed: list[str | None] = []
+
+        def capture_environment(*_args: object, **_kwargs: object) -> None:
+            observed.append(os.environ.get("VANE_GATE_CACHE_ROOT"))
+
+        with mock.patch.dict(
+            os.environ, {"VANE_GATE_CACHE_ROOT": "/tmp/candidate-cache"}
+        ), mock.patch.object(controller, "git_revision", return_value=revision), \
+             mock.patch.object(controller.subprocess, "run", return_value=clean), \
+             mock.patch.object(controller, "run_checked", side_effect=capture_environment):
+            self.assertEqual(controller.command_full(argparse.Namespace(sha=revision)), 0)
+            self.assertGreaterEqual(len(observed), 2)
+            self.assertTrue(
+                all(
+                    value == str(controller.GATE_CACHE_ROOT)
+                    for value in observed[:2]
+                )
+            )
+            self.assertEqual(
+                os.environ["VANE_GATE_CACHE_ROOT"], "/tmp/candidate-cache"
+            )
+
     def test_full_rejects_wrong_or_dirty_exact_checkout(self) -> None:
         with mock.patch.object(controller, "git_revision", return_value="c" * 40):
             with self.assertRaisesRegex(controller.PolicyError, "differs"):
@@ -175,6 +200,53 @@ class FullGatePolicyTest(unittest.TestCase):
                     full_gate.database_package_lanes(
                         ["example/a", "example/b"], lane_count=lane_count
                     )
+
+    def test_store_timing_cache_prefers_exact_head_then_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "gate-cache"
+            head = "a" * 40
+            base = "b" * 40
+            for revision, payload in ((base, b"base\n"), (head, b"head\n")):
+                source = Path(temporary) / f"{revision}.jsonl"
+                source.write_bytes(payload)
+                full_gate.publish_store_timing_seed(
+                    cache_root=cache, revision=revision, source=source
+                )
+            selected = full_gate.select_store_timing_seed(
+                cache_root=cache, revisions=(head, base)
+            )
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual(selected[1], head)
+            self.assertEqual(
+                (selected[0] / full_gate.STORE_TIMING_SEED_NAME).read_bytes(),
+                b"head\n",
+            )
+
+    def test_store_timing_cache_rejects_writable_or_linked_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "gate-cache"
+            revision = "c" * 40
+            source = Path(temporary) / "source.jsonl"
+            source.write_bytes(b"seed\n")
+            full_gate.publish_store_timing_seed(
+                cache_root=cache, revision=revision, source=source
+            )
+            seed = (
+                cache / full_gate.STORE_TIMING_CACHE_VERSION / revision
+                / full_gate.STORE_TIMING_SEED_NAME
+            )
+            seed.chmod(0o622)
+            with self.assertRaisesRegex(controller.PolicyError, "unsafe"):
+                full_gate.select_store_timing_seed(
+                    cache_root=cache, revisions=(revision,)
+                )
+            seed.unlink()
+            seed.symlink_to(source)
+            with self.assertRaisesRegex(controller.PolicyError, "unsafe"):
+                full_gate.select_store_timing_seed(
+                    cache_root=cache, revisions=(revision,)
+                )
 
     def test_destructive_role_test_rejects_production_looking_database(self) -> None:
         with self.assertRaisesRegex(controller.PolicyError, "proven disposable"):

@@ -16,6 +16,7 @@ from pathlib import PurePosixPath
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -59,6 +60,8 @@ DATABASE_TEST_MARKER = re.compile(
     r"DATABASE_URL|VANE_TEST_DATABASE_URL|"
     r"testgate\.(?:Database|CreateDatabase|DestructiveDatabase|PostgreSQLURL)"
 )
+STORE_TIMING_CACHE_VERSION = "store-race-timings-v1"
+STORE_TIMING_SEED_NAME = "store.timings.jsonl"
 
 
 def output(command: list[str], *, cwd: Path, env: dict[str, str]) -> str:
@@ -127,6 +130,88 @@ def database_package_lanes(
     for index, package in enumerate(packages):
         lanes[index % lane_count].append((index, package))
     return tuple(tuple(lane) for lane in lanes)
+
+
+def require_private_cache_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise PolicyError(f"Store timing cache directory is unsafe: {path}")
+    path.mkdir(parents=False, exist_ok=True, mode=0o700)
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise PolicyError(f"Store timing cache directory is unsafe: {path}")
+
+
+def select_store_timing_seed(
+    *, cache_root: Path, revisions: tuple[str, ...]
+) -> tuple[Path, str] | None:
+    if (
+        not cache_root.is_absolute()
+        or cache_root.is_symlink()
+        or cache_root.parent.is_symlink()
+    ):
+        raise PolicyError("Store timing cache root is unsafe")
+    require_private_cache_directory(cache_root)
+    timing_root = cache_root / STORE_TIMING_CACHE_VERSION
+    require_private_cache_directory(timing_root)
+    for revision in dict.fromkeys(revisions):
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise PolicyError("Store timing cache revision is invalid")
+        revision_root = timing_root / revision
+        if not revision_root.exists():
+            continue
+        require_private_cache_directory(revision_root)
+        seed = revision_root / STORE_TIMING_SEED_NAME
+        if not seed.exists():
+            continue
+        metadata = seed.lstat()
+        if (
+            seed.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or metadata.st_size <= 0
+            or metadata.st_size > 16 * 1024 * 1024
+        ):
+            raise PolicyError(f"Store timing seed is unsafe: {seed}")
+        return revision_root, revision
+    return None
+
+
+def publish_store_timing_seed(
+    *, cache_root: Path, revision: str, source: Path
+) -> None:
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise PolicyError("Store timing cache revision is invalid")
+    selected = select_store_timing_seed(cache_root=cache_root, revisions=(revision,))
+    timing_root = cache_root / STORE_TIMING_CACHE_VERSION
+    revision_root = timing_root / revision
+    if selected is None:
+        require_private_cache_directory(revision_root)
+    if source.is_symlink() or not source.is_file():
+        raise PolicyError("generated Store timing seed is unsafe")
+    payload = source.read_bytes()
+    if not payload or len(payload) > 16 * 1024 * 1024:
+        raise PolicyError("generated Store timing seed has an invalid size")
+    target = revision_root / STORE_TIMING_SEED_NAME
+    temporary = revision_root / f".{STORE_TIMING_SEED_NAME}.{os.getpid()}.tmp"
+    try:
+        with temporary.open("xb") as handle:
+            os.chmod(temporary, 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        directory_fd = os.open(revision_root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def migration_tree_object(*, revision: str, path: str, env: dict[str, str]) -> str:
@@ -564,6 +649,10 @@ def main() -> int:
     )
     if ancestor.returncode != 0:
         raise PolicyError("rollback base is not an ancestor of the release revision")
+    gate_cache_root = Path(os.environ.get("VANE_GATE_CACHE_ROOT", ""))
+    selected_timing = select_store_timing_seed(
+        cache_root=gate_cache_root, revisions=(head, rollback_base)
+    )
     base_migration_path = (
         "server/store/migrations"
         if git_path_exists(revision=rollback_base, path="server/store/migrations")
@@ -692,12 +781,70 @@ def main() -> int:
         run_checked([str(go), "run", "./cmd/agenttoolinventory", "-check"], cwd=SERVER)
         store_artifacts = artifacts / "store"
         os.environ["VANE_RUN_DESTRUCTIVE_MIGRATION101_ROLE_TEST"] = "1"
+        timing_arguments: list[str] = []
+        if selected_timing is not None:
+            timing_root, timing_revision = selected_timing
+            timing_arguments = [
+                "--timing-root", str(timing_root),
+                "--timings", STORE_TIMING_SEED_NAME,
+            ]
+            print(f"Using trusted Store timing seed from {timing_revision}", flush=True)
         run_checked(
             [str(go), "run", "./cmd/storetestshard", "run", "--artifacts", str(store_artifacts)]
+            + timing_arguments
             + [item for url in urls[:3] for item in ("--database-url", url)],
             cwd=SERVER,
         )
         os.environ.pop("VANE_RUN_DESTRUCTIVE_MIGRATION101_ROLE_TEST", None)
+        generated_timing_seed = store_artifacts / STORE_TIMING_SEED_NAME
+        generated_timing_manifest = store_artifacts / "store.timings.manifest.json"
+        seed_command = [
+            str(go), "run", "./cmd/storetestshard", "timing-seed",
+            "--repo", str(store_artifacts),
+            "--tests", "store-tests.list.txt",
+            "--output", STORE_TIMING_SEED_NAME,
+            "--manifest", generated_timing_manifest.name,
+            "store-shard-0.test.json", "store-shard-1.test.json",
+            "store-shard-2.test.json",
+        ]
+        seed_result = subprocess.run(
+            seed_command, cwd=SERVER, env=env, text=True, capture_output=True,
+            check=False,
+        )
+        generated_timing_ready = False
+        if seed_result.returncode != 0:
+            print(
+                "Store timing seed generation failed; continuing without cache update: "
+                + seed_result.stderr.strip(),
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            try:
+                store_status = json.loads(
+                    (store_artifacts / "store-shard-status.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                seed_manifest = json.loads(
+                    generated_timing_manifest.read_text(encoding="utf-8")
+                )
+                generated_timing_ready = (
+                    seed_manifest.get("version") == 1
+                    and seed_manifest.get("test_count")
+                    == store_status.get("expected_tests")
+                    and seed_manifest.get("terminal_events")
+                    == store_status.get("expected_tests")
+                    and isinstance(seed_manifest.get("zero_duration_tests"), int)
+                )
+            except (OSError, json.JSONDecodeError, AttributeError):
+                generated_timing_ready = False
+            if not generated_timing_ready:
+                print(
+                    "Store timing seed manifest is incomplete; continuing without cache update",
+                    file=sys.stderr,
+                    flush=True,
+                )
         store_package = output([str(go), "list", "./store"], cwd=SERVER, env=env)
         packages = [
             item for item in output([str(go), "list", "./..."], cwd=SERVER, env=env).splitlines()
@@ -883,6 +1030,29 @@ def main() -> int:
         shutil.copytree(WEB / "dist", verified_web_dist, symlinks=False)
         web_coverage = artifacts / "web-coverage-summary.json"
         shutil.copy2(WEB / "coverage/coverage-summary.json", web_coverage)
+
+        remote_main = subprocess.run(
+            ["git", "rev-parse", "--verify", "origin/main^{commit}"],
+            cwd=ROOT, text=True, capture_output=True, check=False,
+        )
+        if (
+            generated_timing_ready
+            and remote_main.returncode == 0
+            and remote_main.stdout.strip() == head
+        ):
+            try:
+                publish_store_timing_seed(
+                    cache_root=gate_cache_root,
+                    revision=head,
+                    source=generated_timing_seed,
+                )
+                print(f"Published trusted Store timing seed for {head}", flush=True)
+            except (OSError, PolicyError) as error:
+                print(
+                    f"Store timing cache update failed; Gate remains valid: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         evidence_raw = os.environ.get("VANE_FULL_GATE_EVIDENCE", "")
         if evidence_raw:

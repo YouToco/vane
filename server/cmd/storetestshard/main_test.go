@@ -148,7 +148,7 @@ func TestLoadOptionalTimingsFallsBackOnlyForMissingCorruptAndEmpty(t *testing.T)
 		{path: "valid.jsonl", wantStatus: "loaded", wantTiming: 1.5},
 	} {
 		t.Run(tc.wantStatus, func(t *testing.T) {
-			got, err := loadOptionalTimings(repo, tc.path)
+			got, err := loadOptionalTimings(repo, "", tc.path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -165,8 +165,44 @@ func TestLoadOptionalTimingsFallsBackOnlyForMissingCorruptAndEmpty(t *testing.T)
 			}
 		})
 	}
-	if _, err := loadOptionalTimings(repo, "../untrusted.jsonl"); err == nil {
+	if _, err := loadOptionalTimings(repo, "", "../untrusted.jsonl"); err == nil {
 		t.Fatal("path authority failure fell back instead of failing closed")
+	}
+}
+
+func TestLoadOptionalTimingsAcceptsOnlyRelativePathUnderAbsoluteTimingRoot(t *testing.T) {
+	repo := t.TempDir()
+	timingRoot := t.TempDir()
+	seed := `{"Action":"pass","Test":"TestA","Elapsed":2.5}` + "\n"
+	if err := os.WriteFile(filepath.Join(timingRoot, "store.jsonl"), []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadOptionalTimings(repo, timingRoot, "store.jsonl")
+	if err != nil || got.status != "loaded" || got.timings["TestA"] != 2.5 {
+		t.Fatalf("external timing input=%+v err=%v", got, err)
+	}
+	if _, err := loadOptionalTimings(repo, "relative-root", "store.jsonl"); err == nil {
+		t.Fatal("relative timing root was accepted")
+	}
+	if _, err := loadOptionalTimings(repo, timingRoot, "../store.jsonl"); err == nil {
+		t.Fatal("timing root traversal was accepted")
+	}
+}
+
+func TestRunRejectsRelativeTimingRootBeforeShardExecution(t *testing.T) {
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{
+		"--repo", repo,
+		"--artifacts", t.TempDir(),
+		"--timing-root", "relative-cache",
+		"--timings", "store.timings.jsonl",
+		"--database-url", "postgres://vane@127.0.0.1:1/unused",
+	})
+	if err == nil || !strings.Contains(err.Error(), "timing root must be absolute") {
+		t.Fatalf("relative timing root error = %v", err)
 	}
 }
 

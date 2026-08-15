@@ -212,6 +212,7 @@ class ExactRevisionCLITest(unittest.TestCase):
             )
             self.assertEqual(environment["GOCACHE"], str(root / "shared-cache/go-build"))
             self.assertEqual(environment["GOMODCACHE"], str(root / "shared-cache/go-mod"))
+            self.assertEqual(environment["VANE_GATE_CACHE_ROOT"], str(root / "shared-cache"))
             self.assertEqual(environment["GOTOOLCHAIN"], "local")
             self.assertEqual(environment["GOSUMDB"], "sum.golang.org")
             self.assertTrue(environment["PATH"].startswith(str(ROOT / ".vane/tool-cache/go/1.26.6/bin:")))
