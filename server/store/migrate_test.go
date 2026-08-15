@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 137
+const latestMigrationVersion int64 = 138
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -191,6 +191,12 @@ var wantTables = []string{
 	// 137 hashed, one-time account security credentials and append-only audit.
 	"account_security_tokens",
 	"account_security_audit_events",
+	// 138 independent team-workspace long-term memory ledger. Personal memory
+	// remains in migration129 and is never unioned into this corpus.
+	"workspace_memory_authorizations",
+	"workspace_memory_records",
+	"workspace_memory_events",
+	"workspace_memory_receipts",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
