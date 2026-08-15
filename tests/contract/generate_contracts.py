@@ -17,8 +17,19 @@ def canonical_json(value: object) -> str:
 
 
 def routes_contract() -> dict[str, object]:
-    source = (ROOT / "server/api/api.go").read_text(encoding="utf-8")
-    routes = sorted(set(re.findall(r'HandleFunc\("([A-Z]+ /api/[^" ]*)"', source)))
+    sources = [
+        (ROOT / "server/api/api.go").read_text(encoding="utf-8"),
+        (ROOT / "server/cmd/server/main.go").read_text(encoding="utf-8"),
+        (ROOT / "server/cmd/server/telegram_wiring.go").read_text(encoding="utf-8"),
+    ]
+    routes = sorted(
+        set(
+            re.findall(
+                r'Handle(?:Func)?\("([A-Z]+ /(?:api|telegram)/[^" ]*)"',
+                "\n".join(sources),
+            )
+        )
+    )
     if not routes:
         raise RuntimeError("no server API routes discovered")
     return {"schema": "vane.http-routes/v1", "routes": routes}

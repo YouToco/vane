@@ -2,6 +2,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Info } from "lucide-react";
 import FeishuSetup from "./FeishuSetup";
+import TelegramSetup from "./TelegramSetup";
 import Profile from "./Profile";
 import { useI18n } from "@/i18n";
 
@@ -40,6 +41,7 @@ export default function Settings({ hash }: { hash: string }) {
             </Alert>
           )}
           <FeishuSetup />
+          <TelegramSetup />
         </TabsContent>
       </Tabs>
     </div>

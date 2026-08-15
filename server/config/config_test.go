@@ -1654,6 +1654,106 @@ func TestNativeV3EditRecoveryURLFromSystemdCredential(t *testing.T) {
 	}
 }
 
+func TestTelegramConfigRequiresCompleteSecureShape(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  TelegramConfig
+		ok   bool
+	}{
+		{name: "disabled", cfg: TelegramConfig{}, ok: true},
+		{name: "complete", ok: true, cfg: TelegramConfig{
+			Enabled: true, BotToken: "123456:ABC_def-ghi",
+			WebhookSecret: "secret_123", Workers: 1,
+			WebhookURL: "https://api.vane.zhuoqidev.com/telegram/webhook",
+			APIBaseURL: "https://api.telegram.org",
+		}},
+		{name: "missing token", cfg: TelegramConfig{
+			Enabled: true, WebhookSecret: "secret",
+			WebhookURL: "https://api.vane.zhuoqidev.com/telegram/webhook",
+			APIBaseURL: "https://api.telegram.org", Workers: 1,
+		}},
+		{name: "secret whitespace", cfg: TelegramConfig{
+			Enabled: true, BotToken: "123:abc", WebhookSecret: "bad secret",
+			WebhookURL: "https://api.vane.zhuoqidev.com/telegram/webhook",
+			APIBaseURL: "https://api.telegram.org", Workers: 1,
+		}},
+		{name: "wrong webhook path", cfg: TelegramConfig{
+			Enabled: true, BotToken: "123:abc", WebhookSecret: "secret",
+			WebhookURL: "https://api.vane.zhuoqidev.com/hook",
+			APIBaseURL: "https://api.telegram.org", Workers: 1,
+		}},
+		{name: "invalid api base", cfg: TelegramConfig{
+			Enabled: true, BotToken: "123:abc", WebhookSecret: "secret",
+			WebhookURL: "https://api.vane.zhuoqidev.com/telegram/webhook",
+			APIBaseURL: "http://example.com", Workers: 1,
+		}},
+		{name: "multiple workers", cfg: TelegramConfig{
+			Enabled: true, BotToken: "123:abc", WebhookSecret: "secret",
+			WebhookURL: "https://api.vane.zhuoqidev.com/telegram/webhook",
+			APIBaseURL: "https://api.telegram.org", Workers: 2,
+		}},
+		{name: "empty secret", cfg: TelegramConfig{
+			Enabled: true, BotToken: "123:abc", WebhookSecret: "",
+			WebhookURL: "https://api.vane.zhuoqidev.com/telegram/webhook",
+			APIBaseURL: "https://api.telegram.org", Workers: 1,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{DB: DBConfig{URL: "postgres://test"}, Telegram: test.cfg}
+			err := cfg.Validate()
+			if (err == nil) != test.ok {
+				t.Fatalf("Validate() err=%v ok=%t", err, test.ok)
+			}
+		})
+	}
+}
+
+func TestTelegramSecretsLoadFromPureEnvironment(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	t.Setenv("VANE_TELEGRAM_ENABLED", "true")
+	t.Setenv("VANE_TELEGRAM_BOT_TOKEN", "123456:env_secret")
+	t.Setenv("VANE_TELEGRAM_WEBHOOK_SECRET", "webhook_secret")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Telegram.Enabled || cfg.Telegram.BotToken != "123456:env_secret" ||
+		cfg.Telegram.WebhookSecret != "webhook_secret" ||
+		cfg.Telegram.Workers != 1 {
+		t.Fatalf("telegram config=%+v", cfg.Telegram)
+	}
+}
+
+func TestTelegramSecretsLoadFromSystemdCredentials(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, telegramBotTokenCredential),
+		[]byte("123456:credential_token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, telegramWebhookSecretCredential),
+		[]byte("credential_secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", directory)
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	t.Setenv("VANE_TELEGRAM_ENABLED", "true")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Telegram.BotToken != "123456:credential_token" ||
+		cfg.Telegram.WebhookSecret != "credential_secret" {
+		t.Fatalf("telegram credentials not loaded")
+	}
+}
+
 func TestResearchGatewaySocketUsesIsolatedUnixDefault(t *testing.T) {
 	t.Setenv("VANE_DB_URL", "postgres://runtime")
 	configPath := filepath.Join(t.TempDir(), "config.yaml")

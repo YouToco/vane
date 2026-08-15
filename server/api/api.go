@@ -19,6 +19,7 @@ import (
 	"github.com/YouToco/vane/server/feedback"
 	"github.com/YouToco/vane/server/feishu"
 	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/telegram"
 	"github.com/YouToco/vane/server/types"
 )
 
@@ -81,6 +82,15 @@ type TaskAgent interface {
 	) (agent.Outcome, error)
 }
 
+type TelegramManager interface {
+	Status() telegram.Status
+	IssueLink(context.Context, int64, int64) (telegram.Link, error)
+	Binding(context.Context, int64, int64) (store.ChannelIdentity, error)
+	BlockedReplies(context.Context, int64, int64) (store.ChannelDeliveryBlockStats, error)
+	Unlink(context.Context, int64, int64) error
+	SendTest(context.Context, int64, int64) error
+}
+
 // BriefFeedback is the existing explicit-user deep-dive control plane. P2-D
 // reuses it after proving the clicked Insight is an immutable evidence
 // reference of the exact Brief/report next step.
@@ -121,6 +131,7 @@ type Deps struct {
 	// and removes the retired pre-6.8 DeletePush admission signature.
 	Scheduler any
 	TaskAgent TaskAgent
+	Telegram  TelegramManager
 	// BriefFeedback is separate from grounded read-only Agent follow-up:
 	// deep-dive is an explicit fixed action and keeps the existing durable
 	// feedback/idempotency/delivery behavior.
@@ -178,6 +189,10 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/feishu/verify", s.handleFeishuVerify)
 	inner.HandleFunc("POST /api/feishu/config", s.handleFeishuConfig)
 	inner.HandleFunc("POST /api/feishu/test", s.handleFeishuTest)
+	inner.HandleFunc("GET /api/telegram/status", s.handleTelegramStatus)
+	inner.HandleFunc("POST /api/telegram/link", s.handleTelegramLink)
+	inner.HandleFunc("DELETE /api/telegram/link", s.handleTelegramUnlink)
+	inner.HandleFunc("POST /api/telegram/test", s.handleTelegramTest)
 
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)

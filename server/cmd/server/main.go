@@ -775,6 +775,11 @@ func run() error {
 		return fmt.Errorf("装配 Agent 工具注册表: %w", err)
 	}
 	manager.SetAgent(agentLoop)
+	telegramManager, err := buildTelegramManager(cfg.Telegram, st, agentLoop)
+	if err != nil {
+		closeServerStartupResources(temporalClient.Close, closeStores)
+		return fmt.Errorf("装配 Telegram Bot: %w", err)
+	}
 
 	// Build the A2A agent before any worker or recovery goroutine starts. A
 	// composition error is then an ordinary startup failure: no admitted work
@@ -1093,6 +1098,10 @@ func run() error {
 	// same per-user conversation lock.
 	drainIngress := func() error {
 		var drainErrs []error
+		if telegramErr := shutdownTelegramIngress(
+			telegramManager, 2*time.Minute+10*time.Second); telegramErr != nil {
+			drainErrs = append(drainErrs, telegramErr)
+		}
 		managerCtx, cancelManager := context.WithTimeout(context.Background(), 50*time.Second)
 		managerErr := manager.Shutdown(managerCtx)
 		cancelManager()
@@ -1117,6 +1126,35 @@ func run() error {
 		}
 		return nil
 	}
+	if err := telegramManager.Start(ctx); err != nil {
+		stop()
+		drainErr := drainIngress()
+		recoveryErr := stopCreationRecovery()
+		definitionEditRecoveryErr := stopDefinitionEditRecovery()
+		scheduleCommandRecoveryErr := stopScheduleCommandRecovery()
+		outcomeRecoveryErr := stopOutcomeRecovery()
+		pushRecoveryErr := stopPushRecovery()
+		receiptErr := stopReceiptDispatch()
+		definitionEditReceiptErr := stopDefinitionEditReceiptDispatch()
+		sessionErr := drainAgentSessions()
+		maintenanceCtx, cancelMaintenance := context.WithTimeout(
+			context.Background(), 30*time.Second)
+		maintenanceErr := waitMaintenance(maintenanceCtx)
+		cancelMaintenance()
+		if joined := errors.Join(
+			drainErr, recoveryErr, definitionEditRecoveryErr,
+			scheduleCommandRecoveryErr, outcomeRecoveryErr,
+			pushRecoveryErr, receiptErr, definitionEditReceiptErr,
+			sessionErr, maintenanceErr,
+		); joined != nil {
+			return errors.Join(
+				fmt.Errorf("启动 Telegram Bot: %w", err), joined)
+		}
+		w.Stop()
+		temporalClient.Close()
+		closeStores()
+		return fmt.Errorf("启动 Telegram Bot: %w", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -1126,6 +1164,8 @@ func run() error {
 		// and the independently authenticated research executor pool.
 		readinessStores = append(readinessStores, researchControlStore)
 	}
+	readinessStores = appendTelegramReadiness(
+		readinessStores, cfg.Telegram.Enabled, telegramManager)
 	mux.HandleFunc("GET /readyz", handleReadyz(readinessStores...))
 	// principal 解析器：全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 过渡期实现是「全局 owner 回退 + 租户恒为 1」，行为与收敛前逐字一致；
@@ -1138,6 +1178,7 @@ func run() error {
 		Manager:       manager,
 		Scheduler:     sched,
 		TaskAgent:     agentLoop,
+		Telegram:      telegramManager,
 		BriefFeedback: fbSvc,
 		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
 			ExecutiveBriefWebCanaryScheduleID,
@@ -1148,6 +1189,7 @@ func run() error {
 		Principal: auth.NewContextResolver(),
 		Origin:    cfg.Dashboard.Origin,
 	})
+	mountTelegramWebhook(mux, cfg.Telegram.Enabled, telegramManager.Handler())
 
 	// A2A server（a2a-contract §7）：enabled=false 时不 Mount——/a2a 与
 	// agent-card 路径在 mux 上根本不存在（404），零新增暴露面。

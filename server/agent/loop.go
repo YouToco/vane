@@ -526,7 +526,32 @@ func retryAgentChat(
 // 全部 LLM 错误向上抛（feishu 层 humanize）；LLM 出错路径不持久化本轮消息——
 // 半截上下文对下一轮没有价值，行为与现 chat_reply 的无状态失败一致。
 func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Outcome, error) {
-	return l.handleMessage(ctx, userID, "", "", text, false)
+	return l.handleMessage(ctx, userID, "", "", text, false, false)
+}
+
+// HandleChannelMessage runs an authenticated channel update through the owner
+// Agent using a caller-derived stable UUID. A completed replay is returned
+// before any model or Tool call. An interrupted retry keeps the same trace, so
+// write Tools reuse their durable idempotency namespace instead of executing a
+// second business operation.
+//
+// Unlike HandleWebTaskActionMessage this is an ordinary owner conversation:
+// it does not enable the Dashboard's create/edit shortcut mode. The channel
+// adapter must authenticate and tenant-bind the external actor before calling
+// this method; a stable ID is not itself authorization.
+func (l *Loop) HandleChannelMessage(
+	ctx context.Context,
+	userID int64,
+	stableTurnID string,
+	text string,
+) (Outcome, error) {
+	if l == nil || !l.ownerAgent || l.turnReplay == nil ||
+		!validDirectActionID(stableTurnID) {
+		return Outcome{}, types.NewAppError(
+			types.CodeValidation, "渠道消息请求标识无效", types.ErrValidation)
+	}
+	return l.handleMessage(
+		ctx, userID, stableTurnID, "", text, false, false)
 }
 
 // HandleWebTaskActionMessage runs the Dashboard's natural-language create or
@@ -547,7 +572,8 @@ func (l *Loop) HandleWebTaskActionMessage(
 		return Outcome{}, types.NewAppError(
 			types.CodeValidation, "Web 任务请求标识无效", types.ErrValidation)
 	}
-	return l.handleMessage(ctx, userID, actionID, selectedTaskRef, text, false)
+	return l.handleMessage(
+		ctx, userID, actionID, selectedTaskRef, text, false, true)
 }
 
 // HandleExternalContextMessage 处理「用户文字 + 外部内容」的合成输入（当前由飞书
@@ -556,7 +582,7 @@ func (l *Loop) HandleWebTaskActionMessage(
 // 自己的后缀明确要求最新核验时，可暴露一次 query 字节被本地固定的 web_search；
 // 引用正文不能改变查询，也不能触发第二次网络读取。
 func (l *Loop) HandleExternalContextMessage(ctx context.Context, userID int64, text string) (Outcome, error) {
-	return l.handleMessage(ctx, userID, "", "", text, true)
+	return l.handleMessage(ctx, userID, "", "", text, true, false)
 }
 
 const groundedBriefSystemNote = `
@@ -685,10 +711,11 @@ func (l *Loop) handleGroundedMessage(
 func (l *Loop) handleMessage(
 	ctx context.Context,
 	userID int64,
-	webActionID string,
+	stableTurnID string,
 	webSelectedTaskRef string,
 	text string,
 	externalInput bool,
+	webDirectTaskAction bool,
 ) (Outcome, error) {
 	// per-user 串行化整个 load→loop→save（跨所有共享 session admission 的 Loop）。
 	mu := l.lockForUser(userID)
@@ -709,9 +736,9 @@ func (l *Loop) handleMessage(
 	history := l.scrubUntrustedHistory(decodeMessages(sess))
 	// 同一条消息内的所有模型调用（含只读意图裁决）共享 trace_id。
 	turnID := uuid.NewString()
-	webAgentFirst := l.ownerAgent && webActionID != ""
-	if webAgentFirst {
-		turnID = webActionID
+	stableReplay := l.ownerAgent && stableTurnID != ""
+	if stableReplay {
+		turnID = stableTurnID
 		replay, replayErr := l.turnReplay.FindAgentTurnReplayV1(
 			ctx, sess.TenantID, userID, turnID,
 		)
@@ -768,14 +795,14 @@ func (l *Loop) handleMessage(
 		ownerRequest:         ownerRequest,
 		clarifiedOwnerAction: clarifiedOwnerAction,
 		intents:              knownToolIntents,
-		memoryMutationRequired: l.ownerAgent && !externalInput && !webAgentFirst &&
+		memoryMutationRequired: l.ownerAgent && !externalInput && !webDirectTaskAction &&
 			explicitMemoryMutationRequest(ownerRequest),
 		agentFirstEnabled:       l.ownerAgent,
 		successfulCalls:         make(map[string]struct{}),
 		failedCalls:             make(map[string]int),
 		untrustedExternalResult: externalInput,
 	}
-	if webAgentFirst {
+	if webDirectTaskAction {
 		state.webActionMode = webActionCreate
 		if webSelectedTaskRef != "" {
 			state.webActionMode = webActionEdit

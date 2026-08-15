@@ -129,3 +129,13 @@ a2a:
   enabled: false # 默认关闭：不 Mount，/a2a 与 agent-card 均 404（a2a-contract §6/§7）
   token: ""      # VANE_A2A_TOKEN（本体存 my-credentials；为空则挂载但 auth 恒 401，只告警不拒启动）
   base_url: "https://api.vane.zhuoqidev.com/a2a" # 进 AgentCard supportedInterfaces
+
+# Telegram Bot 私聊入口。默认关闭；token/secret 只走环境变量或 systemd credential，
+# 不写入本文件。启用时服务会用 getMe 校验 bot identity，并核对 exact webhook。
+telegram:
+  enabled: false
+  bot_token: ""       # VANE_TELEGRAM_BOT_TOKEN / telegram_bot_token credential
+  webhook_secret: ""  # VANE_TELEGRAM_WEBHOOK_SECRET / telegram_webhook_secret credential
+  webhook_url: "https://api.vane.zhuoqidev.com/telegram/webhook"
+  api_base_url: "https://api.telegram.org"
+  workers: 1

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/YouToco/vane/server/agentcontext"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/store"
@@ -103,6 +105,82 @@ func TestWebTaskActionUsesStableActionIDAsEvidenceTrace(t *testing.T) {
 	)
 	if err != nil || out.Reply == "" || writer.record.TurnID != actionID {
 		t.Fatalf("out=%+v trace=%q err=%v", out, writer.record.TurnID, err)
+	}
+}
+
+func TestChannelMessageReplaysCompletedTurnWithoutModelCall(t *testing.T) {
+	reader := &fakeAgentTurnReplayReader{replay: store.AgentTurnReplayV1{
+		UserMessage: "列出我的任务", AssistantMessage: "你有两个任务。",
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(), Profiles: newFakeStore(),
+		Tools: ownerTestTools(), Evidence: &fakeAgentEvidenceWriter{},
+		TurnReplay: reader, OwnerAgent: true,
+	})
+	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+		t.Fatal("channel replay must not call the model")
+		return nil, nil
+	}
+	out, err := loop.HandleChannelMessage(
+		t.Context(), 7, "b8e3a943-85e0-54e8-8fc0-5d4c1d371a14", "列出我的任务",
+	)
+	if err != nil || out.Reply != "你有两个任务。" || reader.calls != 1 {
+		t.Fatalf("out=%+v calls=%d err=%v", out, reader.calls, err)
+	}
+}
+
+func TestChannelMessageUsesStableIDWithoutWebTaskMode(t *testing.T) {
+	const turnID = "a47f20c0-461d-5ac7-aa41-04d449125864"
+	reader := &fakeAgentTurnReplayReader{err: types.NewAppError(
+		types.CodeNotFound, "missing", types.ErrNotFound,
+	)}
+	writer := &fakeAgentEvidenceWriter{}
+	mutating := &fakeTool{name: "channel_mutation", mutating: true}
+	spec := newToolSpec(mutating, withToolSurface(ownerPolicy(
+		Effects(EffectStateWrite, EffectDirectOwnerWrite), BudgetNone,
+	), ExposureAlways, IntentTasks, ResultTrustLocal, true))
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs, Tools: ownerTestTools(spec), OwnerAgent: true,
+		Evidence: writer, TurnReplay: reader, MaxTurns: 2,
+	})
+	calls := 0
+	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+		calls++
+		if calls == 1 {
+			return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID: "channel-call", Name: spec.Name(), Arguments: `{}`,
+			}}}, nil
+		}
+		return &llm.ChatResponse{Content: "已执行。"}, nil
+	}
+	out, err := loop.HandleChannelMessage(
+		t.Context(), 7, turnID, "执行渠道操作",
+	)
+	if err != nil || out.Reply != "已执行。" || len(mutating.calls) != 1 ||
+		writer.record.TurnID != turnID {
+		t.Fatalf("out=%+v tool_calls=%d trace=%q err=%v",
+			out, len(mutating.calls), writer.record.TurnID, err)
+	}
+}
+
+func TestChannelMessageRejectsInvalidAuthorityOrStableID(t *testing.T) {
+	validID := uuid.NewString()
+	for _, tc := range []struct {
+		name string
+		loop *Loop
+		id   string
+	}{
+		{name: "nil loop", loop: nil, id: validID},
+		{name: "not owner", loop: &Loop{turnReplay: &fakeAgentTurnReplayReader{}}, id: validID},
+		{name: "no replay store", loop: &Loop{ownerAgent: true}, id: validID},
+		{name: "invalid stable id", loop: &Loop{ownerAgent: true, turnReplay: &fakeAgentTurnReplayReader{}}, id: "not-a-uuid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.loop.HandleChannelMessage(t.Context(), 1, tc.id, "hello"); !errors.Is(err, types.ErrValidation) {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	}
 }
 

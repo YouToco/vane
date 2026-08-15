@@ -96,6 +96,25 @@ export interface FeishuStatus {
   connected_at?: string;
 }
 
+export interface TelegramStatus {
+  enabled: boolean;
+  ready: boolean;
+  bound: boolean;
+  bot_id?: number;
+  bot_username?: string;
+  webhook_url?: string;
+  pending_update_count?: number;
+  last_error_code?: string;
+  blocked_reply_count?: number;
+  oldest_blocked_at?: string;
+  bound_at?: string;
+}
+
+export interface TelegramLink {
+  deep_link: string;
+  expires_at: string;
+}
+
 export interface VerifyResult {
   credentials_ok: boolean;
   bot_ok: boolean;
@@ -1492,6 +1511,11 @@ export const api = {
       app_secret: appSecret,
     }),
   feishuTest: () => post<{ ok: boolean }>("/api/feishu/test"),
+  telegramStatus: () => request<TelegramStatus>("/api/telegram/status"),
+  telegramLink: () => post<TelegramLink>("/api/telegram/link"),
+  telegramUnlink: () =>
+    request<{ ok: boolean }>("/api/telegram/link", { method: "DELETE" }),
+  telegramTest: () => post<{ ok: boolean }>("/api/telegram/test"),
 
   // ---- M3 定时任务（B8）----
   listSchedules: () =>

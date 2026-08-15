@@ -2,6 +2,7 @@
   "routes": [
     "DELETE /api/admin/invites/{code}",
     "DELETE /api/schedules/{id}",
+    "DELETE /api/telegram/link",
     "GET /api/admin/cost-calls",
     "GET /api/admin/execution-traces/tenants/{tenant_id}/users/{user_id}/tasks",
     "GET /api/admin/execution-traces/tenants/{tenant_id}/users/{user_id}/tasks/{task_id}/runs",
@@ -26,6 +27,7 @@
     "GET /api/schedules/{id}/report-settings",
     "GET /api/schedules/{id}/reports",
     "GET /api/schedules/{id}/reports/{target_id}",
+    "GET /api/telegram/status",
     "PATCH /api/profile",
     "PATCH /api/schedules/{id}/report-settings",
     "POST /api/admin/invites",
@@ -46,7 +48,10 @@
     "POST /api/schedules/{id}/reports/{target_id}/deep-dive",
     "POST /api/schedules/{id}/resume",
     "POST /api/schedules/{id}/run",
-    "POST /api/task-actions"
+    "POST /api/task-actions",
+    "POST /api/telegram/link",
+    "POST /api/telegram/test",
+    "POST /telegram/webhook"
   ],
   "schema": "vane.http-routes/v1"
 }

@@ -523,6 +523,10 @@
     {
       "path": "132_agent_first_legacy_protocol_write_fence.sql",
       "sha256": "23986419faf563c7436e9aed699bfba53d9a018177553306bea76d3dba7ed555"
+    },
+    {
+      "path": "133_channel_ingress.sql",
+      "sha256": "3bbe6e0b03e8e404554d29bbb18ab207298e056446bceb6ad8742a4d5b2a8d4d"
     }
   ],
   "schema": "vane.migrations/v1"
