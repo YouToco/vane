@@ -93,13 +93,14 @@ Afterward, verify that the controller revision advanced while the product and
 middleware revisions did not. A different exact-main SHA is then released
 through the normal broker path.
 
-On the release Mac, install the narrow client once from the merged controller.
-The private transport key remains outside the repository and can invoke only
-the VPS forced command:
+On the release Mac, install the narrow client once from the merged controller
+as the ordinary release user. The private transport key remains outside the
+repository and can invoke only the VPS forced command. No local root privilege
+is required; production privilege remains exclusively in the VPS broker:
 
 ```bash
-sudo ./ops/bootstrap/install-client.sh \
+./ops/bootstrap/install-client.sh \
   /absolute/path/to/broker_transport_key broker.example 22 \
   /absolute/path/to/known_hosts
-/usr/local/libexec/vane-broker-submit --status
+~/.local/libexec/vane-broker-submit --status
 ```
