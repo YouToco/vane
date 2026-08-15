@@ -101,6 +101,7 @@ export const zhHant: Dict = {
       groupAccount: "帳號",
       profile: "我的畫像",
       channel: "推播通道",
+      members: "成員與邀請",
       admin: "管理後台",
       logout: "登出",
       tagline: "AI 情報系統",
@@ -264,6 +265,7 @@ export const zhHant: Dict = {
       title: "設定",
       tabProfile: "我的畫像",
       tabChannel: "推播通道",
+      tabMembers: "成員與邀請",
       channelZhOnly: "推播通道設定指南面向飛書（中國版）開放平台，暫僅提供簡體中文。",
     },
     profile: {

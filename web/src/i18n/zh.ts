@@ -100,6 +100,7 @@ export const zh = {
       groupAccount: "账号",
       profile: "我的画像",
       channel: "推送通道",
+      members: "成员与邀请",
       admin: "管理后台",
       logout: "退出登录",
       tagline: "AI 情报系统",
@@ -266,6 +267,7 @@ export const zh = {
       title: "设置",
       tabProfile: "我的画像",
       tabChannel: "推送通道",
+      tabMembers: "成员与邀请",
       channelZhOnly: "推送通道配置指南面向飞书（中国版）开放平台，暂仅提供中文。",
     },
     profile: {

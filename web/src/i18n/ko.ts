@@ -103,6 +103,7 @@ export const ko: Dict = {
       groupAccount: "계정",
       profile: "내 프로필",
       channel: "푸시 채널",
+      members: "멤버 및 초대",
       admin: "관리자",
       logout: "로그아웃",
       tagline: "AI 인텔리전스",
@@ -267,6 +268,7 @@ export const ko: Dict = {
       title: "설정",
       tabProfile: "내 프로필",
       tabChannel: "푸시 채널",
+      tabMembers: "멤버 및 초대",
       channelZhOnly:
         "이 설정 가이드는 Feishu(중국판) 개발자 콘솔용으로, 현재 중국어로만 제공됩니다.",
     },

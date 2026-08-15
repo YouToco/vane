@@ -32,6 +32,32 @@ export interface WorkspaceSummary {
   updated_at: string;
 }
 
+export type WorkspaceRole = "owner" | "admin" | "member";
+
+export interface WorkspaceMember {
+  tenant_id: number;
+  user_id: number;
+  email: string;
+  name: string;
+  role: WorkspaceRole;
+  joined_at: string;
+}
+
+export interface WorkspaceInvite {
+  id: number;
+  tenant_id: number;
+  email: string;
+  role: Exclude<WorkspaceRole, "owner">;
+  issued_by: number;
+  expires_at: string;
+  consumed_by?: number;
+  consumed_at?: string;
+  revoked_at?: string;
+  created_at: string;
+  /** Returned exactly once by POST; list responses never contain it. */
+  token?: string;
+}
+
 // ---- 平台管理：指定用户/任务/运行的真实执行轨迹 ----
 
 export interface AdminTraceUser {
@@ -1528,6 +1554,51 @@ export const api = {
     post<{ ok: boolean; tenant_id: number }>(
       `/api/workspaces/${tenantID}/switch`,
       {},
+    ),
+  listWorkspaceMembers: (tenantID: number) =>
+    request<{ members: WorkspaceMember[] }>(
+      `/api/workspaces/${tenantID}/members`,
+    ).then((result) => arr(result.members)),
+  listWorkspaceInvites: (tenantID: number) =>
+    request<{ invites: WorkspaceInvite[] }>(
+      `/api/workspaces/${tenantID}/invites`,
+    ).then((result) => arr(result.invites)),
+  issueWorkspaceInvite: (
+    tenantID: number,
+    email: string,
+    role: Exclude<WorkspaceRole, "owner">,
+  ) =>
+    post<WorkspaceInvite>(`/api/workspaces/${tenantID}/invites`, {
+      email,
+      role,
+    }),
+  revokeWorkspaceInvite: (tenantID: number, inviteID: number) =>
+    request<{ ok: boolean }>(
+      `/api/workspaces/${tenantID}/invites/${inviteID}`,
+      { method: "DELETE" },
+    ),
+  updateWorkspaceMemberRole: (
+    tenantID: number,
+    userID: number,
+    role: Exclude<WorkspaceRole, "owner">,
+  ) =>
+    request<{ ok: boolean }>(
+      `/api/workspaces/${tenantID}/members/${userID}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role }),
+      },
+    ),
+  removeWorkspaceMember: (tenantID: number, userID: number) =>
+    request<{ ok: boolean }>(
+      `/api/workspaces/${tenantID}/members/${userID}`,
+      { method: "DELETE" },
+    ),
+  transferWorkspaceOwnership: (tenantID: number, userID: number) =>
+    post<{ ok: boolean }>(
+      `/api/workspaces/${tenantID}/transfer-ownership`,
+      { user_id: userID },
     ),
   feishuStatus: () => request<FeishuStatus>("/api/feishu/status"),
   feishuVerify: (appId: string, appSecret: string) =>

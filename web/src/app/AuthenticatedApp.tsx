@@ -27,6 +27,7 @@ import {
   LogOut,
   Loader2,
   ChevronsUpDown,
+  Users,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -75,6 +76,7 @@ function useNav() {
       items: [
         { hash: "#/settings", label: N.profile, icon: User },
         { hash: "#/settings/channel", label: N.channel, icon: MessageSquare },
+        { hash: "#/settings/members", label: N.members, icon: Users },
       ],
     },
   ];
@@ -97,6 +99,8 @@ function renderPage(
   hash: string,
   isPlatformOwner: boolean,
   actorScope: string,
+  me: MeResponse,
+  onAuthorityChanged: () => void,
 ) {
   const detailID = taskDetailID(hash);
   if (detailID) {
@@ -109,7 +113,8 @@ function renderPage(
       return <History />;
     case "#/settings":
     case "#/settings/channel":
-      return <Settings hash={hash} />;
+    case "#/settings/members":
+      return <Settings hash={hash} me={me} onAuthorityChanged={onAuthorityChanged} />;
     case "#/admin":
       // 前端兜底：非平台 owner 直接落回首页。真正的拦截在后端
       // requirePlatformOwner，这里只是避免渲染一个注定 404 的页面。
@@ -273,6 +278,13 @@ function Shell({ hash, me }: { hash: string; me: MeResponse }) {
     location.hash = "#/";
     location.reload();
   }
+  function onAuthorityChanged() {
+    // Ownership transfer invalidates the server session. Clear all browser
+    // state scoped to the old Principal before returning to authentication.
+    clearTaskMutationSessionStorage();
+    location.hash = "#/login";
+    location.reload();
+  }
 
   return (
     <SidebarProvider>
@@ -300,7 +312,7 @@ function Shell({ hash, me }: { hash: string; me: MeResponse }) {
         <main className="flex-1 overflow-y-auto">
           <div className="mx-auto max-w-5xl p-6">
             <Suspense fallback={<PageFallback />}>
-              {renderPage(hash, isPlatformOwner, actorScope)}
+              {renderPage(hash, isPlatformOwner, actorScope, me, onAuthorityChanged)}
             </Suspense>
           </div>
         </main>

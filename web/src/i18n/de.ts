@@ -103,6 +103,7 @@ export const de: Dict = {
       groupAccount: "Konto",
       profile: "Mein Profil",
       channel: "Push-Kanal",
+      members: "Mitglieder & Einladungen",
       admin: "Verwaltung",
       logout: "Abmelden",
       tagline: "KI-Intelligence",
@@ -267,6 +268,7 @@ export const de: Dict = {
       title: "Einstellungen",
       tabProfile: "Mein Profil",
       tabChannel: "Push-Kanal",
+      tabMembers: "Mitglieder & Einladungen",
       channelZhOnly:
         "Diese Anleitung richtet sich an die Feishu-Konsole (China) und ist derzeit nur auf Chinesisch verfügbar.",
     },
