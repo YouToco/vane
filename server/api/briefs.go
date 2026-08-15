@@ -35,10 +35,16 @@ func (s *server) handleListTaskBriefs(w http.ResponseWriter, r *http.Request) {
 		writeAppError(w, err)
 		return
 	}
+	task, err := s.deps.Store.GetScheduleForMember(
+		r.Context(), int64(principal.TenantID), principal.UserID, taskID)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
 	page, err := s.deps.Store.ListTaskBriefsV1(
 		r.Context(),
 		int64(principal.TenantID),
-		principal.UserID,
+		task.UserID,
 		taskID,
 		store.TaskBriefQuery{
 			PageSize:  pageSize,
@@ -67,7 +73,7 @@ func (s *server) handleListTaskBriefs(w http.ResponseWriter, r *http.Request) {
 		role = ""
 	}
 	cost, costErr := s.deps.Store.GetScheduleRunCost(
-		r.Context(), principal.UserID, taskID,
+		r.Context(), task.UserID, taskID,
 	)
 	if costErr != nil {
 		slog.WarnContext(

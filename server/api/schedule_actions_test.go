@@ -66,7 +66,10 @@ func TestScheduleActionsUseSessionPrincipalAndSelectedTask(t *testing.T) {
 	} {
 		t.Run(tc.want, func(t *testing.T) {
 			controller := &fakeScheduleActionController{}
-			deps, cookie := authedDeps(t, Deps{Scheduler: controller})
+			deps, cookie := authedDeps(t, Deps{
+				Scheduler: controller,
+				TeamTasks: allowTeamTaskAccess{executionUserID: 1},
+			})
 			mux := http.NewServeMux()
 			Mount(mux, deps)
 			req := httptest.NewRequest(http.MethodPost, tc.path, nil)

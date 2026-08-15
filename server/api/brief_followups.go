@@ -477,8 +477,14 @@ func (s *server) loadBriefGrounding(
 	if err != nil {
 		return store.GroundedBriefContextV1{}, err
 	}
-	return s.deps.Store.LoadGroundedBriefContextV1(
+	task, err := s.deps.Store.GetScheduleForMember(
 		r.Context(), int64(principal.TenantID), principal.UserID,
+		r.PathValue("id"))
+	if err != nil {
+		return store.GroundedBriefContextV1{}, err
+	}
+	return s.deps.Store.LoadGroundedBriefContextV1(
+		r.Context(), int64(principal.TenantID), task.UserID,
 		r.PathValue("id"), kind, targetID)
 }
 
