@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[2]
 BUCKET = "zhuoqidev-vane-web"
 REGION = "cn-shenzhen"
+CDN_DOMAIN = "vane.zhuoqidev.com"
 OWNER_PREVIEW = "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
 RELEASE_MARKER_PATH = "vane-release.json"
 RECEIPT_SCHEMA = "vane.web.aliyun-release/v1"
@@ -73,6 +74,116 @@ def run(command: list[str], *, env: dict[str, str], capture: bool = False) -> st
             f"Web publication command failed ({result.returncode}): {command[0]} {detail}"
         )
     return (result.stdout + result.stderr).strip() if capture else ""
+
+
+def publication_runtime(tool_cache: Path) -> tuple[Path, Path, dict[str, str], dict[str, str]]:
+    if not tool_cache.is_absolute() or tool_cache.is_symlink() or not tool_cache.is_dir():
+        raise RuntimeError("Web publication tool cache is unsafe")
+    lock = json.loads(
+        (ROOT / "tools/toolchain.lock.json").read_text(encoding="utf-8")
+    )["tools"]
+    aliyun = tool_cache / "aliyun_cli" / lock["aliyun_cli"]["version"] / "aliyun"
+    ossutil = tool_cache / "ossutil" / lock["ossutil"]["version"] / "ossutil"
+    for binary in (aliyun, ossutil):
+        if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
+            raise RuntimeError(f"locked Web publication executable is missing: {binary}")
+    if lock["aliyun_cli"]["version"] not in run(
+        [str(aliyun), "version"], env=os.environ.copy(), capture=True
+    ):
+        raise RuntimeError("Aliyun CLI version differs from the lock")
+    if run(
+        [str(ossutil), "version"], env=os.environ.copy(), capture=True
+    ) != lock["ossutil"]["version"]:
+        raise RuntimeError("ossutil version differs from the lock")
+    access_id = os.environ.get("ALIYUN_ACCESS_KEY_ID", "")
+    access_secret = os.environ.get("ALIYUN_ACCESS_KEY_SECRET", "")
+    if not access_id or not access_secret:
+        raise RuntimeError("local OSS publication credentials are unavailable")
+    provider_env = {
+        **os.environ,
+        "OSS_ACCESS_KEY_ID": access_id,
+        "OSS_ACCESS_KEY_SECRET": access_secret,
+        "OSS_REGION": REGION,
+    }
+    aliyun_env = {
+        **os.environ,
+        "ALIBABA_CLOUD_IGNORE_PROFILE": "TRUE",
+        "ALIBABA_CLOUD_ACCESS_KEY_ID": access_id,
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET": access_secret,
+        "ALIBABA_CLOUD_REGION_ID": REGION,
+    }
+    return aliyun, ossutil, provider_env, aliyun_env
+
+
+def verify_dist_public(dist: Path, revision: str, origin: str) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError("Web verification revision is not an exact SHA")
+    if not dist.is_absolute() or dist.is_symlink() or not dist.is_dir():
+        raise RuntimeError("Web verification dist is unsafe")
+    marker = dist / RELEASE_MARKER_PATH
+    index = dist / "index.html"
+    for path in (marker, index):
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Web verification artifact is missing or unsafe: {path.name}")
+    return verify_public_release(
+        origin,
+        revision,
+        expected_marker=marker.read_bytes(),
+        expected_index_sha256=sha256(index),
+    )
+
+
+def preflight(tool_cache: Path, origin: str) -> dict:
+    if origin != f"https://{CDN_DOMAIN}":
+        raise RuntimeError("Web publication origin differs from the canonical production origin")
+    aliyun, ossutil, provider_env, aliyun_env = publication_runtime(tool_cache)
+    run(
+        [str(ossutil), "stat", f"oss://{BUCKET}/{RELEASE_MARKER_PATH}"],
+        env=provider_env,
+        capture=True,
+    )
+    detail_raw = run(
+        [
+            str(aliyun), "cdn", "DescribeCdnDomainDetail",
+            "--DomainName", CDN_DOMAIN,
+        ],
+        env=aliyun_env,
+        capture=True,
+    )
+    try:
+        detail = json.loads(detail_raw, object_pairs_hook=strict_pairs)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("CDN credential preflight returned invalid JSON") from error
+    model = detail.get("GetDomainDetailModel") if isinstance(detail, dict) else None
+    if not isinstance(model, dict) or model.get("DomainName") != CDN_DOMAIN:
+        raise RuntimeError("CDN credential preflight returned the wrong domain")
+    probe = f"{time.time_ns()}"
+    request = Request(
+        origin + f"/{RELEASE_MARKER_PATH}?preflight={probe}",
+        headers={"Cache-Control": "no-cache"},
+    )
+    with urlopen(request, timeout=15) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Web public preflight returned HTTP {response.status}")
+        marker = response.read(64 * 1024 + 1)
+    try:
+        marker_value = json.loads(marker, object_pairs_hook=strict_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Web public preflight marker is invalid JSON") from error
+    if (
+        not isinstance(marker_value, dict)
+        or marker_value.get("schema") != "vane.web-release/v1"
+        or not isinstance(marker_value.get("source_revision"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", marker_value["source_revision"]) is None
+    ):
+        raise RuntimeError("Web public preflight marker is not a deployed release")
+    return {
+        "schema": "vane.web-preflight/v1",
+        "ok": True,
+        "bucket": BUCKET,
+        "cdn_domain": CDN_DOMAIN,
+        "public_revision": marker_value["source_revision"],
+    }
 
 
 def lines(path: Path) -> list[str]:
@@ -444,22 +555,7 @@ def publish(
     ):
         raise RuntimeError("Web publication state paths are unsafe")
 
-    lock = json.loads(
-        (ROOT / "tools/toolchain.lock.json").read_text(encoding="utf-8")
-    )["tools"]
-    aliyun = tool_cache / "aliyun_cli" / lock["aliyun_cli"]["version"] / "aliyun"
-    ossutil = tool_cache / "ossutil" / lock["ossutil"]["version"] / "ossutil"
-    for binary in (aliyun, ossutil):
-        if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
-            raise RuntimeError(f"locked Web publication executable is missing: {binary}")
-    if lock["aliyun_cli"]["version"] not in run([str(aliyun), "version"], env=os.environ.copy(), capture=True):
-        raise RuntimeError("Aliyun CLI version differs from the lock")
-    if run([str(ossutil), "version"], env=os.environ.copy(), capture=True) != lock["ossutil"]["version"]:
-        raise RuntimeError("ossutil version differs from the lock")
-    access_id = os.environ.get("ALIYUN_ACCESS_KEY_ID", "")
-    access_secret = os.environ.get("ALIYUN_ACCESS_KEY_SECRET", "")
-    if not access_id or not access_secret:
-        raise RuntimeError("local OSS publication credentials are unavailable")
+    aliyun, ossutil, provider_env, aliyun_env = publication_runtime(tool_cache)
 
     with lock_file.open("a+b") as state_lock:
         fcntl.flock(state_lock, fcntl.LOCK_EX)
@@ -613,12 +709,6 @@ def publish(
                 if object_name not in reusable
             ]
 
-            provider_env = {
-                **os.environ,
-                "OSS_ACCESS_KEY_ID": access_id,
-                "OSS_ACCESS_KEY_SECRET": access_secret,
-                "OSS_REGION": REGION,
-            }
             publication_started = time.monotonic()
             timings: dict[str, float | int] = {
                 "asset_total": len(asset_objects),
@@ -731,13 +821,6 @@ def publish(
                 time.monotonic() - phase_started, 3
             )
 
-            aliyun_env = {
-                **os.environ,
-                "ALIBABA_CLOUD_IGNORE_PROFILE": "TRUE",
-                "ALIBABA_CLOUD_ACCESS_KEY_ID": access_id,
-                "ALIBABA_CLOUD_ACCESS_KEY_SECRET": access_secret,
-                "ALIBABA_CLOUD_REGION_ID": REGION,
-            }
             def refresh(refresh_path: str) -> None:
                 url = origin.rstrip("/") + refresh_path
                 for attempt in range(1, 4):
@@ -805,14 +888,38 @@ def publish(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dist", type=Path, required=True)
-    parser.add_argument("--sha", required=True)
-    parser.add_argument("--work-root", type=Path, required=True)
-    parser.add_argument("--state-root", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--preflight", action="store_true")
+    mode.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--dist", type=Path)
+    parser.add_argument("--sha")
+    parser.add_argument("--work-root", type=Path)
+    parser.add_argument("--state-root", type=Path)
     parser.add_argument("--tool-cache", type=Path, required=True)
     parser.add_argument("--origin", required=True)
-    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--result", type=Path)
     args = parser.parse_args()
+    if args.preflight:
+        if any(value is not None for value in (args.dist, args.sha, args.work_root, args.state_root, args.result)):
+            parser.error("--preflight accepts only --tool-cache and --origin")
+        result = preflight(args.tool_cache, args.origin)
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.verify_only:
+        if args.dist is None or args.sha is None:
+            parser.error("--verify-only requires --dist and --sha")
+        if any(value is not None for value in (args.work_root, args.state_root, args.result)):
+            parser.error("--verify-only does not accept publication state paths")
+        result = verify_dist_public(args.dist, args.sha, args.origin)
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return 0
+    if any(
+        value is None
+        for value in (args.dist, args.sha, args.work_root, args.state_root, args.result)
+    ):
+        parser.error(
+            "publication requires --dist, --sha, --work-root, --state-root, and --result"
+        )
     result = publish(
         dist=args.dist, revision=args.sha, work_root=args.work_root,
         state_root=args.state_root, tool_cache=args.tool_cache,

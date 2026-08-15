@@ -34,6 +34,8 @@ workspace paths. It starts from an exact remote-main revision:
 ```bash
 ./ops/bin/vane doctor
 ./ops/bin/vane release --sha <40-character-origin-main-sha>
+# Only after a finalized Server / failed Web split:
+./ops/bin/vane resume-web --sha <sha> --release-root /path/to/release-<sha>
 ```
 
 The local command tests and builds both components directly on the Mac. It

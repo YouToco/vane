@@ -42,6 +42,7 @@ trusted signers fail closed.
 ./ops/bin/vane status --manifest /path/to/finalize.json
 ./ops/bin/vane audit --manifest /path/to/finalize.json
 ./ops/bin/vane release --sha <exact-origin-main-sha>
+./ops/bin/vane resume-web --sha <sha> --release-root /path/to/release-<sha>
 ./ops/bin/vane retry --sha <sha> --stage deploy --manifest /path/to/deploy.json
 ./ops/bin/vane rollback --sha <current> --to <previous> \
   --manifest /path/to/current/finalize.json \
@@ -54,7 +55,11 @@ versions, canonical production image digests, and the trusted signer policy.
 It refuses release when any required local installation or broker signer is
 missing; versions alone are never treated as integrity pins.
 
-`release --sha` performs doctor, the complete full gate, deterministic Server
+`release --sha` first performs read-only OSS object, CDN domain, and public
+marker preflight using the canonical production endpoint. Missing or invalid
+Web credentials and an unavailable provider/public path therefore refuse
+before the complete full gate or any Server mutation. It then performs the
+complete full gate, deterministic Server
 artifact construction, a signed plan/gate/artifact chain, and one Server-only
 submission to the configured root-owned broker. After Server success, the same
 command publishes the verified `dist/` directly from the Mac to OSS: immutable
@@ -75,6 +80,16 @@ revision both before and after Web publication. A forged local client success
 cannot authorize Web publication; concurrent Server drift is detected and the
 release is not reported as finalized. Cross-machine serialization remains a
 separate VPS release-lease concern.
+
+`resume-web` is the narrow recovery path for a release whose Server already
+finalized but whose Web publication did not. Run it from a clean checkout of
+the requested revision, which may be an older commit still reachable from
+`origin/main`. It accepts only an owner-private `release-<sha>` evidence root,
+verifies the signed artifact chain binds its exact `full-gate.json`, re-hashes
+the Gate's Web tree and marker, and independently requires the VPS Server SHA
+before and after publication. It never re-runs the full Gate or submits Server
+mutation. If `web-publication.json` already exists, it performs credential-free
+exact public marker/index verification instead of publishing again.
 
 `release-receipt.json` is consumed as an exact ten-field object. The durable
 Server `current-release.json` is also parsed strictly and compared by SHA-256 CAS.
