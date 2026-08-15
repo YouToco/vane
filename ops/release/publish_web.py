@@ -49,6 +49,7 @@ PUBLICATION_SCHEMA = "vane.web-publication/v2"
 PENDING_SCHEMA = "vane.web-pending/v2"
 OSS_WORKERS = 8
 CDN_WORKERS = 4
+PUBLIC_OBJECT_ATTEMPTS = 3
 PUBLIC_USER_AGENT = "vane-release-controller/1"
 OWNER_PREVIEW_CSP = (
     "default-src 'self'; connect-src 'none'; img-src 'self' data:; "
@@ -67,6 +68,15 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             value.update(chunk)
     return value.hexdigest()
+
+
+def cloudflare_public_path(object_name: str) -> str:
+    """Map a built file to the canonical Pages URL that serves its bytes."""
+    if object_name == "index.html":
+        return "/"
+    if object_name.endswith("/index.html"):
+        return "/" + quote(object_name[:-len("index.html")], safe="/-._~")
+    return "/" + quote(object_name, safe="/-._~")
 
 
 def directory_tree_sha256(root: Path) -> str:
@@ -411,6 +421,7 @@ def verify_finalized_publication(
             expected_index_sha256=expected_index_sha256,
             expected_files=cf_verified,
             index_path="/",
+            directory_indexes=True,
         )
     verify_cloudflare_custom_edge(
         revision, expected_marker, expected_index_sha256, cf_verified,
@@ -785,6 +796,7 @@ def verify_public_release(
     expected_index_sha256: str,
     expected_files: dict[str, dict] | None = None,
     index_path: str = "/index.html",
+    directory_indexes: bool = False,
     attempts: int = 6,
 ) -> dict:
     marker_value = validate_release_marker(expected_marker, revision)
@@ -793,6 +805,8 @@ def verify_public_release(
         raise RuntimeError("public Web verification attempt count is invalid")
     if index_path not in {"/", "/index.html"}:
         raise RuntimeError("public Web entrypoint path is invalid")
+    if type(directory_indexes) is not bool:
+        raise RuntimeError("public Web directory-index mode is invalid")
     for attempt in range(1, attempts + 1):
         try:
             # A revision-only query can remain cached at the CDN after the
@@ -833,27 +847,44 @@ def verify_public_release(
 
             def verify_object(object_name: str) -> None:
                 record = (expected_files or {})[object_name]
+                public_path = (
+                    cloudflare_public_path(object_name)
+                    if directory_indexes
+                    else "/" + quote(object_name, safe="/-._~")
+                )
                 target = (
-                    origin.rstrip("/") + "/"
-                    + quote(object_name, safe="/-._~")
+                    origin.rstrip("/") + public_path
                     + f"?release={revision}&probe={probe}"
                 )
-                request = Request(target, headers={
-                    "Cache-Control": "no-cache", "User-Agent": PUBLIC_USER_AGENT,
-                })
-                with urlopen(request, timeout=15) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"public Web object returned HTTP {response.status}: {object_name}"
-                        )
-                    payload = response.read(record["size"] + 1)
-                if (
-                    len(payload) != record["size"]
-                    or hashlib.sha256(payload).hexdigest() != record["sha256"]
-                ):
-                    raise RuntimeError(
-                        f"public Web object differs from artifact: {object_name}"
-                    )
+                last_error: Exception | None = None
+                for object_attempt in range(1, PUBLIC_OBJECT_ATTEMPTS + 1):
+                    try:
+                        request = Request(target + f"&object-attempt={object_attempt}", headers={
+                            "Cache-Control": "no-cache",
+                            "User-Agent": PUBLIC_USER_AGENT,
+                        })
+                        with urlopen(request, timeout=15) as response:
+                            if response.status != 200:
+                                raise RuntimeError(
+                                    "public Web object returned HTTP "
+                                    f"{response.status}: {object_name}"
+                                )
+                            payload = response.read(record["size"] + 1)
+                        if (
+                            len(payload) != record["size"]
+                            or hashlib.sha256(payload).hexdigest() != record["sha256"]
+                        ):
+                            raise RuntimeError(
+                                f"public Web object differs from artifact: {object_name}"
+                            )
+                        return
+                    except Exception as error:
+                        last_error = error
+                        if object_attempt < PUBLIC_OBJECT_ATTEMPTS:
+                            time.sleep(0.25 * object_attempt)
+                raise RuntimeError(
+                    f"public Web object did not converge: {object_name}: {last_error}"
+                )
             parallel_apply(
                 "public Web object verification", object_names,
                 verify_object, workers=CDN_WORKERS,
@@ -1436,7 +1467,9 @@ def verify_cloudflare_controls(
         ):
             raise RuntimeError("Cloudflare _headers behavior differs")
         if OWNER_PREVIEW in public_files:
-            preview_status, preview_headers = request("/" + OWNER_PREVIEW)
+            preview_status, preview_headers = request(
+                cloudflare_public_path(OWNER_PREVIEW)
+            )
             preview_cache = preview_headers.get("cache-control", "").lower().replace(" ", "")
             preview_robots = preview_headers.get("x-robots-tag", "").lower().replace(" ", "")
             preview_csp = preview_headers.get("content-security-policy", "")
@@ -1591,6 +1624,7 @@ def adopt_cloudflare_deployment(
                 expected_index_sha256=expected_index_sha256,
                 expected_files=expected_files,
                 index_path="/",
+                directory_indexes=True,
                 attempts=1,
             )
         custom_smoke = verify_cloudflare_custom_edge(
@@ -1849,10 +1883,7 @@ def verify_cloudflare_custom_edge(
                 try:
                     connection.request(
                         "GET",
-                        (
-                            "/" if object_name == "index.html"
-                            else "/" + quote(object_name, safe="/-._~")
-                        )
+                        cloudflare_public_path(object_name)
                         + f"?release={revision}&cf-edge=1",
                         headers={
                             "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
@@ -1877,7 +1908,7 @@ def verify_cloudflare_custom_edge(
                 try:
                     connection.request(
                         "GET",
-                        "/" + quote(path, safe="/-._~")
+                        cloudflare_public_path(path)
                         + f"?release={revision}&cf-edge=1",
                         headers={
                             "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
@@ -2073,6 +2104,7 @@ def verify_final_provider_bytes(
             expected_index_sha256=expected_index_sha256,
             expected_files=cloudflare_files,
             index_path="/",
+            directory_indexes=True,
         )
     custom_smoke = verify_cloudflare_custom_edge(
         revision,

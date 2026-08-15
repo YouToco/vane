@@ -247,6 +247,7 @@ class PublishWebTest(unittest.TestCase):
             expected_index_sha256: str,
             expected_files: dict[str, dict] | None = None,
             index_path: str = "/index.html",
+            directory_indexes: bool = False,
             attempts: int = 6,
         ) -> dict:
             provider_root = (
@@ -759,7 +760,8 @@ class PublishWebTest(unittest.TestCase):
         def verify(
             origin: str, _revision: str, *, expected_marker: bytes,
             expected_index_sha256: str, expected_files=None,
-            index_path: str = "/index.html", attempts: int = 6,
+            index_path: str = "/index.html", directory_indexes: bool = False,
+            attempts: int = 6,
         ) -> dict:
             provider_root = (
                 self.cloudflare_remote if "pages.dev" in origin else self.remote
@@ -1024,7 +1026,7 @@ class PublishWebTest(unittest.TestCase):
         responses = {
             "/": (200, [("Cache-Control", "no-cache, must-revalidate")]),
             "/" + asset: (200, [("Cache-Control", "public, max-age=31536000, immutable")]),
-            "/" + PREVIEW: (200, [
+            publish_web.cloudflare_public_path(PREVIEW): (200, [
                 ("Cache-Control", "no-store"),
                 ("X-Robots-Tag", "noindex, nofollow, noarchive"),
                 ("Referrer-Policy", "no-referrer"),
@@ -1716,6 +1718,7 @@ class PublishWebTest(unittest.TestCase):
                 expected_marker=marker,
                 expected_index_sha256=hashlib.sha256(index).hexdigest(),
                 index_path="/",
+                directory_indexes=True,
             )
         self.assertEqual(
             requests,
@@ -1724,6 +1727,45 @@ class PublishWebTest(unittest.TestCase):
                 f"https://vane-web.pages.dev/?release={SHA}&probe=123456-1",
             ],
         )
+        self.assertEqual(
+            publish_web.cloudflare_public_path(PREVIEW),
+            "/_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/",
+        )
+
+    def test_public_object_verification_retries_one_transient_edge_body(self) -> None:
+        marker = (self.dist / "vane-release.json").read_bytes()
+        index = (self.dist / "index.html").read_bytes()
+        stable = b'exact-stable-object'
+        object_reads = 0
+
+        def open_request(request, timeout):
+            nonlocal object_reads
+            if "/vane-release.json?" in request.full_url:
+                return PublicResponse(marker)
+            if "/stable-config.json?" in request.full_url:
+                object_reads += 1
+                return PublicResponse(b"transient" if object_reads == 1 else stable)
+            return PublicResponse(index)
+
+        expected = {
+            "index.html": {"path": "index.html", "size": len(index),
+                           "sha256": hashlib.sha256(index).hexdigest()},
+            "vane-release.json": {"path": "vane-release.json", "size": len(marker),
+                                  "sha256": hashlib.sha256(marker).hexdigest()},
+            "stable-config.json": {"path": "stable-config.json", "size": len(stable),
+                                   "sha256": hashlib.sha256(stable).hexdigest()},
+        }
+        with mock.patch.object(
+            publish_web, "urlopen", side_effect=open_request
+        ), mock.patch.object(publish_web.time, "sleep"):
+            publish_web.verify_public_release(
+                "https://vane-web.pages.dev", SHA,
+                expected_marker=marker,
+                expected_index_sha256=hashlib.sha256(index).hexdigest(),
+                expected_files=expected, index_path="/", directory_indexes=True,
+                attempts=1,
+            )
+        self.assertEqual(object_reads, 2)
 
     def test_public_verification_rejects_same_revision_forged_marker(self) -> None:
         expected = (self.dist / "vane-release.json").read_bytes()
