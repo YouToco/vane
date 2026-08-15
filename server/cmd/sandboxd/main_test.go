@@ -24,12 +24,17 @@ func TestLoadConfigRequiresPermanentDarkMode(t *testing.T) {
 	if err != nil || configuration.FeatureEnabled || configuration.Mode != "dark" {
 		t.Fatalf("dark config=%+v err=%v", configuration, err)
 	}
-	enabled := strings.Replace(payload, `"feature_enabled":false`, `"feature_enabled":true`, 1)
-	if err := os.WriteFile(path, []byte(enabled), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadConfig(path, false); err == nil {
-		t.Fatal("feature-enabled sandboxd config accepted")
+	for name, mutation := range map[string]string{
+		"mode":       strings.Replace(payload, `"mode":"dark"`, `"mode":"live"`, 1),
+		"enabled":    strings.Replace(payload, `"feature_enabled":false`, `"feature_enabled":true`, 1),
+		"production": strings.Replace(payload, `"production":true`, `"production":false`, 1),
+	} {
+		if err := os.WriteFile(path, []byte(mutation), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(path, false); err == nil {
+			t.Fatalf("%s sandboxd mutation accepted", name)
+		}
 	}
 	uppercase := strings.Replace(payload, strings.Repeat("a", 64), strings.Repeat("A", 64), 1)
 	if err := os.WriteFile(path, []byte(uppercase), 0o600); err != nil {
@@ -37,6 +42,24 @@ func TestLoadConfigRequiresPermanentDarkMode(t *testing.T) {
 	}
 	if _, err := loadConfig(path, false); err == nil {
 		t.Fatal("uppercase policy digest accepted")
+	}
+}
+
+func TestConfigRejectsDuplicateKeysAndOversizedWhitespace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sandboxd.json")
+	duplicate := `{"mode":"dark","mode":"dark"}`
+	if err := os.WriteFile(path, []byte(duplicate), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path, false); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate security key err=%v", err)
+	}
+	oversized := `{"mode":"dark"}` + strings.Repeat(" ", maxConfigBytes)
+	if err := os.WriteFile(path, []byte(oversized), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path, false); err == nil || !strings.Contains(err.Error(), "size") {
+		t.Fatalf("oversized whitespace config err=%v", err)
 	}
 }
 

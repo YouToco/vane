@@ -42,6 +42,19 @@ func inspectNetworkNamespace(path string) error {
 			return
 		}
 		defer target.Close()
+		var currentStat, targetStat unix.Stat_t
+		if err := unix.Fstat(int(current.Fd()), &currentStat); err != nil {
+			result = fmt.Errorf("stat current netns: %w", err)
+			return
+		}
+		if err := unix.Fstat(int(target.Fd()), &targetStat); err != nil {
+			result = fmt.Errorf("stat target netns: %w", err)
+			return
+		}
+		if currentStat.Dev == targetStat.Dev && currentStat.Ino == targetStat.Ino {
+			result = errors.New("target netns is the current host namespace")
+			return
+		}
 		if err := unix.Setns(int(target.Fd()), unix.CLONE_NEWNET); err != nil {
 			result = fmt.Errorf("enter target netns: %w", err)
 			return

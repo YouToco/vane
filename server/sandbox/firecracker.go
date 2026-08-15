@@ -3,12 +3,14 @@ package sandbox
 import (
 	"context"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -25,21 +27,24 @@ type ArtifactPin struct {
 }
 
 type FirecrackerConfig struct {
-	Firecracker        ArtifactPin            `json:"firecracker"`
-	Jailer             ArtifactPin            `json:"jailer"`
-	Kernel             ArtifactPin            `json:"kernel"`
-	RootFS             ArtifactPin            `json:"rootfs"`
-	CodeImages         map[string]ArtifactPin `json:"code_images"`
-	NetNSPath          string                 `json:"empty_netns_path"`
-	FirecrackerVersion string                 `json:"firecracker_version"`
-	JailerVersion      string                 `json:"jailer_version"`
-	WorkRoot           string                 `json:"work_root"`
-	JailerUIDStart     int                    `json:"jailer_uid_start"`
-	JailerGIDStart     int                    `json:"jailer_gid_start"`
-	IsolationSlots     int                    `json:"isolation_slots"`
-	Production         bool                   `json:"production"`
-	darkLaunchForTest  bool
-	netNSVerifier      func(string) error
+	Firecracker         ArtifactPin            `json:"firecracker"`
+	Jailer              ArtifactPin            `json:"jailer"`
+	Kernel              ArtifactPin            `json:"kernel"`
+	RootFS              ArtifactPin            `json:"rootfs"`
+	CodeImages          map[string]ArtifactPin `json:"code_images"`
+	NetNSPath           string                 `json:"empty_netns_path"`
+	FirecrackerVersion  string                 `json:"firecracker_version"`
+	JailerVersion       string                 `json:"jailer_version"`
+	WorkRoot            string                 `json:"work_root"`
+	JailerUIDStart      int                    `json:"jailer_uid_start"`
+	JailerGIDStart      int                    `json:"jailer_gid_start"`
+	IsolationSlots      int                    `json:"isolation_slots"`
+	Production          bool                   `json:"production"`
+	darkLaunchForTest   bool
+	netNSVerifier       func(string) error
+	reservedUIDs        []uint32
+	reservedGIDs        []uint32
+	hostIdentitiesBound bool
 }
 
 type LaunchPlan struct {
@@ -67,6 +72,12 @@ func NewFirecrackerBackend(config FirecrackerConfig, launcher Launcher) (*Firecr
 	if launcher == nil {
 		launcher = execLauncher{}
 	}
+	if err := validateIdentityPool(config); err != nil {
+		return nil, err
+	}
+	if config.Production && !config.hostIdentitiesBound {
+		return nil, errors.New("production sandbox host service identities are not bound")
+	}
 	if config.IsolationSlots < 1 || config.IsolationSlots > 1024 ||
 		config.JailerUIDStart <= 0 || config.JailerGIDStart <= 0 {
 		return nil, errors.New("sandbox jailer identity pool is invalid")
@@ -78,9 +89,55 @@ func NewFirecrackerBackend(config FirecrackerConfig, launcher Launcher) (*Firecr
 	return &FirecrackerBackend{config: config, launcher: launcher, scrub: scrubTree, free: free}, nil
 }
 
+// uid_t/gid_t all-ones is reserved as the kernel/API "no identity" sentinel.
+const maxHostIdentity = uint64(1<<32 - 2)
+
+func (c *FirecrackerConfig) BindServiceIdentities(vaneServerUID uint32, socketUID, socketGID int) error {
+	if vaneServerUID == 0 || uint64(vaneServerUID) > maxHostIdentity || socketUID < 0 || socketGID < 0 ||
+		uint64(socketUID) > maxHostIdentity || uint64(socketGID) > maxHostIdentity {
+		return errors.New("sandbox host service identity is outside uint32")
+	}
+	c.reservedUIDs = []uint32{vaneServerUID, uint32(socketUID)}
+	c.reservedGIDs = []uint32{uint32(socketGID)}
+	c.hostIdentitiesBound = true
+	return nil
+}
+
+func validateIdentityPool(config FirecrackerConfig) error {
+	if config.IsolationSlots < 1 || config.IsolationSlots > 1024 ||
+		config.JailerUIDStart <= 0 || config.JailerGIDStart <= 0 {
+		return errors.New("sandbox jailer identity pool is invalid")
+	}
+	slots := uint64(config.IsolationSlots)
+	uidStart, gidStart := uint64(config.JailerUIDStart), uint64(config.JailerGIDStart)
+	uidEnd, gidEnd := uidStart+slots-1, gidStart+slots-1
+	if uidEnd > maxHostIdentity || gidEnd > maxHostIdentity {
+		return errors.New("sandbox jailer identity pool exceeds uint32")
+	}
+	for _, reserved := range config.reservedUIDs {
+		if value := uint64(reserved); value >= uidStart && value <= uidEnd {
+			return errors.New("sandbox jailer UID pool collides with a service identity")
+		}
+	}
+	for _, reserved := range config.reservedGIDs {
+		if value := uint64(reserved); value >= gidStart && value <= gidEnd {
+			return errors.New("sandbox jailer GID pool collides with a service identity")
+		}
+	}
+	return nil
+}
+
 func (b *FirecrackerBackend) Preflight(ctx context.Context) error {
 	if runtime.GOOS != "linux" {
 		return errors.New("Firecracker sandbox requires Linux")
+	}
+	if b.config.Production {
+		if err := verifyUnusedIdentityRange(b.config.JailerUIDStart, b.config.IsolationSlots, true); err != nil {
+			return err
+		}
+		if err := verifyUnusedIdentityRange(b.config.JailerGIDStart, b.config.IsolationSlots, false); err != nil {
+			return err
+		}
 	}
 	if err := inspectKVM("/dev/kvm"); err != nil {
 		return err
@@ -116,6 +173,14 @@ func (b *FirecrackerBackend) Preflight(ctx context.Context) error {
 		strings.Contains(strings.ToLower(b.config.Jailer.Path), "debug")) {
 		return errors.New("debug Firecracker artifacts are forbidden in production")
 	}
+	if b.config.Production {
+		if err := verifyStaticELF(b.config.Firecracker.Path); err != nil {
+			return fmt.Errorf("firecracker production artifact: %w", err)
+		}
+		if err := verifyStaticELF(b.config.Jailer.Path); err != nil {
+			return fmt.Errorf("jailer production artifact: %w", err)
+		}
+	}
 	if err := verifyTrustedDirectory(b.config.WorkRoot, b.config.Production); err != nil {
 		return fmt.Errorf("sandbox work root: %w", err)
 	}
@@ -127,6 +192,49 @@ func (b *FirecrackerBackend) Preflight(ctx context.Context) error {
 	}
 	if err := verifyVersion(ctx, b.config.Jailer.Path, "Jailer", b.config.JailerVersion); err != nil {
 		return fmt.Errorf("jailer version: %w", err)
+	}
+	return nil
+}
+
+func verifyStaticELF(path string) error {
+	file, err := elf.Open(path)
+	if err != nil {
+		return fmt.Errorf("parse static ELF: %w", err)
+	}
+	defer file.Close()
+	if file.Type != elf.ET_EXEC {
+		return fmt.Errorf("ELF type %s is not a static executable", file.Type)
+	}
+	for _, program := range file.Progs {
+		if program.Type == elf.PT_INTERP {
+			return errors.New("dynamic ELF PT_INTERP is forbidden")
+		}
+	}
+	return nil
+}
+
+func verifyUnusedIdentityRange(start, slots int, users bool) error {
+	for offset := 0; offset < slots; offset++ {
+		identity := fmt.Sprint(uint64(start) + uint64(offset))
+		if users {
+			_, err := user.LookupId(identity)
+			if err == nil {
+				return fmt.Errorf("sandbox jailer UID %s is already assigned", identity)
+			}
+			var unknown user.UnknownUserError
+			if !errors.As(err, &unknown) {
+				return fmt.Errorf("verify sandbox jailer UID %s: %w", identity, err)
+			}
+			continue
+		}
+		_, err := user.LookupGroupId(identity)
+		if err == nil {
+			return fmt.Errorf("sandbox jailer GID %s is already assigned", identity)
+		}
+		var unknown user.UnknownGroupError
+		if !errors.As(err, &unknown) {
+			return fmt.Errorf("verify sandbox jailer GID %s: %w", identity, err)
+		}
 	}
 	return nil
 }
@@ -283,6 +391,9 @@ func verifyPinnedArtifact(label string, pin ArtifactPin, production bool) error 
 }
 
 func verifyTrustedPath(path string, production bool) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("trusted artifact path is not absolute")
+	}
 	clean := filepath.Clean(path)
 	for current := clean; ; current = filepath.Dir(current) {
 		info, err := os.Lstat(current)
@@ -301,6 +412,9 @@ func verifyTrustedPath(path string, production bool) error {
 		}
 		if current == string(filepath.Separator) {
 			break
+		}
+		if filepath.Dir(current) == current {
+			return errors.New("trusted artifact ancestor traversal made no progress")
 		}
 	}
 	info, err := os.Stat(clean)
@@ -334,6 +448,9 @@ func verifyProtectedDirectoryChain(path string, expectedUID uint32) error {
 }
 
 func verifyDirectoryChainUntil(path, stop string, expectedUID uint32) error {
+	if !filepath.IsAbs(path) || !filepath.IsAbs(stop) {
+		return errors.New("directory chain paths must be absolute")
+	}
 	cleanStop := filepath.Clean(stop)
 	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
 		info, err := os.Lstat(current)
@@ -351,6 +468,9 @@ func verifyDirectoryChainUntil(path, stop string, expectedUID uint32) error {
 		}
 		if current == string(filepath.Separator) {
 			return errors.New("directory stop is not an ancestor")
+		}
+		if filepath.Dir(current) == current {
+			return errors.New("directory ancestor traversal made no progress")
 		}
 	}
 }
@@ -398,13 +518,39 @@ func copyPinnedFile(pin ArtifactPin, destination string) error {
 
 func scrubTree(path string) error {
 	var cleanupErr error
-	walkErr := filepath.Walk(path, func(current string, info os.FileInfo, err error) error {
-		if err == nil && info != nil {
-			cleanupErr = errors.Join(cleanupErr, os.Chmod(current, 0o700))
+	var directories []string
+	walkErr := filepath.WalkDir(path, func(current string, entry os.DirEntry, walkEntryErr error) error {
+		if walkEntryErr != nil {
+			cleanupErr = errors.Join(cleanupErr, walkEntryErr)
+			return nil
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			cleanupErr = errors.Join(cleanupErr, os.Remove(current))
+			return nil
+		}
+		if entry.IsDir() {
+			directories = append(directories, current)
+			return nil
+		}
+		cleanupErr = errors.Join(cleanupErr, os.Remove(current))
 		return nil
 	})
-	return errors.Join(cleanupErr, walkErr, os.RemoveAll(path))
+	for index := len(directories) - 1; index >= 0; index-- {
+		current := directories[index]
+		info, err := os.Lstat(current)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			cleanupErr = errors.Join(cleanupErr, os.Remove(current))
+			continue
+		}
+		cleanupErr = errors.Join(cleanupErr, prepareDirectoryForRemoval(current), os.Remove(current))
+	}
+	return errors.Join(cleanupErr, walkErr)
 }
 
 func jailerID(request Request) string {

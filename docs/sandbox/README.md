@@ -17,6 +17,8 @@ Unix socket, validates the complete authority envelope, and always returns
 - Firecracker, jailer, kernel, root filesystem, and every code image are
   absolute, root-owned, single-link, non-writable paths with exact SHA-256 pins.
   Firecracker and jailer must report the same exact non-debug release.
+  Those digests are authority only after an external trusted release-approval
+  process; this dark foundation does not yet embed an official release manifest.
 - Every invocation receives a derived jailer-safe ID, a distinct host UID/GID
   slot, a new work directory, a new microVM plan, read-only root/code drives,
   non-root guest identity, bounded tmpfs boot contract, CPU/memory/PID cgroups,
@@ -29,6 +31,9 @@ Unix socket, validates the complete authority envelope, and always returns
 - Socket startup fails if the path already exists. The immediate parent and
   socket have exact owner/mode contracts; cleanup removes only the inode that
   sandboxd created, and any cleanup mismatch or failure is returned.
+- Socket messages use one explicit 32-bit length-prefixed JSON frame with a
+  closed maximum; unknown fields, trailing bytes inside the frame, and an
+  oversized declared or encoded payload are rejected without waiting for EOF.
 - Configuration is read only from an absolute root-owned 0400/0600 regular
   file with one link and a root-owned, non-writable, non-symlink parent chain.
   Wire responses contain fixed error codes, never internal paths or principals.
@@ -47,6 +52,12 @@ Activation requires a separate reviewed project that adds, at minimum:
 3. real Linux/KVM Firecracker integration evidence for timeout, fork/output
    abuse, crash cleanup, concurrent tenants, no-network, and metadata denial;
 4. independent security approval and a new explicit rollout gate.
+
+That activation gate must also add an approved `SizeBytes` to every artifact
+pin, place acquisition/plan/copy under the invocation wall deadline, make copy
+context-cancellable, and prove that launcher output-limit errors always map to
+`killed/output_limit`. These are not reachable while both production Run paths
+remain permanently dark.
 
 The current macOS unit suite cannot provide Linux namespace or KVM evidence.
 `sandboxd self-test` therefore fails outside a correctly provisioned Linux

@@ -1,8 +1,9 @@
 package sandbox
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -158,24 +159,58 @@ func (c Client) Execute(ctx context.Context, request Request) (Result, error) {
 }
 
 func readWire(reader io.Reader, target any) error {
-	limited := io.LimitReader(reader, maxWireBytes+1)
-	buffered := bufio.NewReader(limited)
-	decoder := json.NewDecoder(buffered)
+	var header [4]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return fmt.Errorf("read sandbox frame length: %w", err)
+	}
+	length := binary.BigEndian.Uint32(header[:])
+	if length == 0 || length > maxWireBytes {
+		return errors.New("sandbox frame length is outside the closed limit")
+	}
+	payload := make([]byte, int(length))
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		return fmt.Errorf("read sandbox frame payload: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("decode sandbox message: %w", err)
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return errors.New("sandbox message has trailing data or exceeds the wire limit")
+	if decoder.InputOffset() != int64(len(payload)) {
+		return errors.New("sandbox message has trailing bytes")
 	}
 	return nil
 }
 
 func writeWire(writer io.Writer, value any) error {
-	encoder := json.NewEncoder(writer)
-	if err := encoder.Encode(value); err != nil {
+	payload, err := json.Marshal(value)
+	if err != nil {
 		return fmt.Errorf("encode sandbox message: %w", err)
+	}
+	if len(payload) == 0 || len(payload) > maxWireBytes {
+		return errors.New("sandbox frame exceeds the closed wire limit")
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	if err := writeFull(writer, header[:]); err != nil {
+		return fmt.Errorf("write sandbox frame length: %w", err)
+	}
+	if err := writeFull(writer, payload); err != nil {
+		return fmt.Errorf("write sandbox frame payload: %w", err)
+	}
+	return nil
+}
+
+func writeFull(writer io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		written, err := writer.Write(payload)
+		if err != nil {
+			return err
+		}
+		if written <= 0 || written > len(payload) {
+			return io.ErrShortWrite
+		}
+		payload = payload[written:]
 	}
 	return nil
 }
