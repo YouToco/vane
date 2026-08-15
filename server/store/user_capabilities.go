@@ -216,7 +216,7 @@ func (s *Store) beginCapabilityTx(ctx context.Context, tenantID, actorUserID int
 	if tenantID <= 0 || actorUserID <= 0 {
 		return nil, "", capabilityValidation("capability principal is invalid")
 	}
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, "", capabilityDatabase("begin capability transaction", err)
 	}

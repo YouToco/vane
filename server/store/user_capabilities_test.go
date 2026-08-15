@@ -1,11 +1,15 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/server/types"
 )
@@ -105,5 +109,38 @@ func TestCapabilityStoreCredentialSafetyIsLastLineOfDefense(t *testing.T) {
 	cleanMCP.Connection.EndpointURL = "https://mcp.example.com/sk-1234567890abcdef1234567890abcdef"
 	if err := validateMCPCapabilityCredentialSafety(cleanMCP); !errors.Is(err, types.ErrValidation) {
 		t.Fatalf("secret endpoint error=%v", err)
+	}
+}
+
+func TestCreateSkillCapabilityCallsCredentialGateBeforeDatabase(t *testing.T) {
+	manifest := json.RawMessage(`{"schema_version":"vane.skill-package/v1","description":"ghp_123456789012345678901234567890"}`)
+	payloadDigest := digestBytes(manifest)
+	skillMD := []byte("safe declarative skill")
+	skillDigest := digestBytes(skillMD)
+	fileManifest := json.RawMessage(`{"files":["SKILL.md"]}`)
+
+	databaseTouched := false
+	st := &Store{beginTx: func(context.Context, pgx.TxOptions) (pgx.Tx, error) {
+		databaseTouched = true
+		return nil, errors.New("database sentinel")
+	}}
+	_, _, err := st.CreateSkillCapability(t.Context(), types.CreateSkillCapability{
+		TenantID: 1, ActorUserID: 2, Visibility: types.UserCapabilityPersonal,
+		Slug: "market-watch", DisplayName: "Market Watch", Source: types.UserCapabilityUpload,
+		PayloadDigest: payloadDigest, Manifest: manifest, Compatible: true,
+		Skill: types.SkillCapabilityVersion{
+			Name: "market-watch", Description: "Safe watcher",
+			SkillMDDigest: skillDigest, ArchiveDigest: strings.Repeat("a", 64),
+			FileManifest: fileManifest,
+			Files: []types.SkillCapabilityFile{{
+				Path: "SKILL.md", Kind: "skill_md", Digest: skillDigest, Content: skillMD,
+			}},
+		},
+	})
+	if !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("credential-bearing public create error=%v", err)
+	}
+	if databaseTouched {
+		t.Fatal("credential-bearing capability reached the database boundary")
 	}
 }
