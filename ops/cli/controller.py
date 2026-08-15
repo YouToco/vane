@@ -1101,7 +1101,10 @@ def build_release_submission(
         shutil.copy2(binary, source / "server/bin" / binary.name)
     if directory_tree_sha256(source / "server/bin") != gate["binary_tree_sha256"]:
         raise PolicyError("copied binary tree differs from full Gate evidence")
-    committed_source = handoff / "committed-source"
+    # Exact-SHA sources are local build inputs, never part of the broker handoff.
+    # Keeping them beside (rather than inside) server-submission also lets the
+    # submitter's strict top-level allowlist catch accidental packaging drift.
+    committed_source = release_root / "committed-source"
     export_committed_files(revision, committed_source, CONTROL_PLANE_PATHS)
     committed_infra = committed_source / "infra/production"
     if directory_tree_sha256(committed_infra) != gate["infra_tree_sha256"]:
@@ -1225,6 +1228,7 @@ def build_release_submission(
     (handoff / "submission.json").write_bytes(canonical_json(submission))
     shutil.rmtree(source)
     shutil.rmtree(backend_payload)
+    shutil.rmtree(committed_source)
     return handoff
 
 
