@@ -176,16 +176,31 @@ ALTER TABLE workspace_memory_events FORCE ROW LEVEL SECURITY;
 ALTER TABLE workspace_memory_receipts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspace_memory_receipts FORCE ROW LEVEL SECURITY;
 
-CREATE POLICY workspace_memory_authorization_actor ON workspace_memory_authorizations
-  TO vane_workspace_memory_editor
+CREATE POLICY workspace_memory_authorization_select ON workspace_memory_authorizations
+  FOR SELECT TO vane_workspace_memory_editor
   USING (tenant_id=NULLIF(current_setting('app.tenant_id',true),'')::bigint AND
          actor_user_id=NULLIF(current_setting('app.user_id',true),'')::bigint AND
          actor_role=NULLIF(current_setting('app.membership_role',true),'') AND
-         workspace_kind=current_setting('app.workspace_kind',true) AND workspace_kind='team')
+         workspace_kind=current_setting('app.workspace_kind',true) AND workspace_kind='team');
+CREATE POLICY workspace_memory_authorization_insert ON workspace_memory_authorizations
+  FOR INSERT TO vane_workspace_memory_editor
   WITH CHECK (tenant_id=NULLIF(current_setting('app.tenant_id',true),'')::bigint AND
               actor_user_id=NULLIF(current_setting('app.user_id',true),'')::bigint AND
               actor_role=NULLIF(current_setting('app.membership_role',true),'') AND
-              workspace_kind=current_setting('app.workspace_kind',true) AND workspace_kind='team');
+              workspace_kind=current_setting('app.workspace_kind',true) AND workspace_kind='team' AND
+              consumed_event_id IS NULL);
+CREATE POLICY workspace_memory_authorization_update ON workspace_memory_authorizations
+  FOR UPDATE TO vane_workspace_memory_editor
+  USING (tenant_id=NULLIF(current_setting('app.tenant_id',true),'')::bigint AND
+         actor_user_id=NULLIF(current_setting('app.user_id',true),'')::bigint AND
+         actor_role=NULLIF(current_setting('app.membership_role',true),'') AND
+         workspace_kind=current_setting('app.workspace_kind',true) AND workspace_kind='team' AND
+         consumed_event_id IS NULL)
+  WITH CHECK (tenant_id=NULLIF(current_setting('app.tenant_id',true),'')::bigint AND
+              actor_user_id=NULLIF(current_setting('app.user_id',true),'')::bigint AND
+              actor_role=NULLIF(current_setting('app.membership_role',true),'') AND
+              workspace_kind=current_setting('app.workspace_kind',true) AND workspace_kind='team' AND
+              consumed_event_id IS NOT NULL);
 CREATE POLICY workspace_memory_record_tenant ON workspace_memory_records
   TO vane_workspace_memory_editor
   USING (tenant_id=NULLIF(current_setting('app.tenant_id',true),'')::bigint AND
