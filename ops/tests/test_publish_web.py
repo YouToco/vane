@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -64,7 +66,7 @@ class PublishWebTest(unittest.TestCase):
             "printf 'ossutil %s\\n' \"$*\" >>\"$WEB_CALL_LOG\"\n"
             "case \"$1\" in\n"
             " cp) case \"$2\" in\n"
-            "       oss://*) object=${2#oss://zhuoqidev-vane-web/}; mkdir -p \"$(dirname \"$3\")\"; cp \"$OSS_REMOTE/$object\" \"$3\";;\n"
+            "       oss://*) object=${2#oss://zhuoqidev-vane-web/}; [ \"${FAIL_DOWNLOAD-}\" != \"$object\" ] || exit 71; mkdir -p \"$(dirname \"$3\")\"; cp \"$OSS_REMOTE/$object\" \"$3\";;\n"
             "       *) object=${3#oss://zhuoqidev-vane-web/}; mkdir -p \"$OSS_REMOTE/$(dirname \"$object\")\"; cp \"$2\" \"$OSS_REMOTE/$object\"; [ \"${CORRUPT_UPLOAD-}\" != \"$object\" ] || printf bad >\"$OSS_REMOTE/$object\";;\n"
             "     esac;;\n"
             " stat) object=${2#oss://zhuoqidev-vane-web/}; [ \"${FAIL_STAT-}\" != \"$object\" ] || exit 71; size=$(wc -c <\"$OSS_REMOTE/$object\"); printf 'Content-Length : %s\\n' \"$size\";;\n"
@@ -84,9 +86,29 @@ class PublishWebTest(unittest.TestCase):
 
     def publish(self, result_name: str = "result.json") -> dict:
         result_path = self.root / result_name
+
+        def verify(
+            _origin: str,
+            _revision: str,
+            *,
+            expected_marker: bytes,
+            expected_index_sha256: str,
+            attempts: int = 6,
+        ) -> dict:
+            marker = self.remote / "vane-release.json"
+            index = self.remote / "index.html"
+            if (
+                not marker.is_file()
+                or marker.read_bytes() != expected_marker
+                or not index.is_file()
+                or hashlib.sha256(index.read_bytes()).hexdigest()
+                != expected_index_sha256
+            ):
+                raise RuntimeError("provider is not current")
+            return json.loads(expected_marker)
+
         with self.environment, mock.patch.object(
-            publish_web, "verify_public_release",
-            return_value={"source_revision": SHA, "source_dirty": False},
+            publish_web, "verify_public_release", side_effect=verify,
         ):
             return publish_web.publish(
                 dist=self.dist, revision=SHA, work_root=self.work,
@@ -107,16 +129,17 @@ class PublishWebTest(unittest.TestCase):
         self.assertLess(marker, refresh)
         self.assertNotIn("ossutil sync", calls)
         self.assertNotIn("ossutil rm", calls)
+        self.assertNotIn("ossutil stat", calls)
         self.assertEqual(
             json.loads((self.state / "web-current.json").read_text(encoding="utf-8"))["revision"],
             SHA,
         )
 
-    def test_failed_asset_stat_never_cuts_over_index(self) -> None:
+    def test_failed_asset_readback_never_cuts_over_index(self) -> None:
         old_marker = b'{"source_revision":"old"}\n'
         (self.remote / "vane-release.json").write_bytes(old_marker)
-        with mock.patch.dict(os.environ, {"FAIL_STAT": "assets/app-AbCdEf12.js"}):
-            with self.assertRaisesRegex(RuntimeError, "publication command failed"):
+        with mock.patch.dict(os.environ, {"FAIL_DOWNLOAD": "assets/app-AbCdEf12.js"}):
+            with self.assertRaisesRegex(RuntimeError, "critical readback failed"):
                 self.publish()
         calls = self.log.read_text(encoding="utf-8")
         self.assertNotIn("cp " + str(self.dist / "index.html"), calls)
@@ -197,6 +220,41 @@ class PublishWebTest(unittest.TestCase):
         result = self.publish("second.json")
         self.assertEqual(result["status"], "already-current")
         self.assertEqual(receipt.read_bytes(), expected)
+
+    def test_provider_commit_resumes_without_remote_mutation(self) -> None:
+        (self.remote / "index.html").write_bytes((self.dist / "index.html").read_bytes())
+        (self.remote / "vane-release.json").write_bytes(
+            (self.dist / "vane-release.json").read_bytes()
+        )
+        result = self.publish()
+        self.assertEqual(result["status"], "provider-already-current")
+        calls = self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+        self.assertNotIn("ossutil cp", calls)
+        self.assertNotIn("aliyun cdn", calls)
+        self.assertEqual(
+            json.loads((self.state / "web-current.json").read_text(encoding="utf-8"))["revision"],
+            SHA,
+        )
+
+    def test_parallel_apply_uses_a_bounded_worker_pool(self) -> None:
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def action(_: str) -> None:
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+
+        publish_web.parallel_apply(
+            "fixture", [str(index) for index in range(12)], action, workers=4
+        )
+        self.assertGreater(peak, 1)
+        self.assertLessEqual(peak, 4)
 
     def test_public_verification_uses_fixed_root_marker_and_exact_bytes(self) -> None:
         marker = (self.dist / "vane-release.json").read_bytes()
