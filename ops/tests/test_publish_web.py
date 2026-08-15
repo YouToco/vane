@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import time
@@ -20,6 +21,7 @@ assert SPEC and SPEC.loader
 publish_web = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(publish_web)
 SHA = "0123456789abcdef0123456789abcdef01234567"
+SHA2 = "89abcdef0123456789abcdef0123456789abcdef"
 PREVIEW = "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
 
 
@@ -84,7 +86,18 @@ class PublishWebTest(unittest.TestCase):
             "WEB_CALL_LOG": str(self.log),
         })
 
-    def publish(self, result_name: str = "result.json") -> dict:
+    def set_revision(self, revision: str) -> None:
+        marker = json.loads(
+            (self.dist / "vane-release.json").read_text(encoding="utf-8")
+        )
+        marker["source_revision"] = revision
+        (self.dist / "vane-release.json").write_text(
+            json.dumps(marker), encoding="utf-8"
+        )
+
+    def publish(
+        self, result_name: str = "result.json", revision: str = SHA
+    ) -> dict:
         result_path = self.root / result_name
 
         def verify(
@@ -111,7 +124,7 @@ class PublishWebTest(unittest.TestCase):
             publish_web, "verify_public_release", side_effect=verify,
         ):
             return publish_web.publish(
-                dist=self.dist, revision=SHA, work_root=self.work,
+                dist=self.dist, revision=revision, work_root=self.work,
                 state_root=self.state, tool_cache=self.cache,
                 origin="https://vane.example", result_path=result_path,
             )
@@ -208,9 +221,29 @@ class PublishWebTest(unittest.TestCase):
         outside = self.root / "outside.lock"
         outside.write_text("", encoding="utf-8")
         (self.state / "web-release.lock").symlink_to(outside)
-        with self.assertRaisesRegex(RuntimeError, "must not be symlinks"):
+        with self.assertRaisesRegex(RuntimeError, "state paths are unsafe"):
             self.publish()
         self.assertFalse(self.log.exists())
+
+    def test_symlinked_proof_root_is_rejected_before_remote_mutation(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.state / "web-proofs").symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "proof root is unsafe"):
+            self.publish()
+        calls = self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+        self.assertNotIn("ossutil cp", calls)
+        self.assertNotIn("aliyun cdn", calls)
+
+    def test_invalid_local_marker_is_rejected_before_remote_mutation(self) -> None:
+        (self.dist / "vane-release.json").write_text(
+            json.dumps({"source_revision": SHA}), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(RuntimeError, "not exact clean evidence"):
+            self.publish()
+        calls = self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+        self.assertNotIn("ossutil cp", calls)
+        self.assertNotIn("aliyun cdn", calls)
 
     def test_already_current_restores_the_deterministic_receipt(self) -> None:
         self.publish("first.json")
@@ -234,6 +267,71 @@ class PublishWebTest(unittest.TestCase):
         self.assertEqual(
             json.loads((self.state / "web-current.json").read_text(encoding="utf-8"))["revision"],
             SHA,
+        )
+
+    def test_next_revision_reuses_exact_content_addressed_asset(self) -> None:
+        self.publish("first.json")
+        self.log.write_text("", encoding="utf-8")
+        self.set_revision(SHA2)
+        result = self.publish("second.json", SHA2)
+        self.assertEqual(result["status"], "published")
+        calls = self.log.read_text(encoding="utf-8")
+        self.assertNotIn("assets/app-AbCdEf12.js", calls)
+        self.assertIn("index.html", calls)
+        self.assertIn("vane-release.json", calls)
+        current = json.loads(
+            (self.state / "web-current.json").read_text(encoding="utf-8")
+        )
+        proof = self.state / "web-proofs" / current["receipt_sha256"] / "proof.json"
+        self.assertTrue(proof.is_file())
+        self.assertEqual(
+            json.loads(proof.read_text(encoding="utf-8"))["verified_objects"][0]["path"],
+            "assets/app-AbCdEf12.js",
+        )
+
+    def test_same_named_changed_asset_is_uploaded_and_read_back(self) -> None:
+        self.publish("first.json")
+        self.log.write_text("", encoding="utf-8")
+        self.set_revision(SHA2)
+        (self.dist / "assets/app-AbCdEf12.js").write_text(
+            "changed", encoding="utf-8"
+        )
+        result = self.publish("second.json", SHA2)
+        self.assertEqual(result["status"], "published")
+        calls = self.log.read_text(encoding="utf-8")
+        self.assertEqual(
+            sum("assets/app-AbCdEf12.js" in line for line in calls.splitlines()), 2
+        )
+
+    def test_tampered_provider_proof_refuses_before_remote_mutation(self) -> None:
+        self.publish("first.json")
+        current = json.loads(
+            (self.state / "web-current.json").read_text(encoding="utf-8")
+        )
+        proof_path = (
+            self.state / "web-proofs" / current["receipt_sha256"] / "proof.json"
+        )
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+        proof["verified_objects"][0]["sha256"] = "0" * 64
+        proof_path.write_text(json.dumps(proof), encoding="utf-8")
+        self.log.write_text("", encoding="utf-8")
+        self.set_revision(SHA2)
+        with self.assertRaisesRegex(RuntimeError, "differs from receipt"):
+            self.publish("second.json", SHA2)
+        calls = self.log.read_text(encoding="utf-8")
+        self.assertNotIn("ossutil cp", calls)
+        self.assertNotIn("aliyun cdn", calls)
+
+    def test_legacy_state_without_proof_falls_back_to_full_upload(self) -> None:
+        self.publish("first.json")
+        shutil.rmtree(self.state / "web-proofs")
+        self.log.write_text("", encoding="utf-8")
+        self.set_revision(SHA2)
+        result = self.publish("second.json", SHA2)
+        self.assertEqual(result["status"], "published")
+        calls = self.log.read_text(encoding="utf-8")
+        self.assertEqual(
+            sum("assets/app-AbCdEf12.js" in line for line in calls.splitlines()), 2
         )
 
     def test_parallel_apply_uses_a_bounded_worker_pool(self) -> None:
