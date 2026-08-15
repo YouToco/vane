@@ -40,6 +40,7 @@ import { LogoMark } from "@/shared/brand/Logo";
 import { LocaleSwitch } from "@/app/LocaleSwitch";
 import { useI18n } from "@/i18n";
 import { clearTaskMutationSessionStorage } from "@/shared/runtime/task-action-session";
+import { WorkspaceSwitcher } from "@/app/WorkspaceSwitcher";
 
 const Home = lazy(() => import("@/pages/Home"));
 const TaskDashboard = lazy(() => import("@/pages/TaskDashboard"));
@@ -184,11 +185,13 @@ function AppSidebar({
   me,
   isPlatformOwner,
   onLogout,
+  onSwitchWorkspace,
 }: {
   hash: string;
   me: MeResponse;
   isPlatformOwner: boolean;
   onLogout: () => void;
+  onSwitchWorkspace: (tenantID: number) => Promise<void>;
 }) {
   const { t } = useI18n();
   const { groups } = useNav();
@@ -202,6 +205,7 @@ function AppSidebar({
             <span className="text-[11px] text-muted-foreground">{t.app.nav.tagline}</span>
           </div>
         </a>
+        <WorkspaceSwitcher me={me} onSwitch={onSwitchWorkspace} />
       </SidebarHeader>
       <SidebarContent>
         {groups.map((group) => (
@@ -261,10 +265,24 @@ function Shell({ hash, me }: { hash: string; me: MeResponse }) {
     } catch {}
     location.reload();
   }
+  async function onSwitchWorkspace(tenantID: number) {
+    // Pending write confirmations are scoped to the old workspace and must
+    // never survive a principal/token rotation.
+    clearTaskMutationSessionStorage();
+    await api.switchWorkspace(tenantID);
+    location.hash = "#/";
+    location.reload();
+  }
 
   return (
     <SidebarProvider>
-      <AppSidebar hash={hash} me={me} isPlatformOwner={isPlatformOwner} onLogout={onLogout} />
+      <AppSidebar
+        hash={hash}
+        me={me}
+        isPlatformOwner={isPlatformOwner}
+        onLogout={onLogout}
+        onSwitchWorkspace={onSwitchWorkspace}
+      />
       <SidebarInset>
         <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />

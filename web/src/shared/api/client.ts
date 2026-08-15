@@ -14,6 +14,22 @@ export interface MeResponse {
   tenant_id: number;
   /** 用户邮箱，供界面用户块展示；无邮箱的存量飞书用户为空串（后端 COALESCE 保证）。 */
   email?: string;
+  role: "owner" | "admin" | "member";
+  actor_type: "user" | "service_account";
+  workspaces?: WorkspaceSummary[];
+}
+
+export interface WorkspaceSummary {
+  id: number;
+  name: string;
+  kind: "personal" | "team";
+  status: "active" | "suspended" | "deleting";
+  plan: string;
+  seat_limit: number;
+  member_count: number;
+  role: "owner" | "admin" | "member";
+  created_at: string;
+  updated_at: string;
 }
 
 // ---- 平台管理：指定用户/任务/运行的真实执行轨迹 ----
@@ -1478,6 +1494,11 @@ export const api = {
     }),
   logout: () => post<{ ok: boolean }>("/api/auth/logout"),
   me: () => request<MeResponse>("/api/auth/me"),
+  switchWorkspace: (tenantID: number) =>
+    post<{ ok: boolean; tenant_id: number }>(
+      `/api/workspaces/${tenantID}/switch`,
+      {},
+    ),
   feishuStatus: () => request<FeishuStatus>("/api/feishu/status"),
   feishuVerify: (appId: string, appSecret: string) =>
     post<VerifyResult>("/api/feishu/verify", {
