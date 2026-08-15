@@ -1494,6 +1494,36 @@ export const api = {
     }),
   logout: () => post<{ ok: boolean }>("/api/auth/logout"),
   me: () => request<MeResponse>("/api/auth/me"),
+  requestEmailVerification: () =>
+    post<{ ok: boolean; already_verified?: boolean }>(
+      "/api/auth/email-verification/request",
+      {},
+    ),
+  verifyEmail: (token: string) =>
+    post<{ ok: boolean }>("/api/auth/email-verification/verify", { token }),
+  requestPasswordReset: (email: string) =>
+    post<{ ok: boolean; message: string }>("/api/auth/password-reset/request", {
+      email,
+    }),
+  completePasswordReset: (token: string, password: string) =>
+    post<{ ok: boolean }>("/api/auth/password-reset/complete", {
+      token,
+      password,
+    }),
+  reauthenticate: (password: string) =>
+    post<{ ok: boolean; proof: string; expires_in: number }>(
+      "/api/auth/reauth",
+      { password },
+    ),
+  logoutAll: (proof: string) =>
+    request<{ ok: boolean; revoked_sessions: number }>("/api/auth/logout-all", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Vane-Reauth-Token": proof,
+      },
+      body: "{}",
+    }),
   switchWorkspace: (tenantID: number) =>
     post<{ ok: boolean; tenant_id: number }>(
       `/api/workspaces/${tenantID}/switch`,

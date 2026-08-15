@@ -96,7 +96,7 @@ func (s *server) handleRequestEmailVerification(w http.ResponseWriter, r *http.R
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "already_verified": true})
 		return
 	}
-	link := strings.TrimRight(s.deps.Origin, "/") + "/verify-email?token=" + raw
+	link := strings.TrimRight(s.deps.Origin, "/") + "/#/verify-email?token=" + raw
 	if err := s.deps.SecurityMailer.Send(r.Context(), mailer.Message{
 		To: email, Subject: "验证你的 Vane 邮箱",
 		Text: "请在 24 小时内打开以下链接完成邮箱验证：\n" + link,
@@ -181,7 +181,7 @@ func (s *server) handleRequestPasswordReset(w http.ResponseWriter, r *http.Reque
 			if issueErr != nil {
 				slog.Warn("account security: 密码重置请求未签发", "err", issueErr)
 			} else if issued {
-				link := strings.TrimRight(s.deps.Origin, "/") + "/reset-password?token=" + raw
+				link := strings.TrimRight(s.deps.Origin, "/") + "/#/reset-password?token=" + raw
 				if sendErr := s.deps.SecurityMailer.Send(r.Context(), mailer.Message{
 					To: email, Subject: "重置你的 Vane 密码",
 					Text: "请在 30 分钟内打开以下链接重置密码：\n" + link,
