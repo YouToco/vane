@@ -14,6 +14,7 @@ func TestLoadConfigRequiresPermanentDarkMode(t *testing.T) {
       "socket_parent_uid":0,"socket_parent_gid":1,"socket_parent_mode":488,
       "socket_uid":0,"socket_gid":1,"socket_mode":432,
       "vane_server_uid":1001,"max_input_bytes":1024,
+      "max_connections":16,"max_wire_bytes":262144,
       "allowed_policy_sha256":["` + strings.Repeat("a", 64) + `"],
       "firecracker":{"production":true,"isolation_slots":1,
         "jailer_uid_start":20000,"jailer_gid_start":20000}}`
@@ -42,6 +43,31 @@ func TestLoadConfigRequiresPermanentDarkMode(t *testing.T) {
 	}
 	if _, err := loadConfig(path, false); err == nil {
 		t.Fatal("uppercase policy digest accepted")
+	}
+}
+
+func TestConfigRejectsDaemonResourceLimitMutations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sandboxd.json")
+	payload := `{"mode":"dark","feature_enabled":false,"socket_path":"/run/vane-sandbox/sandboxd.sock",
+      "socket_parent_uid":0,"socket_parent_gid":1,"socket_parent_mode":488,
+      "socket_uid":0,"socket_gid":1,"socket_mode":432,"vane_server_uid":1001,
+      "max_input_bytes":1024,"max_connections":16,"max_wire_bytes":262144,
+      "allowed_policy_sha256":["` + strings.Repeat("a", 64) + `"],
+      "firecracker":{"production":true,"isolation_slots":1,
+        "jailer_uid_start":20000,"jailer_gid_start":20000}}`
+	for name, mutation := range map[string]string{
+		"zero-connections": strings.Replace(payload, `"max_connections":16`, `"max_connections":0`, 1),
+		"too-many":         strings.Replace(payload, `"max_connections":16`, `"max_connections":65`, 1),
+		"wire-too-small":   strings.Replace(payload, `"max_wire_bytes":262144`, `"max_wire_bytes":4095`, 1),
+		"wire-too-large":   strings.Replace(payload, `"max_wire_bytes":262144`, `"max_wire_bytes":262145`, 1),
+		"input-over-wire":  strings.Replace(payload, `"max_input_bytes":1024`, `"max_input_bytes":262145`, 1),
+	} {
+		if err := os.WriteFile(path, []byte(mutation), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(path, false); err == nil {
+			t.Fatalf("daemon resource mutation %s accepted", name)
+		}
 	}
 }
 

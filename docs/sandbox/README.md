@@ -34,6 +34,10 @@ Unix socket, validates the complete authority envelope, and always returns
 - Socket messages use one explicit 32-bit length-prefixed JSON frame with a
   closed maximum; unknown fields, trailing bytes inside the frame, and an
   oversized declared or encoded payload are rejected without waiting for EOF.
+- The dark daemon defaults to 16 concurrent connections and a 256 KiB frame,
+  hard-caps configuration at 64 connections/256 KiB, applies a 30-second
+  per-connection deadline, and returns a fixed `busy` response without spawning
+  another handler when all slots are occupied.
 - Configuration is read only from an absolute root-owned 0400/0600 regular
   file with one link and a root-owned, non-writable, non-symlink parent chain.
   Wire responses contain fixed error codes, never internal paths or principals.
