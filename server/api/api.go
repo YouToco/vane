@@ -155,7 +155,12 @@ type Deps struct {
 	// TLS-only SMTP adapter; tests use narrow fakes.
 	AccountSecurity AccountSecurityStore
 	SecurityMailer  SecurityMailer
-	Manager         Manager
+	// Capabilities is the dark, metadata-only Skill/MCP control plane. It has no
+	// execution surface; MCP endpoint admission is independently injectable for
+	// deterministic DNS/SSRF tests.
+	Capabilities         CapabilityStore
+	MCPEndpointAdmission MCPEndpointAdmission
+	Manager              Manager
 	// Scheduler is capability-checked per endpoint below. Keeping this slot
 	// untyped lets each handler require only its idempotent command/read surface
 	// and removes the retired pre-6.8 DeletePush admission signature.
@@ -226,6 +231,9 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/auth/password-reset/complete", s.handleResetPassword)
 	inner.HandleFunc("POST /api/auth/reauth", s.handleReauth)
 	inner.HandleFunc("POST /api/auth/logout-all", s.handleLogoutAll)
+	inner.HandleFunc("GET /api/capabilities", s.handleListCapabilities)
+	inner.HandleFunc("POST /api/capabilities/skills", s.handleCreateSkillCapability)
+	inner.HandleFunc("POST /api/capabilities/mcp", s.handleCreateMCPCapability)
 	inner.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	inner.HandleFunc("GET /api/auth/me", s.handleMe)
 	inner.HandleFunc("GET /api/workspaces", s.handleListWorkspaces)
