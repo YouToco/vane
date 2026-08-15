@@ -11,6 +11,11 @@ vi.mock("@/pages/WorkspaceMembers", () => ({
     <div>workspace-members-marker-{me.tenant_id}</div>
   ),
 }));
+vi.mock("@/pages/A2AAccessTokens", () => ({
+  default: ({ me }: { me: { tenant_id: number } }) => (
+    <div>a2a-access-marker-{me.tenant_id}</div>
+  ),
+}));
 
 import AuthenticatedApp from "@/app/AuthenticatedApp";
 import { I18nProvider } from "@/i18n";
@@ -85,5 +90,27 @@ describe("workspace member navigation", () => {
     expect(await screen.findByText("workspace-members-marker-42")).toBeTruthy();
     expect(screen.getAllByText("成员与邀请").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("Signal Team")).toBeTruthy();
+  });
+
+  test("Settings exposes workspace-scoped access credentials", async () => {
+    render(
+      <I18nProvider>
+        <Settings hash="#/settings/access" me={me} onAuthorityChanged={vi.fn()} />
+      </I18nProvider>,
+    );
+
+    expect(await screen.findByText("a2a-access-marker-42")).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "访问凭证" }).getAttribute("aria-selected")).toBe("true");
+  });
+
+  test("authenticated navigation makes access credentials discoverable", async () => {
+    render(
+      <I18nProvider>
+        <AuthenticatedApp hash="#/settings/access" me={me} />
+      </I18nProvider>,
+    );
+
+    expect(await screen.findByText("a2a-access-marker-42")).toBeTruthy();
+    expect(screen.getAllByText("访问凭证").length).toBeGreaterThanOrEqual(2);
   });
 });
