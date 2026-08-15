@@ -139,6 +139,15 @@ type WorkspaceStore interface {
 	RotateSession(ctx context.Context, oldHash, newHash []byte, userID, tenantID int64, expiresAt time.Time) error
 }
 
+// A2AAccessStore is the hash-only, workspace-scoped token management plane.
+// It is deliberately separate from the legacy A2A ingress so tokens can be
+// issued and verified before the production cutover removes the global token.
+type A2AAccessStore interface {
+	IssueA2AAccessToken(context.Context, types.IssueA2AAccessToken) (*types.A2AAccessToken, error)
+	ListA2AAccessTokens(context.Context, int64, int64) ([]types.A2AAccessToken, error)
+	RevokeA2AAccessToken(context.Context, int64, int64, string) error
+}
+
 // Deps 是 Mount 所需的全部依赖，由 main.go 注入。
 type Deps struct {
 	Store *store.Store
@@ -150,6 +159,9 @@ type Deps struct {
 	// Workspaces can be injected independently in tests. Production falls back
 	// to Store, which implements this interface.
 	Workspaces WorkspaceStore
+	// A2AAccess defaults to Store in production and remains independently
+	// injectable for authorization/API tests.
+	A2AAccess A2AAccessStore
 	// AccountSecurity and SecurityMailer are separated so authentication tests
 	// never open a network connection. Production injects Store plus the
 	// TLS-only SMTP adapter; tests use narrow fakes.
@@ -191,6 +203,13 @@ type Deps struct {
 func (s *server) teamTaskAccess() teamTaskAccessStore {
 	if s.deps.TeamTasks != nil {
 		return s.deps.TeamTasks
+	}
+	return s.deps.Store
+}
+
+func (s *server) a2aAccessStore() A2AAccessStore {
+	if s.deps.A2AAccess != nil {
+		return s.deps.A2AAccess
 	}
 	return s.deps.Store
 }
@@ -238,6 +257,9 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/capabilities", s.handleListCapabilities)
 	inner.HandleFunc("POST /api/capabilities/skills", s.handleCreateSkillCapability)
 	inner.HandleFunc("POST /api/capabilities/mcp", s.handleCreateMCPCapability)
+	inner.HandleFunc("GET /api/a2a-tokens", s.handleListA2AAccessTokens)
+	inner.HandleFunc("POST /api/a2a-tokens", s.handleIssueA2AAccessToken)
+	inner.HandleFunc("DELETE /api/a2a-tokens/{token_id}", s.handleRevokeA2AAccessToken)
 	inner.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	inner.HandleFunc("GET /api/auth/me", s.handleMe)
 	inner.HandleFunc("GET /api/workspaces", s.handleListWorkspaces)
@@ -505,7 +527,7 @@ func (s *server) cors(next http.Handler) http.Handler {
 				h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE")
 				h.Set(
 					"Access-Control-Allow-Headers",
-					"Content-Type, Idempotency-Key",
+					"Content-Type, Idempotency-Key, X-Vane-Reauth-Token",
 				)
 				h.Set("Access-Control-Max-Age", "600")
 				w.WriteHeader(http.StatusNoContent)

@@ -300,6 +300,7 @@ func (s *server) handleReauth(w http.ResponseWriter, r *http.Request) {
 		writeAppError(w, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proof": raw, "expires_in": 600})
 }
 
