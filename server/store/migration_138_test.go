@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -45,7 +46,8 @@ func TestMigration138WorkspaceMemoryContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, lock := range []string{"FOR KEY SHARE OF m,t", "FOR UPDATE OF m,t",
-		"pg_catalog.pg_advisory_xact_lock_shared", "pg_catalog.pg_advisory_xact_lock"} {
+		"lockTenantAdmissionRootShared", "pg_catalog.pg_advisory_xact_lock_shared",
+		"pg_catalog.pg_advisory_xact_lock"} {
 		if !strings.Contains(string(workspaceStore), lock) {
 			t.Errorf("workspace memory admission missing %q", lock)
 		}
@@ -98,11 +100,37 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		sessions[pair.tenant<<32|pair.user] = sessionID
 	}
 
-	st, err := New(t.Context(), scratchURL)
+	workspaceStoreURL := migration138ApplicationURL(t, scratchURL,
+		"migration138-workspace-memory")
+	st, err := New(t.Context(), workspaceStoreURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
+	canonicalReplay := migration138Action(types.MemoryActionRemember, 0, "canonical replay")
+	canonicalReplay.Evidence.OwnerRequest = "  明确写入团队记忆  \n"
+	canonicalAuth, err := st.PrepareWorkspaceMemoryAuthorization(t.Context(), team,
+		creator, sessions[team<<32|creator], canonicalReplay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonicalOwnerRequest string
+	if err := database.QueryRowContext(t.Context(), `SELECT owner_request
+		FROM workspace_memory_authorizations WHERE tenant_id=$1 AND id=$2`,
+		team, canonicalAuth).Scan(&canonicalOwnerRequest); err != nil {
+		t.Fatal(err)
+	}
+	if canonicalOwnerRequest != "明确写入团队记忆" {
+		t.Fatalf("authorization persisted non-canonical request %q", canonicalOwnerRequest)
+	}
+	if _, err := database.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations
+		SET owner_request='owner-drift' WHERE tenant_id=$1 AND id=$2`, team, canonicalAuth); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PrepareWorkspaceMemoryAuthorization(t.Context(), team, creator,
+		sessions[team<<32|creator], canonicalReplay); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("same-id authorization field drift code=%s err=%v", types.CodeOf(err), err)
+	}
 	teamPersonalAction := migration138Action(
 		types.MemoryActionRemember, 0, "must-not-enter-personal-ledger")
 	if _, err := st.PrepareMemoryAuthorization(t.Context(), team, creator,
@@ -243,6 +271,63 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		t.Fatalf("role-drift authorization consumed event=%d", *consumed)
 	}
 
+	// A correct authorization cannot be repurposed through the remember-shaped
+	// (NULL supersedes) record branch even by a direct holder of the capability
+	// role. The database binds both branches to the frozen action and target.
+	mutationTx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutationTx.ExecContext(t.Context(), `SELECT
+		set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true),
+		set_config('app.membership_role','member',true),
+		set_config('app.workspace_kind','team',true)`, fmt.Sprint(team), fmt.Sprint(creator)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutationTx.ExecContext(t.Context(), `SET LOCAL ROLE vane_workspace_memory_editor`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutationTx.ExecContext(t.Context(), `INSERT INTO workspace_memory_records(
+		tenant_id,creator_user_id,created_by_user_id,memory_text,evidence_source_type,
+		evidence_source_id,authorization_id,owner_request,authorization_digest,supersedes_memory_id)
+		VALUES($1,$2,$2,'must-reject','owner_explicit_agent_turn',$3,$4,
+		'explicit mutation',repeat('a',64),NULL)`, team, creator, uuid.NewString(), driftAuth); err == nil {
+		t.Fatal("correct authorization entered remember-shaped record branch")
+	}
+	if err := mutationTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Purge owns the exclusive tenant-admission root. A team recall joins it as
+	// shared before touching its workspace lock, then resumes without deadlock.
+	rootTx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rootTx.ExecContext(t.Context(), `SELECT pg_advisory_xact_lock(
+		hashtextextended('vane/tenant-admission/v1/'||($1::bigint)::text,$2))`,
+		team, tenantAdmissionRootLockSeed); err != nil {
+		t.Fatal(err)
+	}
+	rootRecallDone := make(chan error, 1)
+	go func() {
+		_, recallErr := st.RecallWorkspaceMemories(t.Context(), team, member,
+			types.MemoryRecallQuery{Query: "role drift boundary", Limit: 8})
+		rootRecallDone <- recallErr
+	}()
+	migration138AwaitAdvisoryWaiters(t, database, "migration138-workspace-memory", 1)
+	if err := rootTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case recallErr := <-rootRecallDone:
+		if recallErr != nil {
+			t.Fatal(recallErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("workspace recall deadlocked after tenant admission release")
+	}
+
 	// The admission key is workspace-wide rather than actor-wide: a member's
 	// recall must wait behind an exclusive writer lock acquired by another actor.
 	lockTx, err := database.BeginTx(t.Context(), nil)
@@ -259,11 +344,7 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 			types.MemoryRecallQuery{Query: "role drift boundary", Limit: 8})
 		recallDone <- recallErr
 	}()
-	select {
-	case recallErr := <-recallDone:
-		t.Fatalf("cross-actor recall bypassed exclusive admission: %v", recallErr)
-	case <-time.After(150 * time.Millisecond):
-	}
+	migration138AwaitAdvisoryWaiters(t, database, "migration138-workspace-memory", 1)
 	if err := lockTx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +420,7 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		WHERE relation.relname LIKE 'workspace_memory_%'`).Scan(&policyContract); err != nil {
 		t.Fatal(err)
 	}
-	if policyContract != "389e9ba5523797661dea5f127048269f" {
+	if policyContract != "88ffa5376feae12d0db8c0145bc15dfc" {
 		t.Fatalf("workspace memory policy contract=%s", policyContract)
 	}
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
@@ -422,6 +503,114 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
 		t.Fatalf("deprovision v138 runtime: %v", err)
 	}
+	dry, err := st.PurgeTenant(t.Context(), team, true)
+	if err != nil {
+		t.Fatalf("dry purge consumed workspace memory ledger: %v", err)
+	}
+	for _, table := range []string{"workspace_memory_receipts", "workspace_memory_events",
+		"workspace_memory_records", "workspace_memory_authorizations"} {
+		if dry.Rows[table] == 0 {
+			t.Errorf("dry purge did not exercise %s", table)
+		}
+	}
+	var retainedAfterDry int
+	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM workspace_memory_events
+		WHERE tenant_id=$1`, team).Scan(&retainedAfterDry); err != nil {
+		t.Fatal(err)
+	}
+	if retainedAfterDry == 0 {
+		t.Fatal("dry purge committed workspace memory deletion")
+	}
+	// Deterministic no-deadlock barrier: recall first holds the shared tenant
+	// root while waiting for the workspace child lock; purge then waits for the
+	// exclusive root. Releasing the child lets recall drain before purge.
+	workspaceBarrier, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspaceBarrier.ExecContext(t.Context(), `SELECT pg_advisory_xact_lock(
+		hashtextextended('vane.workspace_memory:'||($1::bigint)::text,0))`, team); err != nil {
+		t.Fatal(err)
+	}
+	concurrentRecall := make(chan error, 1)
+	go func() {
+		_, recallErr := st.RecallWorkspaceMemories(t.Context(), team, member,
+			types.MemoryRecallQuery{Query: "role drift boundary", Limit: 8})
+		concurrentRecall <- recallErr
+	}()
+	migration138AwaitAdvisoryWaiters(t, database, "migration138-workspace-memory", 1)
+	purgeDone := make(chan struct {
+		report *PurgeReport
+		err    error
+	}, 1)
+	go func() {
+		report, purgeErr := st.PurgeTenant(t.Context(), team, false)
+		purgeDone <- struct {
+			report *PurgeReport
+			err    error
+		}{report: report, err: purgeErr}
+	}()
+	migration138AwaitAdvisoryWaiters(t, database, "migration138-workspace-memory", 2)
+	if err := workspaceBarrier.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case recallErr := <-concurrentRecall:
+		if recallErr != nil {
+			t.Fatalf("concurrent recall failed: %v", recallErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent recall deadlocked with purge")
+	}
+	var realPurge *PurgeReport
+	select {
+	case outcome := <-purgeDone:
+		if outcome.err != nil {
+			t.Fatalf("real purge consumed workspace memory ledger: %v", outcome.err)
+		}
+		realPurge = outcome.report
+	case <-time.After(5 * time.Second):
+		t.Fatal("workspace memory purge deadlocked")
+	}
+	if realPurge.Rows["workspace_memory_authorizations"] == 0 ||
+		realPurge.Rows["workspace_memory_events"] == 0 {
+		t.Fatalf("real purge missed consumed authorization cycle: %+v", realPurge.Rows)
+	}
+}
+
+func migration138ApplicationURL(t *testing.T, databaseURL, application string) string {
+	t.Helper()
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("application_name", application)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func migration138AwaitAdvisoryWaiters(
+	t *testing.T, database *sql.DB, application string, want int,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiters int
+		err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_locks lock
+			JOIN pg_stat_activity activity ON activity.pid=lock.pid
+			WHERE lock.locktype='advisory' AND NOT lock.granted
+			  AND activity.datname=current_database() AND activity.application_name=$1`,
+			application).Scan(&waiters)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiters >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("did not observe %d ungranted advisory locks for %s", want, application)
 }
 
 func migration138Apply(t *testing.T, st *Store, tenantID, actorID, sessionID int64,

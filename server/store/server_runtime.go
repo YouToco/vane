@@ -751,7 +751,7 @@ func verifyWorkspaceMemoryRuntimeAuthority(
             AND polroles=ARRAY[(SELECT oid FROM role_row)]::oid[])
           AND md5(string_agg(relname||'|'||polname||'|'||polpermissive::text||'|'||
             polcmd::text||'|'||using_expr||'|'||check_expr,E'\n' ORDER BY relname))=
-            '389e9ba5523797661dea5f127048269f'
+            '88ffa5376feae12d0db8c0145bc15dfc'
           FROM policies
     `).Scan(&policiesSafe); err != nil {
 		return fmt.Errorf("verify workspace memory RLS policies: %w", err)
