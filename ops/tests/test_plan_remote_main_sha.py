@@ -94,6 +94,15 @@ class ExactRevisionCLITest(unittest.TestCase):
             )
             self.assertEqual(files, [(Path("infra/production/service.conf"), 0o644, b"tested\n")])
 
+    def test_committed_build_source_is_not_nested_in_broker_handoff(self) -> None:
+        source = (ROOT / "ops/cli/controller.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'committed_source = release_root / "committed-source"', source
+        )
+        self.assertNotIn(
+            'committed_source = handoff / "committed-source"', source
+        )
+
     def test_default_broker_submitter_ignores_environment_home(self) -> None:
         expected = (
             Path(pwd.getpwuid(os.getuid()).pw_dir)
