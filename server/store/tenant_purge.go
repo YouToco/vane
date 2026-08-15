@@ -69,6 +69,10 @@ type purgeStep struct {
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
 var purgeOrder = []purgeStep{
+	// Account security audit rows retain the one-time token they describe;
+	// explicit tenant erasure removes the audit child before the token ledger.
+	{"account_security_audit_events", "tenant_id = $1"},
+	{"account_security_tokens", "tenant_id = $1"},
 	// Sensitive admin-read evidence binds an exact immutable target run and
 	// must be removed before its snapshot during explicit tenant erasure.
 	{"admin_trace_access_events", "(target_tenant_id = $1 OR actor_tenant_id = $1)"},
@@ -104,6 +108,9 @@ var purgeOrder = []purgeStep{
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"task_creation_operations", "tenant_id = $1"},
+	// Team-task authorization decisions are retained independently from the
+	// mutable schedule row and must be included in exact erasure reporting.
+	{"task_access_audit_events", "tenant_id = $1"},
 	// Agent-first query audits and exact model-visible evidence are children of
 	// the session/tool ledgers. They are retained for normal task/session life
 	// and removed only by this explicit tenant erasure path.
@@ -351,6 +358,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		memoryRecordsAvailable               bool
 		memoryEventsAvailable                bool
 		memoryReceiptsAvailable              bool
+		taskAccessAuditAvailable             bool
+		accountSecurityTokensAvailable       bool
+		accountSecurityAuditAvailable        bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -386,7 +396,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.memory_authorizations') IS NOT NULL,
 		        to_regclass('public.memory_records') IS NOT NULL,
 		        to_regclass('public.memory_events') IS NOT NULL,
-		        to_regclass('public.memory_receipts') IS NOT NULL`,
+		        to_regclass('public.memory_receipts') IS NOT NULL,
+		        to_regclass('public.task_access_audit_events') IS NOT NULL,
+		        to_regclass('public.account_security_tokens') IS NOT NULL,
+		        to_regclass('public.account_security_audit_events') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -422,6 +435,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&memoryRecordsAvailable,
 		&memoryEventsAvailable,
 		&memoryReceiptsAvailable,
+		&taskAccessAuditAvailable,
+		&accountSecurityTokensAvailable,
+		&accountSecurityAuditAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -461,6 +477,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"memory_records":                            memoryRecordsAvailable,
 		"memory_events":                             memoryEventsAvailable,
 		"memory_receipts":                           memoryReceiptsAvailable,
+		"task_access_audit_events":                  taskAccessAuditAvailable,
+		"account_security_tokens":                   accountSecurityTokensAvailable,
+		"account_security_audit_events":             accountSecurityAuditAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
