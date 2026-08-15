@@ -125,6 +125,11 @@ describe("WorkspaceMembers role matrix", () => {
       expect(apiMock.updateWorkspaceMemberRole).toHaveBeenCalledWith(11, 3, "admin");
     });
 
+    await user.click(screen.getAllByRole("button", { name: /移除/ })[1]);
+    await waitFor(() => {
+      expect(apiMock.removeWorkspaceMember).toHaveBeenCalledWith(11, 3);
+    });
+
     await user.click(screen.getAllByRole("button", { name: /转让 Owner/ })[1]);
     await waitFor(() => {
       expect(apiMock.transferWorkspaceOwnership).toHaveBeenCalledWith(11, 3);
@@ -151,12 +156,18 @@ describe("WorkspaceMembers role matrix", () => {
     expect(screen.queryByRole("button", { name: /转让 Owner/ })).toBeNull();
     expect(screen.getAllByRole("button", { name: /移除/ })).toHaveLength(1);
 
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    await waitFor(() => {
+      expect(apiMock.listWorkspaceMembers.mock.calls.filter(([tenantID]) => tenantID === 12)).toHaveLength(2);
+    });
+
     await user.type(screen.getByLabelText("邮箱"), "second@example.com");
     await user.click(screen.getByRole("button", { name: /签发邀请/ }));
     await waitFor(() => {
       expect(apiMock.issueWorkspaceInvite).toHaveBeenCalledWith(12, "second@example.com", "member");
     });
     expect(await screen.findByText("admin-one-time-token")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "复制" }));
 
     await user.click(screen.getByRole("button", { name: "撤销" }));
     await waitFor(() => {
