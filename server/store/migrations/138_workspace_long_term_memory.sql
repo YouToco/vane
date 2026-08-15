@@ -69,7 +69,8 @@ CREATE INDEX idx_workspace_memory_records_scope
 ALTER TABLE workspace_memory_authorizations
     ADD CONSTRAINT fk_workspace_memory_authorization_target
     FOREIGN KEY (tenant_id,target_memory_id,target_creator_user_id)
-    REFERENCES workspace_memory_records(tenant_id,id,creator_user_id);
+    REFERENCES workspace_memory_records(tenant_id,id,creator_user_id)
+    DEFERRABLE INITIALLY DEFERRED;
 
 CREATE TABLE workspace_memory_events (
     id                   BIGSERIAL PRIMARY KEY,
@@ -116,7 +117,8 @@ CREATE INDEX idx_workspace_memory_events_scope
 ALTER TABLE workspace_memory_authorizations
     ADD CONSTRAINT fk_workspace_memory_authorization_consumed
     FOREIGN KEY (tenant_id,actor_user_id,consumed_event_id)
-    REFERENCES workspace_memory_events(tenant_id,actor_user_id,id);
+    REFERENCES workspace_memory_events(tenant_id,actor_user_id,id)
+    DEFERRABLE INITIALLY DEFERRED;
 CREATE UNIQUE INDEX uq_workspace_memory_authorization_consumed
     ON workspace_memory_authorizations(tenant_id,consumed_event_id)
     WHERE consumed_event_id IS NOT NULL;
@@ -184,14 +186,27 @@ CREATE POLICY workspace_memory_record_tenant ON workspace_memory_records
   WITH CHECK (tenant_id=NULLIF(current_setting('app.tenant_id',true),'')::bigint AND
               created_by_user_id=NULLIF(current_setting('app.user_id',true),'')::bigint AND
               current_setting('app.workspace_kind',true)='team' AND (
-                (supersedes_memory_id IS NULL AND creator_user_id=created_by_user_id) OR
+                (supersedes_memory_id IS NULL AND creator_user_id=created_by_user_id AND
+                 EXISTS(SELECT 1 FROM workspace_memory_authorizations authz
+                   WHERE authz.tenant_id=workspace_memory_records.tenant_id
+                     AND authz.actor_user_id=workspace_memory_records.created_by_user_id
+                     AND authz.id=workspace_memory_records.authorization_id
+                     AND authz.action_kind='remember'
+                     AND authz.target_memory_id IS NULL
+                     AND authz.target_creator_user_id IS NULL
+                     AND authz.trace_id=workspace_memory_records.evidence_source_id
+                     AND authz.owner_request=workspace_memory_records.owner_request
+                     AND authz.authorization_digest=workspace_memory_records.authorization_digest)) OR
                 EXISTS(SELECT 1 FROM workspace_memory_authorizations authz
                   WHERE authz.tenant_id=workspace_memory_records.tenant_id
                     AND authz.actor_user_id=workspace_memory_records.created_by_user_id
                     AND authz.id=workspace_memory_records.authorization_id
                     AND authz.action_kind='correct'
                     AND authz.target_memory_id=workspace_memory_records.supersedes_memory_id
-                    AND authz.target_creator_user_id=workspace_memory_records.creator_user_id)));
+                    AND authz.target_creator_user_id=workspace_memory_records.creator_user_id
+                    AND authz.trace_id=workspace_memory_records.evidence_source_id
+                    AND authz.owner_request=workspace_memory_records.owner_request
+                    AND authz.authorization_digest=workspace_memory_records.authorization_digest)));
 CREATE POLICY workspace_memory_event_tenant ON workspace_memory_events
   TO vane_workspace_memory_editor
   USING (tenant_id=NULLIF(current_setting('app.tenant_id',true),'')::bigint AND
@@ -207,12 +222,19 @@ CREATE POLICY workspace_memory_event_tenant ON workspace_memory_events
                   AND authz.actor_role=workspace_memory_events.actor_role
                   AND authz.action_kind=workspace_memory_events.event_kind
                   AND authz.target_memory_id IS NOT DISTINCT FROM
-                      workspace_memory_events.target_memory_id) AND
-              (result_memory_id IS NULL OR EXISTS(
+                      workspace_memory_events.target_memory_id
+                  AND authz.trace_id=workspace_memory_events.evidence_source_id
+                  AND authz.owner_request=workspace_memory_events.owner_request
+                  AND authz.authorization_digest=workspace_memory_events.authorization_digest) AND
+              ((event_kind='forget' AND result_memory_id IS NULL) OR EXISTS(
                 SELECT 1 FROM workspace_memory_records record
                  WHERE record.tenant_id=workspace_memory_events.tenant_id
                    AND record.id=workspace_memory_events.result_memory_id
-                   AND record.authorization_id=workspace_memory_events.authorization_id)));
+                   AND record.authorization_id=workspace_memory_events.authorization_id
+                   AND ((workspace_memory_events.event_kind='remember'
+                         AND record.supersedes_memory_id IS NULL) OR
+                        (workspace_memory_events.event_kind='correct'
+                         AND record.supersedes_memory_id=workspace_memory_events.target_memory_id)))));
 CREATE POLICY workspace_memory_receipt_actor ON workspace_memory_receipts
   TO vane_workspace_memory_editor
   USING (tenant_id=NULLIF(current_setting('app.tenant_id',true),'')::bigint AND

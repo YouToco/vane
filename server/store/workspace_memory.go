@@ -32,6 +32,17 @@ func (s *Store) beginWorkspaceMemoryTx(
 	if _, err := tx.Exec(ctx, `SET LOCAL search_path=pg_catalog,public,pg_temp`); err != nil {
 		return fail(memoryDBError("固定团队记忆搜索路径", err))
 	}
+	// Join tenant erasure's shared admission root before the workspace-local
+	// corpus lock. Purge takes the exclusive root in the same root -> child
+	// order, so it cannot race or form a 40P01 cycle with a team-memory turn.
+	exists, err := lockTenantAdmissionRootShared(ctx, tx, tenantID)
+	if err != nil {
+		return fail(memoryDBError("获取团队记忆租户准入根", err))
+	}
+	if !exists {
+		return fail(types.NewAppError(types.CodeNotFound,
+			"团队工作区不存在或正在清除", nil))
+	}
 	// Every actor in a workspace uses the same advisory admission key. Shared
 	// recall locks can overlap; writes are exclusive so cross-member quota and
 	// active-corpus decisions cannot race.
@@ -111,31 +122,38 @@ func (s *Store) PrepareWorkspaceMemoryAuthorization(
 	}
 	id := uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf(
 		"vane-workspace-memory-authorization/v2:%d:%d:%d:%s:%s:%s",
-		tenantID, actorUserID, sessionID, role, action.Evidence.SourceID, digest))).String()
+		tenantID, actorUserID, sessionID, role, canonical.Evidence.SourceID, digest))).String()
 	if _, err := tx.Exec(ctx, `INSERT INTO workspace_memory_authorizations(
         id,tenant_id,actor_user_id,actor_role,workspace_kind,action_kind,
         target_memory_id,target_creator_user_id,session_id,trace_id,owner_request,
         authorization_digest,request_digest)
         VALUES($1,$2,$3,$4,'team',$5,$6,$7,$8,$9,$10,$11,$12)
-        ON CONFLICT(id) DO NOTHING`, id, tenantID, actorUserID, role,
+		ON CONFLICT(id) DO NOTHING`, id, tenantID, actorUserID, role,
 		canonical.Action, nullableMemoryID(canonical), targetCreator, sessionID,
-		action.Evidence.SourceID, action.Evidence.OwnerRequest,
-		action.Evidence.AuthorizationDigest, digest); err != nil {
+		canonical.Evidence.SourceID, canonical.Evidence.OwnerRequest,
+		canonical.Evidence.AuthorizationDigest, digest); err != nil {
 		return "", memoryDBError("写入团队记忆授权", err)
 	}
-	var stored, storedRole, storedKind, storedAction string
+	var stored, storedRole, storedKind, storedAction, storedTrace,
+		storedOwnerRequest, storedAuthorizationDigest string
+	var storedSession int64
 	var storedTarget, storedCreator *int64
 	if err := tx.QueryRow(ctx, `SELECT request_digest,actor_role,workspace_kind,
-        action_kind,target_memory_id,target_creator_user_id
+        action_kind,target_memory_id,target_creator_user_id,session_id,
+        trace_id::text,owner_request,authorization_digest
         FROM workspace_memory_authorizations
         WHERE tenant_id=$1 AND actor_user_id=$2 AND id=$3`,
 		tenantID, actorUserID, id).Scan(&stored, &storedRole, &storedKind,
-		&storedAction, &storedTarget, &storedCreator); err != nil {
+		&storedAction, &storedTarget, &storedCreator, &storedSession, &storedTrace,
+		&storedOwnerRequest, &storedAuthorizationDigest); err != nil {
 		return "", memoryDBError("验证团队记忆授权", err)
 	}
 	if stored != digest || storedRole != string(role) || storedKind != "team" ||
 		storedAction != canonical.Action || !sameOptionalInt64(storedTarget, nullableMemoryID(canonical)) ||
-		!sameOptionalInt64(storedCreator, targetCreator) {
+		!sameOptionalInt64(storedCreator, targetCreator) || storedSession != sessionID ||
+		storedTrace != canonical.Evidence.SourceID ||
+		storedOwnerRequest != canonical.Evidence.OwnerRequest ||
+		storedAuthorizationDigest != canonical.Evidence.AuthorizationDigest {
 		return "", types.NewAppError(types.CodeConflict, "团队记忆授权重放不一致", nil)
 	}
 	if err := tx.Commit(ctx); err != nil {
