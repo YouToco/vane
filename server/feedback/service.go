@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/promptguard"
 	"github.com/YouToco/vane/server/types"
@@ -89,7 +90,7 @@ type Sender interface {
 type SessionNotifier interface {
 	NotifyEvent(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		sourceIdentity string,
 		notice string,
 	)
@@ -249,7 +250,8 @@ var attitudeActions = []types.FeedbackAction{
 // HandleClick 处理一次反馈按钮点击（契约 §10.4）。返回 error 仅表示未预期的
 // 内部失败（DB 故障等），由 feishu 侧翻译成兜底 toast；业务上的"不能做"
 // （越权/已记录过/原文已清理）都编码在 ClickResult 里。
-func (s *Service) HandleClick(ctx context.Context, userID int64, click Click) (ClickResult, error) {
+func (s *Service) HandleClick(ctx context.Context, principal auth.Principal, click Click) (ClickResult, error) {
+	userID := principal.UserID
 	// 归属校验进 WHERE：按钮 value 可伪造，越权与不存在统一同一响应、
 	// 零副作用（M4 §10 红线对齐）。
 	d, err := s.deps.Store.GetDeliveryForUser(ctx, click.DeliveryID, userID)
@@ -266,7 +268,7 @@ func (s *Service) HandleClick(ctx context.Context, userID int64, click Click) (C
 	case types.FeedbackActionNotInterested, types.FeedbackActionMisjudged:
 		return s.openBadFeedback(ctx, d)
 	case types.FeedbackActionDeepDive:
-		return s.handleDeepDive(ctx, userID, d)
+		return s.handleDeepDive(ctx, principal, d)
 	default:
 		// feishu 侧白名单已挡未知值，这里是纵深兜底。
 		return ClickResult{Toast: "未知操作"}, nil
@@ -324,7 +326,8 @@ type ReasonSubmit struct {
 
 // HandleReasonSubmit atomically records one misjudged event with a stable
 // reason. Opening or cancelling the panel creates no row.
-func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit ReasonSubmit) (ClickResult, error) {
+func (s *Service) HandleReasonSubmit(ctx context.Context, principal auth.Principal, submit ReasonSubmit) (ClickResult, error) {
+	userID := principal.UserID
 	d, err := s.deps.Store.GetDeliveryForUser(ctx, submit.DeliveryID, userID)
 	if err != nil {
 		if errors.Is(err, types.ErrNotFound) {
@@ -497,7 +500,7 @@ func (s *Service) cardState(ctx context.Context, deliveryID int64) (CardState, e
 // “真实用户操作”的高信任通道。用户仍可从原卡片看到标题。
 func (s *Service) notifyClick(
 	ctx context.Context,
-	userID int64,
+	principal auth.Principal,
 	feedbackID int64,
 	deliveryID int64,
 	label string,
@@ -508,7 +511,7 @@ func (s *Service) notifyClick(
 	}
 	s.deps.Notifier.NotifyEvent(
 		ctx,
-		userID,
+		principal,
 		fmt.Sprintf("feedback-click:%d", feedbackID),
 		fmt.Sprintf("[卡片回调] 用户在推送卡片（delivery_id=%d）上点击了「%s」%s", deliveryID, label, suffix))
 }

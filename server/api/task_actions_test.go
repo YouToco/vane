@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
 )
 
 type fakeTaskActionAgent struct {
@@ -26,16 +27,16 @@ type fakeTaskActionAgent struct {
 
 func (f *fakeTaskActionAgent) HandleMessage(
 	_ context.Context,
-	userID int64,
+	principal auth.Principal,
 	text string,
 ) (agent.Outcome, error) {
-	f.userID, f.text = userID, text
+	f.userID, f.text = principal.UserID, text
 	return f.result()
 }
 
 func (f *fakeTaskActionAgent) HandleWebTaskActionMessage(
 	_ context.Context,
-	userID int64,
+	principal auth.Principal,
 	actionID string,
 	taskID string,
 	text string,
@@ -45,7 +46,7 @@ func (f *fakeTaskActionAgent) HandleWebTaskActionMessage(
 	} else {
 		f.editCalls++
 	}
-	f.userID, f.actionID, f.taskID, f.text = userID, actionID, taskID, text
+	f.userID, f.actionID, f.taskID, f.text = principal.UserID, actionID, taskID, text
 	return f.result()
 }
 

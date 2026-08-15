@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/promptguard"
 	"github.com/YouToco/vane/server/types"
 )
@@ -31,13 +32,14 @@ func newTraceID() string { return uuid.NewString() }
 // 连接级 ctx 上（审查 F15）。
 func (s *Service) WrapQuestion(
 	ctx context.Context,
-	userID int64,
+	principal auth.Principal,
 	appIdentity string,
 	inboundMsgID string,
 	parentMsgID string,
 	rootMsgID string,
 	text string,
 ) (string, bool, error) {
+	userID := principal.UserID
 	if parentMsgID == "" && rootMsgID == "" {
 		return "", false, nil // 不是回复任何消息
 	}

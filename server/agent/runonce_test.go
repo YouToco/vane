@@ -41,7 +41,7 @@ func TestRunOnce_只读工具执行(t *testing.T) {
 	}}
 	l := newRunOnceLoop(t, chat.fn, tool)
 
-	outcome, _, err := l.RunOnce(context.Background(), 7, nil, "我的画像摘要是什么？")
+	outcome, _, err := l.RunOnce(context.Background(), testPrincipal(7), nil, "我的画像摘要是什么？")
 	if err != nil {
 		t.Fatalf("RunOnce 失败: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestRunOnce_外部只读结果使用无协议续写(t *testing.T) {
 	}
 	l := newRunOnceLoop(t, chat, tool)
 
-	outcome, history, err := l.RunOnce(context.Background(), 7, nil, "总结这个页面")
+	outcome, history, err := l.RunOnce(context.Background(), testPrincipal(7), nil, "总结这个页面")
 	if err != nil {
 		t.Fatalf("RunOnce 失败: %v", err)
 	}

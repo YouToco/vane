@@ -115,12 +115,12 @@ func notFoundErr(msg string) error {
 
 // GetActiveAgentSession 计数进 getActiveCalls：NotifyEvent 的"现查必须在 session admission 内"
 // （审查 F14）靠"锁被对端持有期间这里有没有被调到"来判定，故计数与回写同一把 mu 保护。
-func (f *fakeStore) GetActiveAgentSession(_ context.Context, userID int64, since time.Time) (*types.AgentSession, error) {
+func (f *fakeStore) GetActiveAgentSession(_ context.Context, tenantID, userID int64, since time.Time) (*types.AgentSession, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.getActiveCalls++
 	for _, s := range f.sessions {
-		if s.UserID == userID && s.Status == types.AgentSessionStatusActive && s.UpdatedAt.After(since) {
+		if s.TenantID == tenantID && s.UserID == userID && s.Status == types.AgentSessionStatusActive && s.UpdatedAt.After(since) {
 			cp := *s
 			return &cp, nil
 		}
@@ -141,13 +141,13 @@ func (f *fakeStore) sessionCount() int {
 	return len(f.sessions)
 }
 
-func (f *fakeStore) CreateAgentSession(_ context.Context, userID int64) (*types.AgentSession, error) {
+func (f *fakeStore) CreateAgentSession(_ context.Context, tenantID, userID int64) (*types.AgentSession, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextSessionID++
 	s := &types.AgentSession{
 		ID:        f.nextSessionID,
-		TenantID:  1,
+		TenantID:  tenantID,
 		UserID:    userID,
 		Status:    types.AgentSessionStatusActive,
 		Messages:  json.RawMessage("[]"),
@@ -427,7 +427,7 @@ func TestAgentThinkingPolicyAndReasoningContinuationStayTransient(t *testing.T) 
 	store := newFakeStore()
 	loop := newTestLoop(t, store, chat.fn, tool)
 
-	outcome, err := loop.HandleMessage(t.Context(), 7, "inspect it")
+	outcome, err := loop.HandleMessage(t.Context(), testPrincipal(7), "inspect it")
 	if err != nil || outcome.Reply != "done" {
 		t.Fatalf("outcome=%+v err=%v", outcome, err)
 	}
@@ -476,7 +476,7 @@ func TestAgentPreservesCompleteSessionHistoryAndOmitsCompletionCap(t *testing.T)
 	}
 
 	store := newFakeStore()
-	sess, err := store.CreateAgentSession(t.Context(), 7)
+	sess, err := store.CreateAgentSession(t.Context(), 1, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +488,7 @@ func TestAgentPreservesCompleteSessionHistoryAndOmitsCompletionCap(t *testing.T)
 	}}}
 	loop := newTestLoop(t, store, chat.fn)
 
-	outcome, err := loop.HandleMessage(t.Context(), 7, "current-question")
+	outcome, err := loop.HandleMessage(t.Context(), testPrincipal(7), "current-question")
 	if err != nil || outcome.Reply != "complete" {
 		t.Fatalf("outcome=%+v err=%v", outcome, err)
 	}
@@ -666,7 +666,7 @@ func TestUntrustedContinuationMessages_DSMLInExternalDataDoesNotEraseUserRequest
 func TestHandleMessage_ScrubsLegacyUntrustedHistoryBeforeModelRequest(t *testing.T) {
 	const attack = "LEGACY-TOOL-RESULT-ATTACK"
 	fs := newFakeStore()
-	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+	sess, _ := fs.CreateAgentSession(context.Background(), 1, 7)
 	legacy := []llm.ChatMessage{
 		{Role: "user", Content: "读取恶意页面"},
 		{Role: "assistant", ToolCalls: []llm.ToolCall{{
@@ -684,7 +684,7 @@ func TestHandleMessage_ScrubsLegacyUntrustedHistoryBeforeModelRequest(t *testing
 		return &llm.ChatResponse{Content: "安全继续", FinishReason: "stop"}, nil
 	}, &fakeTool{name: "create_schedule", mutating: true}) // 刻意不装配 read_page
 
-	if _, err := l.HandleMessage(context.Background(), 7, "继续"); err != nil {
+	if _, err := l.HandleMessage(context.Background(), testPrincipal(7), "继续"); err != nil {
 		t.Fatal(err)
 	}
 	gotRaw, _ := json.Marshal(got.Messages)
@@ -796,7 +796,7 @@ func TestRecordCreationReceiptSessionUsesAgentUserLock(t *testing.T) {
 		LeaseOwner: "receipt-worker", Fence: 3,
 	}
 	messages := json.RawMessage(`[{"role":"user","content":"[卡片回调] done"}]`)
-	admission := l.lockForUser(7)
+	admission := l.lockForScope(receipt.TenantID, receipt.UserID)
 	if err := admission.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -840,7 +840,7 @@ func TestHandleMessage_MaxTurnsFallback(t *testing.T) {
 	l := New(Deps{Store: fs, Tools: testToolSpecs(readTool), Model: "deepseek-v4-pro", MaxTurns: 3, SessionTTL: 30 * time.Minute})
 	l.chatFn = stubborn
 
-	out, err := l.HandleMessage(context.Background(), 1, "陷入循环吧")
+	out, err := l.HandleMessage(context.Background(), testPrincipal(1), "陷入循环吧")
 	if err != nil {
 		t.Fatalf("maxTurns 兜底不应报错: %v", err)
 	}
@@ -942,7 +942,7 @@ func appendCallAt(fs *fakeStore, i int) appendRecord {
 // 画像注入只发生在请求侧（system 不入库），全部两态断言都落在这里。
 func runOneMessage(t *testing.T, l *Loop, chat *scriptedChat, userID int64) string {
 	t.Helper()
-	if _, err := l.HandleMessage(context.Background(), userID, "你好"); err != nil {
+	if _, err := l.HandleMessage(context.Background(), testPrincipal(userID), "你好"); err != nil {
 		t.Fatalf("画像是增强不是门槛, HandleMessage 不应失败: %v", err)
 	}
 	if len(chat.requests) != 1 {
@@ -1006,11 +1006,11 @@ const noticeNotInterested = "[卡片回调] 用户在推送卡片（delivery_id=
 func TestNotifyEvent(t *testing.T) {
 	t.Run("有 active 会话时以 role=user 追加通告", func(t *testing.T) {
 		fs := newFakeStore()
-		sess, _ := fs.CreateAgentSession(context.Background(), 7)
+		sess, _ := fs.CreateAgentSession(context.Background(), 1, 7)
 		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
 
 		l.NotifyEvent(
-			context.Background(), 7, "feedback-click:1",
+			context.Background(), testPrincipal(7), "feedback-click:1",
 			noticeNotInterested,
 		)
 		waitAppends(t, fs, 1)
@@ -1040,7 +1040,7 @@ func TestNotifyEvent(t *testing.T) {
 		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
 
 		l.NotifyEvent(
-			context.Background(), 7, "feedback-click:2",
+			context.Background(), testPrincipal(7), "feedback-click:2",
 			noticeNotInterested,
 		)
 		waitAppends(t, fs, 0) // 等一拍确认没有回写溜进来
@@ -1055,13 +1055,13 @@ func TestNotifyEvent(t *testing.T) {
 
 	t.Run("TTL 外的过期会话不复活", func(t *testing.T) {
 		fs := newFakeStore()
-		sess, _ := fs.CreateAgentSession(context.Background(), 7)
+		sess, _ := fs.CreateAgentSession(context.Background(), 1, 7)
 		// 会话最后更新在 TTL（30min）之外 → GetActiveAgentSession 按 since 过滤掉。
 		fs.sessions[sess.ID].UpdatedAt = time.Now().Add(-2 * time.Hour)
 		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
 
 		l.NotifyEvent(
-			context.Background(), 7, "feedback-click:3",
+			context.Background(), testPrincipal(7), "feedback-click:3",
 			noticeNotInterested,
 		)
 		waitAppends(t, fs, 0)
@@ -1085,7 +1085,7 @@ func TestNotifyEvent(t *testing.T) {
 // 把现查挪到 mu.Lock() 之前（无论移进 NotifyEvent 本体还是 goroutine 开头）即变红。
 func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.T) {
 	fs := newFakeStore()
-	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+	sess, _ := fs.CreateAgentSession(context.Background(), 1, 7)
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1099,7 +1099,7 @@ func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.
 	handleDone := make(chan struct{})
 	go func() {
 		defer close(handleDone)
-		_, _ = l.HandleMessage(context.Background(), 7, "你好")
+		_, _ = l.HandleMessage(context.Background(), testPrincipal(7), "你好")
 	}()
 	<-entered // HandleMessage 已持锁、正卡在模型调用上
 
@@ -1112,7 +1112,7 @@ func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.
 	// 调用方 ctx 已取消：耐久回执必须靠 WithoutCancel 的独立 ctx 存活。
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	l.NotifyEvent(ctx, 7, "feedback-click:4", noticeNotInterested)
+	l.NotifyEvent(ctx, testPrincipal(7), "feedback-click:4", noticeNotInterested)
 
 	// 锁仍被 HandleMessage 持有：现查与回写都不可能发生。
 	time.Sleep(30 * time.Millisecond)
@@ -1158,11 +1158,11 @@ func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.
 // （per-user 锁串行保证第二次在第一次之后跑）。
 func TestAsyncSessionWritePanicRecovered(t *testing.T) {
 	l := New(Deps{})
-	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
+	l.asyncSessionWrite(context.Background(), testPrincipal(42), func(context.Context) {
 		panic("boom（测试构造）")
 	})
 	done := make(chan struct{})
-	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
+	l.asyncSessionWrite(context.Background(), testPrincipal(42), func(context.Context) {
 		close(done)
 	})
 	select {
@@ -1179,9 +1179,9 @@ func TestDrainSessionWritesClosesAdmissionAndWaits(t *testing.T) {
 	if err := mu.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	l.sessionAdmission.users.Store(int64(42), mu)
+	l.sessionAdmission.principals.Store(sessionPrincipalKey{tenantID: 1, userID: 42}, mu)
 	firstRan := make(chan struct{})
-	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
+	l.asyncSessionWrite(context.Background(), testPrincipal(42), func(context.Context) {
 		close(firstRan)
 	})
 
@@ -1201,7 +1201,7 @@ func TestDrainSessionWritesClosesAdmissionAndWaits(t *testing.T) {
 	}
 
 	var rejected atomic.Bool
-	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
+	l.asyncSessionWrite(context.Background(), testPrincipal(42), func(context.Context) {
 		rejected.Store(true)
 	})
 	select {
@@ -1245,7 +1245,7 @@ func TestCancellationStopsUnstartedToolCallsAndNextModelTurn(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := l.RunOnce(ctx, 7, nil, "run two tools")
+		_, _, err := l.RunOnce(ctx, testPrincipal(7), nil, "run two tools")
 		done <- err
 	}()
 	select {
@@ -1280,7 +1280,7 @@ func TestCancellationBeforeConversationDoesNotStartModel(t *testing.T) {
 	l := newTestLoop(t, fs, chat.fn)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, _, err := l.RunOnce(ctx, 7, nil, "canceled")
+	_, _, err := l.RunOnce(ctx, testPrincipal(7), nil, "canceled")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("RunOnce error = %v, want context.Canceled", err)
 	}

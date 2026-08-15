@@ -577,7 +577,7 @@ func TestHandleDeepDive_ContentQueryFailurePropagates(t *testing.T) {
 	h := newHarness(t)
 	h.st.itemErr = databaseErr("fake: 内容库断连")
 
-	_, err := h.svc.HandleClick(context.Background(), testUserID,
+	_, err := h.svc.HandleClick(context.Background(), testPrincipal(testUserID),
 		Click{Action: types.FeedbackActionDeepDive, DeliveryID: testDeliveryID})
 	if err == nil {
 		t.Fatal("DB 故障应上抛 error（与「已清理」区分开）")

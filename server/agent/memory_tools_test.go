@@ -327,7 +327,7 @@ func TestMemoryFullLoopForcesRealForgetReceiptAfterRecall(t *testing.T) {
 	loop.chatFn = chat.fn
 
 	out, err := loop.HandleMessage(
-		t.Context(), 42,
+		t.Context(), testPrincipal(42),
 		"确认：请忘记 memory_id=2，也就是青松-814 这条长期记忆。",
 	)
 	if err != nil || out.Reply != replyMemoryForgotten {
@@ -352,7 +352,7 @@ func TestMemoryFullLoopForcesRealForgetReceiptAfterRecall(t *testing.T) {
 	chat.responses = append(chat.responses, &llm.ChatResponse{
 		Content: "后续对话已看到固定的忘记结果。", FinishReason: "stop",
 	})
-	if next, nextErr := loop.HandleMessage(t.Context(), 42, "继续"); nextErr != nil ||
+	if next, nextErr := loop.HandleMessage(t.Context(), testPrincipal(42), "继续"); nextErr != nil ||
 		next.Reply != "后续对话已看到固定的忘记结果。" {
 		t.Fatalf("next outcome=%+v err=%v", next, nextErr)
 	}
@@ -394,7 +394,7 @@ func TestMemoryFullLoopRejectsMalformedMutationWithoutModelRewrite(t *testing.T)
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "忘记 memory_id=2")
 	if err != nil || !strings.Contains(out.Reply, "参数不是合法 JSON") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
@@ -425,7 +425,7 @@ func TestMemoryFullLoopReturnsAuthorizationDenialWithoutModelRewrite(t *testing.
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "忘记 memory_id=2")
 	if err != nil || !strings.Contains(out.Reply, "没有授权") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
@@ -454,7 +454,7 @@ func TestMemoryFullLoopRejectsMultipleMutationsAtomically(t *testing.T) {
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "忘记 memory_id=2")
 	if err != nil || !strings.Contains(out.Reply, "本批全部未执行") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
@@ -505,7 +505,7 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 	loop.chatFn = chat.fn
 
 	if out, err := loop.HandleMessage(
-		t.Context(), 42, "我们讨论一下生产模型选择",
+		t.Context(), testPrincipal(42), "我们讨论一下生产模型选择",
 	); err != nil || !strings.Contains(out.Reply, "不会自动写入") {
 		t.Fatalf("implicit turn outcome=%+v err=%v", out, err)
 	}
@@ -513,7 +513,7 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 		t.Fatalf("ordinary chat mutated memory: key=%q auth=%d", store.key, authorizer.calls)
 	}
 	if out, err := loop.HandleMessage(
-		t.Context(), 42, "请记住：生产研究模型使用 deepseek-v4-flash",
+		t.Context(), testPrincipal(42), "请记住：生产研究模型使用 deepseek-v4-flash",
 	); err != nil || out.Reply != replyMemoryRemembered {
 		t.Fatalf("remember outcome=%+v err=%v", out, err)
 	}
@@ -526,7 +526,7 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 		t.Fatalf("remember action=%+v authorization=%+v", store.action, authorizer.input)
 	}
 	if out, err := loop.HandleMessage(
-		t.Context(), 42, "我之前明确保存的生产研究模型是什么？",
+		t.Context(), testPrincipal(42), "我之前明确保存的生产研究模型是什么？",
 	); err != nil || !strings.Contains(out.Reply, "deepseek-v4-flash") {
 		t.Fatalf("recall outcome=%+v err=%v", out, err)
 	}
@@ -558,7 +558,7 @@ func TestMemoryFullLoopModelCannotPromoteOrdinaryChat(t *testing.T) {
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	out, err := loop.HandleMessage(t.Context(), 42, "我们讨论一下发布策略")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "我们讨论一下发布策略")
 	if err != nil || !strings.Contains(out.Reply, "没有授权") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}

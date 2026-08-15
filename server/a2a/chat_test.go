@@ -30,11 +30,11 @@ type fakeChat struct {
 	calls      int
 }
 
-func (f *fakeChat) RunOnce(_ context.Context, userID int64, history []llm.ChatMessage, text string) (agent.Outcome, []llm.ChatMessage, error) {
+func (f *fakeChat) RunOnce(_ context.Context, principal auth.Principal, history []llm.ChatMessage, text string) (agent.Outcome, []llm.ChatMessage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	f.gotUserID, f.gotHistory, f.gotText = userID, history, text
+	f.gotUserID, f.gotHistory, f.gotText = principal.UserID, history, text
 	if f.err != nil {
 		return agent.Outcome{}, nil, f.err
 	}
@@ -56,7 +56,7 @@ func (f *fakeOwner) GetSetting(_ context.Context, key string) (json.RawMessage, 
 }
 
 func (f *fakeOwner) ListMembershipsByUser(_ context.Context, userID int64) ([]types.Membership, error) {
-	return []types.Membership{{TenantID: 1, UserID: userID}}, nil
+	return []types.Membership{{TenantID: 1, UserID: userID, Role: types.MembershipRoleOwner}}, nil
 }
 
 func (f *fakeOwner) UpsertUserByOpenID(_ context.Context, openID, name string) (*types.User, error) {

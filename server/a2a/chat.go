@@ -16,6 +16,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/types"
 )
@@ -45,7 +46,7 @@ func (e *executor) executeChat(ctx context.Context, execCtx *a2asrv.ExecutorCont
 	cctx, cancel := context.WithTimeout(ctx, chatBudget)
 	defer cancel()
 
-	userID, err := e.resolveOwner(cctx)
+	principal, err := e.resolvePrincipal(cctx)
 	if err != nil {
 		// 固定文案，**不经 sanitize 透传 Message**（对抗审查 B-F1）：owner 解析链上的
 		// 错误 Message 会内嵌 open_id（store.UpsertUserByOpenID 的 "upsert 用户（open_id=…）"）
@@ -59,7 +60,7 @@ func (e *executor) executeChat(ctx context.Context, execCtx *a2asrv.ExecutorCont
 	}
 
 	history := e.chatHistory(cctx, execCtx)
-	outcome, _, err := e.deps.Chat.RunOnce(cctx, userID, history, text)
+	outcome, _, err := e.deps.Chat.RunOnce(cctx, principal, history, text)
 	if err != nil {
 		// 固定文案，**不透传 Message**（对抗审查 A-2）：RunOnce 的错误可能源自 llm 层，
 		// 而 llm.mapHTTPError 把上游响应体全文拼进 Message（DeepSeek 4xx/5xx 的 provider
@@ -97,14 +98,19 @@ func chatFailText() string { return "对话处理失败，请稍后重试" }
 // ① 加 dbQueryTimeout（A2A 特有的预算，auth 包不该替调用方决定超时）；
 // ② 收窄成 userID——A2A 轨仅用该身份建立对话范围，不暴露 owner 工具目录。
 // 错误的对外文案仍由 ownerErrText 按错误码收窄（B-F1），内层 Message 永不外露。
-func (e *executor) resolveOwner(ctx context.Context) (int64, error) {
+func (e *executor) resolvePrincipal(ctx context.Context) (auth.Principal, error) {
 	octx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
 	p, err := e.deps.Principal.FromContext(octx)
 	if err != nil {
-		return 0, err
+		return auth.Principal{}, err
 	}
-	return p.UserID, nil
+	if p.TenantID <= 0 || p.UserID <= 0 || !p.Role.Valid() ||
+		(p.ActorType != types.ActorTypeUser && p.ActorType != types.ActorTypeServiceAccount) {
+		return auth.Principal{}, types.NewAppError(
+			types.CodeForbidden, "A2A token 未绑定完整工作区身份", types.ErrForbidden)
+	}
+	return p, nil
 }
 
 // chatHistory 按 contextId 重建多轮历史。A2A 的多轮语义：任务终态后不可续写

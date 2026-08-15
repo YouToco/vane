@@ -69,12 +69,12 @@ type scheduleNextRunReader interface {
 type TaskAgent interface {
 	HandleMessage(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		text string,
 	) (agent.Outcome, error)
 	HandleWebTaskActionMessage(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		actionID string,
 		selectedTaskRef string,
 		text string,
@@ -87,7 +87,7 @@ type TaskAgent interface {
 type BriefFeedback interface {
 	HandleClick(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		click feedback.Click,
 	) (feedback.ClickResult, error)
 }
@@ -513,6 +513,8 @@ func writeAppError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, types.ErrValidation):
 		status = http.StatusBadRequest
+	case errors.Is(err, types.ErrForbidden):
+		status = http.StatusForbidden
 	case errors.Is(err, types.ErrNotFound):
 		status = http.StatusNotFound
 	case errors.Is(err, types.ErrConflict):

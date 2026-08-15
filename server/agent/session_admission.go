@@ -16,7 +16,12 @@ import (
 // lifecycle and DrainSessionWrites boundary. Sessionless RunOnce callers such as
 // A2A do not acquire these locks and should not share this dependency.
 type SessionAdmissionCoordinator struct {
-	users sync.Map // map[int64]*userTurnLock
+	principals sync.Map // map[sessionPrincipalKey]*userTurnLock
+}
+
+type sessionPrincipalKey struct {
+	tenantID int64
+	userID   int64
 }
 
 // NewSessionAdmissionCoordinator creates an admission domain. Loops that can
@@ -25,11 +30,15 @@ func NewSessionAdmissionCoordinator() *SessionAdmissionCoordinator {
 	return &SessionAdmissionCoordinator{}
 }
 
-func (c *SessionAdmissionCoordinator) lockForUser(userID int64) *userTurnLock {
+func (c *SessionAdmissionCoordinator) lockForPrincipal(tenantID, userID int64) *userTurnLock {
 	if c == nil {
 		panic("agent: nil session admission coordinator")
 	}
-	value, _ := c.users.LoadOrStore(userID, newUserTurnLock())
+	if tenantID <= 0 || userID <= 0 {
+		panic("agent: invalid session principal")
+	}
+	value, _ := c.principals.LoadOrStore(
+		sessionPrincipalKey{tenantID: tenantID, userID: userID}, newUserTurnLock())
 	return value.(*userTurnLock)
 }
 

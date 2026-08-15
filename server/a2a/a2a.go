@@ -58,7 +58,7 @@ type ContentStore interface {
 // A2A 轨实例，M4 契约 §7.1 RunOnce）。历史与并发语义由本包管理（按 contextId 重建），
 // RunOnce 不碰会话存储、不与 owner 飞书轨互相排队。
 type ChatRunner interface {
-	RunOnce(ctx context.Context, userID int64, history []llm.ChatMessage, text string) (agent.Outcome, []llm.ChatMessage, error)
+	RunOnce(ctx context.Context, principal auth.Principal, history []llm.ChatMessage, text string) (agent.Outcome, []llm.ChatMessage, error)
 }
 
 // Deps 由 cmd/server/main.go 装配（契约 §7）。

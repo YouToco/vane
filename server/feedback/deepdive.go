@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/profilehint"
 	"github.com/YouToco/vane/server/promptguard"
@@ -90,7 +91,7 @@ const deepDiveSystemPrompt = `你是"见微 Vane"的深度解读助手。针对�
 //
 // 同步段只做预检与启动，立即返回"生成中"：生成要几十秒，而卡片回调的同步
 // 预算只有 2.5s。
-func (s *Service) handleDeepDive(ctx context.Context, userID int64, d *types.Delivery) (ClickResult, error) {
+func (s *Service) handleDeepDive(ctx context.Context, principal auth.Principal, d *types.Delivery) (ClickResult, error) {
 	// 准入与 Shutdown.Wait 共用同一把锁：一旦关停开始，新点击不得
 	// 再进入 Store/LLM/Sender。已准入的同步预检/重发由本调用持有
 	// done，启动异步生成后再把它转交给 goroutine。
@@ -178,7 +179,7 @@ func (s *Service) handleDeepDive(ctx context.Context, userID int64, d *types.Del
 				slog.Error("feedback: 深度解读生成 panic", "recover", r, "delivery_id", d.ID)
 			}
 		}()
-		s.generateDeepDive(genCtx, userID, d, item)
+		s.generateDeepDive(genCtx, principal, d, item)
 	}()
 	backgroundOwnsAdmission = true
 
@@ -191,7 +192,8 @@ func (s *Service) handleDeepDive(ctx context.Context, userID int64, d *types.Del
 // generateDeepDive 异步生成并送达长文。落行在发送之前：行是"成功生成"的凭证，
 // 发送失败只记日志——detail 已存正文，用户重点按钮即走重发路径自愈（审查 F4）。
 // 生成失败则不落行：把重试机会留给用户。
-func (s *Service) generateDeepDive(ctx context.Context, userID int64, d *types.Delivery, item *types.ContentItem) {
+func (s *Service) generateDeepDive(ctx context.Context, principal auth.Principal, d *types.Delivery, item *types.ContentItem) {
+	userID := principal.UserID
 	body, err := s.callDeepDive(ctx, userID, item)
 	if err != nil {
 		slog.Error("feedback: 深度解读生成失败", "delivery_id", d.ID, "err", err)
@@ -224,7 +226,7 @@ func (s *Service) generateDeepDive(ctx context.Context, userID int64, d *types.D
 		return
 	}
 	s.notifyClick(
-		ctx, userID, feedbackID, d.ID,
+		ctx, principal, feedbackID, d.ID,
 		"深度解读", "，长文结果将以新消息送达",
 	)
 }

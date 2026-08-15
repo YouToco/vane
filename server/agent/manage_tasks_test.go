@@ -408,11 +408,11 @@ func TestManageTasksFullLoopCompletesOneClarificationWithoutConfirmation(t *test
 			})
 			loop.chatFn = chat.fn
 
-			first, err := loop.HandleMessage(t.Context(), 42, tc.original)
+			first, err := loop.HandleMessage(t.Context(), testPrincipal(42), tc.original)
 			if err != nil || first.Reply != tc.question || writes() != 0 {
 				t.Fatalf("first turn outcome=%+v err=%v writes=%d", first, err, writes())
 			}
-			second, err := loop.HandleMessage(t.Context(), 42, tc.clarified)
+			second, err := loop.HandleMessage(t.Context(), testPrincipal(42), tc.clarified)
 			if err != nil || second.Reply != tc.wantReply || writes() != 1 || authorizer.calls != 2 || len(chat.requests) != 3 {
 				t.Fatalf("second turn outcome=%+v err=%v writes=%d auth=%d", second, err, writes(), authorizer.calls)
 			}
@@ -447,11 +447,11 @@ func TestManageTasksFullLoopCarriesNaturalCreateTimezoneClarification(t *testing
 	})
 	loop.chatFn = chat.fn
 	original := "每天 9 点监控 Kimi 套餐，有重大更新才推。"
-	first, err := loop.HandleMessage(t.Context(), 42, original)
+	first, err := loop.HandleMessage(t.Context(), testPrincipal(42), original)
 	if err != nil || first.Reply != "按哪个时区执行？" || creator.calls != 0 {
 		t.Fatalf("first turn outcome=%+v err=%v creates=%d", first, err, creator.calls)
 	}
-	second, err := loop.HandleMessage(t.Context(), 42, "北京时间")
+	second, err := loop.HandleMessage(t.Context(), testPrincipal(42), "北京时间")
 	if err != nil || second.Reply != "已创建任务：Kimi 套餐监控。" ||
 		creator.calls != 1 || authorizer.calls != 1 || len(chat.requests) != 2 ||
 		!strings.Contains(string(writer.record.ActionReceipts), `"status":"completed"`) {
@@ -504,7 +504,7 @@ func TestManageTasksFullLoopNeverTurnsIndeterminateCreateIntoSuccess(t *testing.
 				OwnerAgent: true, MaxTurns: 3,
 			})
 			loop.chatFn = chat.fn
-			outcome, err := loop.HandleMessage(t.Context(), 42,
+			outcome, err := loop.HandleMessage(t.Context(), testPrincipal(42),
 				"创建 Kimi 套餐监控，每天北京时间 9 点检查，重大更新才推送。")
 			if err != nil || outcome.Reply != tc.wantReply || len(chat.requests) != 1 ||
 				strings.Contains(outcome.Reply, "任务已创建") ||
@@ -538,7 +538,7 @@ func TestManageTasksFullLoopNeverTurnsIndeterminateEditIntoSuccess(t *testing.T)
 		OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	outcome, err := loop.HandleMessage(t.Context(), 42,
+	outcome, err := loop.HandleMessage(t.Context(), testPrincipal(42),
 		"把 Kimi 套餐任务手册改成只查官方原文，无重大更新不推送。")
 	want := "任务操作结果暂时无法确认；系统会按同一请求安全恢复，本次不能声称已经完成。"
 	if err != nil || outcome.Reply != want || len(chat.requests) != 1 ||
@@ -572,7 +572,7 @@ func TestManageTasksFullLoopReportsPresealEditFailureAsNotExecuted(t *testing.T)
 		OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	outcome, err := loop.HandleMessage(t.Context(), 42,
+	outcome, err := loop.HandleMessage(t.Context(), testPrincipal(42),
 		"把 Kimi 套餐任务改成每小时检查，时区用 Bad/Zone。")
 	want := "任务修改未执行，原任务保持不变；请修正变更内容后重试。"
 	if err != nil || outcome.Reply != want || len(chat.requests) != 1 ||
@@ -904,7 +904,7 @@ func TestHandleWebTaskActionDerivesAndEnforcesTrustedRouteCapability(t *testing.
 			})
 			loop.chatFn = chat.fn
 			outcome, err := loop.HandleWebTaskActionMessage(
-				t.Context(), 42, testCase.actionID, testCase.selectedRef, "执行当前页面操作",
+				t.Context(), testPrincipal(42), testCase.actionID, testCase.selectedRef, "执行当前页面操作",
 			)
 			if err != nil || outcome.Reply != "本次未执行。" || len(chat.requests) != 2 {
 				t.Fatalf("outcome=%+v requests=%d err=%v", outcome, len(chat.requests), err)
@@ -943,7 +943,7 @@ func TestHandleWebTaskActionAllowsExactRouteMutation(t *testing.T) {
 		})
 		loop.chatFn = chat.fn
 		outcome, err := loop.HandleWebTaskActionMessage(
-			t.Context(), 42, "a8db8ff7-d1c2-49df-bc61-cd7a6d34cf62", "", "创建 Kimi 监控",
+			t.Context(), testPrincipal(42), "a8db8ff7-d1c2-49df-bc61-cd7a6d34cf62", "", "创建 Kimi 监控",
 		)
 		if err != nil || outcome.Reply != "已创建任务：Kimi 监控。" ||
 			creator.calls != 1 || authorizer.calls != 1 || len(chat.requests) != 1 {
@@ -980,7 +980,7 @@ func TestHandleWebTaskActionAllowsExactRouteMutation(t *testing.T) {
 		})
 		loop.chatFn = chat.fn
 		outcome, err := loop.HandleWebTaskActionMessage(
-			t.Context(), 42, "2288c5ab-03d4-4195-b0eb-195a576ec8f2", "task-a", "修改当前任务",
+			t.Context(), testPrincipal(42), "2288c5ab-03d4-4195-b0eb-195a576ec8f2", "task-a", "修改当前任务",
 		)
 		if err != nil || outcome.Reply != "已修改任务：Kimi 监控。" ||
 			editor.calls != 1 || editor.input.TaskRef != "task-a" ||
@@ -1232,7 +1232,7 @@ func TestOwnerAgentDoesNotImplicitlyReadOrInjectProfile(t *testing.T) {
 		request = in
 		return &llm.ChatResponse{Content: "直接回答"}, nil
 	}
-	outcome, err := loop.HandleMessage(t.Context(), 42, "你好")
+	outcome, err := loop.HandleMessage(t.Context(), testPrincipal(42), "你好")
 	if err != nil || outcome.Reply != "直接回答" {
 		t.Fatalf("outcome=%+v err=%v", outcome, err)
 	}
