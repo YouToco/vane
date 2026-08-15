@@ -246,9 +246,14 @@ type LLMCall struct {
 	// Keeping nil distinct from zero lets pricing mark the amount estimated
 	// (all prompt tokens charged at cache-miss price) without losing exact
 	// total input/output usage.
-	PromptCacheHitTokens  *int      `json:"prompt_cache_hit_tokens,omitempty"`
-	PromptCacheMissTokens *int      `json:"prompt_cache_miss_tokens,omitempty"`
-	ReasoningTokens       *int      `json:"reasoning_tokens,omitempty"` // completion_tokens 的可选子集
+	PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens,omitempty"`
+	ReasoningTokens       *int `json:"reasoning_tokens,omitempty"` // completion_tokens 的可选子集
+	// PolicyManifestPayload is the canonical, non-secret interactive policy
+	// identity used for this request. It contains digests only; prompt bodies,
+	// user content and credentials remain outside this projection.
+	PolicyManifestPayload string    `json:"-"`
+	PolicyManifestDigest  string    `json:"policy_manifest_digest,omitempty"`
 	LatencyMs             int       `json:"latency_ms"`
 	CostUSD               float64   `json:"cost_usd"`                   // 供应商直报或动态价格目录计算后的 USD 兼容投影
 	PrefixCacheHit        *bool     `json:"prefix_cache_hit,omitempty"` // 可空：provider 未报告缓存信息

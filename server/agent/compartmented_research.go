@@ -1234,8 +1234,8 @@ func (l *Loop) finishCompartmentedResearch(
 					compartmentedPublicSummaryRetrySystemNote,
 				bundleMessages, "", false,
 			),
-			Tools: nil, EnableThinking: true,
-			ReasoningEffort: llm.ReasoningEffortHigh,
+			Tools: nil, EnableThinking: l.enableThinking,
+			ReasoningEffort: l.reasoningEffort,
 		}
 		resp, retryErr := l.chatWithContextShadow(ctx, retry, state, contextStep)
 		extraTurns++
@@ -1266,8 +1266,8 @@ func (l *Loop) finishCompartmentedResearch(
 			{Role: "system", Content: compartmentedFinalSynthesisSystemNote},
 			{Role: "user", Content: string(raw)},
 		},
-		Tools: nil, EnableThinking: true,
-		ReasoningEffort: llm.ReasoningEffortHigh,
+		Tools: nil, EnableThinking: l.enableThinking,
+		ReasoningEffort: l.reasoningEffort,
 	}
 	resp, finalErr := l.chatWithContextShadow(ctx, request, state, contextStep+extraTurns)
 	extraTurns++

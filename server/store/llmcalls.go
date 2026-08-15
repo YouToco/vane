@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 
 	"github.com/YouToco/vane/server/types"
 	"github.com/jackc/pgx/v5"
@@ -60,6 +62,22 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 		return 0, types.NewAppError(types.CodeValidation,
 			"reasoning_tokens 必须是 completion_tokens 的非负子集", types.ErrValidation)
 	}
+	if (c.PolicyManifestPayload == "") != (c.PolicyManifestDigest == "") {
+		return 0, types.NewAppError(types.CodeValidation,
+			"policy manifest payload 与 digest 必须同时提供或同时缺省",
+			types.ErrValidation)
+	}
+	if len(c.PolicyManifestPayload) > 16<<10 {
+		return 0, types.NewAppError(types.CodeValidation,
+			"policy manifest payload 超过 16 KiB", types.ErrValidation)
+	}
+	if len(c.PolicyManifestPayload) > 0 {
+		sum := sha256.Sum256([]byte(c.PolicyManifestPayload))
+		if c.PolicyManifestDigest != hex.EncodeToString(sum[:]) {
+			return 0, types.NewAppError(types.CodeValidation,
+				"policy manifest digest 与 payload 不一致", types.ErrValidation)
+		}
+	}
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "开始写入 llm_calls 记录", err)
@@ -70,6 +88,10 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 		providerPricingLedgerLock,
 	); err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "锁定供应商价格账本", err)
+	}
+	var policyManifestPayload any
+	if c.PolicyManifestPayload != "" {
+		policyManifestPayload = []byte(c.PolicyManifestPayload)
 	}
 	var id int64
 	err = tx.QueryRow(ctx,
@@ -100,7 +122,8 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 			prefix_cache_hit, temperature, max_tokens, error,
 			tenant_id, prompt_cache_hit_tokens, prompt_cache_miss_tokens,
 			reasoning_tokens, pricing_rule_id, pricing_status,
-			cost_amount, cost_currency, run_snapshot_id, created_at
+			cost_amount, cost_currency, run_snapshot_id,
+			policy_manifest_payload, policy_manifest_digest, created_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
@@ -128,7 +151,7 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 			  WHEN $14::numeric > 0 THEN 'USD'
 			  ELSE (SELECT currency FROM price)
 			END,
-			$23,
+			$23, $24, NULLIF($25::text, ''),
 			(SELECT at FROM stamp)
 		) RETURNING id`,
 		c.TraceID, c.SpanName, c.UserID, c.RefType, c.RefID,
@@ -136,7 +159,7 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 		c.PromptTokens, c.CompletionTokens, c.LatencyMs, c.CostUSD,
 		c.PrefixCacheHit, c.Temperature, c.MaxTokens, c.Error,
 		c.PromptCacheHitTokens, c.PromptCacheMissTokens, c.ReasoningTokens, c.TenantID,
-		c.RunSnapshotID,
+		c.RunSnapshotID, policyManifestPayload, c.PolicyManifestDigest,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 llm_calls 记录", err)

@@ -2,8 +2,10 @@ package llm
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -142,6 +144,31 @@ func TestChatMessagesAndToolsSerialization(t *testing.T) {
 	}
 	if toolMsg["content"] != "已删除" {
 		t.Errorf("messages[3].content = %v, 期望 已删除", toolMsg["content"])
+	}
+}
+
+func TestDoChatRecordsExactPolicyManifest(t *testing.T) {
+	var gotBody map[string]any
+	srv := newChatCaptureServer(t, chatOKBody, &gotBody)
+	defer srv.Close()
+
+	payload := `{"schema_version":"vane.interactive-agent-policy-manifest/v1","lane":"owner"}`
+	sum := sha256.Sum256([]byte(payload))
+	digest := fmt.Sprintf("%x", sum[:])
+	st := &capturingRecorderStore{}
+	_, err := DoChat(t.Context(), newTestClient(srv.URL, 1), &Recorder{st: st}, CallMeta{
+		TraceID: "policy-manifest", SpanName: "agent",
+		PolicyManifestPayload: payload, PolicyManifestDigest: digest,
+	}, ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hello"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := st.onlyCall(t)
+	if call.PolicyManifestPayload !=
+		`{"schema_version":"vane.interactive-agent-policy-manifest/v1","lane":"owner"}` ||
+		call.PolicyManifestDigest != digest {
+		t.Fatalf("recorded policy manifest drifted: payload=%q digest=%q",
+			call.PolicyManifestPayload, call.PolicyManifestDigest)
 	}
 }
 
