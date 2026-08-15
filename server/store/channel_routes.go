@@ -393,7 +393,7 @@ func (s *Store) RevokeTelegramRoute(
 	if _, err := tx.Exec(ctx,
 		`UPDATE channel_ingress_receipts
 		    SET status='failed',reply_text=NULL,error_code='route_revoked',
-		        processing_lease=NULL,lease_expires_at=NULL,
+		        processing_lease=NULL,lease_expires_at=NULL,next_send_at=NULL,
 		        updated_at=clock_timestamp()
 		  WHERE route_id=$1 AND status IN ('pending','processing','reply_ready')`,
 		routeID); err != nil {
@@ -419,5 +419,260 @@ func (s *Store) RevokeTelegramRoute(
 			"提交 Telegram 群组解绑", err)
 	}
 	_ = identityID
+	return nil
+}
+
+// MigrateTelegramRoutes retargets still-pre-provider route state when Telegram
+// upgrades a basic group to a supergroup. Route IDs are preserved, so Agent
+// conversation scopes and durable correlation remain stable. Historical sent
+// mappings and provider-crossed effects deliberately retain the old chat ID.
+func (s *Store) MigrateTelegramRoutes(
+	ctx context.Context, appIdentity, oldChatID, newChatID string,
+) error {
+	if validateTelegramIdentityParts(appIdentity, "migration", oldChatID) != nil ||
+		validateTelegramIdentityParts(appIdentity, "migration", newChatID) != nil ||
+		oldChatID == newChatID {
+		return types.NewAppError(types.CodeValidation,
+			"Telegram 群迁移范围无效", types.ErrValidation)
+	}
+	oldParsed, oldErr := strconv.ParseInt(oldChatID, 10, 64)
+	newParsed, newErr := strconv.ParseInt(newChatID, 10, 64)
+	if oldErr != nil || newErr != nil || oldParsed == 0 || newParsed == 0 ||
+		strconv.FormatInt(oldParsed, 10) != oldChatID ||
+		strconv.FormatInt(newParsed, 10) != newChatID {
+		return types.NewAppError(types.CodeValidation,
+			"Telegram 群迁移 ID 无效", types.ErrValidation)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "开启 Telegram 群迁移", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
+		fmt.Sprintf("channel-link/v1:%s", channelProviderTelegram)); err != nil {
+		return types.NewAppError(types.CodeDatabase, "锁定 Telegram 群迁移", err)
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT id,provider_chat_id FROM channel_routes
+		  WHERE provider=$1 AND app_identity=$2 AND
+		        provider_chat_id IN ($3,$4) AND route_kind<>'private' AND
+		        status='active'
+		  ORDER BY provider_chat_id,provider_thread_id,id FOR UPDATE`,
+		channelProviderTelegram, appIdentity, oldChatID, newChatID)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "读取 Telegram 群迁移路由", err)
+	}
+	var oldRouteIDs []int64
+	hasNew := false
+	for rows.Next() {
+		var routeID int64
+		var chatID string
+		if err := rows.Scan(&routeID, &chatID); err != nil {
+			rows.Close()
+			return types.NewAppError(types.CodeDatabase, "扫描 Telegram 群迁移路由", err)
+		}
+		if chatID == newChatID {
+			hasNew = true
+		} else {
+			oldRouteIDs = append(oldRouteIDs, routeID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return types.NewAppError(types.CodeDatabase, "遍历 Telegram 群迁移路由", err)
+	}
+	rows.Close()
+	if len(oldRouteIDs) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return types.NewAppError(types.CodeDatabase, "提交 Telegram 群迁移重放", err)
+		}
+		return nil
+	}
+	if hasNew {
+		return types.NewAppError(types.CodeConflict,
+			"Telegram 新群目标已存在独立路由", types.ErrConflict)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE channel_routes
+		    SET provider_chat_id=$2,chat_type='supergroup'
+		  WHERE id=ANY($1) AND status='active'`, oldRouteIDs, newChatID); err != nil {
+		return types.NewAppError(types.CodeDatabase, "迁移 Telegram 群路由", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE channel_ingress_receipts
+		    SET provider_chat_id=$2,updated_at=clock_timestamp()
+		  WHERE route_id=ANY($1) AND
+		        status IN ('pending','processing','reply_ready')`,
+		oldRouteIDs, newChatID); err != nil {
+		return types.NewAppError(types.CodeDatabase, "迁移 Telegram 待处理消息", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE channel_outbound_effects
+		    SET provider_chat_id=$2,updated_at=clock_timestamp()
+		  WHERE route_id=ANY($1) AND status='prepared'`,
+		oldRouteIDs, newChatID); err != nil {
+		return types.NewAppError(types.CodeDatabase, "迁移 Telegram 待发送消息", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.NewAppError(types.CodeDatabase, "提交 Telegram 群迁移", err)
+	}
+	return nil
+}
+
+// InvalidateTelegramDestination consumes provider-authenticated membership or
+// topic lifecycle events. Empty threadID revokes every route in the chat;
+// an exact threadID revokes only that forum topic. Provider-crossed states are
+// retained for audit and are never rewritten into a retryable state.
+func (s *Store) InvalidateTelegramDestination(
+	ctx context.Context, appIdentity, chatID, threadID, reason string,
+) error {
+	if validateTelegramIdentityParts(appIdentity, "lifecycle", chatID) != nil ||
+		(reason != "bot_membership_lost" && reason != "topic_closed") {
+		return types.NewAppError(types.CodeValidation,
+			"Telegram 生命周期范围无效", types.ErrValidation)
+	}
+	if threadID != "" {
+		parsed, err := strconv.ParseInt(threadID, 10, 64)
+		if err != nil || parsed <= 0 || strconv.FormatInt(parsed, 10) != threadID {
+			return types.NewAppError(types.CodeValidation,
+				"Telegram 话题生命周期范围无效", types.ErrValidation)
+		}
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "开启 Telegram 生命周期失效", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
+		fmt.Sprintf("channel-link/v1:%s", channelProviderTelegram)); err != nil {
+		return types.NewAppError(types.CodeDatabase, "锁定 Telegram 生命周期失效", err)
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT id,identity_id,route_kind FROM channel_routes
+		  WHERE provider=$1 AND app_identity=$2 AND provider_chat_id=$3 AND
+		        ($4='' OR provider_thread_id=$4) AND status='active'
+		  ORDER BY identity_id,id`, channelProviderTelegram,
+		appIdentity, chatID, threadID)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "读取 Telegram 生命周期路由", err)
+	}
+	var routeIDs, identityIDs, privateIdentityIDs []int64
+	for rows.Next() {
+		var routeID, identityID int64
+		var routeKind string
+		if err := rows.Scan(&routeID, &identityID, &routeKind); err != nil {
+			rows.Close()
+			return types.NewAppError(types.CodeDatabase, "扫描 Telegram 生命周期路由", err)
+		}
+		routeIDs = append(routeIDs, routeID)
+		identityIDs = append(identityIDs, identityID)
+		if routeKind == "private" {
+			privateIdentityIDs = append(privateIdentityIDs, identityID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return types.NewAppError(types.CodeDatabase, "遍历 Telegram 生命周期路由", err)
+	}
+	rows.Close()
+	if len(routeIDs) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return types.NewAppError(types.CodeDatabase, "提交 Telegram 生命周期重放", err)
+		}
+		return nil
+	}
+	// Agent admission locks identity before route. Use the same row-lock order
+	// so provider lifecycle revocation cannot deadlock with a concurrent claim.
+	if _, err := tx.Exec(ctx,
+		`SELECT id FROM channel_identities WHERE id=ANY($1) ORDER BY id FOR UPDATE`,
+		identityIDs); err != nil {
+		return types.NewAppError(types.CodeDatabase, "锁定 Telegram 生命周期身份", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT id FROM channel_routes
+		  WHERE id=ANY($1) AND provider=$2 AND app_identity=$3 AND
+		        provider_chat_id=$4 AND ($5='' OR provider_thread_id=$5) AND
+		        status='active'
+		  ORDER BY id FOR UPDATE`, routeIDs, channelProviderTelegram,
+		appIdentity, chatID, threadID); err != nil {
+		return types.NewAppError(types.CodeDatabase, "锁定 Telegram 生命周期路由", err)
+	}
+	if len(privateIdentityIDs) > 0 {
+		if _, err := tx.Exec(ctx,
+			`SELECT id FROM channel_routes WHERE identity_id=ANY($1) AND status='active'
+			  ORDER BY id FOR UPDATE`, privateIdentityIDs); err != nil {
+			return types.NewAppError(types.CodeDatabase, "锁定 Telegram 身份路由", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE channel_ingress_receipts
+			    SET status='failed',reply_text=NULL,error_code=$2,
+			        processing_lease=NULL,lease_expires_at=NULL,next_send_at=NULL,
+			        updated_at=clock_timestamp()
+			  WHERE identity_id=ANY($1) AND
+			        status IN ('pending','processing','reply_ready')`,
+			privateIdentityIDs, reason); err != nil {
+			return types.NewAppError(types.CodeDatabase, "取消 Telegram 身份消息", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE channel_outbound_effects
+			    SET status='failed',error_code=$2,next_send_at=NULL,
+			        updated_at=clock_timestamp()
+			  WHERE route_id IN (SELECT id FROM channel_routes WHERE identity_id=ANY($1)) AND
+			        status='prepared'`, privateIdentityIDs, reason); err != nil {
+			return types.NewAppError(types.CodeDatabase, "取消 Telegram 身份发送", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE channel_routes SET status='revoked',revoked_at=clock_timestamp()
+			  WHERE identity_id=ANY($1) AND status='active'`, privateIdentityIDs); err != nil {
+			return types.NewAppError(types.CodeDatabase, "撤销 Telegram 身份路由", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM channel_link_requests l USING channel_identities ci
+			  WHERE ci.id=ANY($1) AND l.tenant_id=ci.tenant_id AND
+			        l.user_id=ci.user_id AND l.provider=$2 AND l.consumed_at IS NULL`,
+			privateIdentityIDs, channelProviderTelegram); err != nil {
+			return types.NewAppError(types.CodeDatabase, "撤销 Telegram 生命周期配对码", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM channel_route_link_requests l USING channel_identities ci
+			  WHERE ci.id=ANY($1) AND l.tenant_id=ci.tenant_id AND
+			        l.user_id=ci.user_id AND l.provider=$2 AND l.consumed_at IS NULL`,
+			privateIdentityIDs, channelProviderTelegram); err != nil {
+			return types.NewAppError(types.CodeDatabase, "撤销 Telegram 生命周期群连接码", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE channel_identities SET status='revoked',revoked_at=clock_timestamp()
+			  WHERE id=ANY($1) AND status='active'`, privateIdentityIDs); err != nil {
+			return types.NewAppError(types.CodeDatabase, "撤销 Telegram 生命周期身份", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx,
+			`UPDATE channel_ingress_receipts
+			    SET status='failed',reply_text=NULL,error_code=$2,
+			        processing_lease=NULL,lease_expires_at=NULL,next_send_at=NULL,
+			        updated_at=clock_timestamp()
+			  WHERE route_id=ANY($1) AND
+			        status IN ('pending','processing','reply_ready')`,
+			routeIDs, reason); err != nil {
+			return types.NewAppError(types.CodeDatabase, "取消 Telegram 路由消息", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE channel_outbound_effects
+			    SET status='failed',error_code=$2,next_send_at=NULL,
+			        updated_at=clock_timestamp()
+			  WHERE route_id=ANY($1) AND status='prepared'`, routeIDs, reason); err != nil {
+			return types.NewAppError(types.CodeDatabase, "取消 Telegram 路由发送", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE channel_routes SET status='revoked',revoked_at=clock_timestamp()
+			  WHERE id=ANY($1) AND status='active'`, routeIDs); err != nil {
+			return types.NewAppError(types.CodeDatabase, "撤销 Telegram 生命周期路由", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.NewAppError(types.CodeDatabase, "提交 Telegram 生命周期失效", err)
+	}
 	return nil
 }

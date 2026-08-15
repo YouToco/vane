@@ -116,11 +116,18 @@ func notFoundErr(msg string) error {
 // GetActiveAgentSession 计数进 getActiveCalls：NotifyEvent 的"现查必须在 session admission 内"
 // （审查 F14）靠"锁被对端持有期间这里有没有被调到"来判定，故计数与回写同一把 mu 保护。
 func (f *fakeStore) GetActiveAgentSession(_ context.Context, userID int64, since time.Time) (*types.AgentSession, error) {
+	return f.GetActiveAgentSessionInScope(context.Background(), userID, ownerConversationScope, since)
+}
+
+func (f *fakeStore) GetActiveAgentSessionInScope(
+	_ context.Context, userID int64, conversationScope string, since time.Time,
+) (*types.AgentSession, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.getActiveCalls++
 	for _, s := range f.sessions {
-		if s.UserID == userID && s.Status == types.AgentSessionStatusActive && s.UpdatedAt.After(since) {
+		if s.UserID == userID && s.ConversationScope == conversationScope &&
+			s.Status == types.AgentSessionStatusActive && s.UpdatedAt.After(since) {
 			cp := *s
 			return &cp, nil
 		}
@@ -142,17 +149,24 @@ func (f *fakeStore) sessionCount() int {
 }
 
 func (f *fakeStore) CreateAgentSession(_ context.Context, userID int64) (*types.AgentSession, error) {
+	return f.CreateAgentSessionInScope(context.Background(), userID, ownerConversationScope)
+}
+
+func (f *fakeStore) CreateAgentSessionInScope(
+	_ context.Context, userID int64, conversationScope string,
+) (*types.AgentSession, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextSessionID++
 	s := &types.AgentSession{
-		ID:        f.nextSessionID,
-		TenantID:  1,
-		UserID:    userID,
-		Status:    types.AgentSessionStatusActive,
-		Messages:  json.RawMessage("[]"),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:                f.nextSessionID,
+		TenantID:          1,
+		UserID:            userID,
+		ConversationScope: conversationScope,
+		Status:            types.AgentSessionStatusActive,
+		Messages:          json.RawMessage("[]"),
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
 	}
 	f.sessions[s.ID] = s
 	cp := *s

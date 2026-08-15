@@ -73,11 +73,14 @@ func (s *Store) TelegramBlockedReplyStats(
 		   SELECT updated_at FROM channel_ingress_receipts
 		    WHERE provider=$1 AND app_identity=$2 AND
 		          status IN ('sending','ambiguous','failed') AND
-		          (status <> 'failed' OR error_code NOT IN ('identity_revoked','route_revoked'))
+		          (status <> 'failed' OR error_code NOT IN
+		             ('identity_revoked','route_revoked','bot_membership_lost','topic_closed'))
 		   UNION ALL
 		   SELECT updated_at FROM channel_outbound_effects
 		    WHERE provider=$1 AND app_identity=$2 AND
-		          status IN ('sending','ambiguous','failed')
+		          status IN ('sending','ambiguous','failed') AND
+		          (status <> 'failed' OR error_code NOT IN
+		             ('bot_membership_lost','topic_closed'))
 		 ) blocked`,
 		channelProviderTelegram, appIdentity).Scan(&stats.Count, &stats.OldestAt)
 	if err != nil {
@@ -96,11 +99,14 @@ func (s *Store) TelegramBlockedReplyStatsForUser(
 		   SELECT updated_at FROM channel_ingress_receipts
 		    WHERE provider=$1 AND app_identity=$2 AND tenant_id=$3 AND user_id=$4 AND
 		          status IN ('sending','ambiguous','failed') AND
-		          (status <> 'failed' OR error_code NOT IN ('identity_revoked','route_revoked'))
+		          (status <> 'failed' OR error_code NOT IN
+		             ('identity_revoked','route_revoked','bot_membership_lost','topic_closed'))
 		   UNION ALL
 		   SELECT updated_at FROM channel_outbound_effects
 		    WHERE provider=$1 AND app_identity=$2 AND tenant_id=$3 AND user_id=$4 AND
-		          status IN ('sending','ambiguous','failed')
+		          status IN ('sending','ambiguous','failed') AND
+		          (status <> 'failed' OR error_code NOT IN
+		             ('bot_membership_lost','topic_closed'))
 		 ) blocked`,
 		channelProviderTelegram, appIdentity, tenantID, userID,
 	).Scan(&stats.Count, &stats.OldestAt)
@@ -475,7 +481,7 @@ func (s *Store) RevokeTelegramIdentity(
 	if _, err := tx.Exec(ctx,
 		`UPDATE channel_ingress_receipts
 		    SET status='failed',reply_text=NULL,error_code='identity_revoked',
-		        processing_lease=NULL,lease_expires_at=NULL,
+		        processing_lease=NULL,lease_expires_at=NULL,next_send_at=NULL,
 		        updated_at=clock_timestamp()
 		  WHERE identity_id=$1 AND
 		        status IN ('pending','processing','reply_ready')`,
@@ -764,7 +770,7 @@ func (s *Store) MarkTelegramIngressReplyReady(
 	command, err := s.pool.Exec(ctx,
 		`UPDATE channel_ingress_receipts
 		    SET status='reply_ready',reply_text=$5,processing_lease=NULL,
-		        lease_expires_at=NULL,updated_at=clock_timestamp()
+		        lease_expires_at=NULL,next_send_at=NULL,updated_at=clock_timestamp()
 		  WHERE provider=$1 AND app_identity=$2 AND provider_update_id=$3 AND
 		        status='processing' AND processing_lease=$4`,
 		item.Provider, item.AppIdentity, item.ProviderUpdateID,
@@ -818,6 +824,7 @@ func (s *Store) ClaimTelegramReplySend(
 		   JOIN channel_routes cr ON cr.id=r.route_id
 		  WHERE r.provider=$1 AND r.app_identity=$2 AND
 		        r.provider_update_id=$3 AND r.status='reply_ready' AND
+		        (r.next_send_at IS NULL OR r.next_send_at<=clock_timestamp()) AND
 		        ci.status='active' AND cr.status='active'
 		  FOR UPDATE OF ci,cr`, provider, appIdentity, updateID).Scan(&identityID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -831,9 +838,10 @@ func (s *Store) ClaimTelegramReplySend(
 	var item ChannelIngress
 	err = tx.QueryRow(ctx,
 		`UPDATE channel_ingress_receipts
-		    SET status='sending',updated_at=clock_timestamp()
+		    SET status='sending',next_send_at=NULL,updated_at=clock_timestamp()
 		  WHERE provider=$1 AND app_identity=$2 AND provider_update_id=$3 AND
-		        identity_id=$4 AND status='reply_ready'
+		        identity_id=$4 AND status='reply_ready' AND
+		        (next_send_at IS NULL OR next_send_at<=clock_timestamp())
 		 RETURNING provider,app_identity,provider_update_id,identity_id,
 		           tenant_id,user_id,external_user_id,provider_chat_id,
 		           provider_thread_id,provider_message_id,route_id,
@@ -883,6 +891,7 @@ func (s *Store) ClaimNextTelegramReplySend(
 		   JOIN channel_routes cr ON cr.id=r.route_id
 		  WHERE ci.provider=$1 AND ci.app_identity=$2 AND ci.status='active' AND
 		        cr.status='active' AND r.status='reply_ready' AND
+		        (r.next_send_at IS NULL OR r.next_send_at<=clock_timestamp()) AND
 		        NOT EXISTS (
 		          SELECT 1 FROM channel_ingress_receipts earlier
 		           WHERE earlier.identity_id=r.identity_id AND
@@ -906,6 +915,7 @@ func (s *Store) ClaimNextTelegramReplySend(
 		     FROM channel_ingress_receipts
 		    WHERE provider=$1 AND app_identity=$2 AND identity_id=$3 AND route_id=$4 AND
 		          status='reply_ready' AND
+		          (next_send_at IS NULL OR next_send_at<=clock_timestamp()) AND
 		          NOT EXISTS (
 		            SELECT 1 FROM channel_ingress_receipts earlier
 		             WHERE earlier.identity_id=channel_ingress_receipts.identity_id AND
@@ -917,7 +927,7 @@ func (s *Store) ClaimNextTelegramReplySend(
 		    FOR UPDATE SKIP LOCKED LIMIT 1
 		 )
 		 UPDATE channel_ingress_receipts r
-		    SET status='sending',updated_at=clock_timestamp()
+		    SET status='sending',next_send_at=NULL,updated_at=clock_timestamp()
 		   FROM candidate c
 		  WHERE r.provider=c.provider AND r.app_identity=c.app_identity AND
 		        r.provider_update_id=c.provider_update_id
@@ -1001,6 +1011,44 @@ func (s *Store) CompleteTelegramReply(
 		return types.NewAppError(types.CodeDatabase, "提交 Telegram 回复结算", err)
 	}
 	return nil
+}
+
+// DeferTelegramReply moves a provider-declared 429 back to the safe pre-send
+// boundary. It is valid only before any chunk was accepted. Once the bounded
+// retry budget is exhausted the reply becomes operator-visible failed state.
+func (s *Store) DeferTelegramReply(
+	ctx context.Context, item ChannelIngress, retryAfter time.Duration,
+	maxRetries int,
+) (bool, error) {
+	if retryAfter < time.Second || retryAfter > 24*time.Hour ||
+		retryAfter%time.Second != 0 || maxRetries < 1 || maxRetries > 100 {
+		return false, types.NewAppError(types.CodeValidation,
+			"Telegram 回复限流参数无效", types.ErrValidation)
+	}
+	var status string
+	err := s.pool.QueryRow(ctx,
+		`UPDATE channel_ingress_receipts
+		    SET send_retry_count=send_retry_count+1,
+		        status=CASE WHEN send_retry_count<$5 THEN 'reply_ready' ELSE 'failed' END,
+		        reply_text=CASE WHEN send_retry_count<$5 THEN reply_text ELSE NULL END,
+		        next_send_at=CASE WHEN send_retry_count<$5
+		                     THEN clock_timestamp()+make_interval(secs=>$4) ELSE NULL END,
+		        error_code=CASE WHEN send_retry_count<$5 THEN NULL
+		                   ELSE 'rate_limit_exhausted' END,
+		        updated_at=clock_timestamp()
+		  WHERE provider=$1 AND app_identity=$2 AND provider_update_id=$3 AND
+		        status='sending' AND provider_message_ids IS NULL
+		 RETURNING status`, item.Provider, item.AppIdentity, item.ProviderUpdateID,
+		int64(retryAfter/time.Second), maxRetries).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, types.NewAppError(types.CodeConflict,
+			"Telegram 回复限流状态冲突", types.ErrConflict)
+	}
+	if err != nil {
+		return false, types.NewAppError(types.CodeDatabase,
+			"延后 Telegram 限流回复", err)
+	}
+	return status == "reply_ready", nil
 }
 
 // MarkTelegramReplyRejected records a provider-declared rejection before any

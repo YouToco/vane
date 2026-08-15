@@ -33,7 +33,7 @@ func TestClientSetWebhookUsesSecretAndMinimalUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`"secret_token":"hook_secret"`, `"allowed_updates":["message","callback_query"]`,
+		`"secret_token":"hook_secret"`, `"allowed_updates":["message","callback_query","my_chat_member"]`,
 		`"drop_pending_updates":false`, `"max_connections":1`,
 	} {
 		if !strings.Contains(body, want) {
@@ -110,7 +110,7 @@ func TestClientTransportErrorNeverLeaksTokenURL(t *testing.T) {
 func TestClientClassifiesExplicit429AsDefinitelyNotSent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"retry"}`))
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"retry","parameters":{"retry_after":7}}`))
 	}))
 	defer server.Close()
 	client, err := NewClient("123:token", server.URL,
@@ -121,7 +121,7 @@ func TestClientClassifiesExplicit429AsDefinitelyNotSent(t *testing.T) {
 	_, err = client.SendMessage(t.Context(), "42", "hello")
 	var deliveryErr *DeliveryError
 	if !errors.As(err, &deliveryErr) || !deliveryErr.DefinitelyNotSent ||
-		deliveryErr.Code != "rate_limited" {
+		deliveryErr.Code != "rate_limited" || deliveryErr.RetryAfter != 7*time.Second {
 		t.Fatalf("error=%+v", deliveryErr)
 	}
 }

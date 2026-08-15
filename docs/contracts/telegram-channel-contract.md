@@ -1,4 +1,4 @@
-# Telegram Bot channel contract (routed ingress v2)
+# Telegram Bot channel contract (routed ingress v3)
 
 Status: implemented, default-off, production UAT pending.
 
@@ -9,10 +9,10 @@ routing data, never Vane user IDs.
 
 ## Scope
 
-Included in v2:
+Included in v3:
 
 - startup `getMe`, exact HTTPS `setWebhook`, `getWebhookInfo` verification;
-- explicit `allowed_updates=["message","callback_query"]`, `max_connections=1` and
+- explicit `allowed_updates=["message","callback_query","my_chat_member"]`, `max_connections=1` and
   `drop_pending_updates=false`;
 - constant-time webhook-secret verification and a 1 MiB body limit;
 - private text plus explicitly installed group/supergroup/forum-topic routes;
@@ -24,6 +24,13 @@ Included in v2:
 - HMAC-authenticated inline callbacks admitted through the same durable inbox;
 - exact `message_thread_id` preservation and provider-neutral
   `(provider,app,chat,thread,message)` mappings;
+- Agent history isolated by the authenticated internal route ID: private chat,
+  each group, and each forum topic have distinct TTL sessions, and raw Telegram
+  actor/chat/thread IDs never become Agent session keys;
+- provider-authenticated group-to-supergroup migration retargets only
+  pre-provider route/effect state while preserving the internal route/session
+  identity; Bot removal/block and topic close/hide revoke affected authority
+  before normal message admission;
 - a provider-neutral durable outbound effect boundary with stable caller UUID,
   frozen route/payload, exact replay, and terminal sent/failed/ambiguous
   settlement. Connection tests use it; future product notifications can reuse
@@ -100,7 +107,7 @@ expires. It calls `agent.Loop.HandleChannelMessage` with the deterministic turn
 UUID. A completed `agent_turn_records` row returns before any model/Tool call;
 an interrupted retry keeps the same Tool idempotency namespace.
 
-Ingress v2 also fixes both provider and process concurrency to one connection
+Ingress v3 also fixes both provider and process concurrency to one connection
 and one worker. The Store orders numeric Telegram update IDs and keeps one
 `pending|processing|reply_ready` head per channel identity. A provider-crossed
 `sending` row is terminal for FIFO purposes: it remains an operator-visible
@@ -117,8 +124,13 @@ timeout, network disconnect, HTTP 5xx, redirect,
 malformed success or partial multi-chunk result ends at `ambiguous`. A crash in
 `sending` remains visibly blocked. This prefers a missing reply over a duplicate
 external message because Telegram Bot API has no caller idempotency key.
-An explicit 4xx/429 before the first chunk is recorded as definite `failed`,
-not ambiguous; it is never retried automatically. Blocked `sending|ambiguous`
+An explicit non-429 4xx before the first chunk is recorded as definite
+`failed`, not ambiguous. A 429 with a valid provider `retry_after` is the one
+safe retry case: before any chunk is accepted it returns to `reply_ready` (or
+outbound `prepared`) with a durable `next_send_at`, survives restart, preserves
+FIFO, and has a bounded five-deferral budget. Missing/invalid `retry_after` or
+an exhausted budget becomes operator-visible terminal `failed`; it is never
+treated as ambiguous. Blocked `sending|ambiguous`
 or terminal `failed` counts and oldest timestamps are exposed in Telegram
 status and the Settings warning surface, scoped to the authenticated
 tenant/user; bot-global counts remain server-side operational telemetry.
@@ -129,7 +141,7 @@ delivery becomes terminal `failed`, while the adapter remains ready.
 
 ## Database role boundary
 
-Migrations 133-134 install exact-user RLS policies and revoke the future
+Migrations 133-136 install exact-user RLS policies and revoke the future
 `vane_app` role, but the current primary Store intentionally still runs through
 the repository's schema-owner compatibility DSN. PostgreSQL owners bypass
 non-FORCE RLS, so this branch does **not** count those policies as current
@@ -173,8 +185,12 @@ Before changing feature 4.9 from `开发中`, production must prove:
 6. 4096-boundary Chinese/emoji replies preserve content and order, and topic
    replies retain the exact `message_thread_id`;
 7. unlink and bot/secret rotation revoke old authority;
-8. Feishu owner chat and one existing Feishu delivery still pass regression;
-9. logs/traces contain no bot token, webhook secret or raw private message.
+8. group migration preserves the internal route, topic close revokes only that
+   topic, and `my_chat_member` removal revokes all routes in that chat;
+9. a real 429 honors durable `retry_after` across restart while timeout/5xx
+   remains ambiguous and cannot resend;
+10. Feishu owner chat and one existing Feishu delivery still pass regression;
+11. logs/traces contain no bot token, webhook secret or raw private message.
 
 ## Historical decisions used
 

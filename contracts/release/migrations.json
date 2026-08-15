@@ -531,6 +531,14 @@
     {
       "path": "134_channel_routes.sql",
       "sha256": "9bb70b41ff4e84b75afdf52815947476c0b85f74c190b8bedf4280724326c628"
+    },
+    {
+      "path": "135_agent_conversation_scopes.sql",
+      "sha256": "803317bbd5de3387281f8d1bd1c93bc459807980ee02899e547b7f3410fcdcb3"
+    },
+    {
+      "path": "136_channel_rate_limit_retry.sql",
+      "sha256": "4644fddd125342b77e86b18491921ebd92289431a40598089beed38e03e95524"
     }
   ],
   "schema": "vane.migrations/v1"

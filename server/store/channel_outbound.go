@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -172,6 +173,7 @@ func (s *Store) ClaimTelegramOutbound(
 		 JOIN channel_routes cr ON cr.id=e.route_id
 		 JOIN channel_identities ci ON ci.id=cr.identity_id
 		WHERE e.effect_id=$1 AND e.provider=$2 AND e.status='prepared' AND
+		      (e.next_send_at IS NULL OR e.next_send_at<=clock_timestamp()) AND
 		      cr.status='active' AND ci.status='active'
 		FOR UPDATE OF cr`, effectID, channelProviderTelegram).Scan(&routeID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -183,8 +185,10 @@ func (s *Store) ClaimTelegramOutbound(
 			"锁定 Telegram outbound authority", err)
 	}
 	effect, err := scanChannelOutbound(tx.QueryRow(ctx,
-		`UPDATE channel_outbound_effects SET status='sending',updated_at=clock_timestamp()
-		  WHERE effect_id=$1 AND route_id=$2 AND status='prepared'
+		`UPDATE channel_outbound_effects
+		    SET status='sending',next_send_at=NULL,updated_at=clock_timestamp()
+		  WHERE effect_id=$1 AND route_id=$2 AND status='prepared' AND
+		        (next_send_at IS NULL OR next_send_at<=clock_timestamp())
 		  RETURNING `+channelOutboundColumns, effectID, routeID))
 	if err != nil {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
@@ -254,6 +258,43 @@ func (s *Store) MarkTelegramOutboundRejected(
 	ctx context.Context, effect ChannelOutboundEffect, errorCode string,
 ) error {
 	return s.finishTelegramOutbound(ctx, effect, "failed", nil, errorCode)
+}
+
+// DeferTelegramOutbound preserves a definite 429 non-send as a durable
+// prepared effect. The stable effect ID can be retried after next_send_at;
+// ambiguous/provider-crossed states never enter this method.
+func (s *Store) DeferTelegramOutbound(
+	ctx context.Context, effect ChannelOutboundEffect, retryAfter time.Duration,
+	maxRetries int,
+) (bool, error) {
+	if retryAfter < time.Second || retryAfter > 24*time.Hour ||
+		retryAfter%time.Second != 0 || maxRetries < 1 || maxRetries > 100 {
+		return false, types.NewAppError(types.CodeValidation,
+			"Telegram outbound 限流参数无效", types.ErrValidation)
+	}
+	var status string
+	err := s.pool.QueryRow(ctx,
+		`UPDATE channel_outbound_effects
+		    SET send_retry_count=send_retry_count+1,
+		        status=CASE WHEN send_retry_count<$4 THEN 'prepared' ELSE 'failed' END,
+		        next_send_at=CASE WHEN send_retry_count<$4
+		                     THEN clock_timestamp()+make_interval(secs=>$3) ELSE NULL END,
+		        error_code=CASE WHEN send_retry_count<$4 THEN NULL
+		                   ELSE 'rate_limit_exhausted' END,
+		        updated_at=clock_timestamp()
+		  WHERE effect_id=$1 AND route_id=$2 AND status='sending' AND
+		        provider_message_ids IS NULL
+		 RETURNING status`, effect.EffectID, effect.RouteID,
+		int64(retryAfter/time.Second), maxRetries).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, types.NewAppError(types.CodeConflict,
+			"Telegram outbound 限流状态冲突", types.ErrConflict)
+	}
+	if err != nil {
+		return false, types.NewAppError(types.CodeDatabase,
+			"延后 Telegram outbound 限流", err)
+	}
+	return status == "prepared", nil
 }
 
 func (s *Store) MarkTelegramOutboundAmbiguous(

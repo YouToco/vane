@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -50,20 +51,27 @@ type Chat struct {
 }
 
 type Message struct {
-	MessageID       int64     `json:"message_id"`
-	MessageThreadID int64     `json:"message_thread_id"`
-	IsTopicMessage  bool      `json:"is_topic_message"`
-	From            *User     `json:"from"`
-	Chat            Chat      `json:"chat"`
-	Text            string    `json:"text"`
-	Caption         string    `json:"caption"`
-	Photo           []FileRef `json:"photo"`
-	Document        *FileRef  `json:"document"`
-	Audio           *FileRef  `json:"audio"`
-	Video           *FileRef  `json:"video"`
-	Voice           *FileRef  `json:"voice"`
-	ReplyToMessage  *Message  `json:"reply_to_message"`
+	MessageID               int64                    `json:"message_id"`
+	MessageThreadID         int64                    `json:"message_thread_id"`
+	IsTopicMessage          bool                     `json:"is_topic_message"`
+	From                    *User                    `json:"from"`
+	Chat                    Chat                     `json:"chat"`
+	Text                    string                   `json:"text"`
+	Caption                 string                   `json:"caption"`
+	Photo                   []FileRef                `json:"photo"`
+	Document                *FileRef                 `json:"document"`
+	Audio                   *FileRef                 `json:"audio"`
+	Video                   *FileRef                 `json:"video"`
+	Voice                   *FileRef                 `json:"voice"`
+	ReplyToMessage          *Message                 `json:"reply_to_message"`
+	MigrateToChatID         int64                    `json:"migrate_to_chat_id"`
+	MigrateFromChatID       int64                    `json:"migrate_from_chat_id"`
+	ForumTopicClosed        *ForumTopicClosed        `json:"forum_topic_closed"`
+	GeneralForumTopicHidden *GeneralForumTopicHidden `json:"general_forum_topic_hidden"`
 }
+
+type ForumTopicClosed struct{}
+type GeneralForumTopicHidden struct{}
 
 type FileRef struct {
 	FileID       string `json:"file_id"`
@@ -78,9 +86,17 @@ type CallbackQuery struct {
 }
 
 type Update struct {
-	UpdateID      int64          `json:"update_id"`
-	Message       *Message       `json:"message"`
-	CallbackQuery *CallbackQuery `json:"callback_query"`
+	UpdateID      int64              `json:"update_id"`
+	Message       *Message           `json:"message"`
+	CallbackQuery *CallbackQuery     `json:"callback_query"`
+	MyChatMember  *ChatMemberUpdated `json:"my_chat_member"`
+}
+
+type ChatMemberUpdated struct {
+	Chat          Chat       `json:"chat"`
+	From          User       `json:"from"`
+	OldChatMember ChatMember `json:"old_chat_member"`
+	NewChatMember ChatMember `json:"new_chat_member"`
 }
 
 type BotCommand struct {
@@ -103,6 +119,7 @@ type SendMessageOptions struct {
 }
 
 type ChatMember struct {
+	User   User   `json:"user"`
 	Status string `json:"status"`
 }
 
@@ -114,6 +131,7 @@ type DeliveryError struct {
 	Code              string
 	DefinitelyNotSent bool
 	HTTPStatus        int
+	RetryAfter        time.Duration
 }
 
 func (e *DeliveryError) Error() string {
@@ -185,7 +203,7 @@ func (c *Client) SetWebhook(
 		MaxConnections     int      `json:"max_connections"`
 	}{
 		URL: webhookURL, SecretToken: secret,
-		AllowedUpdates: []string{"message", "callback_query"}, DropPendingUpdates: false,
+		AllowedUpdates: []string{"message", "callback_query", "my_chat_member"}, DropPendingUpdates: false,
 		MaxConnections: 1,
 	}
 	return c.call(ctx, "setWebhook", payload, nil)
@@ -313,12 +331,17 @@ func (c *Client) call(
 	decoded := json.Unmarshal(body, &envelope) == nil
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		code := "rejected"
+		providerStatus := resp.StatusCode
+		if decoded && envelope.ErrorCode >= 400 && envelope.ErrorCode < 500 {
+			providerStatus = envelope.ErrorCode
+		}
 		if resp.StatusCode == http.StatusTooManyRequests ||
 			(decoded && envelope.ErrorCode == 429) {
 			code = "rate_limited"
 		}
 		return &DeliveryError{
-			Code: code, DefinitelyNotSent: true, HTTPStatus: resp.StatusCode,
+			Code: code, DefinitelyNotSent: true, HTTPStatus: providerStatus,
+			RetryAfter: retryAfter(envelope.Parameters.RetryAfter),
 		}
 	}
 	if !decoded {
@@ -326,11 +349,16 @@ func (c *Client) call(
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !envelope.OK {
 		code := "rejected"
+		providerStatus := resp.StatusCode
+		if envelope.ErrorCode >= 400 && envelope.ErrorCode < 500 {
+			providerStatus = envelope.ErrorCode
+		}
 		if resp.StatusCode == http.StatusTooManyRequests || envelope.ErrorCode == 429 {
 			code = "rate_limited"
 		}
 		return &DeliveryError{
-			Code: code, DefinitelyNotSent: true, HTTPStatus: resp.StatusCode,
+			Code: code, DefinitelyNotSent: true, HTTPStatus: providerStatus,
+			RetryAfter: retryAfter(envelope.Parameters.RetryAfter),
 		}
 	}
 	if result == nil {
@@ -343,6 +371,13 @@ func (c *Client) call(
 		return &DeliveryError{Code: "malformed_result"}
 	}
 	return nil
+}
+
+func retryAfter(seconds int) time.Duration {
+	if seconds <= 0 || seconds > 24*60*60 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func sanitizeDeliveryCode(err error) string {

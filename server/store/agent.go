@@ -12,14 +12,30 @@ import (
 )
 
 // agentSessionColumns 是 agent_sessions 表全列，SELECT 与 scanAgentSession 一一对应。
-const agentSessionColumns = `id, tenant_id, user_id, status, messages, turn_count, activated_tools, created_at, updated_at`
+const agentSessionColumns = `id, tenant_id, user_id, conversation_scope, status, messages, turn_count, activated_tools, created_at, updated_at`
+
+const ownerConversationScope = "owner"
 
 // scanAgentSession 把一行 agent_sessions 扫进 types.AgentSession（复用于单行与 RETURNING）。
 func scanAgentSession(row pgx.Row, as *types.AgentSession) error {
 	return row.Scan(
-		&as.ID, &as.TenantID, &as.UserID, &as.Status, &as.Messages,
+		&as.ID, &as.TenantID, &as.UserID, &as.ConversationScope,
+		&as.Status, &as.Messages,
 		&as.TurnCount, &as.ActivatedTools, &as.CreatedAt, &as.UpdatedAt,
 	)
+}
+
+func validAgentConversationScope(scope string) bool {
+	if len(scope) < 1 || len(scope) > 128 || scope[0] < 'a' || scope[0] > 'z' {
+		return false
+	}
+	for _, char := range scope[1:] {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') &&
+			char != ':' && char != '_' && char != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // GetActiveAgentSession 取该用户最近的 active 会话；updated_at 早于 since 的视为
@@ -33,6 +49,19 @@ func scanAgentSession(row pgx.Row, as *types.AgentSession) error {
 // 不会产生错误结果，故不用 SELECT FOR UPDATE。翻转刻意不动 updated_at——
 // 保留"最后活跃时间"语义供排查。
 func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error) {
+	return s.GetActiveAgentSessionInScope(ctx, userID, ownerConversationScope, since)
+}
+
+// GetActiveAgentSessionInScope returns the active Agent session for one
+// server-authoritative conversation scope. Provider IDs must never be used as
+// the scope; channel adapters derive it from their internal authenticated route.
+func (s *Store) GetActiveAgentSessionInScope(
+	ctx context.Context, userID int64, conversationScope string, since time.Time,
+) (*types.AgentSession, error) {
+	if userID <= 0 || !validAgentConversationScope(conversationScope) {
+		return nil, types.NewAppError(types.CodeValidation,
+			"Agent 会话范围无效", types.ErrValidation)
+	}
 	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
@@ -50,15 +79,18 @@ func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since t
 	var as types.AgentSession
 	err = scanAgentSession(tx.QueryRow(ctx,
 		`WITH stale AS (
-			UPDATE agent_sessions SET status = $3
-			WHERE user_id = $1 AND status = $4 AND updated_at < $2
+			UPDATE agent_sessions SET status = $4
+			WHERE user_id = $1 AND conversation_scope = $2 AND
+			      status = $5 AND updated_at < $3
 		 )
 		 SELECT `+agentSessionColumns+`
 		 FROM agent_sessions
-		 WHERE user_id = $1 AND status = $4 AND updated_at >= $2
+		 WHERE user_id = $1 AND conversation_scope = $2 AND
+		       status = $5 AND updated_at >= $3
 		 ORDER BY updated_at DESC
 		 LIMIT 1`,
-		userID, since, types.AgentSessionStatusExpired, types.AgentSessionStatusActive), &as)
+		userID, conversationScope, since,
+		types.AgentSessionStatusExpired, types.AgentSessionStatusActive), &as)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Preserve the legacy data-modifying CTE semantics: stale rows
@@ -89,10 +121,23 @@ func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since t
 // CreateAgentSession 新建 active 会话（messages / turn_count 走表默认 '[]' / 0）。
 // RETURNING 全列，调用方拿到的实体恒为数据库当前真实状态。
 func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error) {
+	return s.CreateAgentSessionInScope(ctx, userID, ownerConversationScope)
+}
+
+// CreateAgentSessionInScope creates an active session inside one authenticated
+// conversation scope. Multiple active sessions for different scopes are valid.
+func (s *Store) CreateAgentSessionInScope(
+	ctx context.Context, userID int64, conversationScope string,
+) (*types.AgentSession, error) {
+	if userID <= 0 || !validAgentConversationScope(conversationScope) {
+		return nil, types.NewAppError(types.CodeValidation,
+			"Agent 会话范围无效", types.ErrValidation)
+	}
 	var as types.AgentSession
 	err := scanAgentSession(s.pool.QueryRow(ctx,
-		`INSERT INTO agent_sessions (tenant_id, user_id) VALUES (`+tenantOfUser+`$1), $1)
-		 RETURNING `+agentSessionColumns, userID), &as)
+		`INSERT INTO agent_sessions (tenant_id,user_id,conversation_scope)
+		 VALUES (`+tenantOfUser+`$1),$1,$2)
+		 RETURNING `+agentSessionColumns, userID, conversationScope), &as)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("新建 agent 会话（user=%d）", userID), err)

@@ -122,7 +122,8 @@ func TestChannelMessageReplaysCompletedTurnWithoutModelCall(t *testing.T) {
 		return nil, nil
 	}
 	out, err := loop.HandleChannelMessage(
-		t.Context(), 7, "b8e3a943-85e0-54e8-8fc0-5d4c1d371a14", "列出我的任务",
+		t.Context(), 7, "channel-route:11",
+		"b8e3a943-85e0-54e8-8fc0-5d4c1d371a14", "列出我的任务",
 	)
 	if err != nil || out.Reply != "你有两个任务。" || reader.calls != 1 {
 		t.Fatalf("out=%+v calls=%d err=%v", out, reader.calls, err)
@@ -155,12 +156,55 @@ func TestChannelMessageUsesStableIDWithoutWebTaskMode(t *testing.T) {
 		return &llm.ChatResponse{Content: "已执行。"}, nil
 	}
 	out, err := loop.HandleChannelMessage(
-		t.Context(), 7, turnID, "执行渠道操作",
+		t.Context(), 7, "channel-route:11", turnID, "执行渠道操作",
 	)
 	if err != nil || out.Reply != "已执行。" || len(mutating.calls) != 1 ||
 		writer.record.TurnID != turnID {
 		t.Fatalf("out=%+v tool_calls=%d trace=%q err=%v",
 			out, len(mutating.calls), writer.record.TurnID, err)
+	}
+}
+
+func TestChannelMessageHistoryIsIsolatedByAuthenticatedRouteScope(t *testing.T) {
+	reader := &fakeAgentTurnReplayReader{err: types.NewAppError(
+		types.CodeNotFound, "missing", types.ErrNotFound,
+	)}
+	fs := newFakeStore()
+	loop := New(Deps{
+		Store: fs, Profiles: fs, Tools: ownerTestTools(), OwnerAgent: true,
+		Evidence: &fakeAgentEvidenceWriter{}, TurnReplay: reader, MaxTurns: 1,
+	})
+	requests := make([]llm.ChatRequest, 0, 2)
+	loop.chatFn = func(_ context.Context, request llm.ChatRequest) (*llm.ChatResponse, error) {
+		requests = append(requests, request)
+		return &llm.ChatResponse{Content: "已处理。"}, nil
+	}
+	if _, err := loop.HandleChannelMessage(t.Context(), 7, "channel-route:11",
+		"7dd01cc8-c438-5303-95e0-8ad738842c9c", "私聊秘密标记"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loop.HandleChannelMessage(t.Context(), 7, "channel-route:22",
+		"2370d5a6-98af-5935-942f-e6d7ef462980", "群里列出任务"); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("model requests=%d", len(requests))
+	}
+	encoded, err := json.Marshal(requests[1].Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "私聊秘密标记") {
+		t.Fatalf("private route history leaked into group request: %s", encoded)
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	scopes := map[string]int{}
+	for _, session := range fs.sessions {
+		scopes[session.ConversationScope]++
+	}
+	if scopes["channel-route:11"] != 1 || scopes["channel-route:22"] != 1 {
+		t.Fatalf("session scopes=%v", scopes)
 	}
 }
 
@@ -177,10 +221,22 @@ func TestChannelMessageRejectsInvalidAuthorityOrStableID(t *testing.T) {
 		{name: "invalid stable id", loop: &Loop{ownerAgent: true, turnReplay: &fakeAgentTurnReplayReader{}}, id: "not-a-uuid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := tc.loop.HandleChannelMessage(t.Context(), 1, tc.id, "hello"); !errors.Is(err, types.ErrValidation) {
+			if _, err := tc.loop.HandleChannelMessage(
+				t.Context(), 1, "channel-route:11", tc.id, "hello",
+			); !errors.Is(err, types.ErrValidation) {
 				t.Fatalf("err=%v", err)
 			}
 		})
+	}
+	loop := New(Deps{Store: newFakeStore(), Profiles: newFakeStore(),
+		Tools: ownerTestTools(), TurnReplay: &fakeAgentTurnReplayReader{},
+		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true})
+	for _, scope := range []string{"", "owner", "telegram chat 42", strings.Repeat("a", 129)} {
+		if _, err := loop.HandleChannelMessage(
+			t.Context(), 1, scope, validID, "hello",
+		); !errors.Is(err, types.ErrValidation) {
+			t.Fatalf("scope=%q err=%v", scope, err)
+		}
 	}
 }
 

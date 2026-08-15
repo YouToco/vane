@@ -21,42 +21,49 @@ import (
 )
 
 type fakeIngressStore struct {
-	identity         store.ChannelIdentity
-	route            store.ChannelRoute
-	resolveErr       error
-	acceptCalls      int
-	acceptedText     string
-	acceptedKind     string
-	acceptedThread   string
-	accepted         bool
-	acceptErr        error
-	claim            store.ChannelIngress
-	claimErr         error
-	replyReady       string
-	replyErr         error
-	sending          store.ChannelIngress
-	sendingErr       error
-	readyClaim       store.ChannelIngress
-	readyErr         error
-	completed        []string
-	completeErr      error
-	rejected         bool
-	rejectErr        error
-	ambiguous        bool
-	ambiguousErr     error
-	consumed         bool
-	consumeErr       error
-	linkHash         []byte
-	issueErr         error
-	revokeErr        error
-	blocked          store.ChannelDeliveryBlockStats
-	blockedErr       error
-	outbound         store.ChannelOutboundEffect
-	prepareErr       error
-	claimOutboundErr error
-	routes           []store.ChannelRoute
-	routesErr        error
-	routeReplay      bool
+	identity          store.ChannelIdentity
+	route             store.ChannelRoute
+	resolveErr        error
+	acceptCalls       int
+	acceptedText      string
+	acceptedKind      string
+	acceptedThread    string
+	accepted          bool
+	acceptErr         error
+	claim             store.ChannelIngress
+	claimErr          error
+	replyReady        string
+	replyErr          error
+	sending           store.ChannelIngress
+	sendingErr        error
+	readyClaim        store.ChannelIngress
+	readyErr          error
+	completed         []string
+	completeErr       error
+	rejected          bool
+	rejectErr         error
+	ambiguous         bool
+	ambiguousErr      error
+	consumed          bool
+	consumeErr        error
+	linkHash          []byte
+	issueErr          error
+	revokeErr         error
+	blocked           store.ChannelDeliveryBlockStats
+	blockedErr        error
+	outbound          store.ChannelOutboundEffect
+	prepareErr        error
+	claimOutboundErr  error
+	routes            []store.ChannelRoute
+	routesErr         error
+	routeReplay       bool
+	migratedFrom      string
+	migratedTo        string
+	invalidatedChat   string
+	invalidatedThread string
+	invalidatedReason string
+	deferredReply     bool
+	deferredOutbound  bool
 }
 
 func (f *fakeIngressStore) IssueTelegramLinkRequest(_ context.Context, _, _ int64, _ string, hash []byte, _ time.Time) error {
@@ -113,6 +120,14 @@ func (f *fakeIngressStore) ListTelegramRoutesForUser(context.Context, int64, int
 func (f *fakeIngressStore) RevokeTelegramRoute(context.Context, int64, int64, int64, string) error {
 	return f.revokeErr
 }
+func (f *fakeIngressStore) MigrateTelegramRoutes(_ context.Context, _ string, oldChatID, newChatID string) error {
+	f.migratedFrom, f.migratedTo = oldChatID, newChatID
+	return f.revokeErr
+}
+func (f *fakeIngressStore) InvalidateTelegramDestination(_ context.Context, _, chatID, threadID, reason string) error {
+	f.invalidatedChat, f.invalidatedThread, f.invalidatedReason = chatID, threadID, reason
+	return f.revokeErr
+}
 func (f *fakeIngressStore) PrepareTelegramOutbound(_ context.Context, tenantID, userID, routeID int64, effectID, kind, text string) (store.ChannelOutboundEffect, error) {
 	if f.prepareErr != nil {
 		return store.ChannelOutboundEffect{}, f.prepareErr
@@ -152,6 +167,10 @@ func (f *fakeIngressStore) MarkTelegramOutboundRejected(context.Context, store.C
 	f.outbound.Status = "failed"
 	return f.rejectErr
 }
+func (f *fakeIngressStore) DeferTelegramOutbound(context.Context, store.ChannelOutboundEffect, time.Duration, int) (bool, error) {
+	f.deferredOutbound = true
+	return true, f.rejectErr
+}
 func (f *fakeIngressStore) MarkTelegramOutboundAmbiguous(context.Context, store.ChannelOutboundEffect, []string, string) error {
 	f.outbound.Status = "ambiguous"
 	return f.ambiguousErr
@@ -180,6 +199,10 @@ func (f *fakeIngressStore) MarkTelegramReplyRejected(context.Context, store.Chan
 	f.rejected = true
 	return f.rejectErr
 }
+func (f *fakeIngressStore) DeferTelegramReply(context.Context, store.ChannelIngress, time.Duration, int) (bool, error) {
+	f.deferredReply = true
+	return true, f.rejectErr
+}
 func (f *fakeIngressStore) MarkTelegramReplyAmbiguous(context.Context, store.ChannelIngress, []string, string) error {
 	f.ambiguous = true
 	return f.ambiguousErr
@@ -193,15 +216,18 @@ func (f *fakeIngressStore) TelegramBlockedReplyStatsForUser(context.Context, str
 
 type fakeChannelAgent struct {
 	calls  int
+	scope  string
 	turnID string
 	text   string
 	reply  string
 	err    error
 }
 
-func (f *fakeChannelAgent) HandleChannelMessage(_ context.Context, _ int64, turnID, text string) (agent.Outcome, error) {
+func (f *fakeChannelAgent) HandleChannelMessage(
+	_ context.Context, _ int64, scope, turnID, text string,
+) (agent.Outcome, error) {
 	f.calls++
-	f.turnID, f.text = turnID, text
+	f.scope, f.turnID, f.text = scope, turnID, text
 	return agent.Outcome{Reply: f.reply}, f.err
 }
 
@@ -322,6 +348,70 @@ func TestWebhookAcceptsOnlyAddressedAuthorizedGroupAndTopicMessages(t *testing.T
 		st.acceptedText != "列出我的情报任务" || st.acceptedKind != "command" {
 		t.Fatalf("command status=%d calls=%d text=%q kind=%q",
 			rr.Code, st.acceptCalls, st.acceptedText, st.acceptedKind)
+	}
+}
+
+func TestWebhookConsumesTelegramLifecycleBeforeAgentIngress(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		assert func(*testing.T, *fakeIngressStore)
+	}{
+		{
+			name: "group migration",
+			body: `{"update_id":40,"message":{"message_id":9,"chat":{"id":-99,"type":"group"},"migrate_to_chat_id":-10099}}`,
+			assert: func(t *testing.T, st *fakeIngressStore) {
+				if st.migratedFrom != "-99" || st.migratedTo != "-10099" {
+					t.Fatalf("migration=%q -> %q", st.migratedFrom, st.migratedTo)
+				}
+			},
+		},
+		{
+			name: "bot removed",
+			body: `{"update_id":41,"my_chat_member":{"chat":{"id":-10099,"type":"supergroup"},"from":{"id":42},"old_chat_member":{"user":{"id":123,"is_bot":true},"status":"administrator"},"new_chat_member":{"user":{"id":123,"is_bot":true},"status":"kicked"}}}`,
+			assert: func(t *testing.T, st *fakeIngressStore) {
+				if st.invalidatedChat != "-10099" || st.invalidatedThread != "" ||
+					st.invalidatedReason != "bot_membership_lost" {
+					t.Fatalf("invalidation=%q/%q reason=%q", st.invalidatedChat,
+						st.invalidatedThread, st.invalidatedReason)
+				}
+			},
+		},
+		{
+			name: "topic closed",
+			body: `{"update_id":42,"message":{"message_id":10,"message_thread_id":88,"chat":{"id":-10099,"type":"supergroup"},"forum_topic_closed":{}}}`,
+			assert: func(t *testing.T, st *fakeIngressStore) {
+				if st.invalidatedChat != "-10099" || st.invalidatedThread != "88" ||
+					st.invalidatedReason != "topic_closed" {
+					t.Fatalf("invalidation=%q/%q reason=%q", st.invalidatedChat,
+						st.invalidatedThread, st.invalidatedReason)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			st := &fakeIngressStore{}
+			m := newWebhookTestManager(t, st)
+			rr := httptest.NewRecorder()
+			m.Handler().ServeHTTP(rr, webhookRequest(t, "hook_secret", test.body))
+			if rr.Code != http.StatusOK || st.acceptCalls != 0 {
+				t.Fatalf("status=%d ingress_calls=%d", rr.Code, st.acceptCalls)
+			}
+			test.assert(t, st)
+		})
+	}
+}
+
+func TestWebhookLifecycleDatabaseFailureIsRetryable(t *testing.T) {
+	st := &fakeIngressStore{revokeErr: types.NewAppError(
+		types.CodeDatabase, "database unavailable", context.DeadlineExceeded)}
+	m := newWebhookTestManager(t, st)
+	rr := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rr, webhookRequest(t, "hook_secret",
+		`{"update_id":43,"message":{"message_id":10,"message_thread_id":88,"chat":{"id":-10099,"type":"supergroup"},"forum_topic_closed":{}}}`))
+	if rr.Code != http.StatusServiceUnavailable || st.acceptCalls != 0 {
+		t.Fatalf("status=%d ingress_calls=%d", rr.Code, st.acceptCalls)
 	}
 }
 
@@ -645,7 +735,7 @@ func TestProcessOneUsesStableAgentTurnAndSettlesSend(t *testing.T) {
 	turnID := stableTelegramTurnID(123, 77)
 	item := store.ChannelIngress{
 		Provider: "telegram", AppIdentity: "123", ProviderUpdateID: "77",
-		TenantID: 7, UserID: 9, ProviderChatID: "42", InputText: "列出任务",
+		TenantID: 7, UserID: 9, RouteID: 31, ProviderChatID: "42", InputText: "列出任务",
 		StableTurnID: turnID, ProcessingLease: "lease",
 	}
 	st := &fakeIngressStore{claim: item, sending: item}
@@ -664,10 +754,60 @@ func TestProcessOneUsesStableAgentTurnAndSettlesSend(t *testing.T) {
 	if !m.processOne(t.Context()) {
 		t.Fatal("processOne returned false")
 	}
-	if agentFake.calls != 1 || agentFake.turnID != turnID ||
+	if agentFake.calls != 1 || agentFake.scope != "channel-route:31" ||
+		agentFake.turnID != turnID ||
 		st.replyReady != "这是回复" || len(st.completed) != 1 ||
 		st.completed[0] != "88" || st.ambiguous {
 		t.Fatalf("agent=%+v store=%+v", agentFake, st)
+	}
+}
+
+func TestRateLimitedReplyUsesDurableRetryAfterWithoutAmbiguity(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"parameters":{"retry_after":9}}`))
+	}))
+	defer api.Close()
+	item := store.ChannelIngress{Provider: "telegram", AppIdentity: "123",
+		ProviderUpdateID: "81", ProviderChatID: "42", ReplyText: "reply"}
+	st := &fakeIngressStore{}
+	m, err := NewManager(Config{Enabled: true, Token: "123:token",
+		WebhookSecret: "secret", WebhookURL: "https://vane.test/telegram/webhook",
+		APIBaseURL: api.URL, Workers: 1}, st, &fakeChannelAgent{},
+		&http.Client{Timeout: time.Second}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.status.Ready = true
+	m.deliverClaimedReply(t.Context(), item)
+	if !st.deferredReply || st.rejected || st.ambiguous || !m.Status().Ready {
+		t.Fatalf("deferred=%t rejected=%t ambiguous=%t status=%+v",
+			st.deferredReply, st.rejected, st.ambiguous, m.Status())
+	}
+}
+
+func TestRateLimitedOutboundUsesStableEffectDeferral(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"parameters":{"retry_after":11}}`))
+	}))
+	defer api.Close()
+	st := &fakeIngressStore{route: store.ChannelRoute{
+		ID: 31, ProviderChatID: "42", ProviderThreadID: "0",
+	}}
+	m, err := NewManager(Config{Enabled: true, Token: "123:token",
+		WebhookSecret: "secret", WebhookURL: "https://vane.test/telegram/webhook",
+		APIBaseURL: api.URL, Workers: 1}, st, &fakeChannelAgent{},
+		&http.Client{Timeout: time.Second}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = m.SendTextEffect(t.Context(), 7, 9, 31, uuid.NewString(),
+		"test", "rate limited")
+	if !errors.Is(err, types.ErrPush) || !st.deferredOutbound ||
+		st.outbound.Status == "ambiguous" || st.outbound.Status == "failed" {
+		t.Fatalf("err=%v deferred=%t outbound=%+v",
+			err, st.deferredOutbound, st.outbound)
 	}
 }
 
@@ -767,7 +907,7 @@ func TestManagerStartRequiresExactVerifiedWebhookState(t *testing.T) {
 			// The last error may be from Telegram racing this process before its
 			// HTTP listener is live. Exact URL state, not historical delivery
 			// text, is the startup authority.
-			_, _ = w.Write([]byte(`{"ok":true,"result":{"url":"https://api.vane.test/telegram/webhook","pending_update_count":2,"last_error_message":"Connection refused","max_connections":1,"allowed_updates":["message","callback_query"]}}`))
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"url":"https://api.vane.test/telegram/webhook","pending_update_count":2,"last_error_message":"Connection refused","max_connections":1,"allowed_updates":["message","callback_query","my_chat_member"]}}`))
 		default:
 			t.Fatalf("unexpected method path=%s", r.URL.Path)
 		}
@@ -1431,7 +1571,7 @@ func TestManagerStartBlockedObservationAndShutdownDeadline(t *testing.T) {
 			strings.HasSuffix(r.URL.Path, "/setChatMenuButton"):
 			_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
 		default:
-			_, _ = w.Write([]byte(`{"ok":true,"result":{"url":"https://vane.test/telegram/webhook","max_connections":1,"allowed_updates":["message","callback_query"]}}`))
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"url":"https://vane.test/telegram/webhook","max_connections":1,"allowed_updates":["message","callback_query","my_chat_member"]}}`))
 		}
 	}))
 	defer api.Close()

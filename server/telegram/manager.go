@@ -36,6 +36,7 @@ const (
 	agentBudget         = 2 * time.Minute
 	sendBudget          = 15 * time.Second
 	maxMessageRunes     = 4096
+	maxRateLimitRetries = 5
 )
 
 var telegramTurnNamespace = uuid.MustParse("24f09e0f-c35c-5d84-884e-31b6d44cf610")
@@ -87,10 +88,13 @@ type IngressStore interface {
 	AcceptTelegramRoutedIngress(context.Context, store.ChannelIdentity, store.ChannelRoute, string, string, string, string, string, string, string) (bool, error)
 	ListTelegramRoutesForUser(context.Context, int64, int64, string) ([]store.ChannelRoute, error)
 	RevokeTelegramRoute(context.Context, int64, int64, int64, string) error
+	MigrateTelegramRoutes(context.Context, string, string, string) error
+	InvalidateTelegramDestination(context.Context, string, string, string, string) error
 	PrepareTelegramOutbound(context.Context, int64, int64, int64, string, string, string) (store.ChannelOutboundEffect, error)
 	ClaimTelegramOutbound(context.Context, string) (store.ChannelOutboundEffect, error)
 	CompleteTelegramOutbound(context.Context, store.ChannelOutboundEffect, []string) error
 	MarkTelegramOutboundRejected(context.Context, store.ChannelOutboundEffect, string) error
+	DeferTelegramOutbound(context.Context, store.ChannelOutboundEffect, time.Duration, int) (bool, error)
 	MarkTelegramOutboundAmbiguous(context.Context, store.ChannelOutboundEffect, []string, string) error
 	ClaimNextTelegramIngress(context.Context, string, time.Duration) (store.ChannelIngress, error)
 	MarkTelegramIngressReplyReady(context.Context, store.ChannelIngress, string) error
@@ -99,13 +103,14 @@ type IngressStore interface {
 	ClaimNextTelegramReplySend(context.Context, string) (store.ChannelIngress, error)
 	CompleteTelegramReply(context.Context, store.ChannelIngress, []string) error
 	MarkTelegramReplyRejected(context.Context, store.ChannelIngress, string) error
+	DeferTelegramReply(context.Context, store.ChannelIngress, time.Duration, int) (bool, error)
 	MarkTelegramReplyAmbiguous(context.Context, store.ChannelIngress, []string, string) error
 	TelegramBlockedReplyStats(context.Context, string) (store.ChannelDeliveryBlockStats, error)
 	TelegramBlockedReplyStatsForUser(context.Context, string, int64, int64) (store.ChannelDeliveryBlockStats, error)
 }
 
 type ChannelAgent interface {
-	HandleChannelMessage(context.Context, int64, string, string) (agent.Outcome, error)
+	HandleChannelMessage(context.Context, int64, string, string, string) (agent.Outcome, error)
 }
 
 type Manager struct {
@@ -205,8 +210,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	// loop. The exact provider URL is the authoritative installation check;
 	// /readyz starts serving immediately after run() finishes wiring the mux.
 	if info.URL != m.cfg.WebhookURL || info.MaxConnections != 1 ||
-		len(info.AllowedUpdates) != 2 || info.AllowedUpdates[0] != "message" ||
-		info.AllowedUpdates[1] != "callback_query" {
+		len(info.AllowedUpdates) != 3 || info.AllowedUpdates[0] != "message" ||
+		info.AllowedUpdates[1] != "callback_query" ||
+		info.AllowedUpdates[2] != "my_chat_member" {
 		m.setError("webhook_state_mismatch")
 		return errors.New("telegram: provider webhook state is not ready")
 	}
@@ -354,6 +360,14 @@ func (m *Manager) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	if handled, err := m.handleLifecycleUpdate(r.Context(), bot, update); handled {
+		if err != nil {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	inbound, ok := m.normalizeUpdate(bot, update)
 	if !ok {
 		w.WriteHeader(http.StatusOK)
@@ -428,6 +442,47 @@ func (m *Manager) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	m.signal()
 	w.WriteHeader(http.StatusOK)
+}
+
+func (m *Manager) handleLifecycleUpdate(
+	ctx context.Context, bot Bot, update Update,
+) (bool, error) {
+	appIdentity := strconv.FormatInt(bot.ID, 10)
+	if membership := update.MyChatMember; membership != nil {
+		if membership.Chat.ID == 0 || membership.NewChatMember.User.ID != bot.ID ||
+			!membership.NewChatMember.User.IsBot {
+			return true, nil
+		}
+		if membership.NewChatMember.Status != "left" &&
+			membership.NewChatMember.Status != "kicked" {
+			return true, nil
+		}
+		return true, m.store.InvalidateTelegramDestination(
+			ctx, appIdentity, strconv.FormatInt(membership.Chat.ID, 10), "",
+			"bot_membership_lost")
+	}
+	message := update.Message
+	if message == nil || message.Chat.ID == 0 {
+		return false, nil
+	}
+	oldChatID, newChatID := message.Chat.ID, message.MigrateToChatID
+	if message.MigrateFromChatID != 0 {
+		oldChatID, newChatID = message.MigrateFromChatID, message.Chat.ID
+	}
+	if newChatID != 0 {
+		if oldChatID == 0 || oldChatID == newChatID {
+			return true, nil
+		}
+		return true, m.store.MigrateTelegramRoutes(ctx, appIdentity,
+			strconv.FormatInt(oldChatID, 10), strconv.FormatInt(newChatID, 10))
+	}
+	if (message.ForumTopicClosed != nil ||
+		message.GeneralForumTopicHidden != nil) && message.MessageThreadID > 0 {
+		return true, m.store.InvalidateTelegramDestination(
+			ctx, appIdentity, strconv.FormatInt(message.Chat.ID, 10),
+			strconv.FormatInt(message.MessageThreadID, 10), "topic_closed")
+	}
+	return false, nil
 }
 
 type normalizedUpdate struct {
@@ -799,7 +854,8 @@ func (m *Manager) processOne(ctx context.Context) bool {
 		agentCtx, cancelAgent := context.WithTimeout(ctx, agentBudget)
 		var outcome agent.Outcome
 		outcome, agentErr = m.agent.HandleChannelMessage(
-			agentCtx, item.UserID, item.StableTurnID, item.InputText)
+			agentCtx, item.UserID, channelConversationScope(item.RouteID),
+			item.StableTurnID, item.InputText)
 		cancelAgent()
 		reply = outcome.Reply
 	}
@@ -822,6 +878,10 @@ func (m *Manager) processOne(ctx context.Context) bool {
 	}
 	m.deliverClaimedReply(ctx, sending)
 	return true
+}
+
+func channelConversationScope(routeID int64) string {
+	return "channel-route:" + strconv.FormatInt(routeID, 10)
 }
 
 func staticCommandReply(input string) (string, bool) {
@@ -865,6 +925,23 @@ func (m *Manager) deliverClaimedReply(
 			// ambiguity. Once a prior chunk exists, even a later explicit reject is
 			// partial delivery and remains blocked from automatic retry.
 			var deliveryErr *DeliveryError
+			if len(messageIDs) == 0 && errors.As(sendErr, &deliveryErr) &&
+				deliveryErr.DefinitelyNotSent &&
+				deliveryErr.HTTPStatus == http.StatusTooManyRequests &&
+				deliveryErr.RetryAfter > 0 {
+				scheduled, deferErr := m.store.DeferTelegramReply(
+					ctx, sending, deliveryErr.RetryAfter, maxRateLimitRetries)
+				if deferErr != nil {
+					m.logger.Error("telegram: persist rate-limit deferral failed",
+						"error_code", types.CodeOf(deferErr))
+				} else if scheduled {
+					m.logger.Warn("telegram: reply rate limited; retry scheduled",
+						"retry_after", deliveryErr.RetryAfter)
+				} else {
+					m.logger.Error("telegram: reply rate-limit retry budget exhausted")
+				}
+				return
+			}
 			if len(messageIDs) == 0 && errors.As(sendErr, &deliveryErr) &&
 				deliveryErr.DefinitelyNotSent {
 				m.observeProviderError(sendErr)
@@ -1095,6 +1172,22 @@ func (m *Manager) SendTextEffect(
 		cancel()
 		if sendErr != nil {
 			var deliveryErr *DeliveryError
+			if len(messageIDs) == 0 && errors.As(sendErr, &deliveryErr) &&
+				deliveryErr.DefinitelyNotSent &&
+				deliveryErr.HTTPStatus == http.StatusTooManyRequests &&
+				deliveryErr.RetryAfter > 0 {
+				scheduled, deferErr := m.store.DeferTelegramOutbound(
+					ctx, claimed, deliveryErr.RetryAfter, maxRateLimitRetries)
+				if deferErr != nil {
+					return deferErr
+				}
+				if scheduled {
+					return types.NewAppError(types.CodePushFailed,
+						"Telegram 限流，已按 provider retry_after 耐久延后", nil)
+				}
+				return types.NewAppError(types.CodePushFailed,
+					"Telegram 限流重试预算已耗尽", nil)
+			}
 			if len(messageIDs) == 0 && errors.As(sendErr, &deliveryErr) &&
 				deliveryErr.DefinitelyNotSent {
 				m.observeProviderError(sendErr)
