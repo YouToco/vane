@@ -21,6 +21,7 @@ const (
 	DefaultMaxWireBytes   = 256 << 10
 	MaxWireBytesLimit     = 256 << 10
 	MinWireBytesLimit     = 4 << 10
+	MaxInputWireDivisor   = 4
 	darkConnectionTimeout = 30 * time.Second
 )
 

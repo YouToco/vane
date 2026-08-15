@@ -61,6 +61,7 @@ func TestConfigRejectsDaemonResourceLimitMutations(t *testing.T) {
 		"wire-too-small":   strings.Replace(payload, `"max_wire_bytes":262144`, `"max_wire_bytes":4095`, 1),
 		"wire-too-large":   strings.Replace(payload, `"max_wire_bytes":262144`, `"max_wire_bytes":262145`, 1),
 		"input-over-wire":  strings.Replace(payload, `"max_input_bytes":1024`, `"max_input_bytes":262145`, 1),
+		"input-envelope":   strings.Replace(payload, `"max_input_bytes":1024`, `"max_input_bytes":65537`, 1),
 	} {
 		if err := os.WriteFile(path, []byte(mutation), 0o600); err != nil {
 			t.Fatal(err)

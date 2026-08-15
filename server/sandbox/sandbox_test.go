@@ -335,6 +335,20 @@ func TestWireFrameRejectsOversizeAndTrailingWhitespace(t *testing.T) {
 	}
 }
 
+func TestInputQuarterLimitLeavesReachableWireEnvelope(t *testing.T) {
+	for _, wireLimit := range []int{MinWireBytesLimit, MaxWireBytesLimit} {
+		request := testRequest(t, fmt.Sprintf("wire-envelope-%d", wireLimit), 1, 2)
+		request.Input = make([]byte, wireLimit/MaxInputWireDivisor)
+		sealed, err := request.Seal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeWire(io.Discard, sealed, wireLimit); err != nil {
+			t.Fatalf("reachable input/wire envelope limit=%d err=%v", wireLimit, err)
+		}
+	}
+}
+
 func TestDaemonExistingSocketAndInodeReplacementFailClosed(t *testing.T) {
 	directory, err := os.MkdirTemp("/tmp", "vane-sandbox-socket-contract-")
 	if err != nil {

@@ -145,7 +145,7 @@ func loadConfig(path string, requireRoot bool) (config, error) {
 		value.SocketMode != 0o660 || value.MaxInputBytes < 1 ||
 		value.MaxConnections < 1 || value.MaxConnections > sandbox.MaxConnectionsLimit ||
 		value.MaxWireBytes < sandbox.MinWireBytesLimit || value.MaxWireBytes > sandbox.MaxWireBytesLimit ||
-		value.MaxInputBytes > value.MaxWireBytes ||
+		value.MaxInputBytes > value.MaxWireBytes/sandbox.MaxInputWireDivisor ||
 		value.VaneServerUID == 0 || len(value.AllowedPolicyDigests) == 0 {
 		return value, errors.New("sandboxd authority or resource contract is incomplete")
 	}
