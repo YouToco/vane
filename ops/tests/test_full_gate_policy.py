@@ -34,6 +34,21 @@ class FullGatePolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(controller.PolicyError, "package-level"):
             self.run_fake(json.dumps(event) + "\n")
 
+    def test_go_test_gate_uses_explicit_environment(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["go", "test"], returncode=0,
+            stdout=json.dumps({"Action": "pass", "Package": "example/pkg"}) + "\n",
+            stderr="",
+        )
+        isolated = {"VANE_FULL_GATE": "1"}
+        with mock.patch.object(
+            controller.subprocess, "run", return_value=completed
+        ) as invoked:
+            controller.run_go_tests_no_skips(
+                ["go", "test", "-json"], cwd=ROOT, env=isolated
+            )
+        self.assertEqual(invoked.call_args.kwargs["env"], isolated)
+
     def test_nonzero_exit_is_reported_before_malformed_json(self) -> None:
         with self.assertRaisesRegex(controller.PolicyError, "exit 17") as raised:
             self.run_fake("not-json\n", returncode=17)
@@ -102,6 +117,64 @@ class FullGatePolicyTest(unittest.TestCase):
             "vane-release.json",
         ):
             self.assertIn(required, source)
+
+    def test_non_store_database_inventory_matches_repository(self) -> None:
+        full_gate.validate_database_package_inventory(
+            server_root=ROOT / "server",
+            declared=full_gate.NON_STORE_DATABASE_PACKAGE_DIRS,
+        )
+
+    def test_non_store_database_inventory_rejects_unregistered_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            server = Path(temporary)
+            package = server / "newdomain"
+            package.mkdir()
+            (package / "database_test.go").write_text(
+                'package newdomain\n// DATABASE_URL is required.\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(controller.PolicyError, "newdomain"):
+                full_gate.validate_database_package_inventory(
+                    server_root=server, declared=()
+                )
+
+    def test_non_store_packages_are_partitioned_without_overlap(self) -> None:
+        module = "github.com/YouToco/vane/server"
+        database = [
+            f"{module}/{relative}"
+            for relative in full_gate.NON_STORE_DATABASE_PACKAGE_DIRS
+        ]
+        pure, detected_database = full_gate.partition_non_store_packages(
+            packages=[module, *database], module_path=module
+        )
+        self.assertEqual(pure, [module])
+        self.assertEqual(detected_database, database)
+        self.assertFalse(set(pure) & set(detected_database))
+
+    def test_non_store_partition_rejects_stale_declared_package(self) -> None:
+        with self.assertRaisesRegex(controller.PolicyError, "missing"):
+            full_gate.partition_non_store_packages(
+                packages=["github.com/YouToco/vane/server"],
+                module_path="github.com/YouToco/vane/server",
+            )
+
+    def test_database_packages_are_assigned_once_across_isolated_lanes(self) -> None:
+        packages = [f"example/package-{index}" for index in range(9)]
+        lanes = full_gate.database_package_lanes(packages, lane_count=3)
+        self.assertEqual([len(lane) for lane in lanes], [3, 3, 3])
+        flattened = sorted(item for lane in lanes for item in lane)
+        self.assertEqual(flattened, list(enumerate(packages)))
+        self.assertEqual(
+            [[index for index, _ in lane] for lane in lanes],
+            [[0, 3, 6], [1, 4, 7], [2, 5, 8]],
+        )
+
+    def test_database_lane_count_is_bounded(self) -> None:
+        for lane_count in (0, 3):
+            with self.subTest(lane_count=lane_count):
+                with self.assertRaisesRegex(controller.PolicyError, "lane count"):
+                    full_gate.database_package_lanes(
+                        ["example/a", "example/b"], lane_count=lane_count
+                    )
 
     def test_destructive_role_test_rejects_production_looking_database(self) -> None:
         with self.assertRaisesRegex(controller.PolicyError, "proven disposable"):

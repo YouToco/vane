@@ -7,6 +7,19 @@ vulnerability scan, coverage merge, and builds run in the same exact-SHA gate.
 The disposable test environment has no production credentials; production
 mutation remains behind the external root-owned broker.
 
+Non-Store race tests are split by resource ownership. Packages with no
+PostgreSQL capability run together with bounded package/test concurrency and
+with `DATABASE_URL`/`VANE_TEST_DATABASE_URL` removed. The nine declared
+PostgreSQL-backed packages each receive a distinct disposable database and run
+internally with `-parallel=1`. After the Store shards finish, their three
+already-running native clusters become three non-Store lanes; packages in one
+lane remain sequential, while different lanes cannot race through
+cluster-global roles. This avoids new PostgreSQL startup cost and does not
+serialize unrelated packages. A source inventory check fails when a database
+marker appears in an undeclared package or a declaration becomes stale. Every
+invocation emits its own atomic coverage profile; the full Gate merges all
+profiles with the three Store shard profiles before enforcing coverage policy.
+
 `storetestshard run`:
 
 1. builds one race-enabled, atomic-coverage `store.test` binary;
