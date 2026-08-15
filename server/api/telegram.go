@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/types"
@@ -49,8 +50,63 @@ func (s *server) handleTelegramStatus(w http.ResponseWriter, r *http.Request) {
 			writeAppError(w, err)
 			return
 		}
+		routes, err := s.deps.Telegram.Routes(
+			r.Context(), int64(principal.TenantID), principal.UserID)
+		if err != nil {
+			writeAppError(w, err)
+			return
+		}
+		response["routes"] = routes
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *server) handleTelegramRouteLink(w http.ResponseWriter, r *http.Request) {
+	if !s.checkOrigin(w, r) {
+		return
+	}
+	if s.deps.Telegram == nil || !s.deps.Telegram.Status().Ready {
+		writeError(w, http.StatusConflict, "Telegram Bot 尚未就绪")
+		return
+	}
+	principal, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	link, err := s.deps.Telegram.IssueRouteLink(
+		r.Context(), int64(principal.TenantID), principal.UserID)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, link)
+}
+
+func (s *server) handleTelegramRouteUnlink(w http.ResponseWriter, r *http.Request) {
+	if !s.checkOrigin(w, r) {
+		return
+	}
+	if s.deps.Telegram == nil {
+		writeError(w, http.StatusConflict, "Telegram Bot 尚未启用")
+		return
+	}
+	principal, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	routeID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || routeID <= 0 {
+		writeError(w, http.StatusBadRequest, "Telegram 路由 ID 无效")
+		return
+	}
+	if err := s.deps.Telegram.UnlinkRoute(r.Context(),
+		int64(principal.TenantID), principal.UserID, routeID); err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *server) handleTelegramLink(w http.ResponseWriter, r *http.Request) {

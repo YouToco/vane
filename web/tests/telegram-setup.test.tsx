@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 const apiMock = vi.hoisted(() => ({
   telegramStatus: vi.fn(),
   telegramLink: vi.fn(),
+  telegramRouteLink: vi.fn(),
+  telegramRouteUnlink: vi.fn(),
   telegramTest: vi.fn(),
   telegramUnlink: vi.fn(),
 }));
@@ -77,5 +79,32 @@ describe("Telegram settings", () => {
     expect(await screen.findByText(/测试消息已确认送达/)).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: /解除绑定/ }));
     await waitFor(() => expect(apiMock.telegramUnlink).toHaveBeenCalledTimes(1));
+  });
+
+  test("installs and revokes explicit group or topic routes", async () => {
+    apiMock.telegramStatus.mockResolvedValue({
+      enabled: true,
+      ready: true,
+      bound: true,
+      routes: [
+        { id: 1, kind: "private", chat_type: "private", bound_at: "2026-08-15T01:00:00Z" },
+        { id: 7, kind: "topic", chat_type: "supergroup", bound_at: "2026-08-15T01:01:00Z" },
+      ],
+    });
+    apiMock.telegramRouteLink.mockResolvedValue({
+      deep_link: "https://t.me/vane_bot?startgroup=opaque-route-token",
+      command: "/connect opaque-route-token",
+      expires_at: "2026-08-15T01:10:00Z",
+    });
+    apiMock.telegramRouteUnlink.mockResolvedValue({ ok: true });
+    render(<TelegramSetup />);
+    expect(await screen.findByText(/论坛话题 #7 · supergroup/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: /连接群组或话题/ }));
+    await waitFor(() => expect(apiMock.telegramRouteLink).toHaveBeenCalledTimes(1));
+    expect((await screen.findByRole("link", { name: /添加 Bot 到群组/ })).getAttribute("href"))
+      .toBe("https://t.me/vane_bot?startgroup=opaque-route-token");
+    expect(screen.getByText("/connect opaque-route-token")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "解除连接" }));
+    await waitFor(() => expect(apiMock.telegramRouteUnlink).toHaveBeenCalledWith(7));
   });
 });

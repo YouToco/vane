@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -62,7 +63,15 @@ type Status struct {
 
 type Link struct {
 	DeepLink  string    `json:"deep_link"`
+	Command   string    `json:"command,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type RouteSummary struct {
+	ID       int64     `json:"id"`
+	Kind     string    `json:"kind"`
+	ChatType string    `json:"chat_type"`
+	BoundAt  time.Time `json:"bound_at"`
 }
 
 type IngressStore interface {
@@ -72,6 +81,17 @@ type IngressStore interface {
 	GetTelegramIdentityForUser(context.Context, int64, int64, string) (store.ChannelIdentity, error)
 	RevokeTelegramIdentity(context.Context, int64, int64, string) error
 	AcceptTelegramIngress(context.Context, store.ChannelIdentity, string, string, string, string) (bool, error)
+	IssueTelegramRouteLinkRequest(context.Context, int64, int64, string, []byte, time.Time) error
+	ConsumeTelegramRouteLinkRequest(context.Context, []byte, string, string, string, string, string, string) (store.ChannelRoute, bool, error)
+	ResolveTelegramRoute(context.Context, string, string, string, string) (store.ChannelIdentity, store.ChannelRoute, error)
+	AcceptTelegramRoutedIngress(context.Context, store.ChannelIdentity, store.ChannelRoute, string, string, string, string, string, string, string) (bool, error)
+	ListTelegramRoutesForUser(context.Context, int64, int64, string) ([]store.ChannelRoute, error)
+	RevokeTelegramRoute(context.Context, int64, int64, int64, string) error
+	PrepareTelegramOutbound(context.Context, int64, int64, int64, string, string, string) (store.ChannelOutboundEffect, error)
+	ClaimTelegramOutbound(context.Context, string) (store.ChannelOutboundEffect, error)
+	CompleteTelegramOutbound(context.Context, store.ChannelOutboundEffect, []string) error
+	MarkTelegramOutboundRejected(context.Context, store.ChannelOutboundEffect, string) error
+	MarkTelegramOutboundAmbiguous(context.Context, store.ChannelOutboundEffect, []string, string) error
 	ClaimNextTelegramIngress(context.Context, string, time.Duration) (store.ChannelIngress, error)
 	MarkTelegramIngressReplyReady(context.Context, store.ChannelIngress, string) error
 	MarkTelegramIngressFailed(context.Context, store.ChannelIngress, string) error
@@ -158,6 +178,21 @@ func (m *Manager) Start(ctx context.Context) error {
 		m.setError("set_webhook")
 		return fmt.Errorf("telegram: install webhook: %w", err)
 	}
+	commands := []BotCommand{
+		{Command: "help", Description: "查看 Vane Bot 使用说明"},
+		{Command: "status", Description: "查看当前连接状态"},
+		{Command: "tasks", Description: "列出我的情报任务"},
+		{Command: "new", Description: "用自然语言创建任务"},
+		{Command: "connect", Description: "连接当前群组或话题"},
+	}
+	if err := m.client.SetCommands(startupCtx, commands); err != nil {
+		m.setError("set_commands")
+		return fmt.Errorf("telegram: install command menu: %w", err)
+	}
+	if err := m.client.SetCommandsMenu(startupCtx); err != nil {
+		m.setError("set_menu")
+		return fmt.Errorf("telegram: install command menu button: %w", err)
+	}
 	info, err := m.client.GetWebhookInfo(startupCtx)
 	if err != nil {
 		m.setError("get_webhook_info")
@@ -170,7 +205,8 @@ func (m *Manager) Start(ctx context.Context) error {
 	// loop. The exact provider URL is the authoritative installation check;
 	// /readyz starts serving immediately after run() finishes wiring the mux.
 	if info.URL != m.cfg.WebhookURL || info.MaxConnections != 1 ||
-		len(info.AllowedUpdates) != 1 || info.AllowedUpdates[0] != "message" {
+		len(info.AllowedUpdates) != 2 || info.AllowedUpdates[0] != "message" ||
+		info.AllowedUpdates[1] != "callback_query" {
 		m.setError("webhook_state_mismatch")
 		return errors.New("telegram: provider webhook state is not ready")
 	}
@@ -314,20 +350,35 @@ func (m *Manager) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid update", http.StatusBadRequest)
 		return
 	}
-	if update.UpdateID < 0 || update.Message == nil ||
-		update.Message.From == nil || update.Message.Chat.Type != "private" ||
-		update.Message.Chat.ID != update.Message.From.ID ||
-		strings.TrimSpace(update.Message.Text) == "" ||
-		len(update.Message.Text) > 65536 {
+	if update.UpdateID < 0 {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	actorID := strconv.FormatInt(update.Message.From.ID, 10)
-	chatID := strconv.FormatInt(update.Message.Chat.ID, 10)
+	inbound, ok := m.normalizeUpdate(bot, update)
+	if !ok {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	actorID := strconv.FormatInt(inbound.ActorID, 10)
+	chatID := strconv.FormatInt(inbound.ChatID, 10)
+	threadID := strconv.FormatInt(inbound.ThreadID, 10)
 	appIdentity := strconv.FormatInt(bot.ID, 10)
-	text := update.Message.Text
-	if token, ok := startToken(text); ok {
-		if err := m.consumeLink(r.Context(), bot, actorID, chatID, token); err != nil {
+	text := inbound.Text
+	if inbound.ChatType == "private" {
+		if token, start := startToken(text, bot.Username); start {
+			if err := m.consumeLink(r.Context(), bot, actorID, chatID, token); err != nil {
+				if !errors.Is(err, types.ErrNotFound) &&
+					!errors.Is(err, types.ErrConflict) &&
+					!errors.Is(err, types.ErrValidation) {
+					http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	} else if token, connect := routeToken(text, bot.Username); connect {
+		if err := m.consumeRouteLink(r.Context(), bot, inbound, token); err != nil {
 			if !errors.Is(err, types.ErrNotFound) &&
 				!errors.Is(err, types.ErrConflict) &&
 				!errors.Is(err, types.ErrValidation) {
@@ -338,8 +389,8 @@ func (m *Manager) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	identity, err := m.store.ResolveTelegramIdentity(
-		r.Context(), appIdentity, actorID, chatID)
+	identity, route, err := m.store.ResolveTelegramRoute(
+		r.Context(), appIdentity, actorID, chatID, threadID)
 	if err != nil {
 		// Unknown actors are ACKed without a model, Tool, Temporal or business
 		// write. Static rejection replies would make the public bot a spam relay.
@@ -352,11 +403,13 @@ func (m *Manager) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	digest := semanticUpdateDigest(update.UpdateID, actorID, chatID, text)
+	digest := semanticUpdateDigest(update.UpdateID, actorID, chatID, threadID,
+		inbound.MessageID, inbound.Kind, inbound.CallbackID, text)
 	turnID := stableTelegramTurnID(bot.ID, update.UpdateID)
-	_, err = m.store.AcceptTelegramIngress(
-		r.Context(), identity, strconv.FormatInt(update.UpdateID, 10),
-		digest, text, turnID)
+	_, err = m.store.AcceptTelegramRoutedIngress(
+		r.Context(), identity, route, strconv.FormatInt(update.UpdateID, 10),
+		digest, text, turnID, inbound.MessageID, inbound.Kind,
+		inbound.CallbackID)
 	if err != nil {
 		if errors.Is(err, types.ErrConflict) {
 			http.Error(w, "conflicting update", http.StatusConflict)
@@ -365,16 +418,184 @@ func (m *Manager) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	if inbound.CallbackID != "" {
+		ackCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
+		if err := m.client.AnswerCallbackQuery(ackCtx, inbound.CallbackID, "Vane 已接收"); err != nil {
+			m.logger.Warn("telegram: callback acknowledgement not proven",
+				"error_code", sanitizeDeliveryCode(err))
+		}
+		cancel()
+	}
 	m.signal()
 	w.WriteHeader(http.StatusOK)
 }
 
-func startToken(text string) (string, bool) {
+type normalizedUpdate struct {
+	ActorID, ChatID, ThreadID int64
+	MessageID                 string
+	ChatType                  string
+	Text                      string
+	Kind                      string
+	CallbackID                string
+}
+
+func (m *Manager) normalizeUpdate(bot Bot, update Update) (normalizedUpdate, bool) {
+	if update.CallbackQuery != nil {
+		query := update.CallbackQuery
+		if query.Message == nil || query.From.ID <= 0 || query.ID == "" ||
+			len(query.ID) > 128 || query.Message.Chat.ID == 0 {
+			return normalizedUpdate{}, false
+		}
+		action, ok := m.verifyCallback(bot.ID, query.Data)
+		if !ok {
+			return normalizedUpdate{}, false
+		}
+		text := callbackPrompt(action)
+		return normalizedUpdate{
+			ActorID: query.From.ID, ChatID: query.Message.Chat.ID,
+			ThreadID:  query.Message.MessageThreadID,
+			MessageID: strconv.FormatInt(query.Message.MessageID, 10),
+			ChatType:  query.Message.Chat.Type, Text: text, Kind: "callback",
+			CallbackID: query.ID,
+		}, true
+	}
+	message := update.Message
+	if message == nil || message.From == nil || message.From.ID <= 0 ||
+		message.From.IsBot || message.Chat.ID == 0 || message.MessageID <= 0 {
+		return normalizedUpdate{}, false
+	}
+	if message.Chat.Type != "private" && message.Chat.Type != "group" &&
+		message.Chat.Type != "supergroup" {
+		return normalizedUpdate{}, false
+	}
+	if message.Chat.Type == "private" && message.Chat.ID != message.From.ID {
+		return normalizedUpdate{}, false
+	}
+	text := strings.TrimSpace(message.Text)
+	if len(message.Photo) > 0 || message.Document != nil || message.Audio != nil ||
+		message.Video != nil || message.Voice != nil {
+		text = "telegram:media-help"
+	} else if text == "" {
+		text = strings.TrimSpace(message.Caption)
+	}
+	if text == "" || len(text) > 65536 {
+		return normalizedUpdate{}, false
+	}
+	kind := "message"
+	command, args, isCommand := parseCommand(text, bot.Username)
+	if message.Chat.Type != "private" && !isCommand &&
+		!replyTargetsBot(message, bot.ID) {
+		var mentioned bool
+		text, mentioned = stripBotMention(text, bot.Username)
+		if !mentioned {
+			return normalizedUpdate{}, false
+		}
+	}
+	if isCommand {
+		kind = "command"
+		if command != "start" && command != "connect" {
+			text = commandPrompt(command, args)
+			if text == "" {
+				text = "telegram:unknown-command"
+			}
+		}
+	}
+	threadID := message.MessageThreadID
+	if threadID < 0 {
+		return normalizedUpdate{}, false
+	}
+	return normalizedUpdate{
+		ActorID: message.From.ID, ChatID: message.Chat.ID, ThreadID: threadID,
+		MessageID: strconv.FormatInt(message.MessageID, 10),
+		ChatType:  message.Chat.Type, Text: text, Kind: kind,
+	}, true
+}
+
+func parseCommand(text, username string) (string, string, bool) {
 	parts := strings.Fields(text)
-	if len(parts) != 2 || parts[0] != "/start" || len(parts[1]) > 64 {
+	if len(parts) == 0 || !strings.HasPrefix(parts[0], "/") {
+		return "", "", false
+	}
+	command := strings.TrimPrefix(parts[0], "/")
+	if at := strings.IndexByte(command, '@'); at >= 0 {
+		if !strings.EqualFold(command[at+1:], username) {
+			return "", "", false
+		}
+		command = command[:at]
+	}
+	args := strings.TrimSpace(strings.TrimPrefix(text, parts[0]))
+	return strings.ToLower(command), args, true
+}
+
+func startToken(text, username string) (string, bool) {
+	command, args, ok := parseCommand(text, username)
+	if !ok || command != "start" || strings.Contains(args, " ") ||
+		len(args) == 0 || len(args) > 64 {
 		return "", false
 	}
-	return parts[1], true
+	return args, true
+}
+
+func routeToken(text, username string) (string, bool) {
+	command, args, ok := parseCommand(text, username)
+	if !ok || (command != "connect" && command != "start") ||
+		strings.Contains(args, " ") || len(args) == 0 || len(args) > 64 {
+		return "", false
+	}
+	return args, true
+}
+
+func replyTargetsBot(message *Message, botID int64) bool {
+	return message.ReplyToMessage != nil && message.ReplyToMessage.From != nil &&
+		message.ReplyToMessage.From.ID == botID
+}
+
+func stripBotMention(text, username string) (string, bool) {
+	needle := "@" + strings.ToLower(username)
+	lower := strings.ToLower(text)
+	for offset := 0; offset <= len(lower)-len(needle); {
+		index := strings.Index(lower[offset:], needle)
+		if index < 0 {
+			break
+		}
+		index += offset
+		beforeOK := index == 0 || !telegramUsernameChar(lower[index-1])
+		after := index + len(needle)
+		afterOK := after == len(lower) || !telegramUsernameChar(lower[after])
+		if beforeOK && afterOK {
+			cleaned := strings.TrimSpace(text[:index] + " " + text[after:])
+			return cleaned, cleaned != ""
+		}
+		offset = index + len(needle)
+	}
+	return text, false
+}
+
+func telegramUsernameChar(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9' ||
+		value == '_'
+}
+
+func commandPrompt(command, args string) string {
+	switch command {
+	case "help":
+		return "telegram:help"
+	case "status":
+		return "telegram:status"
+	case "tasks":
+		return "列出我的情报任务"
+	case "new":
+		if strings.TrimSpace(args) == "" {
+			return "telegram:new-help"
+		}
+		return "创建情报任务：" + strings.TrimSpace(args)
+	default:
+		return ""
+	}
+}
+
+func callbackPrompt(action string) string {
+	return commandPrompt(action, "")
 }
 
 func (m *Manager) consumeLink(
@@ -408,12 +629,100 @@ func (m *Manager) consumeLink(
 	return nil
 }
 
-func semanticUpdateDigest(updateID int64, actorID, chatID, text string) string {
+func (m *Manager) consumeRouteLink(
+	ctx context.Context, bot Bot, inbound normalizedUpdate, token string,
+) error {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(raw) != 32 {
+		return types.NewAppError(types.CodeValidation,
+			"Telegram 群组连接码格式无效", types.ErrValidation)
+	}
+	chatID := strconv.FormatInt(inbound.ChatID, 10)
+	threadID := strconv.FormatInt(inbound.ThreadID, 10)
+	memberCtx, cancelMember := context.WithTimeout(ctx, sendBudget)
+	member, err := m.client.GetChatMember(memberCtx, chatID, inbound.ActorID)
+	cancelMember()
+	if err != nil {
+		m.observeProviderError(err)
+		return err
+	}
+	if member.Status != "creator" && member.Status != "administrator" {
+		return types.NewAppError(types.CodeConflict,
+			"只有 Telegram 群管理员可以连接 Vane", types.ErrConflict)
+	}
+	hash := sha256.Sum256(raw)
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		strconv.FormatInt(bot.ID, 10), strconv.FormatInt(inbound.ActorID, 10),
+		chatID, threadID, inbound.ChatType,
+	}, "\x00")))
+	_, first, err := m.store.ConsumeTelegramRouteLinkRequest(
+		ctx, hash[:], strconv.FormatInt(bot.ID, 10),
+		strconv.FormatInt(inbound.ActorID, 10), chatID, threadID,
+		inbound.ChatType, hex.EncodeToString(digest[:]))
+	if err != nil || !first {
+		return err
+	}
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendBudget)
+	defer cancel()
+	_, err = m.client.SendMessageTo(sendCtx, chatID,
+		"当前群组或话题已安全连接 Vane。只有完成绑定的 owner 发出的命令、@提及或对 Bot 的回复会进入 Agent。",
+		SendMessageOptions{MessageThreadID: inbound.ThreadID})
+	if err != nil {
+		m.observeProviderError(err)
+		m.logger.Warn("telegram: route confirmation not proven delivered",
+			"error_code", sanitizeDeliveryCode(err))
+	}
+	return nil
+}
+
+func semanticUpdateDigest(
+	updateID int64, actorID, chatID, threadID, messageID, kind,
+	callbackID, text string,
+) string {
 	payload := strings.Join([]string{
-		strconv.FormatInt(updateID, 10), actorID, chatID, text,
+		strconv.FormatInt(updateID, 10), actorID, chatID, threadID,
+		messageID, kind, callbackID, text,
 	}, "\x00")
 	digest := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(digest[:])
+}
+
+func (m *Manager) callbackData(botID int64, action string) string {
+	body := "v1:" + action
+	mac := hmac.New(sha256.New, []byte(m.cfg.WebhookSecret))
+	_, _ = mac.Write([]byte(strconv.FormatInt(botID, 10) + "\x00" + body))
+	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:12])
+	return body + ":" + signature
+}
+
+func (m *Manager) verifyCallback(botID int64, value string) (string, bool) {
+	parts := strings.Split(value, ":")
+	if len(parts) != 3 || parts[0] != "v1" || len(value) > 64 {
+		return "", false
+	}
+	action := parts[1]
+	if action != "help" && action != "status" && action != "tasks" && action != "new" {
+		return "", false
+	}
+	expected := m.callbackData(botID, action)
+	if len(expected) != len(value) ||
+		subtle.ConstantTimeCompare([]byte(expected), []byte(value)) != 1 {
+		return "", false
+	}
+	return action, true
+}
+
+func (m *Manager) commandKeyboard() *InlineKeyboardMarkup {
+	bot, ready := m.botIdentity()
+	if !ready {
+		return nil
+	}
+	return &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+		{{Text: "查看任务", CallbackData: m.callbackData(bot.ID, "tasks")},
+			{Text: "连接状态", CallbackData: m.callbackData(bot.ID, "status")}},
+		{{Text: "创建任务", CallbackData: m.callbackData(bot.ID, "new")},
+			{Text: "帮助", CallbackData: m.callbackData(bot.ID, "help")}},
+	}}
 }
 
 func stableTelegramTurnID(botID, updateID int64) string {
@@ -484,12 +793,17 @@ func (m *Manager) processOne(ctx context.Context) bool {
 		m.logger.Error("telegram: claim ingress failed", "error_code", types.CodeOf(err))
 		return false
 	}
-	agentCtx, cancelAgent := context.WithTimeout(ctx, agentBudget)
-	outcome, agentErr := m.agent.HandleChannelMessage(
-		agentCtx, item.UserID, item.StableTurnID, item.InputText)
-	cancelAgent()
-	reply := outcome.Reply
-	if agentErr != nil || strings.TrimSpace(outcome.Reply) == "" {
+	reply, handled := staticCommandReply(item.InputText)
+	var agentErr error
+	if !handled {
+		agentCtx, cancelAgent := context.WithTimeout(ctx, agentBudget)
+		var outcome agent.Outcome
+		outcome, agentErr = m.agent.HandleChannelMessage(
+			agentCtx, item.UserID, item.StableTurnID, item.InputText)
+		cancelAgent()
+		reply = outcome.Reply
+	}
+	if agentErr != nil || strings.TrimSpace(reply) == "" {
 		// The webhook was already durably accepted, so a terminal silent failure
 		// would strand the user. Persist a content-free, actionable reply through
 		// the same outbox; it does not claim whether a prior Tool committed.
@@ -510,6 +824,23 @@ func (m *Manager) processOne(ctx context.Context) bool {
 	return true
 }
 
+func staticCommandReply(input string) (string, bool) {
+	switch input {
+	case "telegram:help":
+		return "Vane Telegram 助手\n\n/tasks 查看任务\n/new <描述> 创建任务\n/status 查看连接状态\n/connect <连接码> 在群组或话题中完成连接\n\n私聊可直接提问；群组中请使用命令、@提及 Bot，或回复 Bot 消息。", true
+	case "telegram:status":
+		return "当前 Telegram 身份与此聊天路由均已通过 Vane 授权。", true
+	case "telegram:new-help":
+		return "请在 /new 后直接描述任务，例如：/new 每周一整理 OpenAI 官方产品更新。", true
+	case "telegram:unknown-command":
+		return "暂不支持这个命令。发送 /help 查看可用功能。", true
+	case "telegram:media-help":
+		return "已收到媒体消息，但当前 Vane Telegram 渠道只会处理文字，不会下载或把文件内容交给模型。请改用文字描述；后续媒体能力会沿独立的受控文件入口接入。", true
+	default:
+		return "", false
+	}
+}
+
 func (m *Manager) deliverClaimedReply(
 	ctx context.Context, sending store.ChannelIngress,
 ) {
@@ -517,8 +848,17 @@ func (m *Manager) deliverClaimedReply(
 	messageIDs := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
 		sendCtx, cancelSend := context.WithTimeout(ctx, sendBudget)
-		messageID, sendErr := m.client.SendMessage(
-			sendCtx, sending.ProviderChatID, chunk)
+		options := SendMessageOptions{}
+		if sending.ProviderThreadID != "" && sending.ProviderThreadID != "0" {
+			options.MessageThreadID, _ = strconv.ParseInt(sending.ProviderThreadID, 10, 64)
+		}
+		if len(messageIDs) == 0 &&
+			(strings.HasPrefix(sending.InputText, "telegram:") ||
+				sending.IngressKind == "callback") {
+			options.ReplyMarkup = m.commandKeyboard()
+		}
+		messageID, sendErr := m.client.SendMessageTo(
+			sendCtx, sending.ProviderChatID, chunk, options)
 		cancelSend()
 		if sendErr != nil {
 			// A provider-declared 4xx before any chunk is definite failure, not
@@ -601,6 +941,66 @@ func (m *Manager) IssueLink(
 	}, nil
 }
 
+func (m *Manager) IssueRouteLink(
+	ctx context.Context, tenantID, userID int64,
+) (Link, error) {
+	bot, ready := m.botIdentity()
+	if !ready {
+		return Link{}, types.NewAppError(types.CodeConflict,
+			"Telegram Bot 尚未就绪", types.ErrConflict)
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return Link{}, types.NewAppError(types.CodeInternal,
+			"生成 Telegram 群组连接码", err)
+	}
+	hash := sha256.Sum256(raw)
+	expiresAt := time.Now().Add(linkTTL)
+	if err := m.store.IssueTelegramRouteLinkRequest(ctx, tenantID, userID,
+		strconv.FormatInt(bot.ID, 10), hash[:], expiresAt); err != nil {
+		return Link{}, err
+	}
+	token := base64.RawURLEncoding.EncodeToString(raw)
+	return Link{
+		DeepLink:  "https://t.me/" + bot.Username + "?startgroup=" + token,
+		Command:   "/connect " + token,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func (m *Manager) Routes(
+	ctx context.Context, tenantID, userID int64,
+) ([]RouteSummary, error) {
+	bot, ready := m.botIdentity()
+	if !ready {
+		return nil, types.NewAppError(types.CodeConflict,
+			"Telegram Bot 尚未就绪", types.ErrConflict)
+	}
+	routes, err := m.store.ListTelegramRoutesForUser(
+		ctx, tenantID, userID, strconv.FormatInt(bot.ID, 10))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RouteSummary, 0, len(routes))
+	for _, route := range routes {
+		out = append(out, RouteSummary{ID: route.ID, Kind: route.RouteKind,
+			ChatType: route.ChatType, BoundAt: route.BoundAt})
+	}
+	return out, nil
+}
+
+func (m *Manager) UnlinkRoute(
+	ctx context.Context, tenantID, userID, routeID int64,
+) error {
+	bot, ready := m.botIdentity()
+	if !ready {
+		return types.NewAppError(types.CodeConflict,
+			"Telegram Bot 尚未就绪", types.ErrConflict)
+	}
+	return m.store.RevokeTelegramRoute(ctx, tenantID, userID, routeID,
+		strconv.FormatInt(bot.ID, 10))
+}
+
 func (m *Manager) Binding(
 	ctx context.Context, tenantID, userID int64,
 ) (store.ChannelIdentity, error) {
@@ -639,18 +1039,84 @@ func (m *Manager) Unlink(ctx context.Context, tenantID, userID int64) error {
 func (m *Manager) SendTest(
 	ctx context.Context, tenantID, userID int64,
 ) error {
-	identity, err := m.Binding(ctx, tenantID, userID)
+	bot, ready := m.botIdentity()
+	if !ready {
+		return types.NewAppError(types.CodeConflict,
+			"Telegram Bot 尚未就绪", types.ErrConflict)
+	}
+	routes, err := m.store.ListTelegramRoutesForUser(
+		ctx, tenantID, userID, strconv.FormatInt(bot.ID, 10))
 	if err != nil {
 		return err
 	}
-	sendCtx, cancel := context.WithTimeout(ctx, sendBudget)
-	defer cancel()
-	_, err = m.client.SendMessage(sendCtx, identity.ProviderChatID,
-		"Vane Telegram 连接测试成功。")
+	for _, route := range routes {
+		if route.RouteKind == "private" {
+			return m.SendTextEffect(ctx, tenantID, userID, route.ID,
+				uuid.NewString(), "test", "Vane Telegram 连接测试成功。")
+		}
+	}
+	return types.NewAppError(types.CodeNotFound,
+		"Telegram 私聊路由不可用", types.ErrNotFound)
+}
+
+// SendTextEffect is the outbound extension point for future Brief, periodic
+// report, feedback and operational notifications. Callers must derive a stable
+// effectID from their durable business fact. It never retries a provider-crossed
+// request; sending/ambiguous remain operator-visible terminal states.
+func (m *Manager) SendTextEffect(
+	ctx context.Context, tenantID, userID, routeID int64,
+	effectID, effectKind, text string,
+) error {
+	prepared, err := m.store.PrepareTelegramOutbound(
+		ctx, tenantID, userID, routeID, effectID, effectKind, text)
 	if err != nil {
-		m.observeProviderError(err)
+		return err
+	}
+	switch prepared.Status {
+	case "sent":
+		return nil
+	case "prepared":
+	default:
+		return types.NewAppError(types.CodeConflict,
+			"Telegram outbound effect 已结算或等待人工核对", types.ErrConflict)
+	}
+	claimed, err := m.store.ClaimTelegramOutbound(ctx, effectID)
+	if err != nil {
+		return err
+	}
+	threadID, _ := strconv.ParseInt(claimed.ProviderThreadID, 10, 64)
+	chunks := SplitMessage(claimed.PayloadText)
+	messageIDs := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		sendCtx, cancel := context.WithTimeout(ctx, sendBudget)
+		messageID, sendErr := m.client.SendMessageTo(sendCtx,
+			claimed.ProviderChatID, chunk,
+			SendMessageOptions{MessageThreadID: threadID})
+		cancel()
+		if sendErr != nil {
+			var deliveryErr *DeliveryError
+			if len(messageIDs) == 0 && errors.As(sendErr, &deliveryErr) &&
+				deliveryErr.DefinitelyNotSent {
+				m.observeProviderError(sendErr)
+				if settleErr := m.store.MarkTelegramOutboundRejected(
+					ctx, claimed, sanitizeDeliveryCode(sendErr)); settleErr != nil {
+					return settleErr
+				}
+				return types.NewAppError(types.CodePushFailed,
+					"Telegram 明确拒绝发送", nil)
+			}
+			if settleErr := m.store.MarkTelegramOutboundAmbiguous(
+				ctx, claimed, messageIDs, sanitizeDeliveryCode(sendErr)); settleErr != nil {
+				return settleErr
+			}
+			return types.NewAppError(types.CodePushFailed,
+				"Telegram 发送结果不确定，已阻止自动重发", nil)
+		}
+		messageIDs = append(messageIDs, messageID)
+	}
+	if err := m.store.CompleteTelegramOutbound(ctx, claimed, messageIDs); err != nil {
 		return types.NewAppError(types.CodePushFailed,
-			"Telegram 测试消息未确认送达", nil)
+			"Telegram 已发送但本地结算失败，已阻止自动重发", err)
 	}
 	return nil
 }

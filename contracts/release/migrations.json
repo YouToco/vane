@@ -527,6 +527,10 @@
     {
       "path": "133_channel_ingress.sql",
       "sha256": "3bbe6e0b03e8e404554d29bbb18ab207298e056446bceb6ad8742a4d5b2a8d4d"
+    },
+    {
+      "path": "134_channel_routes.sql",
+      "sha256": "9bb70b41ff4e84b75afdf52815947476c0b85f74c190b8bedf4280724326c628"
     }
   ],
   "schema": "vane.migrations/v1"

@@ -3,6 +3,7 @@
     "DELETE /api/admin/invites/{code}",
     "DELETE /api/schedules/{id}",
     "DELETE /api/telegram/link",
+    "DELETE /api/telegram/routes/{id}",
     "GET /api/admin/cost-calls",
     "GET /api/admin/execution-traces/tenants/{tenant_id}/users/{user_id}/tasks",
     "GET /api/admin/execution-traces/tenants/{tenant_id}/users/{user_id}/tasks/{task_id}/runs",
@@ -50,6 +51,7 @@
     "POST /api/schedules/{id}/run",
     "POST /api/task-actions",
     "POST /api/telegram/link",
+    "POST /api/telegram/routes/link",
     "POST /api/telegram/test",
     "POST /telegram/webhook"
   ],

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, Link2, Loader2, Send, Unlink } from "lucide-react";
+import { ExternalLink, Link2, Loader2, MessagesSquare, Send, Trash2, Unlink } from "lucide-react";
 import { api, ApiError } from "@/shared/api/client";
 import type { TelegramLink, TelegramStatus } from "@/shared/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -10,7 +10,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 export default function TelegramSetup() {
   const [status, setStatus] = useState<TelegramStatus | null>(null);
   const [link, setLink] = useState<TelegramLink | null>(null);
-  const [busy, setBusy] = useState<"link" | "test" | "unlink" | "">("");
+  const [routeLink, setRouteLink] = useState<TelegramLink | null>(null);
+  const [busy, setBusy] = useState<"link" | "route" | "test" | "unlink" | `route-${number}` | "">("");
   const [message, setMessage] = useState("");
   const [statusError, setStatusError] = useState("");
 
@@ -76,12 +77,39 @@ export default function TelegramSetup() {
     }
   }
 
+  async function issueRouteLink() {
+    setBusy("route");
+    setMessage("");
+    try {
+      setRouteLink(await api.telegramRouteLink());
+    } catch (error) {
+      setMessage(error instanceof ApiError ? error.message : "生成群组连接链接失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function unlinkRoute(id: number) {
+    setBusy(`route-${id}`);
+    setMessage("");
+    try {
+      await api.telegramRouteUnlink(id);
+      await refresh();
+      setMessage("群组或话题连接已解除。");
+    } catch (error) {
+      setMessage(error instanceof ApiError ? error.message : "解除群组连接失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function unlink() {
     setBusy("unlink");
     setMessage("");
     try {
       await api.telegramUnlink();
       setLink(null);
+      setRouteLink(null);
       await refresh();
       setMessage("Telegram 绑定已解除。旧会话将不再获得 Vane 权限。");
     } catch (error) {
@@ -101,7 +129,7 @@ export default function TelegramSetup() {
           </Badge>
         </div>
         <p className="text-sm text-muted-foreground">
-          通过一次性配对链接，把当前 Vane 账号绑定到 Telegram 私聊。群聊和未绑定用户不会进入 Agent。
+          私聊完成身份绑定后，可把同一个 Bot 安全连接到群组或论坛话题。群里仅响应 owner 的命令、@提及和对 Bot 的回复。
         </p>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -171,15 +199,53 @@ export default function TelegramSetup() {
         )}
 
         {status?.ready && status.bound && (
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => void testConnection()} disabled={busy !== ""}>
-              {busy === "test" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Send className="mr-2 size-4" />}
-              发送测试消息
-            </Button>
-            <Button variant="destructive" onClick={() => void unlink()} disabled={busy !== ""}>
-              {busy === "unlink" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Unlink className="mr-2 size-4" />}
-              解除绑定
-            </Button>
+          <div className="space-y-4">
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => void testConnection()} disabled={busy !== ""}>
+                {busy === "test" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Send className="mr-2 size-4" />}
+                发送测试消息
+              </Button>
+              <Button variant="outline" onClick={() => void issueRouteLink()} disabled={busy !== ""}>
+                {busy === "route" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <MessagesSquare className="mr-2 size-4" />}
+                连接群组或话题
+              </Button>
+              <Button variant="destructive" onClick={() => void unlink()} disabled={busy !== ""}>
+                {busy === "unlink" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Unlink className="mr-2 size-4" />}
+                解除绑定（全部）
+              </Button>
+            </div>
+
+            {routeLink && (
+              <div className="rounded-lg border bg-muted/30 p-3 space-y-2">
+                <p className="text-sm font-medium">在 10 分钟内完成连接</p>
+                <p className="text-xs text-muted-foreground">
+                  打开链接把 Bot 加入目标群；若目标是论坛话题，请再把下面的命令发送到该话题。执行者必须是群管理员和当前 Vane owner。
+                </p>
+                <a className={buttonVariants({ variant: "outline", size: "sm" })} href={routeLink.deep_link} target="_blank" rel="noreferrer">
+                  添加 Bot 到群组 <ExternalLink className="ml-2 size-3" />
+                </a>
+                {routeLink.command && (
+                  <code className="block overflow-x-auto rounded bg-background px-3 py-2 text-xs select-all">
+                    {routeLink.command}
+                  </code>
+                )}
+              </div>
+            )}
+
+            {!!status.routes?.filter((route) => route.kind !== "private").length && (
+              <div className="space-y-2">
+                <p className="text-sm font-medium">已连接的群组与话题</p>
+                {status.routes?.filter((route) => route.kind !== "private").map((route) => (
+                  <div key={route.id} className="flex items-center justify-between rounded border px-3 py-2 text-sm">
+                    <span>{route.kind === "topic" ? "论坛话题" : "群组"} #{route.id} · {route.chat_type}</span>
+                    <Button size="sm" variant="ghost" onClick={() => void unlinkRoute(route.id)} disabled={busy !== ""}>
+                      {busy === `route-${route.id}` ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                      <span className="sr-only">解除连接</span>
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

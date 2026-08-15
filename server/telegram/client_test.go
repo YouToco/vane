@@ -33,11 +33,53 @@ func TestClientSetWebhookUsesSecretAndMinimalUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`"secret_token":"hook_secret"`, `"allowed_updates":["message"]`,
+		`"secret_token":"hook_secret"`, `"allowed_updates":["message","callback_query"]`,
 		`"drop_pending_updates":false`, `"max_connections":1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body=%s missing %s", body, want)
+		}
+	}
+}
+
+func TestClientInstallsMenuAndSendsIntoExactTopic(t *testing.T) {
+	seen := map[string]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := io.ReadAll(r.Body)
+		seen[r.URL.Path] = string(payload)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":7,"chat":{"id":-1007}}}`))
+		default:
+			_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient("123:token", server.URL, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetCommands(t.Context(), []BotCommand{{Command: "help", Description: "Help"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetCommandsMenu(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	messageID, err := client.SendMessageTo(t.Context(), "-1007", "hello",
+		SendMessageOptions{MessageThreadID: 88, ReplyMarkup: &InlineKeyboardMarkup{
+			InlineKeyboard: [][]InlineKeyboardButton{{{Text: "Tasks", CallbackData: "signed"}}},
+		}})
+	if err != nil || messageID != "7" {
+		t.Fatalf("message=%q err=%v", messageID, err)
+	}
+	joined := ""
+	for path, body := range seen {
+		joined += path + body
+	}
+	for _, want := range []string{"/setMyCommands", "/setChatMenuButton",
+		`"message_thread_id":88`, `"callback_data":"signed"`} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("requests=%s missing=%s", joined, want)
 		}
 	}
 }
@@ -154,7 +196,7 @@ func TestClientConfigurationAndReadMethods(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/getMe"):
 			_, _ = w.Write([]byte(`{"ok":true,"result":{"id":123,"username":"vane_bot"}}`))
 		case strings.HasSuffix(r.URL.Path, "/getWebhookInfo"):
-			_, _ = w.Write([]byte(`{"ok":true,"result":{"url":"https://vane.test/telegram/webhook","max_connections":1,"allowed_updates":["message"]}}`))
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"url":"https://vane.test/telegram/webhook","max_connections":1,"allowed_updates":["message","callback_query"]}}`))
 		default:
 			t.Fatalf("path=%s", r.URL.Path)
 		}
@@ -169,11 +211,24 @@ func TestClientConfigurationAndReadMethods(t *testing.T) {
 		t.Fatalf("bot=%+v err=%v", bot, err)
 	}
 	info, err := client.GetWebhookInfo(t.Context())
-	if err != nil || info.MaxConnections != 1 || len(info.AllowedUpdates) != 1 {
+	if err != nil || info.MaxConnections != 1 || len(info.AllowedUpdates) != 2 {
 		t.Fatalf("info=%+v err=%v", info, err)
 	}
 	if _, err := client.SendMessage(t.Context(), "", " "); err == nil {
 		t.Fatal("empty message accepted")
+	}
+	if err := client.SetCommands(t.Context(), nil); err == nil {
+		t.Fatal("empty command menu accepted")
+	}
+	if _, err := client.GetChatMember(t.Context(), "", 0); err == nil {
+		t.Fatal("invalid chat member lookup accepted")
+	}
+	for _, callback := range []struct{ id, text string }{
+		{}, {id: strings.Repeat("x", 129)}, {id: "cb", text: strings.Repeat("x", 201)},
+	} {
+		if err := client.AnswerCallbackQuery(t.Context(), callback.id, callback.text); err == nil {
+			t.Fatalf("invalid callback accepted: %+v", callback)
+		}
 	}
 	if got := sanitizeDeliveryCode(errors.New("boom")); !strings.HasPrefix(got, "internal_") {
 		t.Fatalf("sanitized code=%s", got)

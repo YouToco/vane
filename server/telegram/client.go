@@ -39,23 +39,71 @@ type WebhookInfo struct {
 type User struct {
 	ID       int64  `json:"id"`
 	Username string `json:"username"`
+	IsBot    bool   `json:"is_bot"`
 }
 
 type Chat struct {
-	ID   int64  `json:"id"`
-	Type string `json:"type"`
+	ID      int64  `json:"id"`
+	Type    string `json:"type"`
+	Title   string `json:"title"`
+	IsForum bool   `json:"is_forum"`
 }
 
 type Message struct {
-	MessageID int64  `json:"message_id"`
-	From      *User  `json:"from"`
-	Chat      Chat   `json:"chat"`
-	Text      string `json:"text"`
+	MessageID       int64     `json:"message_id"`
+	MessageThreadID int64     `json:"message_thread_id"`
+	IsTopicMessage  bool      `json:"is_topic_message"`
+	From            *User     `json:"from"`
+	Chat            Chat      `json:"chat"`
+	Text            string    `json:"text"`
+	Caption         string    `json:"caption"`
+	Photo           []FileRef `json:"photo"`
+	Document        *FileRef  `json:"document"`
+	Audio           *FileRef  `json:"audio"`
+	Video           *FileRef  `json:"video"`
+	Voice           *FileRef  `json:"voice"`
+	ReplyToMessage  *Message  `json:"reply_to_message"`
+}
+
+type FileRef struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+}
+
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	From    User     `json:"from"`
+	Message *Message `json:"message"`
+	Data    string   `json:"data"`
 }
 
 type Update struct {
-	UpdateID int64    `json:"update_id"`
-	Message  *Message `json:"message"`
+	UpdateID      int64          `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
+}
+
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+type SendMessageOptions struct {
+	MessageThreadID int64
+	ReplyMarkup     *InlineKeyboardMarkup
+}
+
+type ChatMember struct {
+	Status string `json:"status"`
 }
 
 // DeliveryError classifies whether the provider definitely rejected a send.
@@ -137,10 +185,41 @@ func (c *Client) SetWebhook(
 		MaxConnections     int      `json:"max_connections"`
 	}{
 		URL: webhookURL, SecretToken: secret,
-		AllowedUpdates: []string{"message"}, DropPendingUpdates: false,
+		AllowedUpdates: []string{"message", "callback_query"}, DropPendingUpdates: false,
 		MaxConnections: 1,
 	}
 	return c.call(ctx, "setWebhook", payload, nil)
+}
+
+func (c *Client) SetCommands(ctx context.Context, commands []BotCommand) error {
+	if len(commands) == 0 {
+		return &DeliveryError{Code: "invalid_commands", DefinitelyNotSent: true}
+	}
+	return c.call(ctx, "setMyCommands", struct {
+		Commands []BotCommand `json:"commands"`
+	}{Commands: commands}, nil)
+}
+
+func (c *Client) SetCommandsMenu(ctx context.Context) error {
+	return c.call(ctx, "setChatMenuButton", struct {
+		MenuButton map[string]string `json:"menu_button"`
+	}{MenuButton: map[string]string{"type": "commands"}}, nil)
+}
+
+func (c *Client) GetChatMember(
+	ctx context.Context, chatID string, userID int64,
+) (ChatMember, error) {
+	if chatID == "" || userID <= 0 {
+		return ChatMember{}, &DeliveryError{
+			Code: "invalid_chat_member", DefinitelyNotSent: true,
+		}
+	}
+	var member ChatMember
+	err := c.call(ctx, "getChatMember", struct {
+		ChatID string `json:"chat_id"`
+		UserID int64  `json:"user_id"`
+	}{ChatID: chatID, UserID: userID}, &member)
+	return member, err
 }
 
 func (c *Client) GetWebhookInfo(ctx context.Context) (WebhookInfo, error) {
@@ -154,15 +233,24 @@ func (c *Client) GetWebhookInfo(ctx context.Context) (WebhookInfo, error) {
 func (c *Client) SendMessage(
 	ctx context.Context, chatID, text string,
 ) (string, error) {
+	return c.SendMessageTo(ctx, chatID, text, SendMessageOptions{})
+}
+
+func (c *Client) SendMessageTo(
+	ctx context.Context, chatID, text string, options SendMessageOptions,
+) (string, error) {
 	if chatID == "" || strings.TrimSpace(text) == "" {
 		return "", &DeliveryError{
 			Code: "invalid_send_message", DefinitelyNotSent: true,
 		}
 	}
 	payload := struct {
-		ChatID string `json:"chat_id"`
-		Text   string `json:"text"`
-	}{ChatID: chatID, Text: text}
+		ChatID          string                `json:"chat_id"`
+		Text            string                `json:"text"`
+		MessageThreadID int64                 `json:"message_thread_id,omitempty"`
+		ReplyMarkup     *InlineKeyboardMarkup `json:"reply_markup,omitempty"`
+	}{ChatID: chatID, Text: text, MessageThreadID: options.MessageThreadID,
+		ReplyMarkup: options.ReplyMarkup}
 	var message Message
 	if err := c.call(ctx, "sendMessage", payload, &message); err != nil {
 		return "", err
@@ -171,6 +259,20 @@ func (c *Client) SendMessage(
 		return "", &DeliveryError{Code: "malformed_send_response"}
 	}
 	return strconv.FormatInt(message.MessageID, 10), nil
+}
+
+func (c *Client) AnswerCallbackQuery(
+	ctx context.Context, callbackID, text string,
+) error {
+	if callbackID == "" || len(callbackID) > 128 || len(text) > 200 {
+		return &DeliveryError{
+			Code: "invalid_callback_answer", DefinitelyNotSent: true,
+		}
+	}
+	return c.call(ctx, "answerCallbackQuery", struct {
+		CallbackQueryID string `json:"callback_query_id"`
+		Text            string `json:"text,omitempty"`
+	}{CallbackQueryID: callbackID, Text: text}, nil)
 }
 
 func (c *Client) call(

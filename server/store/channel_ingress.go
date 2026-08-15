@@ -34,21 +34,26 @@ type ChannelIdentity struct {
 
 // ChannelIngress is the durable unit claimed by a channel worker.
 type ChannelIngress struct {
-	Provider         string
-	AppIdentity      string
-	ProviderUpdateID string
-	IdentityID       int64
-	TenantID         int64
-	UserID           int64
-	ExternalUserID   string
-	ProviderChatID   string
-	PayloadDigest    string
-	InputText        string
-	StableTurnID     string
-	Status           string
-	AttemptCount     int
-	ProcessingLease  string
-	ReplyText        string
+	Provider          string
+	AppIdentity       string
+	ProviderUpdateID  string
+	IdentityID        int64
+	TenantID          int64
+	UserID            int64
+	ExternalUserID    string
+	ProviderChatID    string
+	ProviderThreadID  string
+	ProviderMessageID string
+	RouteID           int64
+	IngressKind       string
+	CallbackQueryID   string
+	PayloadDigest     string
+	InputText         string
+	StableTurnID      string
+	Status            string
+	AttemptCount      int
+	ProcessingLease   string
+	ReplyText         string
 }
 
 type ChannelDeliveryBlockStats struct {
@@ -64,11 +69,16 @@ func (s *Store) TelegramBlockedReplyStats(
 ) (ChannelDeliveryBlockStats, error) {
 	var stats ChannelDeliveryBlockStats
 	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*)::integer,MIN(updated_at)
-		   FROM channel_ingress_receipts
-		  WHERE provider=$1 AND app_identity=$2 AND
-		        status IN ('sending','ambiguous','failed') AND
-		        (status <> 'failed' OR error_code IS DISTINCT FROM 'identity_revoked')`,
+		`SELECT COUNT(*)::integer,MIN(updated_at) FROM (
+		   SELECT updated_at FROM channel_ingress_receipts
+		    WHERE provider=$1 AND app_identity=$2 AND
+		          status IN ('sending','ambiguous','failed') AND
+		          (status <> 'failed' OR error_code NOT IN ('identity_revoked','route_revoked'))
+		   UNION ALL
+		   SELECT updated_at FROM channel_outbound_effects
+		    WHERE provider=$1 AND app_identity=$2 AND
+		          status IN ('sending','ambiguous','failed')
+		 ) blocked`,
 		channelProviderTelegram, appIdentity).Scan(&stats.Count, &stats.OldestAt)
 	if err != nil {
 		return ChannelDeliveryBlockStats{}, types.NewAppError(types.CodeDatabase,
@@ -82,11 +92,16 @@ func (s *Store) TelegramBlockedReplyStatsForUser(
 ) (ChannelDeliveryBlockStats, error) {
 	var stats ChannelDeliveryBlockStats
 	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*)::integer,MIN(updated_at)
-		   FROM channel_ingress_receipts
-		  WHERE provider=$1 AND app_identity=$2 AND tenant_id=$3 AND user_id=$4 AND
-		        status IN ('sending','ambiguous','failed') AND
-		        (status <> 'failed' OR error_code IS DISTINCT FROM 'identity_revoked')`,
+		`SELECT COUNT(*)::integer,MIN(updated_at) FROM (
+		   SELECT updated_at FROM channel_ingress_receipts
+		    WHERE provider=$1 AND app_identity=$2 AND tenant_id=$3 AND user_id=$4 AND
+		          status IN ('sending','ambiguous','failed') AND
+		          (status <> 'failed' OR error_code NOT IN ('identity_revoked','route_revoked'))
+		   UNION ALL
+		   SELECT updated_at FROM channel_outbound_effects
+		    WHERE provider=$1 AND app_identity=$2 AND tenant_id=$3 AND user_id=$4 AND
+		          status IN ('sending','ambiguous','failed')
+		 ) blocked`,
 		channelProviderTelegram, appIdentity, tenantID, userID,
 	).Scan(&stats.Count, &stats.OldestAt)
 	if err != nil {
@@ -300,6 +315,9 @@ func (s *Store) ConsumeTelegramLinkRequest(
 				"建立 Telegram 身份绑定", err)
 		}
 	}
+	if _, err := ensureTelegramPrivateRouteTx(ctx, tx, identity); err != nil {
+		return ChannelIdentity{}, false, err
+	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE channel_link_requests
 		    SET consumed_at=clock_timestamp(),consumed_identity_id=$2,
@@ -474,6 +492,21 @@ func (s *Store) RevokeTelegramIdentity(
 			"撤销 Telegram 未消费配对码", err)
 	}
 	if _, err := tx.Exec(ctx,
+		`DELETE FROM channel_route_link_requests
+		  WHERE tenant_id=$1 AND user_id=$2 AND provider=$3 AND
+		        consumed_at IS NULL`, tenantID, userID,
+		channelProviderTelegram); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"撤销 Telegram 未消费群组连接码", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE channel_routes
+		    SET status='revoked',revoked_at=clock_timestamp()
+		  WHERE identity_id=$1 AND status='active'`, identityID); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"撤销 Telegram 路由", err)
+	}
+	if _, err := tx.Exec(ctx,
 		`UPDATE channel_identities
 		    SET status='revoked',revoked_at=clock_timestamp()
 		  WHERE id=$1 AND status='active'`, identityID); err != nil {
@@ -494,11 +527,38 @@ func (s *Store) AcceptTelegramIngress(
 	identity ChannelIdentity,
 	updateID, payloadDigest, inputText, stableTurnID string,
 ) (bool, error) {
+	resolvedIdentity, route, err := s.ResolveTelegramRoute(
+		ctx, identity.AppIdentity, identity.ExternalUserID,
+		identity.ProviderChatID, "0")
+	if err != nil || resolvedIdentity.ID != identity.ID {
+		if err == nil {
+			err = types.NewAppError(types.CodeConflict,
+				"Telegram 私聊身份范围不一致", types.ErrConflict)
+		}
+		return false, err
+	}
+	return s.AcceptTelegramRoutedIngress(ctx, identity, route, updateID,
+		payloadDigest, inputText, stableTurnID, "", "message", "")
+}
+
+// AcceptTelegramRoutedIngress inserts an authenticated private/group/topic
+// update exactly once. The identity and route are both re-checked under row
+// locks, so unlink or route revocation linearizes before Agent admission.
+func (s *Store) AcceptTelegramRoutedIngress(
+	ctx context.Context, identity ChannelIdentity, route ChannelRoute,
+	updateID, payloadDigest, inputText, stableTurnID, providerMessageID,
+	ingressKind, callbackQueryID string,
+) (bool, error) {
 	if identity.ID <= 0 || identity.TenantID <= 0 || identity.UserID <= 0 ||
 		identity.Provider != channelProviderTelegram || identity.Status != "active" ||
+		route.ID <= 0 || route.IdentityID != identity.ID || route.Status != "active" ||
+		route.TenantID != identity.TenantID || route.UserID != identity.UserID ||
+		route.Provider != identity.Provider || route.AppIdentity != identity.AppIdentity ||
 		strings.TrimSpace(updateID) != updateID || updateID == "" || len(updateID) > 128 ||
 		len(payloadDigest) != 64 || strings.TrimSpace(inputText) == "" ||
-		len(inputText) > 65536 {
+		len(inputText) > 65536 || len(providerMessageID) > 128 ||
+		(ingressKind != "message" && ingressKind != "command" && ingressKind != "callback") ||
+		(ingressKind == "callback") != (callbackQueryID != "") || len(callbackQueryID) > 128 {
 		return false, types.NewAppError(types.CodeValidation,
 			"Telegram update 范围无效", types.ErrValidation)
 	}
@@ -518,18 +578,23 @@ func (s *Store) AcceptTelegramIngress(
 			"开启 Telegram update 事务", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	var lockedIdentityID int64
+	var lockedIdentityID, lockedRouteID int64
 	err = tx.QueryRow(ctx,
-		`SELECT ci.id FROM channel_identities ci
+		`SELECT ci.id,cr.id FROM channel_identities ci
+		 JOIN channel_routes cr ON cr.identity_id=ci.id
 		 JOIN memberships m ON m.tenant_id=ci.tenant_id AND m.user_id=ci.user_id
 		 JOIN tenants t ON t.id=ci.tenant_id
 		WHERE ci.id=$1 AND ci.tenant_id=$2 AND ci.user_id=$3 AND
 		      ci.provider=$4 AND ci.app_identity=$5 AND
-		      ci.external_user_id=$6 AND ci.provider_chat_id=$7 AND
-		      ci.chat_type='private' AND ci.status='active' AND t.status='active'
-		FOR UPDATE OF ci`, identity.ID, identity.TenantID, identity.UserID,
+		      ci.external_user_id=$6 AND ci.status='active' AND
+		      cr.id=$7 AND cr.tenant_id=ci.tenant_id AND cr.user_id=ci.user_id AND
+		      cr.provider=$4 AND cr.app_identity=$5 AND
+		      cr.provider_chat_id=$8 AND cr.provider_thread_id=$9 AND
+		      cr.status='active' AND t.status='active'
+		FOR UPDATE OF ci,cr`, identity.ID, identity.TenantID, identity.UserID,
 		identity.Provider, identity.AppIdentity, identity.ExternalUserID,
-		identity.ProviderChatID).Scan(&lockedIdentityID)
+		route.ID, route.ProviderChatID, route.ProviderThreadID,
+	).Scan(&lockedIdentityID, &lockedRouteID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, types.NewAppError(types.CodeNotFound,
 			"Telegram 身份已失效", types.ErrNotFound)
@@ -541,12 +606,14 @@ func (s *Store) AcceptTelegramIngress(
 	command, err := tx.Exec(ctx,
 		`INSERT INTO channel_ingress_receipts
 		 (provider,app_identity,provider_update_id,identity_id,tenant_id,user_id,
-		  external_user_id,provider_chat_id,payload_digest,input_text,stable_turn_id)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		  external_user_id,provider_chat_id,payload_digest,input_text,stable_turn_id,
+		  route_id,provider_thread_id,provider_message_id,ingress_kind,callback_query_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		 ON CONFLICT (provider,app_identity,provider_update_id) DO NOTHING`,
 		identity.Provider, identity.AppIdentity, updateID, identity.ID,
 		identity.TenantID, identity.UserID, identity.ExternalUserID,
-		identity.ProviderChatID, payloadDigest, inputText, stableTurnID)
+		route.ProviderChatID, payloadDigest, inputText, stableTurnID, route.ID,
+		route.ProviderThreadID, providerMessageID, ingressKind, callbackQueryID)
 	if err != nil {
 		return false, types.NewAppError(types.CodeDatabase,
 			"接收 Telegram update", err)
@@ -558,23 +625,27 @@ func (s *Store) AcceptTelegramIngress(
 		}
 		return true, nil
 	}
-	var storedDigest, storedText, storedTurn string
-	var storedIdentity, storedTenant, storedUser int64
+	var storedDigest, storedText, storedTurn, storedMessage, storedKind, storedCallback string
+	var storedIdentity, storedTenant, storedUser, storedRoute int64
 	err = tx.QueryRow(ctx,
 		`SELECT identity_id,tenant_id,user_id,payload_digest,input_text,
-		        stable_turn_id::text
+		        stable_turn_id::text,route_id,provider_message_id,
+		        ingress_kind,callback_query_id
 		   FROM channel_ingress_receipts
 		  WHERE provider=$1 AND app_identity=$2 AND provider_update_id=$3`,
 		identity.Provider, identity.AppIdentity, updateID,
 	).Scan(&storedIdentity, &storedTenant, &storedUser,
-		&storedDigest, &storedText, &storedTurn)
+		&storedDigest, &storedText, &storedTurn, &storedRoute,
+		&storedMessage, &storedKind, &storedCallback)
 	if err != nil {
 		return false, types.NewAppError(types.CodeDatabase,
 			"核对 Telegram update 重放", err)
 	}
 	if storedIdentity != identity.ID || storedTenant != identity.TenantID ||
 		storedUser != identity.UserID || storedDigest != payloadDigest ||
-		storedText != inputText || storedTurn != stableTurnID {
+		storedText != inputText || storedTurn != stableTurnID ||
+		storedRoute != route.ID || storedMessage != providerMessageID ||
+		storedKind != ingressKind || storedCallback != callbackQueryID {
 		return false, types.NewAppError(types.CodeConflict,
 			"Telegram update_id 已被不同请求占用", types.ErrConflict)
 	}
@@ -601,31 +672,24 @@ func (s *Store) ClaimNextTelegramIngress(
 			"开启 Telegram update claim", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	var identityID int64
+	var identityID, routeID int64
 	err = tx.QueryRow(ctx,
-		`SELECT ci.id
-		   FROM channel_identities ci
+		`SELECT ci.id,cr.id
+		   FROM channel_ingress_receipts r
+		   JOIN channel_identities ci ON ci.id=r.identity_id
+		   JOIN channel_routes cr ON cr.id=r.route_id
 		  WHERE ci.provider=$1 AND ci.app_identity=$2 AND ci.status='active' AND
-		        EXISTS (
-		          SELECT 1 FROM channel_ingress_receipts r
-		           WHERE r.identity_id=ci.id AND
-		                 (r.status='pending' OR
-		                  (r.status='processing' AND
-		                   r.lease_expires_at<=clock_timestamp())) AND
-		                 NOT EXISTS (
-		                   SELECT 1 FROM channel_ingress_receipts earlier
-		                    WHERE earlier.identity_id=r.identity_id AND
-		                          earlier.provider_update_id::bigint <
-		                            r.provider_update_id::bigint AND
-		                          earlier.status IN
-		                            ('pending','processing','reply_ready')))
-		  ORDER BY (
-		    SELECT MIN(r.provider_update_id::bigint)
-		      FROM channel_ingress_receipts r
-		     WHERE r.identity_id=ci.id AND
-		           r.status IN ('pending','processing','reply_ready'))
-		  FOR UPDATE OF ci SKIP LOCKED LIMIT 1`,
-		channelProviderTelegram, appIdentity).Scan(&identityID)
+		        cr.status='active' AND
+		        (r.status='pending' OR
+		         (r.status='processing' AND r.lease_expires_at<=clock_timestamp())) AND
+		        NOT EXISTS (
+		          SELECT 1 FROM channel_ingress_receipts earlier
+		           WHERE earlier.identity_id=r.identity_id AND
+		                 earlier.provider_update_id::bigint < r.provider_update_id::bigint AND
+		                 earlier.status IN ('pending','processing','reply_ready'))
+		  ORDER BY r.provider_update_id::bigint
+		  FOR UPDATE OF ci,cr SKIP LOCKED LIMIT 1`,
+		channelProviderTelegram, appIdentity).Scan(&identityID, &routeID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelIngress{}, types.NewAppError(types.CodeNotFound,
 			"没有待处理 Telegram update", types.ErrNotFound)
@@ -640,7 +704,7 @@ func (s *Store) ClaimNextTelegramIngress(
 		`WITH candidate AS (
 		   SELECT provider,app_identity,provider_update_id
 		     FROM channel_ingress_receipts
-		    WHERE provider=$1 AND app_identity=$2 AND identity_id=$5 AND
+		    WHERE provider=$1 AND app_identity=$2 AND identity_id=$5 AND route_id=$6 AND
 		          (status='pending' OR
 		           (status='processing' AND lease_expires_at<=clock_timestamp())) AND
 		          NOT EXISTS (
@@ -662,13 +726,17 @@ func (s *Store) ClaimNextTelegramIngress(
 		        r.provider_update_id=c.provider_update_id
 		 RETURNING r.provider,r.app_identity,r.provider_update_id,r.identity_id,
 		           r.tenant_id,r.user_id,r.external_user_id,r.provider_chat_id,
+		           r.provider_thread_id,r.provider_message_id,r.route_id,
+		           r.ingress_kind,r.callback_query_id,
 		           r.payload_digest,r.input_text,r.stable_turn_id::text,r.status,
 		           r.attempt_count,r.processing_lease::text,COALESCE(r.reply_text,'')`,
 		channelProviderTelegram, appIdentity, claimID, int64(lease/time.Second),
-		identityID,
+		identityID, routeID,
 	).Scan(&item.Provider, &item.AppIdentity, &item.ProviderUpdateID,
 		&item.IdentityID, &item.TenantID, &item.UserID,
-		&item.ExternalUserID, &item.ProviderChatID, &item.PayloadDigest,
+		&item.ExternalUserID, &item.ProviderChatID, &item.ProviderThreadID,
+		&item.ProviderMessageID, &item.RouteID, &item.IngressKind,
+		&item.CallbackQueryID, &item.PayloadDigest,
 		&item.InputText, &item.StableTurnID, &item.Status,
 		&item.AttemptCount, &item.ProcessingLease, &item.ReplyText)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -747,10 +815,11 @@ func (s *Store) ClaimTelegramReplySend(
 		`SELECT ci.id
 		   FROM channel_ingress_receipts r
 		   JOIN channel_identities ci ON ci.id=r.identity_id
+		   JOIN channel_routes cr ON cr.id=r.route_id
 		  WHERE r.provider=$1 AND r.app_identity=$2 AND
 		        r.provider_update_id=$3 AND r.status='reply_ready' AND
-		        ci.status='active'
-		  FOR UPDATE OF ci`, provider, appIdentity, updateID).Scan(&identityID)
+		        ci.status='active' AND cr.status='active'
+		  FOR UPDATE OF ci,cr`, provider, appIdentity, updateID).Scan(&identityID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelIngress{}, types.NewAppError(types.CodeConflict,
 			"Telegram 回复不在可发送状态", types.ErrConflict)
@@ -767,12 +836,16 @@ func (s *Store) ClaimTelegramReplySend(
 		        identity_id=$4 AND status='reply_ready'
 		 RETURNING provider,app_identity,provider_update_id,identity_id,
 		           tenant_id,user_id,external_user_id,provider_chat_id,
+		           provider_thread_id,provider_message_id,route_id,
+		           ingress_kind,callback_query_id,
 		           payload_digest,input_text,stable_turn_id::text,status,
 		           attempt_count,'',reply_text`,
 		provider, appIdentity, updateID, identityID,
 	).Scan(&item.Provider, &item.AppIdentity, &item.ProviderUpdateID,
 		&item.IdentityID, &item.TenantID, &item.UserID,
-		&item.ExternalUserID, &item.ProviderChatID, &item.PayloadDigest,
+		&item.ExternalUserID, &item.ProviderChatID, &item.ProviderThreadID,
+		&item.ProviderMessageID, &item.RouteID, &item.IngressKind,
+		&item.CallbackQueryID, &item.PayloadDigest,
 		&item.InputText, &item.StableTurnID, &item.Status,
 		&item.AttemptCount, &item.ProcessingLease, &item.ReplyText)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -802,28 +875,22 @@ func (s *Store) ClaimNextTelegramReplySend(
 			"开启 Telegram 回复恢复 claim", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	var identityID int64
+	var identityID, routeID int64
 	err = tx.QueryRow(ctx,
-		`SELECT ci.id
-		   FROM channel_identities ci
+		`SELECT ci.id,cr.id
+		   FROM channel_ingress_receipts r
+		   JOIN channel_identities ci ON ci.id=r.identity_id
+		   JOIN channel_routes cr ON cr.id=r.route_id
 		  WHERE ci.provider=$1 AND ci.app_identity=$2 AND ci.status='active' AND
-		        EXISTS (
-		          SELECT 1 FROM channel_ingress_receipts r
-		           WHERE r.identity_id=ci.id AND r.status='reply_ready' AND
-		                 NOT EXISTS (
-		                   SELECT 1 FROM channel_ingress_receipts earlier
-		                    WHERE earlier.identity_id=r.identity_id AND
-		                          earlier.provider_update_id::bigint <
-		                            r.provider_update_id::bigint AND
-		                          earlier.status IN
-		                            ('pending','processing','reply_ready')))
-		  ORDER BY (
-		    SELECT MIN(r.provider_update_id::bigint)
-		      FROM channel_ingress_receipts r
-		     WHERE r.identity_id=ci.id AND
-		           r.status IN ('pending','processing','reply_ready'))
-		  FOR UPDATE OF ci SKIP LOCKED LIMIT 1`,
-		channelProviderTelegram, appIdentity).Scan(&identityID)
+		        cr.status='active' AND r.status='reply_ready' AND
+		        NOT EXISTS (
+		          SELECT 1 FROM channel_ingress_receipts earlier
+		           WHERE earlier.identity_id=r.identity_id AND
+		                 earlier.provider_update_id::bigint < r.provider_update_id::bigint AND
+		                 earlier.status IN ('pending','processing','reply_ready'))
+		  ORDER BY r.provider_update_id::bigint
+		  FOR UPDATE OF ci,cr SKIP LOCKED LIMIT 1`,
+		channelProviderTelegram, appIdentity).Scan(&identityID, &routeID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelIngress{}, types.NewAppError(types.CodeNotFound,
 			"没有待发送 Telegram 回复", types.ErrNotFound)
@@ -837,7 +904,7 @@ func (s *Store) ClaimNextTelegramReplySend(
 		`WITH candidate AS (
 		   SELECT provider,app_identity,provider_update_id
 		     FROM channel_ingress_receipts
-		    WHERE provider=$1 AND app_identity=$2 AND identity_id=$3 AND
+		    WHERE provider=$1 AND app_identity=$2 AND identity_id=$3 AND route_id=$4 AND
 		          status='reply_ready' AND
 		          NOT EXISTS (
 		            SELECT 1 FROM channel_ingress_receipts earlier
@@ -856,12 +923,16 @@ func (s *Store) ClaimNextTelegramReplySend(
 		        r.provider_update_id=c.provider_update_id
 		 RETURNING r.provider,r.app_identity,r.provider_update_id,r.identity_id,
 		           r.tenant_id,r.user_id,r.external_user_id,r.provider_chat_id,
+		           r.provider_thread_id,r.provider_message_id,r.route_id,
+		           r.ingress_kind,r.callback_query_id,
 		           r.payload_digest,r.input_text,r.stable_turn_id::text,r.status,
 		           r.attempt_count,'',r.reply_text`,
-		channelProviderTelegram, appIdentity, identityID,
+		channelProviderTelegram, appIdentity, identityID, routeID,
 	).Scan(&item.Provider, &item.AppIdentity, &item.ProviderUpdateID,
 		&item.IdentityID, &item.TenantID, &item.UserID,
-		&item.ExternalUserID, &item.ProviderChatID, &item.PayloadDigest,
+		&item.ExternalUserID, &item.ProviderChatID, &item.ProviderThreadID,
+		&item.ProviderMessageID, &item.RouteID, &item.IngressKind,
+		&item.CallbackQueryID, &item.PayloadDigest,
 		&item.InputText, &item.StableTurnID, &item.Status,
 		&item.AttemptCount, &item.ProcessingLease, &item.ReplyText)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -887,7 +958,12 @@ func (s *Store) CompleteTelegramReply(
 		return types.NewAppError(types.CodeValidation,
 			"Telegram message IDs 无效", types.ErrValidation)
 	}
-	command, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "开启 Telegram 回复结算", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	command, err := tx.Exec(ctx,
 		`UPDATE channel_ingress_receipts
 		    SET status='completed',provider_message_ids=$4,
 		        updated_at=clock_timestamp()
@@ -901,6 +977,28 @@ func (s *Store) CompleteTelegramReply(
 	if command.RowsAffected() != 1 {
 		return types.NewAppError(types.CodeConflict,
 			"Telegram 回复结算状态冲突", types.ErrConflict)
+	}
+	for _, messageID := range messageIDs {
+		if strings.TrimSpace(messageID) != messageID || messageID == "" || len(messageID) > 128 {
+			return types.NewAppError(types.CodeValidation,
+				"Telegram message ID 无效", types.ErrValidation)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO channel_message_mappings
+			 (provider,app_identity,provider_chat_id,provider_thread_id,
+			  provider_message_id,tenant_id,user_id,route_id,direction,
+			  message_kind,correlation_key)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'outbound',$9,$10)
+			 ON CONFLICT DO NOTHING`, item.Provider, item.AppIdentity,
+			item.ProviderChatID, item.ProviderThreadID, messageID,
+			item.TenantID, item.UserID, item.RouteID,
+			item.IngressKind, "ingress:"+item.ProviderUpdateID); err != nil {
+			return types.NewAppError(types.CodeDatabase,
+				"记录 Telegram 消息映射", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.NewAppError(types.CodeDatabase, "提交 Telegram 回复结算", err)
 	}
 	return nil
 }

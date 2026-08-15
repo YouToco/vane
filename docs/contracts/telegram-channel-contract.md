@@ -1,21 +1,35 @@
-# Telegram Bot channel contract (ingress v1)
+# Telegram Bot channel contract (routed ingress v2)
 
 Status: implemented, default-off, production UAT pending.
 
-This contract adds Telegram as an authenticated private-chat entrance to the
-same Vane owner Agent used by Web and Feishu. It does not reinterpret Telegram
-IDs as Vane users and it does not copy Feishu's historical first-contact owner
-capture.
+This contract adds Telegram as an authenticated, routed entrance to the same
+Vane owner Agent used by Web and Feishu. One owner identity may authorize a
+private chat, groups, supergroups, and exact forum topics. Telegram IDs remain
+routing data, never Vane user IDs.
 
 ## Scope
 
-Included in v1:
+Included in v2:
 
 - startup `getMe`, exact HTTPS `setWebhook`, `getWebhookInfo` verification;
-- explicit `allowed_updates=["message"]`, `max_connections=1` and
+- explicit `allowed_updates=["message","callback_query"]`, `max_connections=1` and
   `drop_pending_updates=false`;
 - constant-time webhook-secret verification and a 1 MiB body limit;
-- private text messages only;
+- private text plus explicitly installed group/supergroup/forum-topic routes;
+- group admission only for the bound owner, and only for commands, an exact
+  `@bot_username` mention, or a reply to a Bot message;
+- administrator-verified, ten-minute, one-time group/topic installation links;
+- Bot command menu (`help`, `status`, `tasks`, `new`, `connect`) and command
+  menu button installed during startup;
+- HMAC-authenticated inline callbacks admitted through the same durable inbox;
+- exact `message_thread_id` preservation and provider-neutral
+  `(provider,app,chat,thread,message)` mappings;
+- a provider-neutral durable outbound effect boundary with stable caller UUID,
+  frozen route/payload, exact replay, and terminal sent/failed/ambiguous
+  settlement. Connection tests use it; future product notifications can reuse
+  it without bypassing Telegram's no-blind-retry rule;
+- explicit media recognition with a safe text-only capability reply; media
+  bytes are not downloaded or silently passed to the model;
 - Web-session-issued, ten-minute, one-time `/start` pairing links;
 - hash-only pairing-token storage and exact actor/chat/bot binding;
 - durable `(provider, bot identity, update_id)` inbox receipts;
@@ -25,13 +39,17 @@ Included in v1:
   message;
 - authenticated status/link/test/unlink Dashboard APIs and Settings UI.
 
-Not included in v1:
+Not included in v2:
 
-- group/channel chats, media, inline queries or Telegram Login;
-- callback buttons, feedback or deep-dive actions;
+- channel-post ingestion, inline queries, Telegram Login, reactions, edits, or
+  arbitrary group-member Agent access;
+- media download/transcription/vision, feedback/deep-dive domain actions, and
+  destructive callbacks. Their transport extension points exist but remain
+  fail-closed until their own authority contracts are implemented;
 - Telegram as the primary scheduled Brief/periodic-report delivery policy.
 
-The last exclusion is deliberate. Current approved task definitions say
+The scheduled-delivery exclusion is deliberate. The transport/outbound effect
+foundation exists, but current approved task definitions still say
 `owner_feishu`, Research V3 target resolution is Feishu-specific, and legacy
 delivery/feedback receipts retain `feishu_message_id`. Telegram `sendMessage`
 has neither the provider UUID nor the arbitrary history lookup used by the
@@ -51,11 +69,19 @@ The only Telegram principal derivation is:
 
 → existing Vane `(tenant_id,user_id)` principal.
 
-Username and display name are never identity. For private-chat v1,
+Username and display name are never identity. For private chat,
 `message.chat.id` must equal `message.from.id`. An unbound actor is acknowledged
 without any Agent, Tool, Temporal or business-data write. Web pairing APIs take
 tenant/user only from `auth.PrincipalFromContext`; request parameters cannot
 choose the target principal.
+
+A `channel_identity` authenticates the human; a `channel_route` independently
+authorizes one destination. Private pairing creates both atomically. A group or
+topic install requires the same bound actor and Telegram `getChatMember` must
+prove `creator` or `administrator`. Forum routes freeze the exact numeric
+`message_thread_id`; another topic cannot fall back to that route. Identity and
+route status are both rechecked under row locks before inbox admission and send
+claim.
 
 A bot-generation change is bound to the immutable numeric bot ID returned by
 `getMe`. Successful pairing to a new bot ID revokes the same Vane user's older
@@ -74,7 +100,7 @@ expires. It calls `agent.Loop.HandleChannelMessage` with the deterministic turn
 UUID. A completed `agent_turn_records` row returns before any model/Tool call;
 an interrupted retry keeps the same Tool idempotency namespace.
 
-Ingress v1 also fixes both provider and process concurrency to one connection
+Ingress v2 also fixes both provider and process concurrency to one connection
 and one worker. The Store orders numeric Telegram update IDs and keeps one
 `pending|processing|reply_ready` head per channel identity. A provider-crossed
 `sending` row is terminal for FIFO purposes: it remains an operator-visible
@@ -103,7 +129,7 @@ delivery becomes terminal `failed`, while the adapter remains ready.
 
 ## Database role boundary
 
-Migration 133 installs exact-user RLS policies and revokes the future
+Migrations 133-134 install exact-user RLS policies and revoke the future
 `vane_app` role, but the current primary Store intentionally still runs through
 the repository's schema-owner compatibility DSN. PostgreSQL owners bypass
 non-FORCE RLS, so this branch does **not** count those policies as current
@@ -121,6 +147,10 @@ tests prove `row_security_active`; it must not be enabled by config alone.
   request path.
 - Transport errors are sanitized and never wrap the token-bearing URL.
 - Replies use plain text; no Markdown/HTML parser or escaping ambiguity exists.
+- Callback values contain only a bounded action and HMAC. Tenant, user, route,
+  Tool arguments, and business-object IDs are never trusted from callback data.
+- Route status APIs expose only internal route ID, kind, chat type, and bind
+  time; raw actor/chat/thread IDs and group titles are not returned to Web.
 - Token, secret, raw update body, actor ID, chat ID and message text are not
   logged or exposed by the status API.
 
@@ -133,12 +163,15 @@ cannot be proven. `/readyz` includes Telegram readiness while enabled.
 Before changing feature 4.9 from `开发中`, production must prove:
 
 1. exact `getMe` bot ID/username and exact HTTPS webhook state;
-2. wrong secret, unknown actor and group messages cause zero Agent/business work;
-3. logged-in owner pairs once, chats, queries tasks and creates one removable
+2. wrong secret, unknown actor, ambient group messages, foreign actors and
+   wrong-topic messages cause zero Agent/business work;
+3. logged-in owner pairs once, installs a group and forum topic, uses the menu
+   and signed callbacks, queries tasks and creates one removable
    test task through the existing Agent lifecycle;
 4. exact and concurrent update replay produce one Agent turn and one task effect;
 5. restart after inbox ACK recovers with the same turn identity;
-6. 4096-boundary Chinese/emoji replies preserve content and order;
+6. 4096-boundary Chinese/emoji replies preserve content and order, and topic
+   replies retain the exact `message_thread_id`;
 7. unlink and bot/secret rotation revoke old authority;
 8. Feishu owner chat and one existing Feishu delivery still pass regression;
 9. logs/traces contain no bot token, webhook secret or raw private message.

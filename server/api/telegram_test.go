@@ -25,6 +25,8 @@ type fakeTelegramManager struct {
 	bindingErr error
 	blocked    store.ChannelDeliveryBlockStats
 	blockedErr error
+	routes     []telegram.RouteSummary
+	routesErr  error
 	issueErr   error
 	unlinkErr  error
 	testErr    error
@@ -41,8 +43,14 @@ func (f *fakeTelegramManager) IssueLink(_ context.Context, tenantID, userID int6
 		ExpiresAt: time.Now().Add(time.Minute),
 	}, nil
 }
+func (f *fakeTelegramManager) IssueRouteLink(ctx context.Context, tenantID, userID int64) (telegram.Link, error) {
+	return f.IssueLink(ctx, tenantID, userID)
+}
 func (f *fakeTelegramManager) Binding(context.Context, int64, int64) (store.ChannelIdentity, error) {
 	return f.identity, f.bindingErr
+}
+func (f *fakeTelegramManager) Routes(context.Context, int64, int64) ([]telegram.RouteSummary, error) {
+	return f.routes, f.routesErr
 }
 func (f *fakeTelegramManager) BlockedReplies(context.Context, int64, int64) (store.ChannelDeliveryBlockStats, error) {
 	return f.blocked, f.blockedErr
@@ -50,6 +58,9 @@ func (f *fakeTelegramManager) BlockedReplies(context.Context, int64, int64) (sto
 func (f *fakeTelegramManager) Unlink(_ context.Context, tenantID, userID int64) error {
 	f.tenantID, f.userID, f.unlinked = tenantID, userID, true
 	return f.unlinkErr
+}
+func (f *fakeTelegramManager) UnlinkRoute(_ context.Context, tenantID, userID, _ int64) error {
+	return f.Unlink(context.Background(), tenantID, userID)
 }
 func (f *fakeTelegramManager) SendTest(_ context.Context, tenantID, userID int64) error {
 	f.tenantID, f.userID, f.tested = tenantID, userID, true
@@ -74,6 +85,31 @@ func TestTelegramLinkUsesOnlySessionPrincipal(t *testing.T) {
 		fake.tenantID != 7 || fake.userID != 9 {
 		t.Fatalf("status=%d issued=%t scope=(%d,%d)",
 			rr.Code, fake.issued, fake.tenantID, fake.userID)
+	}
+}
+
+func TestTelegramRouteMutationsUseSessionScopeAndPathRoute(t *testing.T) {
+	fake := &fakeTelegramManager{status: telegram.Status{Enabled: true, Ready: true}}
+	s := &server{deps: Deps{Telegram: fake}}
+	rr := httptest.NewRecorder()
+	s.handleTelegramRouteLink(rr, telegramPrincipalRequest(
+		http.MethodPost, "/api/telegram/routes/link?tenant_id=999"))
+	if rr.Code != http.StatusOK || !fake.issued || fake.tenantID != 7 || fake.userID != 9 {
+		t.Fatalf("link status=%d fake=%+v", rr.Code, fake)
+	}
+	req := telegramPrincipalRequest(http.MethodDelete, "/api/telegram/routes/42")
+	req.SetPathValue("id", "42")
+	rr = httptest.NewRecorder()
+	s.handleTelegramRouteUnlink(rr, req)
+	if rr.Code != http.StatusOK || !fake.unlinked || fake.tenantID != 7 || fake.userID != 9 {
+		t.Fatalf("unlink status=%d fake=%+v", rr.Code, fake)
+	}
+	bad := telegramPrincipalRequest(http.MethodDelete, "/api/telegram/routes/bad")
+	bad.SetPathValue("id", "bad")
+	rr = httptest.NewRecorder()
+	s.handleTelegramRouteUnlink(rr, bad)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("bad route status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -127,6 +163,9 @@ func TestTelegramHandlersCoverDisabledUnboundAndFailureStates(t *testing.T) {
 		{name: "binding failure", fake: &fakeTelegramManager{
 			status: telegram.Status{Enabled: true, Ready: true}, bindingErr: appErr,
 		}, want: http.StatusInternalServerError},
+		{name: "routes failure", fake: &fakeTelegramManager{
+			status: telegram.Status{Enabled: true, Ready: true}, routesErr: appErr,
+		}, want: http.StatusInternalServerError},
 	} {
 		t.Run("status "+tc.name, func(t *testing.T) {
 			s := &server{deps: Deps{Telegram: tc.fake}}
@@ -141,7 +180,8 @@ func TestTelegramHandlersCoverDisabledUnboundAndFailureStates(t *testing.T) {
 	t.Run("missing principal", func(t *testing.T) {
 		s := &server{deps: Deps{Telegram: &fakeTelegramManager{status: telegram.Status{Ready: true}}}}
 		for _, call := range []func(http.ResponseWriter, *http.Request){
-			s.handleTelegramStatus, s.handleTelegramLink, s.handleTelegramUnlink, s.handleTelegramTest,
+			s.handleTelegramStatus, s.handleTelegramLink, s.handleTelegramRouteLink,
+			s.handleTelegramRouteUnlink, s.handleTelegramUnlink, s.handleTelegramTest,
 		} {
 			rr := httptest.NewRecorder()
 			call(rr, httptest.NewRequest(http.MethodPost, "/api/telegram", nil))
@@ -154,7 +194,8 @@ func TestTelegramHandlersCoverDisabledUnboundAndFailureStates(t *testing.T) {
 	t.Run("disabled mutations", func(t *testing.T) {
 		s := &server{}
 		for _, call := range []func(http.ResponseWriter, *http.Request){
-			s.handleTelegramLink, s.handleTelegramUnlink, s.handleTelegramTest,
+			s.handleTelegramLink, s.handleTelegramRouteLink, s.handleTelegramRouteUnlink,
+			s.handleTelegramUnlink, s.handleTelegramTest,
 		} {
 			rr := httptest.NewRecorder()
 			call(rr, telegramPrincipalRequest(http.MethodPost, "/api/telegram"))
@@ -169,7 +210,8 @@ func TestTelegramHandlersCoverDisabledUnboundAndFailureStates(t *testing.T) {
 			status: telegram.Status{Ready: true},
 		}}}
 		for _, call := range []func(http.ResponseWriter, *http.Request){
-			s.handleTelegramLink, s.handleTelegramUnlink, s.handleTelegramTest,
+			s.handleTelegramLink, s.handleTelegramRouteLink, s.handleTelegramRouteUnlink,
+			s.handleTelegramUnlink, s.handleTelegramTest,
 		} {
 			rr := httptest.NewRecorder()
 			req := telegramPrincipalRequest(http.MethodPost, "/api/telegram")
@@ -190,6 +232,9 @@ func TestTelegramHandlersCoverDisabledUnboundAndFailureStates(t *testing.T) {
 		{name: "link failure", call: (*server).handleTelegramLink,
 			fake: &fakeTelegramManager{status: telegram.Status{Ready: true}, issueErr: appErr},
 			flag: func(f *fakeTelegramManager) bool { return f.issued }},
+		{name: "route link failure", call: (*server).handleTelegramRouteLink,
+			fake: &fakeTelegramManager{status: telegram.Status{Ready: true}, issueErr: appErr},
+			flag: func(f *fakeTelegramManager) bool { return f.issued }},
 		{name: "unlink failure", call: (*server).handleTelegramUnlink,
 			fake: &fakeTelegramManager{status: telegram.Status{Ready: true}, unlinkErr: appErr},
 			flag: func(f *fakeTelegramManager) bool { return f.unlinked }},
@@ -206,6 +251,18 @@ func TestTelegramHandlersCoverDisabledUnboundAndFailureStates(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("route unlink failure", func(t *testing.T) {
+		fake := &fakeTelegramManager{status: telegram.Status{Ready: true}, unlinkErr: appErr}
+		s := &server{deps: Deps{Telegram: fake}}
+		req := telegramPrincipalRequest(http.MethodDelete, "/api/telegram/routes/42")
+		req.SetPathValue("id", "42")
+		rr := httptest.NewRecorder()
+		s.handleTelegramRouteUnlink(rr, req)
+		if rr.Code != http.StatusInternalServerError || !fake.unlinked {
+			t.Fatalf("status=%d called=%t body=%s", rr.Code, fake.unlinked, rr.Body.String())
+		}
+	})
 
 	t.Run("successful unlink and test", func(t *testing.T) {
 		fake := &fakeTelegramManager{status: telegram.Status{Ready: true}}

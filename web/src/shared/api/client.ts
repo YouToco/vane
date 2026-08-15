@@ -108,10 +108,19 @@ export interface TelegramStatus {
   blocked_reply_count?: number;
   oldest_blocked_at?: string;
   bound_at?: string;
+  routes?: TelegramRoute[];
+}
+
+export interface TelegramRoute {
+  id: number;
+  kind: "private" | "group" | "topic" | "channel";
+  chat_type: "private" | "group" | "supergroup" | "channel";
+  bound_at: string;
 }
 
 export interface TelegramLink {
   deep_link: string;
+  command?: string;
   expires_at: string;
 }
 
@@ -1513,6 +1522,9 @@ export const api = {
   feishuTest: () => post<{ ok: boolean }>("/api/feishu/test"),
   telegramStatus: () => request<TelegramStatus>("/api/telegram/status"),
   telegramLink: () => post<TelegramLink>("/api/telegram/link"),
+	telegramRouteLink: () => post<TelegramLink>("/api/telegram/routes/link"),
+	telegramRouteUnlink: (id: number) =>
+		request<{ ok: boolean }>(`/api/telegram/routes/${id}`, { method: "DELETE" }),
   telegramUnlink: () =>
     request<{ ok: boolean }>("/api/telegram/link", { method: "DELETE" }),
   telegramTest: () => post<{ ok: boolean }>("/api/telegram/test"),

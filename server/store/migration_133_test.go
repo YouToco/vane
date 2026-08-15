@@ -60,7 +60,7 @@ func TestTelegramBindingAndIngressReplayPostgres(t *testing.T) {
 	}
 	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
-	if _, err := provider.UpTo(t.Context(), 133); err != nil {
+	if _, err := provider.UpTo(t.Context(), 134); err != nil {
 		t.Fatal(err)
 	}
 	st, err := New(t.Context(), scratchURL)
@@ -515,7 +515,8 @@ func TestTelegramBindingAndIngressReplayPostgres(t *testing.T) {
 		}
 	}
 	if _, err := provider.DownTo(t.Context(), 132); err == nil ||
-		!strings.Contains(err.Error(), "Telegram channel history") {
-		t.Fatalf("migration 133 Down destroyed retained channel history: %v", err)
+		(!strings.Contains(err.Error(), "Telegram channel history") &&
+			!strings.Contains(err.Error(), "routed channel history")) {
+		t.Fatalf("channel Down destroyed retained Telegram history: %v", err)
 	}
 }

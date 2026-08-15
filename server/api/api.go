@@ -85,9 +85,12 @@ type TaskAgent interface {
 type TelegramManager interface {
 	Status() telegram.Status
 	IssueLink(context.Context, int64, int64) (telegram.Link, error)
+	IssueRouteLink(context.Context, int64, int64) (telegram.Link, error)
 	Binding(context.Context, int64, int64) (store.ChannelIdentity, error)
+	Routes(context.Context, int64, int64) ([]telegram.RouteSummary, error)
 	BlockedReplies(context.Context, int64, int64) (store.ChannelDeliveryBlockStats, error)
 	Unlink(context.Context, int64, int64) error
+	UnlinkRoute(context.Context, int64, int64, int64) error
 	SendTest(context.Context, int64, int64) error
 }
 
@@ -192,6 +195,8 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/telegram/status", s.handleTelegramStatus)
 	inner.HandleFunc("POST /api/telegram/link", s.handleTelegramLink)
 	inner.HandleFunc("DELETE /api/telegram/link", s.handleTelegramUnlink)
+	inner.HandleFunc("POST /api/telegram/routes/link", s.handleTelegramRouteLink)
+	inner.HandleFunc("DELETE /api/telegram/routes/{id}", s.handleTelegramRouteUnlink)
 	inner.HandleFunc("POST /api/telegram/test", s.handleTelegramTest)
 
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
