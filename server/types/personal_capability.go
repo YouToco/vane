@@ -113,7 +113,7 @@ type MCPConnectionVersion struct {
 	EndpointURL         string                `json:"endpoint_url"`
 	ProtocolVersion     string                `json:"protocol_version"`
 	Authentication      MCPAuthenticationKind `json:"authentication"`
-	CredentialRef       string                `json:"credential_ref,omitempty"`
+	CredentialRef       string                `json:"-"`
 	ToolSchemaDigest    string                `json:"tool_schema_digest"`
 	ToolSchema          json.RawMessage       `json:"tool_schema"`
 	CreatedAt           time.Time             `json:"created_at"`

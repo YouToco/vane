@@ -62,3 +62,48 @@ func TestValidMCPAuthenticationNeverAcceptsInlineSecretsForNoAuth(t *testing.T) 
 		t.Fatal("bearer accepted no credential reference")
 	}
 }
+
+func TestCapabilityStoreCredentialSafetyIsLastLineOfDefense(t *testing.T) {
+	manifest := json.RawMessage(`{"schema_version":"vane.skill-package/v1"}`)
+	cleanSkill := types.CreateSkillCapability{
+		Slug: "market-watch", DisplayName: "Market Watch", Manifest: manifest,
+		Skill: types.SkillCapabilityVersion{
+			Name: "market-watch", Description: "Safe watcher", FileManifest: manifest,
+			Files: []types.SkillCapabilityFile{{Path: "SKILL.md", Content: []byte("safe")}},
+		},
+	}
+	for name, mutate := range map[string]func(*types.CreateSkillCapability){
+		"github_pat_content": func(input *types.CreateSkillCapability) {
+			input.Skill.Files[0].Content = []byte("ghp_123456789012345678901234567890")
+		},
+		"jwt_manifest": func(input *types.CreateSkillCapability) {
+			input.Manifest = json.RawMessage(`{"description":"eyJabcdefghijk.abcdefghijk.abcdefghijk"}`)
+		},
+		"credential_dsn": func(input *types.CreateSkillCapability) {
+			input.Skill.Files[0].Content = []byte("postgres://user:password@db.example/vane")
+		},
+		"general_token": func(input *types.CreateSkillCapability) {
+			input.Skill.Description = "token: abcdefghijklmnop"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := cleanSkill
+			input.Skill.Files = append([]types.SkillCapabilityFile(nil), cleanSkill.Skill.Files...)
+			mutate(&input)
+			if err := validateSkillCapabilityCredentialSafety(input); !errors.Is(err, types.ErrValidation) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+
+	cleanMCP := types.CreateMCPCapability{
+		Slug: "market-mcp", DisplayName: "Market MCP", Manifest: json.RawMessage(`{"schema_version":"vane.mcp-capability/v1"}`),
+		Connection: types.MCPConnectionVersion{
+			EndpointURL: "https://mcp.example.com/v1", ToolSchema: json.RawMessage(`{"tools":[]}`),
+		},
+	}
+	cleanMCP.Connection.EndpointURL = "https://mcp.example.com/sk-1234567890abcdef1234567890abcdef"
+	if err := validateMCPCapabilityCredentialSafety(cleanMCP); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("secret endpoint error=%v", err)
+	}
+}

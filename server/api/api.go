@@ -160,7 +160,11 @@ type Deps struct {
 	// deterministic DNS/SSRF tests.
 	Capabilities         CapabilityStore
 	MCPEndpointAdmission MCPEndpointAdmission
-	Manager              Manager
+	// MCPReadOnlyPolicy is Vane-owned admission authority. Remote callers may
+	// describe tools, but can never self-assert that a tool is safe/read-only.
+	// A nil resolver intentionally denies every MCP catalog.
+	MCPReadOnlyPolicy MCPReadOnlyPolicyResolver
+	Manager           Manager
 	// Scheduler is capability-checked per endpoint below. Keeping this slot
 	// untyped lets each handler require only its idempotent command/read surface
 	// and removes the retired pre-6.8 DeletePush admission signature.

@@ -74,6 +74,23 @@ type fakeMCPAdmission struct {
 	err       error
 }
 
+type fakeMCPReadOnlyPolicy struct {
+	resolvedURL string
+	toolNames   []string
+	policy      map[string]mcpclient.LocalToolPolicy
+	err         error
+}
+
+func (f *fakeMCPReadOnlyPolicy) Resolve(_ context.Context, _ auth.Principal,
+	endpoint mcpclient.ResolvedEndpoint, tools []mcpclient.RemoteTool,
+) (map[string]mcpclient.LocalToolPolicy, error) {
+	f.resolvedURL = endpoint.URL
+	for _, tool := range tools {
+		f.toolNames = append(f.toolNames, tool.Name)
+	}
+	return f.policy, f.err
+}
+
 func (f *fakeMCPAdmission) Validate(_ context.Context, raw string) (mcpclient.ResolvedEndpoint, error) {
 	f.validated = raw
 	if f.err != nil {
@@ -86,6 +103,15 @@ func (f *fakeMCPAdmission) Validate(_ context.Context, raw string) (mcpclient.Re
 
 func capabilityTestMux(t *testing.T, tenantID, userID int64, role types.MembershipRole,
 	capabilities CapabilityStore, admission MCPEndpointAdmission,
+) (*http.ServeMux, *http.Cookie) {
+	return capabilityTestMuxWithPolicy(t, tenantID, userID, role, capabilities, admission,
+		&fakeMCPReadOnlyPolicy{policy: map[string]mcpclient.LocalToolPolicy{
+			"read_market": {ReadOnly: true, Budget: 3},
+		}})
+}
+
+func capabilityTestMuxWithPolicy(t *testing.T, tenantID, userID int64, role types.MembershipRole,
+	capabilities CapabilityStore, admission MCPEndpointAdmission, policy MCPReadOnlyPolicyResolver,
 ) (*http.ServeMux, *http.Cookie) {
 	t.Helper()
 	authStore := newFakeAuthStore()
@@ -103,7 +129,7 @@ func capabilityTestMux(t *testing.T, tenantID, userID int64, role types.Membersh
 	mux := http.NewServeMux()
 	Mount(mux, Deps{
 		Auth: authStore, Principal: auth.NewContextResolver(), Capabilities: capabilities,
-		MCPEndpointAdmission: admission,
+		MCPEndpointAdmission: admission, MCPReadOnlyPolicy: policy,
 	})
 	return mux, &http.Cookie{Name: sessionCookieName, Value: token}
 }
@@ -148,6 +174,25 @@ func skillZIP(t *testing.T, withScript bool) []byte {
 			t.Fatal(createErr)
 		}
 		_, _ = script.Write([]byte("echo never-executed"))
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
+func skillZIPWithFiles(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	for name, content := range files {
+		part, err := writer.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
@@ -232,6 +277,34 @@ func TestSkillUploadRejectsTenantOverrideAndOversizeBeforeStore(t *testing.T) {
 	}
 }
 
+func TestSkillUploadRejectsCredentialMaterialBeforeStore(t *testing.T) {
+	for name, files := range map[string]map[string]string{
+		"github_pat": {
+			"SKILL.md": "---\nname: market-watch\ndescription: Safe watcher\n---\nghp_123456789012345678901234567890",
+		},
+		"jwt_manifest_field": {
+			"SKILL.md": "---\nname: market-watch\ndescription: eyJabcdefghijk.abcdefghijk.abcdefghijk\n---\nInstructions",
+		},
+		"credential_dsn_reference": {
+			"SKILL.md":             "---\nname: market-watch\ndescription: Safe watcher\n---\nInstructions",
+			"references/source.md": "postgres://user:password@db.example/vane",
+		},
+		"general_token": {
+			"SKILL.md": "---\nname: market-watch\ndescription: Safe watcher\n---\ntoken: abcdefghijklmnop",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := &fakeCapabilityStore{}
+			mux, cookie := capabilityTestMux(t, 71, 81, types.MembershipRoleOwner, store, nil)
+			recorder := serveCapabilityRequest(mux,
+				skillUploadRequest(t, "personal", skillZIPWithFiles(t, files), false), cookie)
+			if recorder.Code != http.StatusBadRequest || store.skillInput != nil {
+				t.Fatalf("status=%d stored=%v body=%s", recorder.Code, store.skillInput != nil, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func validMCPRequest() map[string]any {
 	return map[string]any{
 		"visibility": "workspace", "slug": "market-mcp", "display_name": "Market MCP",
@@ -243,16 +316,17 @@ func validMCPRequest() map[string]any {
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 			"annotations":  map[string]any{"readOnlyHint": false},
 		}},
-		"local_read_only_policy": map[string]any{
-			"read_market": map[string]any{"read_only": true, "budget": 3},
-		},
 	}
 }
 
 func TestMCPCreateValidatesEndpointFreezesToolsAndNeverEchoesCredential(t *testing.T) {
 	store := &fakeCapabilityStore{}
 	admission := &fakeMCPAdmission{}
-	mux, cookie := capabilityTestMux(t, 91, 101, types.MembershipRoleAdmin, store, admission)
+	trustedPolicy := &fakeMCPReadOnlyPolicy{policy: map[string]mcpclient.LocalToolPolicy{
+		"read_market": {ReadOnly: true, Budget: 3},
+	}}
+	mux, cookie := capabilityTestMuxWithPolicy(t, 91, 101, types.MembershipRoleAdmin,
+		store, admission, trustedPolicy)
 	body, _ := json.Marshal(validMCPRequest())
 	recorder := serveCapabilityRequest(mux,
 		httptest.NewRequest(http.MethodPost, "/api/capabilities/mcp", bytes.NewReader(body)), cookie)
@@ -261,6 +335,10 @@ func TestMCPCreateValidatesEndpointFreezesToolsAndNeverEchoesCredential(t *testi
 	}
 	if admission.validated != "https://mcp.example.com/v1" || store.mcpInput == nil {
 		t.Fatalf("MCP admission/store not called: validated=%q input=%+v", admission.validated, store.mcpInput)
+	}
+	if trustedPolicy.resolvedURL != "https://mcp.example.com/v1" ||
+		len(trustedPolicy.toolNames) != 1 || trustedPolicy.toolNames[0] != "read_market" {
+		t.Fatalf("trusted policy did not receive frozen endpoint/tool identity: %+v", trustedPolicy)
 	}
 	if store.mcpInput.Connection.CredentialRef != "vault:credential-123" {
 		t.Fatalf("opaque credential ref not preserved internally: %+v", store.mcpInput.Connection)
@@ -275,6 +353,44 @@ func TestMCPCreateValidatesEndpointFreezesToolsAndNeverEchoesCredential(t *testi
 	}
 	if len(catalog.Tools) != 1 || !catalog.Tools[0].Policy.ReadOnly || catalog.Tools[0].Policy.Budget != 3 {
 		t.Fatalf("frozen local policy mismatch: %+v", catalog.Tools)
+	}
+}
+
+func TestMCPCreateRejectsCallerPolicyMissingTrustedPolicyAndSecretPath(t *testing.T) {
+	store := &fakeCapabilityStore{}
+	admission := &fakeMCPAdmission{}
+
+	callerPolicy := validMCPRequest()
+	callerPolicy["local_read_only_policy"] = map[string]any{
+		"read_market": map[string]any{"read_only": true, "budget": 99},
+	}
+	body, _ := json.Marshal(callerPolicy)
+	mux, cookie := capabilityTestMux(t, 91, 101, types.MembershipRoleAdmin, store, admission)
+	recorder := serveCapabilityRequest(mux,
+		httptest.NewRequest(http.MethodPost, "/api/capabilities/mcp", bytes.NewReader(body)), cookie)
+	if recorder.Code != http.StatusBadRequest || store.mcpInput != nil {
+		t.Fatalf("caller policy status=%d stored=%v", recorder.Code, store.mcpInput != nil)
+	}
+
+	store = &fakeCapabilityStore{}
+	body, _ = json.Marshal(validMCPRequest())
+	mux, cookie = capabilityTestMuxWithPolicy(t, 91, 101, types.MembershipRoleAdmin,
+		store, admission, nil)
+	recorder = serveCapabilityRequest(mux,
+		httptest.NewRequest(http.MethodPost, "/api/capabilities/mcp", bytes.NewReader(body)), cookie)
+	if recorder.Code != http.StatusBadRequest || store.mcpInput != nil {
+		t.Fatalf("missing trusted policy status=%d stored=%v", recorder.Code, store.mcpInput != nil)
+	}
+
+	store = &fakeCapabilityStore{}
+	secretPath := validMCPRequest()
+	secretPath["endpoint_url"] = "https://mcp.example.com/sk-1234567890abcdef1234567890abcdef"
+	body, _ = json.Marshal(secretPath)
+	mux, cookie = capabilityTestMux(t, 91, 101, types.MembershipRoleAdmin, store, admission)
+	recorder = serveCapabilityRequest(mux,
+		httptest.NewRequest(http.MethodPost, "/api/capabilities/mcp", bytes.NewReader(body)), cookie)
+	if recorder.Code != http.StatusBadRequest || store.mcpInput != nil {
+		t.Fatalf("secret path status=%d stored=%v", recorder.Code, store.mcpInput != nil)
 	}
 }
 
