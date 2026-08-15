@@ -7,6 +7,10 @@ audit, bootstrap, policy, or their tests.
 - Local release code may read only the Aliyun credentials needed to upload the
   verified Web build directly to OSS and refresh its CDN entries. Server
   production credentials remain outside the checkout behind the VPS broker.
+- Gate/test subprocesses must receive a sanitized environment without release
+  signing paths, broker/SSH state, or Web provider credentials. The no-VM,
+  single-UID Mac does not claim hostile-code isolation; exact merged main is
+  the local trust root.
 - Production requests require exact `origin/main`, a complete signed manifest
   chain, and a complete integrity lock. Unknowns fail closed.
 - Do not add GitHub Actions, VM/container build dependencies, a second Server

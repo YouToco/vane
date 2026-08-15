@@ -35,6 +35,12 @@ the local release command uses local Aliyun credentials to upload the already
 verified `dist/` directly to OSS and refresh CDN entry paths; Web files never
 pass through or reside on the VPS.
 
+The local Mac intentionally uses one ordinary OS account, so same-UID code is
+not claimed as a hostile-code security boundary. Exact merged main is the local
+trust root. Gate subprocesses receive a sanitized environment with no release,
+broker, SSH, or provider credentials; the VPS forced-command broker remains the
+boundary that must withstand a compromised local client.
+
 Controller changes are tested in their introducing release but cannot activate
 themselves. The installed controller revision may advance only after the
 current release is finalized, for use by a later release.

@@ -75,21 +75,27 @@ class BrokerBootstrapTest(unittest.TestCase):
         self.assertLess(forced, execute)
         self.assertIn("/opt/vane-control/releases/", source)
 
-    def test_local_client_is_root_owned_and_uses_only_forced_ssh(self) -> None:
+    def test_local_client_is_user_scoped_and_uses_only_forced_ssh(self) -> None:
         source = CLIENT_INSTALLER.read_text(encoding="utf-8")
         for required in (
-            "broker client install requires root",
-            "/usr/local/libexec/vane-broker-submit",
-            "/etc/vane-broker/client.json",
-            '"BatchMode=yes"',
-            '"IdentitiesOnly=yes"',
-            '"StrictHostKeyChecking=yes"',
-            'f"vane-broker@{host}"',
+            "broker client must be installed by the release user, not root",
+            "local_root=$user_home/.local",
+            "executable_dir=$local_root/libexec",
+            "config_root=$user_home/.config",
+            "config_dir=$config_root/vane",
+            "broker-client.json",
+            "chmod 0600",
+            "install -m 0700",
+            '"identity_file": private_key',
+            '"known_hosts_file": known_hosts',
             "private key must not be group/world accessible",
         ):
             self.assertIn(required, source)
+        self.assertNotIn("sudo", source)
+        self.assertNotIn("/etc/vane-broker", source)
+        self.assertNotIn("/usr/local/libexec/vane-broker-submit", source)
         self.assertNotIn("StrictHostKeyChecking=no", source)
-        self.assertNotIn("vane@{host}", source)
+        self.assertNotIn('"ssh_command"', source)
 
 
 if __name__ == "__main__":

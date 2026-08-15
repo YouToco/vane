@@ -64,6 +64,22 @@ class LocalGatePolicyTests(unittest.TestCase):
         self.assertEqual(
             policy["production_mutation_authority"], "external-root-owned-broker"
         )
+        self.assertEqual(
+            policy["broker_endpoint"], {
+                "host": "188.253.125.238",
+                "port": 10058,
+                "known_hosts_sha256": "755558dd29ed29400289842f639f31856f12eb0c25654a6d9007fd572163e5d3",
+            }
+        )
+        from ops.cli import controller
+        self.assertEqual(
+            policy["broker_endpoint"],
+            {
+                "host": controller.BROKER_HOST,
+                "port": controller.BROKER_PORT,
+                "known_hosts_sha256": controller.BROKER_KNOWN_HOSTS_SHA256,
+            },
+        )
 
 
 if __name__ == "__main__":

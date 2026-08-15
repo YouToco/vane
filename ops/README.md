@@ -63,10 +63,18 @@ root `vane-release.json` commit object. Bounded CDN refresh is followed by
 exact public marker and entrypoint verification. The user does not assemble
 receipts, current-state documents, manifests, or CAS values. Its non-secret
 local runtime is configured with `VANE_WORK_ROOT`, `VANE_RELEASE_SIGNING_KEY`,
-`VANE_RELEASE_SIGNER`, `VANE_ALLOWED_SIGNERS`, and `VANE_BROKER_SUBMIT`.
+`VANE_RELEASE_SIGNER` and `VANE_ALLOWED_SIGNERS`. The broker submitter is the
+user-scoped `~/.local/libexec/vane-broker-submit`; neither the checkout nor an
+environment variable may replace its executable or fixed SSH destination.
 Missing broker installation or signer material fails closed before Server
 mutation. Aliyun credentials remain local and are passed only to the OSS/CDN
 publisher; Server/runtime credentials remain available only to the broker.
+After submission, the exact controller independently queries the policy-pinned
+numeric VPS endpoint through `/usr/bin/ssh` and requires the requested Server
+revision both before and after Web publication. A forged local client success
+cannot authorize Web publication; concurrent Server drift is detected and the
+release is not reported as finalized. Cross-machine serialization remains a
+separate VPS release-lease concern.
 
 `release-receipt.json` is consumed as an exact ten-field object. The durable
 Server `current-release.json` is also parsed strictly and compared by SHA-256 CAS.

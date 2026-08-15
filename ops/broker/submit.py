@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Package and submit one release to the fixed forced-command broker.
 
-This file is installed as a root-owned local helper.  Repository code passes
-only a release directory; the SSH destination and identity remain in the
-installed helper configuration rather than the checkout or process arguments.
+This file is installed into the release user's private local directory.
+Repository code passes only a release directory; the SSH destination and
+identity remain in a mode-0600 configuration outside the checkout. The remote
+forced-command broker, not this unprivileged client, owns production mutation.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import pwd
+import re
 import stat
 import subprocess
 import sys
@@ -27,6 +30,121 @@ ALLOWED_TOP_LEVEL = {
     "submission.json",
 }
 MAX_BYTES = 768 * 1024 * 1024
+HOST = re.compile(r"^[A-Za-z0-9.-]+$")
+KNOWN_HOSTS_SHA256 = "755558dd29ed29400289842f639f31856f12eb0c25654a6d9007fd572163e5d3"
+
+
+def release_user_home() -> Path:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    try:
+        metadata = home.lstat()
+    except OSError as error:
+        raise RuntimeError("release user home is unavailable or unsafe") from error
+    if (
+        not home.is_absolute()
+        or home.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise RuntimeError("release user home is unavailable or unsafe")
+    return home
+
+
+def default_config_path() -> Path:
+    return release_user_home() / ".config" / "vane" / "broker-client.json"
+
+
+def validate_directory_chain(home: Path, parent: Path) -> None:
+    try:
+        relative = parent.relative_to(home)
+    except ValueError as error:
+        raise RuntimeError("broker client configuration is outside account home") from error
+    current = home
+    for part in relative.parts:
+        current = current / part
+        metadata = current.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or current.is_symlink()
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise RuntimeError("broker client configuration path is unsafe")
+    if stat.S_IMODE(parent.lstat().st_mode) != 0o700:
+        raise RuntimeError(
+            "broker client configuration directory must be user-owned mode 0700"
+        )
+
+
+def validate_config_file(path: Path, *, account_home: Path | None = None) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise RuntimeError(
+            "user-scoped broker client configuration is unavailable"
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise RuntimeError("user-scoped broker client configuration is unavailable")
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise RuntimeError("broker client configuration must be user-owned mode 0600")
+    validate_directory_chain(account_home or release_user_home(), path.parent)
+
+
+def validate_credential_file(path: Path, name: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"broker client {name} is unavailable") from error
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise RuntimeError(f"broker client {name} must be a private user-owned file")
+
+
+def fixed_ssh_command(
+    config: dict, *, known_hosts_sha256: str = KNOWN_HOSTS_SHA256
+) -> list[str]:
+    if set(config) != {
+        "schema", "host", "port", "identity_file", "known_hosts_file"
+    } or config.get("schema") != "vane.broker-client/v1":
+        raise RuntimeError("broker client configuration is invalid")
+    host = config["host"]
+    port = config["port"]
+    identity = config["identity_file"]
+    known_hosts = config["known_hosts_file"]
+    if (
+        not isinstance(host, str)
+        or not HOST.fullmatch(host)
+        or host.startswith(".")
+        or host.endswith(".")
+        or isinstance(port, bool)
+        or not isinstance(port, int)
+        or not 1 <= port <= 65535
+        or not isinstance(identity, str)
+        or not isinstance(known_hosts, str)
+    ):
+        raise RuntimeError("broker client configuration is invalid")
+    identity_path = Path(identity)
+    known_hosts_path = Path(known_hosts)
+    validate_credential_file(identity_path, "identity")
+    validate_credential_file(known_hosts_path, "known-hosts file")
+    if hashlib.sha256(known_hosts_path.read_bytes()).hexdigest() != known_hosts_sha256:
+        raise RuntimeError("broker client known-hosts file differs from release policy")
+    return [
+        "/usr/bin/ssh", "-F", "/dev/null", "-T",
+        "-i", str(identity_path), "-p", str(port),
+        "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "ProxyCommand=none", "-o", "ProxyJump=none",
+        "-o", "PermitLocalCommand=no", "-o", "ClearAllForwardings=yes",
+        "-o", f"UserKnownHostsFile={known_hosts_path}",
+        f"vane-broker@{host}",
+    ]
 
 
 def strict_json(path: Path) -> dict:
@@ -108,22 +226,10 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    config_path = Path("/etc/vane-broker/client.json")
-    testing = os.environ.get("VANE_BROKER_CLIENT_TESTING") == "1" and os.geteuid() != 0
-    if testing:
-        config_path = Path(os.environ.get("VANE_BROKER_CLIENT_CONFIG", ""))
-    if config_path.is_symlink() or not config_path.is_file():
-        raise RuntimeError("root-owned broker client configuration is unavailable")
+    config_path = default_config_path()
+    validate_config_file(config_path)
     config = strict_json(config_path)
-    if set(config) != {"schema", "ssh_command"} or config.get("schema") != "vane.broker-client/v1":
-        raise RuntimeError("broker client configuration is invalid")
-    command = config["ssh_command"]
-    if (
-        not isinstance(command, list)
-        or not command
-        or any(not isinstance(item, str) or not item for item in command)
-    ):
-        raise RuntimeError("broker client SSH command is invalid")
+    command = fixed_ssh_command(config)
     status = subprocess.run(
         [*command, "vane-broker status"],
         input=b"{}",

@@ -13,15 +13,20 @@ import argparse
 from datetime import datetime, timezone
 import gzip
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 from typing import Any
+
+from ops.broker import submit as broker_client
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +41,16 @@ MANIFEST_SCHEMA = "vane.ops-manifest/v1"
 STAGES = ("plan", "gate", "artifact", "deploy", "verify", "finalize")
 EXACT_SHA = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
+BROKER_HOST = "188.253.125.238"
+BROKER_PORT = 10058
+BROKER_KNOWN_HOSTS_SHA256 = "755558dd29ed29400289842f639f31856f12eb0c25654a6d9007fd572163e5d3"
+GATE_ENV_ALLOWLIST = {
+    "ALL_PROXY", "DOCKER_CONTEXT", "DOCKER_HOST", "GOCACHE", "GOMODCACHE",
+    "GOPATH", "GOPROXY", "GOROOT", "GOSUMDB", "GOTOOLCHAIN", "HTTP_PROXY",
+    "HTTPS_PROXY", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "NO_PROXY",
+    "PATH", "SHELL", "SSL_CERT_DIR", "SSL_CERT_FILE", "TERM", "TMPDIR",
+    "TMP", "TEMP", "USER", "VANE_TOOL_CACHE",
+}
 CREATED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 EXIT_POLICY = 78
 RELEASE_RECEIPT_SCHEMA = "vane.release-receipt/v1"
@@ -115,49 +130,79 @@ def directory_tree_sha256(root: Path) -> str:
     return hashlib.sha256(canonical_json({"schema": "vane.directory-tree/v1", "files": entries})).hexdigest()
 
 
-def tracked_control_plane_files() -> list[Path]:
+CONTROL_PLANE_PATHS = (
+    "ops", "contracts", "infra", "tools", "server/go.mod", "server/go.sum",
+    "server/internal/testgate",
+)
+
+
+def committed_files(
+    revision: str, pathspecs: tuple[str, ...], *, repository: Path = ROOT
+) -> list[tuple[Path, int, bytes]]:
     result = subprocess.run(
-        [
-            "git", "ls-files", "-z", "--",
-            "ops", "contracts", "infra", "tools",
-            "server/go.mod", "server/go.sum", "server/internal/testgate",
-        ],
-        cwd=ROOT,
+        ["git", "archive", "--format=tar", revision, "--", *pathspecs],
+        cwd=repository,
         capture_output=True,
         check=False,
     )
     if result.returncode != 0:
-        raise PolicyError("cannot enumerate tracked control-plane files")
-    files: list[Path] = []
-    for raw in result.stdout.split(b"\0"):
-        if not raw:
-            continue
-        relative = Path(os.fsdecode(raw))
-        source = ROOT / relative
-        if source.is_symlink() or not source.is_file():
-            raise PolicyError(f"tracked control-plane member is unsafe: {relative}")
-        files.append(relative)
+        raise PolicyError("cannot export exact committed release files")
+    files: list[tuple[Path, int, bytes]] = []
+    seen: set[str] = set()
+    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+        for member in archive.getmembers():
+            relative = PurePosixPath(member.name)
+            if (
+                relative.is_absolute()
+                or any(part in {"", ".", ".."} for part in relative.parts)
+                or member.issym()
+                or member.islnk()
+            ):
+                raise PolicyError("committed release export contains an unsafe member")
+            if member.isdir():
+                continue
+            if not member.isfile() or member.name in seen:
+                raise PolicyError("committed release export member is invalid")
+            seen.add(member.name)
+            source = archive.extractfile(member)
+            if source is None:
+                raise PolicyError("cannot read committed release export member")
+            mode = 0o755 if member.mode & 0o111 else 0o644
+            files.append((Path(member.name), mode, source.read()))
     if not files:
-        raise PolicyError("tracked control-plane inventory is empty")
-    return sorted(files, key=lambda value: value.as_posix())
+        raise PolicyError("committed release export is empty")
+    return sorted(files, key=lambda value: value[0].as_posix())
 
 
-def write_control_plane_archive(output: Path) -> str:
+def export_committed_files(
+    revision: str, destination: Path, pathspecs: tuple[str, ...]
+) -> list[Path]:
+    files = committed_files(revision, pathspecs)
+    for relative, mode, payload in files:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target.write_bytes(payload)
+        target.chmod(mode)
+    return [relative for relative, _, _ in files]
+
+
+def write_control_plane_archive(output: Path, revision: str | None = None) -> str:
+    exact_revision = revision or git_revision("HEAD")
     with output.open("xb") as raw:
         with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
             with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-                for relative in tracked_control_plane_files():
-                    source = ROOT / relative
+                for relative, mode, payload in committed_files(
+                    exact_revision, CONTROL_PLANE_PATHS
+                ):
                     info = tarfile.TarInfo(relative.as_posix())
                     info.uid = 0
                     info.gid = 0
                     info.uname = "root"
                     info.gname = "root"
                     info.mtime = 0
-                    info.mode = source.stat().st_mode & 0o777
-                    info.size = source.stat().st_size
-                    with source.open("rb") as handle:
-                        archive.addfile(info, handle)
+                    info.mode = mode
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
     return sha256_file(output)
 
 
@@ -763,11 +808,104 @@ def broker_required(operation: str) -> int:
     return EXIT_POLICY
 
 
+def default_broker_submit_path() -> Path:
+    release_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    return release_home / ".local" / "libexec" / "vane-broker-submit"
+
+
+def validate_broker_submitter(
+    path: Path, *, account_home: Path | None = None
+) -> None:
+    home = account_home or Path(pwd.getpwuid(os.getuid()).pw_dir)
+    try:
+        relative_parent = path.parent.relative_to(home)
+        home_metadata = home.lstat()
+    except (OSError, ValueError) as error:
+        raise PolicyError("broker submitter is outside the release account home") from error
+    if (
+        home.is_symlink()
+        or not stat.S_ISDIR(home_metadata.st_mode)
+        or home_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(home_metadata.st_mode) & 0o022
+    ):
+        raise PolicyError("release account home is unsafe")
+    current = home
+    for part in relative_parent.parts:
+        current = current / part
+        metadata = current.lstat()
+        if (
+            current.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise PolicyError("broker submitter directory chain is unsafe")
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or sha256_file(path) != sha256_file(ROOT / "ops/broker/submit.py")
+    ):
+        raise PolicyError("broker submitter differs from exact release source")
+
+
+def verify_production_revision(revision: str) -> str:
+    config_path = broker_client.default_config_path()
+    broker_client.validate_config_file(config_path)
+    config = broker_client.strict_json(config_path)
+    if config.get("host") != BROKER_HOST or config.get("port") != BROKER_PORT:
+        raise PolicyError("broker client endpoint differs from exact release policy")
+    if broker_client.KNOWN_HOSTS_SHA256 != BROKER_KNOWN_HOSTS_SHA256:
+        raise PolicyError("broker client known-hosts authority differs from controller")
+    command = broker_client.fixed_ssh_command(config)
+    status = subprocess.run(
+        [*command, "vane-broker status"],
+        input=b"{}",
+        capture_output=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise PolicyError("independent production status verification failed")
+    try:
+        value = json.loads(status.stdout, object_pairs_hook=reject_duplicate_keys)
+    except json.JSONDecodeError as error:
+        raise PolicyError("independent production status returned invalid JSON") from error
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"ok", "verb", "current_digest", "server_revision"}
+        or value.get("ok") is not True
+        or value.get("verb") != "status"
+        or value.get("server_revision") != revision
+        or not isinstance(value.get("current_digest"), str)
+        or not DIGEST.fullmatch(value["current_digest"])
+    ):
+        raise PolicyError("independent production status differs from released revision")
+    return value["current_digest"]
+
+
+def sanitized_gate_environment(
+    source: dict[str, str], *, gate_home: Path, release_root: Path,
+    gate_evidence: Path, rollback_base: str,
+) -> dict[str, str]:
+    result = {
+        name: value for name, value in source.items() if name in GATE_ENV_ALLOWLIST
+    }
+    result.update({
+        "HOME": str(gate_home),
+        "VANE_WORK_ROOT": str(release_root),
+        "VANE_FULL_GATE_EVIDENCE": str(gate_evidence),
+        "VANE_ROLLBACK_BASE_SHA": rollback_base,
+    })
+    return result
+
+
 def require_release_runtime() -> tuple[Path, Path, str, Path]:
     work_root = Path(os.environ.get("VANE_WORK_ROOT", ""))
     signing_key = Path(os.environ.get("VANE_RELEASE_SIGNING_KEY", ""))
     signer = os.environ.get("VANE_RELEASE_SIGNER", "").strip()
-    broker_submit = Path(os.environ.get("VANE_BROKER_SUBMIT", ""))
+    broker_submit = default_broker_submit_path()
     for name, path, executable in (
         ("VANE_WORK_ROOT", work_root, False),
         ("VANE_RELEASE_SIGNING_KEY", signing_key, False),
@@ -779,6 +917,7 @@ def require_release_runtime() -> tuple[Path, Path, str, Path]:
             valid = valid and os.access(path, os.X_OK)
         if not valid:
             raise PolicyError(f"{name} must name a safe existing absolute path")
+    validate_broker_submitter(broker_submit)
     if not signer or not signer.isascii() or any(char.isspace() for char in signer):
         raise PolicyError("VANE_RELEASE_SIGNER must be a non-empty ASCII principal")
     return work_root, signing_key, signer, broker_submit
@@ -960,27 +1099,36 @@ def build_release_submission(
         if binary.is_symlink() or not binary.is_file():
             raise PolicyError(f"unsafe full-gate binary: {binary}")
         shutil.copy2(binary, source / "server/bin" / binary.name)
-    shutil.copytree(ROOT / "infra/production", source / "infra/production", symlinks=False)
+    if directory_tree_sha256(source / "server/bin") != gate["binary_tree_sha256"]:
+        raise PolicyError("copied binary tree differs from full Gate evidence")
+    committed_source = handoff / "committed-source"
+    export_committed_files(revision, committed_source, CONTROL_PLANE_PATHS)
+    committed_infra = committed_source / "infra/production"
+    if directory_tree_sha256(committed_infra) != gate["infra_tree_sha256"]:
+        raise PolicyError("committed infra tree differs from full Gate evidence")
+    shutil.copytree(
+        committed_infra, source / "infra/production", symlinks=False
+    )
     artifacts = handoff / "artifacts"
     backend_pack = artifacts / "backend-pack"
     backend_payload = artifacts / "backend-payload"
     controller_archive = artifacts / f"controller-{revision}.tar.gz"
     run_id = str(int(datetime.now(timezone.utc).timestamp() * 1_000_000))
-    artifact_tool = ROOT / "ops/release/artifact.py"
+    artifact_tool = committed_source / "ops/release/artifact.py"
     run_checked(
         [sys.executable, str(artifact_tool), "pack", "--component", "backend",
          "--sha", revision, "--source", str(source), "--output", str(backend_pack),
          "--server-release-contract", "vane.server-release-contract/v2 primary_store=owner_compat_v1 research_control_store=restricted_v1 research_store=restricted_v1",
          "--control-plane-revision", revision, "--deploy-run-id", run_id,
          "--build-run-attempt", "1"],
-        cwd=ROOT,
+        cwd=committed_source,
     )
-    write_control_plane_archive(controller_archive)
+    write_control_plane_archive(controller_archive, revision)
     run_checked(
         [sys.executable, str(artifact_tool), "validate", "--component", "backend",
          "--sha", revision, "--input", str(backend_pack), "--output", str(backend_payload),
          "--control-plane-revision", revision, "--deploy-run-id", run_id],
-        cwd=ROOT,
+        cwd=committed_source,
     )
     manifests = handoff / "manifests"
     manifests.mkdir()
@@ -1113,6 +1261,12 @@ def publish_web_after_server(
 
 
 def command_release(args: argparse.Namespace) -> int:
+    if (
+        args.lock != DEFAULT_LOCK
+        or args.policy != DEFAULT_POLICY
+        or args.allowed_signers != DEFAULT_SIGNERS
+    ):
+        raise PolicyError("release authorities must be the exact repository defaults")
     assert_origin_main(args.sha)
     if git_revision("HEAD") != args.sha:
         raise PolicyError("release checkout is not the requested exact origin/main")
@@ -1154,27 +1308,23 @@ def command_release(args: argparse.Namespace) -> int:
         raise PolicyError(f"release evidence path already exists: {release_root}")
     release_root.mkdir(mode=0o700)
     gate_evidence = release_root / "full-gate.json"
-    prior_work_root = os.environ.get("VANE_WORK_ROOT")
-    prior_gate_evidence = os.environ.get("VANE_FULL_GATE_EVIDENCE")
-    prior_rollback_base = os.environ.get("VANE_ROLLBACK_BASE_SHA")
-    os.environ["VANE_WORK_ROOT"] = str(release_root)
-    os.environ["VANE_FULL_GATE_EVIDENCE"] = str(gate_evidence)
-    os.environ["VANE_ROLLBACK_BASE_SHA"] = rollback_base
+    gate_home = release_root / "gate-home"
+    gate_home.mkdir(mode=0o700)
+    prior_environment = dict(os.environ)
+    gate_environment = sanitized_gate_environment(
+        prior_environment,
+        gate_home=gate_home,
+        release_root=release_root,
+        gate_evidence=gate_evidence,
+        rollback_base=rollback_base,
+    )
+    os.environ.clear()
+    os.environ.update(gate_environment)
     try:
         command_full(argparse.Namespace(sha=args.sha))
     finally:
-        if prior_work_root is None:
-            os.environ.pop("VANE_WORK_ROOT", None)
-        else:
-            os.environ["VANE_WORK_ROOT"] = prior_work_root
-        if prior_gate_evidence is None:
-            os.environ.pop("VANE_FULL_GATE_EVIDENCE", None)
-        else:
-            os.environ["VANE_FULL_GATE_EVIDENCE"] = prior_gate_evidence
-        if prior_rollback_base is None:
-            os.environ.pop("VANE_ROLLBACK_BASE_SHA", None)
-        else:
-            os.environ["VANE_ROLLBACK_BASE_SHA"] = prior_rollback_base
+        os.environ.clear()
+        os.environ.update(prior_environment)
     if gate_evidence.is_symlink() or not gate_evidence.is_file():
         raise PolicyError("local exact-SHA full gate returned no evidence")
     submission = build_release_submission(
@@ -1184,9 +1334,11 @@ def command_release(args: argparse.Namespace) -> int:
     submitted = subprocess.run([str(broker_submit), str(submission)], check=False)
     if submitted.returncode != 0:
         raise PolicyError(f"broker submission failed with exit {submitted.returncode}")
+    verify_production_revision(args.sha)
     web_result = publish_web_after_server(
         revision=args.sha, release_root=release_root, gate_evidence=gate_evidence
     )
+    verify_production_revision(args.sha)
     print(json.dumps({
         "revision": args.sha,
         "server_submission": str(submission),
@@ -1360,10 +1512,12 @@ def parser() -> argparse.ArgumentParser:
         "release", help="preflight, gate, build, sign, and submit one exact release"
     )
     release.add_argument("--sha", type=exact_sha, required=True)
-    release.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
-    release.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
-    release.add_argument("--allowed-signers", type=Path, default=DEFAULT_SIGNERS)
-    release.set_defaults(handler=command_release)
+    release.set_defaults(
+        handler=command_release,
+        lock=DEFAULT_LOCK,
+        policy=DEFAULT_POLICY,
+        allowed_signers=DEFAULT_SIGNERS,
+    )
 
     status = commands.add_parser("status", help="read local release evidence")
     status_inputs = status.add_mutually_exclusive_group()

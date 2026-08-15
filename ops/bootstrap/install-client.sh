@@ -2,8 +2,8 @@
 set -euo pipefail
 umask 077
 
-[[ $(id -u) -eq 0 ]] || {
-  echo "broker client install requires root" >&2
+[[ $(id -u) -ne 0 ]] || {
+  echo "broker client must be installed by the release user, not root" >&2
   exit 1
 }
 [[ $# -eq 4 ]] || {
@@ -41,39 +41,77 @@ private_mode=$(stat -f '%Lp' "$private_key" 2>/dev/null || stat -c '%a' "$privat
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 submitter=$(cd -- "$script_dir/../broker" && pwd -P)/submit.py
+policy=$(cd -- "$script_dir/../policy" && pwd -P)/release-policy.json
 [[ -f $submitter && ! -L $submitter ]] || {
   echo "broker submitter source is unavailable" >&2
   exit 1
 }
-root_group=$(id -gn 0)
-install -d -o root -g "$root_group" -m 0755 /usr/local/libexec
-install -o root -g "$root_group" -m 0755 \
-  "$submitter" /usr/local/libexec/vane-broker-submit
-install -d -o root -g "$root_group" -m 0755 /etc/vane-broker
-config=$(mktemp /etc/vane-broker/.client.XXXXXX)
-python3 - "$private_key" "$broker_host" "$broker_port" "$known_hosts" >"$config" <<'PY'
+python3 - "$policy" "$broker_host" "$broker_port" "$known_hosts" <<'PY'
+import hashlib
+import json
+import sys
+
+policy_path, host, port, known_hosts = sys.argv[1:]
+with open(policy_path, encoding="utf-8") as handle:
+    policy = json.load(handle)
+endpoint = policy.get("broker_endpoint")
+if not isinstance(endpoint, dict):
+    raise SystemExit("release policy lacks broker endpoint")
+with open(known_hosts, "rb") as handle:
+    known_hosts_sha256 = hashlib.sha256(handle.read()).hexdigest()
+if endpoint != {
+    "host": host,
+    "port": int(port),
+    "known_hosts_sha256": known_hosts_sha256,
+}:
+    raise SystemExit("broker endpoint differs from exact release policy")
+PY
+
+user_home=$(python3 - <<'PY'
+import os
+import pwd
+
+print(pwd.getpwuid(os.getuid()).pw_dir)
+PY
+)
+[[ $user_home == /* && -d $user_home && ! -L $user_home ]] || {
+  echo "release user home is unavailable or unsafe" >&2
+  exit 1
+}
+local_root=$user_home/.local
+executable_dir=$local_root/libexec
+config_root=$user_home/.config
+config_dir=$config_root/vane
+for path in "$local_root" "$executable_dir" "$config_root" "$config_dir"; do
+  [[ ! -L $path ]] || {
+    echo "broker client install directory must not be a symlink: $path" >&2
+    exit 1
+  }
+done
+install -d -m 0700 "$executable_dir" "$config_dir"
+chmod 0700 "$executable_dir" "$config_dir"
+
+installed_submitter=$executable_dir/vane-broker-submit
+submitter_temp=$(mktemp "$executable_dir/.vane-broker-submit.XXXXXX")
+install -m 0700 "$submitter" "$submitter_temp"
+mv -f "$submitter_temp" "$installed_submitter"
+
+config_temp=$(mktemp "$config_dir/.broker-client.XXXXXX")
+python3 - "$private_key" "$broker_host" "$broker_port" "$known_hosts" >"$config_temp" <<'PY'
 import json
 import sys
 
 private_key, host, port, known_hosts = sys.argv[1:]
 value = {
     "schema": "vane.broker-client/v1",
-    "ssh_command": [
-        "/usr/bin/ssh",
-        "-T",
-        "-i", private_key,
-        "-p", port,
-        "-o", "BatchMode=yes",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={known_hosts}",
-        f"vane-broker@{host}",
-    ],
+    "host": host,
+    "port": int(port),
+    "identity_file": private_key,
+    "known_hosts_file": known_hosts,
 }
 print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 PY
-chown root:"$root_group" "$config"
-chmod 0644 "$config"
-mv -f "$config" /etc/vane-broker/client.json
+chmod 0600 "$config_temp"
+mv -f "$config_temp" "$config_dir/broker-client.json"
 
-echo "root-owned local broker client installed"
+echo "user-scoped broker client installed: $installed_submitter"
