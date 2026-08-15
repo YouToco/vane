@@ -15,6 +15,11 @@ import (
 // CallMeta 是一次调用的记账元信息，由业务层（feishu handler 等）填写。
 type CallMeta struct {
 	TraceID string
+	// PolicyManifestPayload/Digest bind this model call to the exact compiled
+	// interactive policy. They are optional for non-interactive legacy calls
+	// and must be supplied as an exact pair.
+	PolicyManifestPayload string
+	PolicyManifestDigest  string
 	// TenantID is required with QuotaRule and pins both financial accounting
 	// and the llm_calls receipt to the prepared run's tenant.
 	TenantID *int64
@@ -138,19 +143,21 @@ func do(
 	resp, err := c.Complete(ctx, req)
 
 	call := &types.LLMCall{
-		RunSnapshotID: runSnapshotAttribution(ctx),
-		TenantID:      meta.TenantID,
-		TraceID:       meta.TraceID,
-		SpanName:      meta.SpanName,
-		UserID:        meta.UserID,
-		RefType:       meta.RefType,
-		RefID:         meta.RefID,
-		Provider:      c.provider,
-		Model:         c.requestModel(req.Model), // 成功路径下面会覆盖为上游回报的实际模型名
-		SystemPrompt:  req.System,
-		UserPrompt:    req.User,
-		Temperature:   req.Temperature,
-		MaxTokens:     req.MaxTokens,
+		RunSnapshotID:         runSnapshotAttribution(ctx),
+		TenantID:              meta.TenantID,
+		TraceID:               meta.TraceID,
+		SpanName:              meta.SpanName,
+		UserID:                meta.UserID,
+		RefType:               meta.RefType,
+		RefID:                 meta.RefID,
+		Provider:              c.provider,
+		Model:                 c.requestModel(req.Model), // 成功路径下面会覆盖为上游回报的实际模型名
+		SystemPrompt:          req.System,
+		UserPrompt:            req.User,
+		Temperature:           req.Temperature,
+		MaxTokens:             req.MaxTokens,
+		PolicyManifestPayload: meta.PolicyManifestPayload,
+		PolicyManifestDigest:  meta.PolicyManifestDigest,
 	}
 
 	if resp != nil {

@@ -20,6 +20,7 @@ import (
 
 	"github.com/YouToco/vane/server/a2a"
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/agentpolicy"
 	"github.com/YouToco/vane/server/api"
 	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/cardgen"
@@ -755,12 +756,15 @@ func run() error {
 		authorizer, endpoints, exaTools,
 	)
 	agentLoop, err := agent.NewChecked(agent.Deps{
-		Client:           agentLLMClient,
-		Recorder:         recorder,
-		Store:            st,
-		Profiles:         st,
-		Tools:            tools,
-		Model:            cfg.LLM.AgentModel,
+		Client:   agentLLMClient,
+		Recorder: recorder,
+		Store:    st,
+		Profiles: st,
+		Tools:    tools,
+		Policy: func() *agentpolicy.DefinitionV1 {
+			policy := agentpolicy.CurrentOwnerV1(cfg.LLM.Provider, cfg.LLM.AgentModel)
+			return &policy
+		}(),
 		MaxTurns:         cfg.Agent.MaxTurns,
 		SessionTTL:       time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
 		SessionAdmission: sessionAdmission,
@@ -791,13 +795,15 @@ func run() error {
 		}
 		var loopErr error
 		a2aLoop, loopErr = agent.NewChecked(agent.Deps{
-			Client:       agentLLMClient,
-			Recorder:     recorder,
-			Tools:        a2aTools,
-			Model:        cfg.LLM.AgentModel,
-			MaxTurns:     cfg.Agent.MaxTurns,
-			SystemPrompt: a2a.ChatSystemPrompt,
-			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
+			Client:   agentLLMClient,
+			Recorder: recorder,
+			Tools:    a2aTools,
+			Policy: func() *agentpolicy.DefinitionV1 {
+				policy := agentpolicy.CurrentA2AV1(cfg.LLM.Provider, cfg.LLM.AgentModel)
+				return &policy
+			}(),
+			MaxTurns:  cfg.Agent.MaxTurns,
+			ToolCalls: agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
 		})
 		if loopErr != nil {
 			closeServerStartupResources(temporalClient.Close, closeStores)
