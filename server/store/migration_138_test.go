@@ -1,0 +1,479 @@
+package store
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/YouToco/vane/server/internal/testgate"
+	"github.com/YouToco/vane/server/types"
+)
+
+func TestMigration138WorkspaceMemoryContract(t *testing.T) {
+	payload, err := migrationsFS.ReadFile("migrations/138_workspace_long_term_memory.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := string(payload)
+	for _, want := range []string{
+		"CREATE TABLE workspace_memory_authorizations",
+		"CREATE TABLE workspace_memory_records",
+		"CREATE TABLE workspace_memory_events",
+		"CREATE TABLE workspace_memory_receipts",
+		"FORCE ROW LEVEL SECURITY", "vane_workspace_memory_editor",
+		"owner_explicit_agent_turn", "refusing downgrade while retained workspace memory exists",
+	} {
+		if !strings.Contains(sqlText, want) {
+			t.Errorf("migration 138 missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"FROM memory_records", "JOIN memory_records", "UPDATE workspace_memory_records",
+		"DELETE ON workspace_memory", "GRANT UPDATE ON workspace_memory_records",
+	} {
+		if strings.Contains(sqlText, forbidden) {
+			t.Errorf("migration 138 violates independent append-only ledger: %q", forbidden)
+		}
+	}
+	workspaceStore, err := os.ReadFile("workspace_memory.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lock := range []string{"FOR KEY SHARE OF m,t", "FOR UPDATE OF m,t",
+		"pg_catalog.pg_advisory_xact_lock_shared", "pg_catalog.pg_advisory_xact_lock"} {
+		if !strings.Contains(string(workspaceStore), lock) {
+			t.Errorf("workspace memory admission missing %q", lock)
+		}
+	}
+}
+
+func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		testgate.Database(t)
+	}
+	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
+	t.Cleanup(drop)
+	if _, err := provider.UpTo(t.Context(), 138); err != nil {
+		t.Fatal(err)
+	}
+
+	creator := migration138User(t, database, "creator")
+	member := migration138User(t, database, "member")
+	admin := migration138User(t, database, "admin")
+	outsider := migration138User(t, database, "outsider")
+	team := migration138Workspace(t, database, "team", "team", nil)
+	otherTeam := migration138Workspace(t, database, "other", "team", nil)
+	personal := migration138Workspace(t, database, "personal", "personal", &creator)
+	for _, membership := range []struct {
+		tenant, user int64
+		role         string
+	}{
+		{team, creator, "member"}, {team, member, "member"},
+		{team, admin, "admin"}, {otherTeam, outsider, "owner"},
+		{personal, creator, "owner"},
+	} {
+		if _, err := database.ExecContext(t.Context(), `INSERT INTO memberships(
+			tenant_id,user_id,role) VALUES($1,$2,$3)`, membership.tenant,
+			membership.user, membership.role); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sessions := map[int64]int64{}
+	for _, pair := range []struct{ tenant, user int64 }{
+		{team, creator}, {team, member}, {team, admin},
+		{otherTeam, outsider}, {personal, creator},
+	} {
+		var sessionID int64
+		if err := database.QueryRowContext(t.Context(), `INSERT INTO agent_sessions(
+			tenant_id,user_id) VALUES($1,$2) RETURNING id`, pair.tenant, pair.user).
+			Scan(&sessionID); err != nil {
+			t.Fatal(err)
+		}
+		sessions[pair.tenant<<32|pair.user] = sessionID
+	}
+
+	st, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	teamPersonalAction := migration138Action(
+		types.MemoryActionRemember, 0, "must-not-enter-personal-ledger")
+	if _, err := st.PrepareMemoryAuthorization(t.Context(), team, creator,
+		sessions[team<<32|creator], teamPersonalAction); types.CodeOf(err) != types.CodeForbidden {
+		t.Fatalf("personal ledger accepted team workspace code=%s err=%v",
+			types.CodeOf(err), err)
+	}
+
+	// Personal v129 data exists for the same account but must never enter the
+	// team's corpus, even when the query exactly matches it.
+	personalAction := migration138Action(types.MemoryActionRemember, 0, "personal-only-zebra")
+	personalAuth, err := st.PrepareMemoryAuthorization(
+		t.Context(), personal, creator, sessions[personal<<32|creator], personalAction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalAction.Evidence.AuthorizationID = personalAuth
+	if _, err := st.ApplyMemoryAction(t.Context(), personal, creator,
+		strings.Repeat("1", 64), personalAction); err != nil {
+		t.Fatal(err)
+	}
+
+	remember := migration138Action(types.MemoryActionRemember, 0, "team-shared-orbit")
+	remembered := migration138Apply(t, st, team, creator,
+		sessions[team<<32|creator], strings.Repeat("2", 64), remember)
+	if remembered.Memory.CreatorUserID != creator {
+		t.Fatalf("creator=%d want=%d", remembered.Memory.CreatorUserID, creator)
+	}
+	recall, err := st.RecallWorkspaceMemories(t.Context(), team, member,
+		types.MemoryRecallQuery{Query: "team shared orbit", Limit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recall.Memories) != 1 || recall.Memories[0].Memory.ID != remembered.Memory.ID {
+		t.Fatalf("member recall=%+v", recall)
+	}
+	personalLeak, err := st.RecallWorkspaceMemories(t.Context(), team, member,
+		types.MemoryRecallQuery{Query: "personal only zebra", Limit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(personalLeak.Memories) != 0 {
+		t.Fatalf("team recall leaked personal memory: %+v", personalLeak)
+	}
+	other, err := st.RecallWorkspaceMemories(t.Context(), otherTeam, outsider,
+		types.MemoryRecallQuery{Query: "team shared orbit", Limit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other.Memories) != 0 {
+		t.Fatalf("cross-workspace recall leaked: %+v", other)
+	}
+
+	// A non-admin member cannot forget another member's memory. Failed actions
+	// leave their authorization unconsumed and append no event.
+	forget := migration138Action(types.MemoryActionForget, remembered.Memory.ID, "")
+	if _, err := st.PrepareWorkspaceMemoryAuthorization(
+		t.Context(), team, member, sessions[team<<32|member], forget); types.CodeOf(err) != types.CodeForbidden {
+		t.Fatalf("member forget code=%s err=%v", types.CodeOf(err), err)
+	}
+
+	// Creator correction is allowed. An Admin may correct it again, but the
+	// replacement still belongs to the original creator rather than the actor.
+	correct := migration138Action(types.MemoryActionCorrect, remembered.Memory.ID,
+		"team-shared-orbit-corrected")
+	corrected := migration138Apply(t, st, team, creator,
+		sessions[team<<32|creator], strings.Repeat("4", 64), correct)
+	adminCorrect := migration138Action(types.MemoryActionCorrect, corrected.Memory.ID,
+		"team-shared-orbit-admin-corrected")
+	adminCorrected := migration138Apply(t, st, team, admin,
+		sessions[team<<32|admin], strings.Repeat("5", 64), adminCorrect)
+	if adminCorrected.Memory.CreatorUserID != creator {
+		t.Fatalf("admin correction changed creator=%d want=%d",
+			adminCorrected.Memory.CreatorUserID, creator)
+	}
+	adminForget := migration138Action(types.MemoryActionForget, adminCorrected.Memory.ID, "")
+	migration138Apply(t, st, team, admin, sessions[team<<32|admin],
+		strings.Repeat("6", 64), adminForget)
+	afterForget, err := st.RecallWorkspaceMemories(t.Context(), team, creator,
+		types.MemoryRecallQuery{Query: "orbit corrected", Limit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterForget.Memories) != 0 {
+		t.Fatalf("forgotten record remained in BM25 corpus: %+v", afterForget)
+	}
+
+	// A durable authorization freezes the membership role. Changing the role
+	// between Prepare and Apply makes the old authorization invisible/invalid;
+	// it is not silently upgraded to the actor's new authority.
+	driftBase := migration138Apply(t, st, team, creator,
+		sessions[team<<32|creator], strings.Repeat("7", 64),
+		migration138Action(types.MemoryActionRemember, 0, "role-drift-boundary"))
+	drift := migration138Action(types.MemoryActionCorrect, driftBase.Memory.ID,
+		"role-drift-must-not-apply")
+	driftAuth, err := st.PrepareWorkspaceMemoryAuthorization(t.Context(), team,
+		creator, sessions[team<<32|creator], drift)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drift.Evidence.AuthorizationID = driftAuth
+	if _, err := st.ApplyWorkspaceMemoryAction(t.Context(), team, member,
+		strings.Repeat("8", 64), drift); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("cross-actor authorization replay code=%s err=%v", types.CodeOf(err), err)
+	}
+	wrongTarget := drift
+	wrongTarget.MemoryID = remembered.Memory.ID
+	if _, err := st.ApplyWorkspaceMemoryAction(t.Context(), team, creator,
+		strings.Repeat("9", 64), wrongTarget); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("target-bound authorization replay code=%s err=%v", types.CodeOf(err), err)
+	}
+	wrongAction := drift
+	wrongAction.Action = types.MemoryActionForget
+	wrongAction.Text = ""
+	if _, err := st.ApplyWorkspaceMemoryAction(t.Context(), team, creator,
+		strings.Repeat("a", 64), wrongAction); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("action-bound authorization replay code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := database.ExecContext(t.Context(), `UPDATE memberships SET role='admin'
+		WHERE tenant_id=$1 AND user_id=$2`, team, creator); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyWorkspaceMemoryAction(t.Context(), team, creator,
+		strings.Repeat("b", 64), drift); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("role-drift apply code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := database.ExecContext(t.Context(), `UPDATE memberships SET role='member'
+		WHERE tenant_id=$1 AND user_id=$2`, team, creator); err != nil {
+		t.Fatal(err)
+	}
+	var consumed *int64
+	if err := database.QueryRowContext(t.Context(), `SELECT consumed_event_id
+		FROM workspace_memory_authorizations WHERE tenant_id=$1 AND id=$2`,
+		team, driftAuth).Scan(&consumed); err != nil {
+		t.Fatal(err)
+	}
+	if consumed != nil {
+		t.Fatalf("role-drift authorization consumed event=%d", *consumed)
+	}
+
+	// The admission key is workspace-wide rather than actor-wide: a member's
+	// recall must wait behind an exclusive writer lock acquired by another actor.
+	lockTx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTx.ExecContext(t.Context(), `SELECT pg_advisory_xact_lock(
+		hashtextextended('vane.workspace_memory:' || ($1::bigint)::text,0))`, team); err != nil {
+		t.Fatal(err)
+	}
+	recallDone := make(chan error, 1)
+	go func() {
+		_, recallErr := st.RecallWorkspaceMemories(t.Context(), team, member,
+			types.MemoryRecallQuery{Query: "role drift boundary", Limit: 8})
+		recallDone <- recallErr
+	}()
+	select {
+	case recallErr := <-recallDone:
+		t.Fatalf("cross-actor recall bypassed exclusive admission: %v", recallErr)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := lockTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case recallErr := <-recallDone:
+		if recallErr != nil {
+			t.Fatal(recallErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cross-actor recall did not resume after admission release")
+	}
+
+	// Mutation proof: a SELECT with its application tenant predicate removed is
+	// still exact-tenant under FORCE RLS; append-only tables expose no mutation.
+	tx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(t.Context(), `SELECT set_config('app.tenant_id',$1,true),
+		set_config('app.user_id',$2,true),set_config('app.membership_role','member',true),
+		set_config('app.workspace_kind','team',true)`, fmt.Sprint(team), fmt.Sprint(member)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), `SET LOCAL ROLE vane_workspace_memory_editor`); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := tx.QueryRowContext(t.Context(), `SELECT count(*) FROM workspace_memory_records`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	var retained int
+	if err := database.QueryRowContext(t.Context(), `SELECT count(*)
+		FROM workspace_memory_records WHERE tenant_id=$1`, team).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if count != retained {
+		t.Fatalf("tenant-scoped retained records=%d want=%d", count, retained)
+	}
+	var canUpdate, canDelete bool
+	if err := tx.QueryRowContext(t.Context(), `SELECT
+		has_table_privilege(current_user,'workspace_memory_records','UPDATE'),
+		has_table_privilege(current_user,'workspace_memory_events','DELETE')`).Scan(
+		&canUpdate, &canDelete); err != nil {
+		t.Fatal(err)
+	}
+	if canUpdate || canDelete {
+		t.Fatalf("append-only authority update=%t delete=%t", canUpdate, canDelete)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var workspaceRole bool
+	if err := database.QueryRowContext(t.Context(), `SELECT EXISTS(
+		SELECT 1 FROM pg_auth_members edge
+		JOIN pg_roles role ON role.oid=edge.roleid
+		JOIN pg_roles member ON member.oid=edge.member
+		WHERE role.rolname='vane_workspace_memory_editor'
+		  AND member.rolname='vane_server_runtime')`).Scan(
+		&workspaceRole); err != nil {
+		t.Fatal(err)
+	}
+	if workspaceRole {
+		t.Fatal("plain migration Up granted workspace capability to runtime")
+	}
+	var policyContract string
+	if err := database.QueryRowContext(t.Context(), `SELECT md5(string_agg(
+		relation.relname||'|'||policy.polname||'|'||policy.polpermissive::text||'|'||
+		policy.polcmd::text||'|'||
+		pg_get_expr(policy.polqual,policy.polrelid)||'|'||
+		pg_get_expr(policy.polwithcheck,policy.polrelid),E'\n' ORDER BY relation.relname))
+		FROM pg_policy policy JOIN pg_class relation ON relation.oid=policy.polrelid
+		WHERE relation.relname LIKE 'workspace_memory_%'`).Scan(&policyContract); err != nil {
+		t.Fatal(err)
+	}
+	if policyContract != "389e9ba5523797661dea5f127048269f" {
+		t.Fatalf("workspace memory policy contract=%s", policyContract)
+	}
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatalf("provision v138 runtime: %v", err)
+	}
+	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatalf("replay provision v138 runtime: %v", err)
+	}
+	if err := database.QueryRowContext(t.Context(), `SELECT pg_has_role(
+		'vane_server_runtime','vane_workspace_memory_editor','MEMBER')`).Scan(
+		&workspaceRole); err != nil {
+		t.Fatal(err)
+	}
+	if !workspaceRole {
+		t.Fatal("v138 provisioner omitted workspace memory capability")
+	}
+	var edgeCount int
+	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_auth_members edge
+		JOIN pg_roles role ON role.oid=edge.roleid
+		JOIN pg_roles member ON member.oid=edge.member
+		WHERE role.rolname='vane_workspace_memory_editor'
+		  AND member.rolname='vane_server_runtime'
+		  AND NOT edge.admin_option AND NOT edge.inherit_option AND edge.set_option`).Scan(
+		&edgeCount); err != nil {
+		t.Fatal(err)
+	}
+	if edgeCount != 1 {
+		t.Fatalf("workspace runtime edge count=%d want=1", edgeCount)
+	}
+
+	// Startup validation rejects shared-object authority and any policy
+	// replacement, including a superficially valid policy name/role with true
+	// predicates. These are mutation proofs for the exact verifier.
+	runtimePassword := "migration-138-runtime-password"
+	if _, err := database.ExecContext(t.Context(), `ALTER ROLE vane_server_runtime
+		LOGIN PASSWORD '`+runtimePassword+`'`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = database.ExecContext(t.Context(),
+			`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
+	})
+	runtimeURL := serverRuntimeTestURL(t, scratchURL, runtimePassword)
+	baseline, err := NewServerRuntime(t.Context(), runtimeURL)
+	if err != nil {
+		t.Fatalf("exact v138 runtime rejected: %v", err)
+	}
+	baseline.Close()
+	if _, err := database.ExecContext(t.Context(), `DO $$ BEGIN EXECUTE format(
+		'GRANT CONNECT ON DATABASE %I TO vane_workspace_memory_editor',current_database()); END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if mutated, err := NewServerRuntime(t.Context(), runtimeURL); err == nil {
+		mutated.Close()
+		t.Fatal("runtime accepted unexpected database CONNECT authority")
+	}
+	if _, err := database.ExecContext(t.Context(), `DO $$ BEGIN EXECUTE format(
+		'REVOKE CONNECT ON DATABASE %I FROM vane_workspace_memory_editor',current_database()); END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if repaired, err := NewServerRuntime(t.Context(), runtimeURL); err != nil {
+		t.Fatalf("runtime stayed rejected after CONNECT repair: %v", err)
+	} else {
+		repaired.Close()
+	}
+	if _, err := database.ExecContext(t.Context(), `DROP POLICY workspace_memory_record_tenant
+		ON workspace_memory_records;
+		CREATE POLICY workspace_memory_record_tenant ON workspace_memory_records
+		TO vane_workspace_memory_editor USING(true) WITH CHECK(true)`); err != nil {
+		t.Fatal(err)
+	}
+	if mutated, err := NewServerRuntime(t.Context(), runtimeURL); err == nil {
+		mutated.Close()
+		t.Fatal("runtime accepted USING(true)/WITH CHECK(true) policy mutation")
+	}
+	if _, err := database.ExecContext(t.Context(),
+		`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
+		t.Fatalf("deprovision v138 runtime: %v", err)
+	}
+}
+
+func migration138Apply(t *testing.T, st *Store, tenantID, actorID, sessionID int64,
+	key string, action types.MemoryAction) *types.MemoryActionResult {
+	t.Helper()
+	authorizationID, err := st.PrepareWorkspaceMemoryAuthorization(
+		t.Context(), tenantID, actorID, sessionID, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action.Evidence.AuthorizationID = authorizationID
+	result, err := st.ApplyWorkspaceMemoryAction(
+		t.Context(), tenantID, actorID, key, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func migration138Action(kind string, memoryID int64, text string) types.MemoryAction {
+	return types.MemoryAction{Action: kind, MemoryID: memoryID, Text: text,
+		Evidence: types.MemoryEvidence{
+			SourceType: types.MemoryEvidenceOwnerExplicitAgentTurn,
+			SourceID:   uuid.NewString(), OwnerRequest: "明确写入团队记忆",
+			AuthorizationDigest: strings.Repeat("a", 64),
+		}}
+}
+
+func migration138User(t *testing.T, database *sql.DB, suffix string) int64 {
+	t.Helper()
+	var id int64
+	if err := database.QueryRowContext(t.Context(), `INSERT INTO users(
+		feishu_open_id,name) VALUES($1,$1) RETURNING id`,
+		"migration-138-"+suffix+"-"+uuid.NewString()).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func migration138Workspace(t *testing.T, database *sql.DB, name, kind string,
+	personalOwner *int64) int64 {
+	t.Helper()
+	var id int64
+	seatLimit := 5
+	if kind == "personal" {
+		seatLimit = 1
+	}
+	if err := database.QueryRowContext(t.Context(), `INSERT INTO tenants(
+		status,plan,display_name,workspace_kind,personal_owner_user_id,seat_limit)
+		VALUES('active','free',$1,$2,$3,$4) RETURNING id`, name, kind,
+		personalOwner, seatLimit).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}

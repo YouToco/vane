@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/YouToco/vane/server/internal/credentialguard"
 	"github.com/YouToco/vane/server/mcpclient"
 	"github.com/YouToco/vane/server/types"
 )
@@ -50,6 +51,9 @@ func (s *Store) CreateSkillCapability(ctx context.Context, input types.CreateSki
 		return nil, nil, capabilityValidation("Skill packages containing scripts must be incompatible")
 	}
 	if err := validateSkillFiles(input.Skill.Files, input.Skill.SkillMDDigest); err != nil {
+		return nil, nil, err
+	}
+	if err := validateSkillCapabilityCredentialSafety(input); err != nil {
 		return nil, nil, err
 	}
 
@@ -127,6 +131,9 @@ func (s *Store) CreateMCPCapability(ctx context.Context, input types.CreateMCPCa
 		!validSHA256(input.Connection.ToolSchemaDigest) || !validJSONObject(input.Connection.ToolSchema) ||
 		digestBytes(input.Connection.ToolSchema) != input.Connection.ToolSchemaDigest {
 		return nil, nil, capabilityValidation("MCP connection metadata is invalid")
+	}
+	if err := validateMCPCapabilityCredentialSafety(input); err != nil {
+		return nil, nil, err
 	}
 
 	tx, role, err := s.beginCapabilityTx(ctx, input.TenantID, input.ActorUserID)
@@ -349,6 +356,37 @@ func validateSkillFiles(files []types.SkillCapabilityFile, skillMDDigest string)
 	}
 	if !foundSkillMD {
 		return capabilityValidation("Skill file set has no matching SKILL.md")
+	}
+	return nil
+}
+
+func validateSkillCapabilityCredentialSafety(input types.CreateSkillCapability) error {
+	values := []string{
+		input.Slug, input.DisplayName, input.SourceRef, string(input.Manifest),
+		input.Skill.Name, input.Skill.Description, string(input.Skill.FileManifest),
+	}
+	for _, value := range values {
+		if credentialguard.ContainsCredential(value) {
+			return capabilityValidation("Skill capability contains credential material")
+		}
+	}
+	for _, file := range input.Skill.Files {
+		if credentialguard.ContainsCredential(file.Path) ||
+			credentialguard.ContainsCredential(string(file.Content)) {
+			return capabilityValidation("Skill capability contains credential material")
+		}
+	}
+	return nil
+}
+
+func validateMCPCapabilityCredentialSafety(input types.CreateMCPCapability) error {
+	for _, value := range []string{
+		input.Slug, input.DisplayName, string(input.Manifest),
+		input.Connection.EndpointURL, string(input.Connection.ToolSchema),
+	} {
+		if credentialguard.ContainsCredential(value) {
+			return capabilityValidation("MCP capability contains credential material")
+		}
 	}
 	return nil
 }

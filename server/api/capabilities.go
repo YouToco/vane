@@ -13,6 +13,7 @@ import (
 	"regexp"
 
 	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/internal/credentialguard"
 	"github.com/YouToco/vane/server/mcpclient"
 	"github.com/YouToco/vane/server/skillpkg"
 	"github.com/YouToco/vane/server/types"
@@ -39,6 +40,13 @@ type MCPEndpointAdmission interface {
 	Validate(context.Context, string) (mcpclient.ResolvedEndpoint, error)
 }
 
+// MCPReadOnlyPolicyResolver is the trusted, Vane-owned authority for exposing
+// remote MCP tools. Implementations are injected by the server composition
+// root from an audited local allowlist; request JSON is never an authority.
+type MCPReadOnlyPolicyResolver interface {
+	Resolve(context.Context, auth.Principal, mcpclient.ResolvedEndpoint, []mcpclient.RemoteTool) (map[string]mcpclient.LocalToolPolicy, error)
+}
+
 type capabilityInstallResponse struct {
 	Capability *types.UserCapability `json:"capability"`
 	VersionID  string                `json:"version_id"`
@@ -60,6 +68,10 @@ func (s *server) mcpEndpointAdmission() MCPEndpointAdmission {
 		return s.deps.MCPEndpointAdmission
 	}
 	return mcpclient.EndpointValidator{}
+}
+
+func (s *server) mcpReadOnlyPolicy() MCPReadOnlyPolicyResolver {
+	return s.deps.MCPReadOnlyPolicy
 }
 
 func capabilityPrincipal(ctx context.Context) (auth.Principal, error) {
@@ -127,6 +139,10 @@ func (s *server) handleCreateSkillCapability(w http.ResponseWriter, r *http.Requ
 	if fields.DisplayName == "" {
 		fields.DisplayName = pkg.Manifest.Name
 	}
+	if skillPackageContainsCredential(fields, pkg) {
+		writeError(w, http.StatusBadRequest, "Skill 包含疑似凭证，已拒绝安装")
+		return
+	}
 	files := make([]types.SkillCapabilityFile, 0, len(pkg.Manifest.Files))
 	var skillMDDigest string
 	for _, file := range pkg.Manifest.Files {
@@ -163,6 +179,24 @@ func (s *server) handleCreateSkillCapability(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusCreated, capabilityInstallResponse{
 		Capability: capability, VersionID: version.ID.String(), Compatible: version.Compatible,
 	})
+}
+
+func skillPackageContainsCredential(fields skillUploadFields, pkg skillpkg.Package) bool {
+	if credentialguard.ContainsCredential(fields.Slug) ||
+		credentialguard.ContainsCredential(fields.DisplayName) ||
+		credentialguard.ContainsCredential(string(pkg.ManifestJSON)) {
+		return true
+	}
+	for _, file := range pkg.Manifest.Files {
+		if file.Kind == skillpkg.FileScript {
+			continue
+		}
+		if credentialguard.ContainsCredential(file.Path) ||
+			credentialguard.ContainsCredential(string(file.Data)) {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeSkillUpload(w http.ResponseWriter, r *http.Request) (skillUploadFields, error) {
@@ -236,16 +270,15 @@ func readMultipartPart(part *multipart.Part, limit int64) ([]byte, error) {
 }
 
 type createMCPRequest struct {
-	Visibility          types.UserCapabilityVisibility       `json:"visibility"`
-	Slug                string                               `json:"slug"`
-	DisplayName         string                               `json:"display_name"`
-	EndpointURL         string                               `json:"endpoint_url"`
-	Transport           string                               `json:"transport"`
-	ProtocolVersion     string                               `json:"protocol_version"`
-	Authentication      types.MCPAuthenticationKind          `json:"authentication"`
-	CredentialRef       string                               `json:"credential_ref"`
-	Tools               []mcpRemoteToolRequest               `json:"tools"`
-	LocalReadOnlyPolicy map[string]mcpclient.LocalToolPolicy `json:"local_read_only_policy"`
+	Visibility      types.UserCapabilityVisibility `json:"visibility"`
+	Slug            string                         `json:"slug"`
+	DisplayName     string                         `json:"display_name"`
+	EndpointURL     string                         `json:"endpoint_url"`
+	Transport       string                         `json:"transport"`
+	ProtocolVersion string                         `json:"protocol_version"`
+	Authentication  types.MCPAuthenticationKind    `json:"authentication"`
+	CredentialRef   string                         `json:"credential_ref"`
+	Tools           []mcpRemoteToolRequest         `json:"tools"`
 }
 
 type mcpRemoteToolRequest struct {
@@ -307,19 +340,44 @@ func (s *server) handleCreateMCPCapability(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "仅支持远程 Streamable HTTP MCP")
 		return
 	}
+	if credentialguard.ContainsCredential(req.EndpointURL) {
+		writeError(w, http.StatusBadRequest, "MCP 地址不得包含凭证")
+		return
+	}
 	resolved, err := s.mcpEndpointAdmission().Validate(r.Context(), req.EndpointURL)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "MCP 地址必须是公网 HTTPS 且不得解析到私网")
 		return
 	}
+	if credentialguard.ContainsCredential(resolved.URL) {
+		writeError(w, http.StatusBadRequest, "MCP 地址不得包含凭证")
+		return
+	}
 	remoteTools := make([]mcpclient.RemoteTool, len(req.Tools))
 	for index, tool := range req.Tools {
+		if credentialguard.ContainsCredential(tool.Name) ||
+			credentialguard.ContainsCredential(tool.Description) ||
+			credentialguard.ContainsCredential(string(tool.InputSchema)) ||
+			credentialguard.ContainsCredential(string(tool.Annotations)) {
+			writeError(w, http.StatusBadRequest, "MCP 工具描述或 schema 包含疑似凭证")
+			return
+		}
 		remoteTools[index] = mcpclient.RemoteTool{
 			Name: tool.Name, Description: tool.Description,
 			InputSchema: tool.InputSchema, Annotations: tool.Annotations,
 		}
 	}
-	catalog, err := mcpclient.FreezeReadOnlyTools(remoteTools, req.LocalReadOnlyPolicy)
+	policyResolver := s.mcpReadOnlyPolicy()
+	if policyResolver == nil {
+		writeError(w, http.StatusBadRequest, "MCP 工具没有通过 Vane 本地只读策略")
+		return
+	}
+	localPolicy, err := policyResolver.Resolve(r.Context(), p, resolved, remoteTools)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "MCP 工具没有通过 Vane 本地只读策略")
+		return
+	}
+	catalog, err := mcpclient.FreezeReadOnlyTools(remoteTools, localPolicy)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "MCP 工具必须通过本地只读策略并提供有效 schema")
 		return
