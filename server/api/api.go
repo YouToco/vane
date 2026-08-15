@@ -83,7 +83,7 @@ type TaskAgent interface {
 }
 
 type TelegramManager interface {
-	Status() telegram.Status
+	PrincipalStatus(context.Context, int64, int64) telegram.Status
 	IssueLink(context.Context, int64, int64) (telegram.Link, error)
 	IssueRouteLink(context.Context, int64, int64) (telegram.Link, error)
 	Binding(context.Context, int64, int64) (store.ChannelIdentity, error)
@@ -135,6 +135,9 @@ type Deps struct {
 	Scheduler any
 	TaskAgent TaskAgent
 	Telegram  TelegramManager
+	// TelegramAPIBaseURL is the provider origin used only for credential
+	// verification. Production injects config; tests use an isolated provider.
+	TelegramAPIBaseURL string
 	// BriefFeedback is separate from grounded read-only Agent follow-up:
 	// deep-dive is an explicit fixed action and keeps the existing durable
 	// feedback/idempotency/delivery behavior.

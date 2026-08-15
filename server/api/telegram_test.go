@@ -15,24 +15,37 @@ import (
 )
 
 type fakeTelegramManager struct {
-	status     telegram.Status
-	tenantID   int64
-	userID     int64
-	issued     bool
-	unlinked   bool
-	tested     bool
-	identity   store.ChannelIdentity
-	bindingErr error
-	blocked    store.ChannelDeliveryBlockStats
-	blockedErr error
-	routes     []telegram.RouteSummary
-	routesErr  error
-	issueErr   error
-	unlinkErr  error
-	testErr    error
+	status      telegram.Status
+	tenantID    int64
+	userID      int64
+	issued      bool
+	unlinked    bool
+	tested      bool
+	identity    store.ChannelIdentity
+	bindingErr  error
+	blocked     store.ChannelDeliveryBlockStats
+	blockedErr  error
+	routes      []telegram.RouteSummary
+	routesErr   error
+	issueErr    error
+	unlinkErr   error
+	testErr     error
+	activated   bool
+	deactivated bool
 }
 
-func (f *fakeTelegramManager) Status() telegram.Status { return f.status }
+func (f *fakeTelegramManager) ActivateUser(_ context.Context, tenantID, userID int64) error {
+	f.tenantID, f.userID, f.activated = tenantID, userID, true
+	return nil
+}
+func (f *fakeTelegramManager) DeactivateUser(_ context.Context, tenantID, userID int64) error {
+	f.tenantID, f.userID, f.deactivated = tenantID, userID, true
+	return nil
+}
+
+func (f *fakeTelegramManager) PrincipalStatus(context.Context, int64, int64) telegram.Status {
+	return f.status
+}
 func (f *fakeTelegramManager) IssueLink(_ context.Context, tenantID, userID int64) (telegram.Link, error) {
 	f.tenantID, f.userID, f.issued = tenantID, userID, true
 	if f.issueErr != nil {

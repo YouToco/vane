@@ -543,6 +543,10 @@
     {
       "path": "137_credential_vault.sql",
       "sha256": "1fbbd7e478b546910ee17c474997f5b213a7a8035c5e3286505b070a8975a346"
+    },
+    {
+      "path": "138_credential_external_identity.sql",
+      "sha256": "ef0b9a1bb53452dd52877d43754e6ad47674529a9d7a0fdc8b29aae9ee34b6d0"
     }
   ],
   "schema": "vane.migrations/v1"

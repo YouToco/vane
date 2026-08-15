@@ -11,6 +11,9 @@ const apiMock = vi.hoisted(() => ({
   telegramRouteUnlink: vi.fn(),
   telegramTest: vi.fn(),
   telegramUnlink: vi.fn(),
+  telegramCredentialStatus: vi.fn(),
+  telegramRotateCredential: vi.fn(),
+  telegramRevokeCredential: vi.fn(),
 }));
 
 vi.mock("@/shared/api/client", () => ({
@@ -22,6 +25,10 @@ import TelegramSetup from "@/pages/TelegramSetup";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  apiMock.telegramCredentialStatus.mockResolvedValue({
+    configured: false,
+    vault_ready: true,
+  });
 });
 
 afterEach(() => {
@@ -29,16 +36,30 @@ afterEach(() => {
 });
 
 describe("Telegram settings", () => {
-  test("does not ask the browser for bot secrets when server is disabled", async () => {
+  test("lets an ordinary signed-in user configure an encrypted personal bot", async () => {
     apiMock.telegramStatus.mockResolvedValue({
       enabled: false,
       ready: false,
       bound: false,
     });
+    apiMock.telegramRotateCredential.mockResolvedValue({
+      configured: true,
+      vault_ready: true,
+      generation: 1,
+      fingerprint: "0123456789abcdef0123456789abcdef",
+      activation: "active",
+    });
     render(<TelegramSetup />);
-    expect(await screen.findByText(/服务端尚未启用 Telegram/)).toBeTruthy();
-    expect(screen.queryByRole("textbox")).toBeNull();
-    expect(screen.queryByLabelText(/Bot token/i)).toBeNull();
+    expect(await screen.findByText(/当前用户尚未启用 Telegram Bot/)).toBeTruthy();
+    const input = screen.getByLabelText(/新的 Bot Token/i);
+    expect(input.getAttribute("type")).toBe("password");
+    await userEvent.type(input, "123:synthetic-token");
+    await userEvent.click(screen.getByRole("button", { name: /校验、加密并启用/ }));
+    await waitFor(() => expect(apiMock.telegramRotateCredential).toHaveBeenCalledWith({
+      bot_token: "123:synthetic-token",
+    }));
+    expect(await screen.findByText(/已加密保存并启用/)).toBeTruthy();
+    expect((input as HTMLInputElement).value).toBe("");
   });
 
   test("issues an opaque one-time pairing link for the current session", async () => {

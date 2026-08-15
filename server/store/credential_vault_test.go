@@ -245,14 +245,14 @@ func TestMigration137DownRefusesCredentialHistoryPostgres(t *testing.T) {
 	}, json.RawMessage(`{"api_key":"synthetic"}`), json.RawMessage(`{}`), ownerID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.DownTo(t.Context(), latestMigrationVersion-1); err == nil ||
+	if _, err := provider.DownTo(t.Context(), 136); err == nil ||
 		!strings.Contains(err.Error(), "encrypted credential history exists") {
 		t.Fatalf("migration 137 down accepted retained credential: %v", err)
 	}
 	if _, err := database.ExecContext(t.Context(), `DELETE FROM credential_vault_entries`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.DownTo(t.Context(), latestMigrationVersion-1); err != nil {
+	if _, err := provider.DownTo(t.Context(), 136); err != nil {
 		t.Fatalf("empty credential vault could not downgrade: %v", err)
 	}
 	var exists bool
@@ -262,5 +262,95 @@ func TestMigration137DownRefusesCredentialHistoryPostgres(t *testing.T) {
 	}
 	if exists {
 		t.Fatal("credential vault table survived successful migration 137 down")
+	}
+}
+
+func TestCredentialVaultExternalBotIdentityIsUniqueAcrossTenants(t *testing.T) {
+	st, database := credentialVaultTestStore(t)
+	ownerA, tenantA := migration129Identity(t, database, "credential-bot-a")
+	ownerB, tenantB := migration129Identity(t, database, "credential-bot-b")
+	metadata := json.RawMessage(`{"bot_id":778899,"bot_username":"shared_bot"}`)
+	secret := json.RawMessage(`{"bot_token":"778899:synthetic","webhook_secret":"synthetic"}`)
+	if _, err := st.RotateCredential(t.Context(), CredentialScope{
+		Kind: "user", TenantID: tenantA, UserID: ownerA,
+		Provider: "telegram", Purpose: "bot_api",
+	}, secret, metadata, ownerA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RotateCredential(t.Context(), CredentialScope{
+		Kind: "user", TenantID: tenantB, UserID: ownerB,
+		Provider: "telegram", Purpose: "bot_api",
+	}, secret, metadata, ownerB); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("duplicate bot err=%v, want conflict", err)
+	}
+	items, err := st.ListActiveUserCredentialMetadata(
+		t.Context(), "telegram", "bot_api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matched []CredentialMetadata
+	for _, item := range items {
+		var payload struct {
+			BotID int64 `json:"bot_id"`
+		}
+		if err := json.Unmarshal(item.Metadata, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.BotID == 778899 {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 1 || matched[0].TenantID != tenantA {
+		t.Fatalf("active duplicate bot rows=%+v", matched)
+	}
+}
+
+func TestCredentialVaultOrdinaryMemberOwnsOnlyTheirUserScope(t *testing.T) {
+	st, database := credentialVaultTestStore(t)
+	ownerID, tenantID := migration129Identity(t, database, "credential-user-owner")
+	var memberID int64
+	if err := database.QueryRowContext(t.Context(), `INSERT INTO users(feishu_open_id,name)
+		VALUES($1,'credential user member') RETURNING id`,
+		fmt.Sprintf("credential-user-member-%d", time.Now().UnixNano())).Scan(&memberID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(t.Context(), `INSERT INTO memberships(tenant_id,user_id,role)
+		VALUES($1,$2,'member')`, tenantID, memberID); err != nil {
+		t.Fatal(err)
+	}
+	scope := CredentialScope{Kind: "user", TenantID: tenantID, UserID: memberID,
+		Provider: "telegram", Purpose: "bot_api"}
+	if _, err := st.RotateCredential(t.Context(), scope,
+		json.RawMessage(`{"bot_token":"9911:synthetic","webhook_secret":"synthetic"}`),
+		json.RawMessage(`{"bot_id":9911,"bot_username":"member_bot"}`), memberID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CredentialStatus(t.Context(), scope, ownerID); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("tenant owner read member secret metadata err=%v, want hidden", err)
+	}
+	foreign := scope
+	foreign.UserID = ownerID
+	if _, err := st.RotateCredential(t.Context(), foreign,
+		json.RawMessage(`{"bot_token":"9912:synthetic","webhook_secret":"synthetic"}`),
+		json.RawMessage(`{"bot_id":9912}`), memberID); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("member wrote another user scope err=%v, want hidden", err)
+	}
+}
+
+func TestMigration138CredentialExternalIdentityBoundary(t *testing.T) {
+	payload, err := migrationsFS.ReadFile("migrations/138_credential_external_identity.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := string(payload)
+	for _, fragment := range []string{
+		"ADD COLUMN external_identity TEXT",
+		"uq_credential_vault_active_external_identity",
+		"metadata->>'bot_id'",
+		"metadata->>'app_id'",
+	} {
+		if !strings.Contains(sqlText, fragment) {
+			t.Errorf("migration 138 lost boundary %q", fragment)
+		}
 	}
 }

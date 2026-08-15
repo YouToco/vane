@@ -1,17 +1,21 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, Link2, Loader2, MessagesSquare, Send, Trash2, Unlink } from "lucide-react";
+import { ExternalLink, KeyRound, Link2, Loader2, MessagesSquare, RotateCcw, Send, ShieldCheck, Trash2, Unlink } from "lucide-react";
 import { api, ApiError } from "@/shared/api/client";
-import type { TelegramLink, TelegramStatus } from "@/shared/api/client";
+import type { CredentialStatus, TelegramLink, TelegramStatus } from "@/shared/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 export default function TelegramSetup() {
   const [status, setStatus] = useState<TelegramStatus | null>(null);
+  const [credential, setCredential] = useState<CredentialStatus | null>(null);
+  const [botToken, setBotToken] = useState("");
   const [link, setLink] = useState<TelegramLink | null>(null);
   const [routeLink, setRouteLink] = useState<TelegramLink | null>(null);
-  const [busy, setBusy] = useState<"link" | "route" | "test" | "unlink" | `route-${number}` | "">("");
+  const [busy, setBusy] = useState<"credential" | "credential-revoke" | "link" | "route" | "test" | "unlink" | `route-${number}` | "">("");
   const [message, setMessage] = useState("");
   const [statusError, setStatusError] = useState("");
 
@@ -51,6 +55,46 @@ export default function TelegramSetup() {
       clearInterval(timer);
     };
   }, []);
+
+  useEffect(() => {
+    api.telegramCredentialStatus()
+      .then(setCredential)
+      .catch((error) => setMessage(error instanceof ApiError ? error.message : "读取 Bot 凭证状态失败"));
+  }, []);
+
+  async function saveCredential() {
+    setBusy("credential");
+    setMessage("");
+    try {
+      const next = await api.telegramRotateCredential({ bot_token: botToken });
+      setCredential(next);
+      setBotToken("");
+      await refresh();
+      setMessage(`第 ${next.generation} 代个人 Telegram Bot 凭证已加密保存并启用。`);
+    } catch (error) {
+      setMessage(error instanceof ApiError ? error.message : "保存 Telegram Bot 凭证失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function revokeCredential() {
+    if (!window.confirm("撤销后，这个 Bot 将立即停止接收和发送 Vane 消息。确定继续？")) return;
+    setBusy("credential-revoke");
+    setMessage("");
+    try {
+      await api.telegramRevokeCredential();
+      setCredential(await api.telegramCredentialStatus());
+      setStatus(await api.telegramStatus());
+      setLink(null);
+      setRouteLink(null);
+      setMessage("个人 Telegram Bot 凭证已撤销；密文历史仅保留审计。");
+    } catch (error) {
+      setMessage(error instanceof ApiError ? error.message : "撤销 Telegram Bot 凭证失败");
+    } finally {
+      setBusy("");
+    }
+  }
 
   async function issueLink() {
     setBusy("link");
@@ -129,10 +173,57 @@ export default function TelegramSetup() {
           </Badge>
         </div>
         <p className="text-sm text-muted-foreground">
-          私聊完成身份绑定后，可把同一个 Bot 安全连接到群组或论坛话题。群里仅响应 owner 的命令、@提及和对 Bot 的回复。
+          私聊完成身份绑定后，可把自己的 Bot 安全连接到群组或论坛话题。群里仅响应已绑定用户的命令、@提及和对 Bot 的回复。
         </p>
       </CardHeader>
       <CardContent className="space-y-4">
+        <div className="space-y-3 rounded-lg border p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="flex items-center gap-2 text-sm font-medium">
+              <KeyRound className="size-4" />我的 Bot 凭证
+            </p>
+            <Badge variant={credential?.configured ? "default" : "secondary"}>
+              {credential?.configured ? `已保存 · 第 ${credential.generation} 代` : "未配置"}
+            </Badge>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            每位用户配置自己的 Bot，用于私聊、群组、话题和后续推送。Token 以 AES-GCM 密文保存，旧值不会返回浏览器。
+          </p>
+          {credential && !credential.vault_ready && (
+            <Alert variant="destructive"><AlertDescription>部署侧尚未配置凭证库主密钥，暂不能保存。</AlertDescription></Alert>
+          )}
+          <Alert>
+            <ShieldCheck className="size-4" />
+            <AlertDescription>数据库只保存密文、版本、指纹与 Bot ID；加密主密钥仍由部署凭证持有。</AlertDescription>
+          </Alert>
+          <div className="space-y-2">
+            <Label htmlFor="telegram-bot-token">新的 Bot Token</Label>
+            <Input
+              id="telegram-bot-token"
+              type="password"
+              autoComplete="new-password"
+              value={botToken}
+              onChange={(event) => setBotToken(event.target.value)}
+              placeholder="从 BotFather 获取；保存后不会回显"
+            />
+          </div>
+          {credential?.fingerprint && (
+            <p className="text-xs text-muted-foreground">当前指纹：<code>{credential.fingerprint.slice(0, 16)}…</code></p>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => void saveCredential()} disabled={busy !== "" || !botToken || credential?.vault_ready === false}>
+              {busy === "credential" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <RotateCcw className="mr-2 size-4" />}
+              校验、加密并启用
+            </Button>
+            {credential?.configured && (
+              <Button variant="destructive" onClick={() => void revokeCredential()} disabled={busy !== ""}>
+                {busy === "credential-revoke" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Trash2 className="mr-2 size-4" />}
+                撤销 Bot 凭证
+              </Button>
+            )}
+          </div>
+        </div>
+
         {status === null && !statusError && (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" /> 正在读取状态
@@ -150,7 +241,7 @@ export default function TelegramSetup() {
         {status && !status.enabled && (
           <Alert>
             <AlertDescription>
-              服务端尚未启用 Telegram。Bot token 与 webhook secret 只由部署凭证提供，不会在网页中填写或回显。
+              当前用户尚未启用 Telegram Bot。请在上方填写自己的 Bot Token；保存成功后运行时会立即安装独立 webhook。
             </AlertDescription>
           </Alert>
         )}
@@ -219,7 +310,7 @@ export default function TelegramSetup() {
               <div className="rounded-lg border bg-muted/30 p-3 space-y-2">
                 <p className="text-sm font-medium">在 10 分钟内完成连接</p>
                 <p className="text-xs text-muted-foreground">
-                  打开链接把 Bot 加入目标群；若目标是论坛话题，请再把下面的命令发送到该话题。执行者必须是群管理员和当前 Vane owner。
+                  打开链接把 Bot 加入目标群；若目标是论坛话题，请再把下面的命令发送到该话题。执行者必须是群管理员和当前已绑定的 Vane 用户。
                 </p>
                 <a className={buttonVariants({ variant: "outline", size: "sm" })} href={routeLink.deep_link} target="_blank" rel="noreferrer">
                   添加 Bot 到群组 <ExternalLink className="ml-2 size-3" />

@@ -144,6 +144,10 @@ export interface CredentialStatus {
   created_at?: string;
 }
 
+export interface TelegramCredentialInput {
+  bot_token: string;
+}
+
 export interface LLMCredentialInput {
   provider: "deepseek";
   base_url: string;
@@ -1546,6 +1550,17 @@ export const api = {
   telegramUnlink: () =>
     request<{ ok: boolean }>("/api/telegram/link", { method: "DELETE" }),
   telegramTest: () => post<{ ok: boolean }>("/api/telegram/test"),
+  telegramCredentialStatus: () =>
+    request<CredentialStatus>("/api/channels/telegram/credentials"),
+  telegramRotateCredential: (input: TelegramCredentialInput) =>
+    request<CredentialStatus & { activation: "active" | "restart_required" }>(
+      "/api/channels/telegram/credentials",
+      { method: "PUT", body: JSON.stringify(input) },
+    ),
+  telegramRevokeCredential: () =>
+    request<{ ok: boolean; activation?: string }>(
+      "/api/channels/telegram/credentials", { method: "DELETE" },
+    ),
   adminLLMCredentialStatus: () =>
     request<CredentialStatus>("/api/admin/llm/credentials"),
   adminRotateLLMCredential: (input: LLMCredentialInput) =>

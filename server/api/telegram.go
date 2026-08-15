@@ -16,12 +16,13 @@ func (s *server) handleTelegramStatus(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	status := s.deps.Telegram.Status()
 	principal, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
+	status := s.deps.Telegram.PrincipalStatus(
+		r.Context(), int64(principal.TenantID), principal.UserID)
 	blocked, err := s.deps.Telegram.BlockedReplies(
 		r.Context(), int64(principal.TenantID), principal.UserID)
 	if err != nil {
@@ -65,13 +66,14 @@ func (s *server) handleTelegramRouteLink(w http.ResponseWriter, r *http.Request)
 	if !s.checkOrigin(w, r) {
 		return
 	}
-	if s.deps.Telegram == nil || !s.deps.Telegram.Status().Ready {
-		writeError(w, http.StatusConflict, "Telegram Bot 尚未就绪")
-		return
-	}
 	principal, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
+		return
+	}
+	if s.deps.Telegram == nil || !s.deps.Telegram.PrincipalStatus(
+		r.Context(), int64(principal.TenantID), principal.UserID).Ready {
+		writeError(w, http.StatusConflict, "Telegram Bot 尚未就绪")
 		return
 	}
 	link, err := s.deps.Telegram.IssueRouteLink(
@@ -113,13 +115,14 @@ func (s *server) handleTelegramLink(w http.ResponseWriter, r *http.Request) {
 	if !s.checkOrigin(w, r) {
 		return
 	}
-	if s.deps.Telegram == nil || !s.deps.Telegram.Status().Ready {
-		writeError(w, http.StatusConflict, "Telegram Bot 尚未就绪")
-		return
-	}
 	principal, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
+		return
+	}
+	if s.deps.Telegram == nil || !s.deps.Telegram.PrincipalStatus(
+		r.Context(), int64(principal.TenantID), principal.UserID).Ready {
+		writeError(w, http.StatusConflict, "Telegram Bot 尚未就绪")
 		return
 	}
 	link, err := s.deps.Telegram.IssueLink(

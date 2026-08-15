@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/server/credentialvault"
 	"github.com/YouToco/vane/server/types"
@@ -19,6 +20,7 @@ const platformCredentialTenantID int64 = 1
 type CredentialScope struct {
 	Kind     string `json:"scope_kind"`
 	TenantID int64  `json:"tenant_id,omitempty"`
+	UserID   int64  `json:"user_id,omitempty"`
 	Provider string `json:"provider"`
 	Purpose  string `json:"purpose"`
 }
@@ -89,6 +91,10 @@ func (s *Store) RotateCredential(
 	if err := authorizeCredentialActor(ctx, tx, scope, actorUserID); err != nil {
 		return CredentialMetadata{}, err
 	}
+	externalIdentity, err := credentialExternalIdentity(scope, metadata)
+	if err != nil {
+		return CredentialMetadata{}, err
+	}
 	// All writers for one exact authority share this lock, including revoke.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
 		credentialLockKey(scope)); err != nil {
@@ -98,14 +104,16 @@ func (s *Store) RotateCredential(
 	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(generation),0)+1
 		FROM credential_vault_entries
 		WHERE scope_kind=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND
-		      provider=$3 AND purpose=$4`,
-		scope.Kind, nullableCredentialTenant(scope), scope.Provider, scope.Purpose,
+		      user_id IS NOT DISTINCT FROM $3 AND provider=$4 AND purpose=$5`,
+		scope.Kind, nullableCredentialTenant(scope), nullableCredentialUser(scope),
+		scope.Provider, scope.Purpose,
 	).Scan(&generation); err != nil {
 		return CredentialMetadata{}, credentialDBError("分配凭证版本", err)
 	}
 	envelope, err := s.credentialVault.Seal(credentialvault.Scope{
-		Kind: scope.Kind, TenantID: scope.TenantID, Provider: scope.Provider,
-		Purpose: scope.Purpose, Generation: generation,
+		Kind: scope.Kind, TenantID: scope.TenantID, UserID: scope.UserID,
+		Provider: scope.Provider,
+		Purpose:  scope.Purpose, Generation: generation,
 	}, secretJSON)
 	if err != nil {
 		return CredentialMetadata{}, types.NewAppError(types.CodeInternal,
@@ -114,32 +122,78 @@ func (s *Store) RotateCredential(
 	if _, err := tx.Exec(ctx, `UPDATE credential_vault_entries
 		SET status='retired',retired_at=clock_timestamp()
 		WHERE scope_kind=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND
-		      provider=$3 AND purpose=$4 AND status='active'`,
-		scope.Kind, nullableCredentialTenant(scope), scope.Provider, scope.Purpose,
+		      user_id IS NOT DISTINCT FROM $3 AND provider=$4 AND purpose=$5 AND status='active'`,
+		scope.Kind, nullableCredentialTenant(scope), nullableCredentialUser(scope),
+		scope.Provider, scope.Purpose,
 	); err != nil {
 		return CredentialMetadata{}, credentialDBError("归档旧凭证", err)
 	}
 	var result CredentialMetadata
 	result.CredentialScope = scope
 	err = tx.QueryRow(ctx, `INSERT INTO credential_vault_entries(
-		scope_kind,tenant_id,provider,purpose,generation,envelope_version,key_id,
-		nonce,ciphertext,fingerprint,metadata,status,created_by_user_id)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12)
+		scope_kind,tenant_id,user_id,provider,purpose,generation,envelope_version,key_id,
+		nonce,ciphertext,fingerprint,metadata,status,created_by_user_id,external_identity)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active',$13,$14)
 		RETURNING generation,fingerprint,metadata,status,created_by_user_id,
 		          created_at,retired_at,revoked_at`,
-		scope.Kind, nullableCredentialTenant(scope), scope.Provider, scope.Purpose,
-		generation, envelope.Version, envelope.KeyID, envelope.Nonce,
+		scope.Kind, nullableCredentialTenant(scope), nullableCredentialUser(scope),
+		scope.Provider, scope.Purpose, generation, envelope.Version, envelope.KeyID, envelope.Nonce,
 		envelope.Ciphertext, envelope.Fingerprint, metadata, actorUserID,
+		externalIdentity,
 	).Scan(&result.Generation, &result.Fingerprint, &result.Metadata,
 		&result.Status, &result.CreatedByUserID, &result.CreatedAt,
 		&result.RetiredAt, &result.RevokedAt)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+			pgErr.ConstraintName == "uq_credential_vault_active_external_identity" {
+			return CredentialMetadata{}, types.NewAppError(types.CodeConflict,
+				"该渠道应用已由其他用户配置", types.ErrConflict)
+		}
 		return CredentialMetadata{}, credentialDBError("写入加密凭证", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return CredentialMetadata{}, credentialDBError("提交凭证轮换", err)
 	}
 	return result, nil
+}
+
+func credentialExternalIdentity(
+	scope CredentialScope, metadata json.RawMessage,
+) (*string, error) {
+	var value string
+	switch {
+	case scope.Kind == "user" && scope.Provider == "telegram" &&
+		scope.Purpose == "bot_api":
+		var payload struct {
+			BotID json.Number `json:"bot_id"`
+		}
+		decoder := json.NewDecoder(strings.NewReader(string(metadata)))
+		decoder.UseNumber()
+		if err := decoder.Decode(&payload); err != nil || payload.BotID == "" {
+			return nil, credentialValidationError("Telegram bot_id 元数据无效")
+		}
+		botID, err := payload.BotID.Int64()
+		if err != nil || botID <= 0 {
+			return nil, credentialValidationError("Telegram bot_id 元数据无效")
+		}
+		value = fmt.Sprintf("%d", botID)
+	case scope.Kind == "user" && scope.Provider == "feishu" &&
+		scope.Purpose == "app_credentials":
+		var payload struct {
+			AppID string `json:"app_id"`
+		}
+		if err := json.Unmarshal(metadata, &payload); err != nil {
+			return nil, credentialValidationError("飞书 app_id 元数据无效")
+		}
+		value = strings.TrimSpace(payload.AppID)
+		if value == "" || len(value) > 128 {
+			return nil, credentialValidationError("飞书 app_id 元数据无效")
+		}
+	default:
+		return nil, nil
+	}
+	return &value, nil
 }
 
 // CredentialStatus returns only non-secret metadata and re-proves that the
@@ -184,6 +238,47 @@ func (s *Store) ActiveCredentialMetadata(
 	return row.CredentialMetadata, nil
 }
 
+// ListActiveUserCredentialMetadata is an internal control-plane inventory
+// used by channel manager fleets. It returns metadata only; every plaintext
+// secret still requires an exact-generation UseCredential call so callers
+// cannot accidentally obtain a cross-tenant secret collection.
+func (s *Store) ListActiveUserCredentialMetadata(
+	ctx context.Context, provider, purpose string,
+) ([]CredentialMetadata, error) {
+	provider = strings.TrimSpace(provider)
+	purpose = strings.TrimSpace(purpose)
+	if provider == "" || purpose == "" {
+		return nil, credentialValidationError("provider 或 purpose 为空")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT tenant_id,user_id,generation,fingerprint,
+		metadata,status,created_by_user_id,created_at,retired_at,revoked_at
+		FROM credential_vault_entries
+		WHERE scope_kind='user' AND provider=$1 AND purpose=$2 AND status='active'
+		ORDER BY tenant_id,user_id`, provider, purpose)
+	if err != nil {
+		return nil, credentialDBError("列出用户凭证", err)
+	}
+	defer rows.Close()
+	result := make([]CredentialMetadata, 0)
+	for rows.Next() {
+		var item CredentialMetadata
+		item.CredentialScope = CredentialScope{
+			Kind: "user", Provider: provider, Purpose: purpose,
+		}
+		if err := rows.Scan(&item.TenantID, &item.UserID, &item.Generation,
+			&item.Fingerprint, &item.Metadata, &item.Status,
+			&item.CreatedByUserID, &item.CreatedAt, &item.RetiredAt,
+			&item.RevokedAt); err != nil {
+			return nil, credentialDBError("读取用户凭证", err)
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, credentialDBError("遍历用户凭证", err)
+	}
+	return result, nil
+}
+
 // LatestCredentialMetadata distinguishes a never-configured scope from an
 // explicitly revoked one. Startup compatibility may fall back to environment
 // only for the former; a revocation tombstone must remain authoritative.
@@ -199,9 +294,9 @@ func (s *Store) LatestCredentialMetadata(
 		created_by_user_id,created_at,retired_at,revoked_at
 		FROM credential_vault_entries
 		WHERE scope_kind=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND
-		      provider=$3 AND purpose=$4
+		      user_id IS NOT DISTINCT FROM $3 AND provider=$4 AND purpose=$5
 		ORDER BY generation DESC LIMIT 1`, scope.Kind, nullableCredentialTenant(scope),
-		scope.Provider, scope.Purpose).Scan(&result.Generation, &result.Fingerprint,
+		nullableCredentialUser(scope), scope.Provider, scope.Purpose).Scan(&result.Generation, &result.Fingerprint,
 		&result.Metadata, &result.Status, &result.CreatedByUserID, &result.CreatedAt,
 		&result.RetiredAt, &result.RevokedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -234,8 +329,9 @@ func (s *Store) UseCredential(
 		return err
 	}
 	secret, err := s.credentialVault.Open(credentialvault.Scope{
-		Kind: scope.Kind, TenantID: scope.TenantID, Provider: scope.Provider,
-		Purpose: scope.Purpose, Generation: row.Generation,
+		Kind: scope.Kind, TenantID: scope.TenantID, UserID: scope.UserID,
+		Provider: scope.Provider,
+		Purpose:  scope.Purpose, Generation: row.Generation,
 	}, credentialvault.Envelope{
 		Version: row.EnvelopeVersion, KeyID: row.KeyID, Nonce: row.Nonce,
 		Ciphertext: row.Ciphertext, Fingerprint: row.Fingerprint,
@@ -272,8 +368,9 @@ func (s *Store) RevokeCredential(
 	result, err := tx.Exec(ctx, `UPDATE credential_vault_entries
 		SET status='revoked',revoked_at=clock_timestamp()
 		WHERE scope_kind=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND
-		      provider=$3 AND purpose=$4 AND status='active'`,
-		scope.Kind, nullableCredentialTenant(scope), scope.Provider, scope.Purpose)
+		      user_id IS NOT DISTINCT FROM $3 AND provider=$4 AND purpose=$5 AND status='active'`,
+		scope.Kind, nullableCredentialTenant(scope), nullableCredentialUser(scope),
+		scope.Provider, scope.Purpose)
 	if err != nil {
 		return credentialDBError("撤销凭证", err)
 	}
@@ -295,9 +392,10 @@ func queryCredentialRow(
 ) (credentialEnvelopeRow, error) {
 	statusClause := "AND status='active'"
 	if generation > 0 {
-		statusClause = "AND generation=$5 AND status<>'revoked'"
+		statusClause = "AND generation=$6 AND status<>'revoked'"
 	}
-	args := []any{scope.Kind, nullableCredentialTenant(scope), scope.Provider, scope.Purpose}
+	args := []any{scope.Kind, nullableCredentialTenant(scope), nullableCredentialUser(scope),
+		scope.Provider, scope.Purpose}
 	if generation > 0 {
 		args = append(args, generation)
 	}
@@ -307,7 +405,7 @@ func queryCredentialRow(
 		fingerprint,metadata,status,created_by_user_id,created_at,retired_at,revoked_at
 		FROM credential_vault_entries
 		WHERE scope_kind=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND
-		      provider=$3 AND purpose=$4 `+statusClause+`
+		      user_id IS NOT DISTINCT FROM $3 AND provider=$4 AND purpose=$5 `+statusClause+`
 		ORDER BY generation DESC LIMIT 1`, args...).Scan(
 		&row.Generation, &row.EnvelopeVersion, &row.KeyID, &row.Nonce,
 		&row.Ciphertext, &row.Fingerprint, &row.Metadata, &row.Status,
@@ -325,14 +423,21 @@ func queryCredentialRow(
 func authorizeCredentialActor(
 	ctx context.Context, tx pgx.Tx, scope CredentialScope, actorUserID int64,
 ) error {
+	if scope.Kind == "user" && scope.UserID != actorUserID {
+		return types.NewAppError(types.CodeNotFound, "凭证配置不存在", nil)
+	}
 	tenantID := scope.TenantID
 	if scope.Kind == "platform" {
 		tenantID = platformCredentialTenantID
 	}
 	var allowed bool
+	roleClause := ""
+	if scope.Kind != "user" {
+		roleClause = "AND m.role='owner'"
+	}
 	err := tx.QueryRow(ctx, `SELECT true
 		FROM memberships m JOIN tenants t ON t.id=m.tenant_id
-		WHERE m.tenant_id=$1 AND m.user_id=$2 AND m.role='owner' AND
+		WHERE m.tenant_id=$1 AND m.user_id=$2 `+roleClause+` AND
 		      t.status='active' AND t.deleted_at IS NULL
 		FOR KEY SHARE OF m,t`, tenantID, actorUserID).Scan(&allowed)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -342,7 +447,7 @@ func authorizeCredentialActor(
 		return credentialDBError("校验凭证管理员权限", err)
 	}
 	if !allowed {
-		// Hide the existence of platform/foreign-tenant credential scopes.
+		// Hide platform, foreign-tenant, and foreign-user credential scopes.
 		return types.NewAppError(types.CodeNotFound, "凭证配置不存在", nil)
 	}
 	return nil
@@ -374,9 +479,10 @@ func validateCredentialScope(scope CredentialScope) error {
 		}
 		return true
 	}
-	if (scope.Kind != "platform" && scope.Kind != "tenant") ||
-		(scope.Kind == "platform" && scope.TenantID != 0) ||
-		(scope.Kind == "tenant" && scope.TenantID <= 0) ||
+	if (scope.Kind != "platform" && scope.Kind != "tenant" && scope.Kind != "user") ||
+		(scope.Kind == "platform" && (scope.TenantID != 0 || scope.UserID != 0)) ||
+		(scope.Kind == "tenant" && (scope.TenantID <= 0 || scope.UserID != 0)) ||
+		(scope.Kind == "user" && (scope.TenantID <= 0 || scope.UserID <= 0)) ||
 		!validIdentifier(scope.Provider) || !validIdentifier(scope.Purpose) {
 		return credentialValidationError("凭证作用域无效")
 	}
@@ -390,9 +496,16 @@ func nullableCredentialTenant(scope CredentialScope) any {
 	return scope.TenantID
 }
 
+func nullableCredentialUser(scope CredentialScope) any {
+	if scope.Kind != "user" {
+		return nil
+	}
+	return scope.UserID
+}
+
 func credentialLockKey(scope CredentialScope) string {
-	return fmt.Sprintf("credential-vault/%s/%d/%s/%s",
-		scope.Kind, scope.TenantID, scope.Provider, scope.Purpose)
+	return fmt.Sprintf("credential-vault/%s/%d/%d/%s/%s",
+		scope.Kind, scope.TenantID, scope.UserID, scope.Provider, scope.Purpose)
 }
 
 func credentialValidationError(message string) error {

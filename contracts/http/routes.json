@@ -60,6 +60,7 @@
     "POST /api/telegram/routes/link",
     "POST /api/telegram/test",
     "POST /telegram/webhook",
+    "POST /telegram/webhook/{bot_id}",
     "PUT /api/admin/llm/credentials",
     "PUT /api/channels/feishu/credentials",
     "PUT /api/channels/telegram/credentials"

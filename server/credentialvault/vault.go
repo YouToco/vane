@@ -24,10 +24,13 @@ const envelopeVersion = "v1"
 var identifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 
 // Scope is the immutable authority bound into AES-GCM additional data.
-// TenantID must be non-zero only for tenant credentials.
+// TenantID/UserID identify an ordinary user's channel credential. UserID is
+// omitted from legacy platform/tenant AAD so existing v1 envelopes remain
+// decryptable byte-for-byte.
 type Scope struct {
 	Kind       string
 	TenantID   int64
+	UserID     int64
 	Provider   string
 	Purpose    string
 	Generation int64
@@ -155,11 +158,12 @@ func newGCM(key [32]byte) (cipher.AEAD, error) {
 }
 
 func validateScope(scope Scope) error {
-	if scope.Kind != "platform" && scope.Kind != "tenant" {
+	if scope.Kind != "platform" && scope.Kind != "tenant" && scope.Kind != "user" {
 		return errors.New("credential vault: scope kind is invalid")
 	}
-	if (scope.Kind == "tenant" && scope.TenantID <= 0) ||
-		(scope.Kind == "platform" && scope.TenantID != 0) {
+	if (scope.Kind == "tenant" && (scope.TenantID <= 0 || scope.UserID != 0)) ||
+		(scope.Kind == "platform" && (scope.TenantID != 0 || scope.UserID != 0)) ||
+		(scope.Kind == "user" && (scope.TenantID <= 0 || scope.UserID <= 0)) {
 		return errors.New("credential vault: tenant scope is invalid")
 	}
 	if !identifierPattern.MatchString(scope.Provider) ||
@@ -170,11 +174,17 @@ func validateScope(scope Scope) error {
 }
 
 func additionalData(scope Scope, keyID string) []byte {
-	return []byte(strings.Join([]string{
+	parts := []string{
 		"vane-credential-vault", envelopeVersion, scope.Kind,
-		strconv.FormatInt(scope.TenantID, 10), scope.Provider, scope.Purpose,
+		strconv.FormatInt(scope.TenantID, 10),
+	}
+	if scope.UserID > 0 {
+		parts = append(parts, strconv.FormatInt(scope.UserID, 10))
+	}
+	parts = append(parts, scope.Provider, scope.Purpose,
 		strconv.FormatInt(scope.Generation, 10), keyID,
-	}, "\x00"))
+	)
+	return []byte(strings.Join(parts, "\x00"))
 }
 
 func fingerprint(key [32]byte, scope Scope, plaintext []byte) string {

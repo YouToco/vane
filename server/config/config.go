@@ -130,8 +130,8 @@ type LLMConfig struct {
 
 // FetchConfig 是内容抓取配置。
 //
-// 飞书目前仍由旧 Manager 从 settings 读取；migration 137 的 tenant 加密凭证
-// 只有在多租户 Manager fleet 完成切换后才成为运行权威，不能回写明文 settings。
+// 飞书目前仍由旧 Manager 从 settings 读取；migrations 137-138 的 user 加密凭证
+// 只有在用户级 Manager fleet 完成切换后才成为运行权威，不能回写明文 settings。
 type FetchConfig struct {
 	// TikhubAPIKey 环境变量 VANE_FETCH_TIKHUB_API_KEY。
 	TikhubAPIKey string `mapstructure:"tikhub_api_key"`

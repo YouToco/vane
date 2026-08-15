@@ -17,13 +17,18 @@ type telegramShutdowner interface {
 
 func buildTelegramManager(
 	cfg config.TelegramConfig,
-	st telegram.IngressStore,
+	st telegram.CredentialStore,
 	agentLoop telegram.ChannelAgent,
-) (*telegram.Manager, error) {
-	return telegram.NewManager(telegram.Config{
+) (*telegram.Fleet, error) {
+	legacy := telegram.Config{
 		Enabled: cfg.Enabled, Token: cfg.BotToken,
 		WebhookSecret: cfg.WebhookSecret, WebhookURL: cfg.WebhookURL,
 		APIBaseURL: cfg.APIBaseURL, Workers: cfg.Workers,
+	}
+	return telegram.NewFleet(telegram.FleetConfig{
+		Legacy: legacy, WebhookURL: cfg.WebhookURL,
+		APIBaseURL: cfg.APIBaseURL, Workers: cfg.Workers,
+		Dynamic: st != nil,
 	}, st, agentLoop, &http.Client{Timeout: 20 * time.Second}, slog.Default())
 }
 
@@ -50,5 +55,6 @@ func mountTelegramWebhook(
 ) {
 	if enabled {
 		mux.Handle("POST /telegram/webhook", handler)
+		mux.Handle("POST /telegram/webhook/{bot_id}", handler)
 	}
 }

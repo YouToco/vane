@@ -1,14 +1,15 @@
 # Provider credential vault contract
 
-Status: foundation implemented in migration 137; provider runtime cutover is a
-separate, fail-closed rollout.
+Status: foundation implemented in migrations 137-138. Telegram user-manager
+fleet is implemented; Feishu and LLM hot reload remain separate fail-closed
+rollouts.
 
 ## Authority model
 
-- Telegram and Feishu bots are tenant-owned delivery channels. An exact active
-  `owner` membership may verify, rotate, inspect redacted status, or revoke its
-  own tenant credential. A platform administrator does not silently turn one
-  tenant bot into a shared platform bot.
+- Telegram and Feishu bots are user-owned delivery channels. Any exact active
+  membership may verify, rotate, inspect redacted status, or revoke only its
+  own `(tenant_id,user_id)` credential. A tenant owner or platform administrator
+  cannot read or replace another user's Bot credential.
 - LLM routing is shared platform infrastructure. Only an exact active `owner`
   membership in the platform administration tenant may change it.
 - External provider actor, chat, bot, app, or webhook identifiers are never
@@ -21,9 +22,9 @@ separate, fail-closed rollout.
   application before SQL insertion. PostgreSQL stores envelope version, key ID,
   random nonce, authenticated ciphertext, keyed fingerprint, non-secret
   metadata, generation, actor, and lifecycle timestamps only.
-- GCM additional authenticated data binds scope kind, tenant ID, provider,
-  purpose, credential generation, and key ID. Moving ciphertext to another
-  tenant, provider, purpose, or generation must fail authentication.
+- GCM additional authenticated data binds scope kind, tenant ID, user ID for
+  user credentials, provider, purpose, generation, and key ID. Moving
+  ciphertext to another user, tenant, provider, purpose, or generation fails.
 - The deployment key-encryption key (KEK) is never stored in PostgreSQL and is
   never accepted or returned by a Web API. Production supplies it through a
   systemd credential or sensitive environment value. Database backup theft
@@ -36,9 +37,10 @@ separate, fail-closed rollout.
 
 ## Versioning and rotation
 
-- Each exact `(scope, tenant, provider, purpose)` has monotonically increasing
-  generations and at most one active generation.
-- Rotation takes an exact-scope advisory transaction lock, re-proves owner
+- Each exact `(scope, tenant, user, provider, purpose)` has monotonically
+  increasing generations and at most one active generation. A verified Bot/App
+  identity may be active for only one user across the whole database.
+- Rotation takes an exact-scope advisory transaction lock, re-proves user/owner
   authority, retires the prior active generation, encrypts with the active KEK,
   and inserts the new generation in one transaction.
 - Retired provider credential generations remain decryptable for pinned
@@ -61,8 +63,8 @@ provider is dynamically reconfigured. Each provider cutover must also prove:
    generation, or reports an explicit non-active state;
 3. in-flight work keeps its pinned generation and missing retained keys fail
    closed;
-4. Telegram webhook routing is bot-specific and tenant-safe; Feishu connection
-   ownership is tenant-specific; LLM clients switch as one platform generation;
+4. Telegram webhook routing is bot-specific and user-safe; Feishu connection
+   ownership is user-specific; LLM clients switch as one platform generation;
 5. restart, concurrent rotation/revoke, provider verification failure, response
    loss, log redaction, and cross-tenant authorization have real integration
    coverage.
@@ -71,8 +73,14 @@ Until a provider passes those gates, existing environment/settings runtime is
 the compatibility path and the Web credential endpoint must not describe the
 new generation as runtime-active.
 
-The shared LLM is the first partial cutover: the super-administrator Web page
-creates an encrypted platform generation, and the next safe process start makes
+Telegram is the first hot channel cutover: every user can save a Bot token in
+Web, the server verifies `getMe`, creates a random webhook secret, and starts or
+rotates only that user's Manager at `/telegram/webhook/{verified_bot_id}`. The
+same Bot ID cannot be active for two users. The legacy environment Manager is
+only a compatibility route for users without a database-backed Bot.
+
+The shared LLM partial cutover lets the super-administrator Web page create an
+encrypted platform generation, and the next safe process start makes
 that generation authoritative for pipeline, Agent, and research clients. The
 write response therefore says `restart_required`; it does not claim hot reload.
 An unreadable, tampered, or explicitly revoked database generation blocks

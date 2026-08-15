@@ -1181,7 +1181,7 @@ func run() error {
 		readinessStores = append(readinessStores, researchControlStore)
 	}
 	readinessStores = appendTelegramReadiness(
-		readinessStores, cfg.Telegram.Enabled, telegramManager)
+		readinessStores, cfg.Telegram.Enabled || st.CredentialVaultReady(), telegramManager)
 	mux.HandleFunc("GET /readyz", handleReadyz(readinessStores...))
 	// principal 解析器：全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 过渡期实现是「全局 owner 回退 + 租户恒为 1」，行为与收敛前逐字一致；
@@ -1189,13 +1189,14 @@ func run() error {
 	principals := auth.NewOwnerResolver(st, feishu.SettingKeyOwner)
 
 	api.Mount(mux, api.Deps{
-		Store:         st,
-		Auth:          st,
-		Manager:       manager,
-		Scheduler:     sched,
-		TaskAgent:     agentLoop,
-		Telegram:      telegramManager,
-		BriefFeedback: fbSvc,
+		Store:              st,
+		Auth:               st,
+		Manager:            manager,
+		Scheduler:          sched,
+		TaskAgent:          agentLoop,
+		Telegram:           telegramManager,
+		TelegramAPIBaseURL: cfg.Telegram.APIBaseURL,
+		BriefFeedback:      fbSvc,
 		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
 			ExecutiveBriefWebCanaryScheduleID,
 		ExecutiveBriefWebProjectionAllowAll: cfg.Pipeline.
@@ -1205,7 +1206,8 @@ func run() error {
 		Principal: auth.NewContextResolver(),
 		Origin:    cfg.Dashboard.Origin,
 	})
-	mountTelegramWebhook(mux, cfg.Telegram.Enabled, telegramManager.Handler())
+	mountTelegramWebhook(mux,
+		cfg.Telegram.Enabled || st.CredentialVaultReady(), telegramManager.Handler())
 
 	// A2A server（a2a-contract §7）：enabled=false 时不 Mount——/a2a 与
 	// agent-card 路径在 mux 上根本不存在（404），零新增暴露面。

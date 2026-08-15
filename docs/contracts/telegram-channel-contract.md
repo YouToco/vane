@@ -3,7 +3,7 @@
 Status: implemented, default-off, production UAT pending.
 
 This contract adds Telegram as an authenticated, routed entrance to the same
-Vane owner Agent used by Web and Feishu. One owner identity may authorize a
+Vane user Agent used by Web and Feishu. One authenticated user may authorize a
 private chat, groups, supergroups, and exact forum topics. Telegram IDs remain
 routing data, never Vane user IDs.
 
@@ -16,7 +16,7 @@ Included in v3:
   `drop_pending_updates=false`;
 - constant-time webhook-secret verification and a 1 MiB body limit;
 - private text plus explicitly installed group/supergroup/forum-topic routes;
-- group admission only for the bound owner, and only for commands, an exact
+- group admission only for the bound user, and only for commands, an exact
   `@bot_username` mention, or a reply to a Bot message;
 - administrator-verified, ten-minute, one-time group/topic installation links;
 - Bot command menu (`help`, `status`, `tasks`, `new`, `connect`) and command
@@ -153,12 +153,12 @@ tests prove `row_security_active`; it must not be enabled by config alone.
 
 ## Secret and transport rules
 
-- Bot token and webhook secret are absent from repository values. Migration 137
-  adds tenant-owned encrypted database generations managed by exact tenant
-  owners; the current single-manager runtime still uses explicit sensitive env
-  or systemd credentials until the bot-specific manager fleet rollout passes
-  the gates in `credential-vault-contract.md`. A stored generation must not be
-  described as runtime-active before that cutover.
+- Bot token and webhook secret are absent from repository values. Migrations
+  137-138 store user-owned encrypted generations. Every authenticated member
+  may manage only their exact `(tenant_id,user_id)` scope; AES-GCM AAD binds that
+  scope. The manager fleet routes `/telegram/webhook/{verified_bot_id}` and hot
+  rotates the exact user's Manager. The legacy environment Manager remains a
+  compatibility route only and does not become a platform-owned Bot.
 - Bot API redirects are never followed because the token is embedded in the
   request path.
 - Transport errors are sanitized and never wrap the token-bearing URL.
@@ -172,9 +172,11 @@ tests prove `row_security_active`; it must not be enabled by config alone.
 
 ## Rollout and UAT
 
-The adapter is dark unless `VANE_TELEGRAM_ENABLED=true`. Enabled startup fails
-before readiness if token identity, webhook installation or exact webhook state
-cannot be proven. `/readyz` includes Telegram readiness while enabled.
+The legacy adapter is dark unless `VANE_TELEGRAM_ENABLED=true`. Database-backed
+user Bots require the credential vault key and are discovered at startup even
+when the legacy adapter is disabled. A bad stored generation fails startup;
+runtime failure is exposed to the exact user without taking unrelated users
+offline. `/readyz` proves the fleet router, not every user's provider account.
 
 Before changing feature 4.9 from `开发中`, production must prove:
 

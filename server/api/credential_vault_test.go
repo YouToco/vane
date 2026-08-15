@@ -115,3 +115,92 @@ func TestLLMCredentialEndpointEncryptsAndNeverEchoesSecretPostgres(t *testing.T)
 		t.Fatalf("active credentials after revoke=%d", active)
 	}
 }
+
+func TestOrdinaryMemberTelegramCredentialIsUserScopedEncryptedAndActivatedPostgres(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		requireDatabaseCapability(t)
+	}
+	st := inviteAPIStore(t)
+	if err := st.ConfigureCredentialVault("api-user-key", strings.Repeat("24", 32), ""); err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	user, err := st.UpsertUserByOpenID(ctx,
+		fmt.Sprintf("credential-api-member-%d", time.Now().UnixNano()), "member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddMembership(ctx, 1, user.ID, types.MembershipRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	cleanupDB, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = cleanupDB.Exec(t.Context(), `DELETE FROM credential_vault_entries WHERE created_by_user_id=$1`, user.ID)
+		_, _ = cleanupDB.Exec(t.Context(), `DELETE FROM memberships WHERE user_id=$1`, user.ID)
+		_, _ = cleanupDB.Exec(t.Context(), `DELETE FROM users WHERE id=$1`, user.ID)
+		cleanupDB.Close()
+	})
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/getMe") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"id":551199,"username":"member_bot"}}`))
+	}))
+	defer provider.Close()
+
+	authStore := newFakeAuthStore()
+	token, hash, err := auth.NewSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authStore.sessions[string(hash)] = &types.Session{TokenHash: hash,
+		UserID: user.ID, TenantID: 1, ExpiresAt: time.Now().Add(time.Hour)}
+	authStore.members[user.ID] = []types.Membership{{
+		TenantID: 1, UserID: user.ID, Role: types.MembershipRoleMember}}
+	runtime := &fakeTelegramManager{}
+	mux := http.NewServeMux()
+	Mount(mux, Deps{Store: st, Auth: authStore, Telegram: runtime,
+		TelegramAPIBaseURL: provider.URL, Principal: auth.NewContextResolver()})
+	const syntheticToken = "551199:synthetic-member-token"
+	put := httptest.NewRequest(http.MethodPut, "/api/channels/telegram/credentials",
+		strings.NewReader(`{"bot_token":"`+syntheticToken+`"}`))
+	put.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	putResponse := httptest.NewRecorder()
+	mux.ServeHTTP(putResponse, put)
+	if putResponse.Code != http.StatusOK || !runtime.activated ||
+		runtime.tenantID != 1 || runtime.userID != user.ID ||
+		!strings.Contains(putResponse.Body.String(), `"activation":"active"`) ||
+		strings.Contains(putResponse.Body.String(), syntheticToken) {
+		t.Fatalf("PUT status=%d runtime=%+v body=%s",
+			putResponse.Code, runtime, putResponse.Body.String())
+	}
+	var ciphertext []byte
+	var scopeKind string
+	var storedUserID int64
+	var externalIdentity string
+	if err := cleanupDB.QueryRow(ctx, `SELECT scope_kind,user_id,external_identity,ciphertext
+		FROM credential_vault_entries WHERE provider='telegram' AND purpose='bot_api' AND
+		created_by_user_id=$1 AND status='active'`, user.ID).Scan(
+		&scopeKind, &storedUserID, &externalIdentity, &ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	if scopeKind != "user" || storedUserID != user.ID || externalIdentity != "551199" ||
+		bytes.Contains(ciphertext, []byte(syntheticToken)) {
+		t.Fatalf("unsafe row scope=%s user=%d external=%s", scopeKind, storedUserID, externalIdentity)
+	}
+
+	deleteRequest := httptest.NewRequest(http.MethodDelete,
+		"/api/channels/telegram/credentials", nil)
+	deleteRequest.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	deleteResponse := httptest.NewRecorder()
+	mux.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusOK || !runtime.deactivated {
+		t.Fatalf("DELETE status=%d runtime=%+v body=%s",
+			deleteResponse.Code, runtime, deleteResponse.Body.String())
+	}
+}

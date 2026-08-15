@@ -67,6 +67,25 @@ func TestOpenFailsClosedAcrossAuthorityBoundaries(t *testing.T) {
 	}
 }
 
+func TestUserCredentialAADBindsTenantAndUser(t *testing.T) {
+	vault := testVault(t)
+	scope := Scope{Kind: "user", TenantID: 7, UserID: 70,
+		Provider: "telegram", Purpose: "bot_api", Generation: 1}
+	envelope, err := vault.Seal(scope, []byte("synthetic-user-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, altered := range []Scope{
+		{Kind: "user", TenantID: 7, UserID: 71, Provider: "telegram", Purpose: "bot_api", Generation: 1},
+		{Kind: "user", TenantID: 8, UserID: 70, Provider: "telegram", Purpose: "bot_api", Generation: 1},
+		{Kind: "tenant", TenantID: 7, Provider: "telegram", Purpose: "bot_api", Generation: 1},
+	} {
+		if _, err := vault.Open(altered, envelope); err == nil {
+			t.Fatalf("altered user authority decrypted: %+v", altered)
+		}
+	}
+}
+
 func TestRetiredKeyDecryptsButNewWritesUseActiveKey(t *testing.T) {
 	oldVault, err := New(Config{ActiveKeyID: "key-0", ActiveKey: bytes.Repeat([]byte{0x24}, 32)})
 	if err != nil {

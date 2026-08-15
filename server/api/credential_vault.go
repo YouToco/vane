@@ -51,25 +51,31 @@ type llmCredentialRequest struct {
 	MaxConcurrent int    `json:"max_concurrent"`
 }
 
-func (s *server) handleTenantCredentialStatus(
+type telegramCredentialRuntime interface {
+	ActivateUser(context.Context, int64, int64) error
+	DeactivateUser(context.Context, int64, int64) error
+}
+
+func (s *server) handleUserCredentialStatus(
 	w http.ResponseWriter, r *http.Request, provider, purpose string,
 ) {
-	principal, ok := s.requireTenantOwner(w, r)
-	if !ok {
+	principal, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
 		return
 	}
 	s.writeCredentialStatus(w, r, store.CredentialScope{
-		Kind: "tenant", TenantID: int64(principal.TenantID),
+		Kind: "user", TenantID: int64(principal.TenantID), UserID: principal.UserID,
 		Provider: provider, Purpose: purpose,
 	}, principal.UserID)
 }
 
 func (s *server) handleTelegramCredentialStatus(w http.ResponseWriter, r *http.Request) {
-	s.handleTenantCredentialStatus(w, r, "telegram", telegramCredentialPurpose)
+	s.handleUserCredentialStatus(w, r, "telegram", telegramCredentialPurpose)
 }
 
 func (s *server) handleFeishuCredentialStatus(w http.ResponseWriter, r *http.Request) {
-	s.handleTenantCredentialStatus(w, r, "feishu", feishuCredentialPurpose)
+	s.handleUserCredentialStatus(w, r, "feishu", feishuCredentialPurpose)
 }
 
 func (s *server) handleLLMCredentialStatus(w http.ResponseWriter, r *http.Request) {
@@ -118,7 +124,11 @@ func (s *server) handleTelegramCredentialPut(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	request.BotToken = strings.TrimSpace(request.BotToken)
-	client, err := telegram.NewClient(request.BotToken, "https://api.telegram.org",
+	apiBaseURL := strings.TrimSpace(s.deps.TelegramAPIBaseURL)
+	if apiBaseURL == "" {
+		apiBaseURL = "https://api.telegram.org"
+	}
+	client, err := telegram.NewClient(request.BotToken, apiBaseURL,
 		&http.Client{Timeout: 10 * time.Second})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "Telegram Bot token 格式无效")
@@ -144,17 +154,31 @@ func (s *server) handleTelegramCredentialPut(w http.ResponseWriter, r *http.Requ
 		"bot_id": bot.ID, "bot_username": bot.Username,
 	})
 	rotated, err := s.deps.Store.RotateCredential(r.Context(), store.CredentialScope{
-		Kind: "tenant", TenantID: int64(principal.TenantID),
+		Kind: "user", TenantID: int64(principal.TenantID), UserID: principal.UserID,
 		Provider: "telegram", Purpose: telegramCredentialPurpose,
 	}, secret, metadata, principal.UserID)
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
+	activation := "restart_required"
+	if runtime, ok := s.deps.Telegram.(telegramCredentialRuntime); ok {
+		if err := runtime.ActivateUser(r.Context(), int64(principal.TenantID), principal.UserID); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"configured": true, "generation": rotated.Generation,
+				"fingerprint": rotated.Fingerprint, "metadata": rotated.Metadata,
+				"vault_ready": true,
+				"activation":  "failed_restart_required",
+			})
+			return
+		}
+		activation = "active"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": true, "generation": rotated.Generation,
 		"fingerprint": rotated.Fingerprint, "metadata": rotated.Metadata,
-		"activation": "manager_fleet_pending",
+		"vault_ready": true,
+		"activation":  activation,
 	})
 }
 
@@ -181,7 +205,7 @@ func (s *server) handleFeishuCredentialPut(w http.ResponseWriter, r *http.Reques
 	secret, _ := json.Marshal(request)
 	metadata, _ := json.Marshal(map[string]string{"app_id": request.AppID})
 	rotated, err := s.deps.Store.RotateCredential(r.Context(), store.CredentialScope{
-		Kind: "tenant", TenantID: int64(principal.TenantID),
+		Kind: "user", TenantID: int64(principal.TenantID), UserID: principal.UserID,
 		Provider: "feishu", Purpose: feishuCredentialPurpose,
 	}, secret, metadata, principal.UserID)
 	if err != nil {
@@ -191,7 +215,8 @@ func (s *server) handleFeishuCredentialPut(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": true, "generation": rotated.Generation,
 		"fingerprint": rotated.Fingerprint, "metadata": rotated.Metadata,
-		"activation": "manager_fleet_pending",
+		"vault_ready": true,
+		"activation":  "manager_fleet_pending",
 	})
 }
 
@@ -236,19 +261,20 @@ func (s *server) handleLLMCredentialPut(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": true, "generation": rotated.Generation,
 		"fingerprint": rotated.Fingerprint, "metadata": rotated.Metadata,
-		"activation": "restart_required",
+		"vault_ready": true,
+		"activation":  "restart_required",
 	})
 }
 
 func (s *server) handleTelegramCredentialDelete(w http.ResponseWriter, r *http.Request) {
-	s.handleTenantCredentialDelete(w, r, "telegram", telegramCredentialPurpose)
+	s.handleUserCredentialDelete(w, r, "telegram", telegramCredentialPurpose)
 }
 
 func (s *server) handleFeishuCredentialDelete(w http.ResponseWriter, r *http.Request) {
-	s.handleTenantCredentialDelete(w, r, "feishu", feishuCredentialPurpose)
+	s.handleUserCredentialDelete(w, r, "feishu", feishuCredentialPurpose)
 }
 
-func (s *server) handleTenantCredentialDelete(
+func (s *server) handleUserCredentialDelete(
 	w http.ResponseWriter, r *http.Request, provider, purpose string,
 ) {
 	principal, ok := s.requireCredentialMutation(w, r, false)
@@ -256,11 +282,22 @@ func (s *server) handleTenantCredentialDelete(
 		return
 	}
 	if err := s.deps.Store.RevokeCredential(r.Context(), store.CredentialScope{
-		Kind: "tenant", TenantID: int64(principal.TenantID),
+		Kind: "user", TenantID: int64(principal.TenantID), UserID: principal.UserID,
 		Provider: provider, Purpose: purpose,
 	}, principal.UserID); err != nil {
 		writeAppError(w, err)
 		return
+	}
+	if provider == "telegram" {
+		if runtime, ok := s.deps.Telegram.(telegramCredentialRuntime); ok {
+			if err := runtime.DeactivateUser(
+				r.Context(), int64(principal.TenantID), principal.UserID); err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+					"ok": true, "activation": "revoked_restart_required",
+				})
+				return
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -296,7 +333,12 @@ func (s *server) requireCredentialMutation(
 		}
 		return principal, true
 	}
-	return s.requireTenantOwner(w, r)
+	principal, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return auth.Principal{}, false
+	}
+	return principal, true
 }
 
 func decodeCredentialBody(w http.ResponseWriter, r *http.Request, target any) bool {
