@@ -54,7 +54,7 @@ func authzMux(t *testing.T, userID, tenantID int64, sched any) (*http.ServeMux, 
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	fake.members[userID] = []types.Membership{{
-		TenantID: tenantID, UserID: userID,
+		TenantID: tenantID, UserID: userID, Role: types.MembershipRoleOwner,
 	}}
 	mux := http.NewServeMux()
 	Mount(mux, Deps{Auth: fake, Principal: auth.NewContextResolver(), Scheduler: sched})

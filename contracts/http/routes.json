@@ -1,6 +1,9 @@
 {
   "routes": [
     "DELETE /api/admin/invites/{code}",
+    "DELETE /api/admin/llm/credentials",
+    "DELETE /api/channels/feishu/credentials",
+    "DELETE /api/channels/telegram/credentials",
     "DELETE /api/schedules/{id}",
     "DELETE /api/telegram/link",
     "DELETE /api/telegram/routes/{id}",
@@ -10,10 +13,13 @@
     "GET /api/admin/execution-traces/tenants/{tenant_id}/users/{user_id}/tasks/{task_id}/runs/{snapshot_id}",
     "GET /api/admin/execution-traces/users",
     "GET /api/admin/invites",
+    "GET /api/admin/llm/credentials",
     "GET /api/admin/observability",
     "GET /api/admin/provider-prices",
     "GET /api/admin/runstats",
     "GET /api/auth/me",
+    "GET /api/channels/feishu/credentials",
+    "GET /api/channels/telegram/credentials",
     "GET /api/deliveries",
     "GET /api/feishu/status",
     "GET /api/profile",
@@ -53,7 +59,10 @@
     "POST /api/telegram/link",
     "POST /api/telegram/routes/link",
     "POST /api/telegram/test",
-    "POST /telegram/webhook"
+    "POST /telegram/webhook",
+    "PUT /api/admin/llm/credentials",
+    "PUT /api/channels/feishu/credentials",
+    "PUT /api/channels/telegram/credentials"
   ],
   "schema": "vane.http-routes/v1"
 }

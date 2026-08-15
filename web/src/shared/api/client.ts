@@ -5,9 +5,8 @@
 import { apiBase } from "./base";
 
 // PLATFORM_OWNER_TENANT_ID 必须与后端 types.SingleTenantID 保持一致：
-// 后端 api/platformadmin.go 的 requirePlatformOwner 就是用 tenant_id==1 判定平台 owner，
-// 前端据此决定是否显示管理面入口。判据同源，不另造一套角色标记——
-// 前端猜错只会多显示/少显示入口，真正的拦截始终在后端那道闸门。
+// 前端目前只能用 tenant_id==1 决定是否显示管理面入口；后端还会重新证明
+// exact owner membership。前端判断只影响可见性，真正授权始终在服务端。
 export const PLATFORM_OWNER_TENANT_ID = 1;
 
 export interface MeResponse {
@@ -134,6 +133,25 @@ export interface VerifyResult {
 export interface ConfigResult {
   status: FeishuStatus;
   verify: VerifyResult;
+}
+
+export interface CredentialStatus {
+  configured: boolean;
+  vault_ready: boolean;
+  generation?: number;
+  fingerprint?: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+}
+
+export interface LLMCredentialInput {
+  provider: "deepseek";
+  base_url: string;
+  api_key: string;
+  model: string;
+  agent_model: string;
+  research_model: string;
+  max_concurrent: number;
 }
 
 // ---- M3 推送管道相关类型 ----
@@ -1528,6 +1546,15 @@ export const api = {
   telegramUnlink: () =>
     request<{ ok: boolean }>("/api/telegram/link", { method: "DELETE" }),
   telegramTest: () => post<{ ok: boolean }>("/api/telegram/test"),
+  adminLLMCredentialStatus: () =>
+    request<CredentialStatus>("/api/admin/llm/credentials"),
+  adminRotateLLMCredential: (input: LLMCredentialInput) =>
+    request<CredentialStatus & { activation: "restart_required" }>(
+      "/api/admin/llm/credentials",
+      { method: "PUT", body: JSON.stringify(input) },
+    ),
+  adminRevokeLLMCredential: () =>
+    request<{ ok: boolean }>("/api/admin/llm/credentials", { method: "DELETE" }),
 
   // ---- M3 定时任务（B8）----
   listSchedules: () =>

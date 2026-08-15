@@ -124,6 +124,22 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("初始化数据库连接池: %w", err)
 	}
+	if cfg.CredentialVault.ActiveKeyID != "" {
+		if err := st.ConfigureCredentialVault(
+			cfg.CredentialVault.ActiveKeyID,
+			cfg.CredentialVault.ActiveKeyHex,
+			cfg.CredentialVault.RetiredKeys,
+		); err != nil {
+			closeServerStores(st, nil)
+			return fmt.Errorf("初始化加密凭证库: %w", err)
+		}
+	} else {
+		slog.Warn("加密凭证库未配置，Web 凭证管理将 fail-closed")
+	}
+	if err := applyStoredLLMCredential(ctx, st, &cfg.LLM); err != nil {
+		closeServerStores(st, nil)
+		return fmt.Errorf("加载数据库 LLM 凭证: %w", err)
+	}
 	var researchControlStore *store.Store
 	closeStores := func() { closeServerStores(st, researchControlStore) }
 	if _, err := st.AssertAgentFirstLegacyWriteFence(ctx); err != nil {

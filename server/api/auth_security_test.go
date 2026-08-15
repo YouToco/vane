@@ -774,6 +774,30 @@ func TestSec_PlatformEndpointsGatedToOwner(t *testing.T) {
 	}
 }
 
+func TestSec_PlatformTenantMemberIsNotSuperAdministrator(t *testing.T) {
+	fake := newFakeAuthStore()
+	token, hash, err := auth.NewSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.sessions[string(hash)] = &types.Session{
+		TokenHash: hash, UserID: 77, TenantID: 1,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	fake.members[77] = []types.Membership{{
+		TenantID: 1, UserID: 77, Role: types.MembershipRoleMember,
+	}}
+	mux := http.NewServeMux()
+	Mount(mux, Deps{Auth: fake, Principal: auth.NewContextResolver()})
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/llm/credentials", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("platform tenant member got %d, want hidden 404", response.Code)
+	}
+}
+
 // TestSec_MultiTenantLoginFailsLoudly：用户属于多个租户时，登录必须**报错**而非
 // 静默登进第一个。
 //

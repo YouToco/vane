@@ -1754,6 +1754,73 @@ func TestTelegramSecretsLoadFromSystemdCredentials(t *testing.T) {
 	}
 }
 
+func TestCredentialVaultConfigValidation(t *testing.T) {
+	valid := strings.Repeat("42", 32)
+	tests := []struct {
+		name    string
+		config  CredentialVaultConfig
+		wantErr bool
+	}{
+		{name: "optional while no database credentials exist"},
+		{name: "active key", config: CredentialVaultConfig{
+			ActiveKeyID: "vault-key-1", ActiveKeyHex: valid,
+		}},
+		{name: "retained decrypt keys", config: CredentialVaultConfig{
+			ActiveKeyID: "vault-key-1", ActiveKeyHex: valid,
+			RetiredKeys: "vault-key-0=" + strings.Repeat("24", 32),
+		}},
+		{name: "missing id", config: CredentialVaultConfig{ActiveKeyHex: valid}, wantErr: true},
+		{name: "short key", config: CredentialVaultConfig{
+			ActiveKeyID: "vault-key-1", ActiveKeyHex: "42",
+		}, wantErr: true},
+		{name: "all zero key", config: CredentialVaultConfig{
+			ActiveKeyID: "vault-key-1", ActiveKeyHex: strings.Repeat("00", 32),
+		}, wantErr: true},
+		{name: "uppercase key", config: CredentialVaultConfig{
+			ActiveKeyID: "vault-key-1", ActiveKeyHex: strings.ToUpper(strings.Repeat("ab", 32)),
+		}, wantErr: true},
+		{name: "active repeated as retired", config: CredentialVaultConfig{
+			ActiveKeyID: "vault-key-1", ActiveKeyHex: valid,
+			RetiredKeys: "vault-key-1=" + strings.Repeat("24", 32),
+		}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{DB: DBConfig{URL: "postgres://test"}, CredentialVault: test.config}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() err=%v wantErr=%v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestCredentialVaultKeysLoadFromSystemdCredentials(t *testing.T) {
+	directory := t.TempDir()
+	t.Setenv("CREDENTIALS_DIRECTORY", directory)
+	t.Setenv("VANE_DB_URL", "postgres://test")
+	t.Setenv("VANE_CREDENTIAL_VAULT_ACTIVE_KEY_ID", "vault-key-1")
+	active := strings.Repeat("42", 32)
+	retired := "vault-key-0=" + strings.Repeat("24", 32)
+	if err := os.WriteFile(filepath.Join(directory, credentialVaultKeyCredential),
+		[]byte(active+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, credentialVaultRetiredCredential),
+		[]byte(retired+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CredentialVault.ActiveKeyID != "vault-key-1" ||
+		cfg.CredentialVault.ActiveKeyHex != active ||
+		cfg.CredentialVault.RetiredKeys != retired {
+		t.Fatalf("unexpected credential vault config: %+v", cfg.CredentialVault)
+	}
+}
+
 func TestResearchGatewaySocketUsesIsolatedUnixDefault(t *testing.T) {
 	t.Setenv("VANE_DB_URL", "postgres://runtime")
 	configPath := filepath.Join(t.TempDir(), "config.yaml")

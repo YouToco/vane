@@ -153,8 +153,12 @@ tests prove `row_security_active`; it must not be enabled by config alone.
 
 ## Secret and transport rules
 
-- Bot token and webhook secret are loaded only from explicit sensitive env
-  bindings or systemd credentials; they are absent from repository values.
+- Bot token and webhook secret are absent from repository values. Migration 137
+  adds tenant-owned encrypted database generations managed by exact tenant
+  owners; the current single-manager runtime still uses explicit sensitive env
+  or systemd credentials until the bot-specific manager fleet rollout passes
+  the gates in `credential-vault-contract.md`. A stored generation must not be
+  described as runtime-active before that cutover.
 - Bot API redirects are never followed because the token is embedded in the
   request path.
 - Transport errors are sanitized and never wrap the token-bearing URL.

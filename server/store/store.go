@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/YouToco/vane/server/credentialvault"
 )
 
 // Store 持有数据库连接池，是所有数据访问方法的接收者。
@@ -34,6 +36,7 @@ type Store struct {
 	legacyAdmissionClosed        uint32
 	agentConversationScopes      bool
 	channelSendRetry             bool
+	credentialVault              *credentialvault.Vault
 }
 
 var errResearchRuntimeUnavailable = errors.New("store: V3 research runtime database is not configured")

@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 136
+const latestMigrationVersion int64 = 137
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -49,6 +49,8 @@ var wantTables = []string{
 	"invites",
 	// 019 邮箱+密码身份与会话（决议 D2′）
 	"user_sessions",
+	// 137 encrypted platform/tenant provider credential generations.
+	"credential_vault_entries",
 	// 133 authenticated external-channel binding and durable ingress.
 	"channel_identities",
 	"channel_link_requests",

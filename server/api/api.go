@@ -198,6 +198,15 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/telegram/routes/link", s.handleTelegramRouteLink)
 	inner.HandleFunc("DELETE /api/telegram/routes/{id}", s.handleTelegramRouteUnlink)
 	inner.HandleFunc("POST /api/telegram/test", s.handleTelegramTest)
+	inner.HandleFunc("GET /api/channels/telegram/credentials", s.handleTelegramCredentialStatus)
+	inner.HandleFunc("PUT /api/channels/telegram/credentials", s.handleTelegramCredentialPut)
+	inner.HandleFunc("DELETE /api/channels/telegram/credentials", s.handleTelegramCredentialDelete)
+	inner.HandleFunc("GET /api/channels/feishu/credentials", s.handleFeishuCredentialStatus)
+	inner.HandleFunc("PUT /api/channels/feishu/credentials", s.handleFeishuCredentialPut)
+	inner.HandleFunc("DELETE /api/channels/feishu/credentials", s.handleFeishuCredentialDelete)
+	inner.HandleFunc("GET /api/admin/llm/credentials", s.handleLLMCredentialStatus)
+	inner.HandleFunc("PUT /api/admin/llm/credentials", s.handleLLMCredentialPut)
+	inner.HandleFunc("DELETE /api/admin/llm/credentials", s.handleLLMCredentialDelete)
 
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)

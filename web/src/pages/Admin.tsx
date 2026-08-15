@@ -7,6 +7,7 @@ import Invites from "./Invites";
 import Pricing from "./Pricing";
 import CallCostLedger from "./CallCostLedger";
 import ExecutionTraces from "./ExecutionTraces";
+import LLMCredentials from "./LLMCredentials";
 import { useI18n } from "@/i18n";
 
 // 管理面：只承载**平台级**视图（跨租户/系统级），与用户面严格分开。
@@ -49,6 +50,7 @@ export default function Admin() {
           <TabsTrigger value="pricing">{A.tabPricing}</TabsTrigger>
           <TabsTrigger value="execution-traces">执行轨迹</TabsTrigger>
           <TabsTrigger value="invites">{A.tabInvites}</TabsTrigger>
+          <TabsTrigger value="llm-credentials">LLM 配置</TabsTrigger>
         </TabsList>
         <TabsContent value="observability" className="mt-4 space-y-4">
           {zhOnly}
@@ -72,6 +74,10 @@ export default function Admin() {
         </TabsContent>
         <TabsContent value="invites" className="mt-4">
           <Invites />
+        </TabsContent>
+        <TabsContent value="llm-credentials" className="mt-4 space-y-4">
+          {zhOnly}
+          <LLMCredentials />
         </TabsContent>
       </Tabs>
     </div>

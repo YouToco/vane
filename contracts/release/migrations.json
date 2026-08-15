@@ -539,6 +539,10 @@
     {
       "path": "136_channel_rate_limit_retry.sql",
       "sha256": "4644fddd125342b77e86b18491921ebd92289431a40598089beed38e03e95524"
+    },
+    {
+      "path": "137_credential_vault.sql",
+      "sha256": "1fbbd7e478b546910ee17c474997f5b213a7a8035c5e3286505b070a8975a346"
     }
   ],
   "schema": "vane.migrations/v1"
