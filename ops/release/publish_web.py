@@ -309,6 +309,8 @@ def publish(
                 "OSS_ACCESS_KEY_SECRET": access_secret,
                 "OSS_REGION": REGION,
             }
+            publication_started = time.monotonic()
+            timings: dict[str, float] = {}
             asset_objects = lines(plan / "assets.list")
 
             def upload_asset(object_name: str) -> None:
@@ -320,11 +322,15 @@ def publish(
                     env=provider_env,
                 )
 
+            phase_started = time.monotonic()
             parallel_apply(
                 "OSS immutable upload",
                 asset_objects,
                 upload_asset,
                 workers=OSS_WORKERS,
+            )
+            timings["immutable_upload"] = round(
+                time.monotonic() - phase_started, 3
             )
             readback_root = plan / "provider-readback"
             critical_objects: list[str] = []
@@ -343,12 +349,17 @@ def publish(
                     readback_root,
                 )
 
+            phase_started = time.monotonic()
             parallel_apply(
                 "OSS critical readback",
                 critical_objects,
                 readback_asset,
                 workers=OSS_WORKERS,
             )
+            timings["critical_readback"] = round(
+                time.monotonic() - phase_started, 3
+            )
+            phase_started = time.monotonic()
             for object_name in lines(plan / "html-before-entry.list"):
                 run(
                     [
@@ -367,6 +378,10 @@ def publish(
                     ],
                     env=provider_env,
                 )
+            timings["html_before_entry"] = round(
+                time.monotonic() - phase_started, 3
+            )
+            phase_started = time.monotonic()
             run(
                 [
                     str(ossutil), "cp", str(dist / "index.html"),
@@ -381,8 +396,12 @@ def publish(
                 provider_env,
                 readback_root,
             )
+            timings["entry_commit"] = round(
+                time.monotonic() - phase_started, 3
+            )
             # Commit the public revision only after every earlier provider
             # object and the entrypoint have exact-byte readback evidence.
+            phase_started = time.monotonic()
             run(
                 [
                     str(ossutil),
@@ -399,6 +418,9 @@ def publish(
                 marker_path,
                 provider_env,
                 readback_root,
+            )
+            timings["marker_commit"] = round(
+                time.monotonic() - phase_started, 3
             )
 
             aliyun_env = {
@@ -424,18 +446,25 @@ def publish(
                     if attempt == 3:
                         raise RuntimeError(f"CDN refresh failed after three attempts: {url}")
                     time.sleep(attempt * 5)
+            phase_started = time.monotonic()
             parallel_apply(
                 "CDN refresh",
                 lines(plan / "cdn-refresh-paths.list"),
                 refresh,
                 workers=CDN_WORKERS,
             )
+            timings["cdn_refresh"] = round(time.monotonic() - phase_started, 3)
+            phase_started = time.monotonic()
             marker = verify_public_release(
                 origin,
                 revision,
                 expected_marker=expected_marker,
                 expected_index_sha256=expected_index_sha256,
             )
+            timings["public_verify"] = round(
+                time.monotonic() - phase_started, 3
+            )
+            timings["total"] = round(time.monotonic() - publication_started, 3)
             state = {
                 "schema": "vane.web-current/v1",
                 "revision": revision,
@@ -449,6 +478,11 @@ def publish(
             atomic_copy(receipt, result_path.with_name("web-release-receipt.json"))
             atomic_json(state_file, state)
             atomic_json(result_path, result)
+            print(
+                "Web publication timings: "
+                + json.dumps(timings, sort_keys=True, separators=(",", ":")),
+                file=sys.stderr,
+            )
             return result
 
 
