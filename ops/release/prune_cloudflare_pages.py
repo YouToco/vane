@@ -306,7 +306,10 @@ def _validate_authority(
 ) -> None:
     if project.get("name") != PROJECT:
         raise PruneError("Cloudflare project identity differs from vane-web")
-    if "source" not in project or project.get("source") is not None:
+    # Cloudflare omits ``source`` entirely for some Direct Upload projects and
+    # returns it as null for others.  A non-null value is the Git-bound shape;
+    # absence and null are equivalent unbound authority states.
+    if project.get("source") is not None:
         raise PruneError("Cloudflare project is not an unbound direct-upload project")
     if project.get("production_branch") != PRODUCTION_BRANCH:
         raise PruneError("Cloudflare project production branch is not main")
@@ -551,4 +554,3 @@ def run_prune(
     result = {**summary, "deleted_count": len(deleted), "status": "complete"}
     emit({"event": "cloudflare_pages_prune_complete", "result": result})
     return result
-

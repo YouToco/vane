@@ -542,6 +542,15 @@ class CloudflarePagesPruneTest(unittest.TestCase):
         self.assertNotIn("env_vars", serialized)
         self.assertEqual(first_digest, prune.manifest_sha256(first))
 
+    def test_accepts_cloudflare_direct_upload_shape_with_source_omitted(self) -> None:
+        api = FakeAPI()
+        del api.project_value["source"]
+
+        manifest, digest = plan(api)
+
+        self.assertEqual(manifest["project_authority"]["source"], None)
+        self.assertEqual(digest, prune.manifest_sha256(manifest))
+
     def test_dry_run_emits_reviewable_plan_without_delete(self) -> None:
         api = FakeAPI()
         _, digest = plan(api)
