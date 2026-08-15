@@ -174,6 +174,74 @@ class ExactRevisionCLITest(unittest.TestCase):
                     controller.verify_production_revision("a" * 40)
             remote_status.assert_not_called()
 
+    def test_gate_environment_uses_canonical_shared_public_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gate_home = root / "gate-home"
+            release_root = root / "release"
+            gate_home.mkdir()
+            release_root.mkdir()
+            environment = controller.sanitized_gate_environment(
+                {
+                    "PATH": "/usr/bin",
+                    "GOCACHE": "/private/candidate-build-cache",
+                    "GOMODCACHE": "/private/candidate-module-cache",
+                    "GOTOOLCHAIN": "auto",
+                    "VANE_RELEASE_SIGNING_KEY": "/private/signing-key",
+                    "ALIYUN_ACCESS_KEY_SECRET": "provider-secret",
+                },
+                gate_home=gate_home,
+                release_root=release_root,
+                gate_evidence=release_root / "full-gate.json",
+                rollback_base="a" * 40,
+                cache_root=root / "shared-cache",
+            )
+            self.assertEqual(environment["GOCACHE"], str(root / "shared-cache/go-build"))
+            self.assertEqual(environment["GOMODCACHE"], str(root / "shared-cache/go-mod"))
+            self.assertEqual(environment["GOTOOLCHAIN"], "local")
+            self.assertEqual(environment["GOSUMDB"], "sum.golang.org")
+            self.assertTrue(environment["PATH"].startswith(str(ROOT / ".vane/tool-cache/go/1.26.6/bin:")))
+            self.assertNotIn("VANE_RELEASE_SIGNING_KEY", environment)
+            self.assertNotIn("ALIYUN_ACCESS_KEY_SECRET", environment)
+            for name in ("shared-cache", "go-build", "go-mod"):
+                path = root / (name if name == "shared-cache" else f"shared-cache/{name}")
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    def test_gate_environment_rejects_symlinked_shared_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            outside.mkdir()
+            cache = root / "shared-cache"
+            cache.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(controller.PolicyError, "cache root is unsafe"):
+                controller.sanitized_gate_environment(
+                    {"PATH": "/usr/bin"},
+                    gate_home=root,
+                    release_root=root,
+                    gate_evidence=root / "full-gate.json",
+                    rollback_base="a" * 40,
+                    cache_root=cache,
+                )
+
+    def test_gate_environment_rejects_symlinked_cache_parent_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            outside.mkdir()
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(controller.PolicyError, "cache parent is unsafe"):
+                controller.sanitized_gate_environment(
+                    {"PATH": "/usr/bin"},
+                    gate_home=root,
+                    release_root=root,
+                    gate_evidence=root / "full-gate.json",
+                    rollback_base="a" * 40,
+                    cache_root=linked_parent / "gate-cache",
+                )
+            self.assertFalse((outside / "gate-cache").exists())
+
     def test_one_command_release_runs_gate_build_and_broker_submission(self) -> None:
         revision = "a" * 40
         with tempfile.TemporaryDirectory() as temporary:

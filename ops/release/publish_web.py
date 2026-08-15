@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fcntl
 import hashlib
 import json
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Callable
 from urllib.request import Request, urlopen
 
 
@@ -23,6 +25,8 @@ BUCKET = "zhuoqidev-vane-web"
 REGION = "cn-shenzhen"
 OWNER_PREVIEW = "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
 RELEASE_MARKER_PATH = "vane-release.json"
+OSS_WORKERS = 8
+CDN_WORKERS = 4
 
 
 def sha256(path: Path) -> str:
@@ -68,16 +72,34 @@ def lines(path: Path) -> list[str]:
     return [value for value in path.read_text(encoding="utf-8").splitlines() if value]
 
 
-def stat_size(ossutil: Path, object_name: str, env: dict[str, str]) -> int:
-    result = run(
-        [str(ossutil), "stat", f"oss://{BUCKET}/{object_name}"],
-        env=env,
-        capture=True,
-    )
-    match = re.search(r"(?im)^Content-Length\s*:\s*([0-9]+)\s*$", result)
-    if match is None:
-        raise RuntimeError(f"OSS stat lacks Content-Length: {object_name}")
-    return int(match.group(1))
+def parallel_apply(
+    label: str,
+    values: list[str],
+    action: Callable[[str], None],
+    *,
+    workers: int,
+) -> None:
+    if workers < 1:
+        raise RuntimeError(f"{label} worker count is invalid")
+    if len(values) != len(set(values)):
+        raise RuntimeError(f"{label} contains duplicate objects")
+    if not values:
+        return
+    failures: dict[str, Exception] = {}
+    with ThreadPoolExecutor(
+        max_workers=min(workers, len(values)),
+        thread_name_prefix="vane-web",
+    ) as executor:
+        futures = {executor.submit(action, value): value for value in values}
+        for future in as_completed(futures):
+            value = futures[future]
+            try:
+                future.result()
+            except Exception as error:  # all running immutable writes finish before refusal
+                failures[value] = error
+    if failures:
+        first = sorted(failures)[0]
+        raise RuntimeError(f"{label} failed for {first}: {failures[first]}")
 
 
 def verify_public_release(
@@ -86,6 +108,7 @@ def verify_public_release(
     *,
     expected_marker: bytes,
     expected_index_sha256: str,
+    attempts: int = 6,
 ) -> dict:
     def strict_pairs(items: list[tuple[str, object]]) -> dict[str, object]:
         value: dict[str, object] = {}
@@ -114,7 +137,9 @@ def verify_public_release(
     marker_target = origin.rstrip("/") + f"/{RELEASE_MARKER_PATH}?release={revision}"
     index_target = origin.rstrip("/") + f"/index.html?release={revision}"
     last_error: Exception | None = None
-    for attempt in range(1, 7):
+    if attempts < 1 or attempts > 6:
+        raise RuntimeError("public Web verification attempt count is invalid")
+    for attempt in range(1, attempts + 1):
         try:
             request = Request(marker_target, headers={"Cache-Control": "no-cache"})
             with urlopen(request, timeout=15) as response:
@@ -133,7 +158,7 @@ def verify_public_release(
             return marker_value
         except Exception as error:  # network convergence is bounded and evidenced
             last_error = error
-            if attempt < 6:
+            if attempt < attempts:
                 time.sleep(attempt * 2)
     raise RuntimeError(f"public Web release did not converge: {last_error}")
 
@@ -249,13 +274,44 @@ def publish(
                     atomic_json(result_path, result)
                     return result
 
+            # If the provider commit and public entrypoint already match this
+            # exact receipt, a prior process crashed only before local state
+            # settlement. Marker-last makes this a safe, zero-mutation resume.
+            try:
+                marker = verify_public_release(
+                    origin,
+                    revision,
+                    expected_marker=expected_marker,
+                    expected_index_sha256=expected_index_sha256,
+                    attempts=1,
+                )
+            except RuntimeError:
+                marker = None
+            if marker is not None:
+                state = {
+                    "schema": "vane.web-current/v1",
+                    "revision": revision,
+                    "receipt_sha256": receipt_digest,
+                }
+                result = {
+                    "schema": "vane.web-publication/v1", "revision": revision,
+                    "receipt_sha256": receipt_digest, "marker": marker,
+                    "status": "provider-already-current",
+                }
+                atomic_copy(receipt, result_path.with_name("web-release-receipt.json"))
+                atomic_json(state_file, state)
+                atomic_json(result_path, result)
+                return result
+
             provider_env = {
                 **os.environ,
                 "OSS_ACCESS_KEY_ID": access_id,
                 "OSS_ACCESS_KEY_SECRET": access_secret,
                 "OSS_REGION": REGION,
             }
-            for object_name in lines(plan / "assets.list"):
+            asset_objects = lines(plan / "assets.list")
+
+            def upload_asset(object_name: str) -> None:
                 run(
                     [
                         str(ossutil), "cp", str(dist / object_name),
@@ -263,11 +319,22 @@ def publish(
                     ],
                     env=provider_env,
                 )
+
+            parallel_apply(
+                "OSS immutable upload",
+                asset_objects,
+                upload_asset,
+                workers=OSS_WORKERS,
+            )
             readback_root = plan / "provider-readback"
+            critical_objects: list[str] = []
             for row in lines(plan / "critical-assets.list"):
                 size, object_name = row.split("\t", 1)
-                if stat_size(ossutil, object_name, provider_env) != int(size):
-                    raise RuntimeError(f"OSS critical asset size differs: {object_name}")
+                if int(size) != (dist / object_name).stat().st_size:
+                    raise RuntimeError(f"local critical asset size differs: {object_name}")
+                critical_objects.append(object_name)
+
+            def readback_asset(object_name: str) -> None:
                 verify_oss_object(
                     ossutil,
                     object_name,
@@ -275,6 +342,13 @@ def publish(
                     provider_env,
                     readback_root,
                 )
+
+            parallel_apply(
+                "OSS critical readback",
+                critical_objects,
+                readback_asset,
+                workers=OSS_WORKERS,
+            )
             for object_name in lines(plan / "html-before-entry.list"):
                 run(
                     [
@@ -300,8 +374,6 @@ def publish(
                 ],
                 env=provider_env,
             )
-            if stat_size(ossutil, "index.html", provider_env) != (dist / "index.html").stat().st_size:
-                raise RuntimeError("OSS index.html size differs after atomic cutover")
             verify_oss_object(
                 ossutil,
                 "index.html",
@@ -336,7 +408,7 @@ def publish(
                 "ALIBABA_CLOUD_ACCESS_KEY_SECRET": access_secret,
                 "ALIBABA_CLOUD_REGION_ID": REGION,
             }
-            for refresh_path in lines(plan / "cdn-refresh-paths.list"):
+            def refresh(refresh_path: str) -> None:
                 url = origin.rstrip("/") + refresh_path
                 for attempt in range(1, 4):
                     refreshed = subprocess.run(
@@ -352,6 +424,12 @@ def publish(
                     if attempt == 3:
                         raise RuntimeError(f"CDN refresh failed after three attempts: {url}")
                     time.sleep(attempt * 5)
+            parallel_apply(
+                "CDN refresh",
+                lines(plan / "cdn-refresh-paths.list"),
+                refresh,
+                workers=CDN_WORKERS,
+            )
             marker = verify_public_release(
                 origin,
                 revision,

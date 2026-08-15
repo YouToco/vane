@@ -45,12 +45,12 @@ BROKER_HOST = "188.253.125.238"
 BROKER_PORT = 10058
 BROKER_KNOWN_HOSTS_SHA256 = "755558dd29ed29400289842f639f31856f12eb0c25654a6d9007fd572163e5d3"
 GATE_ENV_ALLOWLIST = {
-    "ALL_PROXY", "DOCKER_CONTEXT", "DOCKER_HOST", "GOCACHE", "GOMODCACHE",
-    "GOPATH", "GOPROXY", "GOROOT", "GOSUMDB", "GOTOOLCHAIN", "HTTP_PROXY",
+    "ALL_PROXY", "DOCKER_CONTEXT", "DOCKER_HOST", "GOPROXY", "HTTP_PROXY",
     "HTTPS_PROXY", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "NO_PROXY",
     "PATH", "SHELL", "SSL_CERT_DIR", "SSL_CERT_FILE", "TERM", "TMPDIR",
     "TMP", "TEMP", "USER", "VANE_TOOL_CACHE",
 }
+GATE_CACHE_ROOT = ROOT / ".vane" / "gate-cache"
 CREATED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 EXIT_POLICY = 78
 RELEASE_RECEIPT_SCHEMA = "vane.release-receipt/v1"
@@ -887,13 +887,57 @@ def verify_production_revision(revision: str) -> str:
 
 def sanitized_gate_environment(
     source: dict[str, str], *, gate_home: Path, release_root: Path,
-    gate_evidence: Path, rollback_base: str,
+    gate_evidence: Path, rollback_base: str, cache_root: Path | None = None,
 ) -> dict[str, str]:
+    shared_cache = cache_root or GATE_CACHE_ROOT
+    if not shared_cache.is_absolute() or shared_cache.is_symlink():
+        raise PolicyError("shared Gate cache root is unsafe")
+    cache_parent = shared_cache.parent
+    if cache_parent.is_symlink():
+        raise PolicyError("shared Gate cache parent is unsafe")
+    cache_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def require_cache_directory(directory: Path) -> None:
+        if directory.is_symlink():
+            raise PolicyError(f"shared Gate cache directory is unsafe: {directory}")
+        directory.mkdir(exist_ok=True, mode=0o700)
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise PolicyError(f"shared Gate cache directory is unsafe: {directory}")
+
+    require_cache_directory(cache_parent)
+    require_cache_directory(shared_cache)
+    go_build_cache = shared_cache / "go-build"
+    go_module_cache = shared_cache / "go-mod"
+    require_cache_directory(go_build_cache)
+    require_cache_directory(go_module_cache)
+
+    lock = load_json(DEFAULT_LOCK)
+    try:
+        go_version = lock["tools"]["go"]["version"]
+    except (KeyError, TypeError) as error:
+        raise PolicyError("toolchain lock has no exact Go version") from error
+    tool_cache = Path(
+        source.get("VANE_TOOL_CACHE", str(ROOT / ".vane" / "tool-cache"))
+    )
+    locked_go = tool_cache / "go" / str(go_version) / "bin" / "go"
+    if locked_go.is_symlink() or not locked_go.is_file() or not os.access(locked_go, os.X_OK):
+        raise PolicyError("locked Go executable is unavailable for the Gate")
+
     result = {
         name: value for name, value in source.items() if name in GATE_ENV_ALLOWLIST
     }
     result.update({
+        "GOCACHE": str(go_build_cache),
+        "GOMODCACHE": str(go_module_cache),
+        "GOSUMDB": "sum.golang.org",
+        "GOTOOLCHAIN": "local",
         "HOME": str(gate_home),
+        "PATH": f"{locked_go.parent}:{source.get('PATH', '')}",
         "VANE_WORK_ROOT": str(release_root),
         "VANE_FULL_GATE_EVIDENCE": str(gate_evidence),
         "VANE_ROLLBACK_BASE_SHA": rollback_base,
