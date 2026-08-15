@@ -32,6 +32,7 @@ import (
 	"github.com/YouToco/vane/server/feishu"
 	"github.com/YouToco/vane/server/fetcher"
 	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/mailer"
 	"github.com/YouToco/vane/server/periodicbrief"
 	"github.com/YouToco/vane/server/profilehint"
 	"github.com/YouToco/vane/server/pusheffect"
@@ -103,6 +104,18 @@ func run() error {
 	cfg, err := config.Load("")
 	if err != nil {
 		return fmt.Errorf("加载配置: %w", err)
+	}
+	var securityMailer api.SecurityMailer
+	if cfg.SMTP.Enabled {
+		securityMailer, err = mailer.NewSMTP(mailer.Config{
+			Host: cfg.SMTP.Host, Port: cfg.SMTP.Port,
+			Username: cfg.SMTP.Username, Password: cfg.SMTP.Password,
+			From: cfg.SMTP.From, TLSMode: mailer.TLSMode(cfg.SMTP.TLSMode),
+			ServerName: cfg.SMTP.ServerName,
+		})
+		if err != nil {
+			return fmt.Errorf("初始化账号安全邮件服务: %w", err)
+		}
 	}
 	// The owner surface always contains manage_tasks create. Fail before the
 	// first Store connection (and therefore before workers or ingress) instead
@@ -1139,12 +1152,14 @@ func run() error {
 	principals := auth.NewOwnerResolver(st, feishu.SettingKeyOwner)
 
 	api.Mount(mux, api.Deps{
-		Store:         st,
-		Auth:          st,
-		Manager:       manager,
-		Scheduler:     sched,
-		TaskAgent:     agentLoop,
-		BriefFeedback: fbSvc,
+		Store:           st,
+		Auth:            st,
+		AccountSecurity: st,
+		SecurityMailer:  securityMailer,
+		Manager:         manager,
+		Scheduler:       sched,
+		TaskAgent:       agentLoop,
+		BriefFeedback:   fbSvc,
 		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
 			ExecutiveBriefWebCanaryScheduleID,
 		ExecutiveBriefWebProjectionAllowAll: cfg.Pipeline.

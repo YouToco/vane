@@ -150,7 +150,12 @@ type Deps struct {
 	// Workspaces can be injected independently in tests. Production falls back
 	// to Store, which implements this interface.
 	Workspaces WorkspaceStore
-	Manager    Manager
+	// AccountSecurity and SecurityMailer are separated so authentication tests
+	// never open a network connection. Production injects Store plus the
+	// TLS-only SMTP adapter; tests use narrow fakes.
+	AccountSecurity AccountSecurityStore
+	SecurityMailer  SecurityMailer
+	Manager         Manager
 	// Scheduler is capability-checked per endpoint below. Keeping this slot
 	// untyped lets each handler require only its idempotent command/read surface
 	// and removes the retired pre-6.8 DeletePush admission signature.
@@ -215,6 +220,12 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/auth/register", s.handleRegister)
 	inner.HandleFunc("POST /api/auth/login", s.handleLogin)
 	inner.HandleFunc("POST /api/auth/workspace-invites/register", s.handleWorkspaceInviteRegister)
+	inner.HandleFunc("POST /api/auth/email-verification/request", s.handleRequestEmailVerification)
+	inner.HandleFunc("POST /api/auth/email-verification/verify", s.handleVerifyEmail)
+	inner.HandleFunc("POST /api/auth/password-reset/request", s.handleRequestPasswordReset)
+	inner.HandleFunc("POST /api/auth/password-reset/complete", s.handleResetPassword)
+	inner.HandleFunc("POST /api/auth/reauth", s.handleReauth)
+	inner.HandleFunc("POST /api/auth/logout-all", s.handleLogoutAll)
 	inner.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	inner.HandleFunc("GET /api/auth/me", s.handleMe)
 	inner.HandleFunc("GET /api/workspaces", s.handleListWorkspaces)
