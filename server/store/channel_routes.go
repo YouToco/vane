@@ -369,6 +369,10 @@ func (s *Store) ListTelegramRoutesForUser(
 func (s *Store) RevokeTelegramRoute(
 	ctx context.Context, tenantID, userID, routeID int64, appIdentity string,
 ) error {
+	retryClear := ""
+	if s.channelSendRetry {
+		retryClear = ",next_send_at=NULL"
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
@@ -393,7 +397,7 @@ func (s *Store) RevokeTelegramRoute(
 	if _, err := tx.Exec(ctx,
 		`UPDATE channel_ingress_receipts
 		    SET status='failed',reply_text=NULL,error_code='route_revoked',
-		        processing_lease=NULL,lease_expires_at=NULL,next_send_at=NULL,
+		        processing_lease=NULL,lease_expires_at=NULL`+retryClear+`,
 		        updated_at=clock_timestamp()
 		  WHERE route_id=$1 AND status IN ('pending','processing','reply_ready')`,
 		routeID); err != nil {
@@ -429,6 +433,10 @@ func (s *Store) RevokeTelegramRoute(
 func (s *Store) MigrateTelegramRoutes(
 	ctx context.Context, appIdentity, oldChatID, newChatID string,
 ) error {
+	if !s.channelSendRetry {
+		return types.NewAppError(types.CodeValidation,
+			"Telegram 群迁移 schema 尚未生效", types.ErrValidation)
+	}
 	if validateTelegramIdentityParts(appIdentity, "migration", oldChatID) != nil ||
 		validateTelegramIdentityParts(appIdentity, "migration", newChatID) != nil ||
 		oldChatID == newChatID {
@@ -527,6 +535,10 @@ func (s *Store) MigrateTelegramRoutes(
 func (s *Store) InvalidateTelegramDestination(
 	ctx context.Context, appIdentity, chatID, threadID, reason string,
 ) error {
+	if !s.channelSendRetry {
+		return types.NewAppError(types.CodeValidation,
+			"Telegram 生命周期 schema 尚未生效", types.ErrValidation)
+	}
 	if validateTelegramIdentityParts(appIdentity, "lifecycle", chatID) != nil ||
 		(reason != "bot_membership_lost" && reason != "topic_closed") {
 		return types.NewAppError(types.CodeValidation,

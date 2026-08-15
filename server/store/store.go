@@ -32,6 +32,8 @@ type Store struct {
 	researchCapabilityConfigured bool
 	intelligenceCursorState      *intelligenceCursorState
 	legacyAdmissionClosed        uint32
+	agentConversationScopes      bool
+	channelSendRetry             bool
 }
 
 var errResearchRuntimeUnavailable = errors.New("store: V3 research runtime database is not configured")
@@ -206,9 +208,12 @@ func newStorePool(
 }
 
 func newStore(pool, researchPool *pgxpool.Pool) *Store {
+	agentScopes, channelRetry := detectOptionalSchemaCapabilities(pool)
 	store := &Store{
 		pool: pool, beginTx: pool.BeginTx,
 		intelligenceCursorState: &intelligenceCursorState{},
+		agentConversationScopes: agentScopes,
+		channelSendRetry:        channelRetry,
 		beginResearchTx: func(context.Context, pgx.TxOptions) (pgx.Tx, error) {
 			return nil, errResearchRuntimeUnavailable
 		},
@@ -224,6 +229,33 @@ func newStore(pool, researchPool *pgxpool.Pool) *Store {
 		store.beginResearchTx = researchPool.BeginTx
 	}
 	return store
+}
+
+// detectOptionalSchemaCapabilities keeps retained-history tests honest: they
+// intentionally construct the current Store against older migration targets.
+// Production constructs Store only after Migrate, so both capabilities are
+// true. Detection failure is fail-closed by assuming the new schema; later
+// scoped SQL then fails instead of silently sharing owner/channel history.
+func detectOptionalSchemaCapabilities(pool *pgxpool.Pool) (bool, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var agentScopes, ingressRetry, outboundRetry bool
+	err := pool.QueryRow(ctx,
+		`SELECT
+		 EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+		          WHERE attrelid=to_regclass('public.agent_sessions') AND
+		                attname='conversation_scope' AND NOT attisdropped),
+		 EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+		          WHERE attrelid=to_regclass('public.channel_ingress_receipts') AND
+		                attname='next_send_at' AND NOT attisdropped),
+		 EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+		          WHERE attrelid=to_regclass('public.channel_outbound_effects') AND
+		                attname='next_send_at' AND NOT attisdropped)`,
+	).Scan(&agentScopes, &ingressRetry, &outboundRetry)
+	if err != nil {
+		return true, true
+	}
+	return agentScopes, ingressRetry && outboundRetry
 }
 
 func (s *Store) beginResearchTransaction(

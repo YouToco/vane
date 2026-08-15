@@ -161,6 +161,11 @@ func (s *Store) PrepareTelegramOutbound(
 func (s *Store) ClaimTelegramOutbound(
 	ctx context.Context, effectID string,
 ) (ChannelOutboundEffect, error) {
+	dueClause, retryClear := "", ""
+	if s.channelSendRetry {
+		dueClause = " AND (e.next_send_at IS NULL OR e.next_send_at<=clock_timestamp())"
+		retryClear = ",next_send_at=NULL"
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
@@ -172,8 +177,7 @@ func (s *Store) ClaimTelegramOutbound(
 		`SELECT cr.id FROM channel_outbound_effects e
 		 JOIN channel_routes cr ON cr.id=e.route_id
 		 JOIN channel_identities ci ON ci.id=cr.identity_id
-		WHERE e.effect_id=$1 AND e.provider=$2 AND e.status='prepared' AND
-		      (e.next_send_at IS NULL OR e.next_send_at<=clock_timestamp()) AND
+		WHERE e.effect_id=$1 AND e.provider=$2 AND e.status='prepared'`+dueClause+` AND
 		      cr.status='active' AND ci.status='active'
 		FOR UPDATE OF cr`, effectID, channelProviderTelegram).Scan(&routeID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -186,9 +190,9 @@ func (s *Store) ClaimTelegramOutbound(
 	}
 	effect, err := scanChannelOutbound(tx.QueryRow(ctx,
 		`UPDATE channel_outbound_effects
-		    SET status='sending',next_send_at=NULL,updated_at=clock_timestamp()
-		  WHERE effect_id=$1 AND route_id=$2 AND status='prepared' AND
-		        (next_send_at IS NULL OR next_send_at<=clock_timestamp())
+		    SET status='sending'`+retryClear+`,updated_at=clock_timestamp()
+		  WHERE effect_id=$1 AND route_id=$2 AND status='prepared'`+
+			strings.ReplaceAll(dueClause, "e.", "")+`
 		  RETURNING `+channelOutboundColumns, effectID, routeID))
 	if err != nil {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
@@ -267,6 +271,10 @@ func (s *Store) DeferTelegramOutbound(
 	ctx context.Context, effect ChannelOutboundEffect, retryAfter time.Duration,
 	maxRetries int,
 ) (bool, error) {
+	if !s.channelSendRetry {
+		return false, types.NewAppError(types.CodeValidation,
+			"Telegram outbound 限流迁移尚未生效", types.ErrValidation)
+	}
 	if retryAfter < time.Second || retryAfter > 24*time.Hour ||
 		retryAfter%time.Second != 0 || maxRetries < 1 || maxRetries > 100 {
 		return false, types.NewAppError(types.CodeValidation,

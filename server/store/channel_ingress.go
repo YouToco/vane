@@ -445,6 +445,10 @@ func (s *Store) GetTelegramIdentityForUser(
 func (s *Store) RevokeTelegramIdentity(
 	ctx context.Context, tenantID, userID int64, appIdentity string,
 ) error {
+	retryClear := ""
+	if s.channelSendRetry {
+		retryClear = ",next_send_at=NULL"
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
@@ -481,7 +485,7 @@ func (s *Store) RevokeTelegramIdentity(
 	if _, err := tx.Exec(ctx,
 		`UPDATE channel_ingress_receipts
 		    SET status='failed',reply_text=NULL,error_code='identity_revoked',
-		        processing_lease=NULL,lease_expires_at=NULL,next_send_at=NULL,
+		        processing_lease=NULL,lease_expires_at=NULL`+retryClear+`,
 		        updated_at=clock_timestamp()
 		  WHERE identity_id=$1 AND
 		        status IN ('pending','processing','reply_ready')`,
@@ -763,6 +767,10 @@ func (s *Store) ClaimNextTelegramIngress(
 func (s *Store) MarkTelegramIngressReplyReady(
 	ctx context.Context, item ChannelIngress, reply string,
 ) error {
+	retryClear := ""
+	if s.channelSendRetry {
+		retryClear = ",next_send_at=NULL"
+	}
 	if strings.TrimSpace(reply) == "" || len(reply) > 262144 {
 		return types.NewAppError(types.CodeValidation,
 			"Telegram 回复内容无效", types.ErrValidation)
@@ -770,7 +778,7 @@ func (s *Store) MarkTelegramIngressReplyReady(
 	command, err := s.pool.Exec(ctx,
 		`UPDATE channel_ingress_receipts
 		    SET status='reply_ready',reply_text=$5,processing_lease=NULL,
-		        lease_expires_at=NULL,next_send_at=NULL,updated_at=clock_timestamp()
+		        lease_expires_at=NULL`+retryClear+`,updated_at=clock_timestamp()
 		  WHERE provider=$1 AND app_identity=$2 AND provider_update_id=$3 AND
 		        status='processing' AND processing_lease=$4`,
 		item.Provider, item.AppIdentity, item.ProviderUpdateID,
@@ -810,6 +818,11 @@ func (s *Store) MarkTelegramIngressFailed(
 func (s *Store) ClaimTelegramReplySend(
 	ctx context.Context, provider, appIdentity, updateID string,
 ) (ChannelIngress, error) {
+	dueClause, retryClear := "", ""
+	if s.channelSendRetry {
+		dueClause = " AND (r.next_send_at IS NULL OR r.next_send_at<=clock_timestamp())"
+		retryClear = ",next_send_at=NULL"
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return ChannelIngress{}, types.NewAppError(types.CodeDatabase,
@@ -823,8 +836,7 @@ func (s *Store) ClaimTelegramReplySend(
 		   JOIN channel_identities ci ON ci.id=r.identity_id
 		   JOIN channel_routes cr ON cr.id=r.route_id
 		  WHERE r.provider=$1 AND r.app_identity=$2 AND
-		        r.provider_update_id=$3 AND r.status='reply_ready' AND
-		        (r.next_send_at IS NULL OR r.next_send_at<=clock_timestamp()) AND
+		        r.provider_update_id=$3 AND r.status='reply_ready'`+dueClause+` AND
 		        ci.status='active' AND cr.status='active'
 		  FOR UPDATE OF ci,cr`, provider, appIdentity, updateID).Scan(&identityID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -838,10 +850,10 @@ func (s *Store) ClaimTelegramReplySend(
 	var item ChannelIngress
 	err = tx.QueryRow(ctx,
 		`UPDATE channel_ingress_receipts
-		    SET status='sending',next_send_at=NULL,updated_at=clock_timestamp()
+		    SET status='sending'`+retryClear+`,updated_at=clock_timestamp()
 		  WHERE provider=$1 AND app_identity=$2 AND provider_update_id=$3 AND
-		        identity_id=$4 AND status='reply_ready' AND
-		        (next_send_at IS NULL OR next_send_at<=clock_timestamp())
+		        identity_id=$4 AND status='reply_ready'`+
+			strings.ReplaceAll(dueClause, "r.", "")+`
 		 RETURNING provider,app_identity,provider_update_id,identity_id,
 		           tenant_id,user_id,external_user_id,provider_chat_id,
 		           provider_thread_id,provider_message_id,route_id,
@@ -877,6 +889,11 @@ func (s *Store) ClaimTelegramReplySend(
 func (s *Store) ClaimNextTelegramReplySend(
 	ctx context.Context, appIdentity string,
 ) (ChannelIngress, error) {
+	dueClause, retryClear := "", ""
+	if s.channelSendRetry {
+		dueClause = " AND (r.next_send_at IS NULL OR r.next_send_at<=clock_timestamp())"
+		retryClear = ",next_send_at=NULL"
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return ChannelIngress{}, types.NewAppError(types.CodeDatabase,
@@ -890,8 +907,7 @@ func (s *Store) ClaimNextTelegramReplySend(
 		   JOIN channel_identities ci ON ci.id=r.identity_id
 		   JOIN channel_routes cr ON cr.id=r.route_id
 		  WHERE ci.provider=$1 AND ci.app_identity=$2 AND ci.status='active' AND
-		        cr.status='active' AND r.status='reply_ready' AND
-		        (r.next_send_at IS NULL OR r.next_send_at<=clock_timestamp()) AND
+		        cr.status='active' AND r.status='reply_ready'`+dueClause+` AND
 		        NOT EXISTS (
 		          SELECT 1 FROM channel_ingress_receipts earlier
 		           WHERE earlier.identity_id=r.identity_id AND
@@ -914,8 +930,7 @@ func (s *Store) ClaimNextTelegramReplySend(
 		   SELECT provider,app_identity,provider_update_id
 		     FROM channel_ingress_receipts
 		    WHERE provider=$1 AND app_identity=$2 AND identity_id=$3 AND route_id=$4 AND
-		          status='reply_ready' AND
-		          (next_send_at IS NULL OR next_send_at<=clock_timestamp()) AND
+		          status='reply_ready'`+strings.ReplaceAll(dueClause, "r.", "")+` AND
 		          NOT EXISTS (
 		            SELECT 1 FROM channel_ingress_receipts earlier
 		             WHERE earlier.identity_id=channel_ingress_receipts.identity_id AND
@@ -927,7 +942,7 @@ func (s *Store) ClaimNextTelegramReplySend(
 		    FOR UPDATE SKIP LOCKED LIMIT 1
 		 )
 		 UPDATE channel_ingress_receipts r
-		    SET status='sending',next_send_at=NULL,updated_at=clock_timestamp()
+		    SET status='sending'`+retryClear+`,updated_at=clock_timestamp()
 		   FROM candidate c
 		  WHERE r.provider=c.provider AND r.app_identity=c.app_identity AND
 		        r.provider_update_id=c.provider_update_id
@@ -1020,6 +1035,10 @@ func (s *Store) DeferTelegramReply(
 	ctx context.Context, item ChannelIngress, retryAfter time.Duration,
 	maxRetries int,
 ) (bool, error) {
+	if !s.channelSendRetry {
+		return false, types.NewAppError(types.CodeValidation,
+			"Telegram 回复限流迁移尚未生效", types.ErrValidation)
+	}
 	if retryAfter < time.Second || retryAfter > 24*time.Hour ||
 		retryAfter%time.Second != 0 || maxRetries < 1 || maxRetries > 100 {
 		return false, types.NewAppError(types.CodeValidation,

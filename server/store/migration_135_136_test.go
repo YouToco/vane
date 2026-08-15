@@ -52,6 +52,102 @@ func TestMigration135And136Boundaries(t *testing.T) {
 	}
 }
 
+func TestOptionalTelegramSchemaGuardsRejectBeforeDatabase(t *testing.T) {
+	st := &Store{}
+	if _, err := st.GetActiveAgentSessionInScope(
+		t.Context(), 1, "channel-route:1", time.Now().Add(-time.Hour),
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("scoped lookup without migration err=%v", err)
+	}
+	if _, err := st.CreateAgentSessionInScope(
+		t.Context(), 1, "channel-route:1",
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("scoped create without migration err=%v", err)
+	}
+	if _, err := st.DeferTelegramReply(
+		t.Context(), ChannelIngress{}, time.Second, 1,
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("reply retry without migration err=%v", err)
+	}
+	if _, err := st.DeferTelegramOutbound(
+		t.Context(), ChannelOutboundEffect{}, time.Second, 1,
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("outbound retry without migration err=%v", err)
+	}
+	if err := st.MigrateTelegramRoutes(
+		t.Context(), "12345", "-10", "-20",
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("route migration without schema err=%v", err)
+	}
+	if err := st.InvalidateTelegramDestination(
+		t.Context(), "12345", "-10", "", "bot_membership_lost",
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("destination invalidation without schema err=%v", err)
+	}
+}
+
+func TestOptionalSchemaCapabilitiesAcrossRetainedMigrationPostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		requireDatabaseCapability(t)
+	}
+	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
+	t.Cleanup(drop)
+	if _, err := provider.UpTo(t.Context(), 134); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.agentConversationScopes || legacy.channelSendRetry {
+		legacy.Close()
+		t.Fatalf("migration 134 capabilities=(%t,%t), want false,false",
+			legacy.agentConversationScopes, legacy.channelSendRetry)
+	}
+	userID, _ := migration129Identity(t, database, "retained-schema-capabilities")
+	if _, err := legacy.GetActiveAgentSession(
+		t.Context(), userID, time.Now().Add(-time.Hour),
+	); !errors.Is(err, types.ErrNotFound) {
+		legacy.Close()
+		t.Fatalf("legacy empty lookup err=%v", err)
+	}
+	session, err := legacy.CreateAgentSession(t.Context(), userID)
+	if err != nil || session.ConversationScope != ownerConversationScope {
+		legacy.Close()
+		t.Fatalf("legacy session=%+v err=%v", session, err)
+	}
+	got, err := legacy.GetActiveAgentSession(
+		t.Context(), userID, time.Now().Add(-time.Hour))
+	if err != nil || got.ID != session.ID || got.ConversationScope != ownerConversationScope {
+		legacy.Close()
+		t.Fatalf("legacy lookup=%+v err=%v", got, err)
+	}
+	legacy.Close()
+
+	if agentScopes, channelRetry := detectOptionalSchemaCapabilities(legacy.pool); !agentScopes || !channelRetry {
+		t.Fatalf("capability detection failure must fail closed, got (%t,%t)",
+			agentScopes, channelRetry)
+	}
+	if _, err := provider.UpTo(t.Context(), 136); err != nil {
+		t.Fatal(err)
+	}
+	current, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, current)
+	if !current.agentConversationScopes || !current.channelSendRetry {
+		t.Fatalf("migration 136 capabilities=(%t,%t), want true,true",
+			current.agentConversationScopes, current.channelSendRetry)
+	}
+	got, err = current.GetActiveAgentSession(
+		t.Context(), userID, time.Now().Add(-time.Hour))
+	if err != nil || got.ID != session.ID || got.ConversationScope != ownerConversationScope {
+		t.Fatalf("migrated owner lookup=%+v err=%v", got, err)
+	}
+}
+
 func TestScopedAgentSessionsPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {

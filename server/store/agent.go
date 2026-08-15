@@ -11,17 +11,30 @@ import (
 	"github.com/YouToco/vane/server/types"
 )
 
-// agentSessionColumns 是 agent_sessions 表全列，SELECT 与 scanAgentSession 一一对应。
-const agentSessionColumns = `id, tenant_id, user_id, conversation_scope, status, messages, turn_count, activated_tools, created_at, updated_at`
+// agentSessionColumns retains the pre-135 projection for retained-history
+// tests and legacy schema readers. Scoped production reads use the explicit
+// superset below.
+const agentSessionColumns = `id, tenant_id, user_id, status, messages, turn_count, activated_tools, created_at, updated_at`
+
+const scopedAgentSessionColumns = `id, tenant_id, user_id, conversation_scope, status, messages, turn_count, activated_tools, created_at, updated_at`
 
 const ownerConversationScope = "owner"
 
 // scanAgentSession 把一行 agent_sessions 扫进 types.AgentSession（复用于单行与 RETURNING）。
 func scanAgentSession(row pgx.Row, as *types.AgentSession) error {
+	as.ConversationScope = ownerConversationScope
 	return row.Scan(
-		&as.ID, &as.TenantID, &as.UserID, &as.ConversationScope,
+		&as.ID, &as.TenantID, &as.UserID,
 		&as.Status, &as.Messages,
 		&as.TurnCount, &as.ActivatedTools, &as.CreatedAt, &as.UpdatedAt,
+	)
+}
+
+func scanScopedAgentSession(row pgx.Row, as *types.AgentSession) error {
+	return row.Scan(
+		&as.ID, &as.TenantID, &as.UserID, &as.ConversationScope,
+		&as.Status, &as.Messages, &as.TurnCount, &as.ActivatedTools,
+		&as.CreatedAt, &as.UpdatedAt,
 	)
 }
 
@@ -49,7 +62,55 @@ func validAgentConversationScope(scope string) bool {
 // 不会产生错误结果，故不用 SELECT FOR UPDATE。翻转刻意不动 updated_at——
 // 保留"最后活跃时间"语义供排查。
 func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error) {
+	if !s.agentConversationScopes {
+		return s.getActiveAgentSessionLegacy(ctx, userID, since)
+	}
 	return s.GetActiveAgentSessionInScope(ctx, userID, ownerConversationScope, since)
+}
+
+func (s *Store) getActiveAgentSessionLegacy(
+	ctx context.Context, userID int64, since time.Time,
+) (*types.AgentSession, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("开始查询用户 %d 的活跃 agent 会话", userID), err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL search_path = pg_catalog, public`); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("固定用户 %d 的 agent 会话查询路径", userID), err)
+	}
+	var as types.AgentSession
+	err = scanAgentSession(tx.QueryRow(ctx,
+		`WITH stale AS (
+			UPDATE agent_sessions SET status=$3
+			 WHERE user_id=$1 AND status=$4 AND updated_at<$2
+		 )
+		 SELECT `+agentSessionColumns+` FROM agent_sessions
+		  WHERE user_id=$1 AND status=$4 AND updated_at>=$2
+		  ORDER BY updated_at DESC LIMIT 1`, userID, since,
+		types.AgentSessionStatusExpired, types.AgentSessionStatusActive), &as)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return nil, types.NewAppError(types.CodeDatabase,
+					fmt.Sprintf("提交用户 %d 的 agent 会话过期翻转", userID), commitErr)
+			}
+			return nil, types.NewAppError(types.CodeNotFound,
+				fmt.Sprintf("用户 %d 无活跃 agent 会话", userID), err)
+		}
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询用户 %d 的活跃 agent 会话", userID), err)
+	}
+	if err := loadAuthoritativeActiveAgentSessionProjection(ctx, tx, &as); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("提交用户 %d 的活跃 agent 会话查询", userID), err)
+	}
+	return &as, nil
 }
 
 // GetActiveAgentSessionInScope returns the active Agent session for one
@@ -61,6 +122,10 @@ func (s *Store) GetActiveAgentSessionInScope(
 	if userID <= 0 || !validAgentConversationScope(conversationScope) {
 		return nil, types.NewAppError(types.CodeValidation,
 			"Agent 会话范围无效", types.ErrValidation)
+	}
+	if !s.agentConversationScopes {
+		return nil, types.NewAppError(types.CodeValidation,
+			"Agent 会话范围迁移尚未生效", types.ErrValidation)
 	}
 	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
@@ -77,13 +142,13 @@ func (s *Store) GetActiveAgentSessionInScope(
 	}
 
 	var as types.AgentSession
-	err = scanAgentSession(tx.QueryRow(ctx,
+	err = scanScopedAgentSession(tx.QueryRow(ctx,
 		`WITH stale AS (
 			UPDATE agent_sessions SET status = $4
 			WHERE user_id = $1 AND conversation_scope = $2 AND
 			      status = $5 AND updated_at < $3
 		 )
-		 SELECT `+agentSessionColumns+`
+		 SELECT `+scopedAgentSessionColumns+`
 		 FROM agent_sessions
 		 WHERE user_id = $1 AND conversation_scope = $2 AND
 		       status = $5 AND updated_at >= $3
@@ -121,6 +186,18 @@ func (s *Store) GetActiveAgentSessionInScope(
 // CreateAgentSession 新建 active 会话（messages / turn_count 走表默认 '[]' / 0）。
 // RETURNING 全列，调用方拿到的实体恒为数据库当前真实状态。
 func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error) {
+	if !s.agentConversationScopes {
+		var as types.AgentSession
+		err := scanAgentSession(s.pool.QueryRow(ctx,
+			`INSERT INTO agent_sessions (tenant_id,user_id)
+			 VALUES (`+tenantOfUser+`$1),$1)
+			 RETURNING `+agentSessionColumns, userID), &as)
+		if err != nil {
+			return nil, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("新建 agent 会话（user=%d）", userID), err)
+		}
+		return &as, nil
+	}
 	return s.CreateAgentSessionInScope(ctx, userID, ownerConversationScope)
 }
 
@@ -133,11 +210,15 @@ func (s *Store) CreateAgentSessionInScope(
 		return nil, types.NewAppError(types.CodeValidation,
 			"Agent 会话范围无效", types.ErrValidation)
 	}
+	if !s.agentConversationScopes {
+		return nil, types.NewAppError(types.CodeValidation,
+			"Agent 会话范围迁移尚未生效", types.ErrValidation)
+	}
 	var as types.AgentSession
-	err := scanAgentSession(s.pool.QueryRow(ctx,
+	err := scanScopedAgentSession(s.pool.QueryRow(ctx,
 		`INSERT INTO agent_sessions (tenant_id,user_id,conversation_scope)
 		 VALUES (`+tenantOfUser+`$1),$1,$2)
-		 RETURNING `+agentSessionColumns, userID, conversationScope), &as)
+		 RETURNING `+scopedAgentSessionColumns, userID, conversationScope), &as)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("新建 agent 会话（user=%d）", userID), err)
