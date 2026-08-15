@@ -44,6 +44,7 @@ DIGEST = re.compile(r"^[0-9a-f]{64}$")
 BROKER_HOST = "188.253.125.238"
 BROKER_PORT = 10058
 BROKER_KNOWN_HOSTS_SHA256 = "755558dd29ed29400289842f639f31856f12eb0c25654a6d9007fd572163e5d3"
+WEB_ORIGIN = "https://vane.zhuoqidev.com"
 GATE_ENV_ALLOWLIST = {
     "ALL_PROXY", "DOCKER_CONTEXT", "DOCKER_HOST", "GOPROXY", "HTTP_PROXY",
     "HTTPS_PROXY", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "NO_PROXY",
@@ -66,6 +67,15 @@ RELEASE_RECEIPT_KEYS = {
     "server_release_contract_sha256",
     "vane_sha256",
     "agentfirstretention_sha256",
+}
+FULL_GATE_KEYS = {
+    "schema", "revision", "binary_dir", "web_dist",
+    "binary_tree_sha256", "web_tree_sha256", "web_coverage_sha256",
+    "server_coverage_sha256", "release_marker_sha256",
+    "server_source_tree_sha256", "infra_tree_sha256",
+    "migration_tree_object", "rollback_base_revision",
+    "rollback_compatibility_path", "rollback_compatibility_sha256",
+    "server_rollback_safe",
 }
 
 
@@ -1091,16 +1101,7 @@ def build_release_submission(
     signing_key: Path, signer: str, allowed_signers: Path,
 ) -> Path:
     gate = load_json(gate_evidence)
-    expected_gate_keys = {
-        "schema", "revision", "binary_dir", "web_dist",
-        "binary_tree_sha256", "web_tree_sha256", "web_coverage_sha256",
-        "server_coverage_sha256", "release_marker_sha256",
-        "server_source_tree_sha256", "infra_tree_sha256",
-        "migration_tree_object", "rollback_base_revision",
-        "rollback_compatibility_path", "rollback_compatibility_sha256",
-        "server_rollback_safe",
-    }
-    if not isinstance(gate, dict) or set(gate) != expected_gate_keys:
+    if not isinstance(gate, dict) or set(gate) != FULL_GATE_KEYS:
         raise PolicyError("full gate evidence shape is not exact")
     if gate["schema"] != "vane.full-gate-evidence/v1" or gate["revision"] != revision:
         raise PolicyError("full gate evidence does not bind the release revision")
@@ -1276,24 +1277,79 @@ def build_release_submission(
     return handoff
 
 
-def publish_web_after_server(
-    *, revision: str, release_root: Path, gate_evidence: Path
-) -> Path:
-    gate = load_json(gate_evidence)
-    web_dist = Path(gate["web_dist"])
-    if web_dist.is_absolute():
-        raise PolicyError("full gate Web dist path must be relative")
-    web_dist = release_root / web_dist
-    if directory_tree_sha256(web_dist) != gate["web_tree_sha256"]:
-        raise PolicyError("verified Web dist changed before local publication")
+def web_publication_context() -> tuple[Path, Path, str]:
     web_state = Path(
         os.environ.get("VANE_WEB_STATE_ROOT", str(Path.home() / ".local/state/vane"))
     )
-    web_state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    web_origin = os.environ.get("VANE_WEB_ORIGIN", "https://vane.zhuoqidev.com")
     tool_cache = Path(
         os.environ.get("VANE_TOOL_CACHE", str(ROOT / ".vane/tool-cache"))
     )
+    return web_state, tool_cache, WEB_ORIGIN
+
+
+def preflight_web_publication() -> None:
+    _, tool_cache, web_origin = web_publication_context()
+    run_checked(
+        [
+            sys.executable,
+            str(ROOT / "ops/release/publish_web.py"),
+            "--preflight",
+            "--tool-cache", str(tool_cache),
+            "--origin", web_origin,
+        ],
+        cwd=ROOT,
+    )
+
+
+def validated_web_dist(
+    *, revision: str, release_root: Path, gate_evidence: Path
+) -> Path:
+    gate = load_json(gate_evidence)
+    if not isinstance(gate, dict) or set(gate) != FULL_GATE_KEYS:
+        raise PolicyError("full gate evidence shape is not exact")
+    if gate["schema"] != "vane.full-gate-evidence/v1" or gate["revision"] != revision:
+        raise PolicyError("full gate evidence does not bind the Web revision")
+    if not isinstance(gate["web_tree_sha256"], str):
+        raise PolicyError("full gate web_tree_sha256 is not a string")
+    digest_value(gate["web_tree_sha256"], field="full gate web_tree_sha256")
+    if not isinstance(gate["release_marker_sha256"], str):
+        raise PolicyError("full gate release_marker_sha256 is not a string")
+    digest_value(
+        gate["release_marker_sha256"], field="full gate release_marker_sha256"
+    )
+    if not isinstance(gate["web_dist"], str):
+        raise PolicyError("full gate Web dist path is not a string")
+    pure_dist = PurePosixPath(gate["web_dist"])
+    if (
+        pure_dist.is_absolute()
+        or not pure_dist.parts
+        or any(part in {"", ".", ".."} for part in pure_dist.parts)
+    ):
+        raise PolicyError("full gate Web dist path must be safe and relative")
+    web_dist = Path(gate["web_dist"])
+    web_dist = release_root.joinpath(*pure_dist.parts)
+    try:
+        web_dist.resolve(strict=True).relative_to(release_root.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise PolicyError("full gate Web dist escapes the release evidence root") from error
+    if directory_tree_sha256(web_dist) != gate["web_tree_sha256"]:
+        raise PolicyError("verified Web dist changed before local publication")
+    marker = web_dist / "vane-release.json"
+    if marker.is_symlink() or not marker.is_file():
+        raise PolicyError("verified Web release marker is missing or unsafe")
+    if sha256_file(marker) != gate["release_marker_sha256"]:
+        raise PolicyError("verified Web release marker changed after full Gate")
+    return web_dist
+
+
+def publish_web_after_server(
+    *, revision: str, release_root: Path, gate_evidence: Path
+) -> Path:
+    web_dist = validated_web_dist(
+        revision=revision, release_root=release_root, gate_evidence=gate_evidence
+    )
+    web_state, tool_cache, web_origin = web_publication_context()
+    web_state.mkdir(parents=True, exist_ok=True, mode=0o700)
     web_result = release_root / "web-publication.json"
     run_checked(
         [
@@ -1306,6 +1362,182 @@ def publish_web_after_server(
         cwd=ROOT,
     )
     return web_result
+
+
+def verify_web_after_server(
+    *, revision: str, release_root: Path, gate_evidence: Path
+) -> None:
+    web_dist = validated_web_dist(
+        revision=revision, release_root=release_root, gate_evidence=gate_evidence
+    )
+    _, tool_cache, web_origin = web_publication_context()
+    run_checked(
+        [
+            sys.executable,
+            str(ROOT / "ops/release/publish_web.py"),
+            "--verify-only",
+            "--dist", str(web_dist),
+            "--sha", revision,
+            "--tool-cache", str(tool_cache),
+            "--origin", web_origin,
+        ],
+        cwd=ROOT,
+    )
+
+
+def assert_resume_source(revision: str) -> None:
+    if git_revision("HEAD") != revision:
+        raise PolicyError("Web resume checkout differs from the requested exact SHA")
+    remote_main = git_revision("refs/remotes/origin/main")
+    merged = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", revision, remote_main],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if merged.returncode != 0:
+        raise PolicyError("Web resume revision is not reachable from origin/main")
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if dirty.returncode != 0 or dirty.stdout:
+        raise PolicyError("Web resume requires a clean exact-source worktree")
+
+
+def validate_resume_release_root(path: Path, revision: str) -> Path:
+    if not path.is_absolute() or path.is_symlink():
+        raise PolicyError("Web resume release root must be a safe absolute directory")
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise PolicyError("Web resume release root is unavailable") from error
+    if (
+        resolved.name != f"release-{revision}"
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise PolicyError("Web resume release root identity or permissions are unsafe")
+    return resolved
+
+
+def signed_web_gate(
+    *, revision: str, release_root: Path, allowed_signers: Path
+) -> Path:
+    handoff = release_root / "server-submission"
+    manifests = handoff / "manifests"
+    gate_evidence = handoff / "full-gate.json"
+    artifact_manifest = manifests / "artifact.json"
+    for directory in (handoff, manifests):
+        if directory.is_symlink() or not directory.is_dir():
+            raise PolicyError("Web resume signed handoff directory is missing or unsafe")
+    for path in (gate_evidence, artifact_manifest):
+        if path.is_symlink() or not path.is_file():
+            raise PolicyError("Web resume signed evidence is missing or unsafe")
+    chain = require_release_chain(
+        artifact_manifest, revision, "artifact", allowed_signers
+    )
+    gate_manifest = next(
+        (manifest for _, manifest in chain if manifest["stage"] == "gate"), None
+    )
+    if gate_manifest is None:
+        raise PolicyError("Web resume manifest chain has no signed Gate")
+    evidence = {
+        item["name"]: item["sha256"] for item in gate_manifest["evidence"]
+    }
+    if evidence.get("full-gate.json") != sha256_file(gate_evidence):
+        raise PolicyError("Web resume full Gate is not bound by the signed manifest chain")
+    validated_web_dist(
+        revision=revision,
+        release_root=release_root,
+        gate_evidence=gate_evidence,
+    )
+    return gate_evidence
+
+
+def validate_existing_web_result(
+    *, revision: str, release_root: Path, gate_evidence: Path
+) -> None:
+    result_path = release_root / "web-publication.json"
+    result = load_json(result_path)
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"schema", "revision", "receipt_sha256", "marker", "status"}
+        or result.get("schema") != "vane.web-publication/v1"
+        or result.get("revision") != revision
+        or result.get("status")
+        not in {"published", "provider-already-current", "already-current"}
+        or not isinstance(result.get("receipt_sha256"), str)
+    ):
+        raise PolicyError("existing Web publication result is not exact")
+    digest_value(result["receipt_sha256"], field="Web publication receipt_sha256")
+    receipt = release_root / "web-release-receipt.json"
+    if receipt.is_symlink() or not receipt.is_file():
+        raise PolicyError("existing Web publication receipt is missing or unsafe")
+    if sha256_file(receipt) != result["receipt_sha256"]:
+        raise PolicyError("existing Web publication receipt digest differs from its result")
+    web_dist = validated_web_dist(
+        revision=revision, release_root=release_root, gate_evidence=gate_evidence
+    )
+    marker = load_json(web_dist / "vane-release.json")
+    if result.get("marker") != marker:
+        raise PolicyError("existing Web publication marker differs from the signed Gate artifact")
+
+
+def command_resume_web(args: argparse.Namespace) -> int:
+    if args.allowed_signers != DEFAULT_SIGNERS:
+        raise PolicyError("Web resume signer authority must be the repository default")
+    assert_resume_source(args.sha)
+    release_root = validate_resume_release_root(args.release_root, args.sha)
+    gate_evidence = signed_web_gate(
+        revision=args.sha,
+        release_root=release_root,
+        allowed_signers=args.allowed_signers,
+    )
+    web_result = release_root / "web-publication.json"
+    if web_result.is_symlink() or (web_result.exists() and not web_result.is_file()):
+        raise PolicyError("Web publication result path is unsafe")
+    if web_result.exists():
+        validate_existing_web_result(
+            revision=args.sha,
+            release_root=release_root,
+            gate_evidence=gate_evidence,
+        )
+        status = "already-published"
+    else:
+        preflight_web_publication()
+        status = "web-published"
+    verify_production_revision(args.sha)
+    if status == "already-published":
+        verify_web_after_server(
+            revision=args.sha,
+            release_root=release_root,
+            gate_evidence=gate_evidence,
+        )
+    else:
+        web_result = publish_web_after_server(
+            revision=args.sha,
+            release_root=release_root,
+            gate_evidence=gate_evidence,
+        )
+    verify_production_revision(args.sha)
+    print(
+        json.dumps(
+            {
+                "revision": args.sha,
+                "web_evidence": str(web_result),
+                "status": status,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
 
 
 def command_release(args: argparse.Namespace) -> int:
@@ -1330,6 +1562,9 @@ def command_release(args: argparse.Namespace) -> int:
         preflight_errors.append(f"allowed signer policy has no trusted keys: {args.allowed_signers}")
     if preflight_errors:
         raise PolicyError("release preflight failed: " + "; ".join(preflight_errors))
+    # Provider credentials and both provider/public read paths must be proven
+    # before the expensive Gate and before any Server production mutation.
+    preflight_web_publication()
     broker_status = subprocess.run(
         [str(broker_submit), "--status"],
         text=True,
@@ -1564,6 +1799,17 @@ def parser() -> argparse.ArgumentParser:
         handler=command_release,
         lock=DEFAULT_LOCK,
         policy=DEFAULT_POLICY,
+        allowed_signers=DEFAULT_SIGNERS,
+    )
+
+    resume_web = commands.add_parser(
+        "resume-web",
+        help="publish or verify Web from an existing signed exact-SHA release",
+    )
+    resume_web.add_argument("--sha", type=exact_sha, required=True)
+    resume_web.add_argument("--release-root", type=Path, required=True)
+    resume_web.set_defaults(
+        handler=command_resume_web,
         allowed_signers=DEFAULT_SIGNERS,
     )
 

@@ -25,6 +25,23 @@ SHA2 = "89abcdef0123456789abcdef0123456789abcdef"
 PREVIEW = "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
 
 
+class PublicResponse:
+    def __init__(self, payload: bytes, status: int = 200) -> None:
+        self.payload = payload
+        self.status = status
+
+    def __enter__(self) -> "PublicResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self, limit: int) -> bytes:
+        if len(self.payload) > limit:
+            raise AssertionError("fixture exceeded response limit")
+        return self.payload
+
+
 class PublishWebTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -59,7 +76,8 @@ class PublishWebTest(unittest.TestCase):
         aliyun.write_text(
             "#!/bin/sh\n"
             "if [ \"$1\" = version ]; then echo 3.4.10; exit 0; fi\n"
-            "printf 'aliyun %s\\n' \"$*\" >>\"$WEB_CALL_LOG\"\n",
+            "printf 'aliyun %s\\n' \"$*\" >>\"$WEB_CALL_LOG\"\n"
+            "if [ \"$1 $2\" = 'cdn DescribeCdnDomainDetail' ]; then printf '%s\\n' '{\"GetDomainDetailModel\":{\"DomainName\":\"vane.zhuoqidev.com\"}}'; exit 0; fi\n",
             encoding="utf-8",
         )
         ossutil.write_text(
@@ -128,6 +146,64 @@ class PublishWebTest(unittest.TestCase):
                 state_root=self.state, tool_cache=self.cache,
                 origin="https://vane.example", result_path=result_path,
             )
+
+    def test_preflight_is_read_only_and_proves_both_provider_credentials(self) -> None:
+        marker = (self.dist / "vane-release.json").read_bytes()
+        (self.remote / "vane-release.json").write_bytes(marker)
+        with self.environment, mock.patch.object(
+            publish_web, "urlopen", return_value=PublicResponse(marker)
+        ):
+            result = publish_web.preflight(
+                self.cache, "https://vane.zhuoqidev.com"
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["public_revision"], SHA)
+        calls = self.log.read_text(encoding="utf-8")
+        self.assertIn(
+            "ossutil stat oss://zhuoqidev-vane-web/vane-release.json", calls
+        )
+        self.assertIn("aliyun cdn DescribeCdnDomainDetail", calls)
+        self.assertNotIn("ossutil cp", calls)
+        self.assertNotIn("RefreshObjectCaches", calls)
+
+    def test_preflight_rejects_missing_credentials_before_provider_calls(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ALIYUN_ACCESS_KEY_ID": "",
+                "ALIYUN_ACCESS_KEY_SECRET": "",
+                "WEB_CALL_LOG": str(self.log),
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "credentials are unavailable"):
+                publish_web.preflight(
+                    self.cache, "https://vane.zhuoqidev.com"
+                )
+        calls = self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+        self.assertNotIn("ossutil stat", calls)
+        self.assertNotIn("aliyun cdn", calls)
+
+    def test_verify_only_uses_exact_dist_bytes_without_provider_credentials(self) -> None:
+        marker = json.loads(
+            (self.dist / "vane-release.json").read_text(encoding="utf-8")
+        )
+        with mock.patch.object(
+            publish_web, "verify_public_release", return_value=marker
+        ) as verify:
+            self.assertEqual(
+                publish_web.verify_dist_public(
+                    self.dist, SHA, "https://vane.example"
+                ),
+                marker,
+            )
+        verify.assert_called_once_with(
+            "https://vane.example",
+            SHA,
+            expected_marker=(self.dist / "vane-release.json").read_bytes(),
+            expected_index_sha256=hashlib.sha256(
+                (self.dist / "index.html").read_bytes()
+            ).hexdigest(),
+        )
 
     def test_assets_precede_entry_and_cdn_refresh(self) -> None:
         result = self.publish()

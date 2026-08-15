@@ -60,6 +60,20 @@ class ExactRevisionCLITest(unittest.TestCase):
         self.assertEqual(args.policy, controller.DEFAULT_POLICY)
         self.assertEqual(args.allowed_signers, controller.DEFAULT_SIGNERS)
 
+    def test_resume_web_accepts_only_exact_sha_and_release_root(self) -> None:
+        revision = "a" * 40
+        args = controller.parser().parse_args(
+            ["resume-web", "--sha", revision, "--release-root", "/tmp/evidence"]
+        )
+        self.assertEqual(args.sha, revision)
+        self.assertEqual(args.release_root, Path("/tmp/evidence"))
+        self.assertEqual(args.allowed_signers, controller.DEFAULT_SIGNERS)
+        result = self.run_cli(
+            "resume-web", "--sha", revision, "--release-root", "/tmp/evidence",
+            "--allowed-signers", "/tmp/attacker",
+        )
+        self.assertEqual(result.returncode, 2, result)
+
     def test_release_rejects_external_policy_argument(self) -> None:
         result = self.run_cli(
             "release", "--sha", "a" * 40, "--policy", "/tmp/fake-policy.json"
@@ -241,6 +255,166 @@ class ExactRevisionCLITest(unittest.TestCase):
                     cache_root=linked_parent / "gate-cache",
                 )
             self.assertFalse((outside / "gate-cache").exists())
+
+    def test_release_refuses_failed_web_preflight_before_gate_or_broker(self) -> None:
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            key = root / "signing-key"
+            broker = root / "broker"
+            key.write_text("fixture", encoding="utf-8")
+            broker.write_text("fixture", encoding="utf-8")
+            args = argparse.Namespace(
+                sha=revision,
+                lock=controller.DEFAULT_LOCK,
+                policy=controller.DEFAULT_POLICY,
+                allowed_signers=controller.DEFAULT_SIGNERS,
+            )
+            clean = subprocess.CompletedProcess(
+                ["git", "status"], 0, stdout="", stderr=""
+            )
+            with (
+                mock.patch.object(controller, "assert_origin_main"),
+                mock.patch.object(controller, "git_revision", return_value=revision),
+                mock.patch.object(controller, "require_release_runtime", return_value=(root, key, "release-test", broker)),
+                mock.patch.object(controller, "validate_toolchain", return_value=[]),
+                mock.patch.object(controller, "signer_entries", return_value=["fixture"]),
+                mock.patch.object(controller, "preflight_web_publication", side_effect=controller.PolicyError("Web provider preflight failed")),
+                mock.patch.object(controller, "command_full") as full,
+                mock.patch.object(controller, "build_release_submission") as build,
+                mock.patch.object(controller.subprocess, "run", return_value=clean) as run,
+            ):
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "Web provider preflight failed"
+                ):
+                    controller.command_release(args)
+            full.assert_not_called()
+            build.assert_not_called()
+            self.assertFalse(
+                any(call.args[0] == [str(broker), "--status"] for call in run.call_args_list)
+            )
+
+    def test_resume_web_publishes_from_signed_gate_without_gate_or_server_submit(self) -> None:
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            release_root = Path(temporary) / f"release-{revision}"
+            release_root.mkdir(mode=0o700)
+            resolved_root = release_root.resolve()
+            gate = release_root / "server-submission/full-gate.json"
+            gate.parent.mkdir()
+            gate.write_text("{}\n", encoding="utf-8")
+            args = argparse.Namespace(
+                sha=revision,
+                release_root=release_root,
+                allowed_signers=controller.DEFAULT_SIGNERS,
+            )
+            with (
+                mock.patch.object(controller, "assert_resume_source"),
+                mock.patch.object(controller, "signed_web_gate", return_value=gate),
+                mock.patch.object(controller, "preflight_web_publication") as preflight,
+                mock.patch.object(controller, "verify_production_revision", return_value="f" * 64) as verify_server,
+                mock.patch.object(controller, "publish_web_after_server", return_value=release_root / "web-publication.json") as publish,
+                mock.patch.object(controller, "command_full") as full,
+                mock.patch.object(controller.subprocess, "run") as run,
+            ):
+                self.assertEqual(controller.command_resume_web(args), 0)
+            preflight.assert_called_once_with()
+            publish.assert_called_once_with(
+                revision=revision,
+                release_root=resolved_root,
+                gate_evidence=gate,
+            )
+            self.assertEqual(verify_server.call_count, 2)
+            full.assert_not_called()
+            run.assert_not_called()
+
+    def test_resume_web_existing_result_is_verify_only_without_credentials(self) -> None:
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            release_root = Path(temporary) / f"release-{revision}"
+            release_root.mkdir(mode=0o700)
+            resolved_root = release_root.resolve()
+            result = release_root / "web-publication.json"
+            result.write_text("{}\n", encoding="utf-8")
+            gate = release_root / "signed-gate.json"
+            gate.write_text("{}\n", encoding="utf-8")
+            args = argparse.Namespace(
+                sha=revision,
+                release_root=release_root,
+                allowed_signers=controller.DEFAULT_SIGNERS,
+            )
+            with (
+                mock.patch.object(controller, "assert_resume_source"),
+                mock.patch.object(controller, "signed_web_gate", return_value=gate),
+                mock.patch.object(controller, "validate_existing_web_result") as validate_result,
+                mock.patch.object(controller, "preflight_web_publication") as preflight,
+                mock.patch.object(controller, "verify_production_revision", return_value="f" * 64),
+                mock.patch.object(controller, "verify_web_after_server") as verify_web,
+                mock.patch.object(controller, "publish_web_after_server") as publish,
+            ):
+                self.assertEqual(controller.command_resume_web(args), 0)
+            validate_result.assert_called_once()
+            preflight.assert_not_called()
+            publish.assert_not_called()
+            verify_web.assert_called_once_with(
+                revision=revision,
+                release_root=resolved_root,
+                gate_evidence=gate,
+            )
+
+    def test_resume_web_rejects_gate_not_bound_by_signed_manifest(self) -> None:
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            release_root = Path(temporary) / f"release-{revision}"
+            handoff = release_root / "server-submission"
+            manifests = handoff / "manifests"
+            manifests.mkdir(parents=True)
+            gate = handoff / "full-gate.json"
+            artifact = manifests / "artifact.json"
+            gate.write_text("trusted gate\n", encoding="utf-8")
+            artifact.write_text("fixture\n", encoding="utf-8")
+            chain = [
+                (manifests / "plan.json", {"stage": "plan", "evidence": []}),
+                (manifests / "gate.json", {
+                    "stage": "gate",
+                    "evidence": [{"name": "full-gate.json", "sha256": "0" * 64}],
+                }),
+                (artifact, {"stage": "artifact", "evidence": []}),
+            ]
+            with (
+                mock.patch.object(controller, "require_release_chain", return_value=chain),
+                mock.patch.object(controller, "validated_web_dist") as validate_dist,
+            ):
+                with self.assertRaisesRegex(controller.PolicyError, "not bound"):
+                    controller.signed_web_gate(
+                        revision=revision,
+                        release_root=release_root,
+                        allowed_signers=controller.DEFAULT_SIGNERS,
+                    )
+            validate_dist.assert_not_called()
+
+    def test_resume_web_rejects_signed_gate_path_escape(self) -> None:
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release_root = root / f"release-{revision}"
+            release_root.mkdir()
+            gate = {key: None for key in controller.FULL_GATE_KEYS}
+            gate.update({
+                "schema": "vane.full-gate-evidence/v1",
+                "revision": revision,
+                "web_dist": "../outside",
+                "web_tree_sha256": "b" * 64,
+                "release_marker_sha256": "c" * 64,
+            })
+            gate_path = release_root / "full-gate.json"
+            gate_path.write_text(json.dumps(gate), encoding="utf-8")
+            with self.assertRaisesRegex(controller.PolicyError, "safe and relative"):
+                controller.validated_web_dist(
+                    revision=revision,
+                    release_root=release_root,
+                    gate_evidence=gate_path,
+                )
 
     def test_one_command_release_runs_gate_build_and_broker_submission(self) -> None:
         revision = "a" * 40
