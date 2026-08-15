@@ -1165,7 +1165,7 @@ func run() error {
 		ExecutiveBriefWebProjectionAllowAll: cfg.Pipeline.
 			ExecutiveBriefWebProjectionAllowAll,
 		// HTTP 面的 principal 来自会话中间件注入的 ctx（企业级契约 §1.1 的最终形态）；
-		// a2a/gate 无 HTTP 会话，仍用 owner 回退——这正是把 principal 做成接口的价值。
+		// A2A 由独立 hash-only bearer middleware 注入相同 Principal，不再走 owner fallback。
 		Principal: auth.NewContextResolver(),
 		Origin:    cfg.Dashboard.Origin,
 	})
@@ -1180,7 +1180,7 @@ func run() error {
 		// 无论只遗留 1 秒还是 15 分钟都已没有执行者，必须立即置 FAILED。
 		// 失败只记日志不拒启动：清账是尽力而为，不该拖垮服务拉起。
 		cleanupCtx, cancelCleanup := context.WithTimeout(ctx, a2aStartupCleanupTimeout)
-		n, cleanupErr := st.FailStaleA2ATasks(cleanupCtx, time.Now())
+		n, cleanupErr := st.FailStaleA2APrincipalTasks(cleanupCtx, time.Now())
 		cancelCleanup()
 		if cleanupErr != nil {
 			slog.Warn("a2a: 清理滞留任务失败（不阻塞启动）", "err", cleanupErr)
@@ -1189,13 +1189,12 @@ func run() error {
 		}
 
 		a2aRuntime, err = a2a.Mount(mux, a2a.Deps{
-			Storage:   st,
-			Content:   st,
-			Chat:      a2aLoop,
-			Principal: principals,
-			Token:     cfg.A2A.Token,
-			BaseURL:   cfg.A2A.BaseURL,
-			Version:   vaneVersion,
+			Storage:       st,
+			Content:       st,
+			Chat:          a2aLoop,
+			Authenticator: st,
+			BaseURL:       cfg.A2A.BaseURL,
+			Version:       vaneVersion,
 		})
 		if err != nil {
 			stop()

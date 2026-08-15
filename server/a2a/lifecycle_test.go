@@ -51,7 +51,7 @@ type blockingGetStorage struct {
 	postClose int
 }
 
-func (s *blockingGetStorage) GetA2ATask(ctx context.Context, id string) (*types.A2ATask, error) {
+func (s *blockingGetStorage) GetA2APrincipalTask(ctx context.Context, scope types.A2AExecutionScope, id string) (*types.A2ATask, error) {
 	s.once.Do(func() { close(s.entered) })
 	select {
 	case <-s.release:
@@ -66,10 +66,10 @@ func (s *blockingGetStorage) GetA2ATask(ctx context.Context, id string) (*types.
 	if s.err != nil {
 		return nil, s.err
 	}
-	return s.fakeTaskStorage.GetA2ATask(ctx, id)
+	return s.fakeTaskStorage.GetA2APrincipalTask(ctx, scope, id)
 }
 
-func (s *blockingFinalUpdateStorage) UpdateA2ATask(ctx context.Context, id string, expectedVersion int64, status string, task json.RawMessage) error {
+func (s *blockingFinalUpdateStorage) UpdateA2APrincipalTask(ctx context.Context, scope types.A2AExecutionScope, id string, expectedVersion int64, status string, task json.RawMessage) error {
 	if status == s.blockStatus {
 		s.once.Do(func() { close(s.entered) })
 		select {
@@ -78,7 +78,7 @@ func (s *blockingFinalUpdateStorage) UpdateA2ATask(ctx context.Context, id strin
 			return ctx.Err()
 		}
 	}
-	return s.fakeTaskStorage.UpdateA2ATask(ctx, id, expectedVersion, status, task)
+	return s.fakeTaskStorage.UpdateA2APrincipalTask(ctx, scope, id, expectedVersion, status, task)
 }
 
 func TestRuntimeShutdownWaitsForDetachedTaskStoreCleanup(t *testing.T) {
@@ -93,13 +93,9 @@ func TestRuntimeShutdownWaitsForDetachedTaskStoreCleanup(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	runtime, err := Mount(mux, Deps{
-		Storage:   storage,
-		Content:   &fakeContent{},
-		Chat:      chat,
-		Principal: ownerResolver(&fakeOwner{userID: 7}),
-		Token:     testToken,
-		BaseURL:   srv.URL + "/a2a",
-		Version:   "lifecycle-test",
+		Storage: storage, Content: &fakeContent{}, Chat: chat,
+		Authenticator: &fakeAuthenticator{},
+		BaseURL:       srv.URL + "/a2a", Version: "lifecycle-test",
 	})
 	if err != nil {
 		t.Fatalf("Mount 失败: %v", err)
@@ -188,7 +184,7 @@ func TestRuntimeTracksDuplicateDetachedCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.CreateA2ATask(t.Context(), &types.A2ATask{
+	if err := storage.CreateA2APrincipalTask(t.Context(), scopeFromTestAuthority(), &types.A2ATask{
 		ID: string(task.ID), ContextID: task.ContextID,
 		Status: string(task.Status.State), Task: payload,
 	}); err != nil {
@@ -206,7 +202,7 @@ func TestRuntimeTracksDuplicateDetachedCancel(t *testing.T) {
 	}
 	firstDone := make(chan cancelResult, 1)
 	go func() {
-		got, callErr := handler.CancelTask(t.Context(), &protocol.CancelTaskRequest{ID: task.ID})
+		got, callErr := handler.CancelTask(testA2AContext(t.Context()), &protocol.CancelTaskRequest{ID: task.ID})
 		firstDone <- cancelResult{task: got, err: callErr}
 	}()
 	select {
@@ -217,7 +213,7 @@ func TestRuntimeTracksDuplicateDetachedCancel(t *testing.T) {
 
 	secondDone := make(chan cancelResult, 1)
 	go func() {
-		got, callErr := handler.CancelTask(t.Context(), &protocol.CancelTaskRequest{ID: task.ID})
+		got, callErr := handler.CancelTask(testA2AContext(t.Context()), &protocol.CancelTaskRequest{ID: task.ID})
 		secondDone <- cancelResult{task: got, err: callErr}
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -265,12 +261,12 @@ func TestRuntimeTracksCancelConcurrentWithActiveExecution(t *testing.T) {
 	chat := &cancelAwareChat{entered: make(chan struct{})}
 	runtime := newRuntime()
 	executor := &lifecycleExecutor{inner: newExecutor(Deps{
-		Storage: storage, Chat: chat, Principal: ownerResolver(&fakeOwner{userID: 7}),
+		Storage: storage, Chat: chat,
 	}), runtime: runtime}
 	inner := a2asrv.NewHandler(executor, a2asrv.WithTaskStore(newTaskStore(storage)))
 	handler := &lifecycleRequestHandler{RequestHandler: inner, runtime: runtime}
 
-	result, err := handler.SendMessage(t.Context(), &protocol.SendMessageRequest{
+	result, err := handler.SendMessage(testA2AContext(t.Context()), &protocol.SendMessageRequest{
 		Config:  &protocol.SendMessageConfig{ReturnImmediately: true},
 		Message: chatMsg("keep running"),
 	})
@@ -286,7 +282,7 @@ func TestRuntimeTracksCancelConcurrentWithActiveExecution(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("active execution did not start")
 	}
-	canceled, err := handler.CancelTask(t.Context(), &protocol.CancelTaskRequest{ID: task.ID})
+	canceled, err := handler.CancelTask(testA2AContext(t.Context()), &protocol.CancelTaskRequest{ID: task.ID})
 	if err != nil {
 		t.Fatalf("CancelTask active execution: %v", err)
 	}
@@ -321,7 +317,7 @@ func TestClientCancellationCannotDropPreExecutorReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.CreateA2ATask(t.Context(), &types.A2ATask{
+	if err := storage.CreateA2APrincipalTask(t.Context(), scopeFromTestAuthority(), &types.A2ATask{
 		ID: string(task.ID), ContextID: task.ContextID,
 		Status: string(task.Status.State), Task: payload,
 	}); err != nil {
@@ -334,7 +330,7 @@ func TestClientCancellationCannotDropPreExecutorReservation(t *testing.T) {
 	}), runtime: runtime}
 	inner := a2asrv.NewHandler(executor, a2asrv.WithTaskStore(newTaskStore(storage)))
 	handler := &lifecycleRequestHandler{RequestHandler: inner, runtime: runtime}
-	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	requestCtx, cancelRequest := context.WithCancel(testA2AContext(t.Context()))
 	message := textMsg("continuation")
 	message.TaskID = task.ID
 	sendDone := make(chan error, 1)
@@ -393,7 +389,7 @@ func TestRuntimeShutdownDrainsPreExecutorFailureWithoutCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.CreateA2ATask(t.Context(), &types.A2ATask{
+	if err := storage.CreateA2APrincipalTask(t.Context(), scopeFromTestAuthority(), &types.A2ATask{
 		ID: string(task.ID), ContextID: task.ContextID,
 		Status: string(task.Status.State), Task: payload,
 	}); err != nil {
@@ -408,7 +404,7 @@ func TestRuntimeShutdownDrainsPreExecutorFailureWithoutCleanup(t *testing.T) {
 	message.TaskID = task.ID
 	sendDone := make(chan error, 1)
 	go func() {
-		_, callErr := handler.SendMessage(t.Context(), &protocol.SendMessageRequest{Message: message})
+		_, callErr := handler.SendMessage(testA2AContext(t.Context()), &protocol.SendMessageRequest{Message: message})
 		sendDone <- callErr
 	}()
 	select {

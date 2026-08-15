@@ -33,7 +33,7 @@ const bearerScheme = "bearer"
 // buildCard 构造 Agent Card。securityRequirements 必填（契约 A-C2 审查裁决）：
 // securitySchemes 只是"可用方案声明"，不构成访问要求——官方 a2aclient 的
 // AuthInterceptor 按 securityRequirements 决定是否附凭证，缺了它卡片驱动的客户端
-// 会裸发 SendMessage 被 requireBearer 恒 401（Gate ③④ 卡死）。
+// 会裸发 SendMessage 被 scoped bearer authority 恒 401（Gate ③④ 卡死）。
 // scheme 值用 IANA 注册形态 "Bearer"（RFC 7235 大小写不敏感，但对端未必遵守）。
 func buildCard(deps Deps) *a2a.AgentCard {
 	return &a2a.AgentCard{

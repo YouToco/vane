@@ -421,13 +421,17 @@ type AgentSession struct {
 // ProtoJSON 权威载荷（store 层不解析）；ID/ContextID/Status 是提取列。SDK 类型不出 a2a/ 包
 // （隔离原则，同 agent.Store 窄接口先例），store 层只见本类型。
 type A2ATask struct {
-	ID        string          `json:"id"` // 服务端生成 taskId
-	ContextID string          `json:"context_id"`
-	Status    string          `json:"status"`  // TASK_STATE_* 原文
-	Task      json.RawMessage `json:"task"`    // JSONB，完整 a2a.Task ProtoJSON
-	Version   int64           `json:"version"` // 乐观并发版本，从 1 起
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	TenantID        int64           `json:"tenant_id"`
+	PrincipalUserID int64           `json:"principal_user_id"`
+	ActorType       ActorType       `json:"actor_type"`
+	CreatedByToken  string          `json:"created_by_token_id"`
+	ID              string          `json:"id"` // 服务端生成 taskId
+	ContextID       string          `json:"context_id"`
+	Status          string          `json:"status"`  // TASK_STATE_* 原文
+	Task            json.RawMessage `json:"task"`    // JSONB，完整 a2a.Task ProtoJSON
+	Version         int64           `json:"version"` // 乐观并发版本，从 1 起
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
 // A2ATaskQuery 是 ListA2ATasks（a2a-contract §4.1）的过滤条件，字段面对齐 SDK

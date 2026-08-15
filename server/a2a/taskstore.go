@@ -57,7 +57,7 @@ func marshalTask(task *a2a.Task) (json.RawMessage, error) {
 func unmarshalTask(t *types.A2ATask) (*a2a.Task, error) {
 	var task a2a.Task
 	if err := json.Unmarshal(t.Task, &task); err != nil {
-		return nil, fmt.Errorf("反序列化 a2a_tasks.task（id=%s）: %w", t.ID, err)
+		return nil, fmt.Errorf("反序列化 principal-scoped A2A task（id=%s）: %w", t.ID, err)
 	}
 	return &task, nil
 }
@@ -65,13 +65,17 @@ func unmarshalTask(t *types.A2ATask) (*a2a.Task, error) {
 // Create 落新任务。id 已存在 → taskstore.ErrTaskAlreadyExists（接口文档 "should return"）；
 // 成功返回 TaskVersion(1)（表默认值，契约 §5.9）。
 func (a *storeAdapter) Create(ctx context.Context, task *a2a.Task) (taskstore.TaskVersion, error) {
+	scope, scopeErr := authorityFromContext(ctx)
+	if scopeErr != nil {
+		return taskstore.TaskVersionMissing, storeErr("Create/authority", string(task.ID), scopeErr)
+	}
 	ctx, cancel := opCtx(ctx)
 	defer cancel()
 	raw, err := marshalTask(task)
 	if err != nil {
 		return taskstore.TaskVersionMissing, storeErr("Create/marshal", string(task.ID), err)
 	}
-	err = a.st.CreateA2ATask(ctx, &types.A2ATask{
+	err = a.st.CreateA2APrincipalTask(ctx, scope, &types.A2ATask{
 		ID:        string(task.ID),
 		ContextID: task.ContextID,
 		Status:    string(task.Status.State),
@@ -88,9 +92,13 @@ func (a *storeAdapter) Create(ctx context.Context, task *a2a.Task) (taskstore.Ta
 
 // Get 按 id 取任务。无行 → a2a.ErrTaskNotFound（§9.2 的 -32001 断言依赖本行）。
 func (a *storeAdapter) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.StoredTask, error) {
+	scope, scopeErr := authorityFromContext(ctx)
+	if scopeErr != nil {
+		return nil, storeErr("Get/authority", string(taskID), scopeErr)
+	}
 	ctx, cancel := opCtx(ctx)
 	defer cancel()
-	row, err := a.st.GetA2ATask(ctx, string(taskID))
+	row, err := a.st.GetA2APrincipalTask(ctx, scope, string(taskID))
 	if err != nil {
 		if errors.Is(err, types.ErrNotFound) {
 			return nil, a2a.ErrTaskNotFound
@@ -110,6 +118,10 @@ func (a *storeAdapter) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.S
 // PrevVersion==TaskVersionMissing（SDK "不跟踪版本"哨兵）时先回读当前版本再条件更新
 // （InMemory 同语义：跳过乐观锁检查；回读窗口内的并发前进会得 Conflict，语义仍正确）。
 func (a *storeAdapter) Update(ctx context.Context, update *taskstore.UpdateRequest) (taskstore.TaskVersion, error) {
+	scope, scopeErr := authorityFromContext(ctx)
+	if scopeErr != nil {
+		return taskstore.TaskVersionMissing, storeErr("Update/authority", string(update.Task.ID), scopeErr)
+	}
 	ctx, cancel := opCtx(ctx)
 	defer cancel()
 	raw, err := marshalTask(update.Task)
@@ -118,7 +130,7 @@ func (a *storeAdapter) Update(ctx context.Context, update *taskstore.UpdateReque
 	}
 	prev := update.PrevVersion
 	if prev == taskstore.TaskVersionMissing {
-		row, err := a.st.GetA2ATask(ctx, string(update.Task.ID))
+		row, err := a.st.GetA2APrincipalTask(ctx, scope, string(update.Task.ID))
 		if err != nil {
 			if errors.Is(err, types.ErrNotFound) {
 				return taskstore.TaskVersionMissing, a2a.ErrTaskNotFound
@@ -127,7 +139,7 @@ func (a *storeAdapter) Update(ctx context.Context, update *taskstore.UpdateReque
 		}
 		prev = taskstore.TaskVersion(row.Version)
 	}
-	err = a.st.UpdateA2ATask(ctx, string(update.Task.ID), int64(prev),
+	err = a.st.UpdateA2APrincipalTask(ctx, scope, string(update.Task.ID), int64(prev),
 		string(update.Task.Status.State), raw)
 	if err != nil {
 		switch {
@@ -146,6 +158,10 @@ func (a *storeAdapter) Update(ctx context.Context, update *taskstore.UpdateReque
 // HistoryLength/IncludeArtifacts 是 task JSONB 裁剪语义，在本层处理，store 不感知。
 // Tenant 单租户恒空不映射（契约 §3）。
 func (a *storeAdapter) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a.ListTasksResponse, error) {
+	scope, scopeErr := authorityFromContext(ctx)
+	if scopeErr != nil {
+		return nil, storeErr("List/authority", "", scopeErr)
+	}
 	q := types.A2ATaskQuery{
 		ContextID: req.ContextID,
 		Status:    string(req.Status),
@@ -157,7 +173,7 @@ func (a *storeAdapter) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2
 	}
 	ctx, cancel := opCtx(ctx)
 	defer cancel()
-	rows, total, next, err := a.st.ListA2ATasks(ctx, q)
+	rows, total, next, err := a.st.ListA2APrincipalTasks(ctx, scope, q)
 	if err != nil {
 		return nil, storeErr("List", "", err)
 	}

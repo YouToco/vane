@@ -50,3 +50,38 @@ func TestA2AMountGuardedByEnabled(t *testing.T) {
 		t.Fatalf("a2a.Mount 不在 if cfg.A2A.Enabled 块内（深度 %d）——enabled=false 的零暴露面被破坏", depth)
 	}
 }
+
+// TestA2AMountUsesScopedAuthority locks the multi-user cutover at the
+// composition root. Reintroducing the retired global token or owner resolver
+// would otherwise compile while silently collapsing all A2A traffic back into
+// one account.
+func TestA2AMountUsesScopedAuthority(t *testing.T) {
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller 定位不到本测试文件")
+	}
+	root := filepath.Clean(filepath.Join(filepath.Dir(self), "..", ".."))
+	read := func(path string) string {
+		t.Helper()
+		payload, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatalf("读 %s: %v", path, err)
+		}
+		return string(payload)
+	}
+	mainSource := read("cmd/server/main.go")
+	for _, forbidden := range []string{"Token: cfg.A2A.Token", "Principal: principals", "FailStaleA2ATasks("} {
+		if strings.Contains(mainSource, forbidden) {
+			t.Fatalf("A2A 组装回流旧全局 authority: %q", forbidden)
+		}
+	}
+	for _, required := range []string{"Authenticator: st", "FailStaleA2APrincipalTasks("} {
+		if strings.Count(mainSource, required) != 1 {
+			t.Fatalf("A2A 组装必须精确保留一处 %q", required)
+		}
+	}
+	configSource := read("config/config.go")
+	if strings.Contains(configSource, "A2A.Token") || regexp.MustCompile(`(?m)^\s*Token\s+string`).MatchString(configSource) {
+		t.Fatal("config 不得恢复全局 A2A token")
+	}
+}

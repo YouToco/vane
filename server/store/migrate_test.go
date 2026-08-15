@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 139
+const latestMigrationVersion int64 = 140
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -43,6 +43,7 @@ var wantTables = []string{
 	"content_sources",
 	// 013 A2A server 任务持久化
 	"a2a_tasks",
+	"a2a_principal_tasks",
 	// 139 hash-only, workspace/principal-bound A2A access authority.
 	"a2a_access_tokens",
 	"a2a_access_token_events",
