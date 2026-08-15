@@ -7,6 +7,7 @@ container, Docker socket, or production credential participates in the gate.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -39,6 +40,26 @@ LOCK = json.loads(
     (CONTROL_ROOT / "tools/toolchain.lock.json").read_text(encoding="utf-8")
 )["tools"]
 
+# Each package below contains PostgreSQL-backed tests. It gets a private
+# database and remains internally serial. Every other package runs without
+# database environment variables, so a missing registration fails closed in
+# VANE_FULL_GATE instead of racing on shared schema state or silently skipping.
+NON_STORE_DATABASE_PACKAGE_DIRS = (
+    "a2a",
+    "api",
+    "evolver",
+    "feishu",
+    "llm",
+    "periodicbrief",
+    "researchgateway",
+    "scheduler",
+    "task",
+)
+DATABASE_TEST_MARKER = re.compile(
+    r"DATABASE_URL|VANE_TEST_DATABASE_URL|"
+    r"testgate\.(?:Database|CreateDatabase|DestructiveDatabase|PostgreSQLURL)"
+)
+
 
 def output(command: list[str], *, cwd: Path, env: dict[str, str]) -> str:
     result = subprocess.run(
@@ -58,6 +79,54 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_database_package_inventory(
+    *, server_root: Path, declared: tuple[str, ...]
+) -> None:
+    if tuple(sorted(set(declared))) != declared:
+        raise PolicyError("non-Store database package inventory is not sorted and unique")
+    detected: set[str] = set()
+    for test_file in server_root.rglob("*_test.go"):
+        relative = test_file.relative_to(server_root)
+        if not relative.parts or relative.parts[0] == "store":
+            continue
+        if DATABASE_TEST_MARKER.search(test_file.read_text(encoding="utf-8")):
+            detected.add(relative.parent.as_posix())
+    expected = set(declared)
+    if detected != expected:
+        raise PolicyError(
+            "non-Store database package inventory drift: "
+            f"missing={sorted(detected - expected)} stale={sorted(expected - detected)}"
+        )
+
+
+def partition_non_store_packages(
+    *, packages: list[str], module_path: str
+) -> tuple[list[str], list[str]]:
+    database_packages = [
+        f"{module_path}/{relative}" for relative in NON_STORE_DATABASE_PACKAGE_DIRS
+    ]
+    package_set = set(packages)
+    missing = sorted(set(database_packages) - package_set)
+    if missing:
+        raise PolicyError(f"declared non-Store database packages are missing: {missing}")
+    database_set = set(database_packages)
+    pure_packages = [package for package in packages if package not in database_set]
+    if not pure_packages:
+        raise PolicyError("non-Store pure package group is empty")
+    return pure_packages, database_packages
+
+
+def database_package_lanes(
+    packages: list[str], *, lane_count: int
+) -> tuple[tuple[tuple[int, str], ...], ...]:
+    if lane_count < 1 or lane_count > len(packages):
+        raise PolicyError("non-Store database lane count is invalid")
+    lanes: list[list[tuple[int, str]]] = [[] for _ in range(lane_count)]
+    for index, package in enumerate(packages):
+        lanes[index % lane_count].append((index, package))
+    return tuple(tuple(lane) for lane in lanes)
 
 
 def migration_tree_object(*, revision: str, path: str, env: dict[str, str]) -> str:
@@ -535,6 +604,7 @@ def main() -> int:
     try:
         os.environ.update(env)
         urls: list[str] = []
+        postgres_ports: list[int] = []
         for index in range(5):
             # Store migration tests create and revoke cluster-wide roles. A
             # separate database in one cluster is not isolation: parallel
@@ -559,6 +629,7 @@ def main() -> int:
                 cwd=ROOT,
             )
             postgres_clusters.append(data_dir)
+            postgres_ports.append(pg_port)
             database = f"vane_full_{index}"
             run_checked(
                 [
@@ -632,23 +703,94 @@ def main() -> int:
             item for item in output([str(go), "list", "./..."], cwd=SERVER, env=env).splitlines()
             if item != store_package
         ]
-        non_store = artifacts / "non-store.coverage.out"
-        os.environ["DATABASE_URL"] = urls[3]
+        validate_database_package_inventory(
+            server_root=SERVER, declared=NON_STORE_DATABASE_PACKAGE_DIRS
+        )
+        module_path = output([str(go), "list", "-m"], cwd=SERVER, env=env)
+        pure_packages, database_packages = partition_non_store_packages(
+            packages=packages, module_path=module_path
+        )
+        non_store_profiles: list[Path] = []
+        pure_profile = artifacts / "non-store-pure.coverage.out"
+        pure_env = {**env}
+        pure_env.pop("DATABASE_URL", None)
+        pure_env.pop("VANE_TEST_DATABASE_URL", None)
         run_go_tests_no_skips(
             [
-                str(go), "test", "-json", "-race", "-p=1", "-parallel=1",
+                str(go), "test", "-json", "-race", "-p=4", "-parallel=4",
                 "-count=1", "-timeout=40m", "-covermode=atomic",
-                f"-coverprofile={non_store}", *packages,
+                f"-coverprofile={pure_profile}", *pure_packages,
             ],
             cwd=SERVER,
+            env=pure_env,
         )
+        non_store_profiles.append(pure_profile)
+        database_lanes = database_package_lanes(database_packages, lane_count=3)
+
+        def run_database_lane(
+            lane_index: int, lane: tuple[tuple[int, str], ...]
+        ) -> list[Path]:
+            profiles: list[Path] = []
+            for package_index, package in lane:
+                database = f"vane_full_non_store_{package_index}"
+                run_checked(
+                    [
+                        str(postgres["createdb"]), "-h", "127.0.0.1", "-p",
+                        str(postgres_ports[lane_index]), "-U", "vane", database,
+                    ],
+                    cwd=ROOT,
+                )
+                database_url = (
+                    f"postgres://vane@127.0.0.1:{postgres_ports[lane_index]}/"
+                    f"{database}?sslmode=disable"
+                )
+                assert_disposable_database(
+                    data_dir=postgres_clusters[lane_index], database_url=database_url,
+                    owner_root=runtime, expected_database=database,
+                )
+                profile = (
+                    artifacts / f"non-store-database-{package_index}.coverage.out"
+                )
+                database_env = {
+                    **env,
+                    "DATABASE_URL": database_url,
+                    "VANE_TEST_DATABASE_URL": database_url,
+                }
+                run_go_tests_no_skips(
+                    [
+                        str(go), "test", "-json", "-race", "-p=1", "-parallel=1",
+                        "-count=1", "-timeout=40m", "-covermode=atomic",
+                        f"-coverprofile={profile}", package,
+                    ],
+                    cwd=SERVER,
+                    env=database_env,
+                )
+                profiles.append(profile)
+            return profiles
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(database_lanes), thread_name_prefix="non-store-db"
+        ) as executor:
+            futures = [
+                executor.submit(run_database_lane, index, lane)
+                for index, lane in enumerate(database_lanes)
+            ]
+            for future in futures:
+                non_store_profiles.extend(future.result())
         for package, test in (
             ("./internal/agentfirstaudit", "^TestRetentionClockEvidenceRealTemporalHistory$"),
             ("./periodicbrief", "^TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges$"),
         ):
+            integration_env = {
+                **env,
+                "DATABASE_URL": urls[3],
+                "VANE_TEST_DATABASE_URL": urls[3],
+                "VANE_TEMPORAL_ADDRESS": temporal_address,
+            }
             run_go_tests_no_skips(
                 [str(go), "test", "-json", "-tags=integration", package, "-run", test, "-count=1"],
                 cwd=SERVER,
+                env=integration_env,
             )
 
         server_coverage = artifacts / "coverage.out"
@@ -656,7 +798,8 @@ def main() -> int:
             [
                 str(go), "run", "./cmd/storetestshard", "merge-coverage",
                 "--output", str(server_coverage),
-                str(store_artifacts / "store.coverage.out"), str(non_store),
+                str(store_artifacts / "store.coverage.out"),
+                *(str(profile) for profile in non_store_profiles),
             ],
             cwd=SERVER,
         )

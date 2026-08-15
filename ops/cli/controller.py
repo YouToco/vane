@@ -584,12 +584,14 @@ def run_checked(command: list[str], *, cwd: Path) -> None:
 
 
 def run_go_tests_json(
-    command: list[str], *, cwd: Path, fail_on_skips: bool
+    command: list[str], *, cwd: Path, fail_on_skips: bool,
+    env: dict[str, str] | None = None,
 ) -> list[str]:
     print("+", " ".join(command), flush=True)
     result = subprocess.run(
         command,
         cwd=cwd,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -625,8 +627,10 @@ def run_go_tests_json(
     return skipped
 
 
-def run_go_tests_no_skips(command: list[str], *, cwd: Path) -> None:
-    run_go_tests_json(command, cwd=cwd, fail_on_skips=True)
+def run_go_tests_no_skips(
+    command: list[str], *, cwd: Path, env: dict[str, str] | None = None
+) -> None:
+    run_go_tests_json(command, cwd=cwd, fail_on_skips=True, env=env)
 
 
 def command_doctor(args: argparse.Namespace) -> int:
