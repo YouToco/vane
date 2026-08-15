@@ -103,6 +103,7 @@ export const es: Dict = {
       groupAccount: "Cuenta",
       profile: "Mi perfil",
       channel: "Canal de envío",
+      members: "Miembros e invitaciones",
       admin: "Administración",
       logout: "Cerrar sesión",
       tagline: "Inteligencia con IA",
@@ -267,6 +268,7 @@ export const es: Dict = {
       title: "Ajustes",
       tabProfile: "Mi perfil",
       tabChannel: "Canal de envío",
+      tabMembers: "Miembros e invitaciones",
       channelZhOnly:
         "Esta guía apunta a la consola de Feishu (China) y por ahora solo está en chino.",
     },
