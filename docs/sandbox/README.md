@@ -38,6 +38,9 @@ Unix socket, validates the complete authority envelope, and always returns
   hard-caps configuration at 64 connections/256 KiB, applies a 30-second
   per-connection deadline, and returns a fixed `busy` response without spawning
   another handler when all slots are occupied.
+  Raw request input is capped at one quarter of the configured frame so its
+  base64 representation and the complete authority/policy JSON envelope remain
+  representable within the same closed frame.
 - Configuration is read only from an absolute root-owned 0400/0600 regular
   file with one link and a root-owned, non-writable, non-symlink parent chain.
   Wire responses contain fixed error codes, never internal paths or principals.
