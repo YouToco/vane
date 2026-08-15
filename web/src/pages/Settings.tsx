@@ -4,6 +4,7 @@ import { Info } from "lucide-react";
 import FeishuSetup from "./FeishuSetup";
 import Profile from "./Profile";
 import WorkspaceMembers from "./WorkspaceMembers";
+import A2AAccessTokens from "./A2AAccessTokens";
 import { useI18n } from "@/i18n";
 import type { MeResponse } from "@/shared/api/client";
 
@@ -25,6 +26,8 @@ export default function Settings({
     ? "channel"
     : hash === "#/settings/members"
       ? "members"
+      : hash === "#/settings/access"
+        ? "access"
       : "profile";
   // 推送通道配置指南面向飞书（中国版）开放平台，正文保持中文；
   // 非中文语言下给一条说明，避免用户以为页面坏了。
@@ -40,13 +43,16 @@ export default function Settings({
             ? "#/settings/channel"
             : v === "members"
               ? "#/settings/members"
+              : v === "access"
+                ? "#/settings/access"
               : "#/settings";
         }}
       >
-        <TabsList>
+        <TabsList className="max-w-full justify-start overflow-x-auto">
           <TabsTrigger value="profile">{S.tabProfile}</TabsTrigger>
           <TabsTrigger value="channel">{S.tabChannel}</TabsTrigger>
           <TabsTrigger value="members">{S.tabMembers}</TabsTrigger>
+          <TabsTrigger value="access">{locale === "zh" || locale === "zh-Hant" ? "访问凭证" : "Access credentials"}</TabsTrigger>
         </TabsList>
         <TabsContent value="profile" className="mt-4">
           <Profile />
@@ -62,6 +68,9 @@ export default function Settings({
         </TabsContent>
         <TabsContent value="members" className="mt-4">
           <WorkspaceMembers me={me} onAuthorityChanged={onAuthorityChanged} />
+        </TabsContent>
+        <TabsContent value="access" className="mt-4">
+          <A2AAccessTokens me={me} />
         </TabsContent>
       </Tabs>
     </div>

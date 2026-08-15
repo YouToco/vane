@@ -60,6 +60,32 @@ export interface WorkspaceInvite {
   token?: string;
 }
 
+export type A2AScope = "assistant.chat" | "content.query";
+export type A2AActorType = "user" | "service_account";
+
+export interface A2AAccessToken {
+  id: string;
+  tenant_id: number;
+  principal_user_id: number;
+  actor_type: A2AActorType;
+  service_account_label?: string;
+  scopes: A2AScope[];
+  issued_by: number;
+  expires_at: string;
+  revoked_at?: string;
+  created_at: string;
+  /** Returned exactly once by POST; list responses must never contain it. */
+  token?: string;
+}
+
+export interface IssueA2AAccessTokenRequest {
+  actor_type: A2AActorType;
+  principal_user_id: number;
+  service_account_label?: string;
+  scopes: A2AScope[];
+  expires_in_days: number;
+}
+
 // ---- 平台管理：指定用户/任务/运行的真实执行轨迹 ----
 
 export interface AdminTraceUser {
@@ -1015,6 +1041,11 @@ export class ApiError extends Error {
 // 本地 dev 留空走 Vite 代理（同源相对路径，vite.config.ts）。
 const API_BASE = apiBase(import.meta.env.DEV);
 
+export function getA2AEndpoint(): string {
+  const base = API_BASE || (typeof location === "undefined" ? "" : location.origin);
+  return base ? new URL("/a2a", base).toString() : "/a2a";
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
@@ -1602,6 +1633,23 @@ export const api = {
       `/api/workspaces/${tenantID}/transfer-ownership`,
       { user_id: userID },
     ),
+  listA2AAccessTokens: () =>
+    request<{ tokens: A2AAccessToken[] }>("/api/a2a-tokens").then((result) =>
+      arr(result.tokens).map(({ token: _rawToken, ...item }) => item),
+    ),
+  issueA2AAccessToken: (input: IssueA2AAccessTokenRequest, reauthProof: string) =>
+    request<A2AAccessToken>("/api/a2a-tokens", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Vane-Reauth-Token": reauthProof,
+      },
+      body: JSON.stringify(input),
+    }),
+  revokeA2AAccessToken: (tokenID: string) =>
+    request<{ ok: boolean }>(`/api/a2a-tokens/${encodeURIComponent(tokenID)}`, {
+      method: "DELETE",
+    }),
   feishuStatus: () => request<FeishuStatus>("/api/feishu/status"),
   feishuVerify: (appId: string, appSecret: string) =>
     post<VerifyResult>("/api/feishu/verify", {

@@ -28,6 +28,7 @@ import {
   Loader2,
   ChevronsUpDown,
   Users,
+  KeyRound,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -60,7 +61,7 @@ interface NavItem {
 // 我的情报 = 日常要看的产出；账号 = 影响产出的自身设置。
 // 文案来自 i18n 字典，导航结构随语言重建（结构轻，无需 memo 精调）。
 function useNav() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const N = t.app.nav;
   const groups: { label: string; items: NavItem[] }[] = [
     {
@@ -77,6 +78,11 @@ function useNav() {
         { hash: "#/settings", label: N.profile, icon: User },
         { hash: "#/settings/channel", label: N.channel, icon: MessageSquare },
         { hash: "#/settings/members", label: N.members, icon: Users },
+        {
+          hash: "#/settings/access",
+          label: locale === "zh" || locale === "zh-Hant" ? "访问凭证" : "Access credentials",
+          icon: KeyRound,
+        },
       ],
     },
   ];
@@ -114,6 +120,7 @@ function renderPage(
     case "#/settings":
     case "#/settings/channel":
     case "#/settings/members":
+    case "#/settings/access":
       return <Settings hash={hash} me={me} onAuthorityChanged={onAuthorityChanged} />;
     case "#/admin":
       // 前端兜底：非平台 owner 直接落回首页。真正的拦截在后端
