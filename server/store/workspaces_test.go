@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/server/internal/testgate"
 	"github.com/YouToco/vane/server/types"
 )
 
@@ -15,7 +16,7 @@ func workspaceIntegrationStore(t *testing.T) *Store {
 	t.Helper()
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DATABASE_URL is required for PostgreSQL workspace tests")
+		testgate.Database(t)
 	}
 	if err := Migrate(t.Context(), databaseURL); err != nil {
 		t.Fatalf("migrate workspace test database: %v", err)
