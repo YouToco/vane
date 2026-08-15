@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -115,16 +116,22 @@ func loadConfig(path string, requireRoot bool) (config, error) {
 	}
 	defer file.Close()
 	openedInfo, err := file.Stat()
-	if err != nil || !os.SameFile(trustedInfo, openedInfo) {
+	if err != nil || !os.SameFile(trustedInfo, openedInfo) || openedInfo.Size() != trustedInfo.Size() {
 		return value, errors.New("sandboxd config inode changed while opening")
 	}
-	decoder := json.NewDecoder(io.LimitReader(file, maxConfigBytes+1))
+	payload, err := io.ReadAll(file)
+	if err != nil || int64(len(payload)) != openedInfo.Size() {
+		return value, errors.New("sandboxd config size changed while reading")
+	}
+	if err := rejectDuplicateJSONKeys(payload); err != nil {
+		return value, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&value); err != nil {
 		return value, err
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+	if decoder.InputOffset() != int64(len(payload)) {
 		return value, errors.New("sandboxd config has trailing or oversized content")
 	}
 	if value.Mode != "dark" || value.FeatureEnabled || !value.Firecracker.Production {
@@ -142,6 +149,9 @@ func loadConfig(path string, requireRoot bool) (config, error) {
 			return value, errors.New("sandboxd allowed policy digest is invalid")
 		}
 	}
+	if err := value.Firecracker.BindServiceIdentities(value.VaneServerUID, value.SocketUID, value.SocketGID); err != nil {
+		return value, err
+	}
 	return value, nil
 }
 
@@ -156,6 +166,9 @@ func verifyConfigPath(path string, requireRoot bool) (os.FileInfo, error) {
 	if leaf.Mode()&os.ModeSymlink != 0 || !leaf.Mode().IsRegular() ||
 		(leaf.Mode().Perm() != 0o600 && leaf.Mode().Perm() != 0o400) {
 		return nil, errors.New("sandboxd config must be a non-symlink regular file with mode 0600 or 0400")
+	}
+	if leaf.Size() < 1 || leaf.Size() > maxConfigBytes {
+		return nil, errors.New("sandboxd config size is outside the closed limit")
 	}
 	if stat, ok := leaf.Sys().(*syscall.Stat_t); !ok || stat.Nlink != 1 ||
 		(requireRoot && stat.Uid != 0) {
@@ -178,4 +191,53 @@ func verifyConfigPath(path string, requireRoot bool) (os.FileInfo, error) {
 		}
 	}
 	return leaf, nil
+}
+
+func rejectDuplicateJSONKeys(payload []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	var walkValue func() error
+	walkValue = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("sandboxd config object key is not a string")
+				}
+				if _, exists := seen[key]; exists {
+					return fmt.Errorf("sandboxd config contains duplicate key %q", key)
+				}
+				seen[key] = struct{}{}
+				if err := walkValue(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		case '[':
+			for decoder.More() {
+				if err := walkValue(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		default:
+			return errors.New("sandboxd config has unexpected delimiter")
+		}
+	}
+	return walkValue()
 }

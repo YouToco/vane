@@ -1,16 +1,25 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -63,6 +72,71 @@ func TestServiceValidatesAuthorityThenAlwaysRemainsDark(t *testing.T) {
 	}
 }
 
+func TestDefaultFirecrackerBackendCannotLaunchOrCreateWorkdir(t *testing.T) {
+	config := testFirecrackerConfig(t)
+	launcher := &recordingLauncher{}
+	backend, err := NewFirecrackerBackend(config, launcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Run(t.Context(), testRequest(t, "production-dark", 1, 2)); !errors.Is(err, ErrDarkFoundation) {
+		t.Fatalf("default backend err=%v", err)
+	}
+	if launcher.plan.Executable != "" {
+		t.Fatalf("dark backend called launcher: %+v", launcher.plan)
+	}
+	entries, err := os.ReadDir(config.WorkRoot)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("dark backend created invocation work entries=%v err=%v", entries, err)
+	}
+}
+
+func TestProductionCallersCannotReferenceDarkSandbox(t *testing.T) {
+	_, sourcePath, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("test source path unavailable")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(sourcePath), "..", ".."))
+	for _, relative := range []string{"server/cmd/server", "server/agent", "server/skillpkg", "server/mcpclient"} {
+		root := filepath.Join(repositoryRoot, relative)
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil || entry.IsDir() || filepath.Ext(path) != ".go" {
+				return walkErr
+			}
+			parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+			if err != nil {
+				return err
+			}
+			var forbidden string
+			ast.Inspect(parsed, func(node ast.Node) bool {
+				switch value := node.(type) {
+				case *ast.ImportSpec:
+					literal, _ := strconv.Unquote(value.Path.Value)
+					if strings.HasSuffix(literal, "/server/sandbox") {
+						forbidden = literal
+					}
+				case *ast.Ident:
+					if value.Name == "sandbox" || value.Name == "sandboxd" {
+						forbidden = value.Name
+					}
+				case *ast.BasicLit:
+					if value.Kind == token.STRING && strings.Contains(value.Value, "sandboxd") {
+						forbidden = "sandboxd"
+					}
+				}
+				return forbidden == ""
+			})
+			if forbidden != "" {
+				return fmt.Errorf("%s references dark sandbox authority %q", path, forbidden)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestDaemonRequiresAuthorizedSocketPeer(t *testing.T) {
 	directory, err := os.MkdirTemp("/tmp", "vane-sandbox-socket-")
 	if err != nil {
@@ -103,6 +177,72 @@ func TestDaemonRequiresAuthorizedSocketPeer(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDaemonAuthorizedRoundTripDoesNotWaitForEOF(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "vane-sandbox-roundtrip-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid, ok := fileOwner(info)
+	if !ok {
+		t.Fatal("socket parent owner unavailable")
+	}
+	request := testRequest(t, "authorized-roundtrip", 1, 2)
+	service, err := NewService(ServiceConfig{MaxInputBytes: 1024,
+		AllowedPolicyDigests: map[string]struct{}{request.PolicyDigest: {}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	socket := filepath.Join(directory, "sandboxd.sock")
+	daemon := Daemon{SocketPath: socket, Socket: SocketContract{
+		ParentUID: uid, ParentGID: gid, ParentMode: 0o700,
+		SocketUID: os.Geteuid(), SocketGID: os.Getegid(), SocketMode: 0o660,
+		allowUnprivilegedForTest: true,
+	}, Service: service, Authorizer: authorizerFunc(func(*net.UnixConn) error { return nil })}
+	go func() { done <- daemon.Serve(ctx) }()
+	waitForSocket(t, socket)
+	roundtripCtx, roundtripCancel := context.WithTimeout(t.Context(), time.Second)
+	defer roundtripCancel()
+	result, err := (Client{SocketPath: socket}).Execute(roundtripCtx, request)
+	if err == nil || err.Error() != "dark_foundation" || result.Status != "disabled" {
+		t.Fatalf("authorized dark roundtrip result=%+v err=%v", result, err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWireFrameRejectsOversizeAndTrailingWhitespace(t *testing.T) {
+	frame := func(payload []byte) []byte {
+		result := make([]byte, 4+len(payload))
+		binary.BigEndian.PutUint32(result[:4], uint32(len(payload)))
+		copy(result[4:], payload)
+		return result
+	}
+	var decoded map[string]any
+	if err := readWire(bytes.NewReader(frame([]byte(`{"ok":true} `))), &decoded); err == nil {
+		t.Fatal("JSON trailing whitespace inside a frame was accepted")
+	}
+	var oversized [4]byte
+	binary.BigEndian.PutUint32(oversized[:], maxWireBytes+1)
+	if err := readWire(bytes.NewReader(oversized[:]), &decoded); err == nil {
+		t.Fatal("oversized declared frame was accepted")
+	}
+	if err := writeWire(io.Discard, map[string]string{"payload": strings.Repeat("x", maxWireBytes)}); err == nil {
+		t.Fatal("oversized encoded frame was accepted")
 	}
 }
 
@@ -191,6 +331,21 @@ func TestNetNSMountPointRequiresTopologyInspection(t *testing.T) {
 	}
 }
 
+func TestRelativeNetNSPathFailsWithoutAncestorLoop(t *testing.T) {
+	done := make(chan error, 1)
+	go func() {
+		done <- verifyEmptyNetNS("relative-empty.netns", false, func(string) error { return nil })
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not absolute") {
+			t.Fatalf("relative netns err=%v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("relative netns path caused non-progressing ancestor traversal")
+	}
+}
+
 func TestArtifactPinsRejectDigestSymlinkAndWritablePath(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "kernel")
@@ -259,6 +414,39 @@ func TestProtectedDirectoryChainRejectsWritableAncestor(t *testing.T) {
 	}
 }
 
+func TestScrubTreeUnlinksSymlinkWithoutTouchingExternalVictim(t *testing.T) {
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	want := []byte("must remain unchanged")
+	if err := os.WriteFile(victim, want, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "invocation")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(root, "attacker-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := scrubTree(root); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(victim)
+	if err != nil || !bytes.Equal(payload, want) {
+		t.Fatalf("external victim content changed payload=%q err=%v", payload, err)
+	}
+	info, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o400 {
+		t.Fatalf("external victim mode changed mode=%v", info.Mode().Perm())
+	}
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatalf("invocation root survived scrub: %v", err)
+	}
+}
+
 func TestFirecrackerTestHarnessEnforcesTimeoutAndOutputCap(t *testing.T) {
 	config := testFirecrackerConfig(t)
 	config.darkLaunchForTest = true
@@ -291,7 +479,7 @@ func TestRouteFixturesPermitOnlyLoopback(t *testing.T) {
 	if err := validateRouteTable(strings.NewReader(ipv4Loopback), false); err != nil {
 		t.Fatalf("loopback IPv4 route rejected: %v", err)
 	}
-	ipv6Loopback := strings.Repeat("0", 32) + " 00 " + strings.Repeat("0", 32) +
+	ipv6Loopback := strings.Repeat("0", 31) + "1 80 " + strings.Repeat("0", 32) +
 		" 00 " + strings.Repeat("0", 32) + " 00000000 00000000 00000000 00000001 lo\n"
 	if err := validateRouteTable(strings.NewReader(ipv6Loopback), true); err != nil {
 		t.Fatalf("loopback IPv6 route rejected: %v", err)
@@ -301,6 +489,57 @@ func TestRouteFixturesPermitOnlyLoopback(t *testing.T) {
 	}
 	if err := validateRouteTable(strings.NewReader(strings.Replace(ipv6Loopback, " lo", " eth0", 1)), true); err == nil {
 		t.Fatal("non-loopback IPv6 route accepted")
+	}
+	defaultViaLoopback := strings.Replace(ipv4Loopback, "0000007F", "00000000", 1)
+	defaultViaLoopback = strings.Replace(defaultViaLoopback, "000000FF", "00000000", 1)
+	if err := validateRouteTable(strings.NewReader(defaultViaLoopback), false); err == nil {
+		t.Fatal("IPv4 default route via loopback accepted")
+	}
+}
+
+func TestJailerIdentityPoolRejectsBoundsAndServiceCollision(t *testing.T) {
+	config := testFirecrackerConfig(t)
+	config.JailerUIDStart = int(maxHostIdentity)
+	config.IsolationSlots = 2
+	if _, err := NewFirecrackerBackend(config, &recordingLauncher{}); err == nil {
+		t.Fatal("overflowing jailer UID pool accepted")
+	}
+	config.IsolationSlots = 1
+	if _, err := NewFirecrackerBackend(config, &recordingLauncher{}); err != nil {
+		t.Fatalf("maximum non-sentinel jailer UID rejected: %v", err)
+	}
+	config.JailerUIDStart = int(maxHostIdentity) + 1
+	if _, err := NewFirecrackerBackend(config, &recordingLauncher{}); err == nil {
+		t.Fatal("uid_t all-ones sentinel accepted")
+	}
+	config = testFirecrackerConfig(t)
+	config.Production = true
+	if err := config.BindServiceIdentities(uint32(config.JailerUIDStart), 0, config.JailerGIDStart+100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFirecrackerBackend(config, &recordingLauncher{}); err == nil ||
+		!strings.Contains(err.Error(), "collides") {
+		t.Fatalf("service UID collision err=%v", err)
+	}
+	if err := config.BindServiceIdentities(1001, 0, config.JailerGIDStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFirecrackerBackend(config, &recordingLauncher{}); err == nil ||
+		!strings.Contains(err.Error(), "collides") {
+		t.Fatalf("socket GID collision err=%v", err)
+	}
+	if err := config.BindServiceIdentities(1001, 0, int(maxHostIdentity)+1); err == nil {
+		t.Fatal("socket gid_t all-ones sentinel accepted")
+	}
+	if err := config.BindServiceIdentities(^uint32(0), 0, 1001); err == nil {
+		t.Fatal("Vane service uid_t sentinel accepted")
+	}
+}
+
+func TestAssignedHostIdentityIsRejected(t *testing.T) {
+	if err := verifyUnusedIdentityRange(os.Geteuid(), 1, true); err == nil ||
+		!strings.Contains(err.Error(), "already assigned") {
+		t.Fatalf("assigned current UID err=%v", err)
 	}
 }
 

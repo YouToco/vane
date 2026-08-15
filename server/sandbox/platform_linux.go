@@ -9,8 +9,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func inspectKVM(path string) error {
@@ -28,9 +32,24 @@ func inspectKVM(path string) error {
 	return file.Close()
 }
 
-func verifyVersion(ctx context.Context, path, binary, expected string) error {
-	output, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
+func prepareDirectoryForRemoval(path string) error {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
+		return err
+	}
+	chmodErr := unix.Fchmod(fd, 0o700)
+	return errors.Join(chmodErr, unix.Close(fd))
+}
+
+func verifyVersion(ctx context.Context, path, binary, expected string) error {
+	versionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	output, err := (execLauncher{}).Run(versionCtx, LaunchPlan{Executable: path,
+		Arguments: []string{"--version"}, WorkDir: filepath.Dir(path), OutputLimit: 64 << 10})
+	if err != nil {
+		if errors.Is(versionCtx.Err(), context.DeadlineExceeded) {
+			return errors.New("version command timed out")
+		}
 		return err
 	}
 	return validateVersionOutput(binary, expected, string(output))
