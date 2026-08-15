@@ -22,7 +22,7 @@ type fakeContent struct {
 	calls      int
 }
 
-func (f *fakeContent) SearchContentItems(_ context.Context, keyword string, since time.Time, limit int) ([]types.ContentItem, error) {
+func (f *fakeContent) SearchContentItemsForA2A(_ context.Context, _ types.A2AExecutionScope, keyword string, since time.Time, limit int) ([]types.ContentItem, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -47,7 +47,7 @@ func newFakeTaskStorage() *fakeTaskStorage {
 	return &fakeTaskStorage{rows: make(map[string]*types.A2ATask)}
 }
 
-func (f *fakeTaskStorage) CreateA2ATask(_ context.Context, t *types.A2ATask) error {
+func (f *fakeTaskStorage) CreateA2APrincipalTask(_ context.Context, scope types.A2AExecutionScope, t *types.A2ATask) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.createErr != nil {
@@ -57,6 +57,8 @@ func (f *fakeTaskStorage) CreateA2ATask(_ context.Context, t *types.A2ATask) err
 		return types.NewAppError(types.CodeConflict, "任务已存在", nil)
 	}
 	cp := *t
+	cp.TenantID, cp.PrincipalUserID = scope.TenantID, scope.UserID
+	cp.ActorType, cp.CreatedByToken = scope.ActorType, scope.TokenID
 	cp.Version = 1
 	now := time.Now()
 	cp.CreatedAt, cp.UpdatedAt = now, now
@@ -64,14 +66,14 @@ func (f *fakeTaskStorage) CreateA2ATask(_ context.Context, t *types.A2ATask) err
 	return nil
 }
 
-func (f *fakeTaskStorage) GetA2ATask(_ context.Context, id string) (*types.A2ATask, error) {
+func (f *fakeTaskStorage) GetA2APrincipalTask(_ context.Context, scope types.A2AExecutionScope, id string) (*types.A2ATask, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
 	row, ok := f.rows[id]
-	if !ok {
+	if !ok || row.TenantID != scope.TenantID || row.PrincipalUserID != scope.UserID {
 		return nil, types.NewAppError(types.CodeNotFound, "任务不存在", nil)
 	}
 	cp := *row
@@ -79,14 +81,14 @@ func (f *fakeTaskStorage) GetA2ATask(_ context.Context, id string) (*types.A2ATa
 	return &cp, nil
 }
 
-func (f *fakeTaskStorage) UpdateA2ATask(_ context.Context, id string, expectedVersion int64, status string, task json.RawMessage) error {
+func (f *fakeTaskStorage) UpdateA2APrincipalTask(_ context.Context, scope types.A2AExecutionScope, id string, expectedVersion int64, status string, task json.RawMessage) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.updateErr != nil {
 		return f.updateErr
 	}
 	row, ok := f.rows[id]
-	if !ok {
+	if !ok || row.TenantID != scope.TenantID || row.PrincipalUserID != scope.UserID {
 		return types.NewAppError(types.CodeNotFound, "任务不存在", nil)
 	}
 	if row.Version != expectedVersion {
@@ -99,7 +101,7 @@ func (f *fakeTaskStorage) UpdateA2ATask(_ context.Context, id string, expectedVe
 	return nil
 }
 
-func (f *fakeTaskStorage) ListA2ATasks(_ context.Context, q types.A2ATaskQuery) ([]types.A2ATask, int64, string, error) {
+func (f *fakeTaskStorage) ListA2APrincipalTasks(_ context.Context, scope types.A2AExecutionScope, q types.A2ATaskQuery) ([]types.A2ATask, int64, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
@@ -107,6 +109,9 @@ func (f *fakeTaskStorage) ListA2ATasks(_ context.Context, q types.A2ATaskQuery) 
 	}
 	var out []types.A2ATask
 	for _, row := range f.rows {
+		if row.TenantID != scope.TenantID || row.PrincipalUserID != scope.UserID {
+			continue
+		}
 		if q.ContextID != "" && row.ContextID != q.ContextID {
 			continue
 		}
@@ -124,4 +129,41 @@ func (f *fakeTaskStorage) ListA2ATasks(_ context.Context, q types.A2ATaskQuery) 
 		return out[i].ID > out[j].ID
 	})
 	return out, int64(len(out)), "", nil
+}
+
+var testAuthority = types.A2AAuthenticatedPrincipal{
+	TokenID: "11111111-1111-4111-8111-111111111111", TenantID: 11, UserID: 22,
+	Role: types.MembershipRoleMember, ActorType: types.ActorTypeUser,
+	Scopes: []types.A2AScope{types.A2AScopeAssistantChat, types.A2AScopeContentQuery},
+}
+
+func testA2AContext(ctx context.Context) context.Context {
+	copy := testAuthority
+	copy.Scopes = append([]types.A2AScope(nil), testAuthority.Scopes...)
+	return withA2AAuthority(ctx, &copy)
+}
+
+func scopeFromTestAuthority() types.A2AExecutionScope {
+	ctx := testA2AContext(context.Background())
+	scope, _ := authorityFromContext(ctx)
+	return scope
+}
+
+type fakeAuthenticator struct {
+	item *types.A2AAuthenticatedPrincipal
+	err  error
+}
+
+func (f *fakeAuthenticator) AuthenticateA2AAccessToken(context.Context, []byte) (*types.A2AAuthenticatedPrincipal, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.item == nil {
+		copy := testAuthority
+		copy.Scopes = append([]types.A2AScope(nil), testAuthority.Scopes...)
+		return &copy, nil
+	}
+	copy := *f.item
+	copy.Scopes = append([]types.A2AScope(nil), f.item.Scopes...)
+	return &copy, nil
 }

@@ -69,6 +69,9 @@ type purgeStep struct {
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
 var purgeOrder = []purgeStep{
+	// Principal-scoped A2A task history references the credential that admitted
+	// it, so erase tasks before token lifecycle evidence.
+	{"a2a_principal_tasks", "tenant_id = $1"},
 	// Scoped A2A tokens retain only hashes and append-only lifecycle evidence.
 	// Explicit tenant erasure removes the event child before its token parent.
 	{"a2a_access_token_events", "tenant_id = $1"},
@@ -377,6 +380,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		workspaceMemoryReceiptsAvailable       bool
 		a2aAccessTokensAvailable               bool
 		a2aAccessTokenEventsAvailable          bool
+		a2aPrincipalTasksAvailable             bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -421,7 +425,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.workspace_memory_events') IS NOT NULL,
 		        to_regclass('public.workspace_memory_receipts') IS NOT NULL,
 		        to_regclass('public.a2a_access_tokens') IS NOT NULL,
-		        to_regclass('public.a2a_access_token_events') IS NOT NULL`,
+		        to_regclass('public.a2a_access_token_events') IS NOT NULL,
+		        to_regclass('public.a2a_principal_tasks') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -466,6 +471,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&workspaceMemoryReceiptsAvailable,
 		&a2aAccessTokensAvailable,
 		&a2aAccessTokenEventsAvailable,
+		&a2aPrincipalTasksAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -514,6 +520,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"workspace_memory_receipts":                 workspaceMemoryReceiptsAvailable,
 		"a2a_access_tokens":                         a2aAccessTokensAvailable,
 		"a2a_access_token_events":                   a2aAccessTokenEventsAvailable,
+		"a2a_principal_tasks":                       a2aPrincipalTasksAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,

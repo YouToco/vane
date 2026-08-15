@@ -57,3 +57,16 @@ type A2AAuthenticatedPrincipal struct {
 	ActorType ActorType
 	Scopes    []A2AScope
 }
+
+// A2AExecutionScope is the immutable authority captured after a bearer has
+// been authenticated. Task and content stores accept this value explicitly so
+// no caller can infer a workspace from user_id or silently fall back to the
+// historical global A2A task namespace.
+type A2AExecutionScope struct {
+	TokenID   string
+	TenantID  int64
+	UserID    int64
+	Role      MembershipRole
+	ActorType ActorType
+	Scopes    []A2AScope
+}

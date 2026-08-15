@@ -190,11 +190,11 @@ func (s *Store) ListA2ATasks(ctx context.Context, q types.A2ATaskQuery) (items [
 	return items, total, next, nil
 }
 
-// CountA2ATasks 只读计数，供 Gate 探针 P-A2A（契约 §10）：probe.Store 接口追加此一行
-// 归 PR-3（probe/ 不在本 PR 范围），本方法先行就位。
+// CountA2ATasks 只读计数，供 Gate 探针 P-A2A。生产 A2A 已切到
+// principal-scoped ledger；不再用 migration013 的全局历史表作为就绪 authority。
 func (s *Store) CountA2ATasks(ctx context.Context) (int64, error) {
 	var n int64
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM a2a_tasks`).Scan(&n); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM a2a_principal_tasks`).Scan(&n); err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "统计 A2A 任务总数", err)
 	}
 	return n, nil

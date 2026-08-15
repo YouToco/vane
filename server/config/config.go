@@ -291,9 +291,6 @@ type DashboardConfig struct {
 type A2AConfig struct {
 	// Enabled 默认 false：未显式开启时 main.go 不 Mount，零新增暴露面。
 	Enabled bool `mapstructure:"enabled"`
-	// Token 环境变量 VANE_A2A_TOKEN；本体存 YouToco/my-credentials，绝不入库。
-	// 为空时照常挂载、auth 恒 401、Mount 时 slog.Warn 一次（Dashboard Password 先例）。
-	Token string `mapstructure:"token"`
 	// BaseURL 是对外 A2A endpoint，进 AgentCard supportedInterfaces。
 	BaseURL string `mapstructure:"base_url"`
 }
@@ -314,7 +311,6 @@ var sensitiveKeys = []string{
 	"fetch.exa_api_key",
 	"dashboard.password",
 	"smtp.password",
-	"a2a.token",
 }
 
 const nativeV3EditRecoveryDBCredential = "native_v3_edit_recovery_db_url"
