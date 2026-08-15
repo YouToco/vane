@@ -134,13 +134,24 @@ def verify_public_release(
         or marker_value["file_count"] <= 0
     ):
         raise RuntimeError("local Web release marker is not exact clean evidence")
-    marker_target = origin.rstrip("/") + f"/{RELEASE_MARKER_PATH}?release={revision}"
-    index_target = origin.rstrip("/") + f"/index.html?release={revision}"
     last_error: Exception | None = None
     if attempts < 1 or attempts > 6:
         raise RuntimeError("public Web verification attempt count is invalid")
     for attempt in range(1, attempts + 1):
         try:
+            # A revision-only query can remain cached at the CDN after the
+            # marker-last commit. Each verification attempt must force a
+            # distinct edge lookup so a stale response cannot trigger an
+            # unnecessary full republish or exhaust the convergence window.
+            probe = f"{time.time_ns()}-{attempt}"
+            marker_target = (
+                origin.rstrip("/")
+                + f"/{RELEASE_MARKER_PATH}?release={revision}&probe={probe}"
+            )
+            index_target = (
+                origin.rstrip("/")
+                + f"/index.html?release={revision}&probe={probe}"
+            )
             request = Request(marker_target, headers={"Cache-Control": "no-cache"})
             with urlopen(request, timeout=15) as response:
                 if response.status != 200:
