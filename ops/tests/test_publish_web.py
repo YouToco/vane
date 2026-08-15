@@ -2025,6 +2025,64 @@ class PublishWebTest(unittest.TestCase):
                     SHA, marker, hashlib.sha256(index).hexdigest(), expected
                 )
 
+    def test_cloudflare_custom_edge_retries_one_transient_object(self) -> None:
+        marker = (self.dist / "vane-release.json").read_bytes()
+        index = (self.dist / "index.html").read_bytes()
+        stable = b'{"stable":true}'
+        expected = {
+            "index.html": {"path": "index.html", "size": len(index),
+                           "sha256": hashlib.sha256(index).hexdigest()},
+            "vane-release.json": {
+                "path": "vane-release.json", "size": len(marker),
+                "sha256": hashlib.sha256(marker).hexdigest(),
+            },
+            "stable-config.json": {
+                "path": "stable-config.json", "size": len(stable),
+                "sha256": hashlib.sha256(stable).hexdigest(),
+            },
+        }
+        attempts: dict[str, int] = {}
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+
+            def read(self, limit: int) -> bytes:
+                return self.payload[:limit]
+
+        class Connection:
+            def __init__(self, ip: str) -> None:
+                self.path = ""
+
+            def request(self, method: str, path: str, headers: dict) -> None:
+                self.path = path.split("?", 1)[0]
+                attempts[self.path] = attempts.get(self.path, 0) + 1
+
+            def getresponse(self):
+                if self.path == "/stable-config.json" and attempts[self.path] == 1:
+                    return Response(b"transient")
+                return Response({
+                    "/vane-release.json": marker,
+                    "/": index,
+                    "/stable-config.json": stable,
+                }[self.path])
+
+            def close(self) -> None:
+                pass
+
+        with mock.patch.object(
+            publish_web, "aliyun_doh_addresses", return_value=["104.18.1.1"]
+        ), mock.patch.object(
+            publish_web, "PinnedEdgeHTTPSConnection", Connection
+        ), mock.patch.object(publish_web.time, "sleep"):
+            smoke = publish_web.verify_cloudflare_custom_edge(
+                SHA, marker, hashlib.sha256(index).hexdigest(), expected
+            )
+        self.assertEqual(smoke["edge_ip"], "104.18.1.1")
+        self.assertEqual(attempts["/stable-config.json"], 2)
+
     def test_aliyun_edge_requires_exact_redirect_and_splat_behavior(self) -> None:
         marker = (self.dist / "vane-release.json").read_bytes()
         index = (self.dist / "index.html").read_bytes()

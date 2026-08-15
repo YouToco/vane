@@ -1873,63 +1873,86 @@ def verify_cloudflare_custom_edge(
     last_error: Exception | None = None
     for address in aliyun_doh_addresses(cname):
         try:
-            bodies: dict[str, bytes] = {}
-            probes = {
-                RELEASE_MARKER_PATH: (expected_marker, 64 * 1024 + 1),
-                "index.html": (None, 8 * 1024 * 1024 + 1),
-            }
-            for object_name, (_, limit) in probes.items():
-                connection = PinnedEdgeHTTPSConnection(address)
-                try:
-                    connection.request(
-                        "GET",
-                        cloudflare_public_path(object_name)
-                        + f"?release={revision}&cf-edge=1",
-                        headers={
-                            "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
-                            "User-Agent": PUBLIC_USER_AGENT,
-                        },
-                    )
-                    response = connection.getresponse()
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Cloudflare pinned custom edge returned HTTP {response.status}"
+            def read_exact_object(
+                object_name: str, *, limit: int,
+                expected_bytes: bytes | None = None,
+                expected_size: int | None = None,
+                expected_sha256: str | None = None,
+            ) -> bytes:
+                object_error: Exception | None = None
+                for object_attempt in range(1, PUBLIC_OBJECT_ATTEMPTS + 1):
+                    connection = PinnedEdgeHTTPSConnection(address)
+                    try:
+                        connection.request(
+                            "GET",
+                            cloudflare_public_path(object_name)
+                            + f"?release={revision}&cf-edge=1"
+                            + f"&object-attempt={object_attempt}",
+                            headers={
+                                "Host": CDN_DOMAIN,
+                                "Cache-Control": "no-cache",
+                                "User-Agent": PUBLIC_USER_AGENT,
+                            },
                         )
-                    bodies[object_name] = response.read(limit)
-                finally:
-                    connection.close()
-            if bodies[RELEASE_MARKER_PATH] != expected_marker:
-                raise RuntimeError("Cloudflare custom edge marker differs from artifact")
-            if hashlib.sha256(bodies["index.html"]).hexdigest() != expected_index_sha256:
-                raise RuntimeError("Cloudflare custom edge index differs from artifact")
+                        response = connection.getresponse()
+                        if response.status != 200:
+                            raise RuntimeError(
+                                "Cloudflare pinned custom edge returned HTTP "
+                                f"{response.status}: {object_name}"
+                            )
+                        payload = response.read(limit)
+                    except Exception as error:
+                        object_error = error
+                    else:
+                        if expected_bytes is not None and payload != expected_bytes:
+                            object_error = RuntimeError(
+                                "Cloudflare custom edge object differs from artifact: "
+                                f"{object_name}"
+                            )
+                        elif (
+                            expected_size is not None
+                            and expected_sha256 is not None
+                            and (
+                                len(payload) != expected_size
+                                or hashlib.sha256(payload).hexdigest()
+                                != expected_sha256
+                            )
+                        ):
+                            object_error = RuntimeError(
+                                "Cloudflare custom edge object differs from artifact: "
+                                f"{object_name}"
+                            )
+                        else:
+                            return payload
+                    finally:
+                        connection.close()
+                    if object_attempt < PUBLIC_OBJECT_ATTEMPTS:
+                        time.sleep(0.25 * object_attempt)
+                raise RuntimeError(
+                    "Cloudflare custom edge object did not converge: "
+                    f"{object_name}: {object_error}"
+                )
+
+            bodies: dict[str, bytes] = {}
+            bodies[RELEASE_MARKER_PATH] = read_exact_object(
+                RELEASE_MARKER_PATH, limit=64 * 1024 + 1,
+                expected_bytes=expected_marker,
+            )
+            index_record = expected_files.get("index.html")
+            if not isinstance(index_record, dict):
+                raise RuntimeError("Cloudflare custom edge index evidence is missing")
+            bodies["index.html"] = read_exact_object(
+                "index.html", limit=8 * 1024 * 1024 + 1,
+                expected_size=index_record["size"],
+                expected_sha256=expected_index_sha256,
+            )
             def verify_object(path: str) -> None:
                 record = objects[path]
-                connection = PinnedEdgeHTTPSConnection(address)
-                try:
-                    connection.request(
-                        "GET",
-                        cloudflare_public_path(path)
-                        + f"?release={revision}&cf-edge=1",
-                        headers={
-                            "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
-                            "User-Agent": PUBLIC_USER_AGENT,
-                        },
-                    )
-                    response = connection.getresponse()
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Cloudflare pinned custom edge returned HTTP {response.status}"
-                        )
-                    payload = response.read(record["size"] + 1)
-                finally:
-                    connection.close()
-                if (
-                    len(payload) != record["size"]
-                    or hashlib.sha256(payload).hexdigest() != record["sha256"]
-                ):
-                    raise RuntimeError(
-                        f"Cloudflare custom edge object differs from artifact: {path}"
-                    )
+                read_exact_object(
+                    path, limit=record["size"] + 1,
+                    expected_size=record["size"],
+                    expected_sha256=record["sha256"],
+                )
             parallel_apply(
                 "Cloudflare pinned custom edge verification",
                 sorted(objects), verify_object, workers=CDN_WORKERS,
