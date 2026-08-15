@@ -110,12 +110,35 @@ type AuthStore interface {
 	DeleteSession(ctx context.Context, tokenHash []byte) error
 }
 
+// WorkspaceStore is the multi-workspace control plane. It is intentionally
+// separate from AuthStore so legacy authentication fakes and old login flows
+// remain source-compatible while the capability is rolled out dark.
+type WorkspaceStore interface {
+	ListWorkspacesForUser(ctx context.Context, userID int64) ([]types.Workspace, error)
+	GetWorkspaceForUser(ctx context.Context, tenantID, userID int64) (*types.Workspace, error)
+	DefaultWorkspaceForUser(ctx context.Context, userID int64) (int64, error)
+	CreateTeamWorkspace(ctx context.Context, currentTenantID, actorUserID int64, name string, seatLimit int) (*types.Workspace, error)
+	IssueWorkspaceInvite(ctx context.Context, tenantID, actorUserID int64, email string, role types.MembershipRole, tokenHash []byte, expiresAt time.Time) (*types.WorkspaceInvite, error)
+	ListWorkspaceInvites(ctx context.Context, tenantID, actorUserID int64) ([]types.WorkspaceInvite, error)
+	RevokeWorkspaceInvite(ctx context.Context, tenantID, actorUserID, inviteID int64) error
+	AcceptWorkspaceInvite(ctx context.Context, tokenHash []byte, userID int64) (*types.Workspace, error)
+	RegisterWithWorkspaceInvite(ctx context.Context, email, passwordHash string, tokenHash []byte) (*types.User, *types.Workspace, error)
+	ListWorkspaceMembers(ctx context.Context, tenantID, actorUserID int64) ([]types.WorkspaceMember, error)
+	UpdateWorkspaceMemberRole(ctx context.Context, tenantID, actorUserID, targetUserID int64, role types.MembershipRole) error
+	RemoveWorkspaceMember(ctx context.Context, tenantID, actorUserID, targetUserID int64) error
+	TransferWorkspaceOwnership(ctx context.Context, tenantID, actorUserID, targetUserID int64) error
+	RotateSession(ctx context.Context, oldHash, newHash []byte, userID, tenantID int64, expiresAt time.Time) error
+}
+
 // Deps 是 Mount 所需的全部依赖，由 main.go 注入。
 type Deps struct {
 	Store *store.Store
 	// Auth 是认证路径的窄接口；生产与 Store 同为 *store.Store。
-	Auth    AuthStore
-	Manager Manager
+	Auth AuthStore
+	// Workspaces can be injected independently in tests. Production falls back
+	// to Store, which implements this interface.
+	Workspaces WorkspaceStore
+	Manager    Manager
 	// Scheduler is capability-checked per endpoint below. Keeping this slot
 	// untyped lets each handler require only its idempotent command/read surface
 	// and removes the retired pre-6.8 DeletePush admission signature.
@@ -172,8 +195,20 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner := http.NewServeMux()
 	inner.HandleFunc("POST /api/auth/register", s.handleRegister)
 	inner.HandleFunc("POST /api/auth/login", s.handleLogin)
+	inner.HandleFunc("POST /api/auth/workspace-invites/register", s.handleWorkspaceInviteRegister)
 	inner.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	inner.HandleFunc("GET /api/auth/me", s.handleMe)
+	inner.HandleFunc("GET /api/workspaces", s.handleListWorkspaces)
+	inner.HandleFunc("POST /api/workspaces", s.handleCreateWorkspace)
+	inner.HandleFunc("POST /api/workspaces/{tenant_id}/switch", s.handleSwitchWorkspace)
+	inner.HandleFunc("GET /api/workspaces/{tenant_id}/members", s.handleListWorkspaceMembers)
+	inner.HandleFunc("POST /api/workspaces/{tenant_id}/invites", s.handleIssueWorkspaceInvite)
+	inner.HandleFunc("GET /api/workspaces/{tenant_id}/invites", s.handleListWorkspaceInvites)
+	inner.HandleFunc("DELETE /api/workspaces/{tenant_id}/invites/{invite_id}", s.handleRevokeWorkspaceInvite)
+	inner.HandleFunc("POST /api/workspace-invites/accept", s.handleAcceptWorkspaceInvite)
+	inner.HandleFunc("PATCH /api/workspaces/{tenant_id}/members/{user_id}", s.handleUpdateWorkspaceMember)
+	inner.HandleFunc("DELETE /api/workspaces/{tenant_id}/members/{user_id}", s.handleRemoveWorkspaceMember)
+	inner.HandleFunc("POST /api/workspaces/{tenant_id}/transfer-ownership", s.handleTransferWorkspaceOwnership)
 	inner.HandleFunc("GET /api/feishu/status", s.handleFeishuStatus)
 	inner.HandleFunc("POST /api/feishu/verify", s.handleFeishuVerify)
 	inner.HandleFunc("POST /api/feishu/config", s.handleFeishuConfig)

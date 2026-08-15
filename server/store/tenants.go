@@ -63,7 +63,9 @@ func (s *Store) CreateTenantWithInvite(ctx context.Context, code string, userID 
 	// 步骤 2：建租户。
 	var t types.Tenant
 	if err := scanTenant(tx.QueryRow(ctx,
-		`INSERT INTO tenants DEFAULT VALUES RETURNING `+tenantColumns), &t); err != nil {
+		`INSERT INTO tenants(display_name,workspace_kind,personal_owner_user_id,seat_limit)
+		 VALUES('个人工作区','personal',$1,1) RETURNING `+tenantColumns,
+		userID), &t); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "创建租户", err)
 	}
 

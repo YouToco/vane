@@ -23,6 +23,76 @@ const (
 	MembershipRoleMember MembershipRole = "member"
 )
 
+// Valid reports whether role can be persisted in memberships.
+func (r MembershipRole) Valid() bool {
+	switch r {
+	case MembershipRoleOwner, MembershipRoleAdmin, MembershipRoleMember:
+		return true
+	default:
+		return false
+	}
+}
+
+// WorkspaceKind separates a user's private workspace from shared team workspaces.
+type WorkspaceKind string
+
+const (
+	WorkspaceKindPersonal WorkspaceKind = "personal"
+	WorkspaceKindTeam     WorkspaceKind = "team"
+)
+
+// ActorType records how a principal authenticated. Interactive browser and
+// channel identities are users; scoped automation credentials use service_account.
+type ActorType string
+
+const (
+	ActorTypeUser           ActorType = "user"
+	ActorTypeServiceAccount ActorType = "service_account"
+)
+
+// Workspace is the product projection of a tenant together with the caller's
+// exact membership. It deliberately does not infer membership from user ID.
+type Workspace struct {
+	ID                  int64          `json:"id"`
+	Name                string         `json:"name"`
+	Kind                WorkspaceKind  `json:"kind"`
+	Status              TenantStatus   `json:"status"`
+	Plan                string         `json:"plan"`
+	SeatLimit           int            `json:"seat_limit"`
+	MemberCount         int            `json:"member_count"`
+	Role                MembershipRole `json:"role"`
+	PersonalOwnerUserID *int64         `json:"-"`
+	CreatedAt           time.Time      `json:"created_at"`
+	UpdatedAt           time.Time      `json:"updated_at"`
+}
+
+// WorkspaceMember is safe for member-directory responses. Password, session,
+// channel identity and credential fields never cross this boundary.
+type WorkspaceMember struct {
+	TenantID int64          `json:"tenant_id"`
+	UserID   int64          `json:"user_id"`
+	Email    string         `json:"email"`
+	Name     string         `json:"name"`
+	Role     MembershipRole `json:"role"`
+	JoinedAt time.Time      `json:"joined_at"`
+}
+
+// WorkspaceInvite is the durable, one-time team invitation. Only TokenHash is
+// stored; the raw token is returned once by the API and never persisted.
+type WorkspaceInvite struct {
+	ID           int64          `json:"id"`
+	TenantID     int64          `json:"tenant_id"`
+	Email        string         `json:"email"`
+	Role         MembershipRole `json:"role"`
+	IssuedBy     int64          `json:"issued_by"`
+	ExpiresAt    time.Time      `json:"expires_at"`
+	ConsumedBy   *int64         `json:"consumed_by,omitempty"`
+	ConsumedAt   *time.Time     `json:"consumed_at,omitempty"`
+	RevokedAt    *time.Time     `json:"revoked_at,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
+	RawTokenOnce string         `json:"token,omitempty"`
+}
+
 // Tenant 租户（tenants 表，migration 018）。
 type Tenant struct {
 	ID     int64        `json:"id"`
@@ -73,10 +143,12 @@ func (i Invite) Expired(now time.Time) bool {
 //
 // TokenHash 是会话 token 的 sha256——**库里没有明文 token**（见 auth/session.go）。
 type Session struct {
-	TokenHash  []byte     `json:"-"`
-	UserID     int64      `json:"user_id"`
-	TenantID   int64      `json:"tenant_id"`
-	CreatedAt  time.Time  `json:"created_at"`
-	ExpiresAt  time.Time  `json:"expires_at"`
-	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	TokenHash  []byte         `json:"-"`
+	UserID     int64          `json:"user_id"`
+	TenantID   int64          `json:"tenant_id"`
+	Role       MembershipRole `json:"role"`
+	ActorType  ActorType      `json:"actor_type"`
+	CreatedAt  time.Time      `json:"created_at"`
+	ExpiresAt  time.Time      `json:"expires_at"`
+	LastSeenAt *time.Time     `json:"last_seen_at,omitempty"`
 }

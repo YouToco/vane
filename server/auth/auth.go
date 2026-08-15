@@ -28,8 +28,10 @@ import (
 // 刻意不含任何认证机制的痕迹（无 token、无 session、无 open_id）：这正是 I-A4
 // 要保护的边界——上层拿到 Principal 就够了，不需要知道它是怎么来的。
 type Principal struct {
-	TenantID types.TenantID
-	UserID   int64
+	TenantID  types.TenantID
+	UserID    int64
+	Role      types.MembershipRole
+	ActorType types.ActorType
 }
 
 // PrincipalResolver 解析当前请求的 principal。api / a2a / gate 依赖本接口而非具体实现。
@@ -129,7 +131,10 @@ func (r *ownerResolver) FromContext(ctx context.Context) (Principal, error) {
 		return Principal{}, types.NewAppError(types.CodeConflict,
 			"owner 尚未归属任何租户", nil)
 	case 1:
-		return Principal{TenantID: types.TenantID(ms[0].TenantID), UserID: u.ID}, nil
+		return Principal{
+			TenantID: types.TenantID(ms[0].TenantID), UserID: u.ID,
+			Role: ms[0].Role, ActorType: types.ActorTypeUser,
+		}, nil
 	default:
 		return Principal{}, types.NewAppError(types.CodeConflict,
 			"owner 属于多个租户，当前版本无法确定应使用哪一个", nil)
