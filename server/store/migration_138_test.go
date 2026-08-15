@@ -27,6 +27,9 @@ func TestMigration138WorkspaceMemoryContract(t *testing.T) {
 		"CREATE TABLE workspace_memory_events",
 		"CREATE TABLE workspace_memory_receipts",
 		"FORCE ROW LEVEL SECURITY", "vane_workspace_memory_editor",
+		"uq_workspace_memory_record_authorization",
+		"uq_workspace_memory_event_authorization",
+		"uq_workspace_memory_event_consumption_binding",
 		"owner_explicit_agent_turn", "refusing downgrade while retained workspace memory exists",
 	} {
 		if !strings.Contains(sqlText, want) {
@@ -123,13 +126,35 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 	if canonicalOwnerRequest != "明确写入团队记忆" {
 		t.Fatalf("authorization persisted non-canonical request %q", canonicalOwnerRequest)
 	}
-	if _, err := database.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations
-		SET owner_request='owner-drift' WHERE tenant_id=$1 AND id=$2`, team, canonicalAuth); err != nil {
+	var alternateSession int64
+	if err := database.QueryRowContext(t.Context(), `INSERT INTO agent_sessions(
+		tenant_id,user_id) VALUES($1,$2) RETURNING id`, team, creator).Scan(&alternateSession); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.PrepareWorkspaceMemoryAuthorization(t.Context(), team, creator,
-		sessions[team<<32|creator], canonicalReplay); types.CodeOf(err) != types.CodeConflict {
-		t.Fatalf("same-id authorization field drift code=%s err=%v", types.CodeOf(err), err)
+	for _, mutation := range []struct {
+		name    string
+		query   string
+		value   any
+		restore any
+	}{
+		{"owner", "owner_request=$3", "owner-drift", canonicalOwnerRequest},
+		{"session", "session_id=$3", alternateSession, sessions[team<<32|creator]},
+		{"trace", "trace_id=$3", uuid.NewString(), canonicalReplay.Evidence.SourceID},
+		{"authorization digest", "authorization_digest=$3", strings.Repeat("0", 64),
+			canonicalReplay.Evidence.AuthorizationDigest},
+	} {
+		if _, err := database.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations SET `+
+			mutation.query+` WHERE tenant_id=$1 AND id=$2`, team, canonicalAuth, mutation.value); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.PrepareWorkspaceMemoryAuthorization(t.Context(), team, creator,
+			sessions[team<<32|creator], canonicalReplay); types.CodeOf(err) != types.CodeConflict {
+			t.Fatalf("same-id %s drift code=%s err=%v", mutation.name, types.CodeOf(err), err)
+		}
+		if _, err := database.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations SET `+
+			mutation.query+` WHERE tenant_id=$1 AND id=$2`, team, canonicalAuth, mutation.restore); err != nil {
+			t.Fatal(err)
+		}
 	}
 	teamPersonalAction := migration138Action(
 		types.MemoryActionRemember, 0, "must-not-enter-personal-ledger")
@@ -158,6 +183,80 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		sessions[team<<32|creator], strings.Repeat("2", 64), remember)
 	if remembered.Memory.CreatorUserID != creator {
 		t.Fatalf("creator=%d want=%d", remembered.Memory.CreatorUserID, creator)
+	}
+	remember.Evidence.AuthorizationID = remembered.Memory.Evidence.AuthorizationID
+	replayed, err := st.ApplyWorkspaceMemoryAction(t.Context(), team, creator,
+		strings.Repeat("2", 64), remember)
+	if err != nil || replayed.Event.ID != remembered.Event.ID {
+		t.Fatalf("same-key receipt replay result=%+v err=%v", replayed, err)
+	}
+	if _, err := st.ApplyWorkspaceMemoryAction(t.Context(), team, creator,
+		strings.Repeat("c", 64), remember); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("second authorization consumption code=%s err=%v", types.CodeOf(err), err)
+	}
+	// Defense-in-depth exact-once constraints are independent mutation guards.
+	// Even the restricted role cannot reuse a consumed remember authorization.
+	duplicateRecordTx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration138EnterWorkspaceRole(t, duplicateRecordTx, team, creator, "member")
+	if _, err := duplicateRecordTx.ExecContext(t.Context(), `INSERT INTO workspace_memory_records(
+		tenant_id,creator_user_id,created_by_user_id,memory_text,evidence_source_type,
+		evidence_source_id,authorization_id,owner_request,authorization_digest,supersedes_memory_id)
+		VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,NULL)`, team, creator,
+		remembered.Memory.Text, remembered.Memory.Evidence.SourceType,
+		remembered.Memory.Evidence.SourceID, remembered.Memory.Evidence.AuthorizationID,
+		remembered.Memory.Evidence.OwnerRequest,
+		remembered.Memory.Evidence.AuthorizationDigest); err == nil {
+		t.Fatal("record exact-once constraint accepted consumed authorization")
+	}
+	if err := duplicateRecordTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drop only the record guard inside a rollback-only owner transaction to
+	// prove the event guard independently rejects the same authorization.
+	duplicateEventTx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := duplicateEventTx.ExecContext(t.Context(), `ALTER TABLE workspace_memory_records
+		DROP CONSTRAINT uq_workspace_memory_record_authorization`); err != nil {
+		t.Fatal(err)
+	}
+	migration138EnterWorkspaceRole(t, duplicateEventTx, team, creator, "member")
+	var duplicateRecordID int64
+	if err := duplicateEventTx.QueryRowContext(t.Context(), `INSERT INTO workspace_memory_records(
+		tenant_id,creator_user_id,created_by_user_id,memory_text,evidence_source_type,
+		evidence_source_id,authorization_id,owner_request,authorization_digest,supersedes_memory_id)
+		VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,NULL) RETURNING id`, team, creator,
+		remembered.Memory.Text, remembered.Memory.Evidence.SourceType,
+		remembered.Memory.Evidence.SourceID, remembered.Memory.Evidence.AuthorizationID,
+		remembered.Memory.Evidence.OwnerRequest,
+		remembered.Memory.Evidence.AuthorizationDigest).Scan(&duplicateRecordID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := duplicateEventTx.ExecContext(t.Context(), `INSERT INTO workspace_memory_events(
+		tenant_id,actor_user_id,actor_role,event_kind,target_memory_id,result_memory_id,
+		evidence_source_type,evidence_source_id,authorization_id,owner_request,authorization_digest)
+		VALUES($1,$2,'member','remember',NULL,$3,$4,$5,$6,$7,$8)`, team, creator,
+		duplicateRecordID, remembered.Memory.Evidence.SourceType,
+		remembered.Memory.Evidence.SourceID, remembered.Memory.Evidence.AuthorizationID,
+		remembered.Memory.Evidence.OwnerRequest,
+		remembered.Memory.Evidence.AuthorizationDigest); err == nil {
+		t.Fatal("event exact-once constraint accepted consumed authorization")
+	}
+	if err := duplicateEventTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"source", "owner", "digest"} {
+		migration138AssertRecordFieldMutationRejected(t, database, team, creator,
+			remembered, field)
+	}
+	for _, field := range []string{"source", "owner", "digest"} {
+		migration138AssertEventFieldMutationRejected(t, database, team, creator,
+			remembered, field)
 	}
 	recall, err := st.RecallWorkspaceMemories(t.Context(), team, member,
 		types.MemoryRecallQuery{Query: "team shared orbit", Limit: 8})
@@ -224,6 +323,32 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 	driftBase := migration138Apply(t, st, team, creator,
 		sessions[team<<32|creator], strings.Repeat("7", 64),
 		migration138Action(types.MemoryActionRemember, 0, "role-drift-boundary"))
+	swapTx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration138EnterWorkspaceRole(t, swapTx, team, creator, "member")
+	if _, err := swapTx.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations
+		SET consumed_event_id=NULL WHERE tenant_id=$1 AND actor_user_id=$2
+		AND id IN($3::uuid,$4::uuid)`, team, creator,
+		remembered.Memory.Evidence.AuthorizationID,
+		driftBase.Memory.Evidence.AuthorizationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := swapTx.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations
+		SET consumed_event_id=CASE id WHEN $3::uuid THEN $4::bigint ELSE $5::bigint END
+		WHERE tenant_id=$1 AND actor_user_id=$2 AND id IN($3::uuid,$6::uuid)`,
+		team, creator, remembered.Memory.Evidence.AuthorizationID, driftBase.Event.ID,
+		remembered.Event.ID, driftBase.Memory.Evidence.AuthorizationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := swapTx.ExecContext(t.Context(),
+		`SET CONSTRAINTS fk_workspace_memory_authorization_consumed IMMEDIATE`); err == nil {
+		t.Fatal("consumed event authorization binding accepted swapped events")
+	}
+	if err := swapTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
 	drift := migration138Action(types.MemoryActionCorrect, driftBase.Memory.ID,
 		"role-drift-must-not-apply")
 	driftAuth, err := st.PrepareWorkspaceMemoryAuthorization(t.Context(), team,
@@ -232,6 +357,12 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	drift.Evidence.AuthorizationID = driftAuth
+	for _, field := range []string{"action", "target"} {
+		migration138AssertCorrectRecordBindingRejected(t, database, team, creator,
+			driftBase, remembered, drift, field)
+		migration138AssertCorrectEventBindingRejected(t, database, team, creator,
+			driftBase, remembered, drift, field)
+	}
 	if _, err := st.ApplyWorkspaceMemoryAction(t.Context(), team, member,
 		strings.Repeat("8", 64), drift); types.CodeOf(err) != types.CodeConflict {
 		t.Fatalf("cross-actor authorization replay code=%s err=%v", types.CodeOf(err), err)
@@ -290,8 +421,9 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 	if _, err := mutationTx.ExecContext(t.Context(), `INSERT INTO workspace_memory_records(
 		tenant_id,creator_user_id,created_by_user_id,memory_text,evidence_source_type,
 		evidence_source_id,authorization_id,owner_request,authorization_digest,supersedes_memory_id)
-		VALUES($1,$2,$2,'must-reject','owner_explicit_agent_turn',$3,$4,
-		'explicit mutation',repeat('a',64),NULL)`, team, creator, uuid.NewString(), driftAuth); err == nil {
+		VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,NULL)`, team, creator, drift.Text,
+		drift.Evidence.SourceType, drift.Evidence.SourceID, driftAuth,
+		drift.Evidence.OwnerRequest, drift.Evidence.AuthorizationDigest); err == nil {
 		t.Fatal("correct authorization entered remember-shaped record branch")
 	}
 	if err := mutationTx.Rollback(); err != nil {
@@ -588,6 +720,212 @@ func migration138ApplicationURL(t *testing.T, databaseURL, application string) s
 	query.Set("application_name", application)
 	parsed.RawQuery = query.Encode()
 	return parsed.String()
+}
+
+func migration138EnterWorkspaceRole(
+	t *testing.T, tx *sql.Tx, tenantID, userID int64, role string,
+) {
+	t.Helper()
+	if _, err := tx.ExecContext(t.Context(), `SELECT
+		set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true),
+		set_config('app.membership_role',$3,true),set_config('app.workspace_kind','team',true)`,
+		fmt.Sprint(tenantID), fmt.Sprint(userID), role); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), `SET LOCAL ROLE vane_workspace_memory_editor`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func migration138AssertRecordFieldMutationRejected(
+	t *testing.T, database *sql.DB, tenantID, actorID int64,
+	remembered *types.MemoryActionResult, field string,
+) {
+	t.Helper()
+	tx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(t.Context(), `ALTER TABLE workspace_memory_records
+		DROP CONSTRAINT uq_workspace_memory_record_authorization`); err != nil {
+		t.Fatal(err)
+	}
+	migration138EnterWorkspaceRole(t, tx, tenantID, actorID, "member")
+	sourceID, ownerRequest := remembered.Memory.Evidence.SourceID,
+		remembered.Memory.Evidence.OwnerRequest
+	authorizationDigest := remembered.Memory.Evidence.AuthorizationDigest
+	var supersedes any
+	switch field {
+	case "source":
+		sourceID = uuid.NewString()
+	case "owner":
+		ownerRequest += " drift"
+	case "digest":
+		authorizationDigest = strings.Repeat("0", 64)
+	default:
+		t.Fatalf("unknown record mutation %s", field)
+	}
+	if _, err := tx.ExecContext(t.Context(), `INSERT INTO workspace_memory_records(
+		tenant_id,creator_user_id,created_by_user_id,memory_text,evidence_source_type,
+		evidence_source_id,authorization_id,owner_request,authorization_digest,supersedes_memory_id)
+		VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,$9)`, tenantID, actorID,
+		remembered.Memory.Text, remembered.Memory.Evidence.SourceType, sourceID,
+		remembered.Memory.Evidence.AuthorizationID, ownerRequest, authorizationDigest,
+		supersedes); err == nil {
+		t.Fatalf("record RLS accepted single-field %s mutation", field)
+	}
+}
+
+func migration138AssertEventFieldMutationRejected(
+	t *testing.T, database *sql.DB, tenantID, actorID int64,
+	remembered *types.MemoryActionResult, field string,
+) {
+	t.Helper()
+	tx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		`ALTER TABLE workspace_memory_authorizations
+		 DROP CONSTRAINT fk_workspace_memory_authorization_consumed`,
+		`ALTER TABLE workspace_memory_records
+		 DROP CONSTRAINT uq_workspace_memory_record_authorization`,
+		`ALTER TABLE workspace_memory_events
+		 DROP CONSTRAINT uq_workspace_memory_event_authorization`,
+		`ALTER TABLE workspace_memory_events
+		 DROP CONSTRAINT uq_workspace_memory_event_consumption_binding`,
+	} {
+		if _, err := tx.ExecContext(t.Context(), statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	migration138EnterWorkspaceRole(t, tx, tenantID, actorID, "member")
+	var resultID int64
+	if err := tx.QueryRowContext(t.Context(), `INSERT INTO workspace_memory_records(
+		tenant_id,creator_user_id,created_by_user_id,memory_text,evidence_source_type,
+		evidence_source_id,authorization_id,owner_request,authorization_digest,supersedes_memory_id)
+		VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,NULL) RETURNING id`, tenantID, actorID,
+		remembered.Memory.Text, remembered.Memory.Evidence.SourceType,
+		remembered.Memory.Evidence.SourceID, remembered.Memory.Evidence.AuthorizationID,
+		remembered.Memory.Evidence.OwnerRequest,
+		remembered.Memory.Evidence.AuthorizationDigest).Scan(&resultID); err != nil {
+		t.Fatal(err)
+	}
+	action := types.MemoryActionRemember
+	var target any
+	sourceID, ownerRequest := remembered.Memory.Evidence.SourceID,
+		remembered.Memory.Evidence.OwnerRequest
+	authorizationDigest := remembered.Memory.Evidence.AuthorizationDigest
+	switch field {
+	case "source":
+		sourceID = uuid.NewString()
+	case "owner":
+		ownerRequest += " drift"
+	case "digest":
+		authorizationDigest = strings.Repeat("0", 64)
+	default:
+		t.Fatalf("unknown event mutation %s", field)
+	}
+	if _, err := tx.ExecContext(t.Context(), `INSERT INTO workspace_memory_events(
+		tenant_id,actor_user_id,actor_role,event_kind,target_memory_id,result_memory_id,
+		evidence_source_type,evidence_source_id,authorization_id,owner_request,authorization_digest)
+		VALUES($1,$2,'member',$3,$4,$5,$6,$7,$8,$9,$10)`, tenantID, actorID,
+		action, target, resultID, remembered.Memory.Evidence.SourceType, sourceID,
+		remembered.Memory.Evidence.AuthorizationID, ownerRequest, authorizationDigest); err == nil {
+		t.Fatalf("event RLS accepted single-field %s mutation", field)
+	}
+}
+
+func migration138AssertCorrectRecordBindingRejected(
+	t *testing.T, database *sql.DB, tenantID, actorID int64,
+	target, alternate *types.MemoryActionResult, action types.MemoryAction, field string,
+) {
+	t.Helper()
+	tx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	switch field {
+	case "action":
+		if _, err := tx.ExecContext(t.Context(), `ALTER TABLE workspace_memory_authorizations
+			DROP CONSTRAINT ck_workspace_memory_authorization_action_shape`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations
+			SET action_kind='remember' WHERE tenant_id=$1 AND id=$2`, tenantID,
+			action.Evidence.AuthorizationID); err != nil {
+			t.Fatal(err)
+		}
+	case "target":
+		if _, err := tx.ExecContext(t.Context(), `UPDATE workspace_memory_authorizations
+			SET target_memory_id=$3,target_creator_user_id=$2
+			WHERE tenant_id=$1 AND id=$4`, tenantID, actorID, alternate.Memory.ID,
+			action.Evidence.AuthorizationID); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unknown correct record binding %s", field)
+	}
+	migration138EnterWorkspaceRole(t, tx, tenantID, actorID, "member")
+	if _, err := tx.ExecContext(t.Context(), `INSERT INTO workspace_memory_records(
+		tenant_id,creator_user_id,created_by_user_id,memory_text,evidence_source_type,
+		evidence_source_id,authorization_id,owner_request,authorization_digest,supersedes_memory_id)
+		VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,$9)`, tenantID, actorID, action.Text,
+		action.Evidence.SourceType, action.Evidence.SourceID, action.Evidence.AuthorizationID,
+		action.Evidence.OwnerRequest, action.Evidence.AuthorizationDigest, target.Memory.ID); err == nil {
+		t.Fatalf("record RLS accepted isolated correct %s mutation", field)
+	}
+}
+
+func migration138AssertCorrectEventBindingRejected(
+	t *testing.T, database *sql.DB, tenantID, actorID int64,
+	target, alternate *types.MemoryActionResult, action types.MemoryAction, field string,
+) {
+	t.Helper()
+	tx, err := database.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var supersedes any
+	eventKind := types.MemoryActionCorrect
+	eventTarget := target.Memory.ID
+	switch field {
+	case "action":
+		if _, err := tx.ExecContext(t.Context(), `ALTER TABLE workspace_memory_events
+			DROP CONSTRAINT ck_workspace_memory_event_shape`); err != nil {
+			t.Fatal(err)
+		}
+		eventKind = types.MemoryActionRemember
+	case "target":
+		supersedes = alternate.Memory.ID
+		eventTarget = alternate.Memory.ID
+	default:
+		t.Fatalf("unknown correct event binding %s", field)
+	}
+	var resultID int64
+	if err := tx.QueryRowContext(t.Context(), `INSERT INTO workspace_memory_records(
+		tenant_id,creator_user_id,created_by_user_id,memory_text,evidence_source_type,
+		evidence_source_id,authorization_id,owner_request,authorization_digest,supersedes_memory_id)
+		VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, tenantID, actorID,
+		action.Text, action.Evidence.SourceType, action.Evidence.SourceID,
+		action.Evidence.AuthorizationID, action.Evidence.OwnerRequest,
+		action.Evidence.AuthorizationDigest, supersedes).Scan(&resultID); err != nil {
+		t.Fatal(err)
+	}
+	migration138EnterWorkspaceRole(t, tx, tenantID, actorID, "member")
+	if _, err := tx.ExecContext(t.Context(), `INSERT INTO workspace_memory_events(
+		tenant_id,actor_user_id,actor_role,event_kind,target_memory_id,result_memory_id,
+		evidence_source_type,evidence_source_id,authorization_id,owner_request,authorization_digest)
+		VALUES($1,$2,'member',$3,$4,$5,$6,$7,$8,$9,$10)`, tenantID, actorID,
+		eventKind, eventTarget, resultID, action.Evidence.SourceType,
+		action.Evidence.SourceID, action.Evidence.AuthorizationID,
+		action.Evidence.OwnerRequest, action.Evidence.AuthorizationDigest); err == nil {
+		t.Fatalf("event RLS accepted isolated correct %s mutation", field)
+	}
 }
 
 func migration138AwaitAdvisoryWaiters(
