@@ -132,6 +132,12 @@ var purgeOrder = []purgeStep{
 	{"memory_events", "tenant_id = $1"},
 	{"memory_records", "tenant_id = $1"},
 	{"memory_authorizations", "tenant_id = $1"},
+	// Team memory is a separate immutable ledger so personal v129 receipts keep
+	// their exact wire and user scope. Preserve the same child-first order.
+	{"workspace_memory_receipts", "tenant_id = $1"},
+	{"workspace_memory_events", "tenant_id = $1"},
+	{"workspace_memory_records", "tenant_id = $1"},
+	{"workspace_memory_authorizations", "tenant_id = $1"},
 	// User-configured capabilities are immutable, tenant-scoped artifacts. Their
 	// event and subtype rows reference the shared version/root identities, so
 	// explicit tenant erasure must preserve this child-first order.
@@ -324,43 +330,47 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
 	}
 	var (
-		canonicalBriefStagesAvailable        bool
-		profileEpochsAvailable               bool
-		profileEpochFencesAvailable          bool
-		profileCheckpointsAvailable          bool
-		profileEpochEventsAvailable          bool
-		profileEpochReceiptsAvailable        bool
-		profileActivitiesAvailable           bool
-		executiveReceiptsAvailable           bool
-		executiveArtifactsAvailable          bool
-		reportSettingsAvailable              bool
-		periodicIntentsAvailable             bool
-		periodicReceiptsAvailable            bool
-		periodicReportsAvailable             bool
-		periodicDeliveriesAvailable          bool
-		researchBriefsAvailable              bool
-		researchGroundingAvailable           bool
-		researchGroundingCorrectionAvailable bool
-		researchPlannerSearchAvailable       bool
-		researchEvidenceAvailable            bool
-		researchLLMSettlementsAvailable      bool
-		researchLLMReservationsAvailable     bool
-		researchSpendSettlementsAvailable    bool
-		researchSpendReservationsAvailable   bool
-		researchRunCapabilitiesAvailable     bool
-		researchBriefDeliveriesAvailable     bool
-		researchV3AuthoritiesAvailable       bool
-		researchV3CutoversAvailable          bool
-		researchV3PrepareHeadsAvailable      bool
-		researchV3PrepareOpsAvailable        bool
-		scheduleCommandCursorAvailable       bool
-		memoryAuthorizationsAvailable        bool
-		memoryRecordsAvailable               bool
-		memoryEventsAvailable                bool
-		memoryReceiptsAvailable              bool
-		taskAccessAuditAvailable             bool
-		accountSecurityTokensAvailable       bool
-		accountSecurityAuditAvailable        bool
+		canonicalBriefStagesAvailable          bool
+		profileEpochsAvailable                 bool
+		profileEpochFencesAvailable            bool
+		profileCheckpointsAvailable            bool
+		profileEpochEventsAvailable            bool
+		profileEpochReceiptsAvailable          bool
+		profileActivitiesAvailable             bool
+		executiveReceiptsAvailable             bool
+		executiveArtifactsAvailable            bool
+		reportSettingsAvailable                bool
+		periodicIntentsAvailable               bool
+		periodicReceiptsAvailable              bool
+		periodicReportsAvailable               bool
+		periodicDeliveriesAvailable            bool
+		researchBriefsAvailable                bool
+		researchGroundingAvailable             bool
+		researchGroundingCorrectionAvailable   bool
+		researchPlannerSearchAvailable         bool
+		researchEvidenceAvailable              bool
+		researchLLMSettlementsAvailable        bool
+		researchLLMReservationsAvailable       bool
+		researchSpendSettlementsAvailable      bool
+		researchSpendReservationsAvailable     bool
+		researchRunCapabilitiesAvailable       bool
+		researchBriefDeliveriesAvailable       bool
+		researchV3AuthoritiesAvailable         bool
+		researchV3CutoversAvailable            bool
+		researchV3PrepareHeadsAvailable        bool
+		researchV3PrepareOpsAvailable          bool
+		scheduleCommandCursorAvailable         bool
+		memoryAuthorizationsAvailable          bool
+		memoryRecordsAvailable                 bool
+		memoryEventsAvailable                  bool
+		memoryReceiptsAvailable                bool
+		taskAccessAuditAvailable               bool
+		accountSecurityTokensAvailable         bool
+		accountSecurityAuditAvailable          bool
+		workspaceMemoryAuthorizationsAvailable bool
+		workspaceMemoryRecordsAvailable        bool
+		workspaceMemoryEventsAvailable         bool
+		workspaceMemoryReceiptsAvailable       bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -399,7 +409,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.memory_receipts') IS NOT NULL,
 		        to_regclass('public.task_access_audit_events') IS NOT NULL,
 		        to_regclass('public.account_security_tokens') IS NOT NULL,
-		        to_regclass('public.account_security_audit_events') IS NOT NULL`,
+		        to_regclass('public.account_security_audit_events') IS NOT NULL,
+		        to_regclass('public.workspace_memory_authorizations') IS NOT NULL,
+		        to_regclass('public.workspace_memory_records') IS NOT NULL,
+		        to_regclass('public.workspace_memory_events') IS NOT NULL,
+		        to_regclass('public.workspace_memory_receipts') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -438,6 +452,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&taskAccessAuditAvailable,
 		&accountSecurityTokensAvailable,
 		&accountSecurityAuditAvailable,
+		&workspaceMemoryAuthorizationsAvailable,
+		&workspaceMemoryRecordsAvailable,
+		&workspaceMemoryEventsAvailable,
+		&workspaceMemoryReceiptsAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -480,6 +498,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"task_access_audit_events":                  taskAccessAuditAvailable,
 		"account_security_tokens":                   accountSecurityTokensAvailable,
 		"account_security_audit_events":             accountSecurityAuditAvailable,
+		"workspace_memory_authorizations":           workspaceMemoryAuthorizationsAvailable,
+		"workspace_memory_records":                  workspaceMemoryRecordsAvailable,
+		"workspace_memory_events":                   workspaceMemoryEventsAvailable,
+		"workspace_memory_receipts":                 workspaceMemoryReceiptsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
