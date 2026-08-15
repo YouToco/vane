@@ -32,6 +32,7 @@ CREATE TABLE workspace_memory_authorizations (
     CHECK (actor_role IN ('owner','admin','member')),
     CHECK (workspace_kind='team'),
     CHECK (action_kind IN ('remember','correct','forget')),
+    CONSTRAINT ck_workspace_memory_authorization_action_shape
     CHECK ((action_kind='remember' AND target_memory_id IS NULL
               AND target_creator_user_id IS NULL) OR
            (action_kind IN ('correct','forget') AND target_memory_id IS NOT NULL
@@ -54,6 +55,8 @@ CREATE TABLE workspace_memory_records (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (tenant_id,id),
     UNIQUE (tenant_id,id,creator_user_id),
+    CONSTRAINT uq_workspace_memory_record_authorization
+        UNIQUE (tenant_id,authorization_id),
     FOREIGN KEY (tenant_id,created_by_user_id,authorization_id)
         REFERENCES workspace_memory_authorizations(tenant_id,actor_user_id,id),
     FOREIGN KEY (tenant_id,supersedes_memory_id)
@@ -88,6 +91,10 @@ CREATE TABLE workspace_memory_events (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (tenant_id,id),
     UNIQUE (tenant_id,actor_user_id,id),
+    CONSTRAINT uq_workspace_memory_event_authorization
+        UNIQUE (tenant_id,authorization_id),
+    CONSTRAINT uq_workspace_memory_event_consumption_binding
+        UNIQUE (tenant_id,actor_user_id,authorization_id,id),
     FOREIGN KEY (tenant_id,actor_user_id,authorization_id)
         REFERENCES workspace_memory_authorizations(tenant_id,actor_user_id,id),
     FOREIGN KEY (tenant_id,target_memory_id)
@@ -95,7 +102,7 @@ CREATE TABLE workspace_memory_events (
     FOREIGN KEY (tenant_id,result_memory_id)
         REFERENCES workspace_memory_records(tenant_id,id),
     CHECK (event_kind IN ('remember','correct','forget')),
-    CHECK (
+    CONSTRAINT ck_workspace_memory_event_shape CHECK (
       (event_kind='remember' AND target_memory_id IS NULL AND result_memory_id IS NOT NULL) OR
       (event_kind='correct' AND target_memory_id IS NOT NULL AND result_memory_id IS NOT NULL) OR
       (event_kind='forget' AND target_memory_id IS NOT NULL AND result_memory_id IS NULL)
@@ -116,8 +123,8 @@ CREATE INDEX idx_workspace_memory_events_scope
 
 ALTER TABLE workspace_memory_authorizations
     ADD CONSTRAINT fk_workspace_memory_authorization_consumed
-    FOREIGN KEY (tenant_id,actor_user_id,consumed_event_id)
-    REFERENCES workspace_memory_events(tenant_id,actor_user_id,id)
+    FOREIGN KEY (tenant_id,actor_user_id,id,consumed_event_id)
+    REFERENCES workspace_memory_events(tenant_id,actor_user_id,authorization_id,id)
     DEFERRABLE INITIALLY DEFERRED;
 CREATE UNIQUE INDEX uq_workspace_memory_authorization_consumed
     ON workspace_memory_authorizations(tenant_id,consumed_event_id)
