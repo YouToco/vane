@@ -360,5 +360,8 @@ func (s *server) requireSession(next http.Handler) http.Handler {
 // 而那两个需要会话。
 func isPublicAuthPath(p string) bool {
 	return p == "/api/auth/login" || p == "/api/auth/register" ||
-		p == "/api/auth/workspace-invites/register"
+		p == "/api/auth/workspace-invites/register" ||
+		p == "/api/auth/email-verification/verify" ||
+		p == "/api/auth/password-reset/request" ||
+		p == "/api/auth/password-reset/complete"
 }
