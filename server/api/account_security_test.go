@@ -140,6 +140,9 @@ func TestReauthProofIsBoundToCurrentSessionForLogoutAll(t *testing.T) {
 	if reauth.Code != http.StatusOK {
 		t.Fatalf("reauth status=%d body=%s", reauth.Code, reauth.Body.String())
 	}
+	if reauth.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("reauth proof response is cacheable: %v", reauth.Header())
+	}
 	var body struct {
 		Proof string `json:"proof"`
 	}

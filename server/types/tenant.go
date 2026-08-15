@@ -50,6 +50,10 @@ const (
 	ActorTypeServiceAccount ActorType = "service_account"
 )
 
+func (a ActorType) Valid() bool {
+	return a == ActorTypeUser || a == ActorTypeServiceAccount
+}
+
 // Workspace is the product projection of a tenant together with the caller's
 // exact membership. It deliberately does not infer membership from user ID.
 type Workspace struct {

@@ -69,6 +69,10 @@ type purgeStep struct {
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
 var purgeOrder = []purgeStep{
+	// Scoped A2A tokens retain only hashes and append-only lifecycle evidence.
+	// Explicit tenant erasure removes the event child before its token parent.
+	{"a2a_access_token_events", "tenant_id = $1"},
+	{"a2a_access_tokens", "tenant_id = $1"},
 	// Account security audit rows retain the one-time token they describe;
 	// explicit tenant erasure removes the audit child before the token ledger.
 	{"account_security_audit_events", "tenant_id = $1"},
@@ -371,6 +375,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		workspaceMemoryRecordsAvailable        bool
 		workspaceMemoryEventsAvailable         bool
 		workspaceMemoryReceiptsAvailable       bool
+		a2aAccessTokensAvailable               bool
+		a2aAccessTokenEventsAvailable          bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -413,7 +419,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.workspace_memory_authorizations') IS NOT NULL,
 		        to_regclass('public.workspace_memory_records') IS NOT NULL,
 		        to_regclass('public.workspace_memory_events') IS NOT NULL,
-		        to_regclass('public.workspace_memory_receipts') IS NOT NULL`,
+		        to_regclass('public.workspace_memory_receipts') IS NOT NULL,
+		        to_regclass('public.a2a_access_tokens') IS NOT NULL,
+		        to_regclass('public.a2a_access_token_events') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -456,6 +464,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&workspaceMemoryRecordsAvailable,
 		&workspaceMemoryEventsAvailable,
 		&workspaceMemoryReceiptsAvailable,
+		&a2aAccessTokensAvailable,
+		&a2aAccessTokenEventsAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -502,6 +512,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"workspace_memory_records":                  workspaceMemoryRecordsAvailable,
 		"workspace_memory_events":                   workspaceMemoryEventsAvailable,
 		"workspace_memory_receipts":                 workspaceMemoryReceiptsAvailable,
+		"a2a_access_tokens":                         a2aAccessTokensAvailable,
+		"a2a_access_token_events":                   a2aAccessTokenEventsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
@@ -516,6 +528,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	if _, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "锁定租户清理准入根", err)
+	}
+	if a2aAccessTokensAvailable || a2aAccessTokenEventsAvailable {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(
+			hashtextextended('vane/a2a-schema/v139',1447120453))`); err != nil {
+			return nil, types.NewAppError(
+				types.CodeDatabase, "锁定 A2A schema 清理准入根", err)
+		}
 	}
 
 	// Across the purge/coordinator/receipt/session conflict set, every path
