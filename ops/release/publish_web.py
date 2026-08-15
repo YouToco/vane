@@ -49,6 +49,7 @@ PUBLICATION_SCHEMA = "vane.web-publication/v2"
 PENDING_SCHEMA = "vane.web-pending/v2"
 OSS_WORKERS = 8
 CDN_WORKERS = 4
+PUBLIC_USER_AGENT = "vane-release-controller/1"
 OWNER_PREVIEW_CSP = (
     "default-src 'self'; connect-src 'none'; img-src 'self' data:; "
     "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
@@ -409,6 +410,7 @@ def verify_finalized_publication(
             cf_origin, revision, expected_marker=expected_marker,
             expected_index_sha256=expected_index_sha256,
             expected_files=cf_verified,
+            index_path="/",
         )
     verify_cloudflare_custom_edge(
         revision, expected_marker, expected_index_sha256, cf_verified,
@@ -440,7 +442,11 @@ def cloudflare_api(account: str, path: str, cloudflare_env: dict[str, str]) -> o
     token = cloudflare_env["CLOUDFLARE_API_TOKEN"]
     request = Request(
         f"https://api.cloudflare.com/client/v4/accounts/{account}/{path.lstrip('/')}",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": PUBLIC_USER_AGENT,
+        },
     )
     with urlopen(request, timeout=20) as response:
         if response.status != 200:
@@ -579,7 +585,9 @@ def read_public_marker(origin: str) -> dict:
     probe = f"{time.time_ns()}"
     request = Request(
         origin.rstrip("/") + f"/{RELEASE_MARKER_PATH}?preflight={probe}",
-        headers={"Cache-Control": "no-cache"},
+        headers={
+            "Cache-Control": "no-cache", "User-Agent": PUBLIC_USER_AGENT,
+        },
     )
     with urlopen(request, timeout=15) as response:
         if response.status != 200:
@@ -657,7 +665,9 @@ def preflight(tool_cache: Path, origin: str) -> dict:
         # fallback at the marker path before its first receipt-backed release.
         request = Request(
             CLOUDFLARE_ORIGIN + "/?preflight=" + str(time.time_ns()),
-            headers={"Cache-Control": "no-cache"},
+            headers={
+                "Cache-Control": "no-cache", "User-Agent": PUBLIC_USER_AGENT,
+            },
         )
         with urlopen(request, timeout=15) as response:
             if response.status != 200 or not response.read(8 * 1024 * 1024 + 1):
@@ -667,10 +677,13 @@ def preflight(tool_cache: Path, origin: str) -> dict:
         (RELEASE_MARKER_PATH, 64 * 1024 + 1),
         ("index.html", 8 * 1024 * 1024 + 1),
     ):
+        public_path = "" if object_name == "index.html" else "/" + object_name
         request = Request(
-            CLOUDFLARE_ORIGIN + "/" + object_name
+            CLOUDFLARE_ORIGIN + public_path
             + "?preflight-custom=" + str(time.time_ns()),
-            headers={"Cache-Control": "no-cache"},
+            headers={
+                "Cache-Control": "no-cache", "User-Agent": PUBLIC_USER_AGENT,
+            },
         )
         with urlopen(request, timeout=15) as response:
             if response.status != 200:
@@ -771,12 +784,15 @@ def verify_public_release(
     expected_marker: bytes,
     expected_index_sha256: str,
     expected_files: dict[str, dict] | None = None,
+    index_path: str = "/index.html",
     attempts: int = 6,
 ) -> dict:
     marker_value = validate_release_marker(expected_marker, revision)
     last_error: Exception | None = None
     if attempts < 1 or attempts > 6:
         raise RuntimeError("public Web verification attempt count is invalid")
+    if index_path not in {"/", "/index.html"}:
+        raise RuntimeError("public Web entrypoint path is invalid")
     for attempt in range(1, attempts + 1):
         try:
             # A revision-only query can remain cached at the CDN after the
@@ -790,16 +806,20 @@ def verify_public_release(
             )
             index_target = (
                 origin.rstrip("/")
-                + f"/index.html?release={revision}&probe={probe}"
+                + f"{index_path}?release={revision}&probe={probe}"
             )
-            request = Request(marker_target, headers={"Cache-Control": "no-cache"})
+            request = Request(marker_target, headers={
+                "Cache-Control": "no-cache", "User-Agent": PUBLIC_USER_AGENT,
+            })
             with urlopen(request, timeout=15) as response:
                 if response.status != 200:
                     raise RuntimeError(f"release marker returned HTTP {response.status}")
                 public_marker = response.read(64 * 1024 + 1)
             if public_marker != expected_marker:
                 raise RuntimeError("public release marker differs from exact artifact bytes")
-            request = Request(index_target, headers={"Cache-Control": "no-cache"})
+            request = Request(index_target, headers={
+                "Cache-Control": "no-cache", "User-Agent": PUBLIC_USER_AGENT,
+            })
             with urlopen(request, timeout=15) as response:
                 if response.status != 200:
                     raise RuntimeError(f"Web entrypoint returned HTTP {response.status}")
@@ -818,7 +838,9 @@ def verify_public_release(
                     + quote(object_name, safe="/-._~")
                     + f"?release={revision}&probe={probe}"
                 )
-                request = Request(target, headers={"Cache-Control": "no-cache"})
+                request = Request(target, headers={
+                    "Cache-Control": "no-cache", "User-Agent": PUBLIC_USER_AGENT,
+                })
                 with urlopen(request, timeout=15) as response:
                     if response.status != 200:
                         raise RuntimeError(
@@ -1379,6 +1401,7 @@ def verify_cloudflare_controls(
             connection.request(
                 "GET", path, headers={
                     "Cache-Control": "no-cache",
+                    "User-Agent": PUBLIC_USER_AGENT,
                     **({"Host": CDN_DOMAIN} if edge_ip is not None else {}),
                 }
             )
@@ -1567,6 +1590,7 @@ def adopt_cloudflare_deployment(
                 expected_marker=expected_marker,
                 expected_index_sha256=expected_index_sha256,
                 expected_files=expected_files,
+                index_path="/",
                 attempts=1,
             )
         custom_smoke = verify_cloudflare_custom_edge(
@@ -1724,7 +1748,10 @@ def aliyun_doh_addresses(cname: str) -> list[str]:
                     "name": cname, "type": record_type,
                 })
                 request = Request(
-                    target, headers={"Accept": "application/dns-json"}
+                    target, headers={
+                        "Accept": "application/dns-json",
+                        "User-Agent": PUBLIC_USER_AGENT,
+                    }
                 )
                 with urlopen(request, timeout=10) as response:
                     if response.status != 200:
@@ -1822,9 +1849,15 @@ def verify_cloudflare_custom_edge(
                 try:
                     connection.request(
                         "GET",
-                        "/" + quote(object_name, safe="/-._~")
+                        (
+                            "/" if object_name == "index.html"
+                            else "/" + quote(object_name, safe="/-._~")
+                        )
                         + f"?release={revision}&cf-edge=1",
-                        headers={"Host": CDN_DOMAIN, "Cache-Control": "no-cache"},
+                        headers={
+                            "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
+                            "User-Agent": PUBLIC_USER_AGENT,
+                        },
                     )
                     response = connection.getresponse()
                     if response.status != 200:
@@ -1846,7 +1879,10 @@ def verify_cloudflare_custom_edge(
                         "GET",
                         "/" + quote(path, safe="/-._~")
                         + f"?release={revision}&cf-edge=1",
-                        headers={"Host": CDN_DOMAIN, "Cache-Control": "no-cache"},
+                        headers={
+                            "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
+                            "User-Agent": PUBLIC_USER_AGENT,
+                        },
                     )
                     response = connection.getresponse()
                     if response.status != 200:
@@ -1902,7 +1938,10 @@ def verify_aliyun_edge(
                 try:
                     connection.request(
                         "GET", path,
-                        headers={"Host": CDN_DOMAIN, "Cache-Control": "no-cache"},
+                        headers={
+                            "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
+                            "User-Agent": PUBLIC_USER_AGENT,
+                        },
                     )
                     response = connection.getresponse()
                     if response.status != 200:
@@ -1930,7 +1969,10 @@ def verify_aliyun_edge(
                         "GET",
                         "/" + quote(object_name, safe="/-._~")
                         + f"?release={revision}&edge=1",
-                        headers={"Host": CDN_DOMAIN, "Cache-Control": "no-cache"},
+                        headers={
+                            "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
+                            "User-Agent": PUBLIC_USER_AGENT,
+                        },
                     )
                     response = connection.getresponse()
                     if response.status != 200:
@@ -1972,7 +2014,10 @@ def verify_aliyun_edge(
                     try:
                         connection.request(
                             "GET", source,
-                            headers={"Host": CDN_DOMAIN, "Cache-Control": "no-cache"},
+                            headers={
+                                "Host": CDN_DOMAIN, "Cache-Control": "no-cache",
+                                "User-Agent": PUBLIC_USER_AGENT,
+                            },
                         )
                         response = connection.getresponse()
                         headers = {
@@ -2027,6 +2072,7 @@ def verify_final_provider_bytes(
             expected_marker=expected_marker,
             expected_index_sha256=expected_index_sha256,
             expected_files=cloudflare_files,
+            index_path="/",
         )
     custom_smoke = verify_cloudflare_custom_edge(
         revision,

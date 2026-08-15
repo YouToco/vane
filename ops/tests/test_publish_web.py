@@ -246,6 +246,7 @@ class PublishWebTest(unittest.TestCase):
             expected_marker: bytes,
             expected_index_sha256: str,
             expected_files: dict[str, dict] | None = None,
+            index_path: str = "/index.html",
             attempts: int = 6,
         ) -> dict:
             provider_root = (
@@ -401,6 +402,9 @@ class PublishWebTest(unittest.TestCase):
         marker = (self.dist / "vane-release.json").read_bytes()
         shutil.copytree(self.dist, self.remote, dirs_exist_ok=True)
         def preflight_response(request, timeout):
+            self.assertEqual(
+                request.get_header("User-agent"), publish_web.PUBLIC_USER_AGENT
+            )
             if "api.cloudflare.com" in request.full_url:
                 result = (
                     [{
@@ -754,7 +758,8 @@ class PublishWebTest(unittest.TestCase):
 
         def verify(
             origin: str, _revision: str, *, expected_marker: bytes,
-            expected_index_sha256: str, expected_files=None, attempts: int = 6,
+            expected_index_sha256: str, expected_files=None,
+            index_path: str = "/index.html", attempts: int = 6,
         ) -> dict:
             provider_root = (
                 self.cloudflare_remote if "pages.dev" in origin else self.remote
@@ -1693,6 +1698,33 @@ class PublishWebTest(unittest.TestCase):
             ],
         )
 
+    def test_cloudflare_public_verification_reads_entrypoint_from_root(self) -> None:
+        marker = (self.dist / "vane-release.json").read_bytes()
+        index = (self.dist / "index.html").read_bytes()
+        requests: list[str] = []
+
+        def open_request(request, timeout):
+            requests.append(request.full_url)
+            return PublicResponse(marker if len(requests) == 1 else index)
+
+        with mock.patch.object(
+            publish_web, "urlopen", side_effect=open_request
+        ), mock.patch.object(publish_web.time, "time_ns", return_value=123456):
+            publish_web.verify_public_release(
+                "https://vane-web.pages.dev",
+                SHA,
+                expected_marker=marker,
+                expected_index_sha256=hashlib.sha256(index).hexdigest(),
+                index_path="/",
+            )
+        self.assertEqual(
+            requests,
+            [
+                f"https://vane-web.pages.dev/vane-release.json?release={SHA}&probe=123456-1",
+                f"https://vane-web.pages.dev/?release={SHA}&probe=123456-1",
+            ],
+        )
+
     def test_public_verification_rejects_same_revision_forged_marker(self) -> None:
         expected = (self.dist / "vane-release.json").read_bytes()
         forged = json.dumps({
@@ -1897,7 +1929,7 @@ class PublishWebTest(unittest.TestCase):
         requests: list[tuple[str, dict]] = []
         bodies = {
             "/vane-release.json": marker,
-            "/index.html": index,
+            "/": index,
             "/assets/app-AbCdEf12.js": asset,
             "/stable-config.json": stable,
         }
