@@ -280,7 +280,9 @@ class PublishWebTest(unittest.TestCase):
             requests.append((request.full_url, timeout))
             return Response(marker if len(requests) == 1 else index)
 
-        with mock.patch.object(publish_web, "urlopen", side_effect=open_request):
+        with mock.patch.object(
+            publish_web, "urlopen", side_effect=open_request
+        ), mock.patch.object(publish_web.time, "time_ns", return_value=123456):
             value = publish_web.verify_public_release(
                 "https://vane.example",
                 SHA,
@@ -291,8 +293,56 @@ class PublishWebTest(unittest.TestCase):
         self.assertEqual(
             [url for url, _ in requests],
             [
-                f"https://vane.example/vane-release.json?release={SHA}",
-                f"https://vane.example/index.html?release={SHA}",
+                f"https://vane.example/vane-release.json?release={SHA}&probe=123456-1",
+                f"https://vane.example/index.html?release={SHA}&probe=123456-1",
+            ],
+        )
+
+    def test_public_verification_changes_probe_after_stale_edge_response(self) -> None:
+        marker = (self.dist / "vane-release.json").read_bytes()
+        index = (self.dist / "index.html").read_bytes()
+        requests: list[str] = []
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, limit: int) -> bytes:
+                return self.payload[:limit]
+
+        def open_request(request, timeout):
+            requests.append(request.full_url)
+            if len(requests) == 1:
+                return Response(b'{"source_revision":"stale"}')
+            return Response(marker if len(requests) == 2 else index)
+
+        with mock.patch.object(
+            publish_web, "urlopen", side_effect=open_request
+        ), mock.patch.object(
+            publish_web.time, "time_ns", side_effect=[111, 222]
+        ), mock.patch.object(publish_web.time, "sleep"):
+            value = publish_web.verify_public_release(
+                "https://vane.example",
+                SHA,
+                expected_marker=marker,
+                expected_index_sha256=hashlib.sha256(index).hexdigest(),
+                attempts=2,
+            )
+        self.assertEqual(value["source_revision"], SHA)
+        self.assertEqual(
+            requests,
+            [
+                f"https://vane.example/vane-release.json?release={SHA}&probe=111-1",
+                f"https://vane.example/vane-release.json?release={SHA}&probe=222-2",
+                f"https://vane.example/index.html?release={SHA}&probe=222-2",
             ],
         )
 
