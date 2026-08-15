@@ -3,6 +3,7 @@
   "manifest_schema": "vane.ops-manifest/v1",
   "manifest_stages": ["plan", "gate", "artifact", "deploy", "verify", "finalize"],
   "production_mutation_authority": "external-root-owned-broker",
+  "web_publication_mutation_platform": "darwin-arm64",
   "broker_endpoint": {
     "host": "188.253.125.238",
     "port": 10058,
@@ -21,6 +22,7 @@
     "shellcheck": "0.11.0",
     "aliyun_cli": "3.4.10",
     "ossutil": "2.3.0",
+    "wrangler": "4.115.0",
     "acme_sh": "3661fd86b6304115e42f43910e6dd452ab9866d6"
   }
 }

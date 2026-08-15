@@ -73,7 +73,10 @@ class RepositoryPolicyTest(unittest.TestCase):
             for path in files
             if path.name == "package-lock.json"
         )
-        self.assertEqual(lockfiles, ["web/package-lock.json"])
+        self.assertEqual(
+            lockfiles,
+            ["ops/release/wrangler/package-lock.json", "web/package-lock.json"],
+        )
 
     def test_no_ambiguous_root_directories(self) -> None:
         for name in ("scripts", "deploy", "common", "utils", "pkg", "packages"):

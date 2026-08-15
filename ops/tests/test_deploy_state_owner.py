@@ -22,13 +22,13 @@ class DeployStateOwnerTests(unittest.TestCase):
         self.assertIn('$state_dir/control-plane.lock', certificate)
         self.assertIn("flock 9", certificate)
 
-    def test_repository_cli_has_no_production_mutation_implementation(self) -> None:
+    def test_repository_cli_delegates_server_and_scopes_local_web_mutation(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
         self.assertIn("root-owned broker", source)
         self.assertIn("broker_required", source)
+        self.assertIn("Web publication and Cloudflare cleanup", source)
+        self.assertIn("command_prune_cloudflare_pages", source)
         for forbidden in (
-            "CLOUDFLARE_API_TOKEN",
-            "ALIYUN_ACCESS_KEY_SECRET",
             "VPS_SSH_KEY",
             "POSTGRES_PASSWORD",
         ):
