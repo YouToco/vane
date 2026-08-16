@@ -69,6 +69,59 @@ func TestReceiptV1StrictCanonicalCodec(t *testing.T) {
 	}
 }
 
+func TestContractCodecRejectsInvalidValuesBeforeEncodingAndAtWireBounds(t *testing.T) {
+	t.Parallel()
+
+	invocation := testInvocationV1(t)
+	invalidInvocation := invocation
+	invalidInvocation.SchemaVersion = "vane.capability-invocation/v0"
+	if _, err := EncodeInvocationV1(invalidInvocation); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("invalid invocation encode error = %v, want ErrInvalidContract", err)
+	}
+	for name, payload := range map[string][]byte{
+		"empty":     nil,
+		"oversized": bytes.Repeat([]byte(" "), maxEncodedContractBytes+1),
+	} {
+		if _, err := DecodeInvocationV1(payload); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("%s invocation decode error = %v, want ErrInvalidContract", name, err)
+		}
+	}
+
+	invalidPolicy := invocation.Policy
+	invalidPolicy.SchemaVersion = "vane.capability-policy/v0"
+	if _, err := EncodePolicyV1(invalidPolicy); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("invalid policy encode error = %v, want ErrInvalidContract", err)
+	}
+	for name, payload := range map[string][]byte{
+		"empty":     nil,
+		"oversized": bytes.Repeat([]byte(" "), maxEncodedContractBytes+1),
+	} {
+		if _, err := DecodePolicyV1(payload); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("%s policy decode error = %v, want ErrInvalidContract", name, err)
+		}
+	}
+
+	receipt, err := NewReceiptV1(
+		invocation, ReceiptStatusSucceeded, 1, "application/json", []byte(`{}`), "", false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidReceipt := receipt
+	invalidReceipt.InvocationDigest = ""
+	if _, err := EncodeReceiptV1(invalidReceipt, invocation); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("invalid receipt encode error = %v, want ErrInvalidContract", err)
+	}
+	for name, payload := range map[string][]byte{
+		"empty":     nil,
+		"oversized": bytes.Repeat([]byte(" "), maxEncodedReceiptBytes+1),
+	} {
+		if _, err := DecodeReceiptV1(payload, invocation); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("%s receipt decode error = %v, want ErrInvalidContract", name, err)
+		}
+	}
+}
+
 func TestReceiptV1CodecExactInlineResultBoundaryRoundTrips(t *testing.T) {
 	t.Parallel()
 
