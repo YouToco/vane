@@ -20,13 +20,14 @@ func TestMigration136TeamTaskIsolationContract(t *testing.T) {
 	}
 	sqlText := string(payload)
 	for _, fragment := range []string{
-		"ADD COLUMN creator_user_id", "ADD COLUMN assignee_user_id",
-		"ADD COLUMN task_visibility", "CREATE TABLE task_access_audit_events",
+		"CREATE TABLE task_workspace_access", "REFERENCES schedules(tenant_id,user_id,id)",
+		"ALTER TABLE task_workspace_access FORCE ROW LEVEL SECURITY",
+		"CREATE TABLE task_access_audit_events",
 		"ALTER TABLE task_access_audit_events FORCE ROW LEVEL SECURITY",
 		"execution_user_id", "task.assignee_changed",
-		"NEW.creator_user_id := NEW.user_id",
-		"REVOKE ALL ON FUNCTION schedule_team_identity_defaults_v1() FROM PUBLIC",
-		"GRANT UPDATE (assignee_user_id,updated_at) ON schedules TO vane_app",
+		"VALUES(NEW.tenant_id,NEW.user_id,NEW.id,NEW.user_id,NEW.user_id",
+		"REVOKE ALL ON FUNCTION schedule_workspace_access_defaults_v1() FROM PUBLIC",
+		"GRANT UPDATE (assignee_user_id,updated_at) ON task_workspace_access TO vane_app",
 	} {
 		if !strings.Contains(sqlText, fragment) {
 			t.Errorf("migration 136 missing %q", fragment)
@@ -34,7 +35,7 @@ func TestMigration136TeamTaskIsolationContract(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		"SET user_id=$3", "UPDATE schedules SET user_id",
-		"ON UPDATE CASCADE", "GRANT UPDATE (user_id",
+		"ALTER TABLE schedules", "ON UPDATE CASCADE", "GRANT UPDATE (user_id",
 	} {
 		if strings.Contains(sqlText, forbidden) {
 			t.Errorf("migration 136 can rewrite frozen execution identity: %q", forbidden)
@@ -83,6 +84,10 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 	if _, err := provider.UpTo(t.Context(), 136); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := database.ExecContext(t.Context(),
+		`SELECT * FROM assert_agent_first_legacy_write_fence_v132()`); err != nil {
+		t.Fatalf("migration 136 drifted the frozen schedules descriptor: %v", err)
+	}
 	var publicCanExecute bool
 	if err := database.QueryRowContext(t.Context(), `
 		SELECT EXISTS (
@@ -91,7 +96,7 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 			       LATERAL aclexplode(
 			         COALESCE(p.proacl,acldefault('f',p.proowner))
 			       ) acl
-			 WHERE p.oid='schedule_team_identity_defaults_v1()'::regprocedure
+			 WHERE p.oid='schedule_workspace_access_defaults_v1()'::regprocedure
 			   AND acl.grantee=0 AND acl.privilege_type='EXECUTE'
 		)`).Scan(&publicCanExecute); err != nil {
 		t.Fatal(err)
@@ -102,8 +107,10 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 	var executionID, creatorID, assigneeID int64
 	var visibility string
 	if err := database.QueryRowContext(t.Context(), `
-		SELECT user_id,creator_user_id,assignee_user_id,task_visibility
-		FROM schedules WHERE id=$1`, legacyTask).Scan(
+		SELECT s.user_id,a.creator_user_id,a.assignee_user_id,a.task_visibility
+		FROM schedules s JOIN task_workspace_access a
+		  ON a.tenant_id=s.tenant_id AND a.execution_user_id=s.user_id
+		 AND a.schedule_id=s.id WHERE s.id=$1`, legacyTask).Scan(
 		&executionID, &creatorID, &assigneeID, &visibility); err != nil {
 		t.Fatal(err)
 	}
@@ -156,8 +163,10 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 		t.Fatalf("transfer rewrote frozen identity: %+v", transferred)
 	}
 	if err := database.QueryRowContext(t.Context(), `
-		SELECT user_id,creator_user_id,assignee_user_id
-		FROM schedules WHERE id=$1`, legacyTask).Scan(
+		SELECT s.user_id,a.creator_user_id,a.assignee_user_id
+		FROM schedules s JOIN task_workspace_access a
+		  ON a.tenant_id=s.tenant_id AND a.execution_user_id=s.user_id
+		 AND a.schedule_id=s.id WHERE s.id=$1`, legacyTask).Scan(
 		&executionID, &creatorID, &assigneeID); err != nil {
 		t.Fatal(err)
 	}

@@ -24,9 +24,9 @@ const (
 )
 
 const teamScheduleColumns = `
-    s.id,s.tenant_id,s.user_id,s.assignee_user_id,s.creator_user_id,
-    s.task_visibility,s.nl_description,s.spec_json,s.scope_json,s.status,
-    s.execution_mode,s.created_at,s.updated_at`
+    s.id,s.tenant_id,s.user_id,a.assignee_user_id,a.creator_user_id,
+    a.task_visibility,s.nl_description,s.spec_json,s.scope_json,s.status,
+    s.execution_mode,s.created_at,GREATEST(s.updated_at,a.updated_at)`
 
 func scanTeamSchedule(row pgx.Row, out *types.Schedule) error {
 	var rawMode string
@@ -125,9 +125,11 @@ func (s *Store) ListSchedulesForMember(
 	}
 	rows, err := tx.Query(ctx, `SELECT `+teamScheduleColumns+`
           FROM schedules s
+          JOIN task_workspace_access a ON a.tenant_id=s.tenant_id
+           AND a.execution_user_id=s.user_id AND a.schedule_id=s.id
          WHERE s.tenant_id=$1
-           AND (s.task_visibility='workspace' OR
-                s.creator_user_id=$2 OR s.assignee_user_id=$2)
+           AND (a.task_visibility='workspace' OR
+                a.creator_user_id=$2 OR a.assignee_user_id=$2)
            AND `+matureSchedulePredicate+`
          ORDER BY s.created_at DESC,s.id`, tenantID, actorUserID)
 	if err != nil {
@@ -173,9 +175,11 @@ func (s *Store) GetScheduleForMember(
 	var out types.Schedule
 	err = scanTeamSchedule(tx.QueryRow(ctx, `SELECT `+teamScheduleColumns+`
           FROM schedules s
+          JOIN task_workspace_access a ON a.tenant_id=s.tenant_id
+           AND a.execution_user_id=s.user_id AND a.schedule_id=s.id
          WHERE s.tenant_id=$1 AND s.id=$2
-           AND (s.task_visibility='workspace' OR
-                s.creator_user_id=$3 OR s.assignee_user_id=$3)
+           AND (a.task_visibility='workspace' OR
+                a.creator_user_id=$3 OR a.assignee_user_id=$3)
            AND `+matureSchedulePredicate,
 		tenantID, taskID, actorUserID), &out)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -214,11 +218,13 @@ func (s *Store) AuthorizeScheduleMutation(
 	var out types.Schedule
 	err = scanTeamSchedule(tx.QueryRow(ctx, `SELECT `+teamScheduleColumns+`
           FROM schedules s
+          JOIN task_workspace_access a ON a.tenant_id=s.tenant_id
+           AND a.execution_user_id=s.user_id AND a.schedule_id=s.id
          WHERE s.tenant_id=$1 AND s.id=$2
-           AND (s.task_visibility='workspace' OR
-                s.creator_user_id=$3 OR s.assignee_user_id=$3)
+           AND (a.task_visibility='workspace' OR
+                a.creator_user_id=$3 OR a.assignee_user_id=$3)
            AND `+matureSchedulePredicate+`
-         FOR UPDATE OF s`, tenantID, taskID, actorUserID), &out)
+         FOR UPDATE OF s,a`, tenantID, taskID, actorUserID), &out)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, types.NewAppError(types.CodeNotFound, "任务不存在或无权访问", err)
 	}
@@ -283,10 +289,12 @@ func (s *Store) TransferScheduleAssignee(
 	var out types.Schedule
 	err = scanTeamSchedule(tx.QueryRow(ctx, `SELECT `+teamScheduleColumns+`
           FROM schedules s
+          JOIN task_workspace_access a ON a.tenant_id=s.tenant_id
+           AND a.execution_user_id=s.user_id AND a.schedule_id=s.id
          WHERE s.tenant_id=$1 AND s.id=$2
-           AND s.task_visibility='workspace'
+           AND a.task_visibility='workspace'
            AND `+matureSchedulePredicate+`
-         FOR UPDATE OF s`, tenantID, taskID), &out)
+         FOR UPDATE OF s,a`, tenantID, taskID), &out)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, types.NewAppError(types.CodeNotFound, "团队任务不存在", err)
 	}
@@ -297,9 +305,10 @@ func (s *Store) TransferScheduleAssignee(
 	if previous == targetUserID {
 		return nil, types.NewAppError(types.CodeConflict, "目标成员已经是任务负责人", nil)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE schedules
+	if err := tx.QueryRow(ctx, `UPDATE task_workspace_access
         SET assignee_user_id=$3,updated_at=clock_timestamp()
-        WHERE tenant_id=$1 AND id=$2`, tenantID, taskID, targetUserID); err != nil {
+        WHERE tenant_id=$1 AND schedule_id=$2
+        RETURNING updated_at`, tenantID, taskID, targetUserID).Scan(&out.UpdatedAt); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "转移任务负责人", err)
 	}
 	if _, err := tx.Exec(ctx, `

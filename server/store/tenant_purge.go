@@ -117,6 +117,7 @@ var purgeOrder = []purgeStep{
 	{"task_creation_operations", "tenant_id = $1"},
 	// Team-task authorization decisions are retained independently from the
 	// mutable schedule row and must be included in exact erasure reporting.
+	{"task_workspace_access", "tenant_id = $1"},
 	{"task_access_audit_events", "tenant_id = $1"},
 	// Agent-first query audits and exact model-visible evidence are children of
 	// the session/tool ledgers. They are retained for normal task/session life
@@ -371,6 +372,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		memoryRecordsAvailable                 bool
 		memoryEventsAvailable                  bool
 		memoryReceiptsAvailable                bool
+		taskWorkspaceAccessAvailable           bool
 		taskAccessAuditAvailable               bool
 		accountSecurityTokensAvailable         bool
 		accountSecurityAuditAvailable          bool
@@ -425,6 +427,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.memory_records') IS NOT NULL,
 		        to_regclass('public.memory_events') IS NOT NULL,
 		        to_regclass('public.memory_receipts') IS NOT NULL,
+		        to_regclass('public.task_workspace_access') IS NOT NULL,
 		        to_regclass('public.task_access_audit_events') IS NOT NULL,
 		        to_regclass('public.account_security_tokens') IS NOT NULL,
 		        to_regclass('public.account_security_audit_events') IS NOT NULL,
@@ -478,6 +481,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&memoryRecordsAvailable,
 		&memoryEventsAvailable,
 		&memoryReceiptsAvailable,
+		&taskWorkspaceAccessAvailable,
 		&taskAccessAuditAvailable,
 		&accountSecurityTokensAvailable,
 		&accountSecurityAuditAvailable,
@@ -535,6 +539,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"memory_records":                            memoryRecordsAvailable,
 		"memory_events":                             memoryEventsAvailable,
 		"memory_receipts":                           memoryReceiptsAvailable,
+		"task_workspace_access":                     taskWorkspaceAccessAvailable,
 		"task_access_audit_events":                  taskAccessAuditAvailable,
 		"account_security_tokens":                   accountSecurityTokensAvailable,
 		"account_security_audit_events":             accountSecurityAuditAvailable,

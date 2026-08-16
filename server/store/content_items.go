@@ -340,12 +340,16 @@ func (s *Store) SearchContentItemsForA2A(
 	                JOIN task_fetch_targets binding
 	                  ON binding.fetch_target_id=appearance.source_id
 	                JOIN schedules task ON task.id=binding.schedule_id
+	                JOIN task_workspace_access access
+	                  ON access.tenant_id=task.tenant_id
+	                 AND access.execution_user_id=task.user_id
+	                 AND access.schedule_id=task.id
 	                JOIN tenants workspace ON workspace.id=task.tenant_id
 	                WHERE appearance.content_item_id=ci.id
 	                  AND task.tenant_id=$2
 	                  AND (
-	                    (workspace.workspace_kind='team' AND task.task_visibility='workspace') OR
-	                    (workspace.workspace_kind='personal' AND task.task_visibility='personal'
+	                    (workspace.workspace_kind='team' AND access.task_visibility='workspace') OR
+	                    (workspace.workspace_kind='personal' AND access.task_visibility='personal'
 	                     AND workspace.personal_owner_user_id=$3)
 	                  )
 	            )`
