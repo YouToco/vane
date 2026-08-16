@@ -43,7 +43,14 @@ func TestDeliveryChannelPreferenceHandlersPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	taskID := fmt.Sprintf("delivery-channel-task-%d", time.Now().UnixNano())
+	if _, err := cleanup.Exec(ctx,
+		`INSERT INTO schedules(id,tenant_id,user_id,nl_description)
+		 VALUES ($1,1,$2,'delivery channel API task')`, taskID, user.ID); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
+		_, _ = cleanup.Exec(t.Context(), `DELETE FROM schedules WHERE id=$1`, taskID)
 		_, _ = cleanup.Exec(t.Context(), `DELETE FROM memberships WHERE tenant_id=1 AND user_id=$1`, user.ID)
 		_, _ = cleanup.Exec(t.Context(), `DELETE FROM users WHERE id=$1`, user.ID)
 		cleanup.Close()
@@ -83,6 +90,34 @@ func TestDeliveryChannelPreferenceHandlersPostgres(t *testing.T) {
 		deliveryPreferenceRequest(http.MethodGet, "", 1, user.ID))
 	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"selection":"both"`) {
 		t.Fatalf("stored GET status=%d body=%s", get.Code, get.Body.String())
+	}
+
+	taskRequest := func(method, body string) *http.Request {
+		req := deliveryPreferenceRequest(method, body, 1, user.ID)
+		req.SetPathValue("id", taskID)
+		return req
+	}
+	taskPatch := httptest.NewRecorder()
+	s.handlePatchTaskDeliveryChannelPreference(taskPatch,
+		taskRequest(http.MethodPatch, `{"selection":"telegram"}`))
+	if taskPatch.Code != http.StatusOK ||
+		!strings.Contains(taskPatch.Body.String(), `"scope":"task"`) {
+		t.Fatalf("task PATCH status=%d body=%s", taskPatch.Code, taskPatch.Body.String())
+	}
+	taskGet := httptest.NewRecorder()
+	s.handleGetTaskDeliveryChannelPreference(taskGet,
+		taskRequest(http.MethodGet, ""))
+	if taskGet.Code != http.StatusOK ||
+		!strings.Contains(taskGet.Body.String(), `"selection":"telegram"`) {
+		t.Fatalf("task GET status=%d body=%s", taskGet.Code, taskGet.Body.String())
+	}
+	taskDelete := httptest.NewRecorder()
+	s.handleDeleteTaskDeliveryChannelPreference(taskDelete,
+		taskRequest(http.MethodDelete, ""))
+	if taskDelete.Code != http.StatusOK ||
+		!strings.Contains(taskDelete.Body.String(), `"selection":"both"`) ||
+		strings.Contains(taskDelete.Body.String(), `"scope":"task"`) {
+		t.Fatalf("task DELETE status=%d body=%s", taskDelete.Code, taskDelete.Body.String())
 	}
 }
 

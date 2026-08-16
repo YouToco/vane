@@ -45,12 +45,12 @@ export default function Admin() {
       <Tabs defaultValue="observability">
         <TabsList className="max-w-full justify-start overflow-x-auto">
           <TabsTrigger value="observability">{A.tabObservability}</TabsTrigger>
+          <TabsTrigger value="llm-credentials">模型与密钥</TabsTrigger>
           <TabsTrigger value="costs">{A.tabCosts}</TabsTrigger>
           <TabsTrigger value="cost-calls">{A.tabCallCosts}</TabsTrigger>
           <TabsTrigger value="pricing">{A.tabPricing}</TabsTrigger>
           <TabsTrigger value="execution-traces">执行轨迹</TabsTrigger>
           <TabsTrigger value="invites">{A.tabInvites}</TabsTrigger>
-          <TabsTrigger value="llm-credentials">LLM 配置</TabsTrigger>
         </TabsList>
         <TabsContent value="observability" className="mt-4 space-y-4">
           {zhOnly}

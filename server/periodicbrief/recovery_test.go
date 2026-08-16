@@ -34,6 +34,30 @@ type periodicRecoveryStoreFake struct {
 	profile      *types.Profile
 }
 
+func (f *periodicRecoveryStoreFake) ResolveDeliveryChannelPreference(
+	context.Context, int64, int64, string,
+) (store.DeliveryChannelPreference, error) {
+	return store.DeliveryChannelPreference{
+		Selection: store.DeliveryChannelFeishu,
+	}, nil
+}
+func (f *periodicRecoveryStoreFake) PrepareArtifactDeliveryPlan(
+	_ context.Context, tenantID, userID int64, taskID, kind, key string,
+	preference store.DeliveryChannelPreference,
+) (store.ArtifactDeliveryPlan, error) {
+	return store.ArtifactDeliveryPlan{
+		ID:       "a67bc53e-e560-597a-9d6f-a5b9fc70b4e1",
+		TenantID: tenantID, UserID: userID, TaskID: taskID,
+		ArtifactKind: kind, ArtifactKey: key,
+		Selection: preference.Selection,
+	}, nil
+}
+func (f *periodicRecoveryStoreFake) PrepareTelegramOutbound(
+	context.Context, int64, int64, int64, string, string, string,
+) (store.ChannelOutboundEffect, error) {
+	return store.ChannelOutboundEffect{}, nil
+}
+
 func (f *periodicRecoveryStoreFake) ListPeriodicSynthesisRecoveryCandidatesV1(
 	context.Context, *store.PeriodicSynthesisRecoveryCursorV1, int,
 ) ([]store.PeriodicSynthesisRecoveryCandidateV1, error) {

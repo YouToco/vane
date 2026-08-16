@@ -201,6 +201,20 @@ type pushEffectTargetProvider interface {
 	PushEffectTarget() (ownerOpenID, ownerChatID, appIdentity string)
 }
 
+type aggregateChannelDeliveryStore interface {
+	ResolveDeliveryChannelPreference(context.Context, int64, int64, string) (storepkg.DeliveryChannelPreference, error)
+	LoadArtifactDeliveryPlan(context.Context, int64, int64, string, string, string) (storepkg.ArtifactDeliveryPlan, error)
+	PrepareArtifactDeliveryPlan(context.Context, int64, int64, string, string, string,
+		storepkg.DeliveryChannelPreference) (storepkg.ArtifactDeliveryPlan, error)
+	PrepareAggregateTelegramOutbound(context.Context, string, int64, int64, string,
+		int64, int, int, []int64, int64, string, string) (storepkg.ChannelOutboundEffect, error)
+	SettleAggregateTelegramOutbound(context.Context, int64, int64, string, string) error
+}
+
+type aggregateTelegramSender interface {
+	SendTextEffect(context.Context, int64, int64, int64, string, string, string) error
+}
+
 // Store 是 Activity 需要的数据访问子集（规格 B3 的相关方法）。
 // 收窄成接口而非直接依赖 *store.Store：便于 Activity 单测注入替身。
 type Store interface {
@@ -570,6 +584,9 @@ type Activities struct {
 		Deliver(context.Context, types.RunIdentity, types.ResearchRunSnapshotRefV3,
 			types.ResearchRunPlanRefV3, ResearchBriefRefV3, string) (ResearchDeliveryReceiptV3, error)
 	}
+	aggregateChannelStore aggregateChannelDeliveryStore
+	aggregateTelegramMu   sync.RWMutex
+	aggregateTelegram     aggregateTelegramSender
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -788,12 +805,27 @@ func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, f
 		evolver: ev, buildNotice: buildNotice,
 		buildAggCard: buildAggCard, aggHeader: aggHeader,
 		snapshotV2ReadAuditTimeout: 2 * time.Second}
+	if channelStore, ok := st.(aggregateChannelDeliveryStore); ok {
+		a.aggregateChannelStore = channelStore
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(a)
 		}
 	}
 	return a
+}
+
+func (a *Activities) SetAggregateTelegramSender(sender aggregateTelegramSender) {
+	a.aggregateTelegramMu.Lock()
+	defer a.aggregateTelegramMu.Unlock()
+	a.aggregateTelegram = sender
+}
+
+func (a *Activities) aggregateTelegramSender() aggregateTelegramSender {
+	a.aggregateTelegramMu.RLock()
+	defer a.aggregateTelegramMu.RUnlock()
+	return a.aggregateTelegram
 }
 
 // ============================================================
@@ -4546,6 +4578,19 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			types.CodeConflict,
 			"canonical push batch differs from prepared batch", nil))
 	}
+	var aggregatePreference storepkg.DeliveryChannelPreference
+	aggregateArtifactKey := ""
+	if compiled && a.aggregateChannelStore != nil {
+		aggregatePreference, err =
+			a.aggregateChannelStore.ResolveDeliveryChannelPreference(
+				ctx, compiledIdentity.TenantID, compiledIdentity.UserID,
+				compiledIdentity.TaskID)
+		if err != nil {
+			return retryableOrNot(err)
+		}
+		aggregateArtifactKey = fmt.Sprintf("%d:%s:%d",
+			in.Run.Snapshot.SnapshotID, compiledIdentity.TemporalRunID, batchID)
+	}
 	effectAuthority := false
 	newEffectSendsEnabled := false
 	if compiled {
@@ -4557,7 +4602,8 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		effectCanaryEnabled := in.CanonicalOutcome != nil ||
 			a.pushEffectStore != nil &&
 				a.pushEffectCanaryTaskID != "" &&
-				a.pushEffectCanaryTaskID == compiledIdentity.TaskID
+				a.pushEffectCanaryTaskID == compiledIdentity.TaskID ||
+			aggregatePreference.Selection.Includes("telegram")
 		desired := types.PushBatchDeliveryAuthorityLegacy
 		if effectCanaryEnabled {
 			desired = types.PushBatchDeliveryAuthorityEffect
@@ -4600,6 +4646,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			ctx, compiledIdentity, in.Run.Snapshot, in.TraceID, batchID))
 	}
 	var partialEffectPlan []*pusheffect.Effect
+	var aggregatePlan *storepkg.ArtifactDeliveryPlan
 	if effectAuthority {
 		effects, loadErr := a.pushEffectStore.ListPushEffectsForBatch(
 			ctx,
@@ -4612,6 +4659,33 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		)
 		if loadErr != nil {
 			return retryableOrNot(loadErr)
+		}
+		if a.aggregateChannelStore != nil && aggregateArtifactKey != "" {
+			frozen, planErr := a.aggregateChannelStore.LoadArtifactDeliveryPlan(
+				ctx, compiledIdentity.TenantID, compiledIdentity.UserID,
+				compiledIdentity.TaskID, storepkg.ArtifactDeliveryAggregateBrief,
+				aggregateArtifactKey)
+			if errors.Is(planErr, types.ErrNotFound) {
+				preference := aggregatePreference
+				if len(effects) > 0 {
+					// Effects created before channel fan-out shipped are
+					// irrevocably Feishu-only. Never reinterpret them using a
+					// user's newer mutable preference.
+					preference = storepkg.DeliveryChannelPreference{
+						Selection: storepkg.DeliveryChannelFeishu,
+					}
+				}
+				frozen, planErr =
+					a.aggregateChannelStore.PrepareArtifactDeliveryPlan(
+						ctx, compiledIdentity.TenantID,
+						compiledIdentity.UserID, compiledIdentity.TaskID,
+						storepkg.ArtifactDeliveryAggregateBrief,
+						aggregateArtifactKey, preference)
+			}
+			if planErr != nil {
+				return retryableOrNot(planErr)
+			}
+			aggregatePlan = &frozen
 		}
 		if len(effects) > 0 {
 			complete, safeToFinish := completePushEffectPlan(effects)
@@ -4656,7 +4730,8 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			))
 		}
 	}
-	if owner == "" {
+	if owner == "" && (aggregatePlan == nil ||
+		aggregatePlan.Selection.Includes("feishu")) {
 		// Compiled receipt-only recovery above must remain possible after the
 		// owner identity disappears: the external card is already sent and this
 		// branch only applies to a new send. Legacy keeps its original pre-batch
@@ -4874,6 +4949,53 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			pending, planningMarker, buildChunk)
 	}
 	if effectAuthority {
+		if aggregatePlan != nil &&
+			aggregatePlan.Selection.Includes("telegram") {
+			if aggregatePlan.TelegramRouteID == nil ||
+				a.aggregateChannelStore == nil {
+				return nonRetryable(types.NewAppError(
+					types.CodeConflict,
+					"Telegram aggregate Brief route is unavailable", nil))
+			}
+			telegramSender := a.aggregateTelegramSender()
+			if telegramSender == nil {
+				return retryableOrNot(types.NewAppError(
+					types.CodeConflict,
+					"Telegram aggregate Brief sender is unavailable", nil))
+			}
+			for chunkIndex, planned := range plannedChunks {
+				deliveryIDs := make([]int64, 0, len(planned.items))
+				for _, item := range planned.items {
+					deliveryIDs = append(deliveryIDs, item.delID)
+				}
+				slices.Sort(deliveryIDs)
+				effectID := aggregateTelegramEffectID(
+					aggregatePlan.ID, chunkIndex)
+				body := renderAggregateTelegramChunk(
+					taskTitle, planned.items, chunkIndex, len(plannedChunks))
+				if _, err := a.aggregateChannelStore.PrepareAggregateTelegramOutbound(
+					ctx, aggregatePlan.ID, compiledIdentity.TenantID,
+					compiledIdentity.UserID, compiledIdentity.TaskID, batchID,
+					chunkIndex, len(plannedChunks), deliveryIDs,
+					*aggregatePlan.TelegramRouteID, effectID, body); err != nil {
+					return retryableOrNot(err)
+				}
+				if err := telegramSender.SendTextEffect(
+					ctx, compiledIdentity.TenantID, compiledIdentity.UserID,
+					*aggregatePlan.TelegramRouteID, effectID,
+					"aggregate_brief", body); err != nil {
+					return retryableOrNot(err)
+				}
+				if err := a.aggregateChannelStore.SettleAggregateTelegramOutbound(
+					ctx, compiledIdentity.TenantID, compiledIdentity.UserID,
+					aggregatePlan.ID, effectID); err != nil {
+					return retryableOrNot(err)
+				}
+			}
+			if !aggregatePlan.Selection.Includes("feishu") {
+				return nil
+			}
+		}
 		targetProvider, ok := a.feishu.(pushEffectTargetProvider)
 		if !ok {
 			return nonRetryable(types.NewAppError(
@@ -5061,6 +5183,38 @@ func pushEffectID(identity types.RunIdentity, chunkIndex int) string {
 		chunkIndex,
 	)
 	return uuid.NewSHA1(pushEffectUUIDNamespace, []byte(name)).String()
+}
+
+func aggregateTelegramEffectID(planID string, chunkIndex int) string {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(fmt.Sprintf(
+		"vane.aggregate-brief-telegram/v1:%s:%d", planID, chunkIndex))).String()
+}
+
+func renderAggregateTelegramChunk(
+	taskTitle string, items []pushPendingItem, chunkIndex, chunkCount int,
+) string {
+	var body strings.Builder
+	body.WriteString(taskTitle)
+	body.WriteString("｜情报简报")
+	if chunkCount > 1 {
+		fmt.Fprintf(&body, "（%d/%d）", chunkIndex+1, chunkCount)
+	}
+	for _, item := range items {
+		body.WriteString("\n\n")
+		if item.input.Title != "" {
+			body.WriteString(item.input.Title)
+		} else {
+			body.WriteString("重要更新")
+		}
+		body.WriteString("\n")
+		body.WriteString(item.input.BodyMD)
+		if item.input.URL != "" &&
+			!strings.Contains(item.input.BodyMD, item.input.URL) {
+			body.WriteString("\n")
+			body.WriteString(item.input.URL)
+		}
+	}
+	return body.String()
 }
 
 func completePushEffectPlan(

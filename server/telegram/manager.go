@@ -92,6 +92,7 @@ type IngressStore interface {
 	InvalidateTelegramDestination(context.Context, string, string, string, string) error
 	PrepareTelegramOutbound(context.Context, int64, int64, int64, string, string, string) (store.ChannelOutboundEffect, error)
 	ClaimTelegramOutbound(context.Context, string) (store.ChannelOutboundEffect, error)
+	ClaimNextTelegramOutbound(context.Context, string) (store.ChannelOutboundEffect, error)
 	CompleteTelegramOutbound(context.Context, store.ChannelOutboundEffect, []string) error
 	MarkTelegramOutboundRejected(context.Context, store.ChannelOutboundEffect, string) error
 	DeferTelegramOutbound(context.Context, store.ChannelOutboundEffect, time.Duration, int) (bool, error)
@@ -885,7 +886,10 @@ func (m *Manager) runWorker() {
 		case <-ticker.C:
 		}
 		for {
-			progress := m.processReadyReply(m.runCtx)
+			progress := m.processReadyOutbound(m.runCtx)
+			if m.processReadyReply(m.runCtx) {
+				progress = true
+			}
 			if m.processOne(m.runCtx) {
 				progress = true
 			}
@@ -894,6 +898,25 @@ func (m *Manager) runWorker() {
 			}
 		}
 	}
+}
+
+func (m *Manager) processReadyOutbound(ctx context.Context) bool {
+	bot, ready := m.botIdentity()
+	if !ready {
+		return false
+	}
+	item, err := m.store.ClaimNextTelegramOutbound(
+		ctx, strconv.FormatInt(bot.ID, 10))
+	if errors.Is(err, types.ErrNotFound) {
+		return false
+	}
+	if err != nil {
+		m.logger.Error("telegram: claim outbound effect failed",
+			"error_code", types.CodeOf(err))
+		return false
+	}
+	m.deliverClaimedOutbound(ctx, item)
+	return true
 }
 
 func (m *Manager) processReadyReply(ctx context.Context) bool {
@@ -1242,6 +1265,12 @@ func (m *Manager) SendTextEffect(
 	if err != nil {
 		return err
 	}
+	return m.deliverClaimedOutbound(ctx, claimed)
+}
+
+func (m *Manager) deliverClaimedOutbound(
+	ctx context.Context, claimed store.ChannelOutboundEffect,
+) error {
 	threadID, _ := strconv.ParseInt(claimed.ProviderThreadID, 10, 64)
 	chunks := SplitMessage(claimed.PayloadText)
 	messageIDs := make([]string, 0, len(chunks))

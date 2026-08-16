@@ -25,6 +25,16 @@ type DeliverySender interface {
 }
 
 type DeliveryStore interface {
+	ResolveDeliveryChannelPreference(
+		context.Context, int64, int64, string,
+	) (store.DeliveryChannelPreference, error)
+	PrepareArtifactDeliveryPlan(
+		context.Context, int64, int64, string, string, string,
+		store.DeliveryChannelPreference,
+	) (store.ArtifactDeliveryPlan, error)
+	PrepareTelegramOutbound(
+		context.Context, int64, int64, int64, string, string, string,
+	) (store.ChannelOutboundEffect, error)
 	GetBriefReportSettingsV1(
 		context.Context, int64, int64, string,
 	) (store.BriefReportSettingsV1, error)
@@ -43,6 +53,12 @@ type DeliveryStore interface {
 	FinalizePeriodicReportDeliveryV1(
 		context.Context, int64, int64, int64,
 		store.PeriodicReportDeliveryStatusV1, string,
+	) error
+}
+
+type TelegramDeliverySender interface {
+	SendTextEffect(
+		context.Context, int64, int64, int64, string, string, string,
 	) error
 }
 
@@ -124,7 +140,7 @@ func (a *Activities) DeliverPeriodicBriefV1(
 ) error {
 	return deliverPeriodicBriefV1(
 		ctx, input.Report, a.deliveryStore, a.sender,
-		a.dashboardOrigin,
+		a.getTelegramSender(), a.dashboardOrigin,
 		input.Report.TaskID != "" &&
 			input.Report.TaskID == a.deliveryTaskID)
 }
@@ -134,6 +150,7 @@ func deliverPeriodicBriefV1(
 	report types.PeriodicBriefReportV1,
 	deliveryStore DeliveryStore,
 	sender DeliverySender,
+	telegramSender TelegramDeliverySender,
 	dashboardOrigin string,
 	channelEnabled bool,
 ) error {
@@ -164,6 +181,30 @@ func deliverPeriodicBriefV1(
 	if err != nil {
 		return err
 	}
+	preference := store.DeliveryChannelPreference{
+		Selection: store.DeliveryChannelFeishu,
+	}
+	var plan store.ArtifactDeliveryPlan
+	if shouldSend {
+		preference, err = deliveryStore.ResolveDeliveryChannelPreference(
+			ctx, report.TenantID, report.UserID, report.TaskID)
+		if err != nil {
+			return err
+		}
+		plan, err = deliveryStore.PrepareArtifactDeliveryPlan(
+			ctx, report.TenantID, report.UserID, report.TaskID,
+			store.ArtifactDeliveryPeriodicReport,
+			fmt.Sprintf("%d:%s", report.ID, report.Digest), preference)
+		if err != nil {
+			return err
+		}
+	}
+	feishuEnabled := shouldSend && plan.Selection.Includes("feishu")
+	telegramEnabled := shouldSend && plan.Selection.Includes("telegram")
+	if telegramEnabled && plan.TelegramRouteID == nil {
+		return types.NewAppError(types.CodeConflict,
+			"Telegram 周期报告目的地未就绪", types.ErrConflict)
+	}
 	card := feishu.BuildPeriodicBriefCardV1(report, webURL)
 	if card == "" {
 		return types.NewAppError(
@@ -176,7 +217,7 @@ func deliverPeriodicBriefV1(
 			report.ID, report.Digest)),
 	).String()
 	appIdentity, targetOpenID := sender.AppIdentity(), sender.OwnerOpenID()
-	if !shouldSend {
+	if !feishuEnabled {
 		if appIdentity == "" {
 			appIdentity = "web-only"
 		}
@@ -187,10 +228,41 @@ func deliverPeriodicBriefV1(
 	prepared, err := deliveryStore.PreparePeriodicReportDeliveryV1(
 		ctx, report, settings.Delivery, []byte(card), providerUUID,
 		appIdentity, targetOpenID,
-		sender.OwnerChatID(), shouldSend)
+		sender.OwnerChatID(), feishuEnabled)
 	if err != nil {
 		return err
 	}
+	var sendErrs []error
+	if err := deliverPreparedPeriodicFeishu(
+		ctx, deliveryStore, sender, report, prepared); err != nil {
+		sendErrs = append(sendErrs, err)
+	}
+	if telegramEnabled {
+		effectID := uuid.NewSHA1(uuid.NameSpaceURL,
+			[]byte("vane.periodic-report-telegram/v1:"+plan.ID)).String()
+		body := renderPeriodicTelegramV1(report, webURL)
+		if _, err := deliveryStore.PrepareTelegramOutbound(
+			ctx, report.TenantID, report.UserID, *plan.TelegramRouteID,
+			effectID, "periodic_report", body); err != nil {
+			sendErrs = append(sendErrs, err)
+		} else if telegramSender != nil {
+			if err := telegramSender.SendTextEffect(
+				ctx, report.TenantID, report.UserID, *plan.TelegramRouteID,
+				effectID, "periodic_report", body); err != nil {
+				sendErrs = append(sendErrs, err)
+			}
+		}
+	}
+	return errors.Join(sendErrs...)
+}
+
+func deliverPreparedPeriodicFeishu(
+	ctx context.Context,
+	deliveryStore DeliveryStore,
+	sender DeliverySender,
+	report types.PeriodicBriefReportV1,
+	prepared store.PeriodicReportDeliveryV1,
+) error {
 	if prepared.Status == store.PeriodicReportDeliverySkipped ||
 		prepared.Status == store.PeriodicReportDeliverySent ||
 		prepared.Status == store.PeriodicReportDeliveryAmbiguous {
@@ -228,4 +300,38 @@ func deliverPeriodicBriefV1(
 	}
 	return types.NewAppError(
 		types.CodePushFailed, "周期报告推送结果不确定", nil)
+}
+
+func renderPeriodicTelegramV1(
+	report types.PeriodicBriefReportV1, webURL string,
+) string {
+	var body strings.Builder
+	body.WriteString(report.Content.Headline)
+	body.WriteString("\n\n")
+	body.WriteString(report.Content.ExecutiveSummary)
+	if report.Content.WhyForYou != "" {
+		body.WriteString("\n\n为什么值得关注\n")
+		body.WriteString(report.Content.WhyForYou)
+	}
+	if len(report.Content.Signals) > 0 {
+		body.WriteString("\n\n关键变化")
+		for _, signal := range report.Content.Signals {
+			body.WriteString("\n• ")
+			body.WriteString(signal.Title)
+			body.WriteString("：")
+			body.WriteString(signal.Summary)
+		}
+	}
+	if len(report.Content.NextSteps) > 0 {
+		body.WriteString("\n\n建议下一步")
+		for _, step := range report.Content.NextSteps {
+			body.WriteString("\n• ")
+			body.WriteString(step.Label)
+			body.WriteString("：")
+			body.WriteString(step.Rationale)
+		}
+	}
+	body.WriteString("\n\n查看完整报告：")
+	body.WriteString(webURL)
+	return body.String()
 }

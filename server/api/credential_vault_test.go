@@ -61,10 +61,13 @@ func TestLLMCredentialEndpointEncryptsAndNeverEchoesSecretPostgres(t *testing.T)
 	Mount(mux, Deps{Store: st, Auth: fake, Principal: auth.NewContextResolver()})
 	cookie := &http.Cookie{Name: sessionCookieName, Value: token}
 	const syntheticSecret = "synthetic-llm-secret-never-echo"
+	const syntheticAgentSecret = "synthetic-kimi-secret-never-echo"
 	payload := map[string]any{
 		"provider": "deepseek", "base_url": "https://api.deepseek.com",
 		"api_key": syntheticSecret, "model": "pipeline-model",
-		"agent_model": "agent-model", "research_model": "research-model",
+		"agent_provider": "kimi", "agent_base_url": "https://api.moonshot.cn/v1",
+		"agent_api_key": syntheticAgentSecret,
+		"agent_model":   "agent-model", "research_model": "research-model",
 		"max_concurrent": 4,
 	}
 	raw, _ := json.Marshal(payload)
@@ -76,6 +79,7 @@ func TestLLMCredentialEndpointEncryptsAndNeverEchoesSecretPostgres(t *testing.T)
 		t.Fatalf("PUT status=%d body=%s", putResponse.Code, putResponse.Body.String())
 	}
 	if strings.Contains(putResponse.Body.String(), syntheticSecret) ||
+		strings.Contains(putResponse.Body.String(), syntheticAgentSecret) ||
 		!strings.Contains(putResponse.Body.String(), "restart_required") {
 		t.Fatalf("PUT response leaked secret or hid activation boundary: %s", putResponse.Body.String())
 	}
@@ -85,7 +89,8 @@ func TestLLMCredentialEndpointEncryptsAndNeverEchoesSecretPostgres(t *testing.T)
 	).Scan(&ciphertext); err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(ciphertext, []byte(syntheticSecret)) {
+	if bytes.Contains(ciphertext, []byte(syntheticSecret)) ||
+		bytes.Contains(ciphertext, []byte(syntheticAgentSecret)) {
 		t.Fatal("database ciphertext contains the LLM API key")
 	}
 
@@ -94,6 +99,7 @@ func TestLLMCredentialEndpointEncryptsAndNeverEchoesSecretPostgres(t *testing.T)
 	getResponse := httptest.NewRecorder()
 	mux.ServeHTTP(getResponse, get)
 	if getResponse.Code != http.StatusOK || strings.Contains(getResponse.Body.String(), syntheticSecret) ||
+		strings.Contains(getResponse.Body.String(), syntheticAgentSecret) ||
 		!strings.Contains(getResponse.Body.String(), `"configured":true`) {
 		t.Fatalf("GET status=%d body=%s", getResponse.Code, getResponse.Body.String())
 	}

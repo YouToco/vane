@@ -42,11 +42,12 @@ type scheduleCapabilitiesDTO struct {
 
 // scheduleDetailResp 是 GET /api/schedules/{id} 的响应体。
 type scheduleDetailResp struct {
-	Schedule     scheduleDetailScheduleDTO `json:"schedule"`
-	Summary      store.ScheduleRunSummary  `json:"summary"`
-	Playbook     *schedulePlaybookDTO      `json:"playbook,omitempty"` // 无手册的老任务缺省
-	Cost         store.ScheduleRunCost     `json:"cost"`               // 口径见 store/schedule_dashboard.go
-	Capabilities scheduleCapabilitiesDTO   `json:"capabilities"`
+	Schedule        scheduleDetailScheduleDTO       `json:"schedule"`
+	Summary         store.ScheduleRunSummary        `json:"summary"`
+	DeliveryChannel store.DeliveryChannelPreference `json:"delivery_channel"`
+	Playbook        *schedulePlaybookDTO            `json:"playbook,omitempty"` // 无手册的老任务缺省
+	Cost            store.ScheduleRunCost           `json:"cost"`               // 口径见 store/schedule_dashboard.go
+	Capabilities    scheduleCapabilitiesDTO         `json:"capabilities"`
 }
 
 // handleGetScheduleDetail 返回单任务详情：本体 + 运行概览 + 手册 + 成本。
@@ -77,6 +78,12 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	cost, err := s.deps.Store.GetScheduleRunCost(r.Context(), userID, id)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	deliveryChannel, err := s.deps.Store.ResolveDeliveryChannelPreference(
+		r.Context(), sched.TenantID, userID, id)
 	if err != nil {
 		writeAppError(w, err)
 		return
@@ -117,7 +124,7 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 			NextRun:      nextRun,
 			NextRunState: nextRunState,
 		},
-		Summary:  *summary,
+		Summary: *summary, DeliveryChannel: deliveryChannel,
 		Playbook: playbook, Cost: *cost,
 		Capabilities: scheduleCapabilitiesDTO{
 			DefinitionEdit: true,

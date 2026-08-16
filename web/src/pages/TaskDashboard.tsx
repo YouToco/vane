@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, Clock, Loader2, Activity, Newspaper } from "lucide-react";
+import { Plus, Clock, Loader2, Activity, Newspaper, BellRing } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +14,7 @@ import type {
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/shared/utils/time";
 import { taskRunOutcome } from "@/shared/utils/task-detail-presentation";
+import { deliveryChannelLabel } from "@/features/task/TaskDeliveryChannel";
 
 // describeSpec 的 i18n 版：用户面所有任务文案都必须随语言走。
 function describeSpecI18n(spec: ScheduleSpec, s: Dict["app"]["schedule"]): string {
@@ -151,6 +152,10 @@ function TaskCard({ task, summary }: { task: Schedule; summary?: ScheduleRunSumm
               {T.nextRun} {fmtBeijing(task.next_run)}
             </div>
           )}
+          <div className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
+            <BellRing className="size-3" />
+            定时推送：{deliveryChannelLabel(task.delivery_channel)}
+          </div>
         </CardContent>
       </Card>
     </a>

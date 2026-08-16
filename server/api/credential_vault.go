@@ -46,6 +46,9 @@ type llmCredentialRequest struct {
 	BaseURL       string `json:"base_url"`
 	APIKey        string `json:"api_key"`
 	Model         string `json:"model"`
+	AgentProvider string `json:"agent_provider"`
+	AgentBaseURL  string `json:"agent_base_url"`
+	AgentAPIKey   string `json:"agent_api_key"`
 	AgentModel    string `json:"agent_model"`
 	ResearchModel string `json:"research_model"`
 	MaxConcurrent int    `json:"max_concurrent"`
@@ -233,6 +236,9 @@ func (s *server) handleLLMCredentialPut(w http.ResponseWriter, r *http.Request) 
 	request.BaseURL = strings.TrimRight(strings.TrimSpace(request.BaseURL), "/")
 	request.APIKey = strings.TrimSpace(request.APIKey)
 	request.Model = strings.TrimSpace(request.Model)
+	request.AgentProvider = strings.TrimSpace(request.AgentProvider)
+	request.AgentBaseURL = strings.TrimRight(strings.TrimSpace(request.AgentBaseURL), "/")
+	request.AgentAPIKey = strings.TrimSpace(request.AgentAPIKey)
 	request.AgentModel = strings.TrimSpace(request.AgentModel)
 	request.ResearchModel = strings.TrimSpace(request.ResearchModel)
 	parsedURL, err := url.Parse(request.BaseURL)
@@ -244,10 +250,33 @@ func (s *server) handleLLMCredentialPut(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "LLM provider、HTTPS 地址、模型或并发配置无效")
 		return
 	}
-	secret, _ := json.Marshal(map[string]string{"api_key": request.APIKey})
+	if request.BaseURL != "https://api.deepseek.com" {
+		writeError(w, http.StatusBadRequest, "流水线 / Research 当前只允许 DeepSeek 官方 API")
+		return
+	}
+	if request.AgentProvider != "" {
+		agentURL, agentErr := url.Parse(request.AgentBaseURL)
+		validAgentOrigin := request.AgentProvider == "deepseek" &&
+			request.AgentBaseURL == "https://api.deepseek.com" ||
+			request.AgentProvider == "kimi" &&
+				request.AgentBaseURL == "https://api.moonshot.cn/v1"
+		if request.AgentAPIKey == "" || agentErr != nil ||
+			agentURL.Scheme != "https" || agentURL.User != nil ||
+			agentURL.RawQuery != "" || agentURL.Fragment != "" || !validAgentOrigin {
+			writeError(w, http.StatusBadRequest, "Agent 专用 provider、官方 API 地址或 API Key 无效")
+			return
+		}
+	} else if request.AgentBaseURL != "" || request.AgentAPIKey != "" {
+		writeError(w, http.StatusBadRequest, "Agent 继承主路由时不能单独填写地址或 Key")
+		return
+	}
+	secret, _ := json.Marshal(map[string]string{
+		"api_key": request.APIKey, "agent_api_key": request.AgentAPIKey,
+	})
 	metadata, _ := json.Marshal(map[string]any{
 		"provider": request.Provider, "base_url": request.BaseURL,
-		"model": request.Model, "agent_model": request.AgentModel,
+		"model": request.Model, "agent_provider": request.AgentProvider,
+		"agent_base_url": request.AgentBaseURL, "agent_model": request.AgentModel,
 		"research_model": request.ResearchModel,
 		"max_concurrent": request.MaxConcurrent,
 	})

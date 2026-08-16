@@ -17,8 +17,78 @@ import (
 	"github.com/YouToco/vane/server/feedback"
 	"github.com/YouToco/vane/server/pusheffect"
 	"github.com/YouToco/vane/server/runtimepolicy"
+	storepkg "github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
 )
+
+type aggregateChannelStoreFake struct {
+	*effectCountingStore
+	plan         *storepkg.ArtifactDeliveryPlan
+	prepareCalls int
+	settleCalls  int
+}
+
+func (f *aggregateChannelStoreFake) ResolveDeliveryChannelPreference(
+	context.Context, int64, int64, string,
+) (storepkg.DeliveryChannelPreference, error) {
+	routeID := int64(44)
+	return storepkg.DeliveryChannelPreference{
+		Selection: storepkg.DeliveryChannelTelegram, TelegramRouteID: &routeID,
+	}, nil
+}
+func (f *aggregateChannelStoreFake) LoadArtifactDeliveryPlan(
+	context.Context, int64, int64, string, string, string,
+) (storepkg.ArtifactDeliveryPlan, error) {
+	if f.plan == nil {
+		return storepkg.ArtifactDeliveryPlan{}, types.NewAppError(
+			types.CodeNotFound, "missing", types.ErrNotFound)
+	}
+	return *f.plan, nil
+}
+func (f *aggregateChannelStoreFake) PrepareArtifactDeliveryPlan(
+	_ context.Context, tenantID, userID int64, taskID, kind, key string,
+	preference storepkg.DeliveryChannelPreference,
+) (storepkg.ArtifactDeliveryPlan, error) {
+	f.prepareCalls++
+	f.plan = &storepkg.ArtifactDeliveryPlan{
+		ID:       "97e600e8-245a-59b3-a62b-3da056806f37",
+		TenantID: tenantID, UserID: userID, TaskID: taskID,
+		ArtifactKind: kind, ArtifactKey: key,
+		Selection:       preference.Selection,
+		TelegramRouteID: preference.TelegramRouteID,
+	}
+	return *f.plan, nil
+}
+func (f *aggregateChannelStoreFake) PrepareAggregateTelegramOutbound(
+	_ context.Context, _ string, tenantID, userID int64, _ string,
+	_ int64, _, _ int, _ []int64, routeID int64, effectID, body string,
+) (storepkg.ChannelOutboundEffect, error) {
+	f.prepareCalls++
+	return storepkg.ChannelOutboundEffect{
+		EffectID: effectID, TenantID: tenantID, UserID: userID,
+		RouteID: routeID, EffectKind: "aggregate_brief",
+		PayloadText: body, Status: "prepared",
+	}, nil
+}
+func (f *aggregateChannelStoreFake) SettleAggregateTelegramOutbound(
+	context.Context, int64, int64, string, string,
+) error {
+	f.settleCalls++
+	return nil
+}
+
+type aggregateTelegramSenderFake struct {
+	calls int
+	body  string
+}
+
+func (f *aggregateTelegramSenderFake) SendTextEffect(
+	_ context.Context, _, _ int64, _ int64, _, _ string, body string,
+) error {
+	f.calls++
+	f.body = body
+	return nil
+}
 
 func TestPRBCompletePushEffectPlan(t *testing.T) {
 	effect := func(index, count int, status pusheffect.Status) *pusheffect.Effect {
@@ -265,6 +335,49 @@ func TestPRBPushPreparesCompletePlanBeforeFirstProvider(t *testing.T) {
 		compiledStore,
 		legacyStore,
 	)
+}
+
+func TestPRBAggregateTelegramOnlyUsesProviderChildReceipt(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture("Telegram aggregate task")
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true,
+		deliveryIDSequence: []int64{701},
+	}
+	effectStore := newPRBActivityEffectStore(nil, nil)
+	feishuPusher := &prbActivityPusher{chatID: "oc_unused"}
+	feishu := &prbEffectFeishu{
+		owner: "ou_unused", chat: "oc_unused", app: "app_unused",
+	}
+	channelStore := &aggregateChannelStoreFake{
+		effectCountingStore: &effectCountingStore{fakeStore: new(fakeStore)},
+	}
+	activities := prbFullPushActivities(compiledStore, effectStore,
+		feishuPusher, feishu, channelStore, identity.TaskID)
+	telegramSender := &aggregateTelegramSenderFake{}
+	activities.SetAggregateTelegramSender(telegramSender)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.Push)
+	err := executePushActivity(t, env, activities, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID,
+		TraceID: "trace-telegram-aggregate",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID, TaskID: identity.TaskID, Snapshot: ref,
+		},
+		Cards: prbGeneratedCards(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, _, _ := effectStore.snapshot()
+	if telegramSender.calls != 1 || channelStore.settleCalls != 1 ||
+		channelStore.prepareCalls != 2 || len(prepared) != 0 ||
+		len(feishuPusher.snapshot()) != 0 ||
+		!strings.Contains(telegramSender.body, "PRB item 0") {
+		t.Fatalf("telegram=%+v prepare=%d settle=%d feishu_effects=%d feishu_calls=%d",
+			telegramSender, channelStore.prepareCalls, channelStore.settleCalls,
+			len(prepared), len(feishuPusher.snapshot()))
+	}
 }
 
 func TestP1ECanonicalRendererSendsOneFrozenPrefixWithWholeBriefReceipt(t *testing.T) {

@@ -52,6 +52,14 @@ func TestDeliveryChannelPreferenceRejectsInvalidScopeAndSelection(t *testing.T) 
 		t.Context(), 1, 1, DeliveryChannelTelegram, &badRoute); err == nil {
 		t.Fatal("negative Telegram route unexpectedly accepted")
 	}
+	if _, err := st.PutTaskDeliveryChannelPreference(
+		t.Context(), 1, 1, "", DeliveryChannelBoth, nil); err == nil {
+		t.Fatal("empty task override unexpectedly accepted")
+	}
+	if _, err := st.DeleteTaskDeliveryChannelPreference(
+		t.Context(), 1, 1, ""); err == nil {
+		t.Fatal("empty task override delete unexpectedly accepted")
+	}
 }
 
 func TestDeliveryChannelPreferenceDatabaseFailuresAreClassifiedPG(t *testing.T) {
@@ -151,16 +159,12 @@ func TestDeliveryChannelPreferenceResolutionPG(t *testing.T) {
 		!preference.Explicit {
 		t.Fatalf("account=%+v err=%v", preference, err)
 	}
-	if _, err := st.pool.Exec(t.Context(),
-		`INSERT INTO delivery_channel_preferences
-		 (tenant_id,user_id,task_id,selection)
-		 VALUES ($1,$2,'task-one','telegram')`, tenantID, userID); err != nil {
-		t.Fatal(err)
-	}
-	taskPreference, err := st.ResolveDeliveryChannelPreference(
-		t.Context(), tenantID, userID, "task-one")
+	taskPreference, err := st.PutTaskDeliveryChannelPreference(
+		t.Context(), tenantID, userID, "task-one",
+		DeliveryChannelTelegram, &routeID)
 	if err != nil || taskPreference.Selection != DeliveryChannelTelegram ||
-		taskPreference.Scope != "task" {
+		taskPreference.Scope != "task" || taskPreference.TelegramRouteID == nil ||
+		*taskPreference.TelegramRouteID != routeID {
 		t.Fatalf("task override=%+v err=%v", taskPreference, err)
 	}
 	accountPreference, err := st.ResolveDeliveryChannelPreference(
@@ -168,6 +172,17 @@ func TestDeliveryChannelPreferenceResolutionPG(t *testing.T) {
 	if err != nil || accountPreference.Selection != DeliveryChannelBoth ||
 		accountPreference.Scope != "account" {
 		t.Fatalf("account fallback=%+v err=%v", accountPreference, err)
+	}
+	inherited, err := st.DeleteTaskDeliveryChannelPreference(
+		t.Context(), tenantID, userID, "task-one")
+	if err != nil || inherited.Selection != DeliveryChannelBoth ||
+		inherited.Scope != "account" || !inherited.Explicit {
+		t.Fatalf("deleted task override=%+v err=%v", inherited, err)
+	}
+	if _, err := st.PutTaskDeliveryChannelPreference(
+		t.Context(), tenantID, userID, "missing-task",
+		DeliveryChannelBoth, nil); err == nil {
+		t.Fatal("missing task override unexpectedly accepted")
 	}
 	withRoute, err := st.PutAccountDeliveryChannelPreference(
 		t.Context(), tenantID, userID, DeliveryChannelBoth, &routeID)

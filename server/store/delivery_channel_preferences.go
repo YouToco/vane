@@ -127,10 +127,34 @@ func (s *Store) PutAccountDeliveryChannelPreference(
 	ctx context.Context, tenantID, userID int64, selection DeliveryChannelSelection,
 	telegramRouteID *int64,
 ) (DeliveryChannelPreference, error) {
+	return s.putDeliveryChannelPreference(
+		ctx, tenantID, userID, "", selection, telegramRouteID)
+}
+
+// PutTaskDeliveryChannelPreference installs an exact-task override.  The task
+// ownership and optional Telegram route are re-proved inside the same
+// transaction as the preference write; callers cannot attach a foreign task
+// or route by guessing its identifier.
+func (s *Store) PutTaskDeliveryChannelPreference(
+	ctx context.Context, tenantID, userID int64, taskID string,
+	selection DeliveryChannelSelection, telegramRouteID *int64,
+) (DeliveryChannelPreference, error) {
+	if taskID == "" {
+		return DeliveryChannelPreference{}, types.NewAppError(
+			types.CodeValidation, "任务投递渠道偏好范围无效", types.ErrValidation)
+	}
+	return s.putDeliveryChannelPreference(
+		ctx, tenantID, userID, taskID, selection, telegramRouteID)
+}
+
+func (s *Store) putDeliveryChannelPreference(
+	ctx context.Context, tenantID, userID int64, taskID string,
+	selection DeliveryChannelSelection, telegramRouteID *int64,
+) (DeliveryChannelPreference, error) {
 	if selection == DeliveryChannelFeishu {
 		telegramRouteID = nil
 	}
-	if err := validateDeliveryPreferenceScope(tenantID, userID, ""); err != nil ||
+	if err := validateDeliveryPreferenceScope(tenantID, userID, taskID); err != nil ||
 		!selection.Valid() || (telegramRouteID != nil && *telegramRouteID <= 0) {
 		return DeliveryChannelPreference{}, types.NewAppError(
 			types.CodeValidation, "投递渠道偏好无效", types.ErrValidation)
@@ -168,15 +192,30 @@ func (s *Store) PutAccountDeliveryChannelPreference(
 				types.CodeNotFound, "Telegram 投递目的地不可用", types.ErrNotFound)
 		}
 	}
+	if taskID != "" {
+		var taskOwned bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (
+			 SELECT 1 FROM schedules
+			  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+			)`, taskID, tenantID, userID).Scan(&taskOwned); err != nil {
+			return DeliveryChannelPreference{}, types.NewAppError(
+				types.CodeDatabase, "验证任务投递渠道范围", err)
+		}
+		if !taskOwned {
+			return DeliveryChannelPreference{}, types.NewAppError(
+				types.CodeNotFound, "任务不可用", types.ErrNotFound)
+		}
+	}
 	var updatedAt time.Time
 	err = tx.QueryRow(ctx,
 		`INSERT INTO delivery_channel_preferences
 		     (tenant_id,user_id,task_id,selection,telegram_route_id)
-		 VALUES ($1,$2,NULL,$3,$4)
+		 VALUES ($1,$2,NULLIF($3,''),$4,$5)
 		 ON CONFLICT ON CONSTRAINT uq_delivery_channel_preference_scope
 		 DO UPDATE SET selection=EXCLUDED.selection,
 		               telegram_route_id=EXCLUDED.telegram_route_id
-		 RETURNING updated_at`, tenantID, userID, selection, telegramRouteID).Scan(&updatedAt)
+		 RETURNING updated_at`, tenantID, userID, taskID, selection, telegramRouteID).Scan(&updatedAt)
 	if err != nil {
 		return DeliveryChannelPreference{}, types.NewAppError(
 			types.CodeDatabase, "保存投递渠道偏好", err)
@@ -185,8 +224,53 @@ func (s *Store) PutAccountDeliveryChannelPreference(
 		return DeliveryChannelPreference{}, types.NewAppError(
 			types.CodeDatabase, "提交投递渠道偏好", err)
 	}
-	return DeliveryChannelPreference{
+	result := DeliveryChannelPreference{
 		Selection: selection, Scope: "account", TelegramRouteID: telegramRouteID,
 		Explicit: true, UpdatedAt: &updatedAt,
-	}, nil
+	}
+	if taskID != "" {
+		result.Scope, result.TaskID = "task", taskID
+	}
+	return result, nil
+}
+
+// DeleteTaskDeliveryChannelPreference removes only the task override; the
+// account default becomes effective again.  The exact principal scope is
+// bound through vane_app RLS before deletion.
+func (s *Store) DeleteTaskDeliveryChannelPreference(
+	ctx context.Context, tenantID, userID int64, taskID string,
+) (DeliveryChannelPreference, error) {
+	if err := validateDeliveryPreferenceScope(tenantID, userID, taskID); err != nil || taskID == "" {
+		return DeliveryChannelPreference{}, types.NewAppError(
+			types.CodeValidation, "任务投递渠道偏好范围无效", types.ErrValidation)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return DeliveryChannelPreference{}, types.NewAppError(
+			types.CodeDatabase, "开启任务投递渠道偏好删除", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		strconv.FormatInt(tenantID, 10), strconv.FormatInt(userID, 10)); err != nil {
+		return DeliveryChannelPreference{}, types.NewAppError(
+			types.CodeDatabase, "绑定任务投递渠道偏好范围", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		return DeliveryChannelPreference{}, types.NewAppError(
+			types.CodeDatabase, "进入任务投递渠道偏好角色", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM delivery_channel_preferences
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+		tenantID, userID, taskID); err != nil {
+		return DeliveryChannelPreference{}, types.NewAppError(
+			types.CodeDatabase, "删除任务投递渠道偏好", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return DeliveryChannelPreference{}, types.NewAppError(
+			types.CodeDatabase, "提交任务投递渠道偏好删除", err)
+	}
+	return s.ResolveDeliveryChannelPreference(ctx, tenantID, userID, taskID)
 }

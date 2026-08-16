@@ -53,9 +53,12 @@ func TestStoredLLMCredentialOverridesEnvironmentAndTamperFailsClosedPostgres(t *
 		_, _ = cleanup.Exec(cleanupCtx, `DELETE FROM users WHERE id=$1`, user.ID)
 		cleanup.Close()
 	})
-	secret, _ := json.Marshal(storedLLMSecret{APIKey: "database-key"})
+	secret, _ := json.Marshal(storedLLMSecret{
+		APIKey: "database-key", AgentAPIKey: "database-kimi-key",
+	})
 	metadata, _ := json.Marshal(storedLLMMetadata{
 		Provider: "deepseek", BaseURL: "https://database.example",
+		AgentProvider: "kimi", AgentBaseURL: "https://api.moonshot.cn/v1",
 		Model: "database-pipeline", AgentModel: "database-agent",
 		ResearchModel: "database-research", MaxConcurrent: 7,
 	})
@@ -73,6 +76,8 @@ func TestStoredLLMCredentialOverridesEnvironmentAndTamperFailsClosedPostgres(t *
 		t.Fatal(err)
 	}
 	if target.APIKey != "database-key" || target.BaseURL != "https://database.example" ||
+		target.AgentProvider != "kimi" || target.AgentBaseURL != "https://api.moonshot.cn/v1" ||
+		target.AgentAPIKey != "database-kimi-key" ||
 		target.Model != "database-pipeline" || target.AgentModel != "database-agent" ||
 		target.ResearchModel != "database-research" || target.MaxConcurrent != 7 ||
 		target.CompiledCredentialGeneration != rotated.Generation ||

@@ -158,6 +158,7 @@ func run() error {
 	}
 	var researchRuntimeOption workflow.ActivitiesOption
 	var researchDeliveryOption workflow.ActivitiesOption
+	var researchDeliveryCoordinator *workflow.ReceiptBackedResearchDeliveryV3
 	if shouldInitializeResearchV3Runtime(cfg) {
 		researchControlStore, err = store.NewServerRuntimeWithResearchRuntimeCapabilityAndEditRecovery(
 			ctx, cfg.DB.ResearchControlURL, cfg.DB.ResearchRuntimeURL,
@@ -292,6 +293,7 @@ func run() error {
 			closeStores()
 			return fmt.Errorf("初始化 research V3 receipt-backed delivery: %w", deliveryErr)
 		}
+		researchDeliveryCoordinator = delivery
 		researchDeliveryOption = workflow.WithResearchDeliveryV3(delivery)
 	}
 	// 构卡函数注入而非 workflow 直接 import feishu：feishu→agent→workflow 依赖链
@@ -795,6 +797,12 @@ func run() error {
 	if err != nil {
 		closeServerStartupResources(temporalClient.Close, closeStores)
 		return fmt.Errorf("装配 Telegram Bot: %w", err)
+	}
+	periodicActivities.SetTelegramSender(telegramManager)
+	activities.SetAggregateTelegramSender(telegramManager)
+	if researchDeliveryCoordinator != nil {
+		researchDeliveryCoordinator.SetTelegramDelivery(
+			telegramManager, renderResearchBriefTelegramV3)
 	}
 
 	// Build the A2A agent before any worker or recovery goroutine starts. A

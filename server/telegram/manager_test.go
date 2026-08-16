@@ -161,6 +161,10 @@ func (f *fakeIngressStore) ClaimTelegramOutbound(context.Context, string) (store
 	f.outbound.Status = "sending"
 	return f.outbound, nil
 }
+func (f *fakeIngressStore) ClaimNextTelegramOutbound(context.Context, string) (store.ChannelOutboundEffect, error) {
+	return store.ChannelOutboundEffect{}, types.NewAppError(
+		types.CodeNotFound, "empty", types.ErrNotFound)
+}
 func (f *fakeIngressStore) CompleteTelegramOutbound(context.Context, store.ChannelOutboundEffect, []string) error {
 	f.outbound.Status = "sent"
 	return f.completeErr

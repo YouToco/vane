@@ -164,6 +164,9 @@ export interface LLMCredentialInput {
   base_url: string;
   api_key: string;
   model: string;
+  agent_provider: "" | "deepseek" | "kimi";
+  agent_base_url: string;
+  agent_api_key: string;
   agent_model: string;
   research_model: string;
   max_concurrent: number;
@@ -228,6 +231,7 @@ export interface Schedule {
   next_run_state: "scheduled" | "paused" | "none" | "unavailable";
   next_run?: string; // 只有 next_run_state=scheduled 时才是可信的 Temporal 下一次触发
   created_at?: string;
+  delivery_channel?: DeliveryChannelPreference;
 }
 
 // ---- M5 Gate 可观测性（契约 §16）----
@@ -815,6 +819,7 @@ export interface SchedulePlaybook {
 // GET /api/schedules/{id} 响应。playbook 缺席 = 老任务/无手册，不是错误。
 export interface ScheduleDetail {
   schedule: Schedule;
+  delivery_channel: DeliveryChannelPreference;
   capabilities: {
     definition_edit: boolean;
   };
@@ -1112,6 +1117,7 @@ export function normalizeSchedule(raw: Record<string, unknown>): Schedule {
     next_run_state: nextRunState,
     ...(nextRunState === "scheduled" && nextRun ? { next_run: nextRun } : {}),
     created_at: raw.created_at as string | undefined,
+    delivery_channel: raw.delivery_channel as DeliveryChannelPreference | undefined,
   };
 }
 
@@ -1568,6 +1574,26 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ selection, telegram_route_id: telegramRouteId }),
     }),
+  taskDeliveryChannelPreference: (id: string) =>
+    request<DeliveryChannelPreference>(
+      `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
+    ),
+  patchTaskDeliveryChannelPreference: (
+    id: string,
+    selection: DeliveryChannelSelection,
+    telegramRouteId?: number,
+  ) => request<DeliveryChannelPreference>(
+    `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ selection, telegram_route_id: telegramRouteId }),
+    },
+  ),
+  deleteTaskDeliveryChannelPreference: (id: string) =>
+    request<DeliveryChannelPreference>(
+      `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
+      { method: "DELETE" },
+    ),
   telegramCredentialStatus: () =>
     request<CredentialStatus>("/api/channels/telegram/credentials"),
   telegramRotateCredential: (input: TelegramCredentialInput) =>

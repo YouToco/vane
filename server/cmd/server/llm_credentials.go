@@ -14,13 +14,16 @@ import (
 const databaseLLMCredentialPurpose = "shared_runtime"
 
 type storedLLMSecret struct {
-	APIKey string `json:"api_key"`
+	APIKey      string `json:"api_key"`
+	AgentAPIKey string `json:"agent_api_key,omitempty"`
 }
 
 type storedLLMMetadata struct {
 	Provider      string `json:"provider"`
 	BaseURL       string `json:"base_url"`
 	Model         string `json:"model"`
+	AgentProvider string `json:"agent_provider,omitempty"`
+	AgentBaseURL  string `json:"agent_base_url,omitempty"`
 	AgentModel    string `json:"agent_model"`
 	ResearchModel string `json:"research_model"`
 	MaxConcurrent int    `json:"max_concurrent"`
@@ -74,17 +77,25 @@ func applyStoredLLMCredential(
 	next.BaseURL = route.BaseURL
 	next.APIKey = secret.APIKey
 	next.Model = route.Model
-	next.AgentProvider = route.Provider
-	next.AgentBaseURL = route.BaseURL
-	next.AgentAPIKey = secret.APIKey
+	next.AgentProvider = ""
+	next.AgentBaseURL = ""
+	next.AgentAPIKey = ""
+	if route.AgentProvider != "" {
+		next.AgentProvider = route.AgentProvider
+		next.AgentBaseURL = route.AgentBaseURL
+		next.AgentAPIKey = secret.AgentAPIKey
+	}
 	next.AgentModel = route.AgentModel
 	next.ResearchModel = route.ResearchModel
 	next.MaxConcurrent = route.MaxConcurrent
 	next.CompiledEndpointGeneration = metadata.Generation
 	next.CompiledCredentialGeneration = metadata.Generation
+	agentRouteValid := route.AgentProvider == "" ||
+		(route.AgentProvider == "deepseek" || route.AgentProvider == "kimi") &&
+			route.AgentBaseURL != "" && secret.AgentAPIKey != ""
 	if next.Provider != "deepseek" || next.APIKey == "" || next.BaseURL == "" ||
 		next.Model == "" || next.AgentModel == "" || next.ResearchModel == "" ||
-		next.MaxConcurrent < 1 {
+		next.MaxConcurrent < 1 || !agentRouteValid {
 		return errors.New("active database LLM credential is incomplete or unsupported")
 	}
 	*target = next

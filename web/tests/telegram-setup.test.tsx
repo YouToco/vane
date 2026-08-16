@@ -16,6 +16,8 @@ const apiMock = vi.hoisted(() => ({
   telegramRevokeCredential: vi.fn(),
   deliveryChannelPreference: vi.fn(),
   patchDeliveryChannelPreference: vi.fn(),
+  patchTaskDeliveryChannelPreference: vi.fn(),
+  deleteTaskDeliveryChannelPreference: vi.fn(),
 }));
 
 vi.mock("@/shared/api/client", () => ({
@@ -25,6 +27,7 @@ vi.mock("@/shared/api/client", () => ({
 
 import TelegramSetup from "@/pages/TelegramSetup";
 import DeliveryChannelPreferenceCard from "@/pages/DeliveryChannelPreference";
+import TaskDeliveryChannel from "@/features/task/TaskDeliveryChannel";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -130,6 +133,46 @@ describe("Telegram settings", () => {
     expect(screen.getByText("/connect opaque-route-token")).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "解除连接" }));
     await waitFor(() => expect(apiMock.telegramRouteUnlink).toHaveBeenCalledWith(7));
+  });
+});
+
+describe("Task delivery channel", () => {
+  test("shows the effective route and saves an exact task override", async () => {
+    apiMock.telegramStatus.mockResolvedValue({
+      enabled: true,
+      ready: true,
+      bound: true,
+      routes: [
+        { id: 1, kind: "private", chat_type: "private", bound_at: "2026-08-15T01:00:00Z" },
+        { id: 7, kind: "topic", chat_type: "supergroup", bound_at: "2026-08-15T01:01:00Z" },
+      ],
+    });
+    apiMock.patchTaskDeliveryChannelPreference.mockResolvedValue({
+      selection: "both",
+      scope: "task",
+      task_id: "task-7",
+      telegram_route_id: 7,
+      explicit: true,
+    });
+    render(
+      <TaskDeliveryChannel
+        scheduleID="task-7"
+        initial={{
+          selection: "telegram",
+          scope: "account",
+          telegram_route_id: 1,
+          explicit: true,
+        }}
+      />,
+    );
+    const destination = await screen.findByLabelText("Telegram 目的地");
+    await userEvent.selectOptions(destination, "7");
+    await userEvent.click(screen.getByRole("button", { name: "飞书 + Telegram" }));
+    await waitFor(() => expect(
+      apiMock.patchTaskDeliveryChannelPreference,
+    ).toHaveBeenCalledWith("task-7", "both", 7));
+    expect(await screen.findByText("任务推送渠道已保存。")).toBeTruthy();
+    expect(screen.getAllByText("飞书 + Telegram").length).toBeGreaterThan(0);
   });
 });
 

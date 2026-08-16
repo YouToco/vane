@@ -1,8 +1,9 @@
 # Provider credential vault contract
 
-Status: foundation implemented in migrations 137-138. Telegram user-manager
-fleet is implemented; Feishu and LLM hot reload remain separate fail-closed
-rollouts.
+Status: encrypted storage and administration are implemented in migrations
+137-138. Telegram has a per-user runtime manager fleet. Shared LLM credentials
+are selected from the database at safe process start; LLM hot reload and the
+per-user Feishu runtime fleet remain separate fail-closed rollouts.
 
 ## Authority model
 
@@ -79,9 +80,24 @@ rotates only that user's Manager at `/telegram/webhook/{verified_bot_id}`. The
 same Bot ID cannot be active for two users. The legacy environment Manager is
 only a compatibility route for users without a database-backed Bot.
 
-The shared LLM partial cutover lets the super-administrator Web page create an
-encrypted platform generation, and the next safe process start makes
-that generation authoritative for pipeline, Agent, and research clients. The
-write response therefore says `restart_required`; it does not claim hot reload.
-An unreadable, tampered, or explicitly revoked database generation blocks
-startup instead of falling back. Hot generation switching remains a later gate.
+The shared LLM cutover lets only the platform super-administrator create or
+rotate an encrypted platform generation in Web. The next safe process start
+makes it authoritative; the write response therefore says
+`restart_required` and does not claim hot reload. Once platform credential
+history exists, an unreadable, tampered, or explicitly revoked generation
+blocks startup instead of falling back to a VPS model key.
+
+The compiled pipeline and Research V3 currently require the official DeepSeek
+endpoint. Agent chat can inherit that DeepSeek route or use a separately
+encrypted Agent key for the official DeepSeek or Kimi/Moonshot endpoint. The
+provider name, base URL and model are non-secret metadata; both primary and
+dedicated Agent API keys remain encrypted secret material. Selecting Kimi for
+Agent does not imply that compiled research or scheduled report generation has
+switched to Kimi.
+
+Media capability is also fail-closed. No provider/model is treated as image,
+audio or video capable from its name alone. Until a versioned native-modality
+manifest and typed request path are implemented, Telegram media remains a
+durable inert reference with an explicit unsupported reply; Vane does not add
+OCR, transcription, frame extraction or other cross-modal conversion as a
+fallback.

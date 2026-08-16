@@ -49,7 +49,7 @@ describe("shared LLM credential admin", () => {
     });
     render(<LLMCredentials />);
     expect(await screen.findByText("第 4 代")).toBeTruthy();
-    const key = screen.getByLabelText("新 API Key") as HTMLInputElement;
+    const key = screen.getByLabelText("DeepSeek 新 API Key") as HTMLInputElement;
     expect(key.value).toBe("");
     fireEvent.change(key, { target: { value: "synthetic-new-key" } });
     await userEvent.click(screen.getByRole("button", { name: /保存并轮换/ }));
@@ -57,6 +57,9 @@ describe("shared LLM credential admin", () => {
     expect(apiMock.adminRotateLLMCredential.mock.calls[0][0]).toMatchObject({
       api_key: "synthetic-new-key",
       provider: "deepseek",
+      agent_provider: "",
+      agent_base_url: "",
+      agent_api_key: "",
       model: "pipeline-model",
       agent_model: "agent-model",
       research_model: "research-model",

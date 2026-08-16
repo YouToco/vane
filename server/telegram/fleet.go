@@ -437,6 +437,21 @@ func (f *Fleet) SendTest(ctx context.Context, tenantID, userID int64) error {
 	return m.SendTest(ctx, tenantID, userID)
 }
 
+// SendTextEffect routes a durable outbound effect through the exact Bot owned
+// by this Vane principal. The route is re-proved again by Manager/Store before
+// any provider call.
+func (f *Fleet) SendTextEffect(
+	ctx context.Context, tenantID, userID, routeID int64,
+	effectID, effectKind, body string,
+) error {
+	m, err := f.managerForUser(tenantID, userID)
+	if err != nil {
+		return err
+	}
+	return m.SendTextEffect(ctx, tenantID, userID, routeID,
+		effectID, effectKind, body)
+}
+
 func telegramScope(tenantID, userID int64) store.CredentialScope {
 	return store.CredentialScope{Kind: "user", TenantID: tenantID, UserID: userID,
 		Provider: "telegram", Purpose: telegramCredentialPurpose}

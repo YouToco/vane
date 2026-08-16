@@ -205,6 +205,64 @@ func (s *Store) ClaimTelegramOutbound(
 	return effect, nil
 }
 
+// ClaimNextTelegramOutbound recovers only effects that are proven not to have
+// crossed the provider boundary: newly prepared effects and durable 429
+// deferrals whose provider retry_after has elapsed. sending/ambiguous rows are
+// intentionally excluded because Telegram has no history lookup or caller
+// idempotency key that could make a resend safe.
+func (s *Store) ClaimNextTelegramOutbound(
+	ctx context.Context, appIdentity string,
+) (ChannelOutboundEffect, error) {
+	if strings.TrimSpace(appIdentity) != appIdentity || appIdentity == "" ||
+		len(appIdentity) > 128 {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeValidation,
+			"Telegram Bot 身份无效", types.ErrValidation)
+	}
+	dueClause, retryClear := "", ""
+	if s.channelSendRetry {
+		dueClause = " AND (e.next_send_at IS NULL OR e.next_send_at<=clock_timestamp())"
+		retryClear = ",next_send_at=NULL"
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+			"开启 Telegram outbound 恢复", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var effectID uuid.UUID
+	err = tx.QueryRow(ctx,
+		`SELECT e.effect_id FROM channel_outbound_effects e
+		 JOIN channel_routes cr ON cr.id=e.route_id
+		 JOIN channel_identities ci ON ci.id=cr.identity_id
+		WHERE e.provider=$1 AND e.app_identity=$2 AND e.status='prepared'`+
+			dueClause+` AND cr.status='active' AND ci.status='active'
+		ORDER BY COALESCE(e.next_send_at,e.created_at),e.created_at,e.effect_id
+		LIMIT 1 FOR UPDATE OF e,cr SKIP LOCKED`,
+		channelProviderTelegram, appIdentity).Scan(&effectID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeNotFound,
+			"没有待恢复的 Telegram outbound effect", types.ErrNotFound)
+	}
+	if err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+			"领取 Telegram outbound 恢复", err)
+	}
+	effect, err := scanChannelOutbound(tx.QueryRow(ctx,
+		`UPDATE channel_outbound_effects
+		    SET status='sending'`+retryClear+`,updated_at=clock_timestamp()
+		  WHERE effect_id=$1 AND status='prepared'
+		  RETURNING `+channelOutboundColumns, effectID))
+	if err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
+			"Telegram outbound 恢复领取冲突", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+			"提交 Telegram outbound 恢复领取", err)
+	}
+	return effect, nil
+}
+
 func (s *Store) CompleteTelegramOutbound(
 	ctx context.Context, effect ChannelOutboundEffect, messageIDs []string,
 ) error {
@@ -250,6 +308,10 @@ func (s *Store) CompleteTelegramOutbound(
 			return types.NewAppError(types.CodeDatabase,
 				"记录 Telegram outbound 消息映射", err)
 		}
+	}
+	if err := settleAggregateTelegramOutboundTx(
+		ctx, tx, effect, messageIDs); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return types.NewAppError(types.CodeDatabase,

@@ -4,7 +4,8 @@
 -- destinations for future business artifacts; this table does not itself
 -- authorize provider effects. A NULL task_id is the account default. A task row is
 -- an optional, future-compatible override and is constrained to an owned
--- schedule.
+-- schedule. Runtime delivery resolves this exact override before freezing an
+-- immutable artifact plan.
 
 -- +goose Up
 
@@ -58,7 +59,7 @@ CREATE POLICY delivery_channel_preference_exact_principal
 
 REVOKE ALL ON delivery_channel_preferences FROM PUBLIC,vane_app;
 REVOKE ALL ON SEQUENCE delivery_channel_preferences_id_seq FROM PUBLIC,vane_app;
-GRANT SELECT,INSERT,UPDATE ON delivery_channel_preferences TO vane_app;
+GRANT SELECT,INSERT,UPDATE,DELETE ON delivery_channel_preferences TO vane_app;
 GRANT USAGE,SELECT ON SEQUENCE delivery_channel_preferences_id_seq TO vane_app;
 -- Preference writes validate only the exact principal's Telegram route. The
 -- pre-existing RLS policy on channel_routes remains the visibility boundary.

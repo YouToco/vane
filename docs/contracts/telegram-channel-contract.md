@@ -33,12 +33,15 @@ Included in v4:
   before normal message admission;
 - a provider-neutral durable outbound effect boundary with stable caller UUID,
   frozen route/payload, exact replay, and terminal sent/failed/ambiguous
-  settlement. Connection tests use it; future product notifications can reuse
-  it without bypassing Telegram's no-blind-retry rule;
-- an account-level outbound preference with `feishu`, `telegram`, and `both`
-  selections, an optional exact Telegram private/group/topic route, and a
-  legacy-compatible implicit `feishu` default. The schema permits an exact
-  task override without making task-level UI part of this checkpoint;
+  settlement. Connection tests and scheduled product delivery use the same
+  boundary without bypassing Telegram's no-blind-retry rule;
+- account-level and exact task-level outbound preferences with `feishu`,
+  `telegram`, and `both` selections, an optional exact Telegram
+  private/group/topic route, a legacy-compatible implicit `feishu` default,
+  and a task Web surface that shows the effective scheduled destination;
+- immutable per-artifact delivery plans for periodic reports, Research V3 and
+  compiled aggregate Briefs. The plan freezes the selected provider set and
+  exact Telegram bot/chat/topic route before the first external send;
 - explicit media recognition with a safe text-only capability reply; a
   provider-neutral `vane.channel-message/v1` metadata envelope is durably
   frozen with the ingress receipt, while media bytes are not downloaded or
@@ -59,20 +62,24 @@ Not included in v4.1:
 - media download/native multimodal model submission, feedback/deep-dive domain actions, and
   destructive callbacks. Their transport extension points exist but remain
   fail-closed until their own authority contracts are implemented;
-- Telegram as the primary scheduled Brief/periodic-report delivery policy,
-  feedback/deep-dive message mapping, and task-level delivery-preference UI.
+- feedback/deep-dive actions on Telegram delivery messages, Telegram delivery
+  for the legacy non-compiled aggregate path, and automatic migration of old
+  `owner_feishu` workflow histories to a different provider.
 
-The scheduled-delivery exclusion is deliberate. This checkpoint persists the
-user's selection and exact Telegram destination, but it does not let runtime
-code consume that preference yet. Current approved task definitions still say
-`owner_feishu`, Research V3 owns one Brief anchor/effect, periodic delivery owns
-one provider receipt, and legacy delivery/feedback receipts retain
-`feishu_message_id`. Telegram `sendMessage` has neither the provider UUID nor
-the arbitrary history lookup used by the Feishu recovery contract. Scheduled
-fan-out therefore remains a separate S-level provider-receipt/recovery
-migration. Until that batch is implemented and UATed, product feature 4.9
-remains `开发中` and this branch is not merge-ready as the complete channel
-abstraction.
+Scheduled delivery consumes a frozen effective preference in this order:
+exact task override, then account preference, then the legacy-compatible
+implicit `feishu` default. `both` means one immutable artifact plan with two
+independent provider effects; one provider failure does not erase the other's
+receipt. Telegram child receipts live in provider-specific tables and never
+enter `deliveries.feishu_message_id`. Existing Feishu workflow history and old
+receipts remain byte-compatible and are not reinterpreted after a user changes
+preferences.
+
+Periodic reports, Research V3, and compiled aggregate Briefs use this contract.
+The legacy non-compiled aggregate path remains Feishu-only because it predates
+the provider-neutral effect authority. Feedback/deep-dive callbacks also remain
+Feishu-only. Product and UAT claims must state these boundaries rather than
+describing this checkpoint as universal delivery for every historical path.
 
 ## Identity and authorization
 
@@ -234,7 +241,7 @@ modalities.
 
 ## Database role boundary
 
-Migrations 133-140 install exact-user RLS policies and revoke the future
+Migrations 133-142 install exact-user RLS policies and revoke the future
 `vane_app` role, but the current primary Store intentionally still runs through
 the repository's schema-owner compatibility DSN. PostgreSQL owners bypass
 non-FORCE RLS, so this branch does **not** count those policies as current

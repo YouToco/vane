@@ -554,7 +554,15 @@
     },
     {
       "path": "140_delivery_channel_preferences.sql",
-      "sha256": "1d641d3da9032b28147787dfd173e5c6ac19548722f2900fd76e1fb5306e97af"
+      "sha256": "3d99e6b7cee80da97f2a2f7efd20e094ed2e68dd44f40109828477769b0657d7"
+    },
+    {
+      "path": "141_artifact_delivery_plans.sql",
+      "sha256": "5663f22f9b27b68d688ebcf8c181cfcd41349297f9baac70a3ea3dde90f6df49"
+    },
+    {
+      "path": "142_aggregate_channel_delivery_effects.sql",
+      "sha256": "ac4ea8ac0fe6a5fd4ccd5c0d90f828c5ba2bce764bbfdd9c28d25b8a1200766d"
     }
   ],
   "schema": "vane.migrations/v1"

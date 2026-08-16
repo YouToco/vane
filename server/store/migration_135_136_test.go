@@ -348,6 +348,26 @@ func TestTelegramRateLimitAndLifecyclePostgres(t *testing.T) {
 		t.Context(), effectID); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("outbound rate limit was claimable early err=%v", err)
 	}
+	if _, err := restarted.ClaimNextTelegramOutbound(
+		t.Context(), "12345"); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("outbound recovery ignored durable next_send_at err=%v", err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`UPDATE channel_outbound_effects
+		    SET next_send_at=clock_timestamp()-interval '1 second'
+		  WHERE effect_id=$1`, effectID); err != nil {
+		t.Fatal(err)
+	}
+	recoveredEffect, err := restarted.ClaimNextTelegramOutbound(
+		t.Context(), "12345")
+	if err != nil || recoveredEffect.EffectID != effectID ||
+		recoveredEffect.Status != "sending" {
+		t.Fatalf("recovered outbound=%+v err=%v", recoveredEffect, err)
+	}
+	if err := restarted.CompleteTelegramOutbound(
+		t.Context(), recoveredEffect, []string{"recovered-1"}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Migration preserves the internal route/session scope and retargets only
 	// effects that have not crossed the provider boundary.
