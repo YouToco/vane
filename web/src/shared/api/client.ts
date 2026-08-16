@@ -123,6 +123,17 @@ export interface TelegramLink {
   expires_at: string;
 }
 
+export type DeliveryChannelSelection = "feishu" | "telegram" | "both";
+
+export interface DeliveryChannelPreference {
+  selection: DeliveryChannelSelection;
+  scope: "default" | "account" | "task";
+  task_id?: string;
+  telegram_route_id?: number;
+  explicit: boolean;
+  updated_at?: string;
+}
+
 export interface VerifyResult {
   credentials_ok: boolean;
   bot_ok: boolean;
@@ -1550,6 +1561,13 @@ export const api = {
   telegramUnlink: () =>
     request<{ ok: boolean }>("/api/telegram/link", { method: "DELETE" }),
   telegramTest: () => post<{ ok: boolean }>("/api/telegram/test"),
+  deliveryChannelPreference: () =>
+    request<DeliveryChannelPreference>("/api/channels/delivery-preference"),
+  patchDeliveryChannelPreference: (selection: DeliveryChannelSelection, telegramRouteId?: number) =>
+    request<DeliveryChannelPreference>("/api/channels/delivery-preference", {
+      method: "PATCH",
+      body: JSON.stringify({ selection, telegram_route_id: telegramRouteId }),
+    }),
   telegramCredentialStatus: () =>
     request<CredentialStatus>("/api/channels/telegram/credentials"),
   telegramRotateCredential: (input: TelegramCredentialInput) =>

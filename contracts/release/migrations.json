@@ -551,6 +551,10 @@
     {
       "path": "139_channel_media_envelope.sql",
       "sha256": "42562f81f630cbc9a10be1116b2d979f818e2b1ad0ae03c7532b4f2c5eae8a83"
+    },
+    {
+      "path": "140_delivery_channel_preferences.sql",
+      "sha256": "1d641d3da9032b28147787dfd173e5c6ac19548722f2900fd76e1fb5306e97af"
     }
   ],
   "schema": "vane.migrations/v1"

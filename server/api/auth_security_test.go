@@ -390,6 +390,8 @@ func TestSec_ProtectedEndpointsRequireSession(t *testing.T) {
 		{http.MethodDelete, "/api/schedules/abc"},
 		{http.MethodGet, "/api/deliveries"},
 		{http.MethodGet, "/api/profile"},
+		{http.MethodGet, "/api/channels/delivery-preference"},
+		{http.MethodPatch, "/api/channels/delivery-preference"},
 		{http.MethodGet, "/api/admin/observability"},
 		{http.MethodGet, "/api/admin/runstats"},
 		{http.MethodGet, "/api/admin/cost-calls"},

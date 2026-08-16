@@ -14,6 +14,8 @@ const apiMock = vi.hoisted(() => ({
   telegramCredentialStatus: vi.fn(),
   telegramRotateCredential: vi.fn(),
   telegramRevokeCredential: vi.fn(),
+  deliveryChannelPreference: vi.fn(),
+  patchDeliveryChannelPreference: vi.fn(),
 }));
 
 vi.mock("@/shared/api/client", () => ({
@@ -22,6 +24,7 @@ vi.mock("@/shared/api/client", () => ({
 }));
 
 import TelegramSetup from "@/pages/TelegramSetup";
+import DeliveryChannelPreferenceCard from "@/pages/DeliveryChannelPreference";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -127,5 +130,60 @@ describe("Telegram settings", () => {
     expect(screen.getByText("/connect opaque-route-token")).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "解除连接" }));
     await waitFor(() => expect(apiMock.telegramRouteUnlink).toHaveBeenCalledWith(7));
+  });
+});
+
+describe("delivery channel preference", () => {
+  test("shows the compatible Feishu default and persists a dual-channel choice", async () => {
+    apiMock.deliveryChannelPreference.mockResolvedValue({
+      selection: "feishu",
+      scope: "account",
+      explicit: false,
+    });
+    apiMock.telegramStatus.mockResolvedValue({
+      enabled: true,
+      ready: true,
+      bound: true,
+      routes: [],
+    });
+    apiMock.patchDeliveryChannelPreference.mockResolvedValue({
+      selection: "both",
+      scope: "account",
+      explicit: true,
+    });
+
+    render(<DeliveryChannelPreferenceCard />);
+    expect(await screen.findByText(/当前沿用兼容默认值：仅飞书/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: /两个渠道/ }));
+    await waitFor(() => expect(apiMock.patchDeliveryChannelPreference).toHaveBeenCalledWith("both", undefined));
+    expect(await screen.findByText(/主动推送运行时完成渠道化后会使用这个选择/)).toBeTruthy();
+  });
+
+  test("persists an exact Telegram topic route", async () => {
+    apiMock.deliveryChannelPreference.mockResolvedValue({
+      selection: "telegram",
+      scope: "account",
+      telegram_route_id: 7,
+      explicit: true,
+    });
+    apiMock.telegramStatus.mockResolvedValue({
+      enabled: true,
+      ready: true,
+      bound: true,
+      routes: [
+        { id: 7, kind: "topic", chat_type: "supergroup", bound_at: "2026-08-15T01:01:00Z" },
+      ],
+    });
+    apiMock.patchDeliveryChannelPreference.mockResolvedValue({
+      selection: "telegram",
+      scope: "account",
+      telegram_route_id: 7,
+      explicit: true,
+    });
+
+    render(<DeliveryChannelPreferenceCard />);
+    expect(await screen.findByRole("option", { name: "论坛话题 #7" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "保存目的地" }));
+    await waitFor(() => expect(apiMock.patchDeliveryChannelPreference).toHaveBeenCalledWith("telegram", 7));
   });
 });

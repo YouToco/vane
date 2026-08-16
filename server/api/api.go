@@ -201,6 +201,8 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/telegram/routes/link", s.handleTelegramRouteLink)
 	inner.HandleFunc("DELETE /api/telegram/routes/{id}", s.handleTelegramRouteUnlink)
 	inner.HandleFunc("POST /api/telegram/test", s.handleTelegramTest)
+	inner.HandleFunc("GET /api/channels/delivery-preference", s.handleGetDeliveryChannelPreference)
+	inner.HandleFunc("PATCH /api/channels/delivery-preference", s.handlePatchDeliveryChannelPreference)
 	inner.HandleFunc("GET /api/channels/telegram/credentials", s.handleTelegramCredentialStatus)
 	inner.HandleFunc("PUT /api/channels/telegram/credentials", s.handleTelegramCredentialPut)
 	inner.HandleFunc("DELETE /api/channels/telegram/credentials", s.handleTelegramCredentialDelete)

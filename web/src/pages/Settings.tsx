@@ -3,6 +3,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Info } from "lucide-react";
 import FeishuSetup from "./FeishuSetup";
 import TelegramSetup from "./TelegramSetup";
+import DeliveryChannelPreferenceCard from "./DeliveryChannelPreference";
 import Profile from "./Profile";
 import { useI18n } from "@/i18n";
 
@@ -40,6 +41,7 @@ export default function Settings({ hash }: { hash: string }) {
               <AlertDescription>{S.channelZhOnly}</AlertDescription>
             </Alert>
           )}
+          <DeliveryChannelPreferenceCard />
           <FeishuSetup />
           <TelegramSetup />
         </TabsContent>

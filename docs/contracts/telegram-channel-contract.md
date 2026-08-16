@@ -1,4 +1,4 @@
-# Telegram Bot channel contract (routed ingress v4)
+# Telegram Bot channel contract (routed ingress v4.1)
 
 Status: implemented, default-off, production UAT pending.
 
@@ -35,6 +35,10 @@ Included in v4:
   frozen route/payload, exact replay, and terminal sent/failed/ambiguous
   settlement. Connection tests use it; future product notifications can reuse
   it without bypassing Telegram's no-blind-retry rule;
+- an account-level outbound preference with `feishu`, `telegram`, and `both`
+  selections, an optional exact Telegram private/group/topic route, and a
+  legacy-compatible implicit `feishu` default. The schema permits an exact
+  task override without making task-level UI part of this checkpoint;
 - explicit media recognition with a safe text-only capability reply; a
   provider-neutral `vane.channel-message/v1` metadata envelope is durably
   frozen with the ingress receipt, while media bytes are not downloaded or
@@ -48,23 +52,27 @@ Included in v4:
   message;
 - authenticated status/link/test/unlink Dashboard APIs and Settings UI.
 
-Not included in v4:
+Not included in v4.1:
 
 - channel-post ingestion, inline queries, Telegram Login, reactions, edits, or
   arbitrary group-member Agent access;
 - media download/native multimodal model submission, feedback/deep-dive domain actions, and
   destructive callbacks. Their transport extension points exist but remain
   fail-closed until their own authority contracts are implemented;
-- Telegram as the primary scheduled Brief/periodic-report delivery policy.
+- Telegram as the primary scheduled Brief/periodic-report delivery policy,
+  feedback/deep-dive message mapping, and task-level delivery-preference UI.
 
-The scheduled-delivery exclusion is deliberate. The transport/outbound effect
-foundation exists, but current approved task definitions still say
-`owner_feishu`, Research V3 target resolution is Feishu-specific, and legacy
-delivery/feedback receipts retain `feishu_message_id`. Telegram `sendMessage`
-has neither the provider UUID nor the arbitrary history lookup used by the
-Feishu recovery contract. Scheduled Telegram delivery therefore requires a
-separate S-level task-policy and provider-receipt migration. Until that is
-implemented and UATed, product feature 4.9 remains `开发中`.
+The scheduled-delivery exclusion is deliberate. This checkpoint persists the
+user's selection and exact Telegram destination, but it does not let runtime
+code consume that preference yet. Current approved task definitions still say
+`owner_feishu`, Research V3 owns one Brief anchor/effect, periodic delivery owns
+one provider receipt, and legacy delivery/feedback receipts retain
+`feishu_message_id`. Telegram `sendMessage` has neither the provider UUID nor
+the arbitrary history lookup used by the Feishu recovery contract. Scheduled
+fan-out therefore remains a separate S-level provider-receipt/recovery
+migration. Until that batch is implemented and UATed, product feature 4.9
+remains `开发中` and this branch is not merge-ready as the complete channel
+abstraction.
 
 ## Identity and authorization
 
@@ -226,7 +234,7 @@ modalities.
 
 ## Database role boundary
 
-Migrations 133-139 install exact-user RLS policies and revoke the future
+Migrations 133-140 install exact-user RLS policies and revoke the future
 `vane_app` role, but the current primary Store intentionally still runs through
 the repository's schema-owner compatibility DSN. PostgreSQL owners bypass
 non-FORCE RLS, so this branch does **not** count those policies as current
@@ -281,7 +289,10 @@ Before changing feature 4.9 from `开发中`, production must prove:
 9. a real 429 honors durable `retry_after` across restart while timeout/5xx
    remains ambiguous and cannot resend;
 10. Feishu owner chat and one existing Feishu delivery still pass regression;
-11. logs/traces contain no bot token, webhook secret or raw private message.
+11. each of `feishu`, `telegram`, and `both` produces exactly the selected
+    periodic-report effects; a chosen forum-topic destination preserves its
+    exact route while a revoked route fails closed;
+12. logs/traces contain no bot token, webhook secret or raw private message.
 
 ## Historical decisions used
 
