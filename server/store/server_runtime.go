@@ -15,13 +15,11 @@ const nativeV3EditRecoveryRuntimeLoginRole = "vane_native_v3_edit_recovery_runti
 const nativeV3EditRecoveryCapabilityRole = "vane_native_v3_edit_recovery"
 const workspaceMemoryRuntimeCapabilityRole = "vane_workspace_memory_editor"
 
-// serverRuntimeCapabilityRoles is the exact always-on set. Workspace memory is
-// deliberately optional for one bridge release: the migration creates its
-// isolated role, but the bridge keeps provisioning v129 so the previous binary
-// can still start on the upgraded schema. A later release may activate the
-// separately verified optional role without making this bridge unsafe as a
-// rollback binary. Paid research execution and retired/provider roles do not
-// belong in the long-lived application process.
+// serverRuntimeCapabilityRoles is the exact always-on set. The preceding
+// bridge release accepted workspace memory as optional, so it remains a safe
+// rollback base after this release activates the separately verified v138
+// role. Paid research execution and retired/provider roles do not belong in
+// the long-lived application process.
 var serverRuntimeCapabilityRoles = []string{
 	"vane_agent_session_projection_operator",
 	"vane_app",
@@ -44,6 +42,7 @@ var serverRuntimeCapabilityRoles = []string{
 	"vane_run_outcome_recovery",
 	"vane_schedule_commander",
 	"vane_snapshot_cutover_operator",
+	workspaceMemoryRuntimeCapabilityRole,
 }
 
 var serverRuntimeForbiddenRoles = []string{
@@ -74,19 +73,18 @@ var serverRuntimeForbiddenReadRelations = []string{
 }
 
 // ProvisionServerRuntime installs the cluster-global runtime shell only after
-// the target database schema has migrated completely. This bridge release
-// intentionally provisions v129 and leaves workspace memory dark; activating
-// v138 requires a later release whose rollback base accepts the optional role.
-// dbURL must authenticate directly as the migration/schema owner.
+// the target database schema has migrated completely. The exact v138 wrapper
+// activates workspace memory after the preceding bridge release established a
+// rollback-safe optional-role verifier. dbURL must authenticate directly as
+// the migration/schema owner.
 func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_v129")
+		ctx, dbURL, "provision_vane_server_runtime_v138")
 }
 
-// DeprovisionServerRuntime accepts either bridge state and removes the optional
-// v138 edge before delegating to v129's exact teardown. The shell must already
-// be NOLOGIN. A dependency error is intentional evidence of drift and is never
-// papered over with DROP OWNED.
+// DeprovisionServerRuntime removes the v138 edge before delegating to v129's
+// exact teardown. The shell must already be NOLOGIN. A dependency error is
+// intentional evidence of drift and is never papered over with DROP OWNED.
 func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
 		ctx, dbURL, "deprovision_vane_server_runtime_v138")
@@ -462,11 +460,6 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 		return err
 	}
 	wantMemberships := slices.Clone(serverRuntimeCapabilityRoles)
-	workspaceMemoryEnabled := slices.Contains(
-		memberships, workspaceMemoryRuntimeCapabilityRole)
-	if workspaceMemoryEnabled {
-		wantMemberships = append(wantMemberships, workspaceMemoryRuntimeCapabilityRole)
-	}
 	slices.Sort(wantMemberships)
 	if !slices.Equal(memberships, wantMemberships) {
 		return fmt.Errorf("server runtime memberships differ: got=%v want=%v",
@@ -475,10 +468,8 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 	if err := verifyMemoryRuntimeAuthority(ctx, tx); err != nil {
 		return err
 	}
-	if workspaceMemoryEnabled {
-		if err := verifyWorkspaceMemoryRuntimeAuthority(ctx, tx); err != nil {
-			return err
-		}
+	if err := verifyWorkspaceMemoryRuntimeAuthority(ctx, tx); err != nil {
+		return err
 	}
 
 	for _, role := range serverRuntimeForbiddenRoles {
@@ -497,9 +488,6 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 	// just as dangerous as a grant to the NOINHERIT session user.
 	authorityRoles := append([]string{serverRuntimeLoginRole},
 		serverRuntimeCapabilityRoles...)
-	if workspaceMemoryEnabled {
-		authorityRoles = append(authorityRoles, workspaceMemoryRuntimeCapabilityRole)
-	}
 	for _, role := range authorityRoles {
 		if err := validateServerRuntimeAuthorityRole(ctx, tx, role); err != nil {
 			return err

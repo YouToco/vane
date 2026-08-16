@@ -593,22 +593,10 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		t.Fatalf("workspace memory policy contract=%s", policyContract)
 	}
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
-		t.Fatalf("provision bridge runtime: %v", err)
+		t.Fatalf("provision v138 runtime: %v", err)
 	}
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
-		t.Fatalf("replay provision bridge runtime: %v", err)
-	}
-	if err := database.QueryRowContext(t.Context(), `SELECT pg_has_role(
-		'vane_server_runtime','vane_workspace_memory_editor','MEMBER')`).Scan(
-		&workspaceRole); err != nil {
-		t.Fatal(err)
-	}
-	if workspaceRole {
-		t.Fatal("bridge provisioner activated workspace memory before a compatible base release")
-	}
-	if _, err := database.ExecContext(t.Context(),
-		`SELECT provision_vane_server_runtime_v138()`); err != nil {
-		t.Fatalf("activate v138 runtime after bridge: %v", err)
+		t.Fatalf("replay provision v138 runtime: %v", err)
 	}
 	if err := database.QueryRowContext(t.Context(), `SELECT pg_has_role(
 		'vane_server_runtime','vane_workspace_memory_editor','MEMBER')`).Scan(
@@ -616,7 +604,7 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !workspaceRole {
-		t.Fatal("explicit v138 activation omitted workspace memory capability")
+		t.Fatal("current provisioner omitted workspace memory capability")
 	}
 	var edgeCount int
 	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_auth_members edge
@@ -650,6 +638,20 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		t.Fatalf("exact v138 runtime rejected: %v", err)
 	}
 	baseline.Close()
+	if _, err := database.ExecContext(t.Context(), `REVOKE vane_workspace_memory_editor
+		FROM vane_server_runtime`); err != nil {
+		t.Fatal(err)
+	}
+	if missing, err := NewServerRuntime(t.Context(), runtimeURL); err == nil {
+		missing.Close()
+		t.Fatal("runtime accepted missing workspace memory capability")
+	} else if !strings.Contains(err.Error(), "memberships differ") {
+		t.Fatalf("unexpected missing workspace capability error: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `GRANT vane_workspace_memory_editor
+		TO vane_server_runtime WITH ADMIN FALSE,SET TRUE,INHERIT FALSE`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := database.ExecContext(t.Context(), `DO $$ BEGIN EXECUTE format(
 		'GRANT CONNECT ON DATABASE %I TO vane_workspace_memory_editor',current_database()); END $$`); err != nil {
 		t.Fatal(err)
@@ -682,7 +684,7 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
-		t.Fatalf("deprovision optional v138 runtime: %v", err)
+		t.Fatalf("deprovision v138 runtime: %v", err)
 	}
 	dry, err := st.PurgeTenant(t.Context(), team, true)
 	if err != nil {
