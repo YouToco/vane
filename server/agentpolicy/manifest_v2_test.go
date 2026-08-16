@@ -78,6 +78,27 @@ func TestManifestV2RejectsTrustEscalationOrAmbiguousVersion(t *testing.T) {
 	}
 }
 
+func TestManifestV2NormalizesEmptySetAndRejectsNullWire(t *testing.T) {
+	compiled, err := CompileV1(CurrentOwnerV1("deepseek", "deepseek-v4-flash"),
+		ToolCatalogV1{SchemaVersion: ToolCatalogSchemaVersionV1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := BuildManifestV2(compiled.Manifest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _, err := EncodeManifestV2(manifest)
+	if err != nil || !bytes.Contains(payload, []byte(`"capability_refs":[]`)) {
+		t.Fatalf("empty manifest=%s err=%v", payload, err)
+	}
+	nullWire := bytes.Replace(payload, []byte(`"capability_refs":[]`),
+		[]byte(`"capability_refs":null`), 1)
+	if _, _, err := DecodeManifestV2(nullWire); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("null capability set err=%v", err)
+	}
+}
+
 func TestLowerTrustSkillRefV2BindsExactSkillIdentity(t *testing.T) {
 	ref := skillruntime.SkillRefV1{
 		SchemaVersion: skillruntime.SkillRefSchemaVersionV1,

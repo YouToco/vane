@@ -73,8 +73,9 @@ func BuildManifestV2(base ManifestV1, refs []LowerTrustCapabilityRefV2) (Manifes
 		SchemaVersion: ManifestSchemaVersionV2, Lane: base.Lane,
 		DefinitionDigest: base.DefinitionDigest, ModuleRefs: slices.Clone(base.ModuleRefs),
 		ModelRouteDigest: base.ModelRouteDigest, ToolCatalogDigest: base.ToolCatalogDigest,
-		CapabilityRefs: slices.Clone(refs),
+		CapabilityRefs: make([]LowerTrustCapabilityRefV2, len(refs)),
 	}
+	copy(manifest.CapabilityRefs, refs)
 	slices.SortFunc(manifest.CapabilityRefs, compareLowerTrustCapabilityRefV2)
 	if err := validateManifestV2(manifest); err != nil {
 		return ManifestV2{}, err
@@ -125,6 +126,7 @@ func validateManifestV2(manifest ManifestV2) error {
 		ModelRouteDigest: manifest.ModelRouteDigest, ToolCatalogDigest: manifest.ToolCatalogDigest,
 	}
 	if manifest.SchemaVersion != ManifestSchemaVersionV2 || validateManifestV1(base) != nil ||
+		manifest.CapabilityRefs == nil ||
 		len(manifest.CapabilityRefs) > 256 {
 		return invalid("manifest v2 header")
 	}

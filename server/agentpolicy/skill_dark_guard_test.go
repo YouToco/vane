@@ -1,10 +1,14 @@
 package agentpolicy
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -18,46 +22,100 @@ func TestSkillRuntimeDarkSliceHasNoProductionCallPoint(t *testing.T) {
 		t.Fatal("resolve guard location")
 	}
 	serverRoot := filepath.Dir(filepath.Dir(thisFile))
-	allowed := map[string]bool{
-		filepath.Join(serverRoot, "agentpolicy", "manifest_v2.go"):  true,
-		filepath.Join(serverRoot, "skillruntime", "codec.go"):       true,
-		filepath.Join(serverRoot, "skillruntime", "contract.go"):    true,
-		filepath.Join(serverRoot, "store", "user_skill_runtime.go"): true,
-	}
-	identifiers := []string{
-		"BuildManifestV2(", "EncodeManifestV2(", "DecodeManifestV2(", "LowerTrustSkillRefV2(",
-		"AddSkillCapabilityVersion(", "ActivateSkillCapability(", "PauseSkillCapability(",
-		"GetSkillCapabilityDetail(", "DiffSkillCapabilityVersions(", "ResolveSkillRef(",
-		"OpenSkillResource(", "ReadSkillResourceChunk(",
-		"EncodeSkillRefV1(", "DecodeSkillRefV1(",
-		"EncodeSkillResourceHandleV1(", "DecodeSkillResourceHandleV1(",
-		"EncodeSkillResourceChunkV1(", "DecodeSkillResourceChunkV1(",
+	definingManifestFile := filepath.Join(serverRoot, "agentpolicy", "manifest_v2.go")
+	identifiers := map[string]bool{
+		"BuildManifestV2": true, "EncodeManifestV2": true, "DecodeManifestV2": true,
+		"LowerTrustSkillRefV2": true, "AddSkillCapabilityVersion": true,
+		"ActivateSkillCapability": true, "PauseSkillCapability": true,
+		"GetSkillCapabilityDetail": true, "DiffSkillCapabilityVersions": true,
+		"ResolveSkillRef": true, "OpenSkillResource": true, "ReadSkillResourceChunk": true,
 	}
 	err := filepath.WalkDir(serverRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() || !strings.HasSuffix(filePath, ".go") ||
-			strings.HasSuffix(filePath, "_test.go") || allowed[filePath] {
+			strings.HasSuffix(filePath, "_test.go") {
 			return nil
 		}
 		payload, readErr := os.ReadFile(filePath)
 		if readErr != nil {
 			return readErr
 		}
-		for _, identifier := range identifiers {
-			if strings.Contains(string(payload), identifier) {
-				t.Errorf("dark Skill runtime gained production call point %s in %s", identifier, filePath)
-			}
+		findings, parseErr := darkSkillProductionReferences(filePath, payload, identifiers,
+			filePath == definingManifestFile)
+		if parseErr != nil {
+			return parseErr
 		}
-		if strings.Contains(string(payload), `github.com/YouToco/vane/server/skillruntime`) {
-			t.Errorf("dark Skill contract imported by production file %s", filePath)
+		for _, finding := range findings {
+			t.Errorf("dark Skill runtime gained production reference %s in %s", finding, filePath)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestSkillRuntimeDarkGuardCatchesMethodValuesAndForwarders(t *testing.T) {
+	blocked := map[string]bool{"ResolveSkillRef": true, "ReadSkillResourceChunk": true}
+	for name, mutation := range map[string]struct {
+		filePath string
+		source   string
+	}{
+		"method value": {
+			filePath: "mutation.go",
+			source:   `package x; func f(s interface{ ResolveSkillRef() }) { x := s.ResolveSkillRef; x() }`,
+		},
+		"interface forwarder": {
+			filePath: "mutation.go",
+			source:   `package x; type S struct{}; func (s S) ReadSkillResourceChunk(){}; func f(s S){ s.ReadSkillResourceChunk() }`,
+		},
+		"wrapper in defining store file": {
+			filePath: filepath.Join("store", "user_skill_runtime.go"),
+			source:   `package store; type Store struct{}; func (s *Store) ReadSkillResourceChunk(){}; func (s *Store) RuntimeRead(){ s.ReadSkillResourceChunk() }`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			findings, err := darkSkillProductionReferences(mutation.filePath,
+				[]byte(mutation.source), blocked, false)
+			if err != nil || len(findings) == 0 {
+				t.Fatalf("findings=%v err=%v", findings, err)
+			}
+		})
+	}
+}
+
+func darkSkillProductionReferences(filePath string, payload []byte, blocked map[string]bool,
+	allowManifestInternals bool,
+) ([]string, error) {
+	parsed, err := parser.ParseFile(token.NewFileSet(), filePath, payload, 0)
+	if err != nil {
+		return nil, err
+	}
+	findings := make([]string, 0)
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		switch value := node.(type) {
+		case *ast.SelectorExpr:
+			if blocked[value.Sel.Name] {
+				findings = append(findings, value.Sel.Name)
+			}
+		case *ast.CallExpr:
+			identifier, ok := value.Fun.(*ast.Ident)
+			if ok && blocked[identifier.Name] && !allowManifestInternals {
+				findings = append(findings, identifier.Name)
+			}
+		case *ast.ImportSpec:
+			importPath, unquoteErr := strconv.Unquote(value.Path.Value)
+			if unquoteErr == nil && importPath == "github.com/YouToco/vane/server/skillruntime" &&
+				!strings.HasSuffix(filePath, filepath.Join("store", "user_skill_runtime.go")) &&
+				!allowManifestInternals {
+				findings = append(findings, "skillruntime import")
+			}
+		}
+		return true
+	})
+	return findings, nil
 }
 
 func TestSkillRuntimeGateOffPreservesCurrentV1AgentBytes(t *testing.T) {

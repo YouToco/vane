@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/server/capabilityruntime"
 	"github.com/YouToco/vane/server/internal/testgate"
 	"github.com/YouToco/vane/server/skillruntime"
 	"github.com/YouToco/vane/server/types"
@@ -49,7 +51,7 @@ func TestSkillRuntimeLifecycleIsolationAndExactResourcePostgres(t *testing.T) {
 	}
 	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
-	if _, err := provider.UpTo(t.Context(), 135); err != nil {
+	if _, err := provider.UpTo(t.Context(), 139); err != nil {
 		t.Fatal(err)
 	}
 
@@ -77,9 +79,41 @@ func TestSkillRuntimeLifecycleIsolationAndExactResourcePostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
+	ownerPrincipal := skillRuntimePrincipal(t, database, teamA, owner, types.MembershipRoleOwner)
+	memberPrincipal := skillRuntimePrincipal(t, database, teamA, member, types.MembershipRoleMember)
 
 	created, v1, err := st.CreateSkillCapability(t.Context(), skillCreateInputForRuntime(
 		teamA, owner, types.UserCapabilityPersonal, "personal-watch", "v1 instructions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ResolveSkillRef(t.Context(), ownerPrincipal, created.ID, v1.ID); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("draft Skill resolved for runtime code=%s err=%v", types.CodeOf(err), err)
+	}
+	draftDetail, err := st.GetSkillCapabilityDetail(t.Context(), teamA, owner, created.ID, v1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.OpenSkillResource(t.Context(), ownerPrincipal, draftDetail.Ref, "SKILL.md"); types.CodeOf(err) != types.CodeNotFound {
+		t.Fatalf("never-activated Skill opened code=%s err=%v", types.CodeOf(err), err)
+	}
+	servicePrincipal := ownerPrincipal
+	servicePrincipal.ActorType = types.ActorTypeServiceAccount
+	servicePrincipal.A2ATokenAuthorityID = uuid.NewString()
+	servicePrincipal.RequiredA2AScope = types.A2AScopeAssistantChat
+	if _, err := st.ResolveSkillRef(t.Context(), servicePrincipal, created.ID, v1.ID); types.CodeOf(err) != types.CodeForbidden {
+		t.Fatalf("service principal runtime code=%s err=%v", types.CodeOf(err), err)
+	}
+	stalePrincipal := ownerPrincipal
+	stalePrincipal.MembershipAuthorizationGeneration++
+	if _, err := st.ResolveSkillRef(t.Context(), stalePrincipal, created.ID, v1.ID); types.CodeOf(err) != types.CodeForbidden {
+		t.Fatalf("stale principal runtime code=%s err=%v", types.CodeOf(err), err)
+	}
+	activateV1 := skillMutationInput(draftDetail, owner, v1.ID, "activate-v1")
+	if _, err := st.ActivateSkillCapability(t.Context(), activateV1); err != nil {
+		t.Fatal(err)
+	}
+	v1Ref, err := st.ResolveSkillRef(t.Context(), ownerPrincipal, created.ID, v1.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,43 +165,72 @@ func TestSkillRuntimeLifecycleIsolationAndExactResourcePostgres(t *testing.T) {
 		diff.Changes[0].Path != "SKILL.md" || diff.Changes[1].Path != "references/guide.md" {
 		t.Fatalf("diff=%+v", diff)
 	}
-	active, err := st.ActivateSkillCapability(t.Context(), teamA, owner, created.ID, v2.ID)
+	activateV2 := skillMutationInput(v1Detail, owner, v2.ID, "activate-v2")
+	active, err := st.ActivateSkillCapability(t.Context(), activateV2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if active.Capability.Status != types.UserCapabilityActive ||
-		active.Capability.CurrentVersionID == nil || *active.Capability.CurrentVersionID != v2.ID ||
-		active.Ref.Validate() != nil {
+	if active.ResultStatus != types.UserCapabilityActive || active.VersionID != v2.ID || active.Replayed {
 		t.Fatalf("active=%+v", active)
 	}
-	if _, err := st.ActivateSkillCapability(t.Context(), teamA, owner, created.ID, v2.ID); err != nil {
+	replayedActivation, err := st.ActivateSkillCapability(t.Context(), activateV2)
+	if err != nil || !replayedActivation.Replayed || replayedActivation.ResultHeadRevision != active.ResultHeadRevision {
 		t.Fatalf("idempotent activation: %v", err)
 	}
 	var activationEvents int
 	if err := database.QueryRowContext(t.Context(), `
-		SELECT count(*) FROM user_capability_events WHERE capability_id=$1 AND event_kind='activated'`,
-		created.ID).Scan(&activationEvents); err != nil || activationEvents != 1 {
+		SELECT count(*) FROM user_capability_events
+		WHERE capability_id=$1 AND version_id=$2 AND event_kind='activated'`,
+		created.ID, v2.ID).Scan(&activationEvents); err != nil || activationEvents != 1 {
 		t.Fatalf("activation events=%d err=%v", activationEvents, err)
 	}
 
-	// Exact historical v1 remains readable after v2 becomes current. A query
+	v3Input := skillAddInputForRuntime(teamA, owner, created.ID, "v3 instructions", "", nil)
+	v3, err := st.AddSkillCapabilityVersion(t.Context(), v3Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Detail, err := st.GetSkillCapabilityDetail(t.Context(), teamA, owner, created.ID, v2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateV3 := skillMutationInput(v2Detail, owner, v3.ID, "activate-v3")
+	if _, err := st.ActivateSkillCapability(t.Context(), activateV3); err != nil {
+		t.Fatal(err)
+	}
+	staleReplay, err := st.ActivateSkillCapability(t.Context(), activateV2)
+	if err != nil || !staleReplay.Replayed {
+		t.Fatalf("lost-response stale activation replay=%+v err=%v", staleReplay, err)
+	}
+	v3Detail, err := st.GetSkillCapabilityDetail(t.Context(), teamA, owner, created.ID, v3.ID)
+	if err != nil || v3Detail.Capability.CurrentVersionID == nil || *v3Detail.Capability.CurrentVersionID != v3.ID {
+		t.Fatalf("stale activation moved head detail=%+v err=%v", v3Detail, err)
+	}
+	conflictingActivate := activateV2
+	conflictingActivate.OperationID = "activate-v2-stale-new-operation"
+	if _, err := st.ActivateSkillCapability(t.Context(), conflictingActivate); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("stale new activation code=%s err=%v", types.CodeOf(err), err)
+	}
+	operationReuse := activateV2
+	operationReuse.VersionID = v3.ID
+	if _, err := st.ActivateSkillCapability(t.Context(), operationReuse); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("operation reuse code=%s err=%v", types.CodeOf(err), err)
+	}
+
+	// Exact historical v1 remains readable after v3 becomes current. A query
 	// that drops capability_version_id would return v2 bytes and fail here.
-	v1Ref, err := st.ResolveSkillRef(t.Context(), teamA, owner, created.ID, v1.ID)
+	v1Handle, err := st.OpenSkillResource(t.Context(), ownerPrincipal, v1Ref, "SKILL.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	v1Handle, err := st.OpenSkillResource(t.Context(), owner, v1Ref, "SKILL.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	v1Chunk, err := st.ReadSkillResourceChunk(t.Context(), owner, v1Handle, 0, 4)
+	v1Chunk, err := st.ReadSkillResourceChunk(t.Context(), ownerPrincipal, v1Handle, 0, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var reconstructed []byte
 	reconstructed = append(reconstructed, v1Chunk.Data...)
 	for !v1Chunk.EOF {
-		v1Chunk, err = st.ReadSkillResourceChunk(t.Context(), owner, v1Handle,
+		v1Chunk, err = st.ReadSkillResourceChunk(t.Context(), ownerPrincipal, v1Handle,
 			int64(len(reconstructed)), 4)
 		if err != nil {
 			t.Fatal(err)
@@ -179,25 +242,49 @@ func TestSkillRuntimeLifecycleIsolationAndExactResourcePostgres(t *testing.T) {
 	}
 	forged := v1Handle
 	forged.ContentDigest = strings.Repeat("f", 64)
-	if _, err := st.ReadSkillResourceChunk(t.Context(), owner, forged, 0, 4); types.CodeOf(err) != types.CodeNotFound {
+	if _, err := st.ReadSkillResourceChunk(t.Context(), ownerPrincipal, forged, 0, 4); types.CodeOf(err) != types.CodeNotFound {
 		t.Fatalf("forged handle code=%s err=%v", types.CodeOf(err), err)
 	}
-	if _, err := st.ReadSkillResourceChunk(t.Context(), member, v1Handle, 0, 4); types.CodeOf(err) != types.CodeNotFound {
+	if _, err := st.ReadSkillResourceChunk(t.Context(), memberPrincipal, v1Handle, 0, 4); types.CodeOf(err) != types.CodeNotFound {
 		t.Fatalf("member read personal bytes code=%s err=%v", types.CodeOf(err), err)
 	}
 
-	paused, err := st.PauseSkillCapability(t.Context(), teamA, owner, created.ID)
-	if err != nil || paused.Status != types.UserCapabilityPaused {
+	pauseV3 := skillMutationInput(v3Detail, owner, v3.ID, "pause-v3-first")
+	paused, err := st.PauseSkillCapability(t.Context(), pauseV3)
+	if err != nil || paused.ResultStatus != types.UserCapabilityPaused || paused.Replayed {
 		t.Fatalf("paused=%+v err=%v", paused, err)
 	}
-	if _, err := st.PauseSkillCapability(t.Context(), teamA, owner, created.ID); err != nil {
-		t.Fatalf("idempotent pause: %v", err)
+	pauseReplay, err := st.PauseSkillCapability(t.Context(), pauseV3)
+	if err != nil || !pauseReplay.Replayed {
+		t.Fatalf("idempotent pause=%+v err=%v", pauseReplay, err)
 	}
-	var pauseEvents int
+	pausedDetail, err := st.GetSkillCapabilityDetail(t.Context(), teamA, owner, created.ID, v3.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reactivateV3 := skillMutationInput(pausedDetail, owner, v3.ID, "reactivate-v3")
+	if _, err := st.ActivateSkillCapability(t.Context(), reactivateV3); err != nil {
+		t.Fatal(err)
+	}
+	stalePauseReplay, err := st.PauseSkillCapability(t.Context(), pauseV3)
+	if err != nil || !stalePauseReplay.Replayed {
+		t.Fatalf("lost-response stale pause replay=%+v err=%v", stalePauseReplay, err)
+	}
+	reactivatedDetail, err := st.GetSkillCapabilityDetail(t.Context(), teamA, owner, created.ID, v3.ID)
+	if err != nil || reactivatedDetail.Capability.Status != types.UserCapabilityActive {
+		t.Fatalf("stale pause changed reactivated head=%+v err=%v", reactivatedDetail, err)
+	}
+	pauseV3Final := skillMutationInput(reactivatedDetail, owner, v3.ID, "pause-v3-final")
+	if _, err := st.PauseSkillCapability(t.Context(), pauseV3Final); err != nil {
+		t.Fatal(err)
+	}
+	var pauseFirstEvents, pauseFinalEvents int
 	if err := database.QueryRowContext(t.Context(), `
-		SELECT count(*) FROM user_capability_events WHERE capability_id=$1 AND event_kind='paused'`,
-		created.ID).Scan(&pauseEvents); err != nil || pauseEvents != 1 {
-		t.Fatalf("pause events=%d err=%v", pauseEvents, err)
+		SELECT count(*) FILTER (WHERE details->>'operation_id'='pause-v3-first'),
+		       count(*) FILTER (WHERE details->>'operation_id'='pause-v3-final')
+		FROM user_capability_events WHERE capability_id=$1 AND event_kind='paused'`,
+		created.ID).Scan(&pauseFirstEvents, &pauseFinalEvents); err != nil || pauseFirstEvents != 1 || pauseFinalEvents != 1 {
+		t.Fatalf("pause events first=%d final=%d err=%v", pauseFirstEvents, pauseFinalEvents, err)
 	}
 
 	scriptInput := skillAddInputForRuntime(teamA, owner, created.ID, "script metadata", "", nil)
@@ -214,7 +301,12 @@ func TestSkillRuntimeLifecycleIsolationAndExactResourcePostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ActivateSkillCapability(t.Context(), teamA, owner, created.ID, scriptVersion.ID); types.CodeOf(err) != types.CodeValidation {
+	pausedFinalDetail, err := st.GetSkillCapabilityDetail(t.Context(), teamA, owner, created.ID, v3.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateScript := skillMutationInput(pausedFinalDetail, owner, scriptVersion.ID, "activate-script")
+	if _, err := st.ActivateSkillCapability(t.Context(), activateScript); types.CodeOf(err) != types.CodeValidation {
 		t.Fatalf("script activation code=%s err=%v", types.CodeOf(err), err)
 	}
 
@@ -227,7 +319,12 @@ func TestSkillRuntimeLifecycleIsolationAndExactResourcePostgres(t *testing.T) {
 	if _, err := st.AddSkillCapabilityVersion(t.Context(), memberInput); types.CodeOf(err) != types.CodeForbidden {
 		t.Fatalf("member add shared version code=%s err=%v", types.CodeOf(err), err)
 	}
-	if _, err := st.ActivateSkillCapability(t.Context(), teamA, member, shared.ID, sharedV1.ID); types.CodeOf(err) != types.CodeForbidden {
+	sharedDetail, err := st.GetSkillCapabilityDetail(t.Context(), teamA, owner, shared.ID, sharedV1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberActivate := skillMutationInput(sharedDetail, member, sharedV1.ID, "member-activate-shared")
+	if _, err := st.ActivateSkillCapability(t.Context(), memberActivate); types.CodeOf(err) != types.CodeForbidden {
 		t.Fatalf("member activate shared code=%s err=%v", types.CodeOf(err), err)
 	}
 	adminInput := skillAddInputForRuntime(teamA, admin, shared.ID, "admin-v2", "", nil)
@@ -235,12 +332,44 @@ func TestSkillRuntimeLifecycleIsolationAndExactResourcePostgres(t *testing.T) {
 	if err != nil || sharedV2.CreatedBy != admin {
 		t.Fatalf("admin v2=%+v err=%v", sharedV2, err)
 	}
-	if _, err := st.ActivateSkillCapability(t.Context(), teamA, admin, shared.ID, sharedV2.ID); err != nil {
+	sharedV1Detail, err := st.GetSkillCapabilityDetail(t.Context(), teamA, owner, shared.ID, sharedV1.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	sharedRef, err := st.ResolveSkillRef(t.Context(), teamA, member, shared.ID, sharedV2.ID)
+	adminActivate := skillMutationInput(sharedV1Detail, admin, sharedV2.ID, "admin-activate-shared-v2")
+	if _, err := st.ActivateSkillCapability(t.Context(), adminActivate); err != nil {
+		t.Fatal(err)
+	}
+	sharedRef, err := st.ResolveSkillRef(t.Context(), memberPrincipal, shared.ID, sharedV2.ID)
 	if err != nil || sharedRef.Visibility != skillruntime.VisibilityWorkspaceV1 {
 		t.Fatalf("member shared ref=%+v err=%v", sharedRef, err)
+	}
+}
+
+func skillRuntimePrincipal(t *testing.T, database *sql.DB, tenantID, userID int64,
+	role types.MembershipRole,
+) capabilityruntime.PrincipalV1 {
+	t.Helper()
+	var generation int64
+	if err := database.QueryRowContext(t.Context(), `
+		SELECT authorization_generation FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+		tenantID, userID).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	return capabilityruntime.PrincipalV1{
+		TenantID: types.TenantID(tenantID), UserID: userID, Role: role,
+		ActorType: types.ActorTypeUser, MembershipAuthorizationGeneration: generation,
+	}
+}
+
+func skillMutationInput(detail *SkillCapabilityDetail, actorUserID int64, versionID uuid.UUID,
+	operationID string,
+) SkillCapabilityMutationInput {
+	return SkillCapabilityMutationInput{
+		TenantID: detail.Capability.TenantID, ActorUserID: actorUserID,
+		CapabilityID: detail.Capability.ID, VersionID: versionID,
+		ExpectedStatus: detail.Capability.Status, ExpectedHeadRevision: detail.HeadRevision,
+		ExpectedCurrentVersionID: *detail.Capability.CurrentVersionID, OperationID: operationID,
 	}
 }
 

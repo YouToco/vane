@@ -3,8 +3,11 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -12,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/server/capabilityruntime"
 	"github.com/YouToco/vane/server/internal/credentialguard"
 	"github.com/YouToco/vane/server/internal/strictjson"
 	"github.com/YouToco/vane/server/skillruntime"
@@ -43,11 +47,12 @@ type SkillResourceMetadata struct {
 // SkillCapabilityDetail contains exact immutable metadata only. Resource
 // bytes require the separate scoped handle/chunk reader.
 type SkillCapabilityDetail struct {
-	Capability types.UserCapability         `json:"capability"`
-	Version    types.UserCapabilityVersion  `json:"version"`
-	Skill      types.SkillCapabilityVersion `json:"skill"`
-	Ref        skillruntime.SkillRefV1      `json:"ref"`
-	Resources  []SkillResourceMetadata      `json:"resources"`
+	Capability   types.UserCapability         `json:"capability"`
+	Version      types.UserCapabilityVersion  `json:"version"`
+	Skill        types.SkillCapabilityVersion `json:"skill"`
+	Ref          skillruntime.SkillRefV1      `json:"ref"`
+	Resources    []SkillResourceMetadata      `json:"resources"`
+	HeadRevision string                       `json:"head_revision"`
 }
 
 type SkillResourceChange struct {
@@ -63,6 +68,31 @@ type SkillCapabilityDiff struct {
 	ManifestChanged bool                  `json:"manifest_changed"`
 	SkillMDChanged  bool                  `json:"skill_md_changed"`
 	Changes         []SkillResourceChange `json:"changes"`
+}
+
+type SkillCapabilityMutationInput struct {
+	TenantID                 int64
+	ActorUserID              int64
+	CapabilityID             uuid.UUID
+	VersionID                uuid.UUID
+	ExpectedStatus           types.UserCapabilityStatus
+	ExpectedCurrentVersionID uuid.UUID
+	ExpectedHeadRevision     string
+	OperationID              string
+}
+
+type SkillCapabilityMutationReceipt struct {
+	OperationID          string                     `json:"operation_id"`
+	Action               string                     `json:"action"`
+	ActorUserID          int64                      `json:"actor_user_id"`
+	CapabilityID         uuid.UUID                  `json:"capability_id"`
+	VersionID            uuid.UUID                  `json:"version_id"`
+	BaseStatus           types.UserCapabilityStatus `json:"base_status"`
+	BaseCurrentVersionID uuid.UUID                  `json:"base_current_version_id"`
+	ResultStatus         types.UserCapabilityStatus `json:"result_status"`
+	BaseHeadRevision     string                     `json:"base_head_revision"`
+	ResultHeadRevision   string                     `json:"result_head_revision"`
+	Replayed             bool                       `json:"replayed"`
 }
 
 func (s *Store) AddSkillCapabilityVersion(ctx context.Context, input AddSkillCapabilityVersionInput) (*types.UserCapabilityVersion, error) {
@@ -135,23 +165,37 @@ func (s *Store) AddSkillCapabilityVersion(ctx context.Context, input AddSkillCap
 }
 
 // ActivateSkillCapability selects one exact compatible declarative version.
-// Script-bearing versions can never pass this transition.
-func (s *Store) ActivateSkillCapability(ctx context.Context, tenantID, actorUserID int64,
-	capabilityID, versionID uuid.UUID,
-) (*SkillCapabilityDetail, error) {
-	if tenantID <= 0 || actorUserID <= 0 || capabilityID == uuid.Nil || versionID == uuid.Nil {
-		return nil, capabilityValidation("Skill activation is invalid")
+// The expected head and stable operation ID make response-loss retry an exact
+// receipt replay rather than a stale state transition.
+func (s *Store) ActivateSkillCapability(ctx context.Context,
+	input SkillCapabilityMutationInput,
+) (*SkillCapabilityMutationReceipt, error) {
+	if err := validateSkillMutationInput(input); err != nil {
+		return nil, err
 	}
-	tx, role, err := s.beginCapabilityTx(ctx, tenantID, actorUserID)
+	tx, role, err := s.beginCapabilityTx(ctx, input.TenantID, input.ActorUserID)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	head, err := lockSkillCapabilityForMutation(ctx, tx, tenantID, actorUserID, role, capabilityID)
+	head, err := lockSkillCapabilityForMutation(ctx, tx, input.TenantID, input.ActorUserID,
+		role, input.CapabilityID)
 	if err != nil {
 		return nil, err
 	}
-	detail, err := querySkillCapabilityDetailTx(ctx, tx, *head, versionID)
+	if receipt, err := replaySkillMutationReceiptTx(ctx, tx, *head, input, "activate"); err != nil || receipt != nil {
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, capabilityDatabase("commit Skill activation replay", err)
+		}
+		return receipt, nil
+	}
+	if err := matchExpectedSkillHead(*head, input); err != nil {
+		return nil, err
+	}
+	detail, err := querySkillCapabilityDetailTx(ctx, tx, *head, input.VersionID)
 	if err != nil {
 		return nil, err
 	}
@@ -159,62 +203,92 @@ func (s *Store) ActivateSkillCapability(ctx context.Context, tenantID, actorUser
 		validateResolvedSkillDetail(detail) != nil {
 		return nil, capabilityValidation("Skill version is not declarative-runtime compatible")
 	}
-	if head.Status != types.UserCapabilityActive || head.CurrentVersionID == nil ||
-		*head.CurrentVersionID != versionID {
-		if _, err := tx.Exec(ctx, `
-			UPDATE user_capabilities
-			SET current_version_id=$2,status='active',updated_at=clock_timestamp()
-			WHERE tenant_id=$1 AND id=$3`, tenantID, versionID, capabilityID); err != nil {
-			return nil, capabilityDatabase("activate Skill capability", err)
-		}
-		if err := appendSkillCapabilityEvent(ctx, tx, *head, actorUserID,
-			"activated", &versionID, map[string]any{"version": detail.Version.Version}); err != nil {
-			return nil, err
-		}
+	baseRevision := skillCapabilityHeadRevision(*head)
+	var resultUpdatedAt = head.UpdatedAt
+	if err := tx.QueryRow(ctx, `
+		UPDATE user_capabilities
+		SET current_version_id=$2,status='active',updated_at=clock_timestamp()
+		WHERE tenant_id=$1 AND id=$3
+		RETURNING updated_at`, input.TenantID, input.VersionID, input.CapabilityID).Scan(&resultUpdatedAt); err != nil {
+		return nil, capabilityDatabase("activate Skill capability", err)
 	}
-	head.Status = types.UserCapabilityActive
-	head.CurrentVersionID = &versionID
-	detail.Capability = *head
+	resultHead := *head
+	resultHead.Status = types.UserCapabilityActive
+	resultHead.CurrentVersionID = &input.VersionID
+	resultHead.UpdatedAt = resultUpdatedAt
+	receipt := SkillCapabilityMutationReceipt{
+		OperationID: input.OperationID, Action: "activate", ActorUserID: input.ActorUserID,
+		CapabilityID: input.CapabilityID, VersionID: input.VersionID, BaseStatus: head.Status,
+		BaseCurrentVersionID: input.ExpectedCurrentVersionID, ResultStatus: types.UserCapabilityActive,
+		BaseHeadRevision: baseRevision, ResultHeadRevision: skillCapabilityHeadRevision(resultHead),
+	}
+	if err := appendSkillMutationReceiptEvent(ctx, tx, *head, input.ActorUserID,
+		"activated", receipt); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, capabilityDatabase("commit Skill activation", err)
 	}
-	return detail, nil
+	return &receipt, nil
 }
 
-func (s *Store) PauseSkillCapability(ctx context.Context, tenantID, actorUserID int64,
-	capabilityID uuid.UUID,
-) (*types.UserCapability, error) {
-	if tenantID <= 0 || actorUserID <= 0 || capabilityID == uuid.Nil {
-		return nil, capabilityValidation("Skill pause is invalid")
+func (s *Store) PauseSkillCapability(ctx context.Context,
+	input SkillCapabilityMutationInput,
+) (*SkillCapabilityMutationReceipt, error) {
+	if err := validateSkillMutationInput(input); err != nil {
+		return nil, err
 	}
-	tx, role, err := s.beginCapabilityTx(ctx, tenantID, actorUserID)
+	tx, role, err := s.beginCapabilityTx(ctx, input.TenantID, input.ActorUserID)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	head, err := lockSkillCapabilityForMutation(ctx, tx, tenantID, actorUserID, role, capabilityID)
+	head, err := lockSkillCapabilityForMutation(ctx, tx, input.TenantID, input.ActorUserID,
+		role, input.CapabilityID)
 	if err != nil {
 		return nil, err
 	}
-	if head.Status != types.UserCapabilityActive && head.Status != types.UserCapabilityPaused {
-		return nil, capabilityValidation("only an active Skill capability can be paused")
-	}
-	if head.Status == types.UserCapabilityActive {
-		if _, err := tx.Exec(ctx, `
-			UPDATE user_capabilities SET status='paused',updated_at=clock_timestamp()
-			WHERE tenant_id=$1 AND id=$2`, tenantID, capabilityID); err != nil {
-			return nil, capabilityDatabase("pause Skill capability", err)
-		}
-		if err := appendSkillCapabilityEvent(ctx, tx, *head, actorUserID,
-			"paused", head.CurrentVersionID, nil); err != nil {
+	if receipt, err := replaySkillMutationReceiptTx(ctx, tx, *head, input, "pause"); err != nil || receipt != nil {
+		if err != nil {
 			return nil, err
 		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, capabilityDatabase("commit Skill pause replay", err)
+		}
+		return receipt, nil
 	}
-	head.Status = types.UserCapabilityPaused
+	if err := matchExpectedSkillHead(*head, input); err != nil {
+		return nil, err
+	}
+	if head.Status != types.UserCapabilityActive || head.CurrentVersionID == nil ||
+		*head.CurrentVersionID != input.VersionID {
+		return nil, capabilityValidation("only an active Skill capability can be paused")
+	}
+	baseRevision := skillCapabilityHeadRevision(*head)
+	var resultUpdatedAt = head.UpdatedAt
+	if err := tx.QueryRow(ctx, `
+		UPDATE user_capabilities SET status='paused',updated_at=clock_timestamp()
+		WHERE tenant_id=$1 AND id=$2 RETURNING updated_at`,
+		input.TenantID, input.CapabilityID).Scan(&resultUpdatedAt); err != nil {
+		return nil, capabilityDatabase("pause Skill capability", err)
+	}
+	resultHead := *head
+	resultHead.Status = types.UserCapabilityPaused
+	resultHead.UpdatedAt = resultUpdatedAt
+	receipt := SkillCapabilityMutationReceipt{
+		OperationID: input.OperationID, Action: "pause", ActorUserID: input.ActorUserID,
+		CapabilityID: input.CapabilityID, VersionID: input.VersionID, BaseStatus: head.Status,
+		BaseCurrentVersionID: input.ExpectedCurrentVersionID, ResultStatus: types.UserCapabilityPaused,
+		BaseHeadRevision: baseRevision, ResultHeadRevision: skillCapabilityHeadRevision(resultHead),
+	}
+	if err := appendSkillMutationReceiptEvent(ctx, tx, *head, input.ActorUserID,
+		"paused", receipt); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, capabilityDatabase("commit Skill pause", err)
 	}
-	return head, nil
+	return &receipt, nil
 }
 
 func (s *Store) GetSkillCapabilityDetail(ctx context.Context, tenantID, actorUserID int64,
@@ -282,31 +356,47 @@ func (s *Store) DiffSkillCapabilityVersions(ctx context.Context, tenantID, actor
 	return diff, nil
 }
 
-// ResolveSkillRef returns an exact compatible no-script identity. It does not
-// make the resource model-visible and does not require the version to remain
-// the mutable current head, so frozen historical runs can replay exact bytes.
-func (s *Store) ResolveSkillRef(ctx context.Context, tenantID, actorUserID int64,
+// ResolveSkillRef returns the exact compatible no-script identity currently
+// selected by an active capability head. It does not make resource bytes
+// model-visible. Frozen historical runs retain the resolved ref and replay it
+// through the exact-version resource reader.
+func (s *Store) ResolveSkillRef(ctx context.Context, principal capabilityruntime.PrincipalV1,
 	capabilityID, versionID uuid.UUID,
 ) (skillruntime.SkillRefV1, error) {
-	detail, err := s.GetSkillCapabilityDetail(ctx, tenantID, actorUserID, capabilityID, versionID)
+	tx, err := s.beginSkillRuntimeTx(ctx, principal)
 	if err != nil {
 		return skillruntime.SkillRefV1{}, err
 	}
-	if err := detail.Ref.Validate(); err != nil || validateResolvedSkillDetail(detail) != nil {
+	defer func() { _ = tx.Rollback(ctx) }()
+	head, err := queryVisibleSkillHeadTx(ctx, tx, int64(principal.TenantID), capabilityID, false)
+	if err != nil {
+		return skillruntime.SkillRefV1{}, err
+	}
+	detail, err := querySkillCapabilityDetailTx(ctx, tx, *head, versionID)
+	if err != nil {
+		return skillruntime.SkillRefV1{}, err
+	}
+	if detail.Capability.Status != types.UserCapabilityActive ||
+		detail.Capability.CurrentVersionID == nil || *detail.Capability.CurrentVersionID != versionID ||
+		detail.Ref.Validate() != nil || validateResolvedSkillDetail(detail) != nil {
 		return skillruntime.SkillRefV1{}, capabilityValidation("Skill version is not runtime compatible")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return skillruntime.SkillRefV1{}, capabilityDatabase("commit Skill ref resolution", err)
 	}
 	return detail.Ref, nil
 }
 
 // OpenSkillResource validates the complete exact Skill reference again before
 // returning a byte-free resource handle.
-func (s *Store) OpenSkillResource(ctx context.Context, actorUserID int64,
+func (s *Store) OpenSkillResource(ctx context.Context, principal capabilityruntime.PrincipalV1,
 	ref skillruntime.SkillRefV1, resourcePath string,
 ) (skillruntime.SkillResourceHandleV1, error) {
-	if actorUserID <= 0 || ref.Validate() != nil || !utf8.ValidString(resourcePath) {
+	if ref.Validate() != nil || !utf8.ValidString(resourcePath) ||
+		int64(principal.TenantID) != ref.TenantID {
 		return skillruntime.SkillResourceHandleV1{}, capabilityValidation("Skill resource request is invalid")
 	}
-	tx, _, err := s.beginCapabilityTx(ctx, ref.TenantID, actorUserID)
+	tx, err := s.beginSkillRuntimeTx(ctx, principal)
 	if err != nil {
 		return skillruntime.SkillResourceHandleV1{}, err
 	}
@@ -316,9 +406,15 @@ func (s *Store) OpenSkillResource(ctx context.Context, actorUserID int64,
 		return skillruntime.SkillResourceHandleV1{}, err
 	}
 	detail, err := querySkillCapabilityDetailTx(ctx, tx, *head, ref.CapabilityVersionID)
-	if err != nil || detail.Ref != ref || validateResolvedSkillDetail(detail) != nil {
+	activated, activationErr := skillVersionWasActivatedTx(ctx, tx, ref.TenantID,
+		ref.CapabilityID, ref.CapabilityVersionID)
+	if err != nil || activationErr != nil || !activated || detail.Ref != ref ||
+		validateResolvedSkillDetail(detail) != nil {
 		if err != nil {
 			return skillruntime.SkillResourceHandleV1{}, err
+		}
+		if activationErr != nil {
+			return skillruntime.SkillResourceHandleV1{}, activationErr
 		}
 		return skillruntime.SkillResourceHandleV1{}, capabilityNotFound("exact Skill reference is unavailable")
 	}
@@ -352,14 +448,14 @@ func (s *Store) OpenSkillResource(ctx context.Context, actorUserID int64,
 // ReadSkillResourceChunk returns at most 64 KiB and re-proves the exact Skill
 // ref plus resource metadata on every call. No production caller is wired in
 // the dark slice.
-func (s *Store) ReadSkillResourceChunk(ctx context.Context, actorUserID int64,
+func (s *Store) ReadSkillResourceChunk(ctx context.Context, principal capabilityruntime.PrincipalV1,
 	handle skillruntime.SkillResourceHandleV1, offset int64, limit int,
 ) (skillruntime.SkillResourceChunkV1, error) {
-	if actorUserID <= 0 || handle.Validate() != nil || offset < 0 ||
+	if handle.Validate() != nil || int64(principal.TenantID) != handle.Skill.TenantID || offset < 0 ||
 		offset > handle.ContentSize || limit <= 0 || limit > skillruntime.MaxResourceChunkBytesV1 {
 		return skillruntime.SkillResourceChunkV1{}, capabilityValidation("Skill resource chunk request is invalid")
 	}
-	tx, _, err := s.beginCapabilityTx(ctx, handle.Skill.TenantID, actorUserID)
+	tx, err := s.beginSkillRuntimeTx(ctx, principal)
 	if err != nil {
 		return skillruntime.SkillResourceChunkV1{}, err
 	}
@@ -369,9 +465,15 @@ func (s *Store) ReadSkillResourceChunk(ctx context.Context, actorUserID int64,
 		return skillruntime.SkillResourceChunkV1{}, err
 	}
 	detail, err := querySkillCapabilityDetailTx(ctx, tx, *head, handle.Skill.CapabilityVersionID)
-	if err != nil || detail.Ref != handle.Skill || validateResolvedSkillDetail(detail) != nil {
+	activated, activationErr := skillVersionWasActivatedTx(ctx, tx, handle.Skill.TenantID,
+		handle.Skill.CapabilityID, handle.Skill.CapabilityVersionID)
+	if err != nil || activationErr != nil || !activated || detail.Ref != handle.Skill ||
+		validateResolvedSkillDetail(detail) != nil {
 		if err != nil {
 			return skillruntime.SkillResourceChunkV1{}, err
+		}
+		if activationErr != nil {
+			return skillruntime.SkillResourceChunkV1{}, activationErr
 		}
 		return skillruntime.SkillResourceChunkV1{}, capabilityNotFound("exact Skill reference is unavailable")
 	}
@@ -638,7 +740,22 @@ func querySkillCapabilityDetailTx(ctx context.Context, tx pgx.Tx, head types.Use
 		FileManifestDigest: fileManifestDigest, Compatible: detail.Version.Compatible,
 		ContainsScripts: detail.Skill.ContainsScripts,
 	}
+	detail.HeadRevision = skillCapabilityHeadRevision(head)
 	return detail, nil
+}
+
+func skillVersionWasActivatedTx(ctx context.Context, tx pgx.Tx, tenantID int64,
+	capabilityID, versionID uuid.UUID,
+) (bool, error) {
+	var activated bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+		 SELECT 1 FROM user_capability_events
+		 WHERE tenant_id=$1 AND capability_id=$2 AND version_id=$3 AND event_kind='activated')`,
+		tenantID, capabilityID, versionID).Scan(&activated); err != nil {
+		return false, capabilityDatabase("verify Skill activation history", err)
+	}
+	return activated, nil
 }
 
 func diffSkillResources(from, to []SkillResourceMetadata) []SkillResourceChange {
@@ -696,6 +813,189 @@ func appendSkillCapabilityEvent(ctx context.Context, tx pgx.Tx, head types.UserC
 		return capabilityDatabase("append Skill capability event", err)
 	}
 	return nil
+}
+
+func appendSkillMutationReceiptEvent(ctx context.Context, tx pgx.Tx, head types.UserCapability,
+	actorUserID int64, eventKind string, receipt SkillCapabilityMutationReceipt,
+) error {
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return capabilityValidation("Skill mutation receipt is invalid")
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO user_capability_events(
+		 tenant_id,capability_id,owner_user_id,visibility,actor_user_id,event_kind,version_id,details)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+		head.TenantID, head.ID, head.OwnerUserID, head.Visibility, actorUserID,
+		eventKind, receipt.VersionID, payload)
+	if err != nil {
+		return capabilityDatabase("append Skill mutation receipt", err)
+	}
+	return nil
+}
+
+func replaySkillMutationReceiptTx(ctx context.Context, tx pgx.Tx, head types.UserCapability,
+	input SkillCapabilityMutationInput, action string,
+) (*SkillCapabilityMutationReceipt, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT details FROM user_capability_events
+		WHERE tenant_id=$1 AND capability_id=$2 AND details->>'operation_id'=$3
+		ORDER BY id`, head.TenantID, head.ID, input.OperationID)
+	if err != nil {
+		return nil, capabilityDatabase("load Skill mutation receipt", err)
+	}
+	defer rows.Close()
+	var receipts []SkillCapabilityMutationReceipt
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, capabilityDatabase("scan Skill mutation receipt", err)
+		}
+		var receipt SkillCapabilityMutationReceipt
+		if err := json.Unmarshal(payload, &receipt); err != nil {
+			return nil, capabilityDatabase("decode Skill mutation receipt", err)
+		}
+		receipts = append(receipts, receipt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, capabilityDatabase("iterate Skill mutation receipts", err)
+	}
+	if len(receipts) == 0 {
+		return nil, nil
+	}
+	if len(receipts) != 1 {
+		return nil, types.NewAppError(types.CodeConflict,
+			"duplicate Skill mutation receipt", types.ErrConflict)
+	}
+	receipt := receipts[0]
+	expectedResultStatus := types.UserCapabilityActive
+	if action == "pause" {
+		expectedResultStatus = types.UserCapabilityPaused
+	}
+	if receipt.OperationID != input.OperationID || receipt.Action != action ||
+		receipt.ActorUserID != input.ActorUserID || receipt.CapabilityID != input.CapabilityID ||
+		receipt.VersionID != input.VersionID ||
+		receipt.BaseStatus != input.ExpectedStatus ||
+		receipt.BaseCurrentVersionID != input.ExpectedCurrentVersionID ||
+		receipt.BaseHeadRevision != input.ExpectedHeadRevision ||
+		receipt.ResultStatus != expectedResultStatus ||
+		!validSHA256(receipt.ResultHeadRevision) {
+		return nil, types.NewAppError(types.CodeConflict,
+			"Skill operation ID belongs to another mutation", types.ErrConflict)
+	}
+	receipt.Replayed = true
+	return &receipt, nil
+}
+
+func validateSkillMutationInput(input SkillCapabilityMutationInput) error {
+	if input.TenantID <= 0 || input.ActorUserID <= 0 || input.CapabilityID == uuid.Nil ||
+		input.VersionID == uuid.Nil || input.ExpectedCurrentVersionID == uuid.Nil ||
+		!validSkillCapabilityStatus(input.ExpectedStatus) || !validSHA256(input.ExpectedHeadRevision) ||
+		!validSkillOperationID(input.OperationID) {
+		return capabilityValidation("Skill lifecycle mutation is invalid")
+	}
+	return nil
+}
+
+func validSkillCapabilityStatus(status types.UserCapabilityStatus) bool {
+	switch status {
+	case types.UserCapabilityDraft, types.UserCapabilityActive,
+		types.UserCapabilityPaused, types.UserCapabilityIncompatible:
+		return true
+	default:
+		return false
+	}
+}
+
+func matchExpectedSkillHead(head types.UserCapability, input SkillCapabilityMutationInput) error {
+	if head.Status != input.ExpectedStatus || head.CurrentVersionID == nil ||
+		*head.CurrentVersionID != input.ExpectedCurrentVersionID ||
+		skillCapabilityHeadRevision(head) != input.ExpectedHeadRevision {
+		return types.NewAppError(types.CodeConflict,
+			"Skill capability head changed after the request was prepared", types.ErrConflict)
+	}
+	return nil
+}
+
+func validSkillOperationID(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for i := range len(value) {
+		b := value[i]
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+			(b >= '0' && b <= '9') || b == '-' || b == '_' || b == '.' || b == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func skillCapabilityHeadRevision(head types.UserCapability) string {
+	type headRevisionV1 struct {
+		SchemaVersion    string                         `json:"schema_version"`
+		TenantID         int64                          `json:"tenant_id"`
+		CapabilityID     uuid.UUID                      `json:"capability_id"`
+		OwnerUserID      int64                          `json:"owner_user_id"`
+		Visibility       types.UserCapabilityVisibility `json:"visibility"`
+		Status           types.UserCapabilityStatus     `json:"status"`
+		CurrentVersionID *uuid.UUID                     `json:"current_version_id"`
+		UpdatedAt        string                         `json:"updated_at"`
+	}
+	payload, _ := json.Marshal(headRevisionV1{
+		SchemaVersion: "vane.skill-capability-head/v1", TenantID: head.TenantID,
+		CapabilityID: head.ID, OwnerUserID: head.OwnerUserID, Visibility: head.Visibility,
+		Status: head.Status, CurrentVersionID: head.CurrentVersionID,
+		UpdatedAt: head.UpdatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+	})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Store) beginSkillRuntimeTx(ctx context.Context,
+	principal capabilityruntime.PrincipalV1,
+) (pgx.Tx, error) {
+	if principal.ActorType != types.ActorTypeUser || principal.TenantID <= 0 ||
+		principal.UserID <= 0 || !principal.Role.Valid() ||
+		principal.MembershipAuthorizationGeneration <= 0 ||
+		principal.A2ATokenAuthorityID != "" || principal.RequiredA2AScope != "" {
+		return nil, capabilityForbidden("human user Principal is required for declarative Skill runtime")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, capabilityDatabase("begin Skill runtime transaction", err)
+	}
+	var liveRole types.MembershipRole
+	var liveGeneration int64
+	err = tx.QueryRow(ctx, `
+		SELECT m.role,m.authorization_generation
+		FROM memberships m JOIN tenants t ON t.id=m.tenant_id
+		WHERE m.tenant_id=$1 AND m.user_id=$2 AND t.status='active' AND t.deleted_at IS NULL
+		FOR SHARE OF m,t`, principal.TenantID, principal.UserID).Scan(&liveRole, &liveGeneration)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, capabilityForbidden("live Skill runtime membership is required")
+		}
+		return nil, capabilityDatabase("reprove Skill runtime Principal", err)
+	}
+	if liveRole != principal.Role || liveGeneration != principal.MembershipAuthorizationGeneration {
+		_ = tx.Rollback(ctx)
+		return nil, capabilityForbidden("Skill runtime Principal authority changed")
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true),
+		       set_config('app.membership_role',$3,true)`,
+		fmt.Sprint(principal.TenantID), fmt.Sprint(principal.UserID), string(liveRole)); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, capabilityDatabase("set Skill runtime scope", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, capabilityDatabase("enter Skill runtime role", err)
+	}
+	return tx, nil
 }
 
 func capabilityNotFound(message string) error {
