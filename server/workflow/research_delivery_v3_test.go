@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/YouToco/vane/server/pusheffect"
 	storepkg "github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
@@ -14,18 +16,67 @@ import (
 
 type researchDeliveryStoreFakeV3 struct {
 	researchDeliveryStoreV3
-	anchor       storepkg.ResearchBriefDeliveryV3
-	effect       *pusheffect.Effect
-	prepareCalls int
-	claimCalls   int
-	settleCalls  int
-	ambiguous    bool
+	preference    storepkg.DeliveryChannelPreference
+	plan          storepkg.ArtifactDeliveryPlan
+	outboundCalls int
+	anchor        storepkg.ResearchBriefDeliveryV3
+	effect        *pusheffect.Effect
+	prepareCalls  int
+	claimCalls    int
+	settleCalls   int
+	ambiguous     bool
+	payloadErr    error
+	preferenceErr error
+	planErr       error
+	outboundErr   error
+}
+
+func (f *researchDeliveryStoreFakeV3) ResolveDeliveryChannelPreference(
+	context.Context, int64, int64, string,
+) (storepkg.DeliveryChannelPreference, error) {
+	if f.preferenceErr != nil {
+		return storepkg.DeliveryChannelPreference{}, f.preferenceErr
+	}
+	if f.preference.Selection.Valid() {
+		return f.preference, nil
+	}
+	return storepkg.DeliveryChannelPreference{
+		Selection: storepkg.DeliveryChannelFeishu,
+	}, nil
+}
+
+func (f *researchDeliveryStoreFakeV3) PrepareArtifactDeliveryPlan(
+	_ context.Context, tenantID, userID int64, taskID, kind, key string,
+	preference storepkg.DeliveryChannelPreference,
+) (storepkg.ArtifactDeliveryPlan, error) {
+	if f.planErr != nil {
+		return storepkg.ArtifactDeliveryPlan{}, f.planErr
+	}
+	if f.plan.ID != "" {
+		return f.plan, nil
+	}
+	return storepkg.ArtifactDeliveryPlan{
+		ID:       "071ac64e-65af-56a5-a2a5-1f4a3b440c39",
+		TenantID: tenantID, UserID: userID, TaskID: taskID,
+		ArtifactKind: kind, ArtifactKey: key,
+		Selection: preference.Selection,
+	}, nil
+}
+
+func (f *researchDeliveryStoreFakeV3) PrepareTelegramOutbound(
+	context.Context, int64, int64, int64, string, string, string,
+) (storepkg.ChannelOutboundEffect, error) {
+	f.outboundCalls++
+	return storepkg.ChannelOutboundEffect{}, f.outboundErr
 }
 
 func (f *researchDeliveryStoreFakeV3) LoadResearchBriefPayloadForDeliveryV3(
 	context.Context, types.RunIdentity, types.ResearchRunSnapshotRefV3,
 	types.ResearchRunPlanRefV3, types.ResearchBriefRefV3,
 ) (types.ResearchBriefPayloadV3, error) {
+	if f.payloadErr != nil {
+		return types.ResearchBriefPayloadV3{}, f.payloadErr
+	}
 	return types.ResearchBriefPayloadV3{
 		SchemaVersion: types.ResearchBriefPayloadSchemaV3,
 		Headline:      "Kimi update", Summary: "Kimi now has a material pricing update.",
@@ -117,6 +168,22 @@ func (f *researchDeliverySenderFakeV3) PushWithUUID(
 }
 
 type researchDeliveryTargetFakeV3 struct{}
+
+type researchTelegramSenderFakeV3 struct {
+	calls   int
+	routeID int64
+	body    string
+	err     error
+}
+
+func (f *researchTelegramSenderFakeV3) SendTextEffect(
+	_ context.Context, _, _ int64, routeID int64,
+	_, _ string, body string,
+) error {
+	f.calls++
+	f.routeID, f.body = routeID, body
+	return f.err
+}
 
 func (researchDeliveryTargetFakeV3) ResearchDeliveryTargetV3(
 	context.Context, types.RunIdentity,
@@ -240,5 +307,108 @@ func TestReceiptBackedResearchDeliveryV3QuietHasZeroEffects(t *testing.T) {
 	if store.prepareCalls != 0 || store.claimCalls != 0 || sender.calls != 0 {
 		t.Fatalf("quiet Brief effects prepare=%d claim=%d send=%d",
 			store.prepareCalls, store.claimCalls, sender.calls)
+	}
+}
+
+func TestReceiptBackedResearchDeliveryV3TelegramOnly(t *testing.T) {
+	st, identity, snapshot, plan, brief := newResearchDeliveryFakeV3(t)
+	routeID := int64(73)
+	st.preference = storepkg.DeliveryChannelPreference{
+		Selection:       storepkg.DeliveryChannelTelegram,
+		TelegramRouteID: &routeID,
+	}
+	st.plan = storepkg.ArtifactDeliveryPlan{
+		ID:              "40dbdcdf-84e4-530f-a76d-fd2e233622ac",
+		Selection:       storepkg.DeliveryChannelTelegram,
+		TelegramRouteID: &routeID,
+	}
+	delivery, err := NewReceiptBackedResearchDeliveryV3(st,
+		&researchDeliverySenderFakeV3{}, researchDeliveryTargetFakeV3{},
+		func(types.ResearchBriefPayloadV3) ([]byte, error) {
+			return []byte(`{"schema":"2.0"}`), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg := &researchTelegramSenderFakeV3{}
+	delivery.SetTelegramDelivery(tg, func(payload types.ResearchBriefPayloadV3) (string, error) {
+		return payload.Headline + "\n" + payload.Summary, nil
+	})
+	receipt, err := delivery.Deliver(t.Context(), identity, snapshot, plan, brief, "trace-v3")
+	if err != nil || receipt.PlanID != st.plan.ID || receipt.DeliveryID != 0 ||
+		receipt.Validate(brief.BriefID) != nil || tg.calls != 1 ||
+		tg.routeID != routeID || st.outboundCalls != 1 || st.prepareCalls != 0 ||
+		!strings.Contains(tg.body, "Kimi update") {
+		t.Fatalf("receipt=%+v tg=%+v outbound=%d feishu_prepare=%d err=%v",
+			receipt, tg, st.outboundCalls, st.prepareCalls, err)
+	}
+}
+
+func TestReceiptBackedResearchDeliveryV3TelegramFailuresFailClosed(t *testing.T) {
+	sentinel := errors.New("synthetic dependency failure")
+	tests := []struct {
+		name              string
+		mutate            func(*researchDeliveryStoreFakeV3, *researchTelegramSenderFakeV3)
+		configureTelegram bool
+		render            func(types.ResearchBriefPayloadV3) (string, error)
+	}{
+		{name: "payload", mutate: func(st *researchDeliveryStoreFakeV3, _ *researchTelegramSenderFakeV3) { st.payloadErr = sentinel }},
+		{name: "preference", mutate: func(st *researchDeliveryStoreFakeV3, _ *researchTelegramSenderFakeV3) { st.preferenceErr = sentinel }},
+		{name: "plan", mutate: func(st *researchDeliveryStoreFakeV3, _ *researchTelegramSenderFakeV3) { st.planErr = sentinel }},
+		{name: "missing frozen route", mutate: func(st *researchDeliveryStoreFakeV3, _ *researchTelegramSenderFakeV3) {
+			st.plan = storepkg.ArtifactDeliveryPlan{ID: uuid.NewString(), Selection: storepkg.DeliveryChannelTelegram}
+		}},
+		{name: "missing sender", configureTelegram: false},
+		{name: "renderer error", configureTelegram: true, render: func(types.ResearchBriefPayloadV3) (string, error) { return "", sentinel }},
+		{name: "outbound prepare", configureTelegram: true, mutate: func(st *researchDeliveryStoreFakeV3, _ *researchTelegramSenderFakeV3) { st.outboundErr = sentinel }},
+		{name: "provider send", configureTelegram: true, mutate: func(_ *researchDeliveryStoreFakeV3, sender *researchTelegramSenderFakeV3) { sender.err = sentinel }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			st, identity, snapshot, plan, brief := newResearchDeliveryFakeV3(t)
+			routeID := int64(73)
+			st.preference = storepkg.DeliveryChannelPreference{Selection: storepkg.DeliveryChannelTelegram, TelegramRouteID: &routeID}
+			st.plan = storepkg.ArtifactDeliveryPlan{ID: uuid.NewString(), Selection: storepkg.DeliveryChannelTelegram, TelegramRouteID: &routeID}
+			tg := &researchTelegramSenderFakeV3{}
+			if test.mutate != nil {
+				test.mutate(st, tg)
+			}
+			delivery, err := NewReceiptBackedResearchDeliveryV3(st,
+				&researchDeliverySenderFakeV3{}, researchDeliveryTargetFakeV3{},
+				func(types.ResearchBriefPayloadV3) ([]byte, error) { return []byte(`{}`), nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.configureTelegram {
+				render := test.render
+				if render == nil {
+					render = func(types.ResearchBriefPayloadV3) (string, error) { return "body", nil }
+				}
+				delivery.SetTelegramDelivery(tg, render)
+			}
+			if _, err := delivery.Deliver(t.Context(), identity, snapshot, plan, brief, "trace-v3"); err == nil {
+				t.Fatal("unsafe Telegram delivery succeeded")
+			}
+		})
+	}
+}
+
+func TestResearchTelegramReceiptAndProviderSetValidation(t *testing.T) {
+	st, identity, snapshot, plan, brief := newResearchDeliveryFakeV3(t)
+	st.preference = storepkg.DeliveryChannelPreference{Selection: storepkg.DeliveryChannelSelection("invalid")}
+	st.plan = storepkg.ArtifactDeliveryPlan{ID: uuid.NewString(), Selection: storepkg.DeliveryChannelSelection("invalid")}
+	delivery, err := NewReceiptBackedResearchDeliveryV3(st,
+		&researchDeliverySenderFakeV3{}, researchDeliveryTargetFakeV3{},
+		func(types.ResearchBriefPayloadV3) ([]byte, error) { return []byte(`{}`), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := delivery.Deliver(t.Context(), identity, snapshot, plan, brief, "trace-v3"); err == nil {
+		t.Fatal("invalid frozen provider set delivered")
+	}
+	invalidBrief := brief
+	invalidBrief.BriefID = 0
+	if _, err := researchTelegramReceiptV3(storepkg.ArtifactDeliveryPlan{ID: "bad"}, invalidBrief); err == nil {
+		t.Fatal("invalid Telegram receipt accepted")
 	}
 }

@@ -105,3 +105,38 @@ func TestRenderResearchBriefCardV3IsProfessionalAndBounded(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderResearchBriefTelegramV3PreservesEvidenceKinds(t *testing.T) {
+	payload := types.ResearchBriefPayloadV3{
+		SchemaVersion: types.ResearchBriefPayloadSchemaV3,
+		Headline:      "Kimi 套餐开放购买", Summary: "官方页面与接口均显示可购买。",
+		Significance: types.ResearchBriefSignificanceMajorV3,
+		Citations: []types.ResearchBriefCitationV3{
+			{Kind: types.ResearchBriefCitationCurrentEvidenceV3, Ref: "17"},
+			{Kind: types.ResearchBriefCitationHistoryV3, Ref: "brief:12"},
+		},
+	}
+	body, err := renderResearchBriefTelegramV3(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"重大更新", payload.Headline, payload.Summary,
+		"当前证据 17", "历史对比 brief:12",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("message missing %q: %s", want, body)
+		}
+	}
+	payload.Significance = types.ResearchBriefSignificanceQualifiedV3
+	body, err = renderResearchBriefTelegramV3(payload)
+	if err != nil || !strings.HasPrefix(body, "已核验更新") {
+		t.Fatalf("verified body=%q err=%v", body, err)
+	}
+}
+
+func TestRenderResearchBriefTelegramV3RejectsInvalidPayload(t *testing.T) {
+	if _, err := renderResearchBriefTelegramV3(types.ResearchBriefPayloadV3{}); err == nil {
+		t.Fatal("invalid research payload was rendered")
+	}
+}

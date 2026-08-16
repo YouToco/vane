@@ -14,10 +14,42 @@ import (
 
 type periodicDeliveryStoreFake struct {
 	settings      store.BriefReportSettingsV1
+	preference    store.DeliveryChannelPreference
+	plan          store.ArtifactDeliveryPlan
 	prepared      store.PeriodicReportDeliveryV1
 	shouldSend    bool
+	outboundCalls int
 	finalizeCalls int
 	finalStatus   store.PeriodicReportDeliveryStatusV1
+}
+
+func (f *periodicDeliveryStoreFake) ResolveDeliveryChannelPreference(
+	context.Context, int64, int64, string,
+) (store.DeliveryChannelPreference, error) {
+	if f.preference.Selection.Valid() {
+		return f.preference, nil
+	}
+	return store.DeliveryChannelPreference{Selection: store.DeliveryChannelFeishu}, nil
+}
+func (f *periodicDeliveryStoreFake) PrepareArtifactDeliveryPlan(
+	_ context.Context, tenantID, userID int64, taskID, kind, key string,
+	preference store.DeliveryChannelPreference,
+) (store.ArtifactDeliveryPlan, error) {
+	if f.plan.ID != "" {
+		return f.plan, nil
+	}
+	return store.ArtifactDeliveryPlan{
+		ID:       "8c925552-f062-5c77-a127-413240cc2604",
+		TenantID: tenantID, UserID: userID, TaskID: taskID,
+		ArtifactKind: kind, ArtifactKey: key,
+		Selection: preference.Selection,
+	}, nil
+}
+func (f *periodicDeliveryStoreFake) PrepareTelegramOutbound(
+	context.Context, int64, int64, int64, string, string, string,
+) (store.ChannelOutboundEffect, error) {
+	f.outboundCalls++
+	return store.ChannelOutboundEffect{}, nil
 }
 
 func (f *periodicDeliveryStoreFake) GetBriefReportSettingsV1(
@@ -70,6 +102,22 @@ type periodicDeliverySenderFake struct {
 	observation pusheffect.ProviderObservation
 	err         error
 	sendCalls   int
+}
+
+type periodicTelegramSenderFake struct {
+	sendCalls int
+	routeID   int64
+	kind      string
+	body      string
+}
+
+func (f *periodicTelegramSenderFake) SendTextEffect(
+	_ context.Context, _, _ int64, routeID int64,
+	_, kind, body string,
+) error {
+	f.sendCalls++
+	f.routeID, f.kind, f.body = routeID, kind, body
+	return nil
 }
 
 func (*periodicDeliverySenderFake) OwnerOpenID() string { return "ou_1" }
@@ -174,7 +222,7 @@ func TestDeliveryAlwaysSendsQuietReport(t *testing.T) {
 	}
 	if err := deliverPeriodicBriefV1(
 		t.Context(), report, deliveryStore, sender,
-		"https://vane.example", true,
+		nil, "https://vane.example", true,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -204,12 +252,97 @@ func TestDeliveryUnknownStaysSendingForHistoryRecovery(t *testing.T) {
 	}
 	if err := deliverPeriodicBriefV1(
 		t.Context(), report, deliveryStore, sender,
-		"https://vane.example", true,
+		nil, "https://vane.example", true,
 	); err == nil {
 		t.Fatal("ambiguous provider send unexpectedly succeeded")
 	}
 	if deliveryStore.finalizeCalls != 0 {
 		t.Fatalf("unknown send finalized %d times as %s",
 			deliveryStore.finalizeCalls, deliveryStore.finalStatus)
+	}
+}
+
+func TestDeliveryBothFreezesAndSendsBothProviders(t *testing.T) {
+	report := periodicDeliveryReportFixture(t)
+	routeID := int64(91)
+	deliveryStore := &periodicDeliveryStoreFake{
+		settings: store.BriefReportSettingsV1{
+			Mode: store.BriefReportModeAuto, Cadence: store.BriefReportCadenceDaily,
+			Delivery: store.BriefReportDeliveryAlways, Timezone: "UTC",
+		},
+		preference: store.DeliveryChannelPreference{
+			Selection: store.DeliveryChannelBoth, TelegramRouteID: &routeID,
+		},
+		plan: store.ArtifactDeliveryPlan{
+			ID:        "f02daee4-cbc0-5571-a079-b58760264911",
+			Selection: store.DeliveryChannelBoth, TelegramRouteID: &routeID,
+		},
+	}
+	feishuSender := &periodicDeliverySenderFake{
+		observation: pusheffect.ProviderObservation{
+			Disposition: pusheffect.AttemptSent, MessageID: "om_both",
+		},
+	}
+	telegramSender := &periodicTelegramSenderFake{}
+	if err := deliverPeriodicBriefV1(t.Context(), report, deliveryStore,
+		feishuSender, telegramSender, "https://vane.example", true); err != nil {
+		t.Fatal(err)
+	}
+	if feishuSender.sendCalls != 1 || telegramSender.sendCalls != 1 ||
+		deliveryStore.outboundCalls != 1 || telegramSender.routeID != routeID ||
+		telegramSender.kind != "periodic_report" ||
+		!strings.Contains(telegramSender.body, "https://vane.example/") {
+		t.Fatalf("feishu=%d telegram=%+v outbound=%d",
+			feishuSender.sendCalls, telegramSender, deliveryStore.outboundCalls)
+	}
+}
+
+func TestDeliveryTelegramRequiresFrozenRoute(t *testing.T) {
+	report := periodicDeliveryReportFixture(t)
+	deliveryStore := &periodicDeliveryStoreFake{
+		settings: store.BriefReportSettingsV1{
+			Mode: store.BriefReportModeAuto, Cadence: store.BriefReportCadenceDaily,
+			Delivery: store.BriefReportDeliveryAlways, Timezone: "UTC",
+		},
+		preference: store.DeliveryChannelPreference{Selection: store.DeliveryChannelTelegram},
+		plan: store.ArtifactDeliveryPlan{
+			ID: "f02daee4-cbc0-5571-a079-b58760264911", Selection: store.DeliveryChannelTelegram,
+		},
+	}
+	err := deliverPeriodicBriefV1(t.Context(), report, deliveryStore,
+		&periodicDeliverySenderFake{}, &periodicTelegramSenderFake{},
+		"https://vane.example", true)
+	if types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("err=%v code=%s", err, types.CodeOf(err))
+	}
+}
+
+func TestPeriodicTelegramRendererIncludesDecisionSections(t *testing.T) {
+	report := periodicDeliveryReportFixture(t)
+	report.Content.WhyForYou = "会影响下一季度预算"
+	report.Content.Signals = []types.ExecutiveSignalV1{{
+		Title: "价格变化", Summary: "官方价格页已更新",
+	}}
+	report.Content.NextSteps = []types.ExecutiveNextStepV1{{
+		Label: "复核预算", Rationale: "避免超支",
+	}}
+	body := renderPeriodicTelegramV1(report, "https://vane.example/report")
+	for _, want := range []string{
+		report.Content.Headline, report.Content.ExecutiveSummary,
+		"为什么值得关注", "价格变化：官方价格页已更新",
+		"复核预算：避免超支", "https://vane.example/report",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("message missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestActivitiesTelegramSenderIsRaceSafe(t *testing.T) {
+	a := &Activities{}
+	sender := &periodicTelegramSenderFake{}
+	a.SetTelegramSender(sender)
+	if got := a.getTelegramSender(); got != sender {
+		t.Fatalf("sender=%T want %T", got, sender)
 	}
 }

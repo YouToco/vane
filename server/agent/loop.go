@@ -39,9 +39,10 @@ const systemPrompt = agentpolicy.OwnerCoreSystemPromptV1
 // system 末尾 [用户画像] 段的两态文案（M5 契约 §12.2）。画像只注入请求侧，
 // system 不入库不变式保持——画像变更后下一条消息自然生效，无需迁移历史会话。
 const (
-	profileSectionEmpty  = "\n\n[用户画像] 尚未建立。"
-	profileSectionPrefix = "\n\n[用户画像] "
-	environmentSection   = "\n\n[运行环境] 当前 UTC 时间："
+	ownerConversationScope = "owner"
+	profileSectionEmpty    = "\n\n[用户画像] 尚未建立。"
+	profileSectionPrefix   = "\n\n[用户画像] "
+	environmentSection     = "\n\n[运行环境] 当前 UTC 时间："
 )
 
 var errExactAgentEvidenceCapture = errors.New("agent: exact model-visible tool evidence capture failed")
@@ -145,6 +146,15 @@ type Store interface {
 	CreateAgentSession(ctx context.Context, tenantID, userID int64) (*types.AgentSession, error)
 	CommitAgentSessionTurn(ctx context.Context, projection agentledger.SessionProjection, batch agentledger.AppendBatch) (agentledger.ProjectionShadowAudit, error)
 	CommitAgentSessionAppend(ctx context.Context, userID int64, sessionID int64, operationIdentity string, msgs json.RawMessage) (agentledger.ProjectionShadowAudit, error)
+}
+
+type scopedSessionStore interface {
+	GetActiveAgentSessionInScope(
+		context.Context, int64, int64, string, time.Time,
+	) (*types.AgentSession, error)
+	CreateAgentSessionInScope(
+		context.Context, int64, int64, string,
+	) (*types.AgentSession, error)
 }
 
 type AgentEvidenceWriter interface {
@@ -520,7 +530,28 @@ func retryAgentChat(
 // 全部 LLM 错误向上抛（feishu 层 humanize）；LLM 出错路径不持久化本轮消息——
 // 半截上下文对下一轮没有价值，行为与现 chat_reply 的无状态失败一致。
 func (l *Loop) HandleMessage(ctx context.Context, principal auth.Principal, text string) (Outcome, error) {
-	return l.handleMessage(ctx, principal, "", "", text, false)
+	return l.handleMessage(ctx, principal, ownerConversationScope, "", "", text, false, false)
+}
+
+// HandleChannelMessage runs an authenticated external-channel update through
+// the owner Agent with a provider-derived stable turn ID. The conversation
+// scope is an internal route identifier, never a raw chat/topic/actor ID.
+func (l *Loop) HandleChannelMessage(
+	ctx context.Context,
+	principal auth.Principal,
+	conversationScope string,
+	stableTurnID string,
+	text string,
+) (Outcome, error) {
+	if l == nil || !l.ownerAgent || l.turnReplay == nil ||
+		!validDirectActionID(stableTurnID) ||
+		!validConversationScope(conversationScope) ||
+		conversationScope == ownerConversationScope {
+		return Outcome{}, types.NewAppError(
+			types.CodeValidation, "渠道消息请求标识无效", types.ErrValidation)
+	}
+	return l.handleMessage(
+		ctx, principal, conversationScope, stableTurnID, "", text, false, false)
 }
 
 // HandleWebTaskActionMessage runs the Dashboard's natural-language create or
@@ -541,7 +572,9 @@ func (l *Loop) HandleWebTaskActionMessage(
 		return Outcome{}, types.NewAppError(
 			types.CodeValidation, "Web 任务请求标识无效", types.ErrValidation)
 	}
-	return l.handleMessage(ctx, principal, actionID, selectedTaskRef, text, false)
+	return l.handleMessage(
+		ctx, principal, ownerConversationScope, actionID,
+		selectedTaskRef, text, false, true)
 }
 
 // HandleExternalContextMessage 处理「用户文字 + 外部内容」的合成输入（当前由飞书
@@ -550,7 +583,8 @@ func (l *Loop) HandleWebTaskActionMessage(
 // 自己的后缀明确要求最新核验时，可暴露一次 query 字节被本地固定的 web_search；
 // 引用正文不能改变查询，也不能触发第二次网络读取。
 func (l *Loop) HandleExternalContextMessage(ctx context.Context, principal auth.Principal, text string) (Outcome, error) {
-	return l.handleMessage(ctx, principal, "", "", text, true)
+	return l.handleMessage(
+		ctx, principal, ownerConversationScope, "", "", text, true, false)
 }
 
 const groundedBriefSystemNote = `
@@ -613,7 +647,7 @@ func (l *Loop) handleGroundedMessage(
 	if err := ctx.Err(); err != nil {
 		return Outcome{}, err
 	}
-	sess, err := l.loadOrCreateSession(ctx, principal)
+	sess, err := l.loadOrCreateSession(ctx, principal, ownerConversationScope)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -683,10 +717,12 @@ func (l *Loop) handleGroundedMessage(
 func (l *Loop) handleMessage(
 	ctx context.Context,
 	principal auth.Principal,
-	webActionID string,
+	conversationScope string,
+	stableTurnID string,
 	webSelectedTaskRef string,
 	text string,
 	externalInput bool,
+	webDirectTaskAction bool,
 ) (Outcome, error) {
 	if err := validatePrincipal(principal); err != nil {
 		return Outcome{}, err
@@ -702,7 +738,7 @@ func (l *Loop) handleMessage(
 		return Outcome{}, err
 	}
 
-	sess, err := l.loadOrCreateSession(ctx, principal)
+	sess, err := l.loadOrCreateSession(ctx, principal, conversationScope)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -711,9 +747,10 @@ func (l *Loop) handleMessage(
 	history := l.scrubUntrustedHistory(decodeMessages(sess))
 	// 同一条消息内的所有模型调用（含只读意图裁决）共享 trace_id。
 	turnID := uuid.NewString()
-	webAgentFirst := l.ownerAgent && webActionID != ""
-	if webAgentFirst {
-		turnID = webActionID
+	stableReplay := stableTurnID != ""
+	webAgentFirst := l.ownerAgent && webDirectTaskAction
+	if stableReplay {
+		turnID = stableTurnID
 		replay, replayErr := l.turnReplay.FindAgentTurnReplayV1(
 			ctx, sess.TenantID, userID, turnID,
 		)
@@ -2145,11 +2182,31 @@ func (l *Loop) DrainSessionWrites(ctx context.Context) error {
 
 // loadOrCreateSession 取该用户 TTL 内的 active 会话；不存在或已过期就新开
 // （契约 §0：同一 owner 30 分钟内共享一个会话，超时新开）。
-func (l *Loop) loadOrCreateSession(ctx context.Context, principal auth.Principal) (*types.AgentSession, error) {
+func (l *Loop) loadOrCreateSession(
+	ctx context.Context, principal auth.Principal, conversationScope string,
+) (*types.AgentSession, error) {
 	tenantID, userID := int64(principal.TenantID), principal.UserID
-	sess, err := l.store.GetActiveAgentSession(ctx, tenantID, userID, time.Now().Add(-l.sessionTTL))
+	if !validConversationScope(conversationScope) {
+		return nil, types.NewAppError(types.CodeValidation,
+			"渠道 Agent 会话范围不可用", types.ErrValidation)
+	}
+	var sess *types.AgentSession
+	var err error
+	if scoped, ok := l.store.(scopedSessionStore); ok {
+		sess, err = scoped.GetActiveAgentSessionInScope(
+			ctx, tenantID, userID, conversationScope,
+			time.Now().Add(-l.sessionTTL))
+	} else if conversationScope == ownerConversationScope {
+		sess, err = l.store.GetActiveAgentSession(
+			ctx, tenantID, userID, time.Now().Add(-l.sessionTTL))
+	} else {
+		return nil, types.NewAppError(types.CodeConflict,
+			"渠道 Agent 会话能力不可用", types.ErrConflict)
+	}
 	if err == nil {
-		if sess.TenantID != tenantID || sess.UserID != userID {
+		if sess.TenantID != tenantID || sess.UserID != userID ||
+			(sess.ConversationScope != "" &&
+				sess.ConversationScope != conversationScope) {
 			return nil, types.NewAppError(types.CodeForbidden,
 				"Agent 会话身份与当前工作区不一致", types.ErrForbidden)
 		}
@@ -2158,7 +2215,24 @@ func (l *Loop) loadOrCreateSession(ctx context.Context, principal auth.Principal
 	if !errors.Is(err, types.ErrNotFound) {
 		return nil, err
 	}
+	if scoped, ok := l.store.(scopedSessionStore); ok {
+		return scoped.CreateAgentSessionInScope(
+			ctx, tenantID, userID, conversationScope)
+	}
 	return l.store.CreateAgentSession(ctx, tenantID, userID)
+}
+
+func validConversationScope(scope string) bool {
+	if len(scope) < 1 || len(scope) > 128 || scope[0] < 'a' || scope[0] > 'z' {
+		return false
+	}
+	for _, char := range scope {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') &&
+			char != ':' && char != '_' && char != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // saveSession 持久化会话（system 不入库；契约 §7：每次 HandleMessage 结束都要写，

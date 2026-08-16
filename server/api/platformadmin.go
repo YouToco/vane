@@ -29,7 +29,8 @@ const platformOwnerTenantID = types.SingleTenantID
 // 这不是最终形态，但它把「任一注册用户即可劫持全平台」压缩回「只有平台主人能动」，
 // 与改造前的安全水位持平。
 //
-// 判据用租户而非用户：平台 owner 所在的就是承载存量数据的租户 1。
+// 判据同时要求平台租户 1 与该租户的 exact active owner membership；仅仅是
+// 租户 1 的 member/admin 不是超级管理员，不能修改共享 LLM 或读取平台数据。
 //
 // TODO(接缝②)：租户隔离落地后，本闸门应逐个端点解除——
 // feishu 配置改为 per-tenant 凭证，admin 统计改为带租户过滤的自助视图。
@@ -39,10 +40,42 @@ func (s *server) requirePlatformOwner(w http.ResponseWriter, r *http.Request) bo
 		writeAppError(w, err)
 		return false
 	}
-	if p.TenantID != platformOwnerTenantID {
+	if p.TenantID != platformOwnerTenantID ||
+		!s.hasExactOwnerMembership(r, p) {
 		// 回 404 而非 403：不向普通租户暴露「存在这么一个平台管理面」。
 		writeError(w, http.StatusNotFound, "接口不存在")
 		return false
 	}
 	return true
+}
+
+func (s *server) requireTenantOwner(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
+	p, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return auth.Principal{}, false
+	}
+	if !s.hasExactOwnerMembership(r, p) {
+		writeError(w, http.StatusNotFound, "接口不存在")
+		return auth.Principal{}, false
+	}
+	return p, true
+}
+
+func (s *server) hasExactOwnerMembership(r *http.Request, p auth.Principal) bool {
+	if s.deps.Auth == nil {
+		return false
+	}
+	memberships, err := s.deps.Auth.ListMembershipsByUser(r.Context(), p.UserID)
+	if err != nil {
+		return false
+	}
+	for _, membership := range memberships {
+		if membership.TenantID == int64(p.TenantID) &&
+			membership.UserID == p.UserID &&
+			membership.Role == types.MembershipRoleOwner {
+			return true
+		}
+	}
+	return false
 }
