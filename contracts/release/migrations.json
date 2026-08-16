@@ -595,6 +595,10 @@
     {
       "path": "150_aggregate_channel_delivery_effects.sql",
       "sha256": "0e882dd6b7076c64ff3384311a657f27f6714944e8d26bd6ac131f2b11795307"
+    },
+    {
+      "path": "151_research_gateway_credential_vault.sql",
+      "sha256": "0a78bf54cb707c6c876420d5da37cc4ebfb470add2b9f3b5f733743ec2166db6"
     }
   ],
   "schema": "vane.migrations/v1"

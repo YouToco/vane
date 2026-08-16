@@ -11,7 +11,11 @@ Group=vane-research-gateway
 WorkingDirectory=/opt/vane
 EnvironmentFile=/opt/vane/env/research-gateway.env
 LoadCredential=gateway_db_url:/etc/vane/credentials/gateway_db_url
-LoadCredential=llm_api_key_gen1:/etc/vane/credentials/research_llm_api_key_gen1
+# The provider API key is no longer duplicated in deployment state. The
+# gateway reads only encrypted LLM envelopes through its restricted DB role;
+# this KEK remains the sole out-of-database root of trust.
+LoadCredential=credential_vault_active_key
+LoadCredential=credential_vault_retired_keys
 ExecStart=/opt/vane/current/bin/vane-research-gateway
 Restart=on-failure
 RestartSec=5

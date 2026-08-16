@@ -154,6 +154,16 @@ func run() error {
 		closeServerStores(st, nil)
 		return fmt.Errorf("加载数据库 LLM 凭证: %w", err)
 	}
+	storedFetchCredentials, err := loadStoredFetchCredentials(ctx, st, cfg.Fetch)
+	if err != nil {
+		closeServerStores(st, nil)
+		return fmt.Errorf("加载数据库信息获取凭证: %w", err)
+	}
+	cfg.Fetch = storedFetchCredentials.Current
+	if err := validateResolvedRuntimeCredentials(cfg); err != nil {
+		closeServerStores(st, nil)
+		return fmt.Errorf("验证运行时供应商凭证: %w", err)
+	}
 	var researchControlStore *store.Store
 	closeStores := func() { closeServerStores(st, researchControlStore) }
 	if _, err := st.AssertAgentFirstLegacyWriteFence(ctx); err != nil {
@@ -291,7 +301,19 @@ func run() error {
 	// st 作为 fetcher.SeenChecker 注入：TikHub 详情补全按次计费，只为未入库的新笔记
 	// 付费（见 fetcher.SeenChecker）。传真实 store 而非 nil，否则补全整体被跳过。
 	// st 同时作为 BindingCallRecorder：绑定引擎每次上游调用落 tool_calls（契约 §5）。
-	fetch := fetcher.NewMulti(cfg.Fetch, st, st)
+	retainedFetchRoutes, err := buildRetainedFetchRoutes(storedFetchCredentials, st, st)
+	if err != nil {
+		temporalClient.Close()
+		closeStores()
+		return fmt.Errorf("初始化历史信息获取凭证路由: %w", err)
+	}
+	fetch, err := fetcher.NewMultiWithRuntimeRoutesV1(
+		cfg.Fetch, st, st, retainedFetchRoutes...)
+	if err != nil {
+		temporalClient.Close()
+		closeStores()
+		return fmt.Errorf("初始化信息获取路由: %w", err)
+	}
 	hints := profilehint.NewCache(st)
 	score := scorer.New(llmClient, recorder, st, hints)
 	cards := cardgen.New(llmClient, recorder, hints)

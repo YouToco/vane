@@ -34,8 +34,12 @@ func run() error {
 		return err
 	}
 	defer repository.Close()
-	routes := make([]llm.RuntimeModelRouteV1, 0, len(cfg.Routes))
-	for _, route := range cfg.Routes {
+	storedRoutes, err := researchgateway.LoadProcessRoutesV1(ctx, repository, cfg.Vault)
+	if err != nil {
+		return err
+	}
+	routes := make([]llm.RuntimeModelRouteV1, 0, len(storedRoutes))
+	for _, route := range storedRoutes {
 		routes = append(routes, llm.RuntimeModelRouteV1{
 			Provider: route.Provider, Endpoint: route.Endpoint,
 			CredentialRef: route.CredentialRef, Client: llm.New(route.LLM),

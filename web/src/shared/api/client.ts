@@ -240,6 +240,12 @@ export interface LLMCredentialInput {
   max_concurrent: number;
 }
 
+export type PlatformProviderCredential = "exa" | "tikhub";
+
+export interface ProviderCredentialInput {
+  api_key: string;
+}
+
 // ---- M3 推送管道相关类型 ----
 
 // PushScope 与后端 workflow.PushScope 对齐（B1）。M3 固化组件默认留空 = 该用户全部 active 订阅。
@@ -1784,6 +1790,19 @@ export const api = {
     ),
   adminRevokeLLMCredential: () =>
     request<{ ok: boolean }>("/api/admin/llm/credentials", { method: "DELETE" }),
+  adminProviderCredentialStatus: (provider: PlatformProviderCredential) =>
+    request<CredentialStatus>(`/api/admin/providers/${provider}/credentials`),
+  adminRotateProviderCredential: (
+    provider: PlatformProviderCredential,
+    input: ProviderCredentialInput,
+  ) => request<CredentialStatus & { activation: "restart_required" }>(
+    `/api/admin/providers/${provider}/credentials`,
+    { method: "PUT", body: JSON.stringify(input) },
+  ),
+  adminRevokeProviderCredential: (provider: PlatformProviderCredential) =>
+    request<{ ok: boolean }>(`/api/admin/providers/${provider}/credentials`, {
+      method: "DELETE",
+    }),
 
   // ---- M3 定时任务（B8）----
   listSchedules: () =>

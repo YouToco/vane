@@ -115,3 +115,96 @@ func TestStoredLLMCredentialOverridesEnvironmentAndTamperFailsClosedPostgres(t *
 		t.Fatalf("failed load partially mutated environment config: %+v", fallback)
 	}
 }
+
+func TestStoredFetchCredentialsOverrideEnvironmentRetainGenerationsAndRevokeFailsClosedPostgres(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		requireDatabaseCapability(t)
+	}
+	ctx := t.Context()
+	if err := store.Migrate(ctx, databaseURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.ConfigureCredentialVault(
+		"fetch-loader-key", strings.Repeat("52", 32), "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	user, err := st.UpsertUserByOpenID(ctx,
+		fmt.Sprintf("fetch-credential-loader-owner-%d", time.Now().UnixNano()), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddMembership(ctx, 1, user.ID, types.MembershipRoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = cleanup.Exec(cleanupCtx,
+			`DELETE FROM credential_vault_entries WHERE created_by_user_id=$1`, user.ID)
+		_, _ = cleanup.Exec(cleanupCtx, `DELETE FROM memberships WHERE user_id=$1`, user.ID)
+		_, _ = cleanup.Exec(cleanupCtx, `DELETE FROM users WHERE id=$1`, user.ID)
+		cleanup.Close()
+	})
+	rotate := func(provider, apiKey string) store.CredentialMetadata {
+		t.Helper()
+		secret, _ := json.Marshal(storedProviderAPIKey{APIKey: apiKey})
+		metadata, _ := json.Marshal(map[string]string{"provider": provider})
+		rotated, err := st.RotateCredential(ctx, store.CredentialScope{
+			Kind: "platform", Provider: provider, Purpose: fetchProviderCredentialPurpose,
+		}, secret, metadata, user.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rotated
+	}
+	exa1 := rotate("exa", "database-exa-1")
+	exa2 := rotate("exa", "database-exa-2")
+	tikHub1 := rotate("tikhub", "database-tikhub-1")
+	tikHub2 := rotate("tikhub", "database-tikhub-2")
+	loaded, err := loadStoredFetchCredentials(ctx, st, config.FetchConfig{
+		ExaAPIKey: "environment-exa", TikhubAPIKey: "environment-tikhub",
+		CompiledExaCredentialGeneration: 99, CompiledTikHubCredentialGeneration: 98,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Current.ExaAPIKey != "database-exa-2" ||
+		loaded.Current.TikhubAPIKey != "database-tikhub-2" ||
+		loaded.Current.CompiledExaCredentialGeneration != exa2.Generation ||
+		loaded.Current.CompiledTikHubCredentialGeneration != tikHub2.Generation ||
+		len(loaded.RetainedExa) != 1 || len(loaded.RetainedTikHub) != 1 ||
+		loaded.RetainedExa[0].ExaAPIKey != "database-exa-1" ||
+		loaded.RetainedExa[0].CompiledExaCredentialGeneration != exa1.Generation ||
+		loaded.RetainedTikHub[0].TikhubAPIKey != "database-tikhub-1" ||
+		loaded.RetainedTikHub[0].CompiledTikHubCredentialGeneration != tikHub1.Generation {
+		t.Fatalf("database fetch credential set not authoritative: %+v", loaded)
+	}
+	routes, err := buildRetainedFetchRoutes(loaded, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) == 0 {
+		t.Fatal("retired provider generations produced no retained runtime routes")
+	}
+	if err := st.RevokeCredential(ctx, store.CredentialScope{
+		Kind: "platform", Provider: "exa", Purpose: fetchProviderCredentialPurpose,
+	}, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadStoredFetchCredentials(ctx, st, config.FetchConfig{
+		ExaAPIKey: "must-not-revive-environment",
+	}); err == nil {
+		t.Fatal("revoked database Exa credential silently fell back to environment")
+	}
+}

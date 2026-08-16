@@ -309,6 +309,48 @@ func (s *Store) LatestCredentialMetadata(
 	return result, nil
 }
 
+// ListCredentialMetadata returns the complete lifecycle ledger for one exact
+// internal credential authority. It deliberately returns metadata only: a
+// runtime that needs a retained plaintext generation must still call
+// UseCredential for that exact generation. Public HTTP handlers must use
+// CredentialStatus instead so history cannot become an accidental API.
+func (s *Store) ListCredentialMetadata(
+	ctx context.Context, scope CredentialScope,
+) ([]CredentialMetadata, error) {
+	if err := validateCredentialScope(scope); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `SELECT generation,fingerprint,metadata,status,
+		created_by_user_id,created_at,retired_at,revoked_at
+		FROM credential_vault_entries
+		WHERE scope_kind=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND
+		      user_id IS NOT DISTINCT FROM $3 AND provider=$4 AND purpose=$5
+		ORDER BY generation DESC`, scope.Kind, nullableCredentialTenant(scope),
+		nullableCredentialUser(scope), scope.Provider, scope.Purpose)
+	if err != nil {
+		return nil, credentialDBError("读取凭证版本历史", err)
+	}
+	defer rows.Close()
+	result := make([]CredentialMetadata, 0)
+	for rows.Next() {
+		item := CredentialMetadata{CredentialScope: scope}
+		if err := rows.Scan(&item.Generation, &item.Fingerprint, &item.Metadata,
+			&item.Status, &item.CreatedByUserID, &item.CreatedAt,
+			&item.RetiredAt, &item.RevokedAt); err != nil {
+			return nil, credentialDBError("读取凭证版本", err)
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, credentialDBError("遍历凭证版本历史", err)
+	}
+	if len(result) == 0 {
+		return nil, types.NewAppError(types.CodeNotFound,
+			"凭证历史不存在", pgx.ErrNoRows)
+	}
+	return result, nil
+}
+
 // UseCredential decrypts one exact generation only for an internal runtime
 // callback. Plaintext is never put into a JSON-capable public struct.
 func (s *Store) UseCredential(

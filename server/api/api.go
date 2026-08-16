@@ -314,6 +314,9 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/admin/llm/credentials", s.handleLLMCredentialStatus)
 	inner.HandleFunc("PUT /api/admin/llm/credentials", s.handleLLMCredentialPut)
 	inner.HandleFunc("DELETE /api/admin/llm/credentials", s.handleLLMCredentialDelete)
+	inner.HandleFunc("GET /api/admin/providers/{provider}/credentials", s.handleFetchCredentialStatus)
+	inner.HandleFunc("PUT /api/admin/providers/{provider}/credentials", s.handleFetchCredentialPut)
+	inner.HandleFunc("DELETE /api/admin/providers/{provider}/credentials", s.handleFetchCredentialDelete)
 
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)

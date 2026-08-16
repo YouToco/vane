@@ -120,6 +120,51 @@ func TestLLMCredentialEndpointEncryptsAndNeverEchoesSecretPostgres(t *testing.T)
 	if active != 0 {
 		t.Fatalf("active credentials after revoke=%d", active)
 	}
+
+	for _, provider := range []string{"exa", "tikhub"} {
+		syntheticProviderSecret := "synthetic-" + provider + "-secret-never-echo"
+		providerPut := httptest.NewRequest(http.MethodPut,
+			"/api/admin/providers/"+provider+"/credentials",
+			strings.NewReader(`{"api_key":"`+syntheticProviderSecret+`"}`))
+		providerPut.AddCookie(cookie)
+		providerPutResponse := httptest.NewRecorder()
+		mux.ServeHTTP(providerPutResponse, providerPut)
+		if providerPutResponse.Code != http.StatusOK ||
+			strings.Contains(providerPutResponse.Body.String(), syntheticProviderSecret) ||
+			!strings.Contains(providerPutResponse.Body.String(), "restart_required") {
+			t.Fatalf("%s PUT status=%d body=%s", provider,
+				providerPutResponse.Code, providerPutResponse.Body.String())
+		}
+		var providerCiphertext []byte
+		if err := cleanup.QueryRow(ctx, `SELECT ciphertext FROM credential_vault_entries
+			WHERE scope_kind='platform' AND provider=$1 AND purpose='shared_runtime' AND status='active'`,
+			provider).Scan(&providerCiphertext); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(providerCiphertext, []byte(syntheticProviderSecret)) {
+			t.Fatalf("database ciphertext contains the %s API key", provider)
+		}
+		providerGet := httptest.NewRequest(http.MethodGet,
+			"/api/admin/providers/"+provider+"/credentials", nil)
+		providerGet.AddCookie(cookie)
+		providerGetResponse := httptest.NewRecorder()
+		mux.ServeHTTP(providerGetResponse, providerGet)
+		if providerGetResponse.Code != http.StatusOK ||
+			strings.Contains(providerGetResponse.Body.String(), syntheticProviderSecret) ||
+			!strings.Contains(providerGetResponse.Body.String(), `"configured":true`) {
+			t.Fatalf("%s GET status=%d body=%s", provider,
+				providerGetResponse.Code, providerGetResponse.Body.String())
+		}
+		providerDelete := httptest.NewRequest(http.MethodDelete,
+			"/api/admin/providers/"+provider+"/credentials", nil)
+		providerDelete.AddCookie(cookie)
+		providerDeleteResponse := httptest.NewRecorder()
+		mux.ServeHTTP(providerDeleteResponse, providerDelete)
+		if providerDeleteResponse.Code != http.StatusOK {
+			t.Fatalf("%s DELETE status=%d body=%s", provider,
+				providerDeleteResponse.Code, providerDeleteResponse.Body.String())
+		}
+	}
 }
 
 func TestOrdinaryMemberTelegramCredentialIsUserScopedEncryptedAndActivatedPostgres(t *testing.T) {

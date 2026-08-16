@@ -56,6 +56,40 @@ func (r *PostgresRepositoryV1) begin(ctx context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
+func (r *PostgresRepositoryV1) ListLLMCredentialEnvelopesV1(
+	ctx context.Context,
+) ([]LLMCredentialEnvelopeV1, error) {
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	rows, err := tx.Query(ctx, `SELECT generation,envelope_version,key_id,nonce,
+		ciphertext,fingerprint,metadata,status
+		FROM list_research_gateway_llm_credentials_v1()`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]LLMCredentialEnvelopeV1, 0)
+	for rows.Next() {
+		var item LLMCredentialEnvelopeV1
+		if err := rows.Scan(&item.Generation, &item.EnvelopeVersion, &item.KeyID,
+			&item.Nonce, &item.Ciphertext, &item.Fingerprint, &item.Metadata,
+			&item.Status); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (r *PostgresRepositoryV1) Claim(ctx context.Context, binding ExecuteRequestV1) (ClaimV1, error) {
 	tx, err := r.begin(ctx)
 	if err != nil {

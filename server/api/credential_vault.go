@@ -21,6 +21,7 @@ const (
 	telegramCredentialPurpose = "bot_api"
 	feishuCredentialPurpose   = "app_credentials"
 	llmCredentialPurpose      = "shared_runtime"
+	fetchCredentialPurpose    = "shared_runtime"
 )
 
 type credentialStatusResponse struct {
@@ -52,6 +53,10 @@ type llmCredentialRequest struct {
 	AgentModel    string `json:"agent_model"`
 	ResearchModel string `json:"research_model"`
 	MaxConcurrent int    `json:"max_concurrent"`
+}
+
+type providerAPIKeyCredentialRequest struct {
+	APIKey string `json:"api_key"`
 }
 
 type telegramCredentialRuntime interface {
@@ -92,6 +97,21 @@ func (s *server) handleLLMCredentialStatus(w http.ResponseWriter, r *http.Reques
 	}
 	s.writeCredentialStatus(w, r, store.CredentialScope{
 		Kind: "platform", Provider: "llm", Purpose: llmCredentialPurpose,
+	}, principal.UserID)
+}
+
+func (s *server) handleFetchCredentialStatus(w http.ResponseWriter, r *http.Request) {
+	provider, ok := fetchCredentialProvider(w, r)
+	if !ok || !s.requirePlatformOwner(w, r) {
+		return
+	}
+	principal, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	s.writeCredentialStatus(w, r, store.CredentialScope{
+		Kind: "platform", Provider: provider, Purpose: fetchCredentialPurpose,
 	}, principal.UserID)
 }
 
@@ -295,6 +315,43 @@ func (s *server) handleLLMCredentialPut(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (s *server) handleFetchCredentialPut(w http.ResponseWriter, r *http.Request) {
+	provider, validProvider := fetchCredentialProvider(w, r)
+	if !validProvider {
+		return
+	}
+	principal, ok := s.requireCredentialMutation(w, r, true)
+	if !ok {
+		return
+	}
+	var request providerAPIKeyCredentialRequest
+	if !decodeCredentialBody(w, r, &request) {
+		return
+	}
+	request.APIKey = strings.TrimSpace(request.APIKey)
+	if request.APIKey == "" || len(request.APIKey) > 16<<10 ||
+		strings.ContainsAny(request.APIKey, "\r\n") {
+		writeError(w, http.StatusBadRequest, "Provider API Key 格式无效")
+		return
+	}
+	secret, _ := json.Marshal(request)
+	metadata, _ := json.Marshal(map[string]string{
+		"provider": provider, "endpoint": fetchCredentialEndpoint(provider),
+	})
+	rotated, err := s.deps.Store.RotateCredential(r.Context(), store.CredentialScope{
+		Kind: "platform", Provider: provider, Purpose: fetchCredentialPurpose,
+	}, secret, metadata, principal.UserID)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"configured": true, "generation": rotated.Generation,
+		"fingerprint": rotated.Fingerprint, "metadata": rotated.Metadata,
+		"vault_ready": true, "activation": "restart_required",
+	})
+}
+
 func (s *server) handleTelegramCredentialDelete(w http.ResponseWriter, r *http.Request) {
 	s.handleUserCredentialDelete(w, r, "telegram", telegramCredentialPurpose)
 }
@@ -343,6 +400,40 @@ func (s *server) handleLLMCredentialDelete(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *server) handleFetchCredentialDelete(w http.ResponseWriter, r *http.Request) {
+	provider, validProvider := fetchCredentialProvider(w, r)
+	if !validProvider {
+		return
+	}
+	principal, ok := s.requireCredentialMutation(w, r, true)
+	if !ok {
+		return
+	}
+	if err := s.deps.Store.RevokeCredential(r.Context(), store.CredentialScope{
+		Kind: "platform", Provider: provider, Purpose: fetchCredentialPurpose,
+	}, principal.UserID); err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func fetchCredentialProvider(w http.ResponseWriter, r *http.Request) (string, bool) {
+	provider := strings.TrimSpace(r.PathValue("provider"))
+	if provider != "exa" && provider != "tikhub" {
+		writeError(w, http.StatusNotFound, "Provider 凭证配置不存在")
+		return "", false
+	}
+	return provider, true
+}
+
+func fetchCredentialEndpoint(provider string) string {
+	if provider == "exa" {
+		return "https://api.exa.ai"
+	}
+	return "https://api.tikhub.io"
 }
 
 func (s *server) requireCredentialMutation(

@@ -22,15 +22,13 @@ func setMinimalProcessConfigV1(t *testing.T) {
 		[]byte("postgres://gateway:secret@db/vane"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, "llm_api_key_gen1"),
-		[]byte("gateway-llm-secret"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(directory, "credential_vault_active_key"),
+		[]byte(strings.Repeat("42", 32)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CREDENTIALS_DIRECTORY", directory)
-	t.Setenv("VANE_GATEWAY_LLM_ROUTES_JSON", `[{
-		"provider":"deepseek","endpoint_id":"deepseek-compatible-primary",
-		"endpoint_generation":1,"credential_id":"llm-primary",
-		"credential_generation":1,"base_url":"https://api.deepseek.com/v1"}]`)
+	t.Setenv("VANE_GATEWAY_LLM_ROUTES_JSON", "")
+	t.Setenv("VANE_CREDENTIAL_VAULT_ACTIVE_KEY_ID", "vault-test-key")
 	t.Setenv("VANE_GATEWAY_ALLOWED_UID", "1001")
 }
 
@@ -40,39 +38,34 @@ func TestLoadProcessConfigV1AcceptsOnlyMinimalGatewayAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.AllowedUID != 1001 || len(config.Routes) != 1 ||
-		config.Routes[0].LLM.APIKey != "gateway-llm-secret" ||
+	if config.AllowedUID != 1001 || config.Vault == nil ||
 		config.DatabaseURL != "postgres://gateway:secret@db/vane" {
 		t.Fatal("minimal gateway config was not loaded exactly")
 	}
 }
 
-func TestLoadProcessConfigV1RequiresEveryRetainedGenerationCredential(t *testing.T) {
+func TestLoadProcessConfigV1RejectsRetiredRouteEnvironmentAuthority(t *testing.T) {
 	setMinimalProcessConfigV1(t)
-	t.Setenv("VANE_GATEWAY_LLM_ROUTES_JSON", `[{
-		"provider":"deepseek","endpoint_id":"deepseek-compatible-primary",
-		"endpoint_generation":2,"credential_id":"llm-primary",
-		"credential_generation":2,"base_url":"https://api.deepseek.com/v1"}]`)
+	t.Setenv("VANE_GATEWAY_LLM_ROUTES_JSON", `[{"credential_generation":2}]`)
 	if _, err := LoadProcessConfigV1(); err == nil {
-		t.Fatal("missing retained generation credential was accepted")
+		t.Fatal("retired route environment authority was accepted")
 	}
 }
 
-func TestLoadProcessConfigV1CannotSelectDatabaseCredentialAsProviderKey(t *testing.T) {
+func TestLoadProcessConfigV1CannotUseDatabaseCredentialAsVaultKey(t *testing.T) {
 	setMinimalProcessConfigV1(t)
 	const databaseSecret = "must-not-become-provider-bearer"
 	if err := os.WriteFile(filepath.Join(os.Getenv("CREDENTIALS_DIRECTORY"), "gateway_db_url"),
 		[]byte(databaseSecret), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("VANE_GATEWAY_LLM_ROUTES_JSON", `[{
-		"provider":"deepseek","endpoint_id":"deepseek-compatible-primary",
-		"endpoint_generation":1,"credential_id":"llm-primary",
-		"credential_generation":1,"base_url":"https://api.deepseek.com/v1",
-		"credential_name":"gateway_db_url"}]`)
+	if err := os.Remove(filepath.Join(os.Getenv("CREDENTIALS_DIRECTORY"),
+		"credential_vault_active_key")); err != nil {
+		t.Fatal(err)
+	}
 	_, err := LoadProcessConfigV1()
 	if err == nil || strings.Contains(err.Error(), databaseSecret) {
-		t.Fatalf("database credential alias accepted or leaked: %v", err)
+		t.Fatalf("database credential accepted as vault key or leaked: %v", err)
 	}
 }
 

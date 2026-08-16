@@ -1228,8 +1228,14 @@ func (c *Config) Validate() error {
 			c.Fetch.CompiledExaCredentialGeneration <= 0 {
 			return errors.New("config: Research V3 runtime 要求可用的 LLM/Exa retained generations")
 		}
-		if strings.TrimSpace(c.Fetch.ExaAPIKey) == "" {
-			return errors.New("config: Research V3 runtime 要求 fetch.exa_api_key")
+		// A configured credential vault permits the Exa key to be resolved from
+		// its database generation after the primary Store opens. Without a vault,
+		// the environment compatibility value remains mandatory at this earlier
+		// bootstrap boundary. main performs the final post-vault check before any
+		// worker, recovery loop, or ingress starts.
+		if strings.TrimSpace(c.Fetch.ExaAPIKey) == "" &&
+			c.CredentialVault.ActiveKeyID == "" {
+			return errors.New("config: Research V3 runtime 要求 fetch.exa_api_key 或已配置的凭证库")
 		}
 	}
 	return nil
