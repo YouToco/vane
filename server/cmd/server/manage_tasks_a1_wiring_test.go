@@ -26,12 +26,12 @@ func TestAgentFirstManageTasksDoesNotReuseLegacyEditController(t *testing.T) {
 	ast.Inspect(file, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok || !isPackageSelector(call.Fun, "agent", "BuildOwnerTools") ||
-			len(call.Args) != 5 {
+			len(call.Args) != 6 {
 			return true
 		}
-		literal, ok := call.Args[1].(*ast.CompositeLit)
+		literal, ok := call.Args[2].(*ast.CompositeLit)
 		if !ok {
-			t.Fatalf("BuildOwnerTools manage argument=%T, want composite literal", call.Args[1])
+			t.Fatalf("BuildOwnerTools manage argument=%T, want composite literal", call.Args[2])
 		}
 		literals = append(literals, literal)
 		return true

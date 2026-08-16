@@ -773,6 +773,10 @@ func run() error {
 	sessionAdmission := agent.NewSessionAdmissionCoordinator()
 	tools := agent.BuildOwnerTools(
 		st,
+		// Memory has completed its own runtime cutover. Keep it on the exact
+		// v151-verified control Store while the rest of the owner catalog uses
+		// the retained schema-owner compatibility pool.
+		researchControlStore,
 		agent.ManageTasksDeps{
 			Queries: st,
 			Creator: agent.NewResearchTaskCreationV3Executor(

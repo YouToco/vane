@@ -81,9 +81,13 @@ func BuildPublicResearchTools(endpoints *EndpointTools, exa *ExaTools) []ToolSpe
 	return tools
 }
 
-// BuildOwnerTools is the only production owner Agent catalog.
+// BuildOwnerTools is the only production owner Agent catalog. memoryStore is
+// intentionally separate from the owner-compatible primary Store: personal
+// and workspace memory must execute through the exact restricted runtime
+// boundary even while retained recovery readers still require st.
 func BuildOwnerTools(
 	st *store.Store,
+	memoryStore memoryLedgerStore,
 	manage ManageTasksDeps,
 	authorizer OwnerActionAuthorizer,
 	endpoints *EndpointTools,
@@ -93,8 +97,8 @@ func BuildOwnerTools(
 		NewQueryMyIntelligenceTool(st),
 		NewManageTasksTool(manage),
 		NewAuthorizedUpdateProfileTool(st, authorizer),
-		NewRecallMemoryTool(st),
-		NewManageMemoryTool(st, authorizer),
+		NewRecallMemoryTool(memoryStore),
+		NewManageMemoryTool(memoryStore, authorizer),
 	}
 	return append(tools, BuildPublicResearchTools(endpoints, exa)...)
 }

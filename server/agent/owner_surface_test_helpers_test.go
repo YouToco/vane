@@ -5,7 +5,7 @@ package agent
 // partial owner catalogs because production must never degrade to a narrow or
 // legacy task surface.
 func ownerTestTools(overrides ...ToolSpec) []ToolSpec {
-	tools := BuildOwnerTools(nil, ManageTasksDeps{}, nil, nil, nil)
+	tools := BuildOwnerTools(nil, nil, ManageTasksDeps{}, nil, nil, nil)
 	for _, override := range overrides {
 		replaced := false
 		for i := range tools {

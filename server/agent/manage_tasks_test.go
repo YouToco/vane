@@ -1182,7 +1182,7 @@ func TestManageTasksSchemaIsAgentFirstV3Only(t *testing.T) {
 }
 
 func TestOwnerGeneralChatInventoryHidesLegacyTaskTools(t *testing.T) {
-	tools := BuildOwnerTools(&store.Store{}, ManageTasksDeps{}, nil, nil, nil)
+	tools := BuildOwnerTools(&store.Store{}, nil, ManageTasksDeps{}, nil, nil, nil)
 	loop, err := NewChecked(Deps{Tools: tools, OwnerAgent: true,
 		Evidence: &fakeAgentEvidenceWriter{}})
 	if err != nil {
