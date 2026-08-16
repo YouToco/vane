@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -69,6 +70,8 @@ type Activities struct {
 	sender          DeliverySender
 	dashboardOrigin string
 	deliveryTaskID  string
+	telegramMu      sync.RWMutex
+	telegramSender  TelegramDeliverySender
 }
 
 func NewActivities(
@@ -89,6 +92,20 @@ func NewActivities(
 		deliveryStore: deliveryStore, sender: sender,
 		dashboardOrigin: dashboardOrigin,
 		deliveryTaskID:  strings.TrimSpace(deliveryTaskID)}, nil
+}
+
+// SetTelegramSender is called during process composition before the Temporal
+// worker starts. The lock also keeps tests and orderly shutdown race-free.
+func (a *Activities) SetTelegramSender(sender TelegramDeliverySender) {
+	a.telegramMu.Lock()
+	defer a.telegramMu.Unlock()
+	a.telegramSender = sender
+}
+
+func (a *Activities) getTelegramSender() TelegramDeliverySender {
+	a.telegramMu.RLock()
+	defer a.telegramMu.RUnlock()
+	return a.telegramSender
 }
 
 func WorkflowV1(

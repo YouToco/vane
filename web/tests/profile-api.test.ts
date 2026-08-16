@@ -379,3 +379,84 @@ describe("profile API contract", () => {
     expect(result.restore_allowed).toBe(false);
   });
 });
+
+describe("telegram API contract", () => {
+  test("uses session-scoped status, link, unlink, and test routes", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ enabled: true, ready: true, bound: false }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            deep_link: "https://t.me/vane_bot?start=opaque",
+            expires_at: "2026-08-15T05:00:00Z",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ selection: "feishu", scope: "default", explicit: false }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            selection: "both",
+            scope: "account",
+            telegram_route_id: 7,
+            explicit: true,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.telegramStatus()).resolves.toMatchObject({ ready: true });
+    await expect(api.telegramLink()).resolves.toMatchObject({
+      deep_link: "https://t.me/vane_bot?start=opaque",
+    });
+    await expect(api.deliveryChannelPreference()).resolves.toMatchObject({
+      selection: "feishu",
+      explicit: false,
+    });
+    await expect(api.patchDeliveryChannelPreference("both", 7)).resolves.toMatchObject({
+      selection: "both",
+      telegram_route_id: 7,
+    });
+    await expect(api.telegramUnlink()).resolves.toEqual({ ok: true });
+    await expect(api.telegramTest()).resolves.toEqual({ ok: true });
+
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/api/telegram/status",
+      "/api/telegram/link",
+      "/api/channels/delivery-preference",
+      "/api/channels/delivery-preference",
+      "/api/telegram/link",
+      "/api/telegram/test",
+    ]);
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: "include" });
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "POST" });
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ credentials: "include" });
+    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({
+      method: "PATCH",
+      body: JSON.stringify({ selection: "both", telegram_route_id: 7 }),
+    });
+    expect(fetchMock.mock.calls[4]?.[1]).toMatchObject({ method: "DELETE" });
+    expect(fetchMock.mock.calls[5]?.[1]).toMatchObject({ method: "POST" });
+  });
+});

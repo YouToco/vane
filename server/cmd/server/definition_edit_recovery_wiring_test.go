@@ -61,10 +61,13 @@ func TestProductionRecoveryWiringIsNativeV3Only(t *testing.T) {
 		}
 		previous = index
 	}
-	if calls := strings.Count(source, "stopDefinitionEditRecovery()"); calls != 3 {
-		t.Fatalf("stopDefinitionEditRecovery calls=%d, want three drains", calls)
+	// Worker startup, Telegram startup, A2A mount failure and normal shutdown
+	// are the four post-recovery exits. Every one must drain both native V3
+	// recovery loops before Store/Temporal teardown.
+	if calls := strings.Count(source, "stopDefinitionEditRecovery()"); calls != 4 {
+		t.Fatalf("stopDefinitionEditRecovery calls=%d, want four drains", calls)
 	}
-	if calls := strings.Count(source, "stopCreationRecovery()"); calls != 3 {
-		t.Fatalf("stopCreationRecovery calls=%d, want three drains", calls)
+	if calls := strings.Count(source, "stopCreationRecovery()"); calls != 4 {
+		t.Fatalf("stopCreationRecovery calls=%d, want four drains", calls)
 	}
 }
