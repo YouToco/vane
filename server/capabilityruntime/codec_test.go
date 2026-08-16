@@ -3,6 +3,11 @@ package capabilityruntime
 import (
 	"bytes"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -66,6 +71,138 @@ func TestReceiptV1StrictCanonicalCodec(t *testing.T) {
 		if _, err := DecodeReceiptV1(payload, invocation); !errors.Is(err, ErrInvalidContract) {
 			t.Fatalf("%s: DecodeReceiptV1() error = %v, want ErrInvalidContract", name, err)
 		}
+	}
+}
+
+func TestContractCodecRejectsInvalidValuesBeforeEncodingAndAtWireBounds(t *testing.T) {
+	t.Parallel()
+
+	invocation := testInvocationV1(t)
+	invalidInvocation := invocation
+	invalidInvocation.SchemaVersion = "vane.capability-invocation/v0"
+	if _, err := EncodeInvocationV1(invalidInvocation); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("invalid invocation encode error = %v, want ErrInvalidContract", err)
+	}
+	for name, payload := range map[string][]byte{
+		"empty":     nil,
+		"oversized": bytes.Repeat([]byte(" "), maxEncodedContractBytes+1),
+	} {
+		if _, err := DecodeInvocationV1(payload); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("%s invocation decode error = %v, want ErrInvalidContract", name, err)
+		}
+	}
+
+	invalidPolicy := invocation.Policy
+	invalidPolicy.SchemaVersion = "vane.capability-policy/v0"
+	if _, err := EncodePolicyV1(invalidPolicy); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("invalid policy encode error = %v, want ErrInvalidContract", err)
+	}
+	for name, payload := range map[string][]byte{
+		"empty":     nil,
+		"oversized": bytes.Repeat([]byte(" "), maxEncodedContractBytes+1),
+	} {
+		if _, err := DecodePolicyV1(payload); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("%s policy decode error = %v, want ErrInvalidContract", name, err)
+		}
+	}
+
+	receipt, err := NewReceiptV1(
+		invocation, ReceiptStatusSucceeded, 1, "application/json", []byte(`{}`), "", false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidReceipt := receipt
+	invalidReceipt.InvocationDigest = ""
+	if _, err := EncodeReceiptV1(invalidReceipt, invocation); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("invalid receipt encode error = %v, want ErrInvalidContract", err)
+	}
+	for name, payload := range map[string][]byte{
+		"empty":     nil,
+		"oversized": bytes.Repeat([]byte(" "), maxEncodedReceiptBytes+1),
+	} {
+		if _, err := DecodeReceiptV1(payload, invocation); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("%s receipt decode error = %v, want ErrInvalidContract", name, err)
+		}
+	}
+}
+
+func TestContractDecodersKeepExactWireGateBeforeParsing(t *testing.T) {
+	t.Parallel()
+
+	if maxEncodedContractBytes != 512<<10 || maxEncodedReceiptBytes != 512<<10 {
+		t.Fatalf("wire limits drifted: contract=%d receipt=%d",
+			maxEncodedContractBytes, maxEncodedReceiptBytes)
+	}
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate codec test source")
+	}
+	parsed, err := parser.ParseFile(token.NewFileSet(), filepath.Join(filepath.Dir(testFile), "codec.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"DecodeInvocationV1": "maxEncodedContractBytes",
+		"DecodePolicyV1":     "maxEncodedContractBytes",
+		"DecodeReceiptV1":    "maxEncodedReceiptBytes",
+	}
+	for _, declaration := range parsed.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction {
+			continue
+		}
+		limit, tracked := want[function.Name.Name]
+		if !tracked {
+			continue
+		}
+		delete(want, function.Name.Name)
+		if function.Body == nil || len(function.Body.List) == 0 {
+			t.Fatalf("%s has no body", function.Name.Name)
+		}
+		guard, isIf := function.Body.List[0].(*ast.IfStmt)
+		if !isIf || !exactWireGuard(guard.Cond, limit) || len(guard.Body.List) != 1 {
+			t.Fatalf("%s must begin with exact empty-or-oversized wire guard", function.Name.Name)
+		}
+		if _, returns := guard.Body.List[0].(*ast.ReturnStmt); !returns {
+			t.Fatalf("%s wire guard must return before parsing", function.Name.Name)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing contract decoders: %v", want)
+	}
+}
+
+func exactWireGuard(expression ast.Expr, limit string) bool {
+	or, ok := expression.(*ast.BinaryExpr)
+	if !ok || or.Op != token.LOR {
+		return false
+	}
+	return exactPayloadLengthComparison(or.X, token.EQL, "0") &&
+		exactPayloadLengthComparison(or.Y, token.GTR, limit)
+}
+
+func exactPayloadLengthComparison(expression ast.Expr, operator token.Token, right string) bool {
+	comparison, ok := expression.(*ast.BinaryExpr)
+	if !ok || comparison.Op != operator {
+		return false
+	}
+	call, ok := comparison.X.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	function, functionOK := call.Fun.(*ast.Ident)
+	payload, payloadOK := call.Args[0].(*ast.Ident)
+	if !functionOK || function.Name != "len" || !payloadOK || payload.Name != "payload" {
+		return false
+	}
+	switch value := comparison.Y.(type) {
+	case *ast.BasicLit:
+		return value.Value == right
+	case *ast.Ident:
+		return value.Name == right
+	default:
+		return false
 	}
 }
 
