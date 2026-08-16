@@ -414,20 +414,35 @@ BEGIN
       (object_name='public' AND column_name IS NULL AND privilege_type='USAGE')))
     INTO expected_acl_count,unexpected_acl_count FROM entries;
   grants_safe := grants_safe AND expected_acl_count=13 AND unexpected_acl_count=0;
-  SELECT count(*)=5 AND bool_and(polpermissive AND
-      polroles=ARRAY[(SELECT oid FROM pg_catalog.pg_roles
+  WITH expected(relname,polname,polcmd,qual,withcheck) AS (VALUES
+    ('capability_invocations','capability_invocation_select','r',
+     '((tenant_id = (NULLIF(current_setting(''app.tenant_id''::text, true), ''''::text))::bigint) AND (user_id = (NULLIF(current_setting(''app.user_id''::text, true), ''''::text))::bigint))',NULL::text),
+    ('capability_invocations','capability_invocation_insert','a',NULL::text,
+     '((tenant_id = (NULLIF(current_setting(''app.tenant_id''::text, true), ''''::text))::bigint) AND (user_id = (NULLIF(current_setting(''app.user_id''::text, true), ''''::text))::bigint) AND (status = ''pending''::text))'),
+    ('capability_invocations','capability_invocation_update','w',
+     '((tenant_id = (NULLIF(current_setting(''app.tenant_id''::text, true), ''''::text))::bigint) AND (user_id = (NULLIF(current_setting(''app.user_id''::text, true), ''''::text))::bigint))',
+     '((tenant_id = (NULLIF(current_setting(''app.tenant_id''::text, true), ''''::text))::bigint) AND (user_id = (NULLIF(current_setting(''app.user_id''::text, true), ''''::text))::bigint))'),
+    ('capability_invocation_receipts','capability_invocation_receipt_select','r',
+     '((tenant_id = (NULLIF(current_setting(''app.tenant_id''::text, true), ''''::text))::bigint) AND (user_id = (NULLIF(current_setting(''app.user_id''::text, true), ''''::text))::bigint))',NULL::text),
+    ('capability_invocation_receipts','capability_invocation_receipt_insert','a',NULL::text,
+     '((tenant_id = (NULLIF(current_setting(''app.tenant_id''::text, true), ''''::text))::bigint) AND (user_id = (NULLIF(current_setting(''app.user_id''::text, true), ''''::text))::bigint))')
+  ), actual AS (
+    SELECT relation.relname,policy.polname,policy.polcmd,
+           pg_catalog.pg_get_expr(policy.polqual,policy.polrelid) qual,
+           pg_catalog.pg_get_expr(policy.polwithcheck,policy.polrelid) withcheck,
+           policy.polpermissive,policy.polroles
+      FROM pg_catalog.pg_policy policy
+      JOIN pg_catalog.pg_class relation ON relation.oid=policy.polrelid
+     WHERE policy.polrelid IN('public.capability_invocations'::regclass,
+                              'public.capability_invocation_receipts'::regclass)
+  )
+  SELECT count(*)=5 AND bool_and(actual.relname IS NOT NULL AND expected.relname IS NOT NULL AND
+      actual.polpermissive AND
+      actual.polroles=ARRAY[(SELECT oid FROM pg_catalog.pg_roles
         WHERE rolname='vane_capability_invocation_coordinator')]::oid[] AND
-      ((polcmd='r' AND pg_catalog.pg_get_expr(polqual,polrelid) LIKE '%app.tenant_id%' AND
-                    pg_catalog.pg_get_expr(polqual,polrelid) LIKE '%app.user_id%') OR
-       (polcmd='a' AND pg_catalog.pg_get_expr(polwithcheck,polrelid) LIKE '%app.tenant_id%' AND
-                    pg_catalog.pg_get_expr(polwithcheck,polrelid) LIKE '%app.user_id%') OR
-       (polcmd='w' AND pg_catalog.pg_get_expr(polqual,polrelid) LIKE '%app.tenant_id%' AND
-                    pg_catalog.pg_get_expr(polqual,polrelid) LIKE '%app.user_id%' AND
-                    pg_catalog.pg_get_expr(polwithcheck,polrelid) LIKE '%app.tenant_id%' AND
-                    pg_catalog.pg_get_expr(polwithcheck,polrelid) LIKE '%app.user_id%')))
-    FROM pg_catalog.pg_policy WHERE polrelid IN(
-      'public.capability_invocations'::regclass,
-      'public.capability_invocation_receipts'::regclass)
+      actual.polcmd=expected.polcmd AND actual.qual IS NOT DISTINCT FROM expected.qual AND
+      actual.withcheck IS NOT DISTINCT FROM expected.withcheck)
+    FROM expected FULL JOIN actual USING(relname,polname)
   INTO policies_safe;
   IF NOT role_safe OR NOT tables_safe OR NOT grants_safe OR NOT policies_safe THEN
     RAISE EXCEPTION '152: capability ledger contract unsafe role=% tables=% grants=% policies=%',
@@ -440,6 +455,24 @@ SELECT public.assert_vane_capability_invocation_coordinator_v152();
 
 -- +goose Down
 
+-- Freeze the tenant key set, then follow the same admission -> ledger order as
+-- Prepare/Acquire/Settle.  This prevents a downgrade from owning the ledger
+-- while a runtime transaction owns admission and waits for that ledger (the
+-- former reverse-order deadlock).
+LOCK TABLE tenants IN SHARE ROW EXCLUSIVE MODE;
+-- +goose StatementBegin
+DO $capability_invocation_down_admission$
+DECLARE tenant_row record;
+BEGIN
+  -- The tenants table lock freezes the key set.  Acquire the same exclusive
+  -- tenant-admission advisory keys that runtime uses in shared mode, in stable
+  -- order, before taking either ledger table lock.
+  FOR tenant_row IN SELECT id FROM tenants ORDER BY id LOOP
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
+      'vane/tenant-admission/v1/'||tenant_row.id::text,1447120453));
+  END LOOP;
+END $capability_invocation_down_admission$;
+-- +goose StatementEnd
 LOCK TABLE capability_invocation_receipts,capability_invocations IN ACCESS EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$

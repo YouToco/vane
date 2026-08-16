@@ -450,6 +450,10 @@ func validateCapabilityInvocationAuthority(
 func validateStoredCapabilityVersion(
 	ctx context.Context, tx pgx.Tx, invocation capabilityruntime.InvocationV1, storedKind string,
 ) error {
+	// Mutable head status and a parser-compatible version are not execution
+	// authority.  The exact immutable version must still be the current head and
+	// the latest lifecycle authority must be an activation for that same version;
+	// pause/schema drift or advancing the head closes admission immediately.
 	capabilityID, err := uuid.Parse(invocation.Capability.ID)
 	if err != nil || capabilityID == uuid.Nil {
 		return capabilityInvocationForbidden("capability identity is not an installed immutable version")
@@ -470,7 +474,14 @@ func validateStoredCapabilityVersion(
 			  ON (v.tenant_id,v.owner_user_id,v.capability_id)=(c.tenant_id,c.owner_user_id,c.id)
 			JOIN skill_capability_versions s ON s.capability_version_id=v.id
 			WHERE c.tenant_id=$1 AND c.owner_user_id=$2 AND c.id=$3 AND c.kind='skill'
-			  AND c.visibility=$4 AND c.status='active' AND v.id=$5 AND NOT s.contains_scripts
+			  AND c.visibility=$4 AND c.status='active' AND c.current_version_id=v.id AND v.id=$5
+			  AND NOT s.contains_scripts AND COALESCE((SELECT
+			    event.event_kind='activated' AND event.version_id=v.id
+			    FROM user_capability_events event
+			    WHERE event.tenant_id=c.tenant_id AND event.owner_user_id=c.owner_user_id
+			      AND event.capability_id=c.id AND event.visibility=c.visibility
+			      AND event.event_kind IN ('activated','paused','schema_drifted')
+			    ORDER BY event.id DESC LIMIT 1),false)
 			FOR SHARE OF c,v,s`, invocation.Principal.TenantID,
 			invocation.Capability.OwnerUserID, capabilityID, visibility, versionID).
 			Scan(&versionDigest, &schemaDigest, &compatible, &credentialRef)
@@ -480,7 +491,13 @@ func validateStoredCapabilityVersion(
 			  ON (v.tenant_id,v.owner_user_id,v.capability_id)=(c.tenant_id,c.owner_user_id,c.id)
 			JOIN mcp_connection_versions m ON m.capability_version_id=v.id
 			WHERE c.tenant_id=$1 AND c.owner_user_id=$2 AND c.id=$3 AND c.kind='mcp'
-			  AND c.visibility=$4 AND c.status='active' AND v.id=$5
+			  AND c.visibility=$4 AND c.status='active' AND c.current_version_id=v.id AND v.id=$5
+			  AND COALESCE((SELECT event.event_kind='activated' AND event.version_id=v.id
+			    FROM user_capability_events event
+			    WHERE event.tenant_id=c.tenant_id AND event.owner_user_id=c.owner_user_id
+			      AND event.capability_id=c.id AND event.visibility=c.visibility
+			      AND event.event_kind IN ('activated','paused','schema_drifted')
+			    ORDER BY event.id DESC LIMIT 1),false)
 			FOR SHARE OF c,v,m`, invocation.Principal.TenantID,
 			invocation.Capability.OwnerUserID, capabilityID, visibility, versionID).
 			Scan(&versionDigest, &schemaDigest, &compatible, &credentialRef)

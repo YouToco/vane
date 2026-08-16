@@ -421,7 +421,38 @@ func TestCapabilityInvocationServiceAuthorityAndDeclarativeSkillPostgres(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.PrepareCapabilityInvocationV1(t.Context(), skillInvocation, nil); !errors.Is(err, types.ErrForbidden) {
+		t.Fatalf("compatible draft without activated lifecycle err=%v, want forbidden", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `INSERT INTO user_capability_events(
+		tenant_id,capability_id,owner_user_id,visibility,actor_user_id,event_kind,version_id,details)
+		VALUES($1,$2,$3,'personal',$3,'activated',$4,'{}')`,
+		tenantID, capability.ID, userID, version.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.PrepareCapabilityInvocationV1(t.Context(), skillInvocation, nil); err != nil {
+		t.Fatal(err)
+	}
+	var successorID string
+	if err := database.QueryRowContext(t.Context(), `INSERT INTO user_capability_versions(
+		id,capability_id,tenant_id,owner_user_id,version,visibility,source_kind,
+		source_ref,payload_digest,manifest_payload,compatible,created_by)
+		SELECT gen_random_uuid(),capability_id,tenant_id,owner_user_id,version+1,visibility,
+		       source_kind,source_ref,payload_digest,manifest_payload,compatible,created_by
+		FROM user_capability_versions WHERE id=$1 RETURNING id`, version.ID).Scan(&successorID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(t.Context(), `UPDATE user_capabilities
+		SET current_version_id=$3 WHERE tenant_id=$1 AND id=$2`,
+		tenantID, capability.ID, successorID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PrepareCapabilityInvocationV1(t.Context(), skillInvocation, nil); !errors.Is(err, types.ErrForbidden) {
+		t.Fatalf("previously activated historical version err=%v, want forbidden", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `UPDATE user_capabilities
+		SET current_version_id=$3 WHERE tenant_id=$1 AND id=$2`,
+		tenantID, capability.ID, version.ID); err != nil {
 		t.Fatal(err)
 	}
 	badRef := skillInvocation.Capability
