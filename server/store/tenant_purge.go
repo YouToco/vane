@@ -351,6 +351,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		memoryRecordsAvailable               bool
 		memoryEventsAvailable                bool
 		memoryReceiptsAvailable              bool
+		channelIdentitiesAvailable           bool
+		channelLinkRequestsAvailable         bool
+		channelIngressReceiptsAvailable      bool
+		channelRoutesAvailable               bool
+		channelRouteLinksAvailable           bool
+		channelMessageMappingsAvailable      bool
+		channelOutboundEffectsAvailable      bool
+		credentialVaultAvailable             bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -386,7 +394,15 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.memory_authorizations') IS NOT NULL,
 		        to_regclass('public.memory_records') IS NOT NULL,
 		        to_regclass('public.memory_events') IS NOT NULL,
-		        to_regclass('public.memory_receipts') IS NOT NULL`,
+		        to_regclass('public.memory_receipts') IS NOT NULL,
+		        to_regclass('public.channel_identities') IS NOT NULL,
+		        to_regclass('public.channel_link_requests') IS NOT NULL,
+		        to_regclass('public.channel_ingress_receipts') IS NOT NULL,
+		        to_regclass('public.channel_routes') IS NOT NULL,
+		        to_regclass('public.channel_route_link_requests') IS NOT NULL,
+		        to_regclass('public.channel_message_mappings') IS NOT NULL,
+		        to_regclass('public.channel_outbound_effects') IS NOT NULL,
+		        to_regclass('public.credential_vault_entries') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -422,6 +438,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&memoryRecordsAvailable,
 		&memoryEventsAvailable,
 		&memoryReceiptsAvailable,
+		&channelIdentitiesAvailable,
+		&channelLinkRequestsAvailable,
+		&channelIngressReceiptsAvailable,
+		&channelRoutesAvailable,
+		&channelRouteLinksAvailable,
+		&channelMessageMappingsAvailable,
+		&channelOutboundEffectsAvailable,
+		&credentialVaultAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -461,6 +485,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"memory_records":                            memoryRecordsAvailable,
 		"memory_events":                             memoryEventsAvailable,
 		"memory_receipts":                           memoryReceiptsAvailable,
+		"channel_identities":                        channelIdentitiesAvailable,
+		"channel_link_requests":                     channelLinkRequestsAvailable,
+		"channel_ingress_receipts":                  channelIngressReceiptsAvailable,
+		"channel_routes":                            channelRoutesAvailable,
+		"channel_route_link_requests":               channelRouteLinksAvailable,
+		"channel_message_mappings":                  channelMessageMappingsAvailable,
+		"channel_outbound_effects":                  channelOutboundEffectsAvailable,
+		"credential_vault_entries":                  credentialVaultAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
