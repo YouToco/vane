@@ -125,8 +125,13 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	if _, err := st.PurgeTenant(t.Context(), 0, true); types.CodeOf(err) != types.CodeValidation {
-		t.Fatalf("invalid tenant purge code=%s err=%v", types.CodeOf(err), err)
+	const missingTenantID int64 = 9223372036854775807
+	emptyPurge, err := st.PurgeTenant(t.Context(), missingTenantID, true)
+	if err != nil {
+		t.Fatalf("missing tenant purge: %v", err)
+	}
+	if emptyPurge.TenantID != missingTenantID || !emptyPurge.DryRun || emptyPurge.Total != 0 {
+		t.Fatalf("missing tenant purge report=%+v", emptyPurge)
 	}
 
 	visible, err := st.ListSchedulesForMember(t.Context(), tenant, member)
