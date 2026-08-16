@@ -6,86 +6,121 @@ import (
 	"testing"
 )
 
-func TestEnvelopeIsBoundToExactScopeAndDetectsTampering(t *testing.T) {
-	vault, err := New("k2", map[string][]byte{
-		"k1": bytes.Repeat([]byte{1}, 32),
-		"k2": bytes.Repeat([]byte{2}, 32),
+func testVault(t *testing.T) *Vault {
+	t.Helper()
+	vault, err := New(Config{
+		ActiveKeyID: "key-1", ActiveKey: bytes.Repeat([]byte{0x42}, 32),
+		RetiredKeys: map[string][]byte{"key-0": bytes.Repeat([]byte{0x24}, 32)},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope := Scope{TenantID: 7, UserID: 42, Kind: "mcp.oauth.refresh_token"}
-	secret := []byte("refresh-token-that-must-not-leak")
-	envelope, err := vault.Seal(scope, secret)
+	return vault
+}
+
+func TestSealOpenRoundTripAndRandomNonce(t *testing.T) {
+	vault := testVault(t)
+	scope := Scope{Kind: "tenant", TenantID: 7, Provider: "telegram",
+		Purpose: "bot_api", Generation: 3}
+	first, err := vault.Seal(scope, []byte("synthetic-test-secret"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(envelope.Ciphertext, string(secret)) || envelope.KeyVersion != "k2" {
-		t.Fatalf("unsafe envelope: %+v", envelope)
+	second, err := vault.Seal(scope, []byte("synthetic-test-secret"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	opened, err := vault.Open(scope, envelope)
-	if err != nil || !bytes.Equal(opened, secret) {
-		t.Fatalf("open=%q err=%v", opened, err)
+	if bytes.Equal(first.Nonce, second.Nonce) || bytes.Equal(first.Ciphertext, second.Ciphertext) {
+		t.Fatal("each seal must use a fresh nonce")
 	}
-	for _, wrong := range []Scope{
-		{TenantID: 8, UserID: 42, Kind: scope.Kind},
-		{TenantID: 7, UserID: 43, Kind: scope.Kind},
-		{TenantID: 7, UserID: 42, Kind: "feishu.app_secret"},
-	} {
-		if _, err := vault.Open(wrong, envelope); err == nil {
-			t.Fatalf("cross-scope envelope accepted: %+v", wrong)
+	got, err := vault.Open(scope, first)
+	if err != nil || string(got) != "synthetic-test-secret" {
+		t.Fatalf("Open()=(%q,%v)", got, err)
+	}
+	if strings.Contains(string(first.Ciphertext), "synthetic-test-secret") {
+		t.Fatal("ciphertext leaked plaintext")
+	}
+}
+
+func TestOpenFailsClosedAcrossAuthorityBoundaries(t *testing.T) {
+	vault := testVault(t)
+	scope := Scope{Kind: "platform", Provider: "llm", Purpose: "primary_api", Generation: 1}
+	envelope, err := vault.Seal(scope, []byte("synthetic-test-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []Scope{
+		{Kind: "platform", Provider: "llm", Purpose: "primary_api", Generation: 2},
+		{Kind: "platform", Provider: "llm", Purpose: "agent_api", Generation: 1},
+		{Kind: "tenant", TenantID: 1, Provider: "llm", Purpose: "primary_api", Generation: 1},
+	}
+	for _, altered := range tests {
+		if _, err := vault.Open(altered, envelope); err == nil {
+			t.Fatalf("altered scope unexpectedly decrypted: %+v", altered)
 		}
 	}
 	tampered := envelope
-	replacement := byte('A')
-	if tampered.Ciphertext[0] == replacement {
-		replacement = 'B'
-	}
-	tampered.Ciphertext = string(replacement) + tampered.Ciphertext[1:]
+	tampered.Ciphertext = append([]byte(nil), envelope.Ciphertext...)
+	tampered.Ciphertext[0] ^= 0xff
 	if _, err := vault.Open(scope, tampered); err == nil {
-		t.Fatal("tampered envelope accepted")
+		t.Fatal("tampered ciphertext unexpectedly decrypted")
 	}
 }
 
-func TestRetainedKeyCanReadButRequestsExplicitRotation(t *testing.T) {
-	oldVault, err := New("k1", map[string][]byte{"k1": bytes.Repeat([]byte{1}, 32)})
+func TestUserCredentialAADBindsTenantAndUser(t *testing.T) {
+	vault := testVault(t)
+	scope := Scope{Kind: "user", TenantID: 7, UserID: 70,
+		Provider: "telegram", Purpose: "bot_api", Generation: 1}
+	envelope, err := vault.Seal(scope, []byte("synthetic-user-secret"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope := Scope{TenantID: 7, UserID: 0, Kind: "workspace.feishu.app_secret"}
-	envelope, err := oldVault.Seal(scope, []byte("secret"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rotated, err := New("k2", map[string][]byte{
-		"k1": bytes.Repeat([]byte{1}, 32),
-		"k2": bytes.Repeat([]byte{2}, 32),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !rotated.NeedsRotation(envelope) {
-		t.Fatal("retained envelope did not request rotation")
-	}
-	if opened, err := rotated.Open(scope, envelope); err != nil || string(opened) != "secret" {
-		t.Fatalf("retained key read=%q err=%v", opened, err)
-	}
-}
-
-func TestConfigurationAndEnvelopeParsingFailClosed(t *testing.T) {
-	if _, err := New("missing", map[string][]byte{"k1": make([]byte, 32)}); err == nil {
-		t.Fatal("missing primary accepted")
-	}
-	if _, err := New("k1", map[string][]byte{"k1": make([]byte, 16)}); err == nil {
-		t.Fatal("short key accepted")
-	}
-	for _, raw := range [][]byte{
-		[]byte(`{"schema":"vane.encrypted-credential/v1","key_version":"k1","nonce":"n","ciphertext":"c","extra":true}`),
-		[]byte(`{"schema":"other","key_version":"k1","nonce":"n","ciphertext":"c"}`),
-		[]byte(`{"schema":"vane.encrypted-credential/v1","key_version":"k1","nonce":"n","ciphertext":"c"}{}`),
+	for _, altered := range []Scope{
+		{Kind: "user", TenantID: 7, UserID: 71, Provider: "telegram", Purpose: "bot_api", Generation: 1},
+		{Kind: "user", TenantID: 8, UserID: 70, Provider: "telegram", Purpose: "bot_api", Generation: 1},
+		{Kind: "tenant", TenantID: 7, Provider: "telegram", Purpose: "bot_api", Generation: 1},
 	} {
-		if _, err := Parse(raw); err == nil {
-			t.Fatalf("invalid envelope accepted: %s", raw)
+		if _, err := vault.Open(altered, envelope); err == nil {
+			t.Fatalf("altered user authority decrypted: %+v", altered)
+		}
+	}
+}
+
+func TestRetiredKeyDecryptsButNewWritesUseActiveKey(t *testing.T) {
+	oldVault, err := New(Config{ActiveKeyID: "key-0", ActiveKey: bytes.Repeat([]byte{0x24}, 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := Scope{Kind: "tenant", TenantID: 9, Provider: "feishu",
+		Purpose: "app_credentials", Generation: 1}
+	oldEnvelope, err := oldVault.Seal(scope, []byte("old-synthetic-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := testVault(t)
+	if _, err := rotated.Open(scope, oldEnvelope); err != nil {
+		t.Fatalf("retired key could not decrypt retained generation: %v", err)
+	}
+	newEnvelope, err := rotated.Seal(scope, []byte("new-synthetic-secret"))
+	if err != nil || newEnvelope.KeyID != "key-1" {
+		t.Fatalf("new envelope key=%q err=%v", newEnvelope.KeyID, err)
+	}
+}
+
+func TestParseKeyringRejectsMalformedAndDuplicateKeys(t *testing.T) {
+	active := strings.Repeat("42", 32)
+	if _, err := ParseKeyring("key-1", active, "key-0="+strings.Repeat("24", 32)); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ active, retired string }{
+		{"short", ""},
+		{strings.Repeat("00", 32), ""},
+		{strings.Repeat("AB", 32), ""},
+		{active, "missing-equals"},
+		{active, "key-0=" + strings.Repeat("24", 32) + ",key-0=" + strings.Repeat("25", 32)},
+	} {
+		if _, err := ParseKeyring("key-1", test.active, test.retired); err == nil {
+			t.Fatalf("ParseKeyring(%q,%q) unexpectedly succeeded", test.active, test.retired)
 		}
 	}
 }

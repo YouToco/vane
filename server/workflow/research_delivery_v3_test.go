@@ -14,12 +14,48 @@ import (
 
 type researchDeliveryStoreFakeV3 struct {
 	researchDeliveryStoreV3
-	anchor       storepkg.ResearchBriefDeliveryV3
-	effect       *pusheffect.Effect
-	prepareCalls int
-	claimCalls   int
-	settleCalls  int
-	ambiguous    bool
+	preference    storepkg.DeliveryChannelPreference
+	plan          storepkg.ArtifactDeliveryPlan
+	outboundCalls int
+	anchor        storepkg.ResearchBriefDeliveryV3
+	effect        *pusheffect.Effect
+	prepareCalls  int
+	claimCalls    int
+	settleCalls   int
+	ambiguous     bool
+}
+
+func (f *researchDeliveryStoreFakeV3) ResolveDeliveryChannelPreference(
+	context.Context, int64, int64, string,
+) (storepkg.DeliveryChannelPreference, error) {
+	if f.preference.Selection.Valid() {
+		return f.preference, nil
+	}
+	return storepkg.DeliveryChannelPreference{
+		Selection: storepkg.DeliveryChannelFeishu,
+	}, nil
+}
+
+func (f *researchDeliveryStoreFakeV3) PrepareArtifactDeliveryPlan(
+	_ context.Context, tenantID, userID int64, taskID, kind, key string,
+	preference storepkg.DeliveryChannelPreference,
+) (storepkg.ArtifactDeliveryPlan, error) {
+	if f.plan.ID != "" {
+		return f.plan, nil
+	}
+	return storepkg.ArtifactDeliveryPlan{
+		ID:       "071ac64e-65af-56a5-a2a5-1f4a3b440c39",
+		TenantID: tenantID, UserID: userID, TaskID: taskID,
+		ArtifactKind: kind, ArtifactKey: key,
+		Selection: preference.Selection,
+	}, nil
+}
+
+func (f *researchDeliveryStoreFakeV3) PrepareTelegramOutbound(
+	context.Context, int64, int64, int64, string, string, string,
+) (storepkg.ChannelOutboundEffect, error) {
+	f.outboundCalls++
+	return storepkg.ChannelOutboundEffect{}, nil
 }
 
 func (f *researchDeliveryStoreFakeV3) LoadResearchBriefPayloadForDeliveryV3(
@@ -117,6 +153,21 @@ func (f *researchDeliverySenderFakeV3) PushWithUUID(
 }
 
 type researchDeliveryTargetFakeV3 struct{}
+
+type researchTelegramSenderFakeV3 struct {
+	calls   int
+	routeID int64
+	body    string
+}
+
+func (f *researchTelegramSenderFakeV3) SendTextEffect(
+	_ context.Context, _, _ int64, routeID int64,
+	_, _ string, body string,
+) error {
+	f.calls++
+	f.routeID, f.body = routeID, body
+	return nil
+}
 
 func (researchDeliveryTargetFakeV3) ResearchDeliveryTargetV3(
 	context.Context, types.RunIdentity,
@@ -240,5 +291,39 @@ func TestReceiptBackedResearchDeliveryV3QuietHasZeroEffects(t *testing.T) {
 	if store.prepareCalls != 0 || store.claimCalls != 0 || sender.calls != 0 {
 		t.Fatalf("quiet Brief effects prepare=%d claim=%d send=%d",
 			store.prepareCalls, store.claimCalls, sender.calls)
+	}
+}
+
+func TestReceiptBackedResearchDeliveryV3TelegramOnly(t *testing.T) {
+	st, identity, snapshot, plan, brief := newResearchDeliveryFakeV3(t)
+	routeID := int64(73)
+	st.preference = storepkg.DeliveryChannelPreference{
+		Selection:       storepkg.DeliveryChannelTelegram,
+		TelegramRouteID: &routeID,
+	}
+	st.plan = storepkg.ArtifactDeliveryPlan{
+		ID:              "40dbdcdf-84e4-530f-a76d-fd2e233622ac",
+		Selection:       storepkg.DeliveryChannelTelegram,
+		TelegramRouteID: &routeID,
+	}
+	delivery, err := NewReceiptBackedResearchDeliveryV3(st,
+		&researchDeliverySenderFakeV3{}, researchDeliveryTargetFakeV3{},
+		func(types.ResearchBriefPayloadV3) ([]byte, error) {
+			return []byte(`{"schema":"2.0"}`), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg := &researchTelegramSenderFakeV3{}
+	delivery.SetTelegramDelivery(tg, func(payload types.ResearchBriefPayloadV3) (string, error) {
+		return payload.Headline + "\n" + payload.Summary, nil
+	})
+	receipt, err := delivery.Deliver(t.Context(), identity, snapshot, plan, brief, "trace-v3")
+	if err != nil || receipt.PlanID != st.plan.ID || receipt.DeliveryID != 0 ||
+		receipt.Validate(brief.BriefID) != nil || tg.calls != 1 ||
+		tg.routeID != routeID || st.outboundCalls != 1 || st.prepareCalls != 0 ||
+		!strings.Contains(tg.body, "Kimi update") {
+		t.Fatalf("receipt=%+v tg=%+v outbound=%d feishu_prepare=%d err=%v",
+			receipt, tg, st.outboundCalls, st.prepareCalls, err)
 	}
 }

@@ -30,6 +30,12 @@ class GeneratedContractsTest(unittest.TestCase):
             self.assertTrue(path.is_file(), path)
             self.assertEqual(path.read_text(encoding="utf-8"), canonical_json(build()))
 
+    def test_telegram_webhook_is_in_http_route_contract(self) -> None:
+        contract = json.loads(
+            (ROOT / "contracts/http/routes.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("POST /telegram/webhook", contract["routes"])
+
     def test_release_binary_inventory_is_complete(self) -> None:
         contract = json.loads(
             (ROOT / "contracts/release/server-binaries.json").read_text(encoding="utf-8")
@@ -124,6 +130,14 @@ class RepositoryPolicyTest(unittest.TestCase):
         self.assertIn(
             "LoadCredential=native_v3_edit_recovery_db_url:"
             "/etc/vane/credentials/native_v3_edit_recovery_db_url",
+            service,
+        )
+        self.assertIn(
+            "LoadCredential=telegram_bot_token",
+            service,
+        )
+        self.assertIn(
+            "LoadCredential=telegram_webhook_secret",
             service,
         )
         environment = (ROOT / "infra/production/env/server.env.example").read_text(

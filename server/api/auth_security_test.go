@@ -398,6 +398,8 @@ func TestSec_ProtectedEndpointsRequireSession(t *testing.T) {
 		{http.MethodDelete, "/api/schedules/abc"},
 		{http.MethodGet, "/api/deliveries"},
 		{http.MethodGet, "/api/profile"},
+		{http.MethodGet, "/api/channels/delivery-preference"},
+		{http.MethodPatch, "/api/channels/delivery-preference"},
 		{http.MethodGet, "/api/admin/observability"},
 		{http.MethodGet, "/api/admin/runstats"},
 		{http.MethodGet, "/api/admin/cost-calls"},
@@ -779,6 +781,30 @@ func TestSec_PlatformEndpointsGatedToOwner(t *testing.T) {
 				t.Errorf("普通租户访问平台端点应 404，实得 %d —— 可劫持全局配置或读走全平台数据", w.Code)
 			}
 		})
+	}
+}
+
+func TestSec_PlatformTenantMemberIsNotSuperAdministrator(t *testing.T) {
+	fake := newFakeAuthStore()
+	token, hash, err := auth.NewSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.sessions[string(hash)] = &types.Session{
+		TokenHash: hash, UserID: 77, TenantID: 1,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	fake.members[77] = []types.Membership{{
+		TenantID: 1, UserID: 77, Role: types.MembershipRoleMember,
+	}}
+	mux := http.NewServeMux()
+	Mount(mux, Deps{Auth: fake, Principal: auth.NewContextResolver()})
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/llm/credentials", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("platform tenant member got %d, want hidden 404", response.Code)
 	}
 }
 

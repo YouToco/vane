@@ -404,12 +404,13 @@ type SchedulePlaybook struct {
 // 超时由读取路径惰性置 expired。Messages 存 OpenAI 兼容消息数组 JSON
 // （含 tool_calls），延迟解析；system 消息不入库，由 agent loop 调用时动态前置。
 type AgentSession struct {
-	ID        int64              `json:"id"`
-	TenantID  int64              `json:"tenant_id"`
-	UserID    int64              `json:"user_id"`
-	Status    AgentSessionStatus `json:"status"`
-	Messages  json.RawMessage    `json:"messages"` // JSONB，[]llm.ChatMessage 序列化
-	TurnCount int                `json:"turn_count"`
+	ID                int64              `json:"id"`
+	TenantID          int64              `json:"tenant_id"`
+	UserID            int64              `json:"user_id"`
+	ConversationScope string             `json:"conversation_scope"`
+	Status            AgentSessionStatus `json:"status"`
+	Messages          json.RawMessage    `json:"messages"` // JSONB，[]llm.ChatMessage 序列化
+	TurnCount         int                `json:"turn_count"`
 	// ActivatedTools 会话内已激活（动态注入）的 TikHub 端点名（JSONB []string，
 	// migration 015）。激活顺序即注入顺序——append-only，保 FC 请求的缓存前缀稳定。
 	ActivatedTools json.RawMessage `json:"activated_tools"`
