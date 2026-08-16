@@ -134,6 +134,36 @@ func newFeedbackTestManager() *Manager {
 	return m
 }
 
+func TestFeedbackReasonSubmitUsesBoundWorkspacePrincipal(t *testing.T) {
+	cardJSON := BuildDeliveryCard(feedback.CardInput{
+		BodyMD: "**正文**", DeliveryID: 42,
+		State: feedback.CardState{Preference: types.FeedbackActionNotInterested},
+	})
+	m := newFeedbackTestManager()
+	fb := &fakeFeedbackRunner{result: feedback.ClickResult{
+		Toast: "原因已记录", ToastOK: true, CardJSON: cardJSON,
+	}}
+	m.SetFeedback(fb)
+	h := newHandler(m, context.Background())
+
+	resp := h.onFeedbackReasonSubmit(37, 42, types.FeedbackReasonNotRelevant, "不相关")
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || resp.Toast.Content != "原因已记录" {
+		t.Fatalf("reason response = %+v", resp)
+	}
+	assertRawCard(t, resp, cardJSON)
+
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if len(fb.reasonSubmits) != 1 || fb.reasonSubmits[0] != (feedback.ReasonSubmit{
+		DeliveryID: 42, ReasonCode: types.FeedbackReasonNotRelevant, Detail: "不相关",
+	}) {
+		t.Fatalf("reason submits = %+v", fb.reasonSubmits)
+	}
+	if len(fb.clickUsers) != 1 || fb.clickUsers[0] != 37 {
+		t.Fatalf("reason users = %v", fb.clickUsers)
+	}
+}
+
 // assertRawCard 断言回调响应原地把卡片更新为指定的整卡 JSON。
 // SDK 的 Card.Data 是 interface{}（要同时容纳 template/raw 两种载荷），
 // raw 模式下约定放 json.RawMessage——放错类型飞书侧会静默不更新卡片，

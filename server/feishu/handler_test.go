@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/YouToco/vane/server/agent"
@@ -26,6 +28,77 @@ func bindTestUserPrincipal(m *Manager) {
 			TenantID: 1, UserID: userID,
 			Role: types.MembershipRoleOwner, ActorType: types.ActorTypeUser,
 		}, nil
+	}
+}
+
+func TestSingleWorkspacePrincipalFailsClosedAndBindsExactMembership(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		requireDatabaseCapability(t)
+	}
+	ctx := t.Context()
+	if err := store.Migrate(ctx, dbURL); err != nil {
+		t.Fatalf("Migrate() failed: %v", err)
+	}
+	st, err := store.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("store.New() failed: %v", err)
+	}
+	registerStoreClose(t, st)
+
+	openID := "ou_test_workspace_principal_" + uuid.NewString()
+	cleanupTestUser(t, dbURL, openID)
+	user, err := st.UpsertUserByOpenID(ctx, openID, "workspace principal")
+	if err != nil {
+		t.Fatalf("UpsertUserByOpenID() failed: %v", err)
+	}
+
+	withoutStore := newHandler(NewManager(nil, nil, nil), context.Background())
+	if _, err := withoutStore.singleWorkspacePrincipal(ctx, user.ID); types.CodeOf(err) != types.CodeInternal {
+		t.Fatalf("missing resolver code = %s, want %s: %v", types.CodeOf(err), types.CodeInternal, err)
+	}
+
+	h := newHandler(NewManager(st, nil, nil), context.Background())
+	if _, err := h.singleWorkspacePrincipal(ctx, user.ID); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("unbound user code = %s, want %s: %v", types.CodeOf(err), types.CodeConflict, err)
+	}
+	if err := st.AddMembership(ctx, 1, user.ID, types.MembershipRoleMember); err != nil {
+		t.Fatalf("AddMembership(personal) failed: %v", err)
+	}
+	principal, err := h.singleWorkspacePrincipal(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("single membership resolution failed: %v", err)
+	}
+	if principal != (auth.Principal{
+		TenantID: 1, UserID: user.ID,
+		Role: types.MembershipRoleMember, ActorType: types.ActorTypeUser,
+	}) {
+		t.Fatalf("principal = %+v, want exact tenant/user/member/user", principal)
+	}
+
+	database, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatalf("open cleanup database: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	var teamID int64
+	if err := database.QueryRowContext(ctx, `INSERT INTO tenants(
+		status,plan,display_name,workspace_kind,seat_limit)
+		VALUES('active','free',$1,'team',2) RETURNING id`,
+		"principal-test-"+uuid.NewString()).Scan(&teamID); err != nil {
+		t.Fatalf("insert second workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupExec(context.Background(), t, dbURL,
+			`DELETE FROM memberships WHERE user_id=$1`, user.ID)
+		cleanupExec(context.Background(), t, dbURL,
+			`DELETE FROM tenants WHERE id=$1`, teamID)
+	})
+	if err := st.AddMembership(ctx, teamID, user.ID, types.MembershipRoleAdmin); err != nil {
+		t.Fatalf("AddMembership(team) failed: %v", err)
+	}
+	if _, err := h.singleWorkspacePrincipal(ctx, user.ID); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("multi-workspace user code = %s, want %s: %v", types.CodeOf(err), types.CodeConflict, err)
 	}
 }
 
@@ -426,6 +499,54 @@ func TestHandleMessageRouting(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("机器人菜单沿用显式工作区 Principal", func(t *testing.T) {
+		const eventKey = "test_workspace_principal_menu"
+		const command = "列出当前工作区任务"
+		botMenuCommands[eventKey] = command
+		t.Cleanup(func() { delete(botMenuCommands, eventKey) })
+
+		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
+		m.setOwner(owner, "测试")
+		runner := &fakeRunner{}
+		m.SetAgent(runner)
+		h := newHandler(m, context.Background())
+		key, openID := eventKey, owner
+		h.handleBotMenu(context.Background(), &larkapplication.P2BotMenuV6{
+			Event: &larkapplication.P2BotMenuV6Data{
+				EventKey: &key,
+				Operator: &larkapplication.Operator{
+					OperatorId: &larkapplication.UserId{OpenId: &openID},
+				},
+			},
+		})
+		if got := runner.received(); len(got) != 1 || got[0] != command {
+			t.Fatalf("menu agent input = %q, want [%q]", got, command)
+		}
+
+		otherOpenID := "ou_not_owner"
+		h.handleBotMenu(context.Background(), &larkapplication.P2BotMenuV6{
+			Event: &larkapplication.P2BotMenuV6Data{
+				EventKey: &key,
+				Operator: &larkapplication.Operator{
+					OperatorId: &larkapplication.UserId{OpenId: &otherOpenID},
+				},
+			},
+		})
+		delete(botMenuCommands, eventKey)
+		h.handleBotMenu(context.Background(), &larkapplication.P2BotMenuV6{
+			Event: &larkapplication.P2BotMenuV6Data{
+				EventKey: &key,
+				Operator: &larkapplication.Operator{
+					OperatorId: &larkapplication.UserId{OpenId: &openID},
+				},
+			},
+		})
+		if got := runner.received(); len(got) != 1 {
+			t.Fatalf("unauthorized or unknown menu reached agent: %q", got)
+		}
+	})
 }
 
 // TestOnCardActionMissingEvent 验证事件结构缺失时的兜底 toast（不 panic）。
