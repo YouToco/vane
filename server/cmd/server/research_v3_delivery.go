@@ -75,30 +75,3 @@ func renderResearchBriefCardV3(payload types.ResearchBriefPayloadV3) ([]byte, er
 	}
 	return raw, nil
 }
-
-func renderResearchBriefTelegramV3(
-	payload types.ResearchBriefPayloadV3,
-) (string, error) {
-	if err := payload.Validate(); err != nil {
-		return "", err
-	}
-	label := "已核验更新"
-	if payload.Significance == types.ResearchBriefSignificanceMajorV3 {
-		label = "重大更新"
-	}
-	var body strings.Builder
-	fmt.Fprintf(&body, "%s｜%s\n\n%s\n\n核验依据", label,
-		payload.Headline, payload.Summary)
-	for _, citation := range payload.Citations {
-		kind := "当前证据"
-		if citation.Kind == types.ResearchBriefCitationHistoryV3 {
-			kind = "历史对比"
-		}
-		fmt.Fprintf(&body, "\n• %s %s", kind, citation.Ref)
-	}
-	if body.Len() == 0 || body.Len() > 256<<10 {
-		return "", types.NewAppError(
-			types.CodeValidation, "research V3 Telegram 消息超出安全大小", types.ErrValidation)
-	}
-	return body.String(), nil
-}

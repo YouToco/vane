@@ -139,20 +139,3 @@ smtp:
 a2a:
   enabled: false # 默认关闭：不 Mount，/a2a 与 agent-card 均 404（a2a-contract §6/§7）
   base_url: "https://api.vane.zhuoqidev.com/a2a" # 进 AgentCard supportedInterfaces
-
-# Telegram Bot 私聊入口。默认关闭；token/secret 只走环境变量或 systemd credential，
-# 不写入本文件。启用时服务会用 getMe 校验 bot identity，并核对 exact webhook。
-telegram:
-  enabled: false
-  bot_token: ""       # VANE_TELEGRAM_BOT_TOKEN / telegram_bot_token credential
-  webhook_secret: ""  # VANE_TELEGRAM_WEBHOOK_SECRET / telegram_webhook_secret credential
-  webhook_url: "https://api.vane.zhuoqidev.com/telegram/webhook"
-  api_base_url: "https://api.telegram.org"
-  workers: 1
-
-# Provider credentials are encrypted in PostgreSQL. Only this AES-256 keyring
-# stays in deployment state; it is never writable or readable through Web.
-credential_vault:
-  active_key_id: ""   # e.g. vault-key-1 (non-secret identifier)
-  active_key_hex: ""  # VANE_CREDENTIAL_VAULT_ACTIVE_KEY_HEX / systemd credential
-  retired_keys: ""    # optional decrypt-only: old-id=64hex,older-id=64hex

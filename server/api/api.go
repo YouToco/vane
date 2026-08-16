@@ -19,7 +19,6 @@ import (
 	"github.com/YouToco/vane/server/feedback"
 	"github.com/YouToco/vane/server/feishu"
 	"github.com/YouToco/vane/server/store"
-	"github.com/YouToco/vane/server/telegram"
 	"github.com/YouToco/vane/server/types"
 )
 
@@ -89,18 +88,6 @@ type TaskAgent interface {
 		selectedTaskRef string,
 		text string,
 	) (agent.Outcome, error)
-}
-
-type TelegramManager interface {
-	PrincipalStatus(context.Context, int64, int64) telegram.Status
-	IssueLink(context.Context, int64, int64) (telegram.Link, error)
-	IssueRouteLink(context.Context, int64, int64) (telegram.Link, error)
-	Binding(context.Context, int64, int64) (store.ChannelIdentity, error)
-	Routes(context.Context, int64, int64) ([]telegram.RouteSummary, error)
-	BlockedReplies(context.Context, int64, int64) (store.ChannelDeliveryBlockStats, error)
-	Unlink(context.Context, int64, int64) error
-	UnlinkRoute(context.Context, int64, int64, int64) error
-	SendTest(context.Context, int64, int64) error
 }
 
 // BriefFeedback is the existing explicit-user deep-dive control plane. P2-D
@@ -195,10 +182,6 @@ type Deps struct {
 	// and removes the retired pre-6.8 DeletePush admission signature.
 	Scheduler any
 	TaskAgent TaskAgent
-	Telegram  TelegramManager
-	// TelegramAPIBaseURL is the provider origin used only for credential
-	// verification. Production injects config; tests use an isolated provider.
-	TelegramAPIBaseURL string
 	// BriefFeedback is separate from grounded read-only Agent follow-up:
 	// deep-dive is an explicit fixed action and keeps the existing durable
 	// feedback/idempotency/delivery behavior.
@@ -294,26 +277,6 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/feishu/verify", s.handleFeishuVerify)
 	inner.HandleFunc("POST /api/feishu/config", s.handleFeishuConfig)
 	inner.HandleFunc("POST /api/feishu/test", s.handleFeishuTest)
-	inner.HandleFunc("GET /api/telegram/status", s.handleTelegramStatus)
-	inner.HandleFunc("POST /api/telegram/link", s.handleTelegramLink)
-	inner.HandleFunc("DELETE /api/telegram/link", s.handleTelegramUnlink)
-	inner.HandleFunc("POST /api/telegram/routes/link", s.handleTelegramRouteLink)
-	inner.HandleFunc("DELETE /api/telegram/routes/{id}", s.handleTelegramRouteUnlink)
-	inner.HandleFunc("POST /api/telegram/test", s.handleTelegramTest)
-	inner.HandleFunc("GET /api/channels/delivery-preference", s.handleGetDeliveryChannelPreference)
-	inner.HandleFunc("PATCH /api/channels/delivery-preference", s.handlePatchDeliveryChannelPreference)
-	inner.HandleFunc("GET /api/schedules/{id}/delivery-preference", s.handleGetTaskDeliveryChannelPreference)
-	inner.HandleFunc("PATCH /api/schedules/{id}/delivery-preference", s.handlePatchTaskDeliveryChannelPreference)
-	inner.HandleFunc("DELETE /api/schedules/{id}/delivery-preference", s.handleDeleteTaskDeliveryChannelPreference)
-	inner.HandleFunc("GET /api/channels/telegram/credentials", s.handleTelegramCredentialStatus)
-	inner.HandleFunc("PUT /api/channels/telegram/credentials", s.handleTelegramCredentialPut)
-	inner.HandleFunc("DELETE /api/channels/telegram/credentials", s.handleTelegramCredentialDelete)
-	inner.HandleFunc("GET /api/channels/feishu/credentials", s.handleFeishuCredentialStatus)
-	inner.HandleFunc("PUT /api/channels/feishu/credentials", s.handleFeishuCredentialPut)
-	inner.HandleFunc("DELETE /api/channels/feishu/credentials", s.handleFeishuCredentialDelete)
-	inner.HandleFunc("GET /api/admin/llm/credentials", s.handleLLMCredentialStatus)
-	inner.HandleFunc("PUT /api/admin/llm/credentials", s.handleLLMCredentialPut)
-	inner.HandleFunc("DELETE /api/admin/llm/credentials", s.handleLLMCredentialDelete)
 
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)

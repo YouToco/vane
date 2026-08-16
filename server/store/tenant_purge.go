@@ -115,22 +115,6 @@ var purgeOrder = []purgeStep{
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"task_creation_operations", "tenant_id = $1"},
-	// Channel receipts/effects and provider message mappings are children of an
-	// exact route; route/link rows are children of the external identity. User
-	// credential generations reference the membership directly. Explicit tenant
-	// erasure therefore removes this complete provider authority graph before
-	// memberships/users, while platform-scoped credentials (tenant_id NULL) stay.
-	{"aggregate_channel_delivery_effects", "tenant_id = $1"},
-	{"artifact_delivery_plans", "tenant_id = $1"},
-	{"delivery_channel_preferences", "tenant_id = $1"},
-	{"channel_message_mappings", "tenant_id = $1"},
-	{"channel_outbound_effects", "tenant_id = $1"},
-	{"channel_ingress_receipts", "tenant_id = $1"},
-	{"channel_route_link_requests", "tenant_id = $1"},
-	{"channel_routes", "tenant_id = $1"},
-	{"channel_link_requests", "tenant_id = $1"},
-	{"channel_identities", "tenant_id = $1"},
-	{"credential_vault_entries", "tenant_id = $1"},
 	// Team-task authorization decisions are retained independently from the
 	// mutable schedule row and must be included in exact erasure reporting.
 	{"task_workspace_access", "tenant_id = $1"},
@@ -407,17 +391,6 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		a2aAccessTokensAvailable               bool
 		a2aAccessTokenEventsAvailable          bool
 		a2aPrincipalTasksAvailable             bool
-		channelIdentitiesAvailable             bool
-		channelLinkRequestsAvailable           bool
-		channelIngressReceiptsAvailable        bool
-		channelRoutesAvailable                 bool
-		channelRouteLinksAvailable             bool
-		channelMessageMappingsAvailable        bool
-		channelOutboundEffectsAvailable        bool
-		credentialVaultAvailable               bool
-		deliveryChannelPreferencesAvailable    bool
-		artifactDeliveryPlansAvailable         bool
-		aggregateChannelEffectsAvailable       bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -472,18 +445,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.workspace_memory_receipts') IS NOT NULL,
 		        to_regclass('public.a2a_access_tokens') IS NOT NULL,
 		        to_regclass('public.a2a_access_token_events') IS NOT NULL,
-		        to_regclass('public.a2a_principal_tasks') IS NOT NULL,
-		        to_regclass('public.channel_identities') IS NOT NULL,
-		        to_regclass('public.channel_link_requests') IS NOT NULL,
-		        to_regclass('public.channel_ingress_receipts') IS NOT NULL,
-		        to_regclass('public.channel_routes') IS NOT NULL,
-		        to_regclass('public.channel_route_link_requests') IS NOT NULL,
-		        to_regclass('public.channel_message_mappings') IS NOT NULL,
-		        to_regclass('public.channel_outbound_effects') IS NOT NULL,
-		        to_regclass('public.credential_vault_entries') IS NOT NULL,
-		        to_regclass('public.delivery_channel_preferences') IS NOT NULL,
-		        to_regclass('public.artifact_delivery_plans') IS NOT NULL,
-		        to_regclass('public.aggregate_channel_delivery_effects') IS NOT NULL`,
+		        to_regclass('public.a2a_principal_tasks') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -538,17 +500,6 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&a2aAccessTokensAvailable,
 		&a2aAccessTokenEventsAvailable,
 		&a2aPrincipalTasksAvailable,
-		&channelIdentitiesAvailable,
-		&channelLinkRequestsAvailable,
-		&channelIngressReceiptsAvailable,
-		&channelRoutesAvailable,
-		&channelRouteLinksAvailable,
-		&channelMessageMappingsAvailable,
-		&channelOutboundEffectsAvailable,
-		&credentialVaultAvailable,
-		&deliveryChannelPreferencesAvailable,
-		&artifactDeliveryPlansAvailable,
-		&aggregateChannelEffectsAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -607,17 +558,6 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"a2a_access_tokens":                         a2aAccessTokensAvailable,
 		"a2a_access_token_events":                   a2aAccessTokenEventsAvailable,
 		"a2a_principal_tasks":                       a2aPrincipalTasksAvailable,
-		"channel_identities":                        channelIdentitiesAvailable,
-		"channel_link_requests":                     channelLinkRequestsAvailable,
-		"channel_ingress_receipts":                  channelIngressReceiptsAvailable,
-		"channel_routes":                            channelRoutesAvailable,
-		"channel_route_link_requests":               channelRouteLinksAvailable,
-		"channel_message_mappings":                  channelMessageMappingsAvailable,
-		"channel_outbound_effects":                  channelOutboundEffectsAvailable,
-		"credential_vault_entries":                  credentialVaultAvailable,
-		"delivery_channel_preferences":              deliveryChannelPreferencesAvailable,
-		"artifact_delivery_plans":                   artifactDeliveryPlansAvailable,
-		"aggregate_channel_delivery_effects":        aggregateChannelEffectsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,

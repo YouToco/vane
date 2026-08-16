@@ -5,8 +5,9 @@
 import { apiBase } from "./base";
 
 // PLATFORM_OWNER_TENANT_ID 必须与后端 types.SingleTenantID 保持一致：
-// 前端目前只能用 tenant_id==1 决定是否显示管理面入口；后端还会重新证明
-// exact owner membership。前端判断只影响可见性，真正授权始终在服务端。
+// 后端 api/platformadmin.go 的 requirePlatformOwner 就是用 tenant_id==1 判定平台 owner，
+// 前端据此决定是否显示管理面入口。判据同源，不另造一套角色标记——
+// 前端猜错只会多显示/少显示入口，真正的拦截始终在后端那道闸门。
 export const PLATFORM_OWNER_TENANT_ID = 1;
 
 export interface MeResponse {
@@ -163,45 +164,6 @@ export interface FeishuStatus {
   connected_at?: string;
 }
 
-export interface TelegramStatus {
-  enabled: boolean;
-  ready: boolean;
-  bound: boolean;
-  bot_id?: number;
-  bot_username?: string;
-  webhook_url?: string;
-  pending_update_count?: number;
-  last_error_code?: string;
-  blocked_reply_count?: number;
-  oldest_blocked_at?: string;
-  bound_at?: string;
-  routes?: TelegramRoute[];
-}
-
-export interface TelegramRoute {
-  id: number;
-  kind: "private" | "group" | "topic" | "channel";
-  chat_type: "private" | "group" | "supergroup" | "channel";
-  bound_at: string;
-}
-
-export interface TelegramLink {
-  deep_link: string;
-  command?: string;
-  expires_at: string;
-}
-
-export type DeliveryChannelSelection = "feishu" | "telegram" | "both";
-
-export interface DeliveryChannelPreference {
-  selection: DeliveryChannelSelection;
-  scope: "default" | "account" | "task";
-  task_id?: string;
-  telegram_route_id?: number;
-  explicit: boolean;
-  updated_at?: string;
-}
-
 export interface VerifyResult {
   credentials_ok: boolean;
   bot_ok: boolean;
@@ -212,32 +174,6 @@ export interface VerifyResult {
 export interface ConfigResult {
   status: FeishuStatus;
   verify: VerifyResult;
-}
-
-export interface CredentialStatus {
-  configured: boolean;
-  vault_ready: boolean;
-  generation?: number;
-  fingerprint?: string;
-  metadata?: Record<string, unknown>;
-  created_at?: string;
-}
-
-export interface TelegramCredentialInput {
-  bot_token: string;
-}
-
-export interface LLMCredentialInput {
-  provider: "deepseek";
-  base_url: string;
-  api_key: string;
-  model: string;
-  agent_provider: "" | "deepseek" | "kimi";
-  agent_base_url: string;
-  agent_api_key: string;
-  agent_model: string;
-  research_model: string;
-  max_concurrent: number;
 }
 
 // ---- M3 推送管道相关类型 ----
@@ -299,7 +235,6 @@ export interface Schedule {
   next_run_state: "scheduled" | "paused" | "none" | "unavailable";
   next_run?: string; // 只有 next_run_state=scheduled 时才是可信的 Temporal 下一次触发
   created_at?: string;
-  delivery_channel?: DeliveryChannelPreference;
 }
 
 // ---- M5 Gate 可观测性（契约 §16）----
@@ -887,7 +822,6 @@ export interface SchedulePlaybook {
 // GET /api/schedules/{id} 响应。playbook 缺席 = 老任务/无手册，不是错误。
 export interface ScheduleDetail {
   schedule: Schedule;
-  delivery_channel: DeliveryChannelPreference;
   capabilities: {
     definition_edit: boolean;
   };
@@ -1190,7 +1124,6 @@ export function normalizeSchedule(raw: Record<string, unknown>): Schedule {
     next_run_state: nextRunState,
     ...(nextRunState === "scheduled" && nextRun ? { next_run: nextRun } : {}),
     created_at: raw.created_at as string | undefined,
-    delivery_channel: raw.delivery_channel as DeliveryChannelPreference | undefined,
   };
 }
 
@@ -1729,61 +1662,6 @@ export const api = {
       app_secret: appSecret,
     }),
   feishuTest: () => post<{ ok: boolean }>("/api/feishu/test"),
-  telegramStatus: () => request<TelegramStatus>("/api/telegram/status"),
-  telegramLink: () => post<TelegramLink>("/api/telegram/link"),
-	telegramRouteLink: () => post<TelegramLink>("/api/telegram/routes/link"),
-	telegramRouteUnlink: (id: number) =>
-		request<{ ok: boolean }>(`/api/telegram/routes/${id}`, { method: "DELETE" }),
-  telegramUnlink: () =>
-    request<{ ok: boolean }>("/api/telegram/link", { method: "DELETE" }),
-  telegramTest: () => post<{ ok: boolean }>("/api/telegram/test"),
-  deliveryChannelPreference: () =>
-    request<DeliveryChannelPreference>("/api/channels/delivery-preference"),
-  patchDeliveryChannelPreference: (selection: DeliveryChannelSelection, telegramRouteId?: number) =>
-    request<DeliveryChannelPreference>("/api/channels/delivery-preference", {
-      method: "PATCH",
-      body: JSON.stringify({ selection, telegram_route_id: telegramRouteId }),
-    }),
-  taskDeliveryChannelPreference: (id: string) =>
-    request<DeliveryChannelPreference>(
-      `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
-    ),
-  patchTaskDeliveryChannelPreference: (
-    id: string,
-    selection: DeliveryChannelSelection,
-    telegramRouteId?: number,
-  ) => request<DeliveryChannelPreference>(
-    `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
-    {
-      method: "PATCH",
-      body: JSON.stringify({ selection, telegram_route_id: telegramRouteId }),
-    },
-  ),
-  deleteTaskDeliveryChannelPreference: (id: string) =>
-    request<DeliveryChannelPreference>(
-      `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
-      { method: "DELETE" },
-    ),
-  telegramCredentialStatus: () =>
-    request<CredentialStatus>("/api/channels/telegram/credentials"),
-  telegramRotateCredential: (input: TelegramCredentialInput) =>
-    request<CredentialStatus & { activation: "active" | "restart_required" }>(
-      "/api/channels/telegram/credentials",
-      { method: "PUT", body: JSON.stringify(input) },
-    ),
-  telegramRevokeCredential: () =>
-    request<{ ok: boolean; activation?: string }>(
-      "/api/channels/telegram/credentials", { method: "DELETE" },
-    ),
-  adminLLMCredentialStatus: () =>
-    request<CredentialStatus>("/api/admin/llm/credentials"),
-  adminRotateLLMCredential: (input: LLMCredentialInput) =>
-    request<CredentialStatus & { activation: "restart_required" }>(
-      "/api/admin/llm/credentials",
-      { method: "PUT", body: JSON.stringify(input) },
-    ),
-  adminRevokeLLMCredential: () =>
-    request<{ ok: boolean }>("/api/admin/llm/credentials", { method: "DELETE" }),
 
   // ---- M3 定时任务（B8）----
   listSchedules: () =>

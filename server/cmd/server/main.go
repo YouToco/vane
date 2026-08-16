@@ -138,22 +138,6 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("初始化数据库连接池: %w", err)
 	}
-	if cfg.CredentialVault.ActiveKeyID != "" {
-		if err := st.ConfigureCredentialVault(
-			cfg.CredentialVault.ActiveKeyID,
-			cfg.CredentialVault.ActiveKeyHex,
-			cfg.CredentialVault.RetiredKeys,
-		); err != nil {
-			closeServerStores(st, nil)
-			return fmt.Errorf("初始化加密凭证库: %w", err)
-		}
-	} else {
-		slog.Warn("加密凭证库未配置，Web 凭证管理将 fail-closed")
-	}
-	if err := applyStoredLLMCredential(ctx, st, &cfg.LLM); err != nil {
-		closeServerStores(st, nil)
-		return fmt.Errorf("加载数据库 LLM 凭证: %w", err)
-	}
 	var researchControlStore *store.Store
 	closeStores := func() { closeServerStores(st, researchControlStore) }
 	if _, err := st.AssertAgentFirstLegacyWriteFence(ctx); err != nil {
@@ -172,7 +156,6 @@ func run() error {
 	}
 	var researchRuntimeOption workflow.ActivitiesOption
 	var researchDeliveryOption workflow.ActivitiesOption
-	var researchDeliveryCoordinator *workflow.ReceiptBackedResearchDeliveryV3
 	if shouldInitializeResearchV3Runtime(cfg) {
 		researchControlStore, err = store.NewServerRuntimeWithResearchRuntimeCapabilityAndEditRecovery(
 			ctx, cfg.DB.ResearchControlURL, cfg.DB.ResearchRuntimeURL,
@@ -307,7 +290,6 @@ func run() error {
 			closeStores()
 			return fmt.Errorf("初始化 research V3 receipt-backed delivery: %w", deliveryErr)
 		}
-		researchDeliveryCoordinator = delivery
 		researchDeliveryOption = workflow.WithResearchDeliveryV3(delivery)
 	}
 	// 构卡函数注入而非 workflow 直接 import feishu：feishu→agent→workflow 依赖链
@@ -810,17 +792,6 @@ func run() error {
 		return fmt.Errorf("装配 Agent 工具注册表: %w", err)
 	}
 	manager.SetAgent(agentLoop)
-	telegramManager, err := buildTelegramManager(cfg.Telegram, st, agentLoop)
-	if err != nil {
-		closeServerStartupResources(temporalClient.Close, closeStores)
-		return fmt.Errorf("装配 Telegram Bot: %w", err)
-	}
-	periodicActivities.SetTelegramSender(telegramManager)
-	activities.SetAggregateTelegramSender(telegramManager)
-	if researchDeliveryCoordinator != nil {
-		researchDeliveryCoordinator.SetTelegramDelivery(
-			telegramManager, renderResearchBriefTelegramV3)
-	}
 
 	// Build the A2A agent before any worker or recovery goroutine starts. A
 	// composition error is then an ordinary startup failure: no admitted work
@@ -1141,10 +1112,6 @@ func run() error {
 	// same per-user conversation lock.
 	drainIngress := func() error {
 		var drainErrs []error
-		if telegramErr := shutdownTelegramIngress(
-			telegramManager, 2*time.Minute+10*time.Second); telegramErr != nil {
-			drainErrs = append(drainErrs, telegramErr)
-		}
 		managerCtx, cancelManager := context.WithTimeout(context.Background(), 50*time.Second)
 		managerErr := manager.Shutdown(managerCtx)
 		cancelManager()
@@ -1169,35 +1136,6 @@ func run() error {
 		}
 		return nil
 	}
-	if err := telegramManager.Start(ctx); err != nil {
-		stop()
-		drainErr := drainIngress()
-		recoveryErr := stopCreationRecovery()
-		definitionEditRecoveryErr := stopDefinitionEditRecovery()
-		scheduleCommandRecoveryErr := stopScheduleCommandRecovery()
-		outcomeRecoveryErr := stopOutcomeRecovery()
-		pushRecoveryErr := stopPushRecovery()
-		receiptErr := stopReceiptDispatch()
-		definitionEditReceiptErr := stopDefinitionEditReceiptDispatch()
-		sessionErr := drainAgentSessions()
-		maintenanceCtx, cancelMaintenance := context.WithTimeout(
-			context.Background(), 30*time.Second)
-		maintenanceErr := waitMaintenance(maintenanceCtx)
-		cancelMaintenance()
-		if joined := errors.Join(
-			drainErr, recoveryErr, definitionEditRecoveryErr,
-			scheduleCommandRecoveryErr, outcomeRecoveryErr,
-			pushRecoveryErr, receiptErr, definitionEditReceiptErr,
-			sessionErr, maintenanceErr,
-		); joined != nil {
-			return errors.Join(
-				fmt.Errorf("启动 Telegram Bot: %w", err), joined)
-		}
-		w.Stop()
-		temporalClient.Close()
-		closeStores()
-		return fmt.Errorf("启动 Telegram Bot: %w", err)
-	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -1207,8 +1145,6 @@ func run() error {
 		// and the independently authenticated research executor pool.
 		readinessStores = append(readinessStores, researchControlStore)
 	}
-	readinessStores = appendTelegramReadiness(
-		readinessStores, cfg.Telegram.Enabled || st.CredentialVaultReady(), telegramManager)
 	mux.HandleFunc("GET /readyz", handleReadyz(readinessStores...))
 	// principal 解析器：全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 过渡期实现是「全局 owner 回退 + 租户恒为 1」，行为与收敛前逐字一致；
@@ -1216,16 +1152,14 @@ func run() error {
 	principals := auth.NewOwnerResolver(st, feishu.SettingKeyOwner)
 
 	api.Mount(mux, api.Deps{
-		Store:              st,
-		Auth:               st,
-		AccountSecurity:    st,
-		SecurityMailer:     securityMailer,
-		Manager:            manager,
-		Scheduler:          sched,
-		TaskAgent:          agentLoop,
-		Telegram:           telegramManager,
-		TelegramAPIBaseURL: cfg.Telegram.APIBaseURL,
-		BriefFeedback:      fbSvc,
+		Store:           st,
+		Auth:            st,
+		AccountSecurity: st,
+		SecurityMailer:  securityMailer,
+		Manager:         manager,
+		Scheduler:       sched,
+		TaskAgent:       agentLoop,
+		BriefFeedback:   fbSvc,
 		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
 			ExecutiveBriefWebCanaryScheduleID,
 		ExecutiveBriefWebProjectionAllowAll: cfg.Pipeline.
@@ -1235,8 +1169,6 @@ func run() error {
 		Principal: auth.NewContextResolver(),
 		Origin:    cfg.Dashboard.Origin,
 	})
-	mountTelegramWebhook(mux,
-		cfg.Telegram.Enabled || st.CredentialVaultReady(), telegramManager.Handler())
 
 	// A2A server（a2a-contract §7）：enabled=false 时不 Mount——/a2a 与
 	// agent-card 路径在 mux 上根本不存在（404），零新增暴露面。

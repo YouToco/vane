@@ -95,34 +95,6 @@ func TestInvariant_PurgeListNeverTouchesSharedFacts(t *testing.T) {
 	}
 }
 
-func TestInvariant_ChannelAuthorityPurgesInForeignKeyOrder(t *testing.T) {
-	positions := map[string]int{}
-	for index, step := range purgeOrder {
-		positions[step.table] = index
-	}
-	wantOrder := []string{
-		"channel_message_mappings",
-		"channel_outbound_effects",
-		"channel_ingress_receipts",
-		"channel_route_link_requests",
-		"channel_routes",
-		"channel_link_requests",
-		"channel_identities",
-		"credential_vault_entries",
-		"memberships",
-	}
-	for index, table := range wantOrder {
-		position, exists := positions[table]
-		if !exists {
-			t.Fatalf("%s missing from purgeOrder", table)
-		}
-		if index > 0 && positions[wantOrder[index-1]] >= position {
-			t.Fatalf("%s position=%d must precede %s position=%d",
-				wantOrder[index-1], positions[wantOrder[index-1]], table, position)
-		}
-	}
-}
-
 func TestInvariant_ResearchBriefSynthesisPurgesBeforeResearchParents(t *testing.T) {
 	positions := map[string]int{}
 	for index, step := range purgeOrder {

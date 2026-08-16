@@ -16,7 +16,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import TaskActionDialog from "@/features/task/TaskActionDialog";
 import TaskHealthPanel from "@/features/task/TaskHealthPanel";
-import TaskDeliveryChannel from "@/features/task/TaskDeliveryChannel";
 import type { TaskHealthAction } from "@/features/task/TaskHealthPanel";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -833,10 +832,6 @@ export default function TaskDetail({
                 </CardContent>
               </Card>
             )}
-            <TaskDeliveryChannel
-              scheduleID={scheduleID}
-              initial={detail.delivery_channel}
-            />
             <section className="space-y-3">
               <h2 className="text-base font-semibold">
                 {surface.playbookTitle}

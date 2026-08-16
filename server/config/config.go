@@ -42,10 +42,6 @@ type Config struct {
 	Dashboard DashboardConfig `mapstructure:"dashboard"`
 	SMTP      SMTPConfig      `mapstructure:"smtp"`
 	A2A       A2AConfig       `mapstructure:"a2a"`
-	Telegram  TelegramConfig  `mapstructure:"telegram"`
-	// CredentialVault holds only the deployment KEK. Provider credentials
-	// themselves are encrypted, versioned database records managed through Web.
-	CredentialVault CredentialVaultConfig `mapstructure:"credential_vault"`
 }
 
 // SMTPConfig is opt-in. When enabled all fields are required and transport is
@@ -144,8 +140,8 @@ type LLMConfig struct {
 
 // FetchConfig 是内容抓取配置。
 //
-// 飞书目前仍由旧 Manager 从 settings 读取；migrations 145-146 的 user 加密凭证
-// 只有在用户级 Manager fleet 完成切换后才成为运行权威，不能回写明文 settings。
+// 注：飞书凭证不在此配置——AppID/AppSecret 由 Dashboard 向导写入 settings 表、
+// feishu/manager.go 每次连接前从 store 重读（见其注释），config 侧无 FeishuConfig。
 type FetchConfig struct {
 	// TikhubAPIKey 环境变量 VANE_FETCH_TIKHUB_API_KEY。
 	TikhubAPIKey string `mapstructure:"tikhub_api_key"`
@@ -299,26 +295,6 @@ type A2AConfig struct {
 	BaseURL string `mapstructure:"base_url"`
 }
 
-// TelegramConfig is the default-off single-manager compatibility adapter. Its
-// token and webhook secret remain env/systemd credentials until the tenant
-// credential manager fleet is authoritative; bot identity itself is verified
-// with getMe at startup and never inferred from a username.
-type TelegramConfig struct {
-	Enabled       bool   `mapstructure:"enabled"`
-	BotToken      string `mapstructure:"bot_token"`
-	WebhookSecret string `mapstructure:"webhook_secret"`
-	WebhookURL    string `mapstructure:"webhook_url"`
-	APIBaseURL    string `mapstructure:"api_base_url"`
-	Workers       int    `mapstructure:"workers"`
-}
-
-type CredentialVaultConfig struct {
-	ActiveKeyID  string `mapstructure:"active_key_id"`
-	ActiveKeyHex string `mapstructure:"active_key_hex"`
-	// RetiredKeys is a decrypt-only comma-separated key-id=64hex keyring.
-	RetiredKeys string `mapstructure:"retired_keys"`
-}
-
 // sensitiveKeys 需要显式 BindEnv：Viper 的 AutomaticEnv 只对"已知键"
 // （有默认值或出现在配置文件中）生效，纯环境变量运行时嵌套敏感键会漏读。
 var sensitiveKeys = []string{
@@ -334,22 +310,10 @@ var sensitiveKeys = []string{
 	"fetch.tikhub_api_key",
 	"fetch.exa_api_key",
 	"dashboard.password",
-	"a2a.token",
-	"telegram.bot_token",
-	"telegram.webhook_secret",
-	"credential_vault.active_key_hex",
-	"credential_vault.retired_keys",
 	"smtp.password",
 }
 
 const nativeV3EditRecoveryDBCredential = "native_v3_edit_recovery_db_url"
-
-const (
-	telegramBotTokenCredential       = "telegram_bot_token"
-	telegramWebhookSecretCredential  = "telegram_webhook_secret"
-	credentialVaultKeyCredential     = "credential_vault_active_key"
-	credentialVaultRetiredCredential = "credential_vault_retired_keys"
-)
 
 // Load 加载配置并校验。
 //
@@ -389,35 +353,6 @@ func Load(path string) (*Config, error) {
 			return nil, err
 		}
 		cfg.DB.NativeV3EditRecoveryRuntimeURL = credential
-	}
-	if strings.TrimSpace(cfg.Telegram.BotToken) == "" {
-		credential, err := loadOptionalSystemdCredential(telegramBotTokenCredential)
-		if err != nil {
-			return nil, err
-		}
-		cfg.Telegram.BotToken = credential
-	}
-	if strings.TrimSpace(cfg.Telegram.WebhookSecret) == "" {
-		credential, err := loadOptionalSystemdCredential(
-			telegramWebhookSecretCredential)
-		if err != nil {
-			return nil, err
-		}
-		cfg.Telegram.WebhookSecret = credential
-	}
-	if strings.TrimSpace(cfg.CredentialVault.ActiveKeyHex) == "" {
-		credential, err := loadOptionalSystemdCredential(credentialVaultKeyCredential)
-		if err != nil {
-			return nil, err
-		}
-		cfg.CredentialVault.ActiveKeyHex = credential
-	}
-	if strings.TrimSpace(cfg.CredentialVault.RetiredKeys) == "" {
-		credential, err := loadOptionalSystemdCredential(credentialVaultRetiredCredential)
-		if err != nil {
-			return nil, err
-		}
-		cfg.CredentialVault.RetiredKeys = credential
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -553,13 +488,6 @@ func setDefaults(v *viper.Viper) {
 	// token 无默认值，走 sensitiveKeys 显式 BindEnv（契约 §6"三处缺一不可"）。
 	v.SetDefault("a2a.enabled", false)
 	v.SetDefault("a2a.base_url", "https://api.vane.zhuoqidev.com/a2a")
-
-	v.SetDefault("telegram.enabled", false)
-	v.SetDefault("telegram.webhook_url",
-		"https://api.vane.zhuoqidev.com/telegram/webhook")
-	v.SetDefault("telegram.api_base_url", "https://api.telegram.org")
-	v.SetDefault("telegram.workers", 1)
-	v.SetDefault("credential_vault.active_key_id", "")
 }
 
 // readConfigFile 按 Load 的规则定位并读取配置文件。
@@ -588,60 +516,6 @@ func readConfigFile(v *viper.Viper, path string) error {
 // Validate 校验必填项并补齐零值默认值。
 // 允许在 Unmarshal 后单独调用（如配置热更新场景）。
 func (c *Config) Validate() error {
-	c.CredentialVault.ActiveKeyID = strings.TrimSpace(c.CredentialVault.ActiveKeyID)
-	c.CredentialVault.ActiveKeyHex = strings.TrimSpace(c.CredentialVault.ActiveKeyHex)
-	c.CredentialVault.RetiredKeys = strings.TrimSpace(c.CredentialVault.RetiredKeys)
-	vaultConfigured := c.CredentialVault.ActiveKeyID != "" ||
-		c.CredentialVault.ActiveKeyHex != "" || c.CredentialVault.RetiredKeys != ""
-	if vaultConfigured {
-		if !validCredentialVaultKeyID(c.CredentialVault.ActiveKeyID) ||
-			len(c.CredentialVault.ActiveKeyHex) != 64 ||
-			strings.ToLower(c.CredentialVault.ActiveKeyHex) != c.CredentialVault.ActiveKeyHex ||
-			strings.Trim(c.CredentialVault.ActiveKeyHex, "0") == "" {
-			return errors.New("config: credential_vault active key 必须是合法 key id + 32-byte lowercase hex")
-		}
-		if _, err := hex.DecodeString(c.CredentialVault.ActiveKeyHex); err != nil {
-			return errors.New("config: credential_vault.active_key_hex 无效")
-		}
-		if err := validateCredentialVaultRetiredKeys(c.CredentialVault.RetiredKeys,
-			c.CredentialVault.ActiveKeyID); err != nil {
-			return err
-		}
-	}
-	c.Telegram.BotToken = strings.TrimSpace(c.Telegram.BotToken)
-	c.Telegram.WebhookSecret = strings.TrimSpace(c.Telegram.WebhookSecret)
-	c.Telegram.WebhookURL = strings.TrimSpace(c.Telegram.WebhookURL)
-	c.Telegram.APIBaseURL = strings.TrimRight(
-		strings.TrimSpace(c.Telegram.APIBaseURL), "/")
-	if c.Telegram.Workers == 0 {
-		c.Telegram.Workers = 1
-	}
-	if c.Telegram.Enabled {
-		if c.Telegram.BotToken == "" ||
-			strings.ContainsAny(c.Telegram.BotToken, "\r\n/?#") {
-			return errors.New("config: telegram.bot_token 缺失或格式无效")
-		}
-		if !validTelegramWebhookSecret(c.Telegram.WebhookSecret) {
-			return errors.New("config: telegram.webhook_secret 必须是 1-256 位字母、数字、下划线或连字符")
-		}
-		webhookURL, err := url.Parse(c.Telegram.WebhookURL)
-		if err != nil || webhookURL.Scheme != "https" ||
-			webhookURL.Host == "" || webhookURL.Path != "/telegram/webhook" ||
-			webhookURL.RawQuery != "" || webhookURL.Fragment != "" {
-			return errors.New("config: telegram.webhook_url 必须是 HTTPS /telegram/webhook URL")
-		}
-		apiURL, err := url.Parse(c.Telegram.APIBaseURL)
-		if err != nil || apiURL.Host == "" || apiURL.Path != "" ||
-			(apiURL.Scheme != "https" &&
-				!(apiURL.Scheme == "http" &&
-					(apiURL.Hostname() == "127.0.0.1" ||
-						apiURL.Hostname() == "localhost"))) {
-			return errors.New("config: telegram.api_base_url 无效")
-		}
-		if c.Telegram.Workers != 1 {
-			return errors.New("config: telegram ingress v1 的 workers 必须为 1")
-		}
-	}
 	if c.SMTP.Enabled {
 		if strings.TrimSpace(c.SMTP.Host) == "" || c.SMTP.Port < 1 || c.SMTP.Port > 65535 ||
 			strings.TrimSpace(c.SMTP.Username) == "" || c.SMTP.Password == "" ||
@@ -1231,55 +1105,6 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(c.Fetch.ExaAPIKey) == "" {
 			return errors.New("config: Research V3 runtime 要求 fetch.exa_api_key")
 		}
-	}
-	return nil
-}
-
-func validTelegramWebhookSecret(value string) bool {
-	if len(value) < 1 || len(value) > 256 {
-		return false
-	}
-	for _, r := range value {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '_' || r == '-' {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-func validCredentialVaultKeyID(value string) bool {
-	if len(value) < 1 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
-		return false
-	}
-	for _, r := range value[1:] {
-		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' {
-			return false
-		}
-	}
-	return true
-}
-
-func validateCredentialVaultRetiredKeys(value, activeID string) error {
-	if value == "" {
-		return nil
-	}
-	seen := map[string]struct{}{activeID: {}}
-	for _, entry := range strings.Split(value, ",") {
-		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
-		if len(parts) != 2 || !validCredentialVaultKeyID(parts[0]) ||
-			len(parts[1]) != 64 || strings.ToLower(parts[1]) != parts[1] ||
-			strings.Trim(parts[1], "0") == "" {
-			return errors.New("config: credential_vault.retired_keys 格式无效")
-		}
-		if _, err := hex.DecodeString(parts[1]); err != nil {
-			return errors.New("config: credential_vault.retired_keys hex 无效")
-		}
-		if _, duplicate := seen[parts[0]]; duplicate {
-			return errors.New("config: credential_vault.retired_keys key id 重复")
-		}
-		seen[parts[0]] = struct{}{}
 	}
 	return nil
 }

@@ -15,15 +15,6 @@ WorkingDirectory=/opt/vane
 # been removed and the server-runtime Gate is authoritative.
 EnvironmentFile=/opt/vane/env/server-owner-compat.env
 LoadCredential=native_v3_edit_recovery_db_url:/etc/vane/credentials/native_v3_edit_recovery_db_url
-# Relative credential IDs are optional while Telegram is disabled and are
-# resolved by systemd from the host credential stores (for example
-# /etc/credstore). Enabling Telegram makes both values mandatory in config.
-LoadCredential=telegram_bot_token
-LoadCredential=telegram_webhook_secret
-# AES-256 KEK for database-backed provider credentials. The key ID is a
-# non-secret VANE_CREDENTIAL_VAULT_ACTIVE_KEY_ID value in server env.
-LoadCredential=credential_vault_active_key
-LoadCredential=credential_vault_retired_keys
 ExecStart=/opt/vane/current/bin/vane
 Restart=on-failure
 RestartSec=5
