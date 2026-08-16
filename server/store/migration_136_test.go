@@ -125,6 +125,9 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
+	if _, err := st.PurgeTenant(t.Context(), 0, true); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid tenant purge code=%s err=%v", types.CodeOf(err), err)
+	}
 
 	visible, err := st.ListSchedulesForMember(t.Context(), tenant, member)
 	if err != nil {
@@ -138,12 +141,35 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 		t.Context(), otherTenant, outsider, legacyTask); types.CodeOf(err) != types.CodeNotFound {
 		t.Fatalf("cross-tenant task read code=%s err=%v", types.CodeOf(err), err)
 	}
+	readBack, err := st.GetScheduleForMember(t.Context(), tenant, member, legacyTask)
+	if err != nil {
+		t.Fatalf("member task read: %v", err)
+	}
+	if readBack.ID != legacyTask || readBack.UserID != creator {
+		t.Fatalf("member task read projection=%+v", readBack)
+	}
+	if _, err := st.GetScheduleForMember(
+		t.Context(), tenant, member, " invalid "); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid task read code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := st.ListSchedulesForMember(
+		t.Context(), 0, member); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid workspace list code=%s err=%v", types.CodeOf(err), err)
+	}
 
 	// Ordinary members can view shared results but cannot mutate a task they
 	// did not create. Current DB role, not a cached session role, decides.
 	if _, err := st.AuthorizeScheduleMutation(t.Context(), tenant, member,
 		legacyTask, TaskMutationRun); types.CodeOf(err) != types.CodeForbidden {
 		t.Fatalf("non-creator member mutation code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := st.AuthorizeScheduleMutation(t.Context(), tenant, creator,
+		legacyTask, TaskMutation("invalid")); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid task mutation code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := st.AuthorizeScheduleMutation(t.Context(), tenant, admin,
+		"missing-"+uuid.NewString(), TaskMutationRun); types.CodeOf(err) != types.CodeNotFound {
+		t.Fatalf("missing task mutation code=%s err=%v", types.CodeOf(err), err)
 	}
 	if _, err := st.AuthorizeScheduleMutation(t.Context(), tenant, creator,
 		legacyTask, TaskMutationRun); err != nil {
@@ -161,6 +187,26 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 	if transferred.UserID != creator || transferred.CreatorUserID != creator ||
 		transferred.AssigneeUserID != member {
 		t.Fatalf("transfer rewrote frozen identity: %+v", transferred)
+	}
+	if _, err := st.TransferScheduleAssignee(
+		t.Context(), tenant, member, legacyTask, creator); types.CodeOf(err) != types.CodeForbidden {
+		t.Fatalf("member transfer code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := st.TransferScheduleAssignee(
+		t.Context(), tenant, admin, legacyTask, outsider); types.CodeOf(err) != types.CodeNotFound {
+		t.Fatalf("foreign assignee code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := st.TransferScheduleAssignee(
+		t.Context(), tenant, admin, legacyTask, member); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("same assignee code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := st.TransferScheduleAssignee(
+		t.Context(), tenant, admin, "missing-"+uuid.NewString(), member); types.CodeOf(err) != types.CodeNotFound {
+		t.Fatalf("missing transfer task code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := st.TransferScheduleAssignee(
+		t.Context(), tenant, admin, legacyTask, 0); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid transfer target code=%s err=%v", types.CodeOf(err), err)
 	}
 	if err := database.QueryRowContext(t.Context(), `
 		SELECT s.user_id,a.creator_user_id,a.assignee_user_id
@@ -207,6 +253,29 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 	}
 	if canUpdate || canDelete {
 		t.Fatalf("append-only audit update=%t delete=%t", canUpdate, canDelete)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	dryRun, err := st.PurgeTenant(t.Context(), tenant, true)
+	if err != nil {
+		t.Fatalf("dry-run team task purge: %v", err)
+	}
+	if dryRun.Rows["task_workspace_access"] != 1 ||
+		dryRun.Rows["task_access_audit_events"] != 3 {
+		t.Fatalf("team task purge report=%+v", dryRun.Rows)
+	}
+	if _, err := st.PurgeTenant(t.Context(), tenant, false); err != nil {
+		t.Fatalf("team task purge: %v", err)
+	}
+	var retained int
+	if err := database.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM task_workspace_access WHERE tenant_id=$1`, tenant).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 0 {
+		t.Fatalf("task workspace access retained after purge: %d", retained)
 	}
 }
 
