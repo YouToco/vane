@@ -71,6 +71,11 @@ END;
 $$;
 -- +goose StatementEnd
 
+-- Trigger invocation does not require callers to execute the function
+-- directly. Keep the SECURITY DEFINER entry point out of PUBLIC so adding the
+-- compatibility trigger cannot expand any existing runtime capability role.
+REVOKE ALL ON FUNCTION schedule_team_identity_defaults_v1() FROM PUBLIC;
+
 CREATE TRIGGER schedules_team_identity_defaults_v1
 BEFORE INSERT ON schedules
 FOR EACH ROW EXECUTE FUNCTION schedule_team_identity_defaults_v1();

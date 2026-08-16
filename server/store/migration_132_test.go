@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/YouToco/vane/server/taskstate"
 	"github.com/YouToco/vane/server/types"
 )
@@ -179,13 +181,16 @@ func TestMigration132LegacyFenceAndV3PassThroughPostgres(t *testing.T) {
 	if _, err := st.AssertAgentFirstLegacyWriteFence(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "provision_vane_server_runtime_v129",
+	); err != nil {
 		t.Fatalf("provision schema-132 runtime: %v", err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = DeprovisionServerRuntime(ctx, scratchURL)
+		_ = callServerRuntimeProvisioner(
+			ctx, scratchURL, "deprovision_vane_server_runtime_v129")
 	})
 	const runtimePassword = "migration-132-server-runtime-password"
 	if _, err := database.ExecContext(t.Context(),
@@ -199,10 +204,21 @@ func TestMigration132LegacyFenceAndV3PassThroughPostgres(t *testing.T) {
 			`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
 	})
 	runtimeURL := serverRuntimeTestURL(t, scratchURL, runtimePassword)
-	runtimeStore, err := NewServerRuntime(t.Context(), runtimeURL)
+	// Current binaries require the migration-138 capability set and therefore
+	// deliberately reject a schema-132 runtime. This historical migration test
+	// enters only the schema-132 vane_app capability; the current full runtime
+	// boundary is exercised separately on the current schema.
+	runtimePool, err := newStorePool(
+		t.Context(), runtimeURL,
+		func(ctx context.Context, conn *pgx.Conn) error {
+			_, err := conn.Exec(ctx, `SET ROLE vane_app`)
+			return err
+		},
+	)
 	if err != nil {
-		t.Fatalf("open schema-132 production runtime: %v", err)
+		t.Fatalf("open schema-132 application capability: %v", err)
 	}
+	runtimeStore := newStore(runtimePool, nil)
 	if _, err := runtimeStore.AssertAgentFirstLegacyWriteFence(t.Context()); err != nil {
 		runtimeStore.Close()
 		t.Fatalf("schema-132 runtime fence assertion: %v", err)
@@ -571,6 +587,21 @@ func TestMigration132LegacyFenceAndV3PassThroughPostgres(t *testing.T) {
 		t.Fatalf("server runtime could delete retained creation receipt: %v", err)
 	}
 	if err := deleteTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	// PurgeTenant is the current-schema operator contract. Retain the exact
+	// migration-132 fence assertions above, then advance this same retained
+	// history to the current schema before exercising the current purge list.
+	if _, err := database.ExecContext(t.Context(),
+		`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if err := callServerRuntimeProvisioner(
+		t.Context(), scratchURL, "deprovision_vane_server_runtime_v129",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Up(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 

@@ -25,6 +25,7 @@ func TestMigration136TeamTaskIsolationContract(t *testing.T) {
 		"ALTER TABLE task_access_audit_events FORCE ROW LEVEL SECURITY",
 		"execution_user_id", "task.assignee_changed",
 		"NEW.creator_user_id := NEW.user_id",
+		"REVOKE ALL ON FUNCTION schedule_team_identity_defaults_v1() FROM PUBLIC",
 		"GRANT UPDATE (assignee_user_id,updated_at) ON schedules TO vane_app",
 	} {
 		if !strings.Contains(sqlText, fragment) {
@@ -81,6 +82,22 @@ func TestMigration136TeamTaskAuthorizationAndFrozenExecutionIdentityPostgres(t *
 	}
 	if _, err := provider.UpTo(t.Context(), 136); err != nil {
 		t.Fatal(err)
+	}
+	var publicCanExecute bool
+	if err := database.QueryRowContext(t.Context(), `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM pg_proc p,
+			       LATERAL aclexplode(
+			         COALESCE(p.proacl,acldefault('f',p.proowner))
+			       ) acl
+			 WHERE p.oid='schedule_team_identity_defaults_v1()'::regprocedure
+			   AND acl.grantee=0 AND acl.privilege_type='EXECUTE'
+		)`).Scan(&publicCanExecute); err != nil {
+		t.Fatal(err)
+	}
+	if publicCanExecute {
+		t.Fatal("schedule identity SECURITY DEFINER function is executable by PUBLIC")
 	}
 	var executionID, creatorID, assigneeID int64
 	var visibility string
