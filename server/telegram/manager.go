@@ -558,7 +558,8 @@ func (m *Manager) normalizeUpdate(bot Bot, update Update) (normalizedUpdate, boo
 		}
 		// The durable envelope preserves the caption and provider file authority,
 		// but the current worker intentionally remains text-only. A future media
-		// processor will consume the envelope after its own capability gate.
+		// processor may consume it only through an exact native same-modality
+		// capability; conversion fallbacks are forbidden.
 		text = "telegram:media-help"
 	} else if isCommand {
 		kind = "command"
@@ -975,7 +976,7 @@ func staticCommandReply(input string) (string, bool) {
 	case "telegram:unknown-command":
 		return "暂不支持这个命令。发送 /help 查看可用功能。", true
 	case "telegram:media-help":
-		return "已收到媒体消息，但当前 Vane 尚未启用多模态理解，文件内容没有被下载或交给模型。请改用文字描述。媒体类型和文件引用已在你的绑定范围内安全记录，只用于后续受控升级，不会触发后台处理。", true
+		return "已收到媒体消息，但当前 Vane 尚未启用对应模态的原生理解，文件内容没有被下载或交给模型，也不会通过转写、抽帧、OCR 或描述生成绕行处理。请改用文字描述。媒体类型和文件引用已在你的绑定范围内安全记录，只用于后续原生能力升级，不会触发后台处理。", true
 	default:
 		return "", false
 	}

@@ -760,6 +760,11 @@ func TestTelegramUpdateNormalizationAndCommandMatrix(t *testing.T) {
 			t.Fatalf("static reply input=%s reply=%q ok=%t", input, reply, ok)
 		}
 	}
+	mediaReply, ok := staticCommandReply("telegram:media-help")
+	if !ok || !strings.Contains(mediaReply, "不会通过转写、抽帧、OCR 或描述生成绕行处理") ||
+		!strings.Contains(mediaReply, "后续原生能力升级") {
+		t.Fatalf("media reply permits an implicit conversion fallback: %q", mediaReply)
+	}
 	if reply, ok := staticCommandReply("ordinary"); ok || reply != "" {
 		t.Fatalf("ordinary static reply=%q ok=%t", reply, ok)
 	}

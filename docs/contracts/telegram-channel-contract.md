@@ -52,7 +52,7 @@ Not included in v4:
 
 - channel-post ingestion, inline queries, Telegram Login, reactions, edits, or
   arbitrary group-member Agent access;
-- media download/transcription/vision, feedback/deep-dive domain actions, and
+- media download/native multimodal model submission, feedback/deep-dive domain actions, and
   destructive callbacks. Their transport extension points exist but remain
   fail-closed until their own authority contracts are implemented;
 - Telegram as the primary scheduled Brief/periodic-report delivery policy.
@@ -168,42 +168,61 @@ mention removed. Caption text is user input, never a system instruction.
 A future multimodal activation must be a separate A/S-level change and must
 implement all of these gates before the first download or paid model call:
 
+### Native-modality-only invariant
+
+Vane may submit a Telegram attachment only to a selected provider/model contract
+that natively accepts the same semantic modality. Unsupported media remains an
+inert, durable reference and receives an explicit user-visible unsupported
+outcome. Vane must not manufacture apparent support by transcribing audio,
+extracting video frames, OCRing images, generating descriptions, or routing any
+other derived text/modality into a model that lacks the original modality.
+Provider-internal processing behind a documented native `image`, `audio`, or
+`video` input is part of that provider contract; a Vane-side cross-modal adapter
+is not. This is a product authority boundary, not a best-effort fallback.
+
 1. Recheck active tenant membership, channel identity, exact route/topic and a
    dedicated media-processing policy under a durable claim/fence. Revocation
    after webhook receipt must prevent a new download claim.
 2. Select processing from an explicit model capability manifest (`image`,
-   `audio`, `video`, document/PDF), not from model-name guesses. The selected
-   capability, provider/model generation, preprocessing policy and request
-   digest must be frozen for replay and cost attribution.
+   `audio`, `video`, document/PDF), not from model-name guesses. The manifest
+   must distinguish native input support from derived/conversion capabilities;
+   only native support is admissible. The selected capability, provider/model
+   generation, validation policy and request digest must be frozen for replay
+   and cost attribution.
 3. Resolve `file_id` with the then-active encrypted Bot credential. Telegram's
    hosted Bot API currently limits `getFile` downloads to 20 MB and returns a
    temporary path; Vane must apply a lower product quota when appropriate,
    stream with a hard byte limit and deadline, and never persist or log the
    token-bearing URL. MIME and filename metadata are advisory only.
 4. Verify magic bytes and decoded shape before model submission. Enforce image
-   pixel/frame limits, audio/video duration and sampling budgets, decompression
-   limits, supported codecs and tenant cost quota. Generic documents require a
-   separate allowlist/scanner/parser boundary; they cannot inherit image trust.
-5. Materialize a typed model request: direct multimodal content only when the
-   selected model/provider contract supports that modality; otherwise use an
-   explicit, separately metered transcription/description stage. Never silently
-   drop an attachment or pretend a text-only model inspected it.
+   pixel/frame limits, audio/video duration, frame-count and encoded-byte
+   budgets, decompression limits, supported codecs and tenant cost quota.
+   Generic documents require a separate allowlist/scanner/parser boundary;
+   they cannot inherit image trust.
+5. Materialize a typed model request only when the selected model/provider
+   contract natively supports that exact modality. If it does not, stop before
+   download/model cost and settle a durable unsupported outcome. No ASR,
+   transcription, OCR, frame extraction, captioning or description stage may
+   substitute for native support. Never silently drop an attachment or pretend
+   a text-only model inspected it.
 6. Store only content-addressed, tenant-scoped temporary objects with bounded
    retention and deletion/audit receipts. Conversation history stores the
-   typed reference and derived text/digest, not base64 media. Raw bytes must not
-   enter Agent logs, errors, Temporal history or general database JSON.
+   typed reference and canonical metadata digest, not base64 media. Raw bytes
+   must not enter Agent logs, errors, Temporal history or general database JSON.
 7. Treat Telegram albums (`media_group_id`) as multiple independently durable
    updates until a bounded album-assembly protocol exists. Do not assume all
    album members arrive together or block unrelated conversation FIFO forever.
-8. Make user-visible outcomes honest and durable: processed modality and any
-   sampling/transcription fallback are stated; rejected/oversized/unsupported
-   media gets an actionable reply; provider/model failures cannot become silent
-   loss or an unbounded automatic paid retry.
+8. Make user-visible outcomes honest and durable: the exact native processed
+   modality is stated; rejected/oversized/unsupported media gets an actionable
+   reply; provider/model failures cannot become silent loss or an unbounded
+   automatic paid retry. Unsupported never triggers a conversion fallback.
 
 This boundary allows future image/audio/video models to plug in after the
 durable inbox without changing Telegram identity, route, topic, update replay
 or outbound-send semantics. It intentionally does not pre-authorize downloads
-or broaden the current model input protocol.
+or broaden the current model input protocol. A reserved modality may remain
+unsupported indefinitely without blocking text or other natively supported
+modalities.
 
 ## Database role boundary
 

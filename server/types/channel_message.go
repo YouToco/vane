@@ -26,8 +26,11 @@ const (
 // credential material and local paths are never part of the envelope.
 //
 // A future media worker may resolve ProviderFileID with the then-active channel
-// credential only after rechecking identity, route, quota and model capability.
-// MIMEType and FileName are untrusted hints and must be verified from bytes.
+// credential only after rechecking identity, route, quota and an exact native
+// model capability for the same semantic Kind. Unsupported kinds remain inert:
+// Vane must not substitute ASR, OCR, frame extraction, captioning or another
+// cross-modal conversion. MIMEType and FileName are untrusted hints and must be
+// verified from bytes.
 type ChannelMessageEnvelopeV1 struct {
 	Schema       string                      `json:"schema"`
 	Caption      string                      `json:"caption,omitempty"`
