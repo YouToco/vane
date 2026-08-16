@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 )
 
 // TestMain gives the broad Store suite the current production schema while
@@ -56,4 +57,26 @@ func disableRetainedFixtureWriteFences(
 		}
 	}
 	return nil
+}
+
+// restoreCurrentRetainedFixtureSchema repairs the package-owned disposable
+// database after a downgrade-refusal test. Goose correctly restores the
+// production ENABLE ALWAYS fence when a multi-migration DownTo aborts; the
+// broad retained-history suite then needs its test-only fixture exception
+// reinstalled before the next top-level test starts.
+func restoreCurrentRetainedFixtureSchema(t *testing.T, databaseURL string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := Migrate(ctx, databaseURL); err != nil {
+		t.Fatalf("restore current Store test schema: %v", err)
+	}
+	database, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatalf("open restored Store test schema: %v", err)
+	}
+	defer database.Close()
+	if err := disableRetainedFixtureWriteFences(ctx, database); err != nil {
+		t.Fatalf("restore retained Store fixtures: %v", err)
+	}
 }

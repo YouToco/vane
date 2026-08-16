@@ -158,6 +158,9 @@ func TestMigration125RetainedV36RefusesDownPostgres(t *testing.T) {
 	if databaseURL == "" {
 		requireDatabaseCapability(t)
 	}
+	t.Cleanup(func() {
+		restoreCurrentRetainedFixtureSchema(t, databaseURL)
+	})
 	now := time.Now().UTC()
 	fixture := scopedResearchBriefFixtureV35(t, []byte(canonicalWindowDocumentsV33(t,
 		researchWindowDocumentV33{Title: "inside", URL: "https://e/inside",
@@ -191,6 +194,9 @@ func TestMigration124PreparedScopedDefinitionRefusesDownPostgres(t *testing.T) {
 	if databaseURL == "" {
 		requireDatabaseCapability(t)
 	}
+	t.Cleanup(func() {
+		restoreCurrentRetainedFixtureSchema(t, databaseURL)
+	})
 	st, tenantID, userID, taskID := researchV3PrepareFixture(t)
 	policy := researchV3PreparePolicyForTest()
 	policy.TenantID, policy.UserID, policy.TaskID = tenantID, userID, taskID
