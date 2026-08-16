@@ -2,6 +2,8 @@
 // 为什么集中封装：所有请求都要带 cookie（credentials:'include'），且 401 需要统一踢回登录页，
 // 分散在各页面写会漏；错误统一转成后端约定的 {"error":"人话"} 文案，页面只管展示。
 
+import { apiBase } from "./base";
+
 // PLATFORM_OWNER_TENANT_ID 必须与后端 types.SingleTenantID 保持一致：
 // 后端 api/platformadmin.go 的 requirePlatformOwner 就是用 tenant_id==1 判定平台 owner，
 // 前端据此决定是否显示管理面入口。判据同源，不另造一套角色标记——
@@ -966,10 +968,10 @@ export class ApiError extends Error {
   }
 }
 
-// API 基址：静态托管（OSS+CDN 国内线 / Pages 境外线）与后端不同源，生产构建注入
-// 绝对地址（api.vane.zhuoqidev.com，后端已配 CORS + 凭证放行，vane#54）；
-// 本地 dev 留空走 vite 代理（同源相对路径，vite.config.ts）。
-const API_BASE: string = import.meta.env.VITE_API_BASE ?? "";
+// API 基址：静态托管（OSS+CDN 国内线 / Pages 境外线）与后端不同源；
+// 生产值是公开拓扑合同，必须进入确定性制品，不依赖发布机环境变量。
+// 本地 dev 留空走 Vite 代理（同源相对路径，vite.config.ts）。
+const API_BASE = apiBase(import.meta.env.DEV);
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
