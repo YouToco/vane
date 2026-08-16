@@ -133,11 +133,21 @@ class RepositoryPolicyTest(unittest.TestCase):
             service,
         )
         self.assertIn(
-            "LoadCredential=telegram_bot_token",
+            "LoadCredential=telegram_bot_token:/etc/credstore/telegram_bot_token",
             service,
         )
         self.assertIn(
-            "LoadCredential=telegram_webhook_secret",
+            "LoadCredential=telegram_webhook_secret:/etc/credstore/telegram_webhook_secret",
+            service,
+        )
+        self.assertIn(
+            "LoadCredential=credential_vault_active_key:"
+            "/etc/credstore/credential_vault_active_key",
+            service,
+        )
+        self.assertIn(
+            "LoadCredential=credential_vault_retired_keys:"
+            "/etc/credstore/credential_vault_retired_keys",
             service,
         )
         environment = (ROOT / "infra/production/env/server.env.example").read_text(
