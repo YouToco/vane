@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
 )
@@ -111,7 +112,9 @@ type IngressStore interface {
 }
 
 type ChannelAgent interface {
-	HandleChannelMessage(context.Context, int64, string, string, string) (agent.Outcome, error)
+	HandleChannelMessage(
+		context.Context, auth.Principal, string, string, string,
+	) (agent.Outcome, error)
 }
 
 type Manager struct {
@@ -958,7 +961,11 @@ func (m *Manager) processOne(ctx context.Context) bool {
 		agentCtx, cancelAgent := context.WithTimeout(ctx, agentBudget)
 		var outcome agent.Outcome
 		outcome, agentErr = m.agent.HandleChannelMessage(
-			agentCtx, item.UserID, channelConversationScope(item.RouteID),
+			agentCtx, auth.Principal{
+				TenantID: types.TenantID(item.TenantID), UserID: item.UserID,
+				Role: types.MembershipRoleOwner, ActorType: types.ActorTypeUser,
+			},
+			channelConversationScope(item.RouteID),
 			item.StableTurnID, item.InputText)
 		cancelAgent()
 		reply = outcome.Reply

@@ -41,7 +41,7 @@ func TestAggregateTelegramOnlySettlementDoesNotForgeFeishuReceiptPG(t *testing.T
 		`INSERT INTO channel_identities
 		 (tenant_id,user_id,provider,app_identity,external_user_id,
 		  provider_chat_id,chat_type)
-		 VALUES ($1,$2,'telegram','9201','7201','-1007201','supergroup')
+		 VALUES ($1,$2,'telegram','9201','7201','7201','private')
 		 RETURNING id`, tenantID, userID).Scan(&identityID); err != nil {
 		t.Fatal(err)
 	}

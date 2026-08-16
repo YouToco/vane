@@ -467,7 +467,7 @@ func newTaskDefinitionEditReceiptFixture(
 	t.Helper()
 	base := newCompiledTaskFixture(t, st)
 	ctx := t.Context()
-	session, err := st.CreateAgentSession(ctx, base.userID)
+	session, err := st.CreateAgentSession(ctx, base.tenantID, base.userID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
 )
@@ -230,7 +231,7 @@ type fakeChannelAgent struct {
 }
 
 func (f *fakeChannelAgent) HandleChannelMessage(
-	_ context.Context, _ int64, scope, turnID, text string,
+	_ context.Context, _ auth.Principal, scope, turnID, text string,
 ) (agent.Outcome, error) {
 	f.calls++
 	f.scope, f.turnID, f.text = scope, turnID, text

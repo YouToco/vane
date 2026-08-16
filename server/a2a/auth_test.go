@@ -1,12 +1,28 @@
 package a2a
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/types"
 )
+
+type exactTestAuthenticator struct{ token string }
+
+func (a exactTestAuthenticator) AuthenticateA2AAccessToken(_ context.Context, hash []byte) (*types.A2AAuthenticatedPrincipal, error) {
+	if !bytes.Equal(hash, auth.HashSessionToken(a.token)) {
+		return nil, types.ErrForbidden
+	}
+	copy := testAuthority
+	copy.Scopes = append([]types.A2AScope(nil), testAuthority.Scopes...)
+	return &copy, nil
+}
 
 // TestRequireBearer 拒绝矩阵表驱动（契约 §9.1，仿 api/session_test.go）。
 func TestRequireBearer(t *testing.T) {
@@ -15,20 +31,24 @@ func TestRequireBearer(t *testing.T) {
 	})
 	cases := []struct {
 		name       string
-		token      string // 服务端配置
+		disabled   bool
 		authHeader string
 		wantStatus int
 	}{
-		{"无Authorization头", "secret", "", http.StatusUnauthorized},
-		{"错token", "secret", "Bearer wrong", http.StatusUnauthorized},
-		{"非Bearer形态", "secret", "Basic secret", http.StatusUnauthorized},
-		{"空配置token恒401", "", "Bearer ", http.StatusUnauthorized},
-		{"空配置token空串也401", "", "Bearer", http.StatusUnauthorized},
-		{"正确token放行", "secret", "Bearer secret", http.StatusOK},
+		{"无Authorization头", false, "", http.StatusUnauthorized},
+		{"错token", false, "Bearer wrong", http.StatusUnauthorized},
+		{"非Bearer形态", false, "Basic secret", http.StatusUnauthorized},
+		{"无authenticator恒401", true, "Bearer secret", http.StatusUnauthorized},
+		{"空Bearer恒401", false, "Bearer ", http.StatusUnauthorized},
+		{"正确token放行", false, "Bearer secret", http.StatusOK},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := requireBearer(tc.token, okHandler)
+			var authenticator AccessAuthenticator = exactTestAuthenticator{token: "secret"}
+			if tc.disabled {
+				authenticator = nil
+			}
+			h := requireScopedBearer(authenticator, okHandler)
 			req := httptest.NewRequest(http.MethodPost, "/a2a", nil)
 			if tc.authHeader != "" {
 				req.Header.Set("Authorization", tc.authHeader)
@@ -41,14 +61,62 @@ func TestRequireBearer(t *testing.T) {
 			if tc.wantStatus == http.StatusUnauthorized && rec.Header().Get("WWW-Authenticate") != "Bearer" {
 				t.Error("401 应带 WWW-Authenticate: Bearer")
 			}
+			if rec.Header().Get("Cache-Control") != "no-store" {
+				t.Error("A2A bearer response 必须 Cache-Control: no-store")
+			}
 		})
 	}
+}
+
+func TestScopedBearerInjectsExactPrincipalAndAuthority(t *testing.T) {
+	var gotPrincipal auth.Principal
+	var gotScope types.A2AExecutionScope
+	h := requireScopedBearer(exactTestAuthenticator{token: "secret"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotPrincipal, err = auth.PrincipalFromContext(r.Context())
+		if err != nil {
+			t.Fatalf("认证成功却没有 Principal: %v", err)
+		}
+		gotScope, err = authorityFromContext(r.Context())
+		if err != nil {
+			t.Fatalf("认证成功却没有 A2A authority: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/a2a", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status=%d，期望 %d", rec.Code, http.StatusNoContent)
+	}
+	if int64(gotPrincipal.TenantID) != testAuthority.TenantID || gotPrincipal.UserID != testAuthority.UserID ||
+		gotPrincipal.Role != testAuthority.Role || gotPrincipal.ActorType != testAuthority.ActorType {
+		t.Fatalf("Principal 不等于认证 authority: %+v", gotPrincipal)
+	}
+	if gotScope.TokenID != testAuthority.TokenID || gotScope.TenantID != testAuthority.TenantID ||
+		gotScope.UserID != testAuthority.UserID || gotScope.Role != testAuthority.Role ||
+		gotScope.ActorType != testAuthority.ActorType || !sameA2ATestScopes(gotScope.Scopes, testAuthority.Scopes) {
+		t.Fatalf("execution scope 不等于认证 authority: %+v", gotScope)
+	}
+}
+
+func sameA2ATestScopes(left, right []types.A2AScope) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestAuthFailLimiter 同 IP 1 分钟 10 次失败即拒（契约 §5.7）；不同 IP 互不影响；
 // 成功请求不计数。
 func TestAuthFailLimiter(t *testing.T) {
-	h := requireBearer("secret", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	h := requireScopedBearer(exactTestAuthenticator{token: "secret"}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	do := func(ip, auth string) int {
@@ -118,7 +186,7 @@ func TestClientIP(t *testing.T) {
 // TestLimiterNotBypassedBySpoofedXFF 端到端：经 Caddy（loopback 直连）时，攻击者
 // 伪造 XFF 最左段无法绕过限流——同一真实 peer（XFF 最右）连续失败仍被计数封禁。
 func TestLimiterNotBypassedBySpoofedXFF(t *testing.T) {
-	h := requireBearer("secret", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	h := requireScopedBearer(exactTestAuthenticator{token: "secret"}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	do := func(spoofLeft string) int {

@@ -241,7 +241,7 @@ modalities.
 
 ## Database role boundary
 
-Migrations 133-142 install exact-user RLS policies and revoke the future
+Migrations 141-150 install exact-user RLS policies and revoke the future
 `vane_app` role, but the current primary Store intentionally still runs through
 the repository's schema-owner compatibility DSN. PostgreSQL owners bypass
 non-FORCE RLS, so this branch does **not** count those policies as current
@@ -254,7 +254,7 @@ tests prove `row_security_active`; it must not be enabled by config alone.
 ## Secret and transport rules
 
 - Bot token and webhook secret are absent from repository values. Migrations
-  137-138 store user-owned encrypted generations. Every authenticated member
+  145-146 store user-owned encrypted generations. Every authenticated member
   may manage only their exact `(tenant_id,user_id)` scope; AES-GCM AAD binds that
   scope. The manager fleet routes `/telegram/webhook/{verified_bot_id}` and hot
   rotates the exact user's Manager. The legacy environment Manager remains a

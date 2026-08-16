@@ -15,6 +15,74 @@ export interface MeResponse {
   tenant_id: number;
   /** 用户邮箱，供界面用户块展示；无邮箱的存量飞书用户为空串（后端 COALESCE 保证）。 */
   email?: string;
+  role: "owner" | "admin" | "member";
+  actor_type: "user" | "service_account";
+  workspaces?: WorkspaceSummary[];
+}
+
+export interface WorkspaceSummary {
+  id: number;
+  name: string;
+  kind: "personal" | "team";
+  status: "active" | "suspended" | "deleting";
+  plan: string;
+  seat_limit: number;
+  member_count: number;
+  role: "owner" | "admin" | "member";
+  created_at: string;
+  updated_at: string;
+}
+
+export type WorkspaceRole = "owner" | "admin" | "member";
+
+export interface WorkspaceMember {
+  tenant_id: number;
+  user_id: number;
+  email: string;
+  name: string;
+  role: WorkspaceRole;
+  joined_at: string;
+}
+
+export interface WorkspaceInvite {
+  id: number;
+  tenant_id: number;
+  email: string;
+  role: Exclude<WorkspaceRole, "owner">;
+  issued_by: number;
+  expires_at: string;
+  consumed_by?: number;
+  consumed_at?: string;
+  revoked_at?: string;
+  created_at: string;
+  /** Returned exactly once by POST; list responses never contain it. */
+  token?: string;
+}
+
+export type A2AScope = "assistant.chat" | "content.query";
+export type A2AActorType = "user" | "service_account";
+
+export interface A2AAccessToken {
+  id: string;
+  tenant_id: number;
+  principal_user_id: number;
+  actor_type: A2AActorType;
+  service_account_label?: string;
+  scopes: A2AScope[];
+  issued_by: number;
+  expires_at: string;
+  revoked_at?: string;
+  created_at: string;
+  /** Returned exactly once by POST; list responses must never contain it. */
+  token?: string;
+}
+
+export interface IssueA2AAccessTokenRequest {
+  actor_type: A2AActorType;
+  principal_user_id: number;
+  service_account_label?: string;
+  scopes: A2AScope[];
+  expires_in_days: number;
 }
 
 // ---- 平台管理：指定用户/任务/运行的真实执行轨迹 ----
@@ -1039,6 +1107,11 @@ export class ApiError extends Error {
 // 本地 dev 留空走 Vite 代理（同源相对路径，vite.config.ts）。
 const API_BASE = apiBase(import.meta.env.DEV);
 
+export function getA2AEndpoint(): string {
+  const base = API_BASE || (typeof location === "undefined" ? "" : location.origin);
+  return base ? new URL("/a2a", base).toString() : "/a2a";
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
@@ -1547,6 +1620,103 @@ export const api = {
     }),
   logout: () => post<{ ok: boolean }>("/api/auth/logout"),
   me: () => request<MeResponse>("/api/auth/me"),
+  requestEmailVerification: () =>
+    post<{ ok: boolean; already_verified?: boolean }>(
+      "/api/auth/email-verification/request",
+      {},
+    ),
+  verifyEmail: (token: string) =>
+    post<{ ok: boolean }>("/api/auth/email-verification/verify", { token }),
+  requestPasswordReset: (email: string) =>
+    post<{ ok: boolean; message: string }>("/api/auth/password-reset/request", {
+      email,
+    }),
+  completePasswordReset: (token: string, password: string) =>
+    post<{ ok: boolean }>("/api/auth/password-reset/complete", {
+      token,
+      password,
+    }),
+  reauthenticate: (password: string) =>
+    post<{ ok: boolean; proof: string; expires_in: number }>(
+      "/api/auth/reauth",
+      { password },
+    ),
+  logoutAll: (proof: string) =>
+    request<{ ok: boolean; revoked_sessions: number }>("/api/auth/logout-all", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Vane-Reauth-Token": proof,
+      },
+      body: "{}",
+    }),
+  switchWorkspace: (tenantID: number) =>
+    post<{ ok: boolean; tenant_id: number }>(
+      `/api/workspaces/${tenantID}/switch`,
+      {},
+    ),
+  listWorkspaceMembers: (tenantID: number) =>
+    request<{ members: WorkspaceMember[] }>(
+      `/api/workspaces/${tenantID}/members`,
+    ).then((result) => arr(result.members)),
+  listWorkspaceInvites: (tenantID: number) =>
+    request<{ invites: WorkspaceInvite[] }>(
+      `/api/workspaces/${tenantID}/invites`,
+    ).then((result) => arr(result.invites)),
+  issueWorkspaceInvite: (
+    tenantID: number,
+    email: string,
+    role: Exclude<WorkspaceRole, "owner">,
+  ) =>
+    post<WorkspaceInvite>(`/api/workspaces/${tenantID}/invites`, {
+      email,
+      role,
+    }),
+  revokeWorkspaceInvite: (tenantID: number, inviteID: number) =>
+    request<{ ok: boolean }>(
+      `/api/workspaces/${tenantID}/invites/${inviteID}`,
+      { method: "DELETE" },
+    ),
+  updateWorkspaceMemberRole: (
+    tenantID: number,
+    userID: number,
+    role: Exclude<WorkspaceRole, "owner">,
+  ) =>
+    request<{ ok: boolean }>(
+      `/api/workspaces/${tenantID}/members/${userID}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role }),
+      },
+    ),
+  removeWorkspaceMember: (tenantID: number, userID: number) =>
+    request<{ ok: boolean }>(
+      `/api/workspaces/${tenantID}/members/${userID}`,
+      { method: "DELETE" },
+    ),
+  transferWorkspaceOwnership: (tenantID: number, userID: number) =>
+    post<{ ok: boolean }>(
+      `/api/workspaces/${tenantID}/transfer-ownership`,
+      { user_id: userID },
+    ),
+  listA2AAccessTokens: () =>
+    request<{ tokens: A2AAccessToken[] }>("/api/a2a-tokens").then((result) =>
+      arr(result.tokens).map(({ token: _rawToken, ...item }) => item),
+    ),
+  issueA2AAccessToken: (input: IssueA2AAccessTokenRequest, reauthProof: string) =>
+    request<A2AAccessToken>("/api/a2a-tokens", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Vane-Reauth-Token": reauthProof,
+      },
+      body: JSON.stringify(input),
+    }),
+  revokeA2AAccessToken: (tokenID: string) =>
+    request<{ ok: boolean }>(`/api/a2a-tokens/${encodeURIComponent(tokenID)}`, {
+      method: "DELETE",
+    }),
   feishuStatus: () => request<FeishuStatus>("/api/feishu/status"),
   feishuVerify: (appId: string, appSecret: string) =>
     post<VerifyResult>("/api/feishu/verify", {

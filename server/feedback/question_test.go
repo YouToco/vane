@@ -26,7 +26,7 @@ func mustWrapQuestion(
 ) (string, bool) {
 	t.Helper()
 	wrapped, matched, err := svc.WrapQuestion(
-		context.Background(), userID, testAppIdentity, testInboundMsgID,
+		context.Background(), testPrincipal(userID), testAppIdentity, testInboundMsgID,
 		parentMsgID, rootMsgID, text,
 	)
 	if err != nil {
@@ -125,7 +125,7 @@ func TestWrapQuestion_LookupDBErrorFailsClosed(t *testing.T) {
 	h.st.byMsgIDErr = databaseErr("fake: 反查断连")
 
 	wrapped, matched, err := h.svc.WrapQuestion(
-		context.Background(), testUserID, testAppIdentity, testInboundMsgID,
+		context.Background(), testPrincipal(testUserID), testAppIdentity, testInboundMsgID,
 		testMsgID, "", "问题",
 	)
 	if err == nil || matched || wrapped != "" {
@@ -175,7 +175,7 @@ func TestWrapQuestion_InsertFailureStillWraps(t *testing.T) {
 	h.st.insertErr = databaseErr("fake: 落库失败")
 
 	wrapped, matched, err := h.svc.WrapQuestion(
-		context.Background(), testUserID, testAppIdentity, testInboundMsgID,
+		context.Background(), testPrincipal(testUserID), testAppIdentity, testInboundMsgID,
 		testMsgID, "", "原文里说了什么？",
 	)
 	if err != nil || !matched ||
@@ -241,7 +241,7 @@ func TestWrapQuestion_AggregateSiblingReadFailureFailsClosed(t *testing.T) {
 	h.st.listByMsgIDErr = databaseErr("fake: siblings failed")
 
 	wrapped, matched, err := h.svc.WrapQuestion(
-		context.Background(), testUserID, testAppIdentity, testInboundMsgID,
+		context.Background(), testPrincipal(testUserID), testAppIdentity, testInboundMsgID,
 		testMsgID, "", "问题",
 	)
 	if err == nil || matched || wrapped != "" {
@@ -263,7 +263,7 @@ func TestWrapQuestion_PartialAggregateSettlementFailsClosed(t *testing.T) {
 	}`)
 
 	wrapped, matched, err := h.svc.WrapQuestion(
-		context.Background(), testUserID, testAppIdentity, testInboundMsgID,
+		context.Background(), testPrincipal(testUserID), testAppIdentity, testInboundMsgID,
 		testMsgID, "", "第二条说了什么？",
 	)
 	if err == nil || matched || wrapped != "" {
@@ -292,7 +292,7 @@ func TestWrapQuestion_TwoOfThreeAggregateSettlementFailsClosed(t *testing.T) {
 		append(json.RawMessage(nil), h.delivery().CardJSON...)
 
 	wrapped, matched, err := h.svc.WrapQuestion(
-		context.Background(), testUserID, testAppIdentity, testInboundMsgID,
+		context.Background(), testPrincipal(testUserID), testAppIdentity, testInboundMsgID,
 		testMsgID, "", "第三条说了什么？",
 	)
 	if err == nil || matched || wrapped != "" {
@@ -322,7 +322,7 @@ func TestWrapQuestion_AggregateActivityFailureFailsClosed(t *testing.T) {
 	h.st.activityErr = databaseErr("fake: activity failed")
 
 	wrapped, matched, err := h.svc.WrapQuestion(
-		context.Background(), testUserID, testAppIdentity, testInboundMsgID,
+		context.Background(), testPrincipal(testUserID), testAppIdentity, testInboundMsgID,
 		testMsgID, "", "问题",
 	)
 	if err == nil || matched || wrapped != "" {

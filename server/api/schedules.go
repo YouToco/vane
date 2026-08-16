@@ -3,9 +3,10 @@
 package api
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 
-	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
 )
@@ -18,17 +19,13 @@ type scheduleListItem struct {
 // handleListSchedules 读 Postgres 镜像返回当前 owner 的调度列表。
 // GET /api/schedules → 200 [Schedule...]
 func (s *server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
-	userID, err := s.ownerUserID(r.Context())
+	principal, err := s.deps.Principal.FromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
-	principal, err := auth.PrincipalFromContext(r.Context())
-	if err != nil {
-		writeAppError(w, err)
-		return
-	}
-	list, err := s.deps.Store.ListSchedulesByUser(r.Context(), userID)
+	list, err := s.deps.Store.ListSchedulesForMember(
+		r.Context(), int64(principal.TenantID), principal.UserID)
 	if err != nil {
 		writeAppError(w, err)
 		return
@@ -73,7 +70,14 @@ func (s *server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
-	userID, err := s.ownerUserID(r.Context())
+	principal, err := s.deps.Principal.FromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	task, err := s.teamTaskAccess().AuthorizeScheduleMutation(
+		r.Context(), int64(principal.TenantID), principal.UserID,
+		id, store.TaskMutationDelete)
 	if err != nil {
 		writeAppError(w, err)
 		return
@@ -84,10 +88,42 @@ func (s *server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := controller.DeletePushIdempotent(
-		r.Context(), id, userID, idempotencyKey,
+		r.Context(), id, task.UserID, idempotencyKey,
 	); err != nil {
 		writeAppError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+const transferScheduleAssigneeBodyLimit = 4 << 10
+
+func (s *server) handleTransferScheduleAssignee(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		UserID int64 `json:"user_id"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(
+		w, r.Body, transferScheduleAssigneeBodyLimit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "负责人参数无效")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF || body.UserID <= 0 {
+		writeError(w, http.StatusBadRequest, "负责人参数无效")
+		return
+	}
+	principal, err := s.deps.Principal.FromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	task, err := s.teamTaskAccess().TransferScheduleAssignee(
+		r.Context(), int64(principal.TenantID), principal.UserID,
+		r.PathValue("id"), body.UserID)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
 }

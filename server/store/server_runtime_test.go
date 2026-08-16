@@ -63,6 +63,17 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 	if _, err := provider.UpTo(t.Context(), 131); err != nil {
 		t.Fatal(err)
 	}
+	// Run the current runtime verifier against the current schema, but retain
+	// the test's historical fixture builders. Migration 132's independent
+	// scratch suite keeps the physical triggers ENABLE ALWAYS and proves the
+	// production fence; this disposable runtime fixture disables only those
+	// four triggers after applying every current migration.
+	if _, err := provider.Up(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := disableRetainedFixtureWriteFences(t.Context(), owner); err != nil {
+		t.Fatal(err)
+	}
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +114,7 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run("schema 108 retains the unfinished V1 research admission fence", func(t *testing.T) {
+	t.Run("current schema never re-admits a retained V1 research task", func(t *testing.T) {
 		st, err := NewServerRuntime(t.Context(), runtimeURL)
 		if err != nil {
 			t.Fatal(err)
@@ -176,8 +187,14 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		if visible != 0 {
 			t.Fatal("schema 108 admitted a V3-cutover task with unfinished V1 creation")
 		}
-		if _, err := tx.Exec(t.Context(),
-			`DELETE FROM task_creation_operations WHERE id=$1`, operationID); err != nil {
+		// Retained roots are physically immutable after migration 132. Clear the
+		// admission fence through the legitimate terminal transition instead of
+		// deleting history.
+		if _, err := tx.Exec(t.Context(), `
+			UPDATE task_creation_operations
+			   SET status='cancelled',phase='proposal_sealed',
+			       tombstoned_at=clock_timestamp()
+			 WHERE id=$1`, operationID); err != nil {
 			t.Fatal(err)
 		}
 		if err := tx.QueryRow(t.Context(),
@@ -185,8 +202,8 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 			taskID).Scan(&visible); err != nil {
 			t.Fatal(err)
 		}
-		if visible != 1 {
-			t.Fatal("schema 108 rejected a research task after the V1 fence cleared")
+		if visible != 0 {
+			t.Fatal("current schema re-admitted a task created by the retired V1 protocol")
 		}
 	})
 

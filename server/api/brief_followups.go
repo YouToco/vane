@@ -84,7 +84,7 @@ func writeBriefFollowupAppErrorV1(w http.ResponseWriter, err error) {
 type groundedTaskAgent interface {
 	HandleGroundedMessageGuarded(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		question string,
 		grounding string,
 		replyGuard func(string) (string, error),
@@ -477,8 +477,14 @@ func (s *server) loadBriefGrounding(
 	if err != nil {
 		return store.GroundedBriefContextV1{}, err
 	}
-	return s.deps.Store.LoadGroundedBriefContextV1(
+	task, err := s.deps.Store.GetScheduleForMember(
 		r.Context(), int64(principal.TenantID), principal.UserID,
+		r.PathValue("id"))
+	if err != nil {
+		return store.GroundedBriefContextV1{}, err
+	}
+	return s.deps.Store.LoadGroundedBriefContextV1(
+		r.Context(), int64(principal.TenantID), task.UserID,
 		r.PathValue("id"), kind, targetID)
 }
 
@@ -572,7 +578,7 @@ func (s *server) handleBriefFollowup(
 		return
 	}
 	outcome, err := grounded.HandleGroundedMessageGuarded(
-		r.Context(), principal.UserID, request.Question, grounding,
+		r.Context(), principal, request.Question, grounding,
 		guardBriefFollowupReplyV1)
 	if err != nil {
 		writeBriefFollowupAppErrorV1(w, err)
@@ -665,7 +671,7 @@ func (s *server) handleBriefDeepDive(
 		return
 	}
 	result, err := s.deps.BriefFeedback.HandleClick(
-		r.Context(), principal.UserID,
+		r.Context(), principal,
 		feedback.Click{
 			Action:     types.FeedbackActionDeepDive,
 			DeliveryID: request.InsightID,

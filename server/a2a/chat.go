@@ -16,6 +16,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/types"
 )
@@ -33,7 +34,7 @@ const chatHistoryTasks = 8
 // goroutine（taskstore 适配层注释），超预算时 HTTP 响应可能先断，任务经
 // GetTask 兜底可取。
 func (e *executor) executeChat(ctx context.Context, execCtx *a2asrv.ExecutorContext, text string, yield func(a2a.Event, error) bool) {
-	if e.deps.Chat == nil || e.deps.Principal == nil {
+	if e.deps.Chat == nil {
 		yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateRejected,
 			agentMessage(execCtx, skillAssistantChat+" 未启用（服务端未装配 agent 轨）")), nil)
 		return
@@ -45,7 +46,7 @@ func (e *executor) executeChat(ctx context.Context, execCtx *a2asrv.ExecutorCont
 	cctx, cancel := context.WithTimeout(ctx, chatBudget)
 	defer cancel()
 
-	userID, err := e.resolveOwner(cctx)
+	principal, err := e.resolvePrincipal(cctx)
 	if err != nil {
 		// 固定文案，**不经 sanitize 透传 Message**（对抗审查 B-F1）：owner 解析链上的
 		// 错误 Message 会内嵌 open_id（store.UpsertUserByOpenID 的 "upsert 用户（open_id=…）"）
@@ -58,8 +59,18 @@ func (e *executor) executeChat(ctx context.Context, execCtx *a2asrv.ExecutorCont
 		return
 	}
 
-	history := e.chatHistory(cctx, execCtx)
-	outcome, _, err := e.deps.Chat.RunOnce(cctx, userID, history, text)
+	history, err := e.chatHistory(cctx, execCtx)
+	if err != nil {
+		// The history read is also the final live-credential fence before a
+		// paid model call. Revocation must not degrade to an empty history and
+		// still spend under a stale Principal.
+		slog.Error("a2a: assistant.chat paid-call authority fence failed",
+			"task_id", execCtx.TaskID, "context_id", execCtx.ContextID, "err", err)
+		yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateFailed,
+			agentMessage(execCtx, "A2A 请求授权已失效，请重新认证")), nil)
+		return
+	}
+	outcome, _, err := e.deps.Chat.RunOnce(cctx, principal, history, text)
 	if err != nil {
 		// 固定文案，**不透传 Message**（对抗审查 A-2）：RunOnce 的错误可能源自 llm 层，
 		// 而 llm.mapHTTPError 把上游响应体全文拼进 Message（DeepSeek 4xx/5xx 的 provider
@@ -97,14 +108,19 @@ func chatFailText() string { return "对话处理失败，请稍后重试" }
 // ① 加 dbQueryTimeout（A2A 特有的预算，auth 包不该替调用方决定超时）；
 // ② 收窄成 userID——A2A 轨仅用该身份建立对话范围，不暴露 owner 工具目录。
 // 错误的对外文案仍由 ownerErrText 按错误码收窄（B-F1），内层 Message 永不外露。
-func (e *executor) resolveOwner(ctx context.Context) (int64, error) {
+func (e *executor) resolvePrincipal(ctx context.Context) (auth.Principal, error) {
 	octx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
-	p, err := e.deps.Principal.FromContext(octx)
+	p, err := auth.PrincipalFromContext(octx)
 	if err != nil {
-		return 0, err
+		return auth.Principal{}, err
 	}
-	return p.UserID, nil
+	if p.TenantID <= 0 || p.UserID <= 0 || !p.Role.Valid() ||
+		(p.ActorType != types.ActorTypeUser && p.ActorType != types.ActorTypeServiceAccount) {
+		return auth.Principal{}, types.NewAppError(
+			types.CodeForbidden, "A2A token 未绑定完整工作区身份", types.ErrForbidden)
+	}
+	return p, nil
 }
 
 // chatHistory 按 contextId 重建多轮历史。A2A 的多轮语义：任务终态后不可续写
@@ -112,19 +128,24 @@ func (e *executor) resolveOwner(ctx context.Context) (int64, error) {
 // 只纳入已 COMPLETED 的 assistant.chat 任务（content.query 任务不是对话轮次），
 // 每任务折叠成一对 user/assistant，取最近 chatHistoryTasks 个、按时间正序返回。
 //
-// 失败与解析异常一律降级为空/部分历史并记日志：历史是增强不是门槛，
-// 丢上下文的代价远小于把整个任务失败掉（与 agent.profileHint 同哲学）。
-func (e *executor) chatHistory(ctx context.Context, execCtx *a2asrv.ExecutorContext) []llm.ChatMessage {
+// 单行历史载荷解析异常可跳过；但 authority/Store 读失败必须 fail-closed，
+// 因为这一读同时是进入付费模型调用前最后的 live credential fence。
+func (e *executor) chatHistory(ctx context.Context, execCtx *a2asrv.ExecutorContext) ([]llm.ChatMessage, error) {
 	octx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
-	rows, _, _, err := e.deps.Storage.ListA2ATasks(octx, types.A2ATaskQuery{
+	scope, err := authorityFromContext(octx)
+	if err != nil {
+		return nil, err
+	}
+	if e.deps.Storage == nil {
+		return nil, types.NewAppError(types.CodeInternal, "A2A task storage is unavailable", nil)
+	}
+	rows, _, _, err := e.deps.Storage.ListA2APrincipalTasks(octx, scope, types.A2ATaskQuery{
 		ContextID: string(execCtx.ContextID),
 		Status:    string(a2a.TaskStateCompleted),
 	})
 	if err != nil {
-		slog.Warn("a2a: assistant.chat 历史查询失败，按空历史继续",
-			"context_id", execCtx.ContextID, "err", err)
-		return nil
+		return nil, err
 	}
 
 	// rows 按 created_at DESC（store 契约 §4.1）：从最新往回收集，够数即停，再反转为正序。
@@ -151,7 +172,7 @@ func (e *executor) chatHistory(ctx context.Context, execCtx *a2asrv.ExecutorCont
 			llm.ChatMessage{Role: "assistant", Content: picked[i].agent},
 		)
 	}
-	return hist
+	return hist, nil
 }
 
 // chatExchange 从任务 JSONB 还原一对对话轮次：输入必须是 assistant.chat 形态

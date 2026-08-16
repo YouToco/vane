@@ -50,8 +50,14 @@ func (s *server) handleListPeriodicBriefReports(
 		writeAppError(w, err)
 		return
 	}
+	task, err := s.deps.Store.GetScheduleForMember(
+		r.Context(), int64(principal.TenantID), principal.UserID, taskID)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
 	page, err := s.deps.Store.ListPeriodicBriefReportsV1(
-		r.Context(), int64(principal.TenantID), principal.UserID,
+		r.Context(), int64(principal.TenantID), task.UserID,
 		taskID, query)
 	if err != nil {
 		writeAppError(w, err)
@@ -73,8 +79,15 @@ func (s *server) handleGetBriefReportSettings(
 		writeAppError(w, err)
 		return
 	}
-	settings, err := s.deps.Store.GetBriefReportSettingsV1(
+	task, err := s.deps.Store.GetScheduleForMember(
 		r.Context(), int64(principal.TenantID), principal.UserID,
+		r.PathValue("id"))
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	settings, err := s.deps.Store.GetBriefReportSettingsV1(
+		r.Context(), int64(principal.TenantID), task.UserID,
 		r.PathValue("id"))
 	if err != nil {
 		writeAppError(w, err)
@@ -108,8 +121,15 @@ func (s *server) handlePatchBriefReportSettings(
 		writeAppError(w, err)
 		return
 	}
-	settings, err := s.deps.Store.PatchBriefReportSettingsV1(
+	task, err := s.teamTaskAccess().AuthorizeScheduleMutation(
 		r.Context(), int64(principal.TenantID), principal.UserID,
+		r.PathValue("id"), store.TaskMutationEdit)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	settings, err := s.deps.Store.PatchBriefReportSettingsV1(
+		r.Context(), int64(principal.TenantID), task.UserID,
 		r.PathValue("id"), patch)
 	if err != nil {
 		writeAppError(w, err)

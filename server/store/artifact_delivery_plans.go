@@ -116,19 +116,10 @@ func (s *Store) PrepareArtifactDeliveryPlan(
 	}
 	routeID := preference.TelegramRouteID
 	if preference.Selection.Includes("telegram") {
-		query := `SELECT cr.id FROM channel_routes cr
-		 JOIN channel_identities ci ON ci.id=cr.identity_id
-		 WHERE cr.tenant_id=$1 AND cr.user_id=$2 AND cr.provider='telegram' AND
-		       cr.status='active' AND ci.status='active'`
-		args := []any{tenantID, userID}
-		if routeID != nil {
-			query += ` AND cr.id=$3`
-			args = append(args, *routeID)
-		} else {
-			query += ` AND cr.route_kind='private' ORDER BY cr.bound_at,cr.id LIMIT 1`
-		}
 		var resolved int64
-		if err := tx.QueryRow(ctx, query+` FOR UPDATE OF cr`, args...).Scan(&resolved); err != nil {
+		if err := tx.QueryRow(ctx,
+			`SELECT * FROM lock_artifact_delivery_telegram_route_v1($1,$2,$3)`,
+			tenantID, userID, routeID).Scan(&resolved); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ArtifactDeliveryPlan{}, types.NewAppError(types.CodeNotFound,
 					"Telegram 投递目的地不可用", types.ErrNotFound)

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/config"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/types"
@@ -548,6 +549,7 @@ func (s *fakeSender) canceledCount() int {
 }
 
 type notice struct {
+	tenantID       int64
 	userID         int64
 	sourceIdentity string
 	text           string
@@ -560,14 +562,15 @@ type fakeNotifier struct {
 
 func (n *fakeNotifier) NotifyEvent(
 	_ context.Context,
-	userID int64,
+	principal auth.Principal,
 	sourceIdentity string,
 	text string,
 ) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.notices = append(n.notices, notice{
-		userID: userID, sourceIdentity: sourceIdentity, text: text,
+		tenantID: int64(principal.TenantID), userID: principal.UserID,
+		sourceIdentity: sourceIdentity, text: text,
 	})
 }
 
@@ -815,7 +818,7 @@ func (h *harness) delivery() *types.Delivery { return h.st.deliveries[testDelive
 // click 点一次按钮并要求不报错。
 func (h *harness) click(t *testing.T, action types.FeedbackAction) ClickResult {
 	t.Helper()
-	res, err := h.svc.HandleClick(context.Background(), testUserID, Click{Action: action, DeliveryID: testDeliveryID})
+	res, err := h.svc.HandleClick(context.Background(), testPrincipal(testUserID), Click{Action: action, DeliveryID: testDeliveryID})
 	if err != nil {
 		t.Fatalf("HandleClick(%s) 意外报错: %v", action, err)
 	}
@@ -827,7 +830,7 @@ func (h *harness) click(t *testing.T, action types.FeedbackAction) ClickResult {
 // never be mistaken for a persisted preference event.
 func (h *harness) submitBadFeedback(t *testing.T, reason types.FeedbackReason, detail string) ClickResult {
 	t.Helper()
-	res, err := h.svc.HandleReasonSubmit(context.Background(), testUserID, ReasonSubmit{
+	res, err := h.svc.HandleReasonSubmit(context.Background(), testPrincipal(testUserID), ReasonSubmit{
 		DeliveryID: testDeliveryID,
 		ReasonCode: reason,
 		Detail:     detail,

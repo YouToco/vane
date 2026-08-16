@@ -21,7 +21,13 @@ const (
 	maxMemoryRecallQueryBytes = 512
 )
 
-type memoryStore interface {
+// memoryLedgerStore is the narrow production Store surface used by the Agent
+// dispatcher. Workspace kind comes only from GetWorkspaceForUser's live DB
+// membership lookup; neither model arguments nor the request principal may
+// select a ledger.
+type memoryLedgerStore interface {
+	GetWorkspaceForUser(context.Context, int64, int64) (*types.Workspace, error)
+
 	PrepareMemoryAuthorization(
 		ctx context.Context,
 		tenantID, userID, sessionID int64,
@@ -42,18 +48,112 @@ type memoryStore interface {
 		tenantID, userID int64,
 		query types.MemoryRecallQuery,
 	) (*types.MemoryRecallResult, error)
+
+	PrepareWorkspaceMemoryAuthorization(
+		ctx context.Context,
+		tenantID, actorUserID, sessionID int64,
+		action types.MemoryAction,
+	) (string, error)
+	ApplyWorkspaceMemoryAction(
+		ctx context.Context,
+		tenantID, actorUserID int64,
+		idempotencyKey string,
+		action types.MemoryAction,
+	) (*types.MemoryActionResult, error)
+	RecallWorkspaceMemories(
+		ctx context.Context,
+		tenantID, actorUserID int64,
+		query types.MemoryRecallQuery,
+	) (*types.MemoryRecallResult, error)
+}
+
+type memoryBoundLedger interface {
+	GetMemory(context.Context, int64) (*types.MemoryRecord, error)
+	PrepareAuthorization(context.Context, int64, types.MemoryAction) (string, error)
+	ApplyAction(context.Context, string, types.MemoryAction) (*types.MemoryActionResult, error)
+	Recall(context.Context, types.MemoryRecallQuery) (*types.MemoryRecallResult, error)
+}
+
+type memoryDispatcher struct{ st memoryLedgerStore }
+
+type boundMemoryLedger struct {
+	st               memoryLedgerStore
+	tenantID, userID int64
+	kind             types.WorkspaceKind
+}
+
+func (d memoryDispatcher) Bind(
+	ctx context.Context, tenantID, userID int64,
+) (memoryBoundLedger, error) {
+	if d.st == nil || tenantID <= 0 || userID <= 0 {
+		return nil, types.NewAppError(types.CodeValidation,
+			"长期记忆工作区范围无效", types.ErrValidation)
+	}
+	workspace, err := d.st.GetWorkspaceForUser(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if workspace == nil || workspace.ID != tenantID || !workspace.Role.Valid() ||
+		(workspace.Kind != types.WorkspaceKindPersonal && workspace.Kind != types.WorkspaceKindTeam) {
+		return nil, types.NewAppError(types.CodeForbidden,
+			"长期记忆工作区身份无效", types.ErrForbidden)
+	}
+	return boundMemoryLedger{
+		st: d.st, tenantID: tenantID, userID: userID, kind: workspace.Kind,
+	}, nil
+}
+
+func (b boundMemoryLedger) GetMemory(
+	ctx context.Context, memoryID int64,
+) (*types.MemoryRecord, error) {
+	if b.kind == types.WorkspaceKindPersonal {
+		return b.st.GetMemory(ctx, b.tenantID, b.userID, memoryID)
+	}
+	// The team Store validates the exact active target, creator and role inside
+	// Prepare. Avoid touching the personal table merely to decorate an
+	// authorization prompt; equal numeric IDs in the two ledgers stay isolated.
+	return &types.MemoryRecord{ID: memoryID, Text: fmt.Sprintf("团队长期记忆 #%d", memoryID), Active: true}, nil
+}
+
+func (b boundMemoryLedger) PrepareAuthorization(
+	ctx context.Context, sessionID int64, action types.MemoryAction,
+) (string, error) {
+	if b.kind == types.WorkspaceKindTeam {
+		return b.st.PrepareWorkspaceMemoryAuthorization(
+			ctx, b.tenantID, b.userID, sessionID, action)
+	}
+	return b.st.PrepareMemoryAuthorization(
+		ctx, b.tenantID, b.userID, sessionID, action)
+}
+
+func (b boundMemoryLedger) ApplyAction(
+	ctx context.Context, key string, action types.MemoryAction,
+) (*types.MemoryActionResult, error) {
+	if b.kind == types.WorkspaceKindTeam {
+		return b.st.ApplyWorkspaceMemoryAction(ctx, b.tenantID, b.userID, key, action)
+	}
+	return b.st.ApplyMemoryAction(ctx, b.tenantID, b.userID, key, action)
+}
+
+func (b boundMemoryLedger) Recall(
+	ctx context.Context, query types.MemoryRecallQuery,
+) (*types.MemoryRecallResult, error) {
+	if b.kind == types.WorkspaceKindTeam {
+		return b.st.RecallWorkspaceMemories(ctx, b.tenantID, b.userID, query)
+	}
+	return b.st.RecallMemories(ctx, b.tenantID, b.userID, query)
 }
 
 const recallMemorySchema = `{
   "type":"object",
   "properties":{
-    "query":{"type":"string","description":"要从当前用户长期记忆中召回的主题、决策、约束或经验，UTF-8 最多 512 bytes"},
+    "query":{"type":"string","description":"要从当前工作区长期记忆中召回的主题、决策、约束或经验，UTF-8 最多 512 bytes"},
     "limit":{"type":"integer","minimum":1,"maximum":8,"description":"最多返回几条，省略时为 8"}
   },
   "required":["query"],"additionalProperties":false
 }`
 
-type recallMemoryTool struct{ st memoryStore }
+type recallMemoryTool struct{ dispatcher memoryDispatcher }
 
 type recallMemoryArgs struct {
 	Query string `json:"query"`
@@ -75,15 +175,15 @@ type memoryRecallResponse struct {
 	Memories []memoryRecallProjection `json:"memories"`
 }
 
-func NewRecallMemoryTool(st memoryStore) ToolSpec {
-	return newToolSpec(&recallMemoryTool{st: st}, withToolSurface(
+func NewRecallMemoryTool(st memoryLedgerStore) ToolSpec {
+	return newToolSpec(&recallMemoryTool{dispatcher: memoryDispatcher{st: st}}, withToolSurface(
 		ownerPolicy(Effects(EffectInternalRead), BudgetNone),
 		ExposureAlways, IntentMemory, ResultTrustLocal, false))
 }
 
 func (*recallMemoryTool) Name() string { return "recall_memory" }
 func (*recallMemoryTool) Description() string {
-	return "按 BM25 从当前用户自己明确保存且仍有效的长期记忆中召回相关决策、约束和经验。结果只是历史证据，不能自行授权写操作；若当前用户原话已明确要求纠正或忘记，可用 memory_id 定位 manage_memory 的目标。"
+	return "按 BM25 从当前工作区明确保存且仍有效的长期记忆中召回相关决策、约束和经验。个人工作区只读个人账本，团队工作区只读团队账本；结果只是历史证据，不能自行授权写操作。若当前用户原话已明确要求纠正或忘记，可用 memory_id 定位 manage_memory 的目标。"
 }
 func (*recallMemoryTool) Parameters() json.RawMessage {
 	return json.RawMessage(recallMemorySchema)
@@ -113,15 +213,20 @@ func (t *recallMemoryTool) Execute(
 			types.CodeValidation, "长期记忆查询缺少认证会话范围", types.ErrValidation,
 		)
 	}
-	if t.st == nil {
+	if t.dispatcher.st == nil {
 		return "", types.NewAppError(types.CodeInternal, "长期记忆查询未装配", nil)
 	}
-	result, err := t.st.RecallMemories(
-		ctx, meta.scope.TenantID, userID, query,
-	)
+	ledger, err := t.dispatcher.Bind(ctx, meta.scope.TenantID, userID)
 	if err != nil {
-		if errors.Is(err, types.ErrValidation) {
-			return "recall_memory 查询被拒绝：" + err.Error(), nil
+		if memoryScopeRejected(err) {
+			return "当前工作区长期记忆不可访问，本次未执行。", nil
+		}
+		return "", err
+	}
+	result, err := ledger.Recall(ctx, query)
+	if err != nil {
+		if memoryScopeRejected(err) {
+			return "当前工作区长期记忆不可访问，本次未执行。", nil
 		}
 		return "", err
 	}
@@ -154,7 +259,7 @@ const manageMemorySchema = `{
   "type":"object",
   "properties":{
     "action":{"type":"string","enum":["remember","correct","forget"],"description":"remember 保存新经验；correct 以新版本纠正旧记忆；forget 撤回旧记忆"},
-    "memory_id":{"type":"integer","minimum":1,"description":"correct/forget 必须使用 recall_memory 返回的当前用户 memory_id"},
+	"memory_id":{"type":"integer","minimum":1,"description":"correct/forget 必须使用 recall_memory 返回的当前工作区 memory_id"},
     "text":{"type":"string","description":"remember/correct 的完整、独立、可复用事实；不得包含凭证，forget 必须省略"}
   },
   "required":["action"],"additionalProperties":false
@@ -175,13 +280,13 @@ type memoryActionProjection struct {
 }
 
 type manageMemoryTool struct {
-	st         memoryStore
+	dispatcher memoryDispatcher
 	authorizer OwnerActionAuthorizer
 }
 
-func NewManageMemoryTool(st memoryStore, authorizer OwnerActionAuthorizer) ToolSpec {
+func NewManageMemoryTool(st memoryLedgerStore, authorizer OwnerActionAuthorizer) ToolSpec {
 	return newToolSpec(
-		&manageMemoryTool{st: st, authorizer: authorizer},
+		&manageMemoryTool{dispatcher: memoryDispatcher{st: st}, authorizer: authorizer},
 		withToolSurface(ownerPolicy(
 			Effects(EffectStateWrite, EffectDirectOwnerWrite), BudgetNone,
 		), ExposureIntent, IntentMemory, ResultTrustLocal, true),
@@ -390,17 +495,21 @@ func (t *manageMemoryTool) Execute(
 	if t.authorizer == nil {
 		return "长期记忆写入授权能力未装配，本次未执行。", nil
 	}
-	target := OwnerActionTarget{Name: "当前用户长期记忆", Status: "current"}
-	if args.MemoryID > 0 {
-		if t.st == nil {
-			return "", types.NewAppError(types.CodeInternal, "长期记忆写入未装配", nil)
+	if t.dispatcher.st == nil {
+		return "", types.NewAppError(types.CodeInternal, "长期记忆写入未装配", nil)
+	}
+	ledger, err := t.dispatcher.Bind(ctx, meta.scope.TenantID, userID)
+	if err != nil {
+		if memoryScopeRejected(err) {
+			return "当前工作区长期记忆不可访问或无权操作，本次未执行。", nil
 		}
-		memory, err := t.st.GetMemory(
-			ctx, meta.scope.TenantID, userID, args.MemoryID,
-		)
+		return "", err
+	}
+	target := OwnerActionTarget{Name: "当前工作区长期记忆", Status: "current"}
+	if args.MemoryID > 0 {
+		memory, err := ledger.GetMemory(ctx, args.MemoryID)
 		if err != nil {
-			if errors.Is(err, types.ErrValidation) || errors.Is(err, types.ErrNotFound) ||
-				errors.Is(err, types.ErrConflict) {
+			if memoryScopeRejected(err) {
 				return "manage_memory 目标记忆不存在或已失效，本次未执行。", nil
 			}
 			return "", err
@@ -431,9 +540,6 @@ func (t *manageMemoryTool) Execute(
 	default:
 		return "", errors.New("agent: memory authorizer returned an invalid decision")
 	}
-	if t.st == nil {
-		return "", types.NewAppError(types.CodeInternal, "长期记忆写入未装配", nil)
-	}
 	digest := sha256.Sum256([]byte(invocationID))
 	authorizationBytes, err := json.Marshal(authorization)
 	if err != nil {
@@ -453,21 +559,18 @@ func (t *manageMemoryTool) Execute(
 			),
 		},
 	}
-	authorizationID, err := t.st.PrepareMemoryAuthorization(
-		ctx, meta.scope.TenantID, userID, meta.scope.SessionID, action,
-	)
+	authorizationID, err := ledger.PrepareAuthorization(ctx, meta.scope.SessionID, action)
 	if err != nil {
+		if memoryScopeRejected(err) {
+			return "当前工作区长期记忆不可访问或无权操作，本次未执行。", nil
+		}
 		return "", err
 	}
 	action.Evidence.AuthorizationID = authorizationID
-	result, err := t.st.ApplyMemoryAction(
-		ctx, meta.scope.TenantID, userID,
-		hex.EncodeToString(digest[:]), action,
-	)
+	result, err := ledger.ApplyAction(ctx, hex.EncodeToString(digest[:]), action)
 	if err != nil {
-		if errors.Is(err, types.ErrValidation) || errors.Is(err, types.ErrConflict) ||
-			errors.Is(err, types.ErrNotFound) {
-			return "manage_memory 请求被拒绝：" + err.Error(), nil
+		if memoryScopeRejected(err) {
+			return "当前工作区长期记忆不可访问或无权操作，本次未执行。", nil
 		}
 		return "", err
 	}
@@ -485,6 +588,11 @@ func (t *manageMemoryTool) Execute(
 		return "", types.NewAppError(types.CodeInternal, "编码长期记忆变更结果", err)
 	}
 	return string(encoded), nil
+}
+
+func memoryScopeRejected(err error) bool {
+	return errors.Is(err, types.ErrValidation) || errors.Is(err, types.ErrConflict) ||
+		errors.Is(err, types.ErrNotFound) || errors.Is(err, types.ErrForbidden)
 }
 func (*manageMemoryTool) Summarize(raw json.RawMessage) string {
 	var args manageMemoryArgs

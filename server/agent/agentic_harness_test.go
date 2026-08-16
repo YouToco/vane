@@ -39,7 +39,7 @@ func TestGroundedResearchCompletesSearchReadAndAnswerInOneMessage(t *testing.T) 
 	)
 
 	out, err := loop.HandleExternalContextMessage(
-		t.Context(), 7,
+		t.Context(), testPrincipal(7),
 		"[追问上下文]\n旧推送正文\n[追问上下文结束]\n用户的追问：GPT-Live 是否已提供 API 定价？",
 	)
 	if err != nil {
@@ -90,7 +90,7 @@ func TestGroundedResearchRejectsSearchSummaryUntilPageRead(t *testing.T) {
 	)
 
 	out, err := loop.HandleMessage(
-		t.Context(), 7, "请查 GPT-Live 是否已经提供 API 定价",
+		t.Context(), testPrincipal(7), "请查 GPT-Live 是否已经提供 API 定价",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +132,7 @@ func TestGroundedResearchFailsClosedWhenPageIsNeverRead(t *testing.T) {
 	)
 
 	out, err := loop.HandleMessage(
-		t.Context(), 7, "请查 GPT-Live 是否已经提供 API 定价",
+		t.Context(), testPrincipal(7), "请查 GPT-Live 是否已经提供 API 定价",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +182,7 @@ func TestGroundedResearchRequiresReadAfterLatestSearch(t *testing.T) {
 	)
 
 	out, err := loop.HandleMessage(
-		t.Context(), 7, "请核验 OpenAI GPT-Live API 定价",
+		t.Context(), testPrincipal(7), "请核验 OpenAI GPT-Live API 定价",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -222,7 +222,7 @@ func TestGroundedResearchReservesFinalRoundAfterLastTurnPageRead(t *testing.T) {
 	loop.maxTurns = 2
 
 	out, err := loop.HandleMessage(
-		t.Context(), 7, "请核验 OpenAI GPT-Live API 定价",
+		t.Context(), testPrincipal(7), "请核验 OpenAI GPT-Live API 定价",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +263,7 @@ func TestGroundedResearchRejectsToolsOnReservedFinalRound(t *testing.T) {
 	loop.maxTurns = 2
 
 	out, err := loop.HandleMessage(
-		t.Context(), 7, "请核验 OpenAI GPT-Live API 定价",
+		t.Context(), testPrincipal(7), "请核验 OpenAI GPT-Live API 定价",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -287,7 +287,7 @@ func TestOwnerAgentCatalogIsNotKeywordRouted(t *testing.T) {
 	})
 	loop.chatFn = chat.fn
 	if _, _, err := loop.RunOnce(
-		t.Context(), 7, nil, "GPT-Live 是否已提供 API 定价？",
+		t.Context(), testPrincipal(7), nil, "GPT-Live 是否已提供 API 定价？",
 	); err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
@@ -364,7 +364,7 @@ func TestUnifiedLoopFuseReservesToolFreePartialSynthesis(t *testing.T) {
 	})
 	loop.chatFn = chat.fn
 
-	out, _, err := loop.RunOnce(t.Context(), 7, nil, "为什么当时这么判断？")
+	out, _, err := loop.RunOnce(t.Context(), testPrincipal(7), nil, "为什么当时这么判断？")
 	if err != nil {
 		t.Fatal(err)
 	}

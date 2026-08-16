@@ -1,12 +1,23 @@
 # A2A 契约：vane 作为 Agent2Agent Server
 
+> **多用户 authority 修订（2026-08-15，migration 139/140）：** 本修订优先于下文
+> 2026-07 的单 owner 实现细节。`/a2a` 已不再读取全局 `VANE_A2A_TOKEN`，也不再
+> 用飞书 owner 作为运行身份。Bearer 由 hash-only `a2a_access_tokens` 解析为实时
+> `TenantID + UserID + Role + ActorType + scopes`；成员移除、身份世代变更、撤销、
+> 过期或工作区停用立即拒绝。SDK Task 持久化使用 `a2a_principal_tasks`，按
+> exact tenant+principal 隔离；013 `a2a_tasks` 只保留为无法安全归属的历史数据，
+> 新 runtime 零读写路径。`content.query` 只能看到当前工作区任务已绑定信源的内容；
+> `assistant.chat` 只能读取同 principal/context 的 A2A 历史。两项 skill 都必须命中
+> bearer 冻结的本地 scope，不从 Agent Card 或请求自报授权。
+>
 > **工具面修订（2026-08-03）：** A2A `assistant.chat` 使用 public-only
 > composition，但当前公共研究工具均为 Owner-only 的联网/计费能力，经
 > `AuthorizationA2AReadOnly` 过滤后 Agent 工具集为空。它只做模型一般公共知识问答，
 > 不读取 owner 任务、Owner Agent 对话历史、推送计划或画像，也不声称实时联网；已入库内容检索走独立
 > `content.query` skill。
 >
-> 本文件是 A2A 集成并行实现的**唯一契约**。所有签名/JSON/表结构以此为准，实现中发现契约错误不得自行变更——记录到交付报告，由主控裁决。
+> 本文件保留 A2A 协议与历史实现决策；身份、存储与数据可见性以上述
+> 2026-08-15 修订和 migration 139/140 为准。
 > 事实基准：worktree @ ada0f6e（origin/main，2026-07-16 重新核实全部代码事实——方案定稿后 main 又前进，migration 编号与 wantTables 欠账均与方案原文不同，见 §2/§9.5）。2026-07-17 复核 @ e2136d5：012 已被 kind_backfill 占用，A2A migration 顺延为 **013**（§2）；wantTables 欠账清单不变（012 为纯回填不建表）。
 > 设计过程：多 agent 调研 → 双怀疑者对抗审查（2×CRITICAL+12×MINOR 全处置）→ Boss 拍板 8 项（§13）→ 契约起草期双怀疑者再审（5×CRITICAL+7×MINOR，全部处置，见 §14）。方案全文原引用 workmemory `work/2026/2026-07-16-自研-见微Vane-A2A协议集成调研/a2a-integration-plan.md`，经 2026-07-17 双机核查（Windows 本地含未跟踪/stash + 远端）**该文件从未落盘**——设计过程的存档以本契约与 workmemory `journal/2026/2026-07-16.md`、`journal/2026/2026-07-17.md` 的记录为准。
 
@@ -23,7 +34,7 @@ A2A（Agent2Agent，LF 治理）是 agent 间互操作协议：server 发布 Age
 
 **非目标（第一期不做）**：vane 作为 A2A client；streaming（SSE）与 push notification（card 声明 false 且 handler 显式拒绝，启用前置见 §12）；gRPC/REST binding（只做 JSON-RPC 一种即合规）；extended card / card JWS 签名 / 多 peer 差异化授权；任何写能力；画像与个性化分。（原列于此的 `assistant.chat` 已于 2026-07-18 随 PR-4 实施，并于 2026-08-03 收敛为 public-only、当前零 Agent 工具的 RunOnce 形态，见 §12）
 
-**第一个对接方**：Boss 本机 Claude Code。Claude Code 无原生 A2A client（官方互操作只有 MCP），走官方 `a2a` CLI（`go install github.com/a2aproject/a2a-go/v2/cmd/a2a@latest`）+ 本机 skill 封装，token 走 my-credentials，零开发当天可用。注意：CLI 与 server 同源 SDK，**不构成 Gate ⑦ 的"异构客户端"验证**（§10）。
+**第一个对接方**：Boss 本机 Claude Code。Claude Code 无原生 A2A client（官方互操作只有 MCP），走官方 `a2a` CLI（`go install github.com/a2aproject/a2a-go/v2/cmd/a2a@latest`）+ 本机 skill 封装。Bearer 必须由当前工作区的 A2A 凭证管理面签发；不再使用一枚全局运维密钥。注意：CLI 与 server 同源 SDK，**不构成 Gate ⑦ 的"异构客户端"验证**（§10）。
 
 ## 1. 协议基线
 
@@ -36,7 +47,7 @@ A2A（Agent2Agent，LF 治理）是 agent 间互操作协议：server 发布 Age
 - **依赖 review checklist**（升级/引入 SDK 时逐条人工核对；单人仓库不为此加守卫测试）：
   1. go.mod 必须是 `/v2` 主线——裸 `go get github.com/a2aproject/a2a-go` 会拿到旧 v0.3.15；
   2. **push notifications 保持禁用**直到含 SSRF 修复 #373/#374 的 release 出现（#374 已于 2026-07-16 merge 进 main，列每日对账 watch）；
-  3. **#351 IDOR 仍 open**（影响 v2.0.0–v2.3.1 全线）：单 token 单租户下影响有限，**升级多 peer 前必须复查**；
+  3. **#351 IDOR 仍 open**（影响 v2.0.0–v2.3.1 全线）：Vane 不依赖 SDK 做横向隔离；TaskStore 每次 CRUD 都重验 live credential 并带 exact tenant+principal 谓词；
   4. 升级流程：读 release notes → 全量测试 + a2aclient 互通 smoke（§9.4）→ 才合并；须 pin main commit 时在 go.mod 注释注明原因与回钉计划；
   5. PR-2 引入依赖时跑 `go list -deps ./a2a/...` 实测 JSON-RPC 路径依赖面，结果记入 PR 描述（方案预期第三方仅 google/uuid，待实证）。
 
@@ -163,7 +174,7 @@ func escapeLike(s string) string
 ```
 a2a/
 ├── a2a.go        // Deps + TaskStorage/ContentStore 窄接口 + Mount
-├── auth.go       // requireBearer 中间件（常数时间比对，card 端点豁免）
+├── auth.go       // hash-only bearer → live Principal/scopes（card 端点豁免）
 ├── card.go       // buildCard + 包级 capabilities 单一事实源
 ├── executor.go   // AgentExecutor：skill 选择约定 + content.query 确定性执行
 ├── taskstore.go  // 适配 SDK taskstore.Store → TaskStorage（SDK 触点，归 PR-3；哨兵映射 §5.9）
@@ -178,24 +189,25 @@ a2a/
 ```go
 // TaskStorage 是任务持久化窄接口，*store.Store 满足（§4.1 前四方法）。
 type TaskStorage interface {
-    CreateA2ATask(ctx context.Context, t *types.A2ATask) error
-    GetA2ATask(ctx context.Context, id string) (*types.A2ATask, error)
-    UpdateA2ATask(ctx context.Context, id string, expectedVersion int64, status string, task json.RawMessage) error
-    ListA2ATasks(ctx context.Context, q types.A2ATaskQuery) ([]types.A2ATask, int64, string, error)
+    CreateA2APrincipalTask(ctx context.Context, scope types.A2AExecutionScope, t *types.A2ATask) error
+    GetA2APrincipalTask(ctx context.Context, scope types.A2AExecutionScope, id string) (*types.A2ATask, error)
+    UpdateA2APrincipalTask(ctx context.Context, scope types.A2AExecutionScope, id string, expectedVersion int64, status string, task json.RawMessage) error
+    ListA2APrincipalTasks(ctx context.Context, scope types.A2AExecutionScope, q types.A2ATaskQuery) ([]types.A2ATask, int64, string, error)
 }
 
 // ContentStore 是 content.query 数据面窄接口，*store.Store 满足（§4.2）。
 type ContentStore interface {
-    SearchContentItems(ctx context.Context, keyword string, since time.Time, limit int) ([]types.ContentItem, error)
+    SearchContentItemsForA2A(ctx context.Context, scope types.A2AExecutionScope, keyword string, since time.Time, limit int) ([]types.ContentItem, error)
 }
 
 // Deps 由 main.go 装配（§7）。
 type Deps struct {
-    Storage TaskStorage  // 生产 = *store.Store
-    Content ContentStore // 生产 = *store.Store
-    Token   string       // cfg.A2A.Token；空值语义见 §6
-    BaseURL string       // cfg.A2A.BaseURL，进 AgentCard supportedInterfaces 的 url
-    Version string       // 服务版本串，进 AgentCard.version
+    Storage       TaskStorage
+    Content       ContentStore
+    Chat          ChatRunner
+    Authenticator AccessAuthenticator // 生产 = *store.Store
+    BaseURL       string
+    Version       string
 }
 ```
 
@@ -216,7 +228,7 @@ func Mount(mux *http.ServeMux, deps Deps) error {
                                                     // 保证（push 有兜底错误，streaming 没有等价物）
         a2asrv.WithConcurrencyConfig(...),          // 并发上限，默认值见 §5.7
         a2asrv.WithLogger(slog.Default()))
-    mux.Handle("POST /a2a", requireBearer(deps.Token, a2asrv.NewJSONRPCHandler(rh)))
+    mux.Handle("POST /a2a", requireScopedBearer(deps.Authenticator, a2asrv.NewJSONRPCHandler(rh)))
     // card 端点公开无认证（GET /.well-known/agent-card.json，路径用 SDK 常量不硬编码）。
     mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(buildCard(deps)))
     return nil
@@ -235,11 +247,10 @@ func Mount(mux *http.ServeMux, deps Deps) error {
 ### 5.3 auth（`a2a/auth.go`）
 
 ```go
-// requireBearer 校验 Authorization: Bearer <token>。比对用 crypto/subtle.ConstantTimeCompare
-//（防时序侧信道）；失败 401 + WWW-Authenticate: Bearer。token 空串 → 恒 401（不认可任何请求），
-// 对齐 api/session.go:26-32 的 disabled 语义。每请求认证、无会话概念，与 api/ cookie 体系零交集。
-// auth 失败限流仿 api/ratelimit.go 的 loginLimiter（按 IP 计失败），阈值见 §5.7。
-func requireBearer(token string, next http.Handler) http.Handler
+// requireScopedBearer 对原始 bearer 做 SHA-256，通过 Store 重查未撤销/未过期凭证、
+// active workspace、live membership 与 membership generation，然后同时注入 auth.Principal
+// 和 A2AExecutionScope。认证失败只返回固定 401 + WWW-Authenticate: Bearer。
+func requireScopedBearer(authenticator AccessAuthenticator, next http.Handler) http.Handler
 ```
 
 ### 5.4 executor（`a2a/executor.go`）——skill 选择约定与 content.query 语义
@@ -274,7 +285,7 @@ func newExecutor(deps Deps) *executor // 实现 SDK a2asrv.AgentExecutor（Execu
 | `TASK_STATE_REJECTED` | 显式 `skill` 键 ≠ content.query，或消息无 text part（§5.4 两种触发，可构造可测试） | Execute 前置判定 |
 | `TASK_STATE_CANCELED` | CancelTask | Cancel 实现（yield canceled 事件） |
 | `TASK_STATE_INPUT_REQUIRED` | **不使用**：Agent 自然语言澄清没有结构化状态信号。启用前置 = 先定义 Outcome 的结构化澄清字段（§12） | — |
-| `TASK_STATE_AUTH_REQUIRED` | 不使用（单 token 模型） | — |
+| `TASK_STATE_AUTH_REQUIRED` | 不使用（HTTP bearer 在进入 SDK 前完成认证） | — |
 
 **不变式**：taskId/contextId 只由服务端生成（SDK 保证）；终态任务拒收消息（SDK 保证 + Gate ⑤ 实测）；A2A 轨只注册任务级只读工具，任何写调用都必须在执行前拒绝。
 
@@ -343,7 +354,7 @@ func sanitize(err error) string
   字段 `SecurityRequirements SecurityRequirementsOptions`）：securitySchemes 只是"可用方案
   声明"，**不构成访问要求**；官方 a2aclient 的 AuthInterceptor 按卡片 security requirements
   决定是否附凭证——缺了它，卡片驱动的客户端（恰是首个对接方路径：a2a CLI / `NewFromCard`）
-  判定"无认证要求"裸发 SendMessage，被 requireBearer 恒 401，Gate ③④ 直接卡死。buildCard
+  判定"无认证要求"裸发 SendMessage，被 scoped bearer middleware 恒 401，Gate ③④ 直接卡死。buildCard
   必须设置该字段（语义 `[{"bearer": []}]`）。scheme 值用 IANA 注册形态 `"Bearer"`
   （RFC 7235 规定 scheme 大小写不敏感，但对端实现未必遵守）。
 - **本草案是语义草案，非 SDK 序列化逐字形态**：AgentCapabilities 三个 bool 的 json tag 均
@@ -407,15 +418,13 @@ StatusTimestampAfter/PageSize/PageToken 直传 `types.A2ATaskQuery`（§3）；T
 type A2AConfig struct {
     // Enabled 默认 false：未显式开启时 main.go 不 Mount，零新增暴露面。
     Enabled bool `mapstructure:"enabled"`
-    // Token 环境变量 VANE_A2A_TOKEN；本体存 YouToco/my-credentials，绝不入库。
-    // 为空时照常挂载、auth 恒 401、Mount 时 slog.Warn 一次（Dashboard Password 先例）。
-    Token string `mapstructure:"token"`
     // BaseURL 是对外 A2A endpoint，进 AgentCard。
     BaseURL string `mapstructure:"base_url"`
 }
 ```
 
-**三处缺一不可**（config 既有陷阱，config/config.go:113-123 注释）：① Config 结构体加段；② setDefaults：`v.SetDefault("a2a.enabled", false)`、`v.SetDefault("a2a.base_url", "https://api.vane.zhuoqidev.com/a2a")`——有默认值的键 AutomaticEnv 才认识对应环境变量；③ sensitiveKeys 追加 `"a2a.token"`——token 无默认值，不 BindEnv 则纯 env 部署漏读。config.example.yaml 同步补 a2a 段。Validate 不新增拒启动项。
+Config 只保留 enabled/base_url。凭证从工作区管理 API 一次性签发，服务端仅存 hash；
+不存在 `a2a.token` 的 env、YAML 或 sensitiveKeys 配置面。
 
 ## 7. 装配（cmd/server/main.go）
 
@@ -425,7 +434,7 @@ type A2AConfig struct {
 if cfg.A2A.Enabled {
     if err := a2a.Mount(mux, a2a.Deps{
         Storage: st, Content: st,
-        Token: cfg.A2A.Token, BaseURL: cfg.A2A.BaseURL,
+        Authenticator: st, BaseURL: cfg.A2A.BaseURL,
         Version: vaneVersion, // PR-3 **新增**的 main 包常量（cmd/ 现无任何 version 常量），
                               // 值 = 合并时 CHANGELOG 最上方**已发布**版本号（当前 0.4.0；
                               // 若 PR-3 随发版则同步为新号）；不为此新增 ldflags 基建
@@ -442,9 +451,9 @@ if cfg.A2A.Enabled {
 2. **入站消息 = 不可信输入**（协议官方免责声明原话）。P1 不经 LLM，注入面为零；keyword 经 escapeLike 转义（§4.2）。a2a_tasks 里的入站原文**不得回流进任何 LLM prompt**——第一期天然成立，钉为红线防 P2/分析脚本破坏。
 3. **不暴露**：画像（profiles）、个性化分（deliveries.score）、owner 任务/Owner Agent 对话历史/推送计划、任何 Mutating 工具。`content.query` executor 数据面窄接口只有 SearchContentItems；`assistant.chat` 当前 Agent 工具集为空，均由编译期装配封死。
 4. **card 公开是设计选择非规范强制**（§5.2）：卡片内无内部 URL、无密钥、无 owner 信息。
-5. token 比对常数时间；token 本体只存 my-credentials；auth 失败限流（§5.7）。
+5. bearer 只在请求边界做 hash；数据库只存 SHA-256，原文仅签发时返回一次；auth 失败限流（§5.7）。
 6. 全部 SQL 参数化；除 SDK 外不引入新依赖。
-7. GetTask 需过 Bearer 认证，单 token 单租户下无横向越权面（多 peer 前必须复查 SDK #351，§1）。
+7. GetTask 需过 Bearer 认证，且 task ID 外还必须命中 exact tenant+principal；同一 task/context ID 可在不同工作区独立存在。
 
 ## 9. 测试要求（vane 惯例：标准库 testing、手写 fake、DATABASE_URL 门控、无 build tag）
 
@@ -541,7 +550,7 @@ PR-2 与 PR-3 无同包文件耦合可真并行（SDK 触点全在 PR-3）；PR-
 | 1 | 上线策略 | 第一个真实 peer = Boss 本机 Claude Code（官方 a2a CLI 路径）。验证窗口跑 Gate 后可为自用保持开启（dogfooding，Bearer 兜底） |
 | 2 | PR-4 做不做 | **暂缓**，先解决 Claude Code 连通；P1 连通后再议 |
 | 3 | card 主域/子域 | **主域**（PR-infra 独立合并；card 内 endpoint 仍指 api 子域） |
-| 4 | 单 token vs 每 peer | 单 token；a2a_tasks 不加 peer 列，多 peer 是升级触发点（§12） |
+| 4 | 全局 token vs 每 principal | 已切换为每 principal hash-only credential；task 冻结 token id、tenant、user 与 actor type |
 | 5 | 数据边界 | **只做纯内容检索**；"owner 推送历史 + 个性化分"显式否决不暴露 |
 | 6 | 配额阈值 | 契约给默认值再核（§5.7） |
 | 7 | SDK issue 跟踪 | #374 release / #351 IDOR 列每日对账 watch |
@@ -590,8 +599,8 @@ probe.Run 报错中断模式、cmd/gate 退出码语义、CHANGELOG 最新已发
 后续 P1c 又把通用 `llm.mapHTTPError` 收紧为仅返回状态、捕获长度与 SHA-256 短指纹，
 不再把上游响应体放入任何内部错误链；A2A 的固定失败文案仍保留为独立出口防线。
 
-**记录为遗留（单 token 单对端下非漏洞，多对端接入前处理）**：
-- **B-F3**：`contextId` 客户端可控，`chatHistory` 仅按 contextId 取历史、无 per-caller 隔离。若一枚 token 被多个外部 agent 共用，agent A 复用 B 的 contextId 可把 B 的既往对话读进自己这轮 LLM 历史。与 §1「多 peer 升级前复查 #351 IDOR」同族——加第二个 token / 多对端前必须给 contextId 绑定调用方身份或强制服务端生成。
-- **B-F6/A-7**：`/a2a` 无 `MaxBytesReader`（既存，content.query 时代就在）；chat 的 text 直送 LLM、contextId 无界入库放大滥用面。多对端前补 body 上限。
+**历史遗留（2026-08-15 多用户修订已收口身份/任务横向隔离）**：
+- **B-F3（已解决）**：`chatHistory` 同时按 exact tenant+principal+contextId 查询；其他用户/工作区复用 contextId 也看不到历史。
+- **B-F6/A-7（已解决）**：`/a2a` 整个 JSON-RPC envelope 硬限 256 KiB，超限在进 SDK/模型前拒绝；migration140 同时约束 task/context identity 长度。
 - **A-7(hist)**：`chatHistory` 只扫首页（≤50 行），同 context 混大量 content.query 任务时 chat 轮次可能被挤出窗口——与「历史是增强不是门槛」一致，可接受。
 **攻过未破（明确排除）**：A2A 轨产生写操作（显式只读白名单 + 未注册自纠）；REJECTED/FAILED 任务折叠进历史（DB 层 Status=COMPLETED 过滤 + 双校验）；converse 抽取后飞书轨行为变化（逐行核对零变化）；取消/断连场景兜底（detached 继续、终态落库、GetTask 可取）。

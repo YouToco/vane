@@ -299,6 +299,91 @@ func (s *Store) SearchContentItems(ctx context.Context, keyword string, since ti
 	return out, nil
 }
 
+// SearchContentItemsForA2A projects globally de-duplicated content through the
+// current workspace's task fetch targets. content_items/content_sources remain
+// shared facts; this query is the authorization edge that decides which facts
+// an authenticated workspace principal may observe.
+func (s *Store) SearchContentItemsForA2A(
+	ctx context.Context,
+	scope types.A2AExecutionScope,
+	keyword string,
+	since time.Time,
+	limit int,
+) ([]types.ContentItem, error) {
+	hasContentScope := false
+	for _, granted := range scope.Scopes {
+		if granted == types.A2AScopeContentQuery {
+			hasContentScope = true
+			break
+		}
+	}
+	if !hasContentScope {
+		return nil, types.NewAppError(types.CodeForbidden,
+			"A2A credential does not grant content.query", nil)
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	tx, err := s.beginA2APrincipalTx(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	query := `SELECT ci.id,COALESCE(ci.source_id,0),ci.external_id,ci.canonical_key,
+	                 ci.url,ci.title,ci.content,ci.author,ci.published_at,ci.content_hash,
+	                 ci.simhash,ci.fetched_at,ci.created_at,ci.kind
+	          FROM content_items ci
+	          WHERE COALESCE(ci.published_at,ci.fetched_at)>=$1
+	            AND EXISTS (
+	                SELECT 1
+	                FROM content_sources appearance
+	                JOIN task_fetch_targets binding
+	                  ON binding.fetch_target_id=appearance.source_id
+	                JOIN schedules task ON task.id=binding.schedule_id
+	                JOIN task_workspace_access access
+	                  ON access.tenant_id=task.tenant_id
+	                 AND access.execution_user_id=task.user_id
+	                 AND access.schedule_id=task.id
+	                JOIN tenants workspace ON workspace.id=task.tenant_id
+	                WHERE appearance.content_item_id=ci.id
+	                  AND task.tenant_id=$2
+	                  AND (
+	                    (workspace.workspace_kind='team' AND access.task_visibility='workspace') OR
+	                    (workspace.workspace_kind='personal' AND access.task_visibility='personal'
+	                     AND workspace.personal_owner_user_id=$3)
+	                  )
+	            )`
+	args := []any{since, scope.TenantID, scope.UserID}
+	if keyword != "" {
+		args = append(args, "%"+escapeLike(keyword)+"%")
+		query += fmt.Sprintf(` AND (ci.title ILIKE $%d OR ci.content ILIKE $%d)`, len(args), len(args))
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(` ORDER BY COALESCE(ci.published_at,ci.fetched_at) DESC,ci.id DESC LIMIT $%d`, len(args))
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "search workspace-scoped A2A content", err)
+	}
+	defer rows.Close()
+	out := make([]types.ContentItem, 0)
+	for rows.Next() {
+		var item types.ContentItem
+		if err := rows.Scan(&item.ID, &item.SourceID, &item.ExternalID, &item.CanonicalKey,
+			&item.URL, &item.Title, &item.Content, &item.Author, &item.PublishedAt,
+			&item.ContentHash, &item.Simhash, &item.FetchedAt, &item.CreatedAt, &item.Kind); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "scan workspace-scoped A2A content", err)
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "iterate workspace-scoped A2A content", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "commit workspace-scoped A2A content search", err)
+	}
+	return out, nil
+}
+
 // escapeLike 把 s 中的 \、%、_ 依序替换为 \\、\%、\_ 后返回（a2a-contract §4.2）。
 // SQL 侧依赖 Postgres 默认转义符 ESCAPE '\'（标准默认行为，不显式写 ESCAPE 子句）。
 // 替换顺序必须 \ 在先：先转义通配符再转义反斜杠会把刚产出的转义符再翻一遍。

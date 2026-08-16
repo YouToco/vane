@@ -861,7 +861,7 @@ func TestHandleMessage_EndpointSearchInjectInvoke(t *testing.T) {
 	})
 	l.chatFn = chat.fn
 
-	out, err := l.HandleMessage(context.Background(), 1, "帮我看看小红书上 AI 的笔记")
+	out, err := l.HandleMessage(context.Background(), testPrincipal(1), "帮我看看小红书上 AI 的笔记")
 	if err != nil {
 		t.Fatalf("HandleMessage 报错: %v", err)
 	}
@@ -978,7 +978,7 @@ func TestHandleMessage_TaintedEndpointKeepsReadOnlyResearchAndCurrentCache(t *te
 	})
 	l.chatFn = chat.fn
 
-	if _, err := l.HandleMessage(context.Background(), 1, "查小红书大结果"); err != nil {
+	if _, err := l.HandleMessage(context.Background(), testPrincipal(1), "查小红书大结果"); err != nil {
 		t.Fatal(err)
 	}
 	if len(chat.requests) != 5 {
@@ -1074,7 +1074,7 @@ func TestHandleMessage_SearchAndUnactivatedEndpointSameBatchAreBothRejected(t *t
 	})
 	l.chatFn = chat.fn
 
-	out, err := l.HandleMessage(context.Background(), 1, "查小红书 AI")
+	out, err := l.HandleMessage(context.Background(), testPrincipal(1), "查小红书 AI")
 	if err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
@@ -1156,7 +1156,7 @@ func TestExecRecorded_SanitizesNonUTF8AndNUL(t *testing.T) {
 	})
 	l.chatFn = chat.fn
 
-	if _, err := l.HandleMessage(context.Background(), 1, "查小红书"); err != nil {
+	if _, err := l.HandleMessage(context.Background(), testPrincipal(1), "查小红书"); err != nil {
 		t.Fatal(err)
 	}
 	// 端点记账行的 result_preview 必须是合法 UTF-8 且无 NUL（否则真库 INSERT 会失败）。
@@ -1234,7 +1234,7 @@ func TestHandleMessage_UnactivatedEndpointRejected(t *testing.T) {
 	})
 	l.chatFn = chat.fn
 
-	if _, err := l.HandleMessage(context.Background(), 1, "查小红书"); err != nil {
+	if _, err := l.HandleMessage(context.Background(), testPrincipal(1), "查小红书"); err != nil {
 		t.Fatal(err)
 	}
 	if len(inv.calls) != 0 {
@@ -1276,10 +1276,10 @@ func TestHandleMessage_ActivationPersistsAcrossMessages(t *testing.T) {
 	l.chatFn = chat.fn
 
 	ctx := context.Background()
-	if _, err := l.HandleMessage(ctx, 1, "有哪些小红书接口"); err != nil {
+	if _, err := l.HandleMessage(ctx, testPrincipal(1), "有哪些小红书接口"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := l.HandleMessage(ctx, 1, "查 AI 关键词"); err != nil {
+	if _, err := l.HandleMessage(ctx, testPrincipal(1), "查 AI 关键词"); err != nil {
 		t.Fatal(err)
 	}
 	if len(inv.calls) != 1 {

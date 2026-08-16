@@ -161,6 +161,15 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 				agentMessage(execCtx, rejectReason)), nil)
 			return
 		}
+		requiredScope := types.A2AScopeContentQuery
+		if input.skill == skillAssistantChat {
+			requiredScope = types.A2AScopeAssistantChat
+		}
+		if !scopeGranted(ctx, requiredScope) {
+			yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateRejected,
+				agentMessage(execCtx, "当前 A2A 凭证未获准使用 "+string(requiredScope))), nil)
+			return
+		}
 
 		// assistant.chat 分派（契约 §12 P2）：LLM 轨，与下方确定性检索路径互斥。
 		if input.skill == skillAssistantChat {
@@ -176,7 +185,13 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 		defer cancel()
 		since := time.Now().Add(-time.Duration(params.days) * 24 * time.Hour)
-		items, err := e.deps.Content.SearchContentItems(qctx, params.keyword, since, params.limit)
+		scope, scopeErr := authorityFromContext(qctx)
+		if scopeErr != nil {
+			yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateFailed,
+				agentMessage(execCtx, "A2A 请求身份已失效")), nil)
+			return
+		}
+		items, err := e.deps.Content.SearchContentItemsForA2A(qctx, scope, params.keyword, since, params.limit)
 		if err != nil {
 			// 原始错误链只落日志；对外只有 sanitize 文案（契约 §8.1 红线）。
 			slog.Error("a2a: content.query 检索失败",

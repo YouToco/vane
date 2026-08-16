@@ -35,6 +35,7 @@ type MemoryAction struct {
 
 type MemoryRecord struct {
 	ID                 int64          `json:"id"`
+	CreatorUserID      int64          `json:"creator_user_id,omitempty"`
 	Text               string         `json:"text"`
 	Evidence           MemoryEvidence `json:"evidence"`
 	SupersedesMemoryID int64          `json:"supersedes_memory_id,omitempty"`
@@ -44,6 +45,7 @@ type MemoryRecord struct {
 
 type MemoryEvent struct {
 	ID             int64          `json:"id"`
+	ActorUserID    int64          `json:"actor_user_id,omitempty"`
 	Action         string         `json:"action"`
 	TargetMemoryID int64          `json:"target_memory_id,omitempty"`
 	ResultMemoryID int64          `json:"result_memory_id,omitempty"`

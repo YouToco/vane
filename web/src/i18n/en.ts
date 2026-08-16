@@ -103,6 +103,7 @@ export const en: Dict = {
       groupAccount: "Account",
       profile: "My profile",
       channel: "Push channel",
+      members: "Members & invites",
       admin: "Admin",
       logout: "Sign out",
       tagline: "AI intelligence system",
@@ -267,6 +268,7 @@ export const en: Dict = {
       title: "Settings",
       tabProfile: "My profile",
       tabChannel: "Push channel",
+      tabMembers: "Members & invites",
       channelZhOnly:
         "This setup guide targets the Feishu (China) developer console and is currently Chinese-only.",
     },

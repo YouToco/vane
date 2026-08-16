@@ -20,6 +20,7 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/feedback"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/store"
@@ -30,23 +31,23 @@ import (
 // handler 单测可注入假实现；直接引用 agent.Outcome 不构成循环
 // （agent 不 import feishu，依赖单向）。
 type AgentRunner interface {
-	HandleMessage(ctx context.Context, userID int64, text string) (agent.Outcome, error)
+	HandleMessage(ctx context.Context, principal auth.Principal, text string) (agent.Outcome, error)
 	// HandleExternalContextMessage 用于已经拼入推送正文/引用消息的输入。它与
 	// 普通用户文本是不同的信任类型，agent 从首轮就关闭画像与工具面。
-	HandleExternalContextMessage(ctx context.Context, userID int64, text string) (agent.Outcome, error)
+	HandleExternalContextMessage(ctx context.Context, principal auth.Principal, text string) (agent.Outcome, error)
 }
 
 // FeedbackRunner 是 feishu 对 feedback 服务的窄依赖面（M5 契约 §10.4）：
 // 推送卡按钮点击 + 追问识别。同 AgentRunner 的形态——feedback 不 import feishu
 // （构卡与发送都靠注入），依赖单向、无环。
 type FeedbackRunner interface {
-	HandleClick(ctx context.Context, userID int64, click feedback.Click) (feedback.ClickResult, error)
-	HandleReasonSubmit(ctx context.Context, userID int64, submit feedback.ReasonSubmit) (feedback.ClickResult, error)
+	HandleClick(ctx context.Context, principal auth.Principal, click feedback.Click) (feedback.ClickResult, error)
+	HandleReasonSubmit(ctx context.Context, principal auth.Principal, submit feedback.ReasonSubmit) (feedback.ClickResult, error)
 	// WrapQuestion 尝试把"回复推送卡"的消息识别为追问并包装上下文；
 	// matched=false 时调用方按普通消息原样处理。
 	WrapQuestion(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		appIdentity string,
 		inboundMsgID string,
 		parentMsgID string,
@@ -108,6 +109,12 @@ type Manager struct {
 	st  *store.Store
 	cli *llm.Client
 	rec *llm.Recorder
+	// principalForUser is the channel-identity boundary. Production currently
+	// leaves it nil and resolves the exact single workspace from Store; the
+	// upcoming durable Feishu binding adapter will be installed here. Keeping
+	// this dependency explicit also lets tests provide an authenticated scope
+	// without constructing a PostgreSQL Store.
+	principalForUser func(context.Context, int64) (auth.Principal, error)
 
 	// asyncMu + asyncWG 是所有飞书回调异步工作的生命周期闸门。Add/Go 与
 	// Shutdown 关闭准入必须在同一把锁下裁决；关闸后才 Wait，避免 Wait 与首次

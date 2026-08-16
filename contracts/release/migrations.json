@@ -525,44 +525,76 @@
       "sha256": "23986419faf563c7436e9aed699bfba53d9a018177553306bea76d3dba7ed555"
     },
     {
-      "path": "133_channel_ingress.sql",
-      "sha256": "3bbe6e0b03e8e404554d29bbb18ab207298e056446bceb6ad8742a4d5b2a8d4d"
+      "path": "133_interactive_agent_policy_manifest.sql",
+      "sha256": "cdbaad2e5e2c726fea6c6c90ad47506a98740b99060861ac38b83b1f008230c5"
     },
     {
-      "path": "134_channel_routes.sql",
-      "sha256": "9bb70b41ff4e84b75afdf52815947476c0b85f74c190b8bedf4280724326c628"
+      "path": "134_multi_workspace_identity.sql",
+      "sha256": "284cf97d364508d8e751a5256066041dadd89feab0464fd958556558d59f0ab5"
     },
     {
-      "path": "135_agent_conversation_scopes.sql",
-      "sha256": "803317bbd5de3387281f8d1bd1c93bc459807980ee02899e547b7f3410fcdcb3"
+      "path": "135_user_capability_foundation.sql",
+      "sha256": "41684e2b6c28e5ae76ff9da9307833ea6bf5b51e9a84ed95760e4ab4f77950e8"
     },
     {
-      "path": "136_channel_rate_limit_retry.sql",
-      "sha256": "4644fddd125342b77e86b18491921ebd92289431a40598089beed38e03e95524"
+      "path": "136_team_task_isolation.sql",
+      "sha256": "9b453038358edc1159880d53885cfb07c0e46601e67bc2ee6f174ed22fd5ec63"
     },
     {
-      "path": "137_credential_vault.sql",
-      "sha256": "1fbbd7e478b546910ee17c474997f5b213a7a8035c5e3286505b070a8975a346"
+      "path": "137_account_email_security_lifecycle.sql",
+      "sha256": "b8d807b66162742dbffee9c9b990a680e2e4ddbd68ee875604c603f45cb8164d"
     },
     {
-      "path": "138_credential_external_identity.sql",
-      "sha256": "ef0b9a1bb53452dd52877d43754e6ad47674529a9d7a0fdc8b29aae9ee34b6d0"
+      "path": "138_workspace_long_term_memory.sql",
+      "sha256": "52511c64c7c7b9f54020de2bc62879601d6ce132042a64088a8fd7f684cbb0bc"
     },
     {
-      "path": "139_channel_media_envelope.sql",
-      "sha256": "42562f81f630cbc9a10be1116b2d979f818e2b1ad0ae03c7532b4f2c5eae8a83"
+      "path": "139_scoped_a2a_access_tokens.sql",
+      "sha256": "0e6936ebc1b0631ceaedd74b4cc216692c90b27829205437a8468d4b96c12a83"
     },
     {
-      "path": "140_delivery_channel_preferences.sql",
-      "sha256": "3d99e6b7cee80da97f2a2f7efd20e094ed2e68dd44f40109828477769b0657d7"
+      "path": "140_scoped_a2a_principal_tasks.sql",
+      "sha256": "5653d8b8a11fed12980a64a7b760dd2a0a08705ce61ea21b723db7b12da15695"
     },
     {
-      "path": "141_artifact_delivery_plans.sql",
-      "sha256": "5663f22f9b27b68d688ebcf8c181cfcd41349297f9baac70a3ea3dde90f6df49"
+      "path": "141_channel_ingress.sql",
+      "sha256": "7834a41007071d7ef37dd637bec7f66310334599491c368d7615bcf6b2b0d1a2"
     },
     {
-      "path": "142_aggregate_channel_delivery_effects.sql",
-      "sha256": "ac4ea8ac0fe6a5fd4ccd5c0d90f828c5ba2bce764bbfdd9c28d25b8a1200766d"
+      "path": "142_channel_routes.sql",
+      "sha256": "9eb2392ebd1f5133865cabbe0fffebbb29feeec40b155f76bbe34d65b0a77415"
+    },
+    {
+      "path": "143_agent_conversation_scopes.sql",
+      "sha256": "bf20a460befd36d685ac163a58d862d20bcba63f79d32123532279248815c467"
+    },
+    {
+      "path": "144_channel_rate_limit_retry.sql",
+      "sha256": "dc4a419af86f6aa66a0de57894627e6a69885b7cff32e43e085fc5c3da0a424b"
+    },
+    {
+      "path": "145_credential_vault.sql",
+      "sha256": "8d6b9cbf88bb005daee5ce6825e7e259b16ef4ab77f14e16e4cbced6a54c5caf"
+    },
+    {
+      "path": "146_credential_external_identity.sql",
+      "sha256": "07144c1f07072e0d9aa453841248d313834fda815c23f8a8f7a3ef88e888ce1f"
+    },
+    {
+      "path": "147_channel_media_envelope.sql",
+      "sha256": "06a22ae0e1e4941ade3c9a30c307c22cff084a9cabdd7f79e5d9daf26dde0728"
+    },
+    {
+      "path": "148_delivery_channel_preferences.sql",
+      "sha256": "1d718f2393c79bec14d5b42d83919a48be96a8cf8079a444f94dea64773f4db1"
+    },
+    {
+      "path": "149_artifact_delivery_plans.sql",
+      "sha256": "e300398e6768a2e90dba10ce9863573dab1b470896ef55c539fe8f37848a295a"
+    },
+    {
+      "path": "150_aggregate_channel_delivery_effects.sql",
+      "sha256": "0e882dd6b7076c64ff3384311a657f27f6714944e8d26bd6ac131f2b11795307"
     }
   ],
   "schema": "vane.migrations/v1"

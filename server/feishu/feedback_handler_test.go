@@ -13,6 +13,7 @@ import (
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/feedback"
 	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
@@ -51,10 +52,10 @@ type fakeFeedbackRunner struct {
 	wrapErr     error
 }
 
-func (f *fakeFeedbackRunner) HandleClick(_ context.Context, userID int64, click feedback.Click) (feedback.ClickResult, error) {
+func (f *fakeFeedbackRunner) HandleClick(_ context.Context, principal auth.Principal, click feedback.Click) (feedback.ClickResult, error) {
 	f.mu.Lock()
 	f.clicks = append(f.clicks, click)
-	f.clickUsers = append(f.clickUsers, userID)
+	f.clickUsers = append(f.clickUsers, principal.UserID)
 	delay, panicMsg, res, err := f.delay, f.panicMsg, f.result, f.err
 	f.mu.Unlock()
 
@@ -67,10 +68,10 @@ func (f *fakeFeedbackRunner) HandleClick(_ context.Context, userID int64, click 
 	return res, err
 }
 
-func (f *fakeFeedbackRunner) HandleReasonSubmit(_ context.Context, userID int64, submit feedback.ReasonSubmit) (feedback.ClickResult, error) {
+func (f *fakeFeedbackRunner) HandleReasonSubmit(_ context.Context, principal auth.Principal, submit feedback.ReasonSubmit) (feedback.ClickResult, error) {
 	f.mu.Lock()
 	f.reasonSubmits = append(f.reasonSubmits, submit)
-	f.clickUsers = append(f.clickUsers, userID)
+	f.clickUsers = append(f.clickUsers, principal.UserID)
 	res, err := f.result, f.err
 	f.mu.Unlock()
 	return res, err
@@ -78,7 +79,7 @@ func (f *fakeFeedbackRunner) HandleReasonSubmit(_ context.Context, userID int64,
 
 func (f *fakeFeedbackRunner) WrapQuestion(
 	_ context.Context,
-	userID int64,
+	principal auth.Principal,
 	appIdentity string,
 	inboundMsgID string,
 	parentMsgID string,
@@ -88,7 +89,7 @@ func (f *fakeFeedbackRunner) WrapQuestion(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.wraps = append(f.wraps, wrapCall{
-		userID: userID, appIdentity: appIdentity, inboundID: inboundMsgID,
+		userID: principal.UserID, appIdentity: appIdentity, inboundID: inboundMsgID,
 		parentID: parentMsgID, rootID: rootMsgID, text: text,
 	})
 	if f.wrapErr != nil {
@@ -124,6 +125,42 @@ func fbValue(action types.FeedbackAction, deliveryID string) map[string]interfac
 		"vane_action": "fb",
 		"fb":          string(action),
 		"delivery_id": deliveryID,
+	}
+}
+
+func newFeedbackTestManager() *Manager {
+	m := NewManager(nil, nil, nil)
+	bindTestUserPrincipal(m)
+	return m
+}
+
+func TestFeedbackReasonSubmitUsesBoundWorkspacePrincipal(t *testing.T) {
+	cardJSON := BuildDeliveryCard(feedback.CardInput{
+		BodyMD: "**正文**", DeliveryID: 42,
+		State: feedback.CardState{Preference: types.FeedbackActionNotInterested},
+	})
+	m := newFeedbackTestManager()
+	fb := &fakeFeedbackRunner{result: feedback.ClickResult{
+		Toast: "原因已记录", ToastOK: true, CardJSON: cardJSON,
+	}}
+	m.SetFeedback(fb)
+	h := newHandler(m, context.Background())
+
+	resp := h.onFeedbackReasonSubmit(37, 42, types.FeedbackReasonNotRelevant, "不相关")
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || resp.Toast.Content != "原因已记录" {
+		t.Fatalf("reason response = %+v", resp)
+	}
+	assertRawCard(t, resp, cardJSON)
+
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if len(fb.reasonSubmits) != 1 || fb.reasonSubmits[0] != (feedback.ReasonSubmit{
+		DeliveryID: 42, ReasonCode: types.FeedbackReasonNotRelevant, Detail: "不相关",
+	}) {
+		t.Fatalf("reason submits = %+v", fb.reasonSubmits)
+	}
+	if len(fb.clickUsers) != 1 || fb.clickUsers[0] != 37 {
+		t.Fatalf("reason users = %v", fb.clickUsers)
 	}
 }
 
@@ -396,7 +433,7 @@ func TestOnCardActionFeedbackOwnerCheck(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// store 为 nil：拒绝路径必须在 UpsertUserByOpenID 之前短路，
 			// 走到查库就会 panic——这本身就是「零副作用」的证明。
-			m := NewManager(nil, nil, nil)
+			m := newFeedbackTestManager()
 			if tc.owner != "" {
 				m.setOwner(tc.owner, "主人")
 			}
@@ -435,7 +472,7 @@ func TestOnCardActionIgnoresBadFeedbackValue(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := NewManager(nil, nil, nil)
+			m := newFeedbackTestManager()
 			m.setOwner("ou_owner", "主人")
 			fb := &fakeFeedbackRunner{}
 			m.SetFeedback(fb)
@@ -458,7 +495,7 @@ func TestOnCardActionIgnoresBadFeedbackValue(t *testing.T) {
 // TestOnFeedbackActionNotReady 验证 FeedbackRunner 未注入时的兜底 toast
 // （契约 §10.3）：装配不全时按钮点击要给人话，不能崩也不能沉默。
 func TestOnFeedbackActionNotReady(t *testing.T) {
-	m := NewManager(nil, nil, nil)
+	m := newFeedbackTestManager()
 	h := newHandler(m, context.Background())
 
 	resp := h.onFeedbackAction(1, types.FeedbackActionInterested, 42)
@@ -475,7 +512,7 @@ func TestOnFeedbackActionSuccess(t *testing.T) {
 	cardJSON := BuildDeliveryCard(feedback.CardInput{BodyMD: "**解读正文**", DeliveryID: 42,
 		State: feedback.CardState{Preference: types.FeedbackActionInterested}})
 
-	m := NewManager(nil, nil, nil)
+	m := newFeedbackTestManager()
 	fb := &fakeFeedbackRunner{
 		result: feedback.ClickResult{Toast: "已记录：感兴趣", ToastOK: true, CardJSON: cardJSON},
 	}
@@ -542,7 +579,7 @@ func TestOnFeedbackActionToastVariants(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := NewManager(nil, nil, nil)
+			m := newFeedbackTestManager()
 			m.SetFeedback(&fakeFeedbackRunner{result: tc.result})
 			h := newHandler(m, context.Background())
 
@@ -584,7 +621,7 @@ func TestOnFeedbackActionError(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := NewManager(nil, nil, nil)
+			m := newFeedbackTestManager()
 			m.SetFeedback(&fakeFeedbackRunner{err: tc.err})
 			h := newHandler(m, context.Background())
 
@@ -600,7 +637,7 @@ func TestOnFeedbackActionError(t *testing.T) {
 // TestOnFeedbackActionPanic 验证反馈处理 panic 被 goroutine 内的 recover 兜住：
 // WS 回调链上的 panic 会带崩整个进程，这里必须只丢单次点击并给用户 toast。
 func TestOnFeedbackActionPanic(t *testing.T) {
-	m := NewManager(nil, nil, nil)
+	m := newFeedbackTestManager()
 	m.SetFeedback(&fakeFeedbackRunner{panicMsg: "boom"})
 	h := newHandler(m, context.Background())
 
@@ -619,7 +656,7 @@ func TestOnFeedbackActionSyncBudgetTimeout(t *testing.T) {
 	if testing.Short() {
 		requireLongRunningCapability(t)
 	}
-	m := NewManager(nil, nil, nil)
+	m := newFeedbackTestManager()
 	fb := &fakeFeedbackRunner{
 		delay:  feedbackCallbackSyncBudget + 500*time.Millisecond,
 		result: feedback.ClickResult{Toast: "已记录：感兴趣", ToastOK: true, CardJSON: `{"schema":"2.0"}`},
@@ -691,6 +728,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 	t.Run("命中追问时 agent 收到包装后文本", func(t *testing.T) {
 		const appIdentity = "cli_question_wrap_test"
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -737,6 +775,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 
 	t.Run("追问事实持久化失败时不进入 agent", func(t *testing.T) {
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -759,6 +798,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 	t.Run("未命中时原文进 agent", func(t *testing.T) {
 		// 回复的是普通消息/聊天卡：降级为普通聊天，不得改动用户原话。
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -786,6 +826,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		defer closeServer()
 
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		m.apiClient = client
 		runner := &fakeRunner{}
@@ -809,6 +850,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 	t.Run("FeedbackRunner 未注入时不 panic 且走普通路径", func(t *testing.T) {
 		// 灰度装配形态：反馈未就绪时追问降级为普通消息，消息链不能崩。
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -833,6 +875,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		// 插入点不做"是不是回复"的预判：空 id 的短路归 WrapQuestion 内部
 		// （契约 §11 ①），handler 只负责把线索原样递过去。
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -889,6 +932,7 @@ func TestOnCardActionFeedbackRoute(t *testing.T) {
 	cardJSON := BuildDeliveryCard(feedback.CardInput{BodyMD: "**正文**", DeliveryID: 42,
 		State: feedback.CardState{Preference: types.FeedbackActionNotInterested}})
 	m := NewManager(st, nil, nil)
+	bindTestUserPrincipal(m)
 	m.setOwner(owner, "测试")
 	fb := &fakeFeedbackRunner{
 		result: feedback.ClickResult{Toast: "已记录：不感兴趣", ToastOK: true, CardJSON: cardJSON},

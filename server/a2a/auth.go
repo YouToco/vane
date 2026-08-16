@@ -2,13 +2,57 @@
 package a2a
 
 import (
-	"crypto/subtle"
+	"context"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/types"
 )
+
+const maxA2ABearerBytes = 256
+
+// AccessAuthenticator is implemented by *store.Store. Authentication returns
+// a live workspace membership, never a frozen role embedded in the bearer.
+type AccessAuthenticator interface {
+	AuthenticateA2AAccessToken(ctx context.Context, tokenHash []byte) (*types.A2AAuthenticatedPrincipal, error)
+}
+
+type authorityContextKey struct{}
+
+func withA2AAuthority(ctx context.Context, item *types.A2AAuthenticatedPrincipal) context.Context {
+	scope := types.A2AExecutionScope{TokenID: item.TokenID, TenantID: item.TenantID,
+		UserID: item.UserID, Role: item.Role, ActorType: item.ActorType,
+		Scopes: append([]types.A2AScope(nil), item.Scopes...)}
+	ctx = context.WithValue(ctx, authorityContextKey{}, scope)
+	return auth.WithPrincipal(ctx, auth.Principal{TenantID: types.TenantID(item.TenantID),
+		UserID: item.UserID, Role: item.Role, ActorType: item.ActorType})
+}
+
+func authorityFromContext(ctx context.Context) (types.A2AExecutionScope, error) {
+	scope, ok := ctx.Value(authorityContextKey{}).(types.A2AExecutionScope)
+	if !ok || scope.TenantID <= 0 || scope.UserID <= 0 || scope.TokenID == "" {
+		return types.A2AExecutionScope{}, types.NewAppError(types.CodeForbidden,
+			"A2A request authority is missing", nil)
+	}
+	return scope, nil
+}
+
+func scopeGranted(ctx context.Context, required types.A2AScope) bool {
+	scope, err := authorityFromContext(ctx)
+	if err != nil {
+		return false
+	}
+	for _, granted := range scope.Scopes {
+		if granted == required {
+			return true
+		}
+	}
+	return false
+}
 
 // authFailLimiter 按客户端 IP 统计认证失败（仿 api/ratelimit.go 的 loginLimiter，
 // 该实现未导出故本包自持一份；阈值对齐其量级，契约 §5.7）。
@@ -103,12 +147,16 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// requireBearer 校验 Authorization: Bearer <token>。比对用 subtle.ConstantTimeCompare
-// （防时序侧信道）；失败 401 + WWW-Authenticate: Bearer。token 空串 → 恒 401（不认可
-// 任何请求，对齐 api/session.go 的 disabled 语义）。card 端点不经过本中间件（Mount 分路由）。
-func requireBearer(token string, next http.Handler) http.Handler {
+// requireScopedBearer resolves a hash-only bearer through the durable A2A
+// access ledger and injects the complete Principal plus immutable execution
+// scope. The public card endpoint does not pass through this middleware.
+func requireScopedBearer(authenticator AccessAuthenticator, next http.Handler) http.Handler {
 	lim := newAuthFailLimiter()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Task histories and artifacts are principal-scoped data. Intermediaries
+		// must never persist either successful responses or auth failures keyed by
+		// a reusable bearer.
+		w.Header().Set("Cache-Control", "no-store")
 		ip := clientIP(r)
 		now := time.Now()
 		if !lim.allow(ip, now) {
@@ -116,14 +164,19 @@ func requireBearer(token string, next http.Handler) http.Handler {
 			return
 		}
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		// token 空串恒拒：空 token 与"客户端也送空串"匹配等于无鉴权。
-		if !ok || token == "" ||
-			subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+		if !ok || got == "" || len(got) > maxA2ABearerBytes || authenticator == nil {
 			lim.recordFailure(ip, now)
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		item, err := authenticator.AuthenticateA2AAccessToken(r.Context(), auth.HashSessionToken(got))
+		if err != nil || item == nil {
+			lim.recordFailure(ip, now)
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(withA2AAuthority(r.Context(), item)))
 	})
 }

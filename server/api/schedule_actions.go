@@ -3,6 +3,8 @@ package api
 import (
 	"net/http"
 	"strings"
+
+	"github.com/YouToco/vane/server/store"
 )
 
 func scheduleCommandIdempotencyKey(r *http.Request) (string, bool) {
@@ -65,7 +67,14 @@ func (s *server) handleScheduleCommand(
 		)
 		return
 	}
-	userID, err := s.ownerUserID(r.Context())
+	principal, err := s.deps.Principal.FromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	mutation := store.TaskMutation(command)
+	task, err := s.teamTaskAccess().AuthorizeScheduleMutation(
+		r.Context(), int64(principal.TenantID), principal.UserID, id, mutation)
 	if err != nil {
 		writeAppError(w, err)
 		return
@@ -78,15 +87,15 @@ func (s *server) handleScheduleCommand(
 	switch command {
 	case "run":
 		err = controller.TriggerScheduleNowIdempotent(
-			r.Context(), id, userID, idempotencyKey,
+			r.Context(), id, task.UserID, idempotencyKey,
 		)
 	case "pause":
 		err = controller.PausePushIdempotent(
-			r.Context(), id, userID, idempotencyKey,
+			r.Context(), id, task.UserID, idempotencyKey,
 		)
 	case "resume":
 		err = controller.ResumePushIdempotent(
-			r.Context(), id, userID, idempotencyKey,
+			r.Context(), id, task.UserID, idempotencyKey,
 		)
 	default:
 		writeError(w, http.StatusNotFound, "未知任务操作")

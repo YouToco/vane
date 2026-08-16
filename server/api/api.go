@@ -66,16 +66,25 @@ type scheduleNextRunReader interface {
 	NextRun(ctx context.Context, schedID string, userID int64) (*time.Time, error)
 }
 
+type teamTaskAccessStore interface {
+	AuthorizeScheduleMutation(
+		context.Context, int64, int64, string, store.TaskMutation,
+	) (*types.Schedule, error)
+	TransferScheduleAssignee(
+		context.Context, int64, int64, string, int64,
+	) (*types.Schedule, error)
+}
+
 // TaskAgent is the direct natural-language task control plane exposed to Web.
 type TaskAgent interface {
 	HandleMessage(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		text string,
 	) (agent.Outcome, error)
 	HandleWebTaskActionMessage(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		actionID string,
 		selectedTaskRef string,
 		text string,
@@ -100,7 +109,7 @@ type TelegramManager interface {
 type BriefFeedback interface {
 	HandleClick(
 		ctx context.Context,
-		userID int64,
+		principal auth.Principal,
 		click feedback.Click,
 	) (feedback.ClickResult, error)
 }
@@ -123,12 +132,64 @@ type AuthStore interface {
 	DeleteSession(ctx context.Context, tokenHash []byte) error
 }
 
+// WorkspaceStore is the multi-workspace control plane. It is intentionally
+// separate from AuthStore so legacy authentication fakes and old login flows
+// remain source-compatible while the capability is rolled out dark.
+type WorkspaceStore interface {
+	ListWorkspacesForUser(ctx context.Context, userID int64) ([]types.Workspace, error)
+	GetWorkspaceForUser(ctx context.Context, tenantID, userID int64) (*types.Workspace, error)
+	DefaultWorkspaceForUser(ctx context.Context, userID int64) (int64, error)
+	CreateTeamWorkspace(ctx context.Context, currentTenantID, actorUserID int64, name string, seatLimit int) (*types.Workspace, error)
+	IssueWorkspaceInvite(ctx context.Context, tenantID, actorUserID int64, email string, role types.MembershipRole, tokenHash []byte, expiresAt time.Time) (*types.WorkspaceInvite, error)
+	ListWorkspaceInvites(ctx context.Context, tenantID, actorUserID int64) ([]types.WorkspaceInvite, error)
+	RevokeWorkspaceInvite(ctx context.Context, tenantID, actorUserID, inviteID int64) error
+	AcceptWorkspaceInvite(ctx context.Context, tokenHash []byte, userID int64) (*types.Workspace, error)
+	RegisterWithWorkspaceInvite(ctx context.Context, email, passwordHash string, tokenHash []byte) (*types.User, *types.Workspace, error)
+	ListWorkspaceMembers(ctx context.Context, tenantID, actorUserID int64) ([]types.WorkspaceMember, error)
+	UpdateWorkspaceMemberRole(ctx context.Context, tenantID, actorUserID, targetUserID int64, role types.MembershipRole) error
+	RemoveWorkspaceMember(ctx context.Context, tenantID, actorUserID, targetUserID int64) error
+	TransferWorkspaceOwnership(ctx context.Context, tenantID, actorUserID, targetUserID int64) error
+	RotateSession(ctx context.Context, oldHash, newHash []byte, userID, tenantID int64, expiresAt time.Time) error
+}
+
+// A2AAccessStore is the hash-only, workspace-scoped token management plane.
+// It is deliberately separate from the legacy A2A ingress so tokens can be
+// issued and verified before the production cutover removes the global token.
+type A2AAccessStore interface {
+	IssueA2AAccessToken(context.Context, types.IssueA2AAccessToken) (*types.A2AAccessToken, error)
+	ListA2AAccessTokens(context.Context, int64, int64) ([]types.A2AAccessToken, error)
+	RevokeA2AAccessToken(context.Context, int64, int64, string) error
+}
+
 // Deps 是 Mount 所需的全部依赖，由 main.go 注入。
 type Deps struct {
 	Store *store.Store
+	// TeamTasks is independently injectable for HTTP authorization tests.
+	// Production leaves it nil and uses Store.
+	TeamTasks teamTaskAccessStore
 	// Auth 是认证路径的窄接口；生产与 Store 同为 *store.Store。
-	Auth    AuthStore
-	Manager Manager
+	Auth AuthStore
+	// Workspaces can be injected independently in tests. Production falls back
+	// to Store, which implements this interface.
+	Workspaces WorkspaceStore
+	// A2AAccess defaults to Store in production and remains independently
+	// injectable for authorization/API tests.
+	A2AAccess A2AAccessStore
+	// AccountSecurity and SecurityMailer are separated so authentication tests
+	// never open a network connection. Production injects Store plus the
+	// TLS-only SMTP adapter; tests use narrow fakes.
+	AccountSecurity AccountSecurityStore
+	SecurityMailer  SecurityMailer
+	// Capabilities is the dark, metadata-only Skill/MCP control plane. It has no
+	// execution surface; MCP endpoint admission is independently injectable for
+	// deterministic DNS/SSRF tests.
+	Capabilities         CapabilityStore
+	MCPEndpointAdmission MCPEndpointAdmission
+	// MCPReadOnlyPolicy is Vane-owned admission authority. Remote callers may
+	// describe tools, but can never self-assert that a tool is safe/read-only.
+	// A nil resolver intentionally denies every MCP catalog.
+	MCPReadOnlyPolicy MCPReadOnlyPolicyResolver
+	Manager           Manager
 	// Scheduler is capability-checked per endpoint below. Keeping this slot
 	// untyped lets each handler require only its idempotent command/read surface
 	// and removes the retired pre-6.8 DeletePush admission signature.
@@ -154,6 +215,20 @@ type Deps struct {
 	// 前端迁 OSS+CDN 后与 API 跨源（vane.* → api.*），凭证请求要求逐字匹配的
 	// Allow-Origin + Allow-Credentials，不允许通配符。为空 = 不放行任何跨源。
 	Origin string
+}
+
+func (s *server) teamTaskAccess() teamTaskAccessStore {
+	if s.deps.TeamTasks != nil {
+		return s.deps.TeamTasks
+	}
+	return s.deps.Store
+}
+
+func (s *server) a2aAccessStore() A2AAccessStore {
+	if s.deps.A2AAccess != nil {
+		return s.deps.A2AAccess
+	}
+	return s.deps.Store
 }
 
 type server struct {
@@ -189,8 +264,32 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner := http.NewServeMux()
 	inner.HandleFunc("POST /api/auth/register", s.handleRegister)
 	inner.HandleFunc("POST /api/auth/login", s.handleLogin)
+	inner.HandleFunc("POST /api/auth/workspace-invites/register", s.handleWorkspaceInviteRegister)
+	inner.HandleFunc("POST /api/auth/email-verification/request", s.handleRequestEmailVerification)
+	inner.HandleFunc("POST /api/auth/email-verification/verify", s.handleVerifyEmail)
+	inner.HandleFunc("POST /api/auth/password-reset/request", s.handleRequestPasswordReset)
+	inner.HandleFunc("POST /api/auth/password-reset/complete", s.handleResetPassword)
+	inner.HandleFunc("POST /api/auth/reauth", s.handleReauth)
+	inner.HandleFunc("POST /api/auth/logout-all", s.handleLogoutAll)
+	inner.HandleFunc("GET /api/capabilities", s.handleListCapabilities)
+	inner.HandleFunc("POST /api/capabilities/skills", s.handleCreateSkillCapability)
+	inner.HandleFunc("POST /api/capabilities/mcp", s.handleCreateMCPCapability)
+	inner.HandleFunc("GET /api/a2a-tokens", s.handleListA2AAccessTokens)
+	inner.HandleFunc("POST /api/a2a-tokens", s.handleIssueA2AAccessToken)
+	inner.HandleFunc("DELETE /api/a2a-tokens/{token_id}", s.handleRevokeA2AAccessToken)
 	inner.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	inner.HandleFunc("GET /api/auth/me", s.handleMe)
+	inner.HandleFunc("GET /api/workspaces", s.handleListWorkspaces)
+	inner.HandleFunc("POST /api/workspaces", s.handleCreateWorkspace)
+	inner.HandleFunc("POST /api/workspaces/{tenant_id}/switch", s.handleSwitchWorkspace)
+	inner.HandleFunc("GET /api/workspaces/{tenant_id}/members", s.handleListWorkspaceMembers)
+	inner.HandleFunc("POST /api/workspaces/{tenant_id}/invites", s.handleIssueWorkspaceInvite)
+	inner.HandleFunc("GET /api/workspaces/{tenant_id}/invites", s.handleListWorkspaceInvites)
+	inner.HandleFunc("DELETE /api/workspaces/{tenant_id}/invites/{invite_id}", s.handleRevokeWorkspaceInvite)
+	inner.HandleFunc("POST /api/workspace-invites/accept", s.handleAcceptWorkspaceInvite)
+	inner.HandleFunc("PATCH /api/workspaces/{tenant_id}/members/{user_id}", s.handleUpdateWorkspaceMember)
+	inner.HandleFunc("DELETE /api/workspaces/{tenant_id}/members/{user_id}", s.handleRemoveWorkspaceMember)
+	inner.HandleFunc("POST /api/workspaces/{tenant_id}/transfer-ownership", s.handleTransferWorkspaceOwnership)
 	inner.HandleFunc("GET /api/feishu/status", s.handleFeishuStatus)
 	inner.HandleFunc("POST /api/feishu/verify", s.handleFeishuVerify)
 	inner.HandleFunc("POST /api/feishu/config", s.handleFeishuConfig)
@@ -219,6 +318,7 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)
 	inner.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
+	inner.HandleFunc("PATCH /api/schedules/{id}/assignee", s.handleTransferScheduleAssignee)
 
 	// M7 任务数据面端点（功能 6.6/6.7）：只读，任务详情/运行历史/简报/列表概览。
 	// "summary" 是字面段，ServeMux 精确度规则保证它优先于 {id} 通配匹配。
@@ -464,7 +564,7 @@ func (s *server) cors(next http.Handler) http.Handler {
 				h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE")
 				h.Set(
 					"Access-Control-Allow-Headers",
-					"Content-Type, Idempotency-Key",
+					"Content-Type, Idempotency-Key, X-Vane-Reauth-Token",
 				)
 				h.Set("Access-Control-Max-Age", "600")
 				w.WriteHeader(http.StatusNoContent)
@@ -515,6 +615,8 @@ func writeAppError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, types.ErrValidation):
 		status = http.StatusBadRequest
+	case errors.Is(err, types.ErrForbidden):
+		status = http.StatusForbidden
 	case errors.Is(err, types.ErrNotFound):
 		status = http.StatusNotFound
 	case errors.Is(err, types.ErrConflict):

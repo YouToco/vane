@@ -60,7 +60,7 @@ func TestExecuteCompleted(t *testing.T) {
 	ex := newExecutor(Deps{Content: content})
 	execCtx := newExecCtx(textMsg(`{"keyword":"Claude","days":7,"limit":5}`))
 
-	events := collect(t, ex.Execute(t.Context(), execCtx))
+	events := collect(t, ex.Execute(testA2AContext(t.Context()), execCtx))
 
 	// 状态序列：SUBMITTED（Task 事件）→ WORKING → Artifact → COMPLETED。
 	if _, ok := events[0].(*a2a.Task); !ok {
@@ -116,7 +116,7 @@ func TestExecuteParams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			content := &fakeContent{}
 			ex := newExecutor(Deps{Content: content})
-			events := collect(t, ex.Execute(t.Context(), newExecCtx(textMsg(tc.text))))
+			events := collect(t, ex.Execute(testA2AContext(t.Context()), newExecCtx(textMsg(tc.text))))
 			if got := lastStatus(t, events).Status.State; got != a2a.TaskStateCompleted {
 				t.Fatalf("应 COMPLETED，实际 %s", got)
 			}
@@ -147,7 +147,7 @@ func TestExecuteRejected(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			content := &fakeContent{}
 			ex := newExecutor(Deps{Content: content})
-			events := collect(t, ex.Execute(t.Context(), newExecCtx(tc.msg)))
+			events := collect(t, ex.Execute(testA2AContext(t.Context()), newExecCtx(tc.msg)))
 			st := lastStatus(t, events)
 			if st.Status.State != a2a.TaskStateRejected {
 				t.Fatalf("应 REJECTED，实际 %s", st.Status.State)
@@ -168,7 +168,7 @@ func TestExecuteFailedSanitized(t *testing.T) {
 	const leak = "pgx: connection refused"
 	content := &fakeContent{err: errors.New(leak)}
 	ex := newExecutor(Deps{Content: content})
-	events := collect(t, ex.Execute(t.Context(), newExecCtx(textMsg("q"))))
+	events := collect(t, ex.Execute(testA2AContext(t.Context()), newExecCtx(textMsg("q"))))
 
 	st := lastStatus(t, events)
 	if st.Status.State != a2a.TaskStateFailed {
@@ -188,7 +188,7 @@ func TestExecuteFailedSanitized(t *testing.T) {
 	}
 	// AppError 的 Message 可对外（api.writeAppError 先例）。
 	content.err = types.NewAppError(types.CodeDatabase, "检索内容条目失败", errors.New(leak))
-	events = collect(t, ex.Execute(t.Context(), newExecCtx(textMsg("q"))))
+	events = collect(t, ex.Execute(testA2AContext(t.Context()), newExecCtx(textMsg("q"))))
 	st = lastStatus(t, events)
 	if got := st.Status.Message.Parts[0].Text(); got != "检索内容条目失败" {
 		t.Errorf("AppError 应译为其 Message，实际 %q", got)
@@ -199,6 +199,44 @@ func TestExecuteFailedSanitized(t *testing.T) {
 			t.Fatalf("AppError 路径泄露 Cause 链: %s", raw)
 		}
 	}
+}
+
+func TestExecutorRejectsSkillOutsideCredentialScope(t *testing.T) {
+	t.Run("content-only credential cannot call assistant", func(t *testing.T) {
+		authority := testAuthority
+		authority.Scopes = []types.A2AScope{types.A2AScopeContentQuery}
+		ctx := withA2AAuthority(t.Context(), &authority)
+		chat := &fakeChat{reply: "must not run"}
+		ex := newExecutor(Deps{Storage: newFakeTaskStorage(), Chat: chat})
+
+		events := collect(t, ex.Execute(ctx, newExecCtx(chatMsg("hello"))))
+		if got := lastStatus(t, events).Status.State; got != a2a.TaskStateRejected {
+			t.Fatalf("scope 不足应 REJECTED，实际 %s", got)
+		}
+		chat.mu.Lock()
+		defer chat.mu.Unlock()
+		if chat.calls != 0 {
+			t.Fatalf("scope 拒绝后仍调用模型 %d 次", chat.calls)
+		}
+	})
+
+	t.Run("assistant-only credential cannot query content", func(t *testing.T) {
+		authority := testAuthority
+		authority.Scopes = []types.A2AScope{types.A2AScopeAssistantChat}
+		ctx := withA2AAuthority(t.Context(), &authority)
+		content := &fakeContent{}
+		ex := newExecutor(Deps{Content: content})
+
+		events := collect(t, ex.Execute(ctx, newExecCtx(textMsg("private evidence"))))
+		if got := lastStatus(t, events).Status.State; got != a2a.TaskStateRejected {
+			t.Fatalf("scope 不足应 REJECTED，实际 %s", got)
+		}
+		content.mu.Lock()
+		defer content.mu.Unlock()
+		if content.calls != 0 {
+			t.Fatalf("scope 拒绝后仍查询内容 %d 次", content.calls)
+		}
+	})
 }
 
 func TestCancelYieldsCanceled(t *testing.T) {

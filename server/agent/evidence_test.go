@@ -61,7 +61,7 @@ func TestWebTaskActionReplaysCompletedTurnWithoutModelCall(t *testing.T) {
 		return nil, nil
 	}
 	out, err := loop.HandleWebTaskActionMessage(
-		t.Context(), 7, "a58d8934-3b23-420c-b58a-93c0208e186d", "",
+		t.Context(), testPrincipal(7), "a58d8934-3b23-420c-b58a-93c0208e186d", "",
 		"创建 Kimi 套餐监控",
 	)
 	if err != nil || out.Reply != "任务已创建。" || reader.calls != 1 {
@@ -79,7 +79,7 @@ func TestWebTaskActionRejectsRequestIDReusedWithDifferentMessage(t *testing.T) {
 		TurnReplay: reader, OwnerAgent: true,
 	})
 	_, err := loop.HandleWebTaskActionMessage(
-		t.Context(), 7, "d364eb61-a52c-4ddb-8efa-b47fb8c23dc7", "", "创建 B",
+		t.Context(), testPrincipal(7), "d364eb61-a52c-4ddb-8efa-b47fb8c23dc7", "", "创建 B",
 	)
 	if !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("err=%v, want conflict", err)
@@ -101,7 +101,7 @@ func TestWebTaskActionUsesStableActionIDAsEvidenceTrace(t *testing.T) {
 		return &llm.ChatResponse{Content: "请补充监控频率？"}, nil
 	}
 	out, err := loop.HandleWebTaskActionMessage(
-		t.Context(), 7, actionID, "", "创建 Kimi 套餐监控",
+		t.Context(), testPrincipal(7), actionID, "", "创建 Kimi 套餐监控",
 	)
 	if err != nil || out.Reply == "" || writer.record.TurnID != actionID {
 		t.Fatalf("out=%+v trace=%q err=%v", out, writer.record.TurnID, err)
@@ -122,7 +122,7 @@ func TestChannelMessageReplaysCompletedTurnWithoutModelCall(t *testing.T) {
 		return nil, nil
 	}
 	out, err := loop.HandleChannelMessage(
-		t.Context(), 7, "channel-route:11",
+		t.Context(), testPrincipal(7), "channel-route:11",
 		"b8e3a943-85e0-54e8-8fc0-5d4c1d371a14", "列出我的任务",
 	)
 	if err != nil || out.Reply != "你有两个任务。" || reader.calls != 1 {
@@ -156,7 +156,7 @@ func TestChannelMessageUsesStableIDWithoutWebTaskMode(t *testing.T) {
 		return &llm.ChatResponse{Content: "已执行。"}, nil
 	}
 	out, err := loop.HandleChannelMessage(
-		t.Context(), 7, "channel-route:11", turnID, "执行渠道操作",
+		t.Context(), testPrincipal(7), "channel-route:11", turnID, "执行渠道操作",
 	)
 	if err != nil || out.Reply != "已执行。" || len(mutating.calls) != 1 ||
 		writer.record.TurnID != turnID {
@@ -179,11 +179,11 @@ func TestChannelMessageHistoryIsIsolatedByAuthenticatedRouteScope(t *testing.T) 
 		requests = append(requests, request)
 		return &llm.ChatResponse{Content: "已处理。"}, nil
 	}
-	if _, err := loop.HandleChannelMessage(t.Context(), 7, "channel-route:11",
+	if _, err := loop.HandleChannelMessage(t.Context(), testPrincipal(7), "channel-route:11",
 		"7dd01cc8-c438-5303-95e0-8ad738842c9c", "私聊秘密标记"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loop.HandleChannelMessage(t.Context(), 7, "channel-route:22",
+	if _, err := loop.HandleChannelMessage(t.Context(), testPrincipal(7), "channel-route:22",
 		"2370d5a6-98af-5935-942f-e6d7ef462980", "群里列出任务"); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestChannelMessageRejectsInvalidAuthorityOrStableID(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := tc.loop.HandleChannelMessage(
-				t.Context(), 1, "channel-route:11", tc.id, "hello",
+				t.Context(), testPrincipal(1), "channel-route:11", tc.id, "hello",
 			); !errors.Is(err, types.ErrValidation) {
 				t.Fatalf("err=%v", err)
 			}
@@ -233,7 +233,7 @@ func TestChannelMessageRejectsInvalidAuthorityOrStableID(t *testing.T) {
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true})
 	for _, scope := range []string{"", "owner", "telegram chat 42", strings.Repeat("a", 129)} {
 		if _, err := loop.HandleChannelMessage(
-			t.Context(), 1, scope, validID, "hello",
+			t.Context(), testPrincipal(1), scope, validID, "hello",
 		); !errors.Is(err, types.ErrValidation) {
 			t.Fatalf("scope=%q err=%v", scope, err)
 		}
@@ -399,7 +399,7 @@ func TestGroundedGuardedReplyIsTheExactPersistedEvidence(t *testing.T) {
 	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
 		return &llm.ChatResponse{Content: "raw reply"}, nil
 	}
-	outcome, err := loop.HandleGroundedMessageGuarded(t.Context(), 42,
+	outcome, err := loop.HandleGroundedMessageGuarded(t.Context(), testPrincipal(42),
 		"发生了什么？", "frozen brief", func(reply string) (string, error) {
 			return "guarded: " + reply, nil
 		})

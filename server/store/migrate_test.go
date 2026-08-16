@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 142
+const latestMigrationVersion int64 = 150
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -43,15 +43,19 @@ var wantTables = []string{
 	"content_sources",
 	// 013 A2A server 任务持久化
 	"a2a_tasks",
+	"a2a_principal_tasks",
+	// 139 hash-only, workspace/principal-bound A2A access authority.
+	"a2a_access_tokens",
+	"a2a_access_token_events",
 	// 018 租户地基（企业级契约 §1.2）
 	"tenants",
 	"memberships",
 	"invites",
 	// 019 邮箱+密码身份与会话（决议 D2′）
 	"user_sessions",
-	// 137 encrypted platform/tenant provider credential generations.
+	// 145 encrypted platform/tenant provider credential generations.
 	"credential_vault_entries",
-	// 133 authenticated external-channel binding and durable ingress.
+	// 141-150 authenticated channel ingress, routing, credentials and delivery.
 	"channel_identities",
 	"channel_link_requests",
 	"channel_ingress_receipts",
@@ -188,6 +192,29 @@ var wantTables = []string{
 	// 132 immutable epoch proving physical legacy-protocol fencing predates evidence.
 	"agent_first_legacy_protocol_write_fence_v132",
 	// 131 only widens the retained agent_events batch cardinality constraint.
+	// 134 multi-workspace identity control plane.
+	"workspace_invites",
+	"workspace_audit_events",
+	// 135 immutable, tenant/user-isolated Skill and remote MCP capabilities.
+	"user_capabilities",
+	"user_capability_versions",
+	"skill_capability_versions",
+	"skill_capability_files",
+	"mcp_connection_versions",
+	"user_capability_events",
+	// 136 shared-workspace task access projection and append-only audit. The
+	// frozen schedules catalog remains byte-for-byte compatible with fence 132.
+	"task_workspace_access",
+	"task_access_audit_events",
+	// 137 hashed, one-time account security credentials and append-only audit.
+	"account_security_tokens",
+	"account_security_audit_events",
+	// 138 independent team-workspace long-term memory ledger. Personal memory
+	// remains in migration129 and is never unioned into this corpus.
+	"workspace_memory_authorizations",
+	"workspace_memory_records",
+	"workspace_memory_events",
+	"workspace_memory_receipts",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

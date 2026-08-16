@@ -1,7 +1,7 @@
 # Provider credential vault contract
 
 Status: encrypted storage and administration are implemented in migrations
-137-138. Telegram has a per-user runtime manager fleet. Shared LLM credentials
+145-146. Telegram has a per-user runtime manager fleet. Shared LLM credentials
 are selected from the database at safe process start; LLM hot reload and the
 per-user Feishu runtime fleet remain separate fail-closed rollouts.
 
@@ -52,7 +52,7 @@ per-user Feishu runtime fleet remain separate fail-closed rollouts.
   environment token.
 - KEK rotation is independent: new writes use the active key ID while old key
   IDs remain decrypt-only until every retained provider generation has expired.
-- Downgrade of migration 137 refuses while any credential history exists.
+- Downgrade of migration 145 refuses while any credential history exists.
 
 ## Web and runtime rollout gates
 

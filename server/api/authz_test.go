@@ -10,6 +10,7 @@ import (
 
 	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/scheduler"
+	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
 	"github.com/YouToco/vane/server/workflow"
 )
@@ -22,6 +23,20 @@ import (
 type spyScheduler struct {
 	deleted string
 	updated string
+}
+
+type allowTeamTaskAccess struct{ executionUserID int64 }
+
+func (a allowTeamTaskAccess) AuthorizeScheduleMutation(
+	context.Context, int64, int64, string, store.TaskMutation,
+) (*types.Schedule, error) {
+	return &types.Schedule{UserID: a.executionUserID}, nil
+}
+
+func (a allowTeamTaskAccess) TransferScheduleAssignee(
+	context.Context, int64, int64, string, int64,
+) (*types.Schedule, error) {
+	return &types.Schedule{UserID: a.executionUserID}, nil
 }
 
 func (s *spyScheduler) CreatePush(context.Context, int64, scheduler.ScheduleSpec, workflow.PushScope, string) (string, error) {
@@ -57,7 +72,10 @@ func authzMux(t *testing.T, userID, tenantID int64, sched any) (*http.ServeMux, 
 		TenantID: tenantID, UserID: userID, Role: types.MembershipRoleOwner,
 	}}
 	mux := http.NewServeMux()
-	Mount(mux, Deps{Auth: fake, Principal: auth.NewContextResolver(), Scheduler: sched})
+	Mount(mux, Deps{
+		Auth: fake, Principal: auth.NewContextResolver(), Scheduler: sched,
+		TeamTasks: allowTeamTaskAccess{executionUserID: userID},
+	})
 	return mux, &http.Cookie{Name: sessionCookieName, Value: token}
 }
 

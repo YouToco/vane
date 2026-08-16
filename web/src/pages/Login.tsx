@@ -85,6 +85,12 @@ export default function Login() {
     try {
       if (isRegister) {
         await api.register(email.trim(), password, inviteCode.trim());
+        // Registration is already committed at this point. Mail delivery is a
+        // separate best-effort action so SMTP failure cannot roll back the
+        // account or leave the UI claiming registration failed.
+        try {
+          await api.requestEmailVerification();
+        } catch {}
       } else {
         await api.login(email.trim(), password);
       }
@@ -238,6 +244,19 @@ export default function Login() {
                 >
                   {isRegister ? A.toLogin : A.toRegister}
                 </Button>
+                {!isRegister && (
+                  <Button
+                    type="button"
+                    variant="link"
+                    className="h-auto min-h-8 px-2 py-1 text-sm text-muted-foreground hover:text-foreground hover:no-underline"
+                    onClick={() => {
+                      location.hash = "#/forgot-password";
+                    }}
+                    disabled={loading}
+                  >
+                    忘记密码？
+                  </Button>
+                )}
               </CardFooter>
             </Card>
           </form>

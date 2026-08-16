@@ -17,6 +17,7 @@ var (
 	ErrNotFound   = errors.New("vane: not found")  // 资源不存在
 	ErrConflict   = errors.New("vane: conflict")   // 唯一约束冲突 / 状态冲突
 	ErrValidation = errors.New("vane: validation") // 入参 / 业务校验失败
+	ErrForbidden  = errors.New("vane: forbidden")  // 身份有效，但无权执行该操作
 
 	// 系统层
 	ErrDatabase = errors.New("vane: database") // 数据库层错误（含死锁 / 断连 / 约束）
@@ -41,6 +42,7 @@ const (
 	CodeNotFound   ErrCode = "NOT_FOUND"
 	CodeConflict   ErrCode = "CONFLICT"
 	CodeValidation ErrCode = "VALIDATION"
+	CodeForbidden  ErrCode = "FORBIDDEN"
 
 	// 系统层
 	CodeDatabase ErrCode = "DATABASE"
@@ -75,6 +77,7 @@ var codeSentinel = map[ErrCode]error{
 	CodeNotFound:   ErrNotFound,
 	CodeConflict:   ErrConflict,
 	CodeValidation: ErrValidation,
+	CodeForbidden:  ErrForbidden,
 
 	CodeDatabase:     ErrDatabase,
 	CodeDBDeadlock:   ErrDatabase,
@@ -101,6 +104,7 @@ var retryableByDefault = map[ErrCode]bool{
 	CodeNotFound:   false,
 	CodeConflict:   false,
 	CodeValidation: false,
+	CodeForbidden:  false,
 
 	CodeDatabase:     true,
 	CodeDBDeadlock:   true,

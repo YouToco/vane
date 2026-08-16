@@ -185,8 +185,8 @@ func TestCredentialVaultConcurrentRotationHasOneActiveGeneration(t *testing.T) {
 	}
 }
 
-func TestMigration137CredentialVaultBoundary(t *testing.T) {
-	payload, err := migrationsFS.ReadFile("migrations/137_credential_vault.sql")
+func TestMigration145CredentialVaultBoundary(t *testing.T) {
+	payload, err := migrationsFS.ReadFile("migrations/145_credential_vault.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,20 +200,20 @@ func TestMigration137CredentialVaultBoundary(t *testing.T) {
 		"uq_credential_vault_tenant_active",
 		"REVOKE ALL ON credential_vault_entries FROM PUBLIC,vane_app",
 		"ALTER TABLE credential_vault_entries ENABLE ROW LEVEL SECURITY",
-		"migration 137 down refused: encrypted credential history exists",
+		"migration 145 down refused: encrypted credential history exists",
 	} {
 		if !strings.Contains(sqlText, fragment) {
-			t.Errorf("migration 137 lost boundary %q", fragment)
+			t.Errorf("migration 145 lost boundary %q", fragment)
 		}
 	}
 	for _, forbidden := range []string{"app_secret TEXT", "bot_token TEXT", "api_key TEXT", "GRANT ALL"} {
 		if strings.Contains(sqlText, forbidden) {
-			t.Errorf("migration 137 introduced plaintext/overbroad authority %q", forbidden)
+			t.Errorf("migration 145 introduced plaintext/overbroad authority %q", forbidden)
 		}
 	}
 }
 
-func TestMigration137DownRefusesCredentialHistoryPostgres(t *testing.T) {
+func TestMigration145DownRefusesCredentialHistoryPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		requireDatabaseCapability(t)
@@ -247,7 +247,7 @@ func TestMigration137DownRefusesCredentialHistoryPostgres(t *testing.T) {
 	}
 	if _, err := provider.DownTo(t.Context(), 136); err == nil ||
 		!strings.Contains(err.Error(), "encrypted credential history exists") {
-		t.Fatalf("migration 137 down accepted retained credential: %v", err)
+		t.Fatalf("migration 145 down accepted retained credential: %v", err)
 	}
 	if _, err := database.ExecContext(t.Context(), `DELETE FROM credential_vault_entries`); err != nil {
 		t.Fatal(err)
@@ -261,7 +261,7 @@ func TestMigration137DownRefusesCredentialHistoryPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if exists {
-		t.Fatal("credential vault table survived successful migration 137 down")
+		t.Fatal("credential vault table survived successful migration 145 down")
 	}
 }
 
@@ -337,8 +337,8 @@ func TestCredentialVaultOrdinaryMemberOwnsOnlyTheirUserScope(t *testing.T) {
 	}
 }
 
-func TestMigration138CredentialExternalIdentityBoundary(t *testing.T) {
-	payload, err := migrationsFS.ReadFile("migrations/138_credential_external_identity.sql")
+func TestMigration146CredentialExternalIdentityBoundary(t *testing.T) {
+	payload, err := migrationsFS.ReadFile("migrations/146_credential_external_identity.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestMigration138CredentialExternalIdentityBoundary(t *testing.T) {
 		"metadata->>'app_id'",
 	} {
 		if !strings.Contains(sqlText, fragment) {
-			t.Errorf("migration 138 lost boundary %q", fragment)
+			t.Errorf("migration 146 lost boundary %q", fragment)
 		}
 	}
 }
