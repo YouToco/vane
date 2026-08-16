@@ -60,7 +60,7 @@ func TestTelegramBindingAndIngressReplayPostgres(t *testing.T) {
 	}
 	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
-	if _, err := provider.UpTo(t.Context(), 134); err != nil {
+	if _, err := provider.UpTo(t.Context(), 139); err != nil {
 		t.Fatal(err)
 	}
 	st, err := New(t.Context(), scratchURL)

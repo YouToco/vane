@@ -110,7 +110,7 @@ func TestTelegramGroupTopicRoutePostgres(t *testing.T) {
 	}
 	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
-	if _, err := provider.UpTo(t.Context(), 134); err != nil {
+	if _, err := provider.UpTo(t.Context(), 139); err != nil {
 		t.Fatal(err)
 	}
 	st, err := New(t.Context(), scratchURL)
@@ -228,7 +228,7 @@ func TestTelegramGroupTopicRoutePostgres(t *testing.T) {
 	turnID := uuid.NewString()
 	created, err := st.AcceptTelegramRoutedIngress(t.Context(), identity, route,
 		"9100", strings.Repeat("c", 64), "列出我的任务", turnID,
-		"44", "command", "")
+		"44", "command", "", nil)
 	if err != nil || !created {
 		t.Fatalf("accept created=%t err=%v", created, err)
 	}

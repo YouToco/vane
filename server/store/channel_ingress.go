@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,20 @@ import (
 )
 
 const channelProviderTelegram = "telegram"
+
+func channelMediaEnvelopeEqual(left, right []byte) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return len(left) == 0 && len(right) == 0
+	}
+	leftEnvelope, leftErr := types.DecodeChannelMessageEnvelopeV1(left)
+	rightEnvelope, rightErr := types.DecodeChannelMessageEnvelopeV1(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftCanonical, leftErr := types.MarshalChannelMessageEnvelopeV1(leftEnvelope)
+	rightCanonical, rightErr := types.MarshalChannelMessageEnvelopeV1(rightEnvelope)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftCanonical, rightCanonical)
+}
 
 // ChannelIdentity is an authenticated external actor bound to an existing
 // Vane tenant membership. External IDs are routing data, never Vane user IDs.
@@ -49,6 +64,7 @@ type ChannelIngress struct {
 	CallbackQueryID   string
 	PayloadDigest     string
 	InputText         string
+	MediaEnvelope     []byte
 	StableTurnID      string
 	Status            string
 	AttemptCount      int
@@ -548,7 +564,7 @@ func (s *Store) AcceptTelegramIngress(
 		return false, err
 	}
 	return s.AcceptTelegramRoutedIngress(ctx, identity, route, updateID,
-		payloadDigest, inputText, stableTurnID, "", "message", "")
+		payloadDigest, inputText, stableTurnID, "", "message", "", nil)
 }
 
 // AcceptTelegramRoutedIngress inserts an authenticated private/group/topic
@@ -557,7 +573,7 @@ func (s *Store) AcceptTelegramIngress(
 func (s *Store) AcceptTelegramRoutedIngress(
 	ctx context.Context, identity ChannelIdentity, route ChannelRoute,
 	updateID, payloadDigest, inputText, stableTurnID, providerMessageID,
-	ingressKind, callbackQueryID string,
+	ingressKind, callbackQueryID string, mediaEnvelope []byte,
 ) (bool, error) {
 	if identity.ID <= 0 || identity.TenantID <= 0 || identity.UserID <= 0 ||
 		identity.Provider != channelProviderTelegram || identity.Status != "active" ||
@@ -571,6 +587,15 @@ func (s *Store) AcceptTelegramRoutedIngress(
 		(ingressKind == "callback") != (callbackQueryID != "") || len(callbackQueryID) > 128 {
 		return false, types.NewAppError(types.CodeValidation,
 			"Telegram update 范围无效", types.ErrValidation)
+	}
+	if len(mediaEnvelope) > 0 {
+		if ingressKind != "message" || inputText != "telegram:media-help" {
+			return false, types.NewAppError(types.CodeValidation,
+				"Telegram 媒体入口语义无效", types.ErrValidation)
+		}
+		if _, err := types.DecodeChannelMessageEnvelopeV1(mediaEnvelope); err != nil {
+			return false, err
+		}
 	}
 	parsedTurn, err := uuid.Parse(stableTurnID)
 	if err != nil || parsedTurn.String() != stableTurnID {
@@ -617,13 +642,16 @@ func (s *Store) AcceptTelegramRoutedIngress(
 		`INSERT INTO channel_ingress_receipts
 		 (provider,app_identity,provider_update_id,identity_id,tenant_id,user_id,
 		  external_user_id,provider_chat_id,payload_digest,input_text,stable_turn_id,
-		  route_id,provider_thread_id,provider_message_id,ingress_kind,callback_query_id)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+		  route_id,provider_thread_id,provider_message_id,ingress_kind,callback_query_id,
+		  media_envelope)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+		         NULLIF($17,'')::jsonb)
 		 ON CONFLICT (provider,app_identity,provider_update_id) DO NOTHING`,
 		identity.Provider, identity.AppIdentity, updateID, identity.ID,
 		identity.TenantID, identity.UserID, identity.ExternalUserID,
 		route.ProviderChatID, payloadDigest, inputText, stableTurnID, route.ID,
-		route.ProviderThreadID, providerMessageID, ingressKind, callbackQueryID)
+		route.ProviderThreadID, providerMessageID, ingressKind, callbackQueryID,
+		string(mediaEnvelope))
 	if err != nil {
 		return false, types.NewAppError(types.CodeDatabase,
 			"接收 Telegram update", err)
@@ -636,17 +664,18 @@ func (s *Store) AcceptTelegramRoutedIngress(
 		return true, nil
 	}
 	var storedDigest, storedText, storedTurn, storedMessage, storedKind, storedCallback string
+	var storedMedia []byte
 	var storedIdentity, storedTenant, storedUser, storedRoute int64
 	err = tx.QueryRow(ctx,
 		`SELECT identity_id,tenant_id,user_id,payload_digest,input_text,
 		        stable_turn_id::text,route_id,provider_message_id,
-		        ingress_kind,callback_query_id
+		        ingress_kind,callback_query_id,media_envelope
 		   FROM channel_ingress_receipts
 		  WHERE provider=$1 AND app_identity=$2 AND provider_update_id=$3`,
 		identity.Provider, identity.AppIdentity, updateID,
 	).Scan(&storedIdentity, &storedTenant, &storedUser,
 		&storedDigest, &storedText, &storedTurn, &storedRoute,
-		&storedMessage, &storedKind, &storedCallback)
+		&storedMessage, &storedKind, &storedCallback, &storedMedia)
 	if err != nil {
 		return false, types.NewAppError(types.CodeDatabase,
 			"核对 Telegram update 重放", err)
@@ -655,7 +684,8 @@ func (s *Store) AcceptTelegramRoutedIngress(
 		storedUser != identity.UserID || storedDigest != payloadDigest ||
 		storedText != inputText || storedTurn != stableTurnID ||
 		storedRoute != route.ID || storedMessage != providerMessageID ||
-		storedKind != ingressKind || storedCallback != callbackQueryID {
+		storedKind != ingressKind || storedCallback != callbackQueryID ||
+		!channelMediaEnvelopeEqual(storedMedia, mediaEnvelope) {
 		return false, types.NewAppError(types.CodeConflict,
 			"Telegram update_id 已被不同请求占用", types.ErrConflict)
 	}
@@ -738,7 +768,8 @@ func (s *Store) ClaimNextTelegramIngress(
 		           r.tenant_id,r.user_id,r.external_user_id,r.provider_chat_id,
 		           r.provider_thread_id,r.provider_message_id,r.route_id,
 		           r.ingress_kind,r.callback_query_id,
-		           r.payload_digest,r.input_text,r.stable_turn_id::text,r.status,
+		           r.payload_digest,r.input_text,r.media_envelope,
+		           r.stable_turn_id::text,r.status,
 		           r.attempt_count,r.processing_lease::text,COALESCE(r.reply_text,'')`,
 		channelProviderTelegram, appIdentity, claimID, int64(lease/time.Second),
 		identityID, routeID,
@@ -747,7 +778,7 @@ func (s *Store) ClaimNextTelegramIngress(
 		&item.ExternalUserID, &item.ProviderChatID, &item.ProviderThreadID,
 		&item.ProviderMessageID, &item.RouteID, &item.IngressKind,
 		&item.CallbackQueryID, &item.PayloadDigest,
-		&item.InputText, &item.StableTurnID, &item.Status,
+		&item.InputText, &item.MediaEnvelope, &item.StableTurnID, &item.Status,
 		&item.AttemptCount, &item.ProcessingLease, &item.ReplyText)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelIngress{}, types.NewAppError(types.CodeNotFound,
@@ -858,7 +889,7 @@ func (s *Store) ClaimTelegramReplySend(
 		           tenant_id,user_id,external_user_id,provider_chat_id,
 		           provider_thread_id,provider_message_id,route_id,
 		           ingress_kind,callback_query_id,
-		           payload_digest,input_text,stable_turn_id::text,status,
+		           payload_digest,input_text,media_envelope,stable_turn_id::text,status,
 		           attempt_count,'',reply_text`,
 		provider, appIdentity, updateID, identityID,
 	).Scan(&item.Provider, &item.AppIdentity, &item.ProviderUpdateID,
@@ -866,7 +897,7 @@ func (s *Store) ClaimTelegramReplySend(
 		&item.ExternalUserID, &item.ProviderChatID, &item.ProviderThreadID,
 		&item.ProviderMessageID, &item.RouteID, &item.IngressKind,
 		&item.CallbackQueryID, &item.PayloadDigest,
-		&item.InputText, &item.StableTurnID, &item.Status,
+		&item.InputText, &item.MediaEnvelope, &item.StableTurnID, &item.Status,
 		&item.AttemptCount, &item.ProcessingLease, &item.ReplyText)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelIngress{}, types.NewAppError(types.CodeConflict,
@@ -950,7 +981,8 @@ func (s *Store) ClaimNextTelegramReplySend(
 		           r.tenant_id,r.user_id,r.external_user_id,r.provider_chat_id,
 		           r.provider_thread_id,r.provider_message_id,r.route_id,
 		           r.ingress_kind,r.callback_query_id,
-		           r.payload_digest,r.input_text,r.stable_turn_id::text,r.status,
+		           r.payload_digest,r.input_text,r.media_envelope,
+		           r.stable_turn_id::text,r.status,
 		           r.attempt_count,'',r.reply_text`,
 		channelProviderTelegram, appIdentity, identityID, routeID,
 	).Scan(&item.Provider, &item.AppIdentity, &item.ProviderUpdateID,
@@ -958,7 +990,7 @@ func (s *Store) ClaimNextTelegramReplySend(
 		&item.ExternalUserID, &item.ProviderChatID, &item.ProviderThreadID,
 		&item.ProviderMessageID, &item.RouteID, &item.IngressKind,
 		&item.CallbackQueryID, &item.PayloadDigest,
-		&item.InputText, &item.StableTurnID, &item.Status,
+		&item.InputText, &item.MediaEnvelope, &item.StableTurnID, &item.Status,
 		&item.AttemptCount, &item.ProcessingLease, &item.ReplyText)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelIngress{}, types.NewAppError(types.CodeNotFound,

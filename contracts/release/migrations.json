@@ -547,6 +547,10 @@
     {
       "path": "138_credential_external_identity.sql",
       "sha256": "ef0b9a1bb53452dd52877d43754e6ad47674529a9d7a0fdc8b29aae9ee34b6d0"
+    },
+    {
+      "path": "139_channel_media_envelope.sql",
+      "sha256": "42562f81f630cbc9a10be1116b2d979f818e2b1ad0ae03c7532b4f2c5eae8a83"
     }
   ],
   "schema": "vane.migrations/v1"

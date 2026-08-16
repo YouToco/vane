@@ -58,11 +58,15 @@ type Message struct {
 	Chat                    Chat                     `json:"chat"`
 	Text                    string                   `json:"text"`
 	Caption                 string                   `json:"caption"`
+	MediaGroupID            string                   `json:"media_group_id"`
 	Photo                   []FileRef                `json:"photo"`
 	Document                *FileRef                 `json:"document"`
 	Audio                   *FileRef                 `json:"audio"`
 	Video                   *FileRef                 `json:"video"`
 	Voice                   *FileRef                 `json:"voice"`
+	Animation               *FileRef                 `json:"animation"`
+	VideoNote               *FileRef                 `json:"video_note"`
+	Sticker                 *FileRef                 `json:"sticker"`
 	ReplyToMessage          *Message                 `json:"reply_to_message"`
 	MigrateToChatID         int64                    `json:"migrate_to_chat_id"`
 	MigrateFromChatID       int64                    `json:"migrate_from_chat_id"`
@@ -76,6 +80,13 @@ type GeneralForumTopicHidden struct{}
 type FileRef struct {
 	FileID       string `json:"file_id"`
 	FileUniqueID string `json:"file_unique_id"`
+	FileName     string `json:"file_name"`
+	MIMEType     string `json:"mime_type"`
+	FileSize     int64  `json:"file_size"`
+	Width        int64  `json:"width"`
+	Height       int64  `json:"height"`
+	Duration     int64  `json:"duration"`
+	Length       int64  `json:"length"`
 }
 
 type CallbackQuery struct {

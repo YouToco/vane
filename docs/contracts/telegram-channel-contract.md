@@ -1,4 +1,4 @@
-# Telegram Bot channel contract (routed ingress v3)
+# Telegram Bot channel contract (routed ingress v4)
 
 Status: implemented, default-off, production UAT pending.
 
@@ -9,7 +9,7 @@ routing data, never Vane user IDs.
 
 ## Scope
 
-Included in v3:
+Included in v4:
 
 - startup `getMe`, exact HTTPS `setWebhook`, `getWebhookInfo` verification;
 - explicit `allowed_updates=["message","callback_query","my_chat_member"]`, `max_connections=1` and
@@ -35,8 +35,10 @@ Included in v3:
   frozen route/payload, exact replay, and terminal sent/failed/ambiguous
   settlement. Connection tests use it; future product notifications can reuse
   it without bypassing Telegram's no-blind-retry rule;
-- explicit media recognition with a safe text-only capability reply; media
-  bytes are not downloaded or silently passed to the model;
+- explicit media recognition with a safe text-only capability reply; a
+  provider-neutral `vane.channel-message/v1` metadata envelope is durably
+  frozen with the ingress receipt, while media bytes are not downloaded or
+  silently passed to the model;
 - Web-session-issued, ten-minute, one-time `/start` pairing links;
 - hash-only pairing-token storage and exact actor/chat/bot binding;
 - durable `(provider, bot identity, update_id)` inbox receipts;
@@ -46,7 +48,7 @@ Included in v3:
   message;
 - authenticated status/link/test/unlink Dashboard APIs and Settings UI.
 
-Not included in v2:
+Not included in v4:
 
 - channel-post ingestion, inline queries, Telegram Login, reactions, edits, or
   arbitrary group-member Agent access;
@@ -139,9 +141,73 @@ unready until credentials are repaired and the process is restarted. A 403 is
 recipient/chat scoped (for example, the user blocked the Bot): only that
 delivery becomes terminal `failed`, while the adapter remains ready.
 
+## Media evolution boundary
+
+Media support is split into a transport-safe foundation and a separately
+activated understanding pipeline. The current release implements only the
+foundation and continues to return the explicit `telegram:media-help` reply.
+It must not claim that an image, voice note, audio file or video was understood.
+
+At webhook admission, supported Telegram message shapes (`photo`, `animation`,
+`audio`, `voice`, `video`, `video_note`, `document`, and `sticker`) are reduced
+to one versioned provider-neutral envelope. For Telegram animations, the
+compatibility `document` duplicate is collapsed. For photos, only the largest
+available variant is retained. The envelope freezes:
+
+- provider opaque `file_id` and non-downloadable `file_unique_id`;
+- semantic kind, caption, media-group identifier, filename, MIME hint, byte
+  size, dimensions and duration when supplied by Telegram;
+- no Bot token, `file_path`, provider download URL, local path or media bytes.
+
+The envelope is part of the semantic update digest and exact replay comparison.
+A duplicate update with changed media authority conflicts before Agent work.
+Group and topic admission still occurs before persistence: an ambient media
+message is ignored, while an exact mention/reply stores a caption with the Bot
+mention removed. Caption text is user input, never a system instruction.
+
+A future multimodal activation must be a separate A/S-level change and must
+implement all of these gates before the first download or paid model call:
+
+1. Recheck active tenant membership, channel identity, exact route/topic and a
+   dedicated media-processing policy under a durable claim/fence. Revocation
+   after webhook receipt must prevent a new download claim.
+2. Select processing from an explicit model capability manifest (`image`,
+   `audio`, `video`, document/PDF), not from model-name guesses. The selected
+   capability, provider/model generation, preprocessing policy and request
+   digest must be frozen for replay and cost attribution.
+3. Resolve `file_id` with the then-active encrypted Bot credential. Telegram's
+   hosted Bot API currently limits `getFile` downloads to 20 MB and returns a
+   temporary path; Vane must apply a lower product quota when appropriate,
+   stream with a hard byte limit and deadline, and never persist or log the
+   token-bearing URL. MIME and filename metadata are advisory only.
+4. Verify magic bytes and decoded shape before model submission. Enforce image
+   pixel/frame limits, audio/video duration and sampling budgets, decompression
+   limits, supported codecs and tenant cost quota. Generic documents require a
+   separate allowlist/scanner/parser boundary; they cannot inherit image trust.
+5. Materialize a typed model request: direct multimodal content only when the
+   selected model/provider contract supports that modality; otherwise use an
+   explicit, separately metered transcription/description stage. Never silently
+   drop an attachment or pretend a text-only model inspected it.
+6. Store only content-addressed, tenant-scoped temporary objects with bounded
+   retention and deletion/audit receipts. Conversation history stores the
+   typed reference and derived text/digest, not base64 media. Raw bytes must not
+   enter Agent logs, errors, Temporal history or general database JSON.
+7. Treat Telegram albums (`media_group_id`) as multiple independently durable
+   updates until a bounded album-assembly protocol exists. Do not assume all
+   album members arrive together or block unrelated conversation FIFO forever.
+8. Make user-visible outcomes honest and durable: processed modality and any
+   sampling/transcription fallback are stated; rejected/oversized/unsupported
+   media gets an actionable reply; provider/model failures cannot become silent
+   loss or an unbounded automatic paid retry.
+
+This boundary allows future image/audio/video models to plug in after the
+durable inbox without changing Telegram identity, route, topic, update replay
+or outbound-send semantics. It intentionally does not pre-authorize downloads
+or broaden the current model input protocol.
+
 ## Database role boundary
 
-Migrations 133-136 install exact-user RLS policies and revoke the future
+Migrations 133-139 install exact-user RLS policies and revoke the future
 `vane_app` role, but the current primary Store intentionally still runs through
 the repository's schema-owner compatibility DSN. PostgreSQL owners bypass
 non-FORCE RLS, so this branch does **not** count those policies as current

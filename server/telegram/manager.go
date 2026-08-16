@@ -85,7 +85,7 @@ type IngressStore interface {
 	IssueTelegramRouteLinkRequest(context.Context, int64, int64, string, []byte, time.Time) error
 	ConsumeTelegramRouteLinkRequest(context.Context, []byte, string, string, string, string, string, string) (store.ChannelRoute, bool, error)
 	ResolveTelegramRoute(context.Context, string, string, string, string) (store.ChannelIdentity, store.ChannelRoute, error)
-	AcceptTelegramRoutedIngress(context.Context, store.ChannelIdentity, store.ChannelRoute, string, string, string, string, string, string, string) (bool, error)
+	AcceptTelegramRoutedIngress(context.Context, store.ChannelIdentity, store.ChannelRoute, string, string, string, string, string, string, string, []byte) (bool, error)
 	ListTelegramRoutesForUser(context.Context, int64, int64, string) ([]store.ChannelRoute, error)
 	RevokeTelegramRoute(context.Context, int64, int64, int64, string) error
 	MigrateTelegramRoutes(context.Context, string, string, string) error
@@ -418,12 +418,13 @@ func (m *Manager) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest := semanticUpdateDigest(update.UpdateID, actorID, chatID, threadID,
-		inbound.MessageID, inbound.Kind, inbound.CallbackID, text)
+		inbound.MessageID, inbound.Kind, inbound.CallbackID, text,
+		inbound.MediaEnvelope)
 	turnID := stableTelegramTurnID(bot.ID, update.UpdateID)
 	_, err = m.store.AcceptTelegramRoutedIngress(
 		r.Context(), identity, route, strconv.FormatInt(update.UpdateID, 10),
 		digest, text, turnID, inbound.MessageID, inbound.Kind,
-		inbound.CallbackID)
+		inbound.CallbackID, inbound.MediaEnvelope)
 	if err != nil {
 		if errors.Is(err, types.ErrConflict) {
 			http.Error(w, "conflicting update", http.StatusConflict)
@@ -492,6 +493,7 @@ type normalizedUpdate struct {
 	Text                      string
 	Kind                      string
 	CallbackID                string
+	MediaEnvelope             []byte
 }
 
 func (m *Manager) normalizeUpdate(bot Bot, update Update) (normalizedUpdate, bool) {
@@ -526,14 +528,15 @@ func (m *Manager) normalizeUpdate(bot Bot, update Update) (normalizedUpdate, boo
 	if message.Chat.Type == "private" && message.Chat.ID != message.From.ID {
 		return normalizedUpdate{}, false
 	}
+	hasMedia := telegramMessageHasMedia(message)
 	text := strings.TrimSpace(message.Text)
-	if len(message.Photo) > 0 || message.Document != nil || message.Audio != nil ||
-		message.Video != nil || message.Voice != nil {
-		text = "telegram:media-help"
-	} else if text == "" {
+	if hasMedia || text == "" {
+		// Telegram media semantics use Caption. If a malformed provider payload
+		// carries both text and media, do not let the text bypass the durable
+		// media path or diverge from what Telegram clients display as caption.
 		text = strings.TrimSpace(message.Caption)
 	}
-	if text == "" || len(text) > 65536 {
+	if (text == "" && !hasMedia) || len(text) > 65536 {
 		return normalizedUpdate{}, false
 	}
 	kind := "message"
@@ -546,7 +549,18 @@ func (m *Manager) normalizeUpdate(bot Bot, update Update) (normalizedUpdate, boo
 			return normalizedUpdate{}, false
 		}
 	}
-	if isCommand {
+	var mediaEnvelope []byte
+	if hasMedia {
+		var err error
+		mediaEnvelope, err = telegramMediaEnvelope(message, text)
+		if err != nil {
+			return normalizedUpdate{}, false
+		}
+		// The durable envelope preserves the caption and provider file authority,
+		// but the current worker intentionally remains text-only. A future media
+		// processor will consume the envelope after its own capability gate.
+		text = "telegram:media-help"
+	} else if isCommand {
 		kind = "command"
 		if command != "start" && command != "connect" {
 			text = commandPrompt(command, args)
@@ -563,7 +577,73 @@ func (m *Manager) normalizeUpdate(bot Bot, update Update) (normalizedUpdate, boo
 		ActorID: message.From.ID, ChatID: message.Chat.ID, ThreadID: threadID,
 		MessageID: strconv.FormatInt(message.MessageID, 10),
 		ChatType:  message.Chat.Type, Text: text, Kind: kind,
+		MediaEnvelope: mediaEnvelope,
 	}, true
+}
+
+func telegramMessageHasMedia(message *Message) bool {
+	return len(message.Photo) > 0 || message.Document != nil ||
+		message.Audio != nil || message.Video != nil || message.Voice != nil ||
+		message.Animation != nil || message.VideoNote != nil || message.Sticker != nil
+}
+
+func telegramMediaEnvelope(message *Message, caption string) ([]byte, error) {
+	var kind string
+	var file *FileRef
+	// Telegram sets document as a compatibility duplicate for animation. Pick
+	// one semantic item so a future worker cannot download the same bytes twice.
+	switch {
+	case message.Animation != nil:
+		kind, file = "animation", message.Animation
+	case len(message.Photo) > 0:
+		kind = "image"
+		file = largestTelegramPhoto(message.Photo)
+	case message.Video != nil:
+		kind, file = "video", message.Video
+	case message.VideoNote != nil:
+		kind, file = "video_note", message.VideoNote
+	case message.Voice != nil:
+		kind, file = "voice", message.Voice
+	case message.Audio != nil:
+		kind, file = "audio", message.Audio
+	case message.Document != nil:
+		kind, file = "document", message.Document
+	case message.Sticker != nil:
+		kind, file = "sticker", message.Sticker
+	default:
+		return nil, types.NewAppError(
+			types.CodeValidation, "Telegram 媒体类型无效", types.ErrValidation)
+	}
+	width, height := file.Width, file.Height
+	if kind == "video_note" && file.Length > 0 {
+		width, height = file.Length, file.Length
+	}
+	envelope := types.ChannelMessageEnvelopeV1{
+		Schema:       types.ChannelMessageEnvelopeV1Schema,
+		Caption:      caption,
+		MediaGroupID: strings.TrimSpace(message.MediaGroupID),
+		Items: []types.ChannelMessageMediaItemV1{{
+			Kind: kind, ProviderFileID: file.FileID,
+			ProviderUniqueID: file.FileUniqueID, MIMEType: file.MIMEType,
+			FileName: file.FileName, SizeBytes: file.FileSize,
+			Width: width, Height: height, DurationSeconds: file.Duration,
+		}},
+	}
+	return types.MarshalChannelMessageEnvelopeV1(envelope)
+}
+
+func largestTelegramPhoto(photos []FileRef) *FileRef {
+	best := &photos[0]
+	for index := 1; index < len(photos); index++ {
+		candidate := &photos[index]
+		if candidate.Width > best.Width ||
+			(candidate.Width == best.Width && candidate.Height > best.Height) ||
+			(candidate.Width == best.Width && candidate.Height == best.Height &&
+				candidate.FileSize > best.FileSize) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func parseCommand(text, username string) (string, string, bool) {
@@ -732,11 +812,11 @@ func (m *Manager) consumeRouteLink(
 
 func semanticUpdateDigest(
 	updateID int64, actorID, chatID, threadID, messageID, kind,
-	callbackID, text string,
+	callbackID, text string, mediaEnvelope []byte,
 ) string {
 	payload := strings.Join([]string{
 		strconv.FormatInt(updateID, 10), actorID, chatID, threadID,
-		messageID, kind, callbackID, text,
+		messageID, kind, callbackID, text, string(mediaEnvelope),
 	}, "\x00")
 	digest := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(digest[:])
@@ -895,7 +975,7 @@ func staticCommandReply(input string) (string, bool) {
 	case "telegram:unknown-command":
 		return "暂不支持这个命令。发送 /help 查看可用功能。", true
 	case "telegram:media-help":
-		return "已收到媒体消息，但当前 Vane Telegram 渠道只会处理文字，不会下载或把文件内容交给模型。请改用文字描述；后续媒体能力会沿独立的受控文件入口接入。", true
+		return "已收到媒体消息，但当前 Vane 尚未启用多模态理解，文件内容没有被下载或交给模型。请改用文字描述。媒体类型和文件引用已在你的绑定范围内安全记录，只用于后续受控升级，不会触发后台处理。", true
 	default:
 		return "", false
 	}

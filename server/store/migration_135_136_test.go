@@ -224,7 +224,7 @@ func telegramLifecycleFixture(
 ) (*Store, string, int64, int64, ChannelIdentity, ChannelRoute, func()) {
 	t.Helper()
 	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
-	if _, err := provider.UpTo(t.Context(), 136); err != nil {
+	if _, err := provider.UpTo(t.Context(), 139); err != nil {
 		drop()
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestTelegramRateLimitAndLifecyclePostgres(t *testing.T) {
 
 	turnID := uuid.NewString()
 	created, err := st.AcceptTelegramRoutedIngress(t.Context(), identity, route,
-		"9200", strings.Repeat("c", 64), "列出任务", turnID, "10", "message", "")
+		"9200", strings.Repeat("c", 64), "列出任务", turnID, "10", "message", "", nil)
 	if err != nil || !created {
 		t.Fatalf("accept=%t err=%v", created, err)
 	}

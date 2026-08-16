@@ -104,6 +104,19 @@ var purgeOrder = []purgeStep{
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"task_creation_operations", "tenant_id = $1"},
+	// Channel receipts/effects and provider message mappings are children of an
+	// exact route; route/link rows are children of the external identity. User
+	// credential generations reference the membership directly. Explicit tenant
+	// erasure therefore removes this complete provider authority graph before
+	// memberships/users, while platform-scoped credentials (tenant_id NULL) stay.
+	{"channel_message_mappings", "tenant_id = $1"},
+	{"channel_outbound_effects", "tenant_id = $1"},
+	{"channel_ingress_receipts", "tenant_id = $1"},
+	{"channel_route_link_requests", "tenant_id = $1"},
+	{"channel_routes", "tenant_id = $1"},
+	{"channel_link_requests", "tenant_id = $1"},
+	{"channel_identities", "tenant_id = $1"},
+	{"credential_vault_entries", "tenant_id = $1"},
 	// Agent-first query audits and exact model-visible evidence are children of
 	// the session/tool ledgers. They are retained for normal task/session life
 	// and removed only by this explicit tenant erasure path.

@@ -28,6 +28,7 @@ type fakeIngressStore struct {
 	acceptedText      string
 	acceptedKind      string
 	acceptedThread    string
+	acceptedMedia     []byte
 	accepted          bool
 	acceptErr         error
 	claim             store.ChannelIngress
@@ -99,11 +100,12 @@ func (f *fakeIngressStore) ConsumeTelegramRouteLinkRequest(context.Context, []by
 func (f *fakeIngressStore) ResolveTelegramRoute(context.Context, string, string, string, string) (store.ChannelIdentity, store.ChannelRoute, error) {
 	return f.identity, f.route, f.resolveErr
 }
-func (f *fakeIngressStore) AcceptTelegramRoutedIngress(_ context.Context, _ store.ChannelIdentity, route store.ChannelRoute, _, _, text, _, _, kind, _ string) (bool, error) {
+func (f *fakeIngressStore) AcceptTelegramRoutedIngress(_ context.Context, _ store.ChannelIdentity, route store.ChannelRoute, _, _, text, _, _, kind, _ string, media []byte) (bool, error) {
 	f.acceptCalls++
 	f.acceptedText = text
 	f.acceptedKind = kind
 	f.acceptedThread = route.ProviderThreadID
+	f.acceptedMedia = append([]byte(nil), media...)
 	return f.accepted, f.acceptErr
 }
 func (f *fakeIngressStore) ListTelegramRoutesForUser(context.Context, int64, int64, string) ([]store.ChannelRoute, error) {
@@ -348,6 +350,23 @@ func TestWebhookAcceptsOnlyAddressedAuthorizedGroupAndTopicMessages(t *testing.T
 		st.acceptedText != "列出我的情报任务" || st.acceptedKind != "command" {
 		t.Fatalf("command status=%d calls=%d text=%q kind=%q",
 			rr.Code, st.acceptCalls, st.acceptedText, st.acceptedKind)
+	}
+	ambientMedia := `{"update_id":23,"message":{"message_id":6,"message_thread_id":88,"from":{"id":42},"chat":{"id":-1007,"type":"supergroup"},"photo":[{"file_id":"ambient","file_unique_id":"ambient-u","width":640,"height":360,"file_size":1000}]}}`
+	rr = httptest.NewRecorder()
+	m.Handler().ServeHTTP(rr, webhookRequest(t, "hook_secret", ambientMedia))
+	if rr.Code != http.StatusOK || st.acceptCalls != 2 {
+		t.Fatalf("ambient media status=%d calls=%d", rr.Code, st.acceptCalls)
+	}
+	mentionedMedia := `{"update_id":24,"message":{"message_id":7,"message_thread_id":88,"from":{"id":42},"chat":{"id":-1007,"type":"supergroup"},"caption":"@vane_test_bot 分析这张图","photo":[{"file_id":"photo-file","file_unique_id":"photo-u","width":1280,"height":720,"file_size":2000}]}}`
+	rr = httptest.NewRecorder()
+	m.Handler().ServeHTTP(rr, webhookRequest(t, "hook_secret", mentionedMedia))
+	media, err := types.DecodeChannelMessageEnvelopeV1(st.acceptedMedia)
+	if rr.Code != http.StatusOK || st.acceptCalls != 3 || err != nil ||
+		st.acceptedText != "telegram:media-help" || st.acceptedKind != "message" ||
+		len(media.Items) != 1 || media.Items[0].Kind != "image" ||
+		media.Caption != "分析这张图" {
+		t.Fatalf("mentioned media status=%d calls=%d text=%q kind=%q media=%+v err=%v",
+			rr.Code, st.acceptCalls, st.acceptedText, st.acceptedKind, media, err)
 	}
 }
 
@@ -640,12 +659,27 @@ func TestTelegramUpdateNormalizationAndCommandMatrix(t *testing.T) {
 	caption := validMessage()
 	caption.Text, caption.Caption = "", " caption "
 	mediaVariants := []*Message{caption}
+	wantMediaKinds := []string{"", "image", "document", "audio", "video",
+		"voice", "animation", "video_note", "sticker"}
 	for _, configure := range []func(*Message){
-		func(message *Message) { message.Photo = []FileRef{{FileID: "p"}} },
+		func(message *Message) {
+			message.Caption = " compare "
+			message.MediaGroupID = "album-1"
+			message.Photo = []FileRef{
+				{FileID: "small", Width: 320, Height: 180, FileSize: 10},
+				{FileID: "p", FileUniqueID: "pu", Width: 1280, Height: 720, FileSize: 20},
+			}
+		},
 		func(message *Message) { message.Document = &FileRef{FileID: "d"} },
 		func(message *Message) { message.Audio = &FileRef{FileID: "a"} },
 		func(message *Message) { message.Video = &FileRef{FileID: "v"} },
 		func(message *Message) { message.Voice = &FileRef{FileID: "o"} },
+		func(message *Message) {
+			message.Animation = &FileRef{FileID: "g"}
+			message.Document = &FileRef{FileID: "compat-duplicate"}
+		},
+		func(message *Message) { message.VideoNote = &FileRef{FileID: "n", Length: 240} },
+		func(message *Message) { message.Sticker = &FileRef{FileID: "s"} },
 	} {
 		message := validMessage()
 		configure(message)
@@ -661,6 +695,26 @@ func TestTelegramUpdateNormalizationAndCommandMatrix(t *testing.T) {
 		}
 		if i > 0 && got.Text != "telegram:media-help" {
 			t.Fatalf("media[%d]=%q", i, got.Text)
+		}
+		if i == 0 && len(got.MediaEnvelope) != 0 {
+			t.Fatalf("caption-only envelope=%s", got.MediaEnvelope)
+		}
+		if i > 0 {
+			envelope, err := types.DecodeChannelMessageEnvelopeV1(got.MediaEnvelope)
+			if err != nil || len(envelope.Items) != 1 ||
+				envelope.Items[0].Kind != wantMediaKinds[i] {
+				t.Fatalf("media[%d] envelope=%+v err=%v", i, envelope, err)
+			}
+			if i == 1 && (envelope.Items[0].ProviderFileID != "p" ||
+				envelope.Caption != "compare" || envelope.MediaGroupID != "album-1") {
+				t.Fatalf("photo envelope=%+v", envelope)
+			}
+			if i == 6 && envelope.Items[0].ProviderFileID != "g" {
+				t.Fatalf("animation duplicate not collapsed: %+v", envelope)
+			}
+			if i == 7 && (envelope.Items[0].Width != 240 || envelope.Items[0].Height != 240) {
+				t.Fatalf("video note dimensions=%+v", envelope.Items[0])
+			}
 		}
 	}
 
