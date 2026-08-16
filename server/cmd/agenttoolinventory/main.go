@@ -94,7 +94,7 @@ func render() []byte {
 func assertStaticCatalogMatchesOwnerBuilder() {
 	endpointTools := agent.NewEndpointTools(nil, nil, 1, 1)
 	exaTools := agent.NewExaTools(nil, nil, nil, 1)
-	actualSpecs := agent.BuildOwnerTools(nil, agent.ManageTasksDeps{}, nil,
+	actualSpecs := agent.BuildOwnerTools(nil, nil, agent.ManageTasksDeps{}, nil,
 		endpointTools, exaTools)
 	actual := make([]string, 0, len(actualSpecs))
 	for _, spec := range actualSpecs {

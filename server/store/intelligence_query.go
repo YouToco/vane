@@ -691,7 +691,17 @@ func (s *Store) QueryMyIntelligence(
 	if _, err := tx.Exec(queryCtx, `SET LOCAL ROLE vane_intelligence_reader`); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "进入用户情报只读角色", err)
 	}
-	compiled, err := s.compileIntelligenceQuery(queryCtx, tx, scope, query, spec)
+	// The stable as-of cutoff must come from the same PostgreSQL clock that
+	// stamps created_at. Host and database clocks may differ by milliseconds;
+	// using time.Now here can hide a row that committed before this query.
+	var databaseNow time.Time
+	if err := tx.QueryRow(queryCtx, `SELECT pg_catalog.clock_timestamp()`).Scan(
+		&databaseNow); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			"读取用户情报数据库时钟", err)
+	}
+	compiled, err := s.compileIntelligenceQuery(
+		queryCtx, tx, scope, query, spec, databaseNow)
 	if err != nil {
 		return nil, err
 	}
@@ -830,6 +840,7 @@ func (s *Store) compileIntelligenceQuery(
 	scope IntelligenceScope,
 	query IntelligenceQuery,
 	spec intelligenceDatasetSpec,
+	databaseNow ...time.Time,
 ) (*compiledIntelligenceQuery, error) {
 	limit := query.Limit
 	if limit == 0 {
@@ -842,6 +853,9 @@ func (s *Store) compileIntelligenceQuery(
 	queryDigest := intelligenceQueryDigest(query, false)
 	var cursorAfter []json.RawMessage
 	asOf := time.Now().UTC()
+	if len(databaseNow) > 0 {
+		asOf = databaseNow[0].UTC()
+	}
 	if query.Cursor != "" {
 		var err error
 		cursorAfter, asOf, err = s.verifyIntelligenceCursor(ctx, scope, queryDigest, query.Cursor)

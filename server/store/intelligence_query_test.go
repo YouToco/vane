@@ -43,6 +43,24 @@ func TestCompileIntelligenceQueryUsesFixedCatalogAndBoundValues(t *testing.T) {
 	}
 }
 
+func TestCompileIntelligenceQueryUsesDatabaseClockForStableCutoff(t *testing.T) {
+	databaseNow := time.Date(2031, time.March, 4, 5, 6, 7, 800, time.UTC)
+	compiled, err := (&Store{}).compileIntelligenceQuery(
+		t.Context(), nil, IntelligenceScope{TenantID: 7, UserID: 9},
+		IntelligenceQuery{Dataset: IntelligenceToolCalls},
+		intelligenceCatalog[IntelligenceToolCalls], databaseNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compiled.args) < 3 {
+		t.Fatalf("compiled args=%v", compiled.args)
+	}
+	cutoff, ok := compiled.args[2].(time.Time)
+	if !ok || !cutoff.Equal(databaseNow) {
+		t.Fatalf("created_at cutoff=%v want database clock %v", compiled.args[2], databaseNow)
+	}
+}
+
 func TestFeedbackIntelligenceCatalogV3UsesCanonicalScopedProjection(t *testing.T) {
 	if IntelligenceCatalogVersion != "vane.intelligence-catalog/v3" {
 		t.Fatalf("catalog version=%q", IntelligenceCatalogVersion)

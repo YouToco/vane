@@ -281,7 +281,7 @@ func TestOwnerAgentCatalogIsNotKeywordRouted(t *testing.T) {
 	chat := &scriptedChat{responses: []*llm.ChatResponse{{
 		Content: "基于当前信息回答。",
 	}}}
-	tools := BuildOwnerTools(nil, ManageTasksDeps{}, nil, nil, exa)
+	tools := BuildOwnerTools(nil, nil, ManageTasksDeps{}, nil, nil, exa)
 	loop := New(Deps{
 		Tools: tools, OwnerAgent: true, Evidence: &fakeAgentEvidenceWriter{},
 	})
@@ -398,7 +398,7 @@ func TestDynamicDescriptionsHideProviderAndTransport(t *testing.T) {
 func TestProductionToolSchemasHideProvidersAndTransport(t *testing.T) {
 	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
 	endpoints := NewEndpointTools(nil, nil, 0, 1_000_000)
-	static := BuildOwnerTools(nil, ManageTasksDeps{}, nil, endpoints, exa)
+	static := BuildOwnerTools(nil, nil, ManageTasksDeps{}, nil, endpoints, exa)
 	for _, spec := range static {
 		assertPublicToolSurface(t, spec.Name(),
 			spec.Description(), string(spec.Parameters()))

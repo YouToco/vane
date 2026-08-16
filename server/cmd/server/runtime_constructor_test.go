@@ -56,6 +56,19 @@ func TestResearchV3UsesIndependentRestrictedControlStore(t *testing.T) {
 	}
 }
 
+func TestOwnerMemoryToolsUseRestrictedRuntimeStore(t *testing.T) {
+	payload, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(payload)
+	const wiring = `researchControlStore,
+		agent.ManageTasksDeps{`
+	if !strings.Contains(source, wiring) {
+		t.Fatal("owner memory tools are not wired to the restricted runtime Store")
+	}
+}
+
 func TestDefaultResearchModelFreezesFlashAcrossEveryV3Stage(t *testing.T) {
 	cfg := config.Config{DB: config.DBConfig{URL: "postgres://test"}}
 	if err := cfg.Validate(); err != nil {
