@@ -1,39 +1,43 @@
 package capabilityruntime
 
+import "bytes"
+
 type ReceiptStatusV1 string
 
 const (
-	ReceiptStatusSucceeded ReceiptStatusV1 = "succeeded"
-	ReceiptStatusFailed    ReceiptStatusV1 = "failed"
-	ReceiptStatusRejected  ReceiptStatusV1 = "rejected"
-	ReceiptStatusAmbiguous ReceiptStatusV1 = "ambiguous"
+	ReceiptStatusSucceeded      ReceiptStatusV1 = "succeeded"
+	ReceiptStatusDefiniteFailed ReceiptStatusV1 = "definite_failed"
+	ReceiptStatusRejected       ReceiptStatusV1 = "rejected"
+	ReceiptStatusAmbiguous      ReceiptStatusV1 = "ambiguous"
 )
 
-type ResultRefV1 struct {
-	Digest    string `json:"digest"`
-	SizeBytes int64  `json:"size_bytes"`
-	MediaType string `json:"media_type"`
+type ResultEnvelopeV1 struct {
+	Digest           string `json:"digest"`
+	SizeBytes        int64  `json:"size_bytes"`
+	MediaType        string `json:"media_type"`
+	SanitizedPayload []byte `json:"sanitized_payload"`
 }
 
-// ReceiptV1 is a deterministic result receipt. It carries no provider error,
-// credential, or output bytes; ErrorClass must be a controlled local label.
+// ReceiptV1 is a deterministic, replayable result envelope. Successful
+// receipts persist bounded sanitized bytes; provider errors and credentials
+// never enter it, and ErrorClass must be a controlled local label.
 type ReceiptV1 struct {
-	SchemaVersion     string          `json:"schema_version"`
-	InvocationDigest  string          `json:"invocation_digest"`
-	IdempotencyDigest string          `json:"idempotency_digest"`
-	Attempt           int64           `json:"attempt"`
-	Status            ReceiptStatusV1 `json:"status"`
-	Result            ResultRefV1     `json:"result"`
-	ErrorClass        string          `json:"error_class"`
-	Retryable         bool            `json:"retryable"`
-	ReceiptDigest     string          `json:"receipt_digest"`
+	SchemaVersion     string           `json:"schema_version"`
+	InvocationDigest  string           `json:"invocation_digest"`
+	IdempotencyDigest string           `json:"idempotency_digest"`
+	Attempt           int64            `json:"attempt"`
+	Status            ReceiptStatusV1  `json:"status"`
+	Result            ResultEnvelopeV1 `json:"result"`
+	ErrorClass        string           `json:"error_class"`
+	Retryable         bool             `json:"retryable"`
+	ReceiptDigest     string           `json:"receipt_digest"`
 }
 
-// AdapterResultV1 keeps bytes transient while proving they match the durable
-// receipt. Persistence and transport remain responsibilities of later layers.
+// AdapterResultV1 proves the bytes returned by an adapter exactly match the
+// durable sanitized response embedded in ReceiptV1.
 type AdapterResultV1 struct {
-	Receipt ReceiptV1
-	Output  []byte
+	Receipt         ReceiptV1
+	SanitizedOutput []byte
 }
 
 func NewReceiptV1(
@@ -41,7 +45,7 @@ func NewReceiptV1(
 	status ReceiptStatusV1,
 	attempt int64,
 	mediaType string,
-	output []byte,
+	sanitizedOutput []byte,
 	errorClass string,
 	retryable bool,
 ) (ReceiptV1, error) {
@@ -55,8 +59,9 @@ func NewReceiptV1(
 		Attempt:           attempt, Status: status, ErrorClass: errorClass, Retryable: retryable,
 	}
 	if status == ReceiptStatusSucceeded {
-		receipt.Result = ResultRefV1{
-			Digest: sha256Bytes(output), SizeBytes: int64(len(output)), MediaType: mediaType,
+		receipt.Result = ResultEnvelopeV1{
+			Digest: sha256Bytes(sanitizedOutput), SizeBytes: int64(len(sanitizedOutput)), MediaType: mediaType,
+			SanitizedPayload: append([]byte{}, sanitizedOutput...),
 		}
 	}
 	if err := receipt.validateFields(); err != nil {
@@ -106,15 +111,23 @@ func (r ReceiptV1) validateFields() error {
 	switch r.Status {
 	case ReceiptStatusSucceeded:
 		if !validSHA256(r.Result.Digest) || r.Result.SizeBytes < 0 ||
-			!validMediaType(r.Result.MediaType) || r.ErrorClass != "" || r.Retryable {
+			!validMediaType(r.Result.MediaType) ||
+			r.Result.SanitizedPayload == nil ||
+			r.Result.SizeBytes != int64(len(r.Result.SanitizedPayload)) ||
+			r.Result.Digest != sha256Bytes(r.Result.SanitizedPayload) ||
+			r.ErrorClass != "" || r.Retryable {
 			return invalid("successful receipt is invalid")
 		}
-	case ReceiptStatusFailed, ReceiptStatusRejected, ReceiptStatusAmbiguous:
-		if r.Result != (ResultRefV1{}) || !validErrorClass(r.ErrorClass) {
+	// DefiniteFailed means the adapter proved that execution did not cross the
+	// effect boundary; only that failure class may ever be marked retryable.
+	case ReceiptStatusDefiniteFailed, ReceiptStatusRejected, ReceiptStatusAmbiguous:
+		if !r.Result.empty() || !validErrorClass(r.ErrorClass) {
 			return invalid("unsuccessful receipt is invalid")
 		}
-		if r.Status == ReceiptStatusRejected && r.Retryable {
-			return invalid("rejected receipt cannot be retryable")
+		// Ambiguous means the effect may already have happened. Automatic retry
+		// would risk duplicating a remote side effect.
+		if r.Status != ReceiptStatusDefiniteFailed && r.Retryable {
+			return invalid("non-definite receipt cannot be retryable")
 		}
 	default:
 		return invalid("receipt status is invalid")
@@ -124,14 +137,14 @@ func (r ReceiptV1) validateFields() error {
 
 func (r ReceiptV1) expectedDigest() (string, error) {
 	return digestJSON(struct {
-		SchemaVersion     string          `json:"schema_version"`
-		InvocationDigest  string          `json:"invocation_digest"`
-		IdempotencyDigest string          `json:"idempotency_digest"`
-		Attempt           int64           `json:"attempt"`
-		Status            ReceiptStatusV1 `json:"status"`
-		Result            ResultRefV1     `json:"result"`
-		ErrorClass        string          `json:"error_class"`
-		Retryable         bool            `json:"retryable"`
+		SchemaVersion     string           `json:"schema_version"`
+		InvocationDigest  string           `json:"invocation_digest"`
+		IdempotencyDigest string           `json:"idempotency_digest"`
+		Attempt           int64            `json:"attempt"`
+		Status            ReceiptStatusV1  `json:"status"`
+		Result            ResultEnvelopeV1 `json:"result"`
+		ErrorClass        string           `json:"error_class"`
+		Retryable         bool             `json:"retryable"`
 	}{r.SchemaVersion, r.InvocationDigest, r.IdempotencyDigest, r.Attempt,
 		r.Status, r.Result, r.ErrorClass, r.Retryable})
 }
@@ -141,16 +154,22 @@ func (r AdapterResultV1) ValidateFor(invocation InvocationV1) error {
 		return err
 	}
 	if r.Receipt.Status != ReceiptStatusSucceeded {
-		if len(r.Output) != 0 {
+		if len(r.SanitizedOutput) != 0 {
 			return invalid("unsuccessful result contains output")
 		}
 		return nil
 	}
-	if r.Receipt.Result.SizeBytes != int64(len(r.Output)) ||
-		r.Receipt.Result.Digest != sha256Bytes(r.Output) {
+	if r.Receipt.Result.SizeBytes != int64(len(r.SanitizedOutput)) ||
+		r.Receipt.Result.Digest != sha256Bytes(r.SanitizedOutput) ||
+		!bytes.Equal(r.Receipt.Result.SanitizedPayload, r.SanitizedOutput) {
 		return invalid("output differs from result receipt")
 	}
 	return nil
+}
+
+func (r ResultEnvelopeV1) empty() bool {
+	return r.Digest == "" && r.SizeBytes == 0 && r.MediaType == "" &&
+		r.SanitizedPayload == nil
 }
 
 func sha256Bytes(value []byte) string {

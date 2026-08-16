@@ -15,7 +15,7 @@ func TestInvocationV1CanonicalRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	invocation := testInvocationV1(t)
-	if got, want := string(invocation.Arguments), `{"a":1,"z":"last"}`; got != want {
+	if got, want := string(invocation.Arguments), `{"a":"first","z":"last"}`; got != want {
 		t.Fatalf("canonical arguments = %s, want %s", got, want)
 	}
 	encoded, err := EncodeInvocationV1(invocation)
@@ -58,14 +58,12 @@ func TestInvocationV1RequiresExplicitTenantAndUser(t *testing.T) {
 func TestInvocationV1ServiceAccountRequiresExactA2AAuthority(t *testing.T) {
 	t.Parallel()
 
-	valid := testInvocationInputV1()
-	valid.Principal.ActorType = types.ActorTypeServiceAccount
-	valid.Principal.A2ATokenAuthorityID = "11111111-1111-4111-8111-111111111111"
-	valid.Principal.RequiredA2AScope = types.A2AScopeContentQuery
+	valid := testServiceInvocationInputV1()
 	if _, err := NewInvocationV1(valid); err != nil {
 		t.Fatalf("valid service authority error = %v", err)
 	}
-	userWithToken := testInvocationInputV1()
+	userWithToken := valid
+	userWithToken.Principal.ActorType = types.ActorTypeUser
 	userWithToken.Principal.A2ATokenAuthorityID = valid.Principal.A2ATokenAuthorityID
 	userWithToken.Principal.RequiredA2AScope = valid.Principal.RequiredA2AScope
 	if _, err := NewInvocationV1(userWithToken); !errors.Is(err, ErrInvalidContract) {
@@ -73,9 +71,18 @@ func TestInvocationV1ServiceAccountRequiresExactA2AAuthority(t *testing.T) {
 	}
 	cases := map[string]func(*InvocationInputV1){
 		"missing token":      func(v *InvocationInputV1) { v.Principal.A2ATokenAuthorityID = "" },
+		"nil token":          func(v *InvocationInputV1) { v.Principal.A2ATokenAuthorityID = "00000000-0000-0000-0000-000000000000" },
 		"noncanonical token": func(v *InvocationInputV1) { v.Principal.A2ATokenAuthorityID = "11111111-1111-4111-8111-11111111111A" },
 		"missing scope":      func(v *InvocationInputV1) { v.Principal.RequiredA2AScope = "" },
 		"remote scope":       func(v *InvocationInputV1) { v.Principal.RequiredA2AScope = types.A2AScope("tools.write") },
+		"content query cannot invoke tools": func(v *InvocationInputV1) {
+			v.Principal.RequiredA2AScope = types.A2AScopeContentQuery
+			v.Operation = "web_search"
+		},
+		"private capability": func(v *InvocationInputV1) {
+			private := testInvocationInputV1()
+			v.Capability, v.Policy = private.Capability, private.Policy
+		},
 	}
 	for name, mutate := range cases {
 		candidate := valid
@@ -84,25 +91,38 @@ func TestInvocationV1ServiceAccountRequiresExactA2AAuthority(t *testing.T) {
 			t.Fatalf("%s: error = %v, want ErrInvalidContract", name, err)
 		}
 	}
+	for _, kind := range []CapabilityKind{
+		CapabilityKindDeclarativeSkill, CapabilityKindRemoteMCP, CapabilityKindSandboxScript,
+	} {
+		candidate := valid
+		candidate.Capability.Kind = kind
+		candidate.Capability.Scope = CapabilityScopeWorkspace
+		candidate.Capability.OwnerUserID = 12
+		candidate.Policy = testPolicyForKind(kind)
+		if _, err := NewInvocationV1(candidate); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("service account private %s error = %v, want ErrInvalidContract", kind, err)
+		}
+	}
 
 	service, err := NewInvocationV1(valid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	authorityChanges := map[string]func(*InvocationInputV1){
-		"token": func(v *InvocationInputV1) { v.Principal.A2ATokenAuthorityID = "22222222-2222-4222-8222-222222222222" },
-		"scope": func(v *InvocationInputV1) { v.Principal.RequiredA2AScope = types.A2AScopeAssistantChat },
+	rotated := valid
+	rotated.Principal.A2ATokenAuthorityID = "22222222-2222-4222-8222-222222222222"
+	changed, err := NewInvocationV1(rotated)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for name, mutate := range authorityChanges {
+	if changed.IdempotencyDigest != service.IdempotencyDigest ||
+		changed.InvocationDigest == service.InvocationDigest {
+		t.Fatal("token rotation did not become a same-key invocation conflict")
+	}
+	for _, operation := range []string{"web_search", "recall_memory"} {
 		candidate := valid
-		mutate(&candidate)
-		changed, err := NewInvocationV1(candidate)
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if changed.IdempotencyDigest == service.IdempotencyDigest ||
-			changed.InvocationDigest == service.InvocationDigest {
-			t.Fatalf("%s is not authority-bound", name)
+		candidate.Operation = operation
+		if _, err := NewInvocationV1(candidate); err != nil {
+			t.Fatalf("assistant.chat builtin operation %q error = %v", operation, err)
 		}
 	}
 }
@@ -122,11 +142,11 @@ func TestInvocationV1StrictCodecRejectsRepresentationDrift(t *testing.T) {
 			[]byte(`"operation":"tools/call"`),
 			[]byte(`"operation":"other","operation":"tools/call"`), 1),
 		"duplicate argument": bytes.Replace(encoded,
-			[]byte(`"arguments":{"a":1,"z":"last"}`),
-			[]byte(`"arguments":{"a":1,"a":2,"z":"last"}`), 1),
+			[]byte(`"arguments":{"a":"first","z":"last"}`),
+			[]byte(`"arguments":{"a":"first","a":"second","z":"last"}`), 1),
 		"noncanonical argument order": bytes.Replace(encoded,
-			[]byte(`"arguments":{"a":1,"z":"last"}`),
-			[]byte(`"arguments":{"z":"last","a":1}`), 1),
+			[]byte(`"arguments":{"a":"first","z":"last"}`),
+			[]byte(`"arguments":{"z":"last","a":"first"}`), 1),
 		"noncanonical whitespace": append([]byte(" "), encoded...),
 		"trailing value":          append(bytes.Clone(encoded), []byte(`{}`)...),
 		"missing required field": bytes.Replace(encoded,
@@ -140,6 +160,43 @@ func TestInvocationV1StrictCodecRejectsRepresentationDrift(t *testing.T) {
 				t.Fatalf("DecodeInvocationV1() error = %v, want ErrInvalidContract", err)
 			}
 		})
+	}
+}
+
+func TestInvocationV1AcceptsOnlyCanonicalInt64JSONNumbers(t *testing.T) {
+	t.Parallel()
+
+	for _, spelling := range []string{
+		"0", "1", "-1", "9223372036854775807", "-9223372036854775808",
+	} {
+		input := testInvocationInputV1()
+		input.Arguments = json.RawMessage(`{"value":` + spelling + `}`)
+		invocation, err := NewInvocationV1(input)
+		if err != nil {
+			t.Fatalf("canonical integer %q error = %v", spelling, err)
+		}
+		if string(invocation.Arguments) != `{"value":`+spelling+`}` {
+			t.Fatalf("canonical integer %q drifted to %s", spelling, invocation.Arguments)
+		}
+	}
+	for _, spelling := range []string{
+		"1.0", "1e0", "1E0", "-0", "2.5e-3", "01",
+		"9223372036854775808", "-9223372036854775809",
+	} {
+		input := testInvocationInputV1()
+		input.Arguments = json.RawMessage(`{"value":` + spelling + `}`)
+		if _, err := NewInvocationV1(input); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("noncanonical integer %q error = %v, want ErrInvalidContract", spelling, err)
+		}
+	}
+	input := testInvocationInputV1()
+	input.Arguments = json.RawMessage(`{"nested":[0,{"value":-2}]}`)
+	if _, err := NewInvocationV1(input); err != nil {
+		t.Fatalf("nested canonical integers error = %v", err)
+	}
+	input.Arguments = json.RawMessage(`{"nested":[0,{"value":2.0}]}`)
+	if _, err := NewInvocationV1(input); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("nested noncanonical number error = %v, want ErrInvalidContract", err)
 	}
 }
 
@@ -169,11 +226,13 @@ func TestInvocationV1EveryAuthorityFieldIsDigestBound(t *testing.T) {
 		"policy digest":          func(v *InvocationV1) { v.PolicyDigest = otherDigest },
 		"credential provider":    func(v *InvocationV1) { v.Credential.Provider = "mcp_other" },
 		"credential purpose":     func(v *InvocationV1) { v.Credential.Purpose = "connection_other" },
+		"credential opaque ref":  func(v *InvocationV1) { v.Credential.OpaqueRef = "vault:mcp-other" },
+		"credential ref digest":  func(v *InvocationV1) { v.Credential.OpaqueRefDigest = otherDigest },
 		"credential scope":       func(v *InvocationV1) { v.Credential.Scope = CredentialScopeTenant; v.Credential.UserID = 0 },
 		"credential user":        func(v *InvocationV1) { v.Credential.UserID++ },
 		"credential gen":         func(v *InvocationV1) { v.Credential.Generation++ },
 		"credential fingerprint": func(v *InvocationV1) { v.Credential.Fingerprint = otherDigest },
-		"arguments":              func(v *InvocationV1) { v.Arguments = json.RawMessage(`{"a":2,"z":"last"}`) },
+		"arguments":              func(v *InvocationV1) { v.Arguments = json.RawMessage(`{"a":"changed","z":"last"}`) },
 		"idempotency key":        func(v *InvocationV1) { v.IdempotencyKey = "run-44/tool-8" },
 		"idempotency sum":        func(v *InvocationV1) { v.IdempotencyDigest = otherDigest },
 		"invocation sum":         func(v *InvocationV1) { v.InvocationDigest = otherDigest },
@@ -198,16 +257,20 @@ func TestInvocationV1IdempotencyIdentitySeparatesScopeFromPayloadConflict(t *tes
 
 	base := testInvocationV1(t)
 	identityChanges := map[string]func(*InvocationInputV1){
-		"tenant": func(v *InvocationInputV1) { v.Principal.TenantID++ },
-		"user":   func(v *InvocationInputV1) { v.Principal.UserID++; v.Credential.UserID++ },
-		"actor": func(v *InvocationInputV1) {
-			v.Principal.ActorType = types.ActorTypeServiceAccount
-			v.Principal.A2ATokenAuthorityID = "11111111-1111-4111-8111-111111111111"
-			v.Principal.RequiredA2AScope = types.A2AScopeContentQuery
+		"tenant":           func(v *InvocationInputV1) { v.Principal.TenantID++ },
+		"user":             func(v *InvocationInputV1) { v.Principal.UserID++; v.Credential.UserID++ },
+		"capability id":    func(v *InvocationInputV1) { v.Capability.ID = "workspace.mcp.other" },
+		"capability owner": func(v *InvocationInputV1) { v.Capability.OwnerUserID++ },
+		"capability kind": func(v *InvocationInputV1) {
+			v.Capability.Kind = CapabilityKindSandboxScript
+			v.Policy = testPolicyForKind(CapabilityKindSandboxScript)
 		},
-		"capability": func(v *InvocationInputV1) { v.Capability.VersionID = "version-8" },
-		"operation":  func(v *InvocationInputV1) { v.Operation = "resources/read" },
-		"key":        func(v *InvocationInputV1) { v.IdempotencyKey = "run-44/tool-8" },
+		"capability scope": func(v *InvocationInputV1) {
+			v.Capability.Scope = CapabilityScopePersonal
+			v.Capability.OwnerUserID = v.Principal.UserID
+		},
+		"operation": func(v *InvocationInputV1) { v.Operation = "resources/read" },
+		"key":       func(v *InvocationInputV1) { v.IdempotencyKey = "run-44/tool-8" },
 	}
 	for name, mutate := range identityChanges {
 		input := testInvocationInputV1()
@@ -222,9 +285,19 @@ func TestInvocationV1IdempotencyIdentitySeparatesScopeFromPayloadConflict(t *tes
 	}
 
 	payloadChanges := map[string]func(*InvocationInputV1){
-		"arguments":             func(v *InvocationInputV1) { v.Arguments = json.RawMessage(`{"a":2}`) },
-		"policy":                func(v *InvocationInputV1) { v.Policy.TimeoutMillis++ },
-		"credential":            func(v *InvocationInputV1) { v.Credential.Generation++ },
+		"version id":     func(v *InvocationInputV1) { v.Capability.VersionID = "version-8" },
+		"version digest": func(v *InvocationInputV1) { v.Capability.VersionDigest = strings.Repeat("e", 64) },
+		"schema digest":  func(v *InvocationInputV1) { v.Capability.OperationSchemaDigest = strings.Repeat("f", 64) },
+		"arguments":      func(v *InvocationInputV1) { v.Arguments = json.RawMessage(`{"a":"changed"}`) },
+		"policy":         func(v *InvocationInputV1) { v.Policy.TimeoutMillis++ },
+		"credential rotation": func(v *InvocationInputV1) {
+			v.Credential.Generation++
+			v.Credential.Fingerprint = strings.Repeat("e", 64)
+		},
+		"credential ref": func(v *InvocationInputV1) {
+			v.Credential.OpaqueRef = "vault:mcp-secondary"
+			v.Credential.OpaqueRefDigest = rawSHA256([]byte(v.Credential.OpaqueRef))
+		},
 		"live role evidence":    func(v *InvocationInputV1) { v.Principal.Role = types.MembershipRoleAdmin },
 		"membership generation": func(v *InvocationInputV1) { v.Principal.MembershipAuthorizationGeneration++ },
 	}
@@ -241,6 +314,23 @@ func TestInvocationV1IdempotencyIdentitySeparatesScopeFromPayloadConflict(t *tes
 		if changed.InvocationDigest == base.InvocationDigest {
 			t.Fatalf("%s did not create an idempotency payload conflict", name)
 		}
+	}
+
+	userBuiltin := testServiceInvocationInputV1()
+	userBuiltin.Principal.ActorType = types.ActorTypeUser
+	userBuiltin.Principal.A2ATokenAuthorityID = ""
+	userBuiltin.Principal.RequiredA2AScope = ""
+	userInvocation, err := NewInvocationV1(userBuiltin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceInvocation, err := NewInvocationV1(testServiceInvocationInputV1())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if userInvocation.IdempotencyDigest != serviceInvocation.IdempotencyDigest ||
+		userInvocation.InvocationDigest == serviceInvocation.InvocationDigest {
+		t.Fatal("actor authority drift did not become a same-key invocation conflict")
 	}
 }
 
@@ -302,13 +392,31 @@ func testInvocationInputV1() InvocationInputV1 {
 			MaxInputBytes: 64 << 10, MaxOutputBytes: 256 << 10,
 		},
 		Credential: CredentialRefV1{
+			OpaqueRef: "vault:mcp-primary", OpaqueRefDigest: rawSHA256([]byte("vault:mcp-primary")),
 			Provider: "mcp", Purpose: "connection_primary",
 			Scope: CredentialScopeUser, UserID: 73, Generation: 7,
 			Fingerprint: strings.Repeat("d", 64),
 		},
-		Arguments:      json.RawMessage(` { "z": "last", "a": 1 } `),
+		Arguments:      json.RawMessage(` { "z": "last", "a": "first" } `),
 		IdempotencyKey: "run-44/tool-7",
 	}
+}
+
+func testServiceInvocationInputV1() InvocationInputV1 {
+	input := testInvocationInputV1()
+	input.Principal.ActorType = types.ActorTypeServiceAccount
+	input.Principal.A2ATokenAuthorityID = "11111111-1111-4111-8111-111111111111"
+	input.Principal.RequiredA2AScope = types.A2AScopeAssistantChat
+	input.Capability = CapabilityRefV1{
+		Kind: CapabilityKindBuiltinTool, Scope: CapabilityScopePlatform,
+		ID: "agent.builtin.tools", VersionID: "version-1",
+		VersionDigest:         strings.Repeat("a", 64),
+		OperationSchemaDigest: strings.Repeat("c", 64),
+	}
+	input.Operation = "web_search"
+	input.Policy = testPolicyForKind(CapabilityKindBuiltinTool)
+	input.Credential = CredentialRefV1{}
+	return input
 }
 
 // Compile-time proof that adapters share the one invocation/result boundary.
@@ -323,5 +431,5 @@ func (testAdapterV1) Invoke(_ context.Context, invocation InvocationV1) (Adapter
 	receipt, err := NewReceiptV1(
 		invocation, ReceiptStatusSucceeded, 1, "application/json", output, "", false,
 	)
-	return AdapterResultV1{Receipt: receipt, Output: output}, err
+	return AdapterResultV1{Receipt: receipt, SanitizedOutput: output}, err
 }

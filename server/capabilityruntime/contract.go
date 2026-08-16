@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"mime"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -27,7 +28,7 @@ const (
 	ReceiptSchemaVersionV1    = "vane.capability-receipt/v1"
 
 	maxArgumentsBytes  = 256 << 10
-	maxResultBytes     = 16 << 20
+	maxResultBytes     = 256 << 10
 	maxTimeoutMillis   = 15 * 60 * 1000
 	maxIdentifierBytes = 255
 	maxMediaTypeBytes  = 127
@@ -133,12 +134,14 @@ type CapabilityRefV1 struct {
 // cannot express "latest": every credentialful invocation pins generation
 // and fingerprint under one exact scope/provider/purpose authority.
 type CredentialRefV1 struct {
-	Provider    string            `json:"provider"`
-	Purpose     string            `json:"purpose"`
-	Scope       CredentialScopeV1 `json:"scope"`
-	UserID      int64             `json:"user_id"`
-	Generation  int64             `json:"generation"`
-	Fingerprint string            `json:"fingerprint"`
+	OpaqueRef       string            `json:"opaque_ref"`
+	OpaqueRefDigest string            `json:"opaque_ref_digest"`
+	Provider        string            `json:"provider"`
+	Purpose         string            `json:"purpose"`
+	Scope           CredentialScopeV1 `json:"scope"`
+	UserID          int64             `json:"user_id"`
+	Generation      int64             `json:"generation"`
+	Fingerprint     string            `json:"fingerprint"`
 }
 
 // PolicyV1 is the closed, locally-authoritative effect envelope frozen into
@@ -268,6 +271,9 @@ func (i InvocationV1) validateFields() error {
 	if err := i.Capability.validatePolicy(i.Policy); err != nil {
 		return err
 	}
+	if err := i.validateServiceAuthority(); err != nil {
+		return err
+	}
 	if err := i.Credential.validateFor(i.Principal); err != nil {
 		return err
 	}
@@ -358,12 +364,16 @@ func (r CredentialRefV1) validateFor(principal PrincipalV1) error {
 	if r == (CredentialRefV1{}) {
 		return nil
 	}
-	if !validVaultIdentifier(r.Provider) || !validVaultIdentifier(r.Purpose) ||
+	if !validOpaqueCredentialRef(r.OpaqueRef) ||
+		r.OpaqueRefDigest != rawSHA256([]byte(r.OpaqueRef)) ||
+		!validVaultIdentifier(r.Provider) || !validVaultIdentifier(r.Purpose) ||
 		r.Generation <= 0 || r.UserID < 0 || !validSHA256(r.Fingerprint) {
 		return invalid("credential reference is invalid")
 	}
 	switch r.Scope {
 	case CredentialScopePlatform, CredentialScopeTenant:
+		// Tenant scope is always resolved under Principal.TenantID; it never
+		// carries or infers a second tenant identity here.
 		if r.UserID != 0 {
 			return invalid("shared credential contains a user")
 		}
@@ -385,7 +395,7 @@ func (p PrincipalV1) validateAuthority() error {
 		}
 	case types.ActorTypeServiceAccount:
 		parsed, err := uuid.Parse(p.A2ATokenAuthorityID)
-		if err != nil || parsed.String() != p.A2ATokenAuthorityID ||
+		if err != nil || parsed == uuid.Nil || parsed.String() != p.A2ATokenAuthorityID ||
 			!p.RequiredA2AScope.Valid() {
 			return invalid("service principal authority is invalid")
 		}
@@ -426,8 +436,9 @@ func (r CapabilityRefV1) validatePolicy(policy PolicyV1) error {
 			return invalid("builtin capability isolation is invalid")
 		}
 	case CapabilityKindDeclarativeSkill:
-		_, codeExecution := effects[EffectCodeExecution]
-		if policy.Isolation != IsolationInProcess || codeExecution {
+		if policy.Isolation != IsolationInProcess || policy.Network != NetworkPolicyNone ||
+			!policy.ReadOnly || len(policy.Effects) != 1 ||
+			policy.Effects[0] != EffectInternalRead {
 			return invalid("declarative skill policy is invalid")
 		}
 	case CapabilityKindRemoteMCP:
@@ -449,23 +460,45 @@ func (r CapabilityRefV1) validatePolicy(policy PolicyV1) error {
 	return nil
 }
 
+func (i InvocationV1) validateServiceAuthority() error {
+	if i.Principal.ActorType != types.ActorTypeServiceAccount {
+		return nil
+	}
+	if i.Capability.Kind != CapabilityKindBuiltinTool {
+		return invalid("service principal cannot invoke private capabilities")
+	}
+	// assistant.chat authorizes entry into the builtin-only agent tool set;
+	// Operation remains the exact builtin operation (for example web_search).
+	// content.query is a deterministic entrypoint, not capability authority.
+	if i.Principal.RequiredA2AScope != types.A2AScopeAssistantChat {
+		return invalid("A2A scope cannot authorize capability invocation")
+	}
+	return nil
+}
+
 func (i InvocationV1) expectedIdempotencyDigest() (string, error) {
-	// Role and membership generation are deliberately excluded: a live
-	// membership change must make the frozen invocation payload conflict, not
-	// create a second side-effect key.
+	// Only stable business identity belongs in the side-effect key. Authority,
+	// immutable version/schema, policy, arguments, and credential generations
+	// stay in InvocationDigest so any drift becomes a same-key conflict.
 	return digestJSON(struct {
-		SchemaVersion       string          `json:"schema_version"`
-		TenantID            types.TenantID  `json:"tenant_id"`
-		UserID              int64           `json:"user_id"`
-		ActorType           types.ActorType `json:"actor_type"`
-		A2ATokenAuthorityID string          `json:"a2a_token_authority_id"`
-		RequiredA2AScope    types.A2AScope  `json:"required_a2a_scope"`
-		Capability          CapabilityRefV1 `json:"capability"`
-		Operation           string          `json:"operation"`
-		Key                 string          `json:"key"`
+		SchemaVersion string                     `json:"schema_version"`
+		TenantID      types.TenantID             `json:"tenant_id"`
+		UserID        int64                      `json:"user_id"`
+		Capability    stableCapabilityIdentityV1 `json:"capability"`
+		Operation     string                     `json:"operation"`
+		Key           string                     `json:"key"`
 	}{"vane.capability-idempotency/v1", i.Principal.TenantID, i.Principal.UserID,
-		i.Principal.ActorType, i.Principal.A2ATokenAuthorityID,
-		i.Principal.RequiredA2AScope, i.Capability, i.Operation, i.IdempotencyKey})
+		stableCapabilityIdentityV1{
+			Kind: i.Capability.Kind, Scope: i.Capability.Scope,
+			OwnerUserID: i.Capability.OwnerUserID, ID: i.Capability.ID,
+		}, i.Operation, i.IdempotencyKey})
+}
+
+type stableCapabilityIdentityV1 struct {
+	Kind        CapabilityKind    `json:"kind"`
+	Scope       CapabilityScopeV1 `json:"scope"`
+	OwnerUserID int64             `json:"owner_user_id"`
+	ID          string            `json:"id"`
 }
 
 func (i InvocationV1) expectedInvocationDigest() (string, error) {
@@ -492,11 +525,54 @@ func canonicalJSONObject(raw json.RawMessage) (json.RawMessage, error) {
 	if err := strictjson.Decode(raw, &object); err != nil || object == nil {
 		return nil, invalid("arguments must be a strict JSON object")
 	}
+	if !canonicalJSONNumbers(object) {
+		return nil, invalid("arguments contain a noncanonical or out-of-range JSON number")
+	}
 	canonical, err := json.Marshal(object)
 	if err != nil {
 		return nil, invalid("arguments cannot be canonicalized")
 	}
 	return canonical, nil
+}
+
+func canonicalJSONNumbers(value any) bool {
+	switch typed := value.(type) {
+	case json.Number:
+		return validCanonicalJSONInteger(typed.String())
+	case map[string]any:
+		for _, child := range typed {
+			if !canonicalJSONNumbers(child) {
+				return false
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if !canonicalJSONNumbers(child) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validCanonicalJSONInteger(value string) bool {
+	if value == "0" {
+		return true
+	}
+	digits := value
+	if strings.HasPrefix(digits, "-") {
+		digits = strings.TrimPrefix(digits, "-")
+	}
+	if digits == "" || digits[0] < '1' || digits[0] > '9' {
+		return false
+	}
+	for _, char := range digits[1:] {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseInt(value, 10, 64)
+	return err == nil
 }
 
 func digestJSON(value any) (string, error) {
@@ -557,6 +633,24 @@ func validVaultIdentifier(value string) bool {
 	for _, char := range value[1:] {
 		if (char < 'a' || char > 'z') && (char < '0' || char > '9') &&
 			char != '_' && char != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validOpaqueCredentialRef(value string) bool {
+	const prefix = "vault:"
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	identifier := strings.TrimPrefix(value, prefix)
+	if identifier == "" || len(identifier) > 240 {
+		return false
+	}
+	for _, char := range identifier {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '.' && char != '_' && char != '-' {
 			return false
 		}
 	}

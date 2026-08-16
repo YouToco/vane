@@ -8,7 +8,10 @@ import (
 	"github.com/YouToco/vane/server/internal/strictjson"
 )
 
-const maxEncodedContractBytes = 512 << 10
+const (
+	maxEncodedContractBytes = 512 << 10
+	maxEncodedReceiptBytes  = maxEncodedContractBytes
+)
 
 func EncodeInvocationV1(invocation InvocationV1) ([]byte, error) {
 	if err := invocation.Validate(); err != nil {
@@ -64,11 +67,15 @@ func EncodeReceiptV1(receipt ReceiptV1, invocation InvocationV1) ([]byte, error)
 	if err := receipt.ValidateFor(invocation); err != nil {
 		return nil, err
 	}
-	return json.Marshal(receipt)
+	payload, err := json.Marshal(receipt)
+	if err != nil || len(payload) > maxEncodedReceiptBytes {
+		return nil, invalid("receipt JSON size is invalid")
+	}
+	return payload, nil
 }
 
 func DecodeReceiptV1(payload []byte, invocation InvocationV1) (ReceiptV1, error) {
-	if len(payload) == 0 || len(payload) > maxEncodedContractBytes {
+	if len(payload) == 0 || len(payload) > maxEncodedReceiptBytes {
 		return ReceiptV1{}, invalid("receipt JSON size is invalid")
 	}
 	var receipt ReceiptV1

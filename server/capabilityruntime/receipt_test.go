@@ -30,9 +30,12 @@ func TestReceiptV1BindsInvocationAndRawResult(t *testing.T) {
 	if err != nil || !bytes.Equal(encoded, reencoded) {
 		t.Fatalf("receipt round trip: err=%v got=%s want=%s", err, reencoded, encoded)
 	}
+	if !bytes.Equal(decoded.Result.SanitizedPayload, result.SanitizedOutput) {
+		t.Fatal("durable receipt lost exact sanitized response bytes")
+	}
 
 	tamperedOutput := result
-	tamperedOutput.Output = []byte(`{"ok":false}`)
+	tamperedOutput.SanitizedOutput = []byte(`{"ok":false}`)
 	if err := tamperedOutput.ValidateFor(invocation); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("tampered output error = %v, want ErrInvalidContract", err)
 	}
@@ -63,10 +66,11 @@ func TestReceiptV1EveryFieldIsDigestBound(t *testing.T) {
 		"invocation":     func(v *ReceiptV1) { v.InvocationDigest = otherDigest },
 		"idempotency":    func(v *ReceiptV1) { v.IdempotencyDigest = otherDigest },
 		"attempt":        func(v *ReceiptV1) { v.Attempt++ },
-		"status":         func(v *ReceiptV1) { v.Status = ReceiptStatusFailed },
+		"status":         func(v *ReceiptV1) { v.Status = ReceiptStatusDefiniteFailed },
 		"result digest":  func(v *ReceiptV1) { v.Result.Digest = otherDigest },
 		"result size":    func(v *ReceiptV1) { v.Result.SizeBytes++ },
 		"media type":     func(v *ReceiptV1) { v.Result.MediaType = "text/plain" },
+		"result payload": func(v *ReceiptV1) { v.Result.SanitizedPayload = []byte(`{"changed":true}`) },
 		"error class":    func(v *ReceiptV1) { v.ErrorClass = "timeout" },
 		"retryable":      func(v *ReceiptV1) { v.Retryable = true },
 		"receipt digest": func(v *ReceiptV1) { v.ReceiptDigest = otherDigest },
@@ -80,12 +84,12 @@ func TestReceiptV1EveryFieldIsDigestBound(t *testing.T) {
 	}
 }
 
-func TestReceiptV1FailureIsControlledAndOutputFree(t *testing.T) {
+func TestReceiptV1DefiniteFailureIsControlledAndOutputFree(t *testing.T) {
 	t.Parallel()
 
 	invocation := testInvocationV1(t)
 	receipt, err := NewReceiptV1(
-		invocation, ReceiptStatusFailed, 2, "", nil, "upstream_timeout", true,
+		invocation, ReceiptStatusDefiniteFailed, 2, "", nil, "upstream_timeout", true,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +98,16 @@ func TestReceiptV1FailureIsControlledAndOutputFree(t *testing.T) {
 	if err := result.ValidateFor(invocation); err != nil {
 		t.Fatal(err)
 	}
-	result.Output = []byte("provider error containing a secret")
+	nonCanonicalEmpty := receipt
+	nonCanonicalEmpty.Result.SanitizedPayload = []byte{}
+	nonCanonicalEmpty.ReceiptDigest, err = nonCanonicalEmpty.expectedDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nonCanonicalEmpty.ValidateFor(invocation); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("noncanonical empty failure result error = %v, want ErrInvalidContract", err)
+	}
+	result.SanitizedOutput = []byte("provider error containing a secret")
 	if err := result.ValidateFor(invocation); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("failed output error = %v, want ErrInvalidContract", err)
 	}
@@ -102,6 +115,25 @@ func TestReceiptV1FailureIsControlledAndOutputFree(t *testing.T) {
 		invocation, ReceiptStatusRejected, 1, "", nil, "policy_denied", true,
 	); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("retryable rejection error = %v, want ErrInvalidContract", err)
+	}
+	if _, err := NewReceiptV1(
+		invocation, ReceiptStatusAmbiguous, 1, "", nil, "unknown_effect", true,
+	); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("retryable ambiguous error = %v, want ErrInvalidContract", err)
+	}
+	ambiguous, err := NewReceiptV1(
+		invocation, ReceiptStatusAmbiguous, 1, "", nil, "unknown_effect", false,
+	)
+	if err != nil {
+		t.Fatalf("non-retryable ambiguous receipt error = %v", err)
+	}
+	ambiguous.Retryable = true
+	ambiguous.ReceiptDigest, err = ambiguous.expectedDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ambiguous.ValidateFor(invocation); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("digest-consistent retryable ambiguous error = %v, want ErrInvalidContract", err)
 	}
 }
 

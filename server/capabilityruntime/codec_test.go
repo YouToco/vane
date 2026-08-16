@@ -69,6 +69,50 @@ func TestReceiptV1StrictCanonicalCodec(t *testing.T) {
 	}
 }
 
+func TestReceiptV1CodecExactInlineResultBoundaryRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	input := testInvocationInputV1()
+	input.Policy.MaxOutputBytes = maxResultBytes
+	invocation, err := NewInvocationV1(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := bytes.Repeat([]byte("s"), maxResultBytes)
+	receipt, err := NewReceiptV1(
+		invocation, ReceiptStatusSucceeded, 1, "application/octet-stream", output, "", false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := EncodeReceiptV1(receipt, invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > maxEncodedReceiptBytes {
+		t.Fatalf("max result encoded size = %d, wire limit = %d", len(encoded), maxEncodedReceiptBytes)
+	}
+	decoded, err := DecodeReceiptV1(encoded, invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded.Result.SanitizedPayload, output) {
+		t.Fatal("receipt codec lost bounded result bytes")
+	}
+
+	overPolicy := testInvocationInputV1()
+	overPolicy.Policy.MaxOutputBytes = maxResultBytes + 1
+	if _, err := NewInvocationV1(overPolicy); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("max output policy + 1 error = %v, want ErrInvalidContract", err)
+	}
+	if _, err := NewReceiptV1(
+		invocation, ReceiptStatusSucceeded, 1, "application/octet-stream",
+		bytes.Repeat([]byte("s"), maxResultBytes+1), "", false,
+	); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("max inline result + 1 error = %v, want ErrInvalidContract", err)
+	}
+}
+
 func TestInvocationV1EnforcesFrozenByteBudgets(t *testing.T) {
 	t.Parallel()
 
@@ -97,7 +141,7 @@ func TestInvocationV1EnforcesFrozenByteBudgets(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := NewReceiptV1(
-		invocation, ReceiptStatusFailed, 2, "", nil, "upstream_timeout", false,
+		invocation, ReceiptStatusDefiniteFailed, 2, "", nil, "upstream_timeout", false,
 	); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("attempt budget error = %v, want ErrInvalidContract", err)
 	}

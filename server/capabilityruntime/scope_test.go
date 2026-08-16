@@ -44,8 +44,13 @@ func TestCapabilityRefV1ScopeMatrix(t *testing.T) {
 func testPolicyForKind(kind CapabilityKind) PolicyV1 {
 	policy := testInvocationInputV1().Policy
 	switch kind {
-	case CapabilityKindBuiltinTool, CapabilityKindDeclarativeSkill:
+	case CapabilityKindBuiltinTool:
 		policy.Effects = []EffectV1{}
+		policy.Network = NetworkPolicyNone
+		policy.Isolation = IsolationInProcess
+	case CapabilityKindDeclarativeSkill:
+		policy.Effects = []EffectV1{EffectInternalRead}
+		policy.ReadOnly = true
 		policy.Network = NetworkPolicyNone
 		policy.Isolation = IsolationInProcess
 	case CapabilityKindSandboxScript:
@@ -81,7 +86,12 @@ func TestCredentialRefV1ScopeMatrix(t *testing.T) {
 			v.Provider = "MCP"
 			return v
 		}(), true},
-		{"partial zero", CredentialRefV1{Provider: "mcp"}, true},
+		{"partial zero", CredentialRefV1{OpaqueRef: "vault:mcp-primary"}, true},
+		{"opaque digest mismatch", func() CredentialRefV1 {
+			v := testCredentialV1(CredentialScopeUser, 73, 1)
+			v.OpaqueRefDigest = strings.Repeat("a", 64)
+			return v
+		}(), true},
 		{"unknown", testCredentialV1(CredentialScopeV1("foreign"), 0, 1), true},
 	}
 	for _, tt := range cases {
@@ -98,8 +108,33 @@ func TestCredentialRefV1ScopeMatrix(t *testing.T) {
 
 func testCredentialV1(scope CredentialScopeV1, userID, generation int64) CredentialRefV1 {
 	return CredentialRefV1{
+		OpaqueRef: "vault:mcp-primary", OpaqueRefDigest: rawSHA256([]byte("vault:mcp-primary")),
 		Provider: "mcp", Purpose: "connection_primary", Scope: scope,
 		UserID: userID, Generation: generation, Fingerprint: strings.Repeat("d", 64),
+	}
+}
+
+func TestCredentialRefV1TenantScopeUsesExplicitPrincipalTenant(t *testing.T) {
+	t.Parallel()
+
+	firstInput := testInvocationInputV1()
+	firstInput.Credential = testCredentialV1(CredentialScopeTenant, 0, 2)
+	first, err := NewInvocationV1(firstInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInput := firstInput
+	secondInput.Principal.TenantID++
+	second, err := NewInvocationV1(secondInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Credential != second.Credential {
+		t.Fatal("tenant credential metadata unexpectedly inferred a tenant")
+	}
+	if first.IdempotencyDigest == second.IdempotencyDigest ||
+		first.InvocationDigest == second.InvocationDigest {
+		t.Fatal("explicit Principal tenant is not authority-bound")
 	}
 }
 
@@ -113,6 +148,15 @@ func TestCapabilityRefV1RejectsPolicyKindMismatch(t *testing.T) {
 	}{
 		{"builtin outside process", CapabilityKindBuiltinTool, func(p *PolicyV1) { p.Isolation = IsolationFirecracker; p.Effects = []EffectV1{EffectCodeExecution} }},
 		{"declarative skill executes code", CapabilityKindDeclarativeSkill, func(p *PolicyV1) { p.Isolation = IsolationFirecracker; p.Effects = []EffectV1{EffectCodeExecution} }},
+		{"declarative skill network", CapabilityKindDeclarativeSkill, func(p *PolicyV1) {
+			p.Network = NetworkPolicyPublicHTTPSReadOnly
+			p.Effects = []EffectV1{EffectInternalRead, EffectNetworkRead}
+		}},
+		{"declarative skill writable", CapabilityKindDeclarativeSkill, func(p *PolicyV1) { p.ReadOnly = false }},
+		{"declarative skill empty effects", CapabilityKindDeclarativeSkill, func(p *PolicyV1) { p.Effects = []EffectV1{} }},
+		{"declarative skill billable", CapabilityKindDeclarativeSkill, func(p *PolicyV1) { p.Effects = []EffectV1{EffectBillable, EffectInternalRead} }},
+		{"declarative skill state write", CapabilityKindDeclarativeSkill, func(p *PolicyV1) { p.Effects = []EffectV1{EffectInternalRead, EffectStateWrite} }},
+		{"declarative skill delivery", CapabilityKindDeclarativeSkill, func(p *PolicyV1) { p.Effects = []EffectV1{EffectDelivery, EffectInternalRead} }},
 		{"remote mcp not read-only", CapabilityKindRemoteMCP, func(p *PolicyV1) { p.ReadOnly = false }},
 		{"script outside microvm", CapabilityKindSandboxScript, func(p *PolicyV1) { p.Isolation = IsolationInProcess }},
 	}
