@@ -130,12 +130,7 @@ func fbValue(action types.FeedbackAction, deliveryID string) map[string]interfac
 
 func newFeedbackTestManager() *Manager {
 	m := NewManager(nil, nil, nil)
-	m.principalForUser = func(_ context.Context, userID int64) (auth.Principal, error) {
-		return auth.Principal{
-			TenantID: 1, UserID: userID,
-			Role: types.MembershipRoleOwner, ActorType: types.ActorTypeUser,
-		}, nil
-	}
+	bindTestUserPrincipal(m)
 	return m
 }
 
@@ -703,6 +698,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 	t.Run("命中追问时 agent 收到包装后文本", func(t *testing.T) {
 		const appIdentity = "cli_question_wrap_test"
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -749,6 +745,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 
 	t.Run("追问事实持久化失败时不进入 agent", func(t *testing.T) {
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -771,6 +768,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 	t.Run("未命中时原文进 agent", func(t *testing.T) {
 		// 回复的是普通消息/聊天卡：降级为普通聊天，不得改动用户原话。
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -798,6 +796,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		defer closeServer()
 
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		m.apiClient = client
 		runner := &fakeRunner{}
@@ -821,6 +820,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 	t.Run("FeedbackRunner 未注入时不 panic 且走普通路径", func(t *testing.T) {
 		// 灰度装配形态：反馈未就绪时追问降级为普通消息，消息链不能崩。
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -845,6 +845,7 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		// 插入点不做"是不是回复"的预判：空 id 的短路归 WrapQuestion 内部
 		// （契约 §11 ①），handler 只负责把线索原样递过去。
 		m := NewManager(st, nil, nil)
+		bindTestUserPrincipal(m)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
@@ -901,6 +902,7 @@ func TestOnCardActionFeedbackRoute(t *testing.T) {
 	cardJSON := BuildDeliveryCard(feedback.CardInput{BodyMD: "**正文**", DeliveryID: 42,
 		State: feedback.CardState{Preference: types.FeedbackActionNotInterested}})
 	m := NewManager(st, nil, nil)
+	bindTestUserPrincipal(m)
 	m.setOwner(owner, "测试")
 	fb := &fakeFeedbackRunner{
 		result: feedback.ClickResult{Toast: "已记录：不感兴趣", ToastOK: true, CardJSON: cardJSON},

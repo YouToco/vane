@@ -17,7 +17,17 @@ import (
 	"github.com/YouToco/vane/server/agent"
 	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/store"
+	"github.com/YouToco/vane/server/types"
 )
+
+func bindTestUserPrincipal(m *Manager) {
+	m.principalForUser = func(_ context.Context, userID int64) (auth.Principal, error) {
+		return auth.Principal{
+			TenantID: 1, UserID: userID,
+			Role: types.MembershipRoleOwner, ActorType: types.ActorTypeUser,
+		}, nil
+	}
+}
 
 func cardEvent(operatorOpenID string, value map[string]interface{}) *callback.CardActionTriggerEvent {
 	return &callback.CardActionTriggerEvent{
@@ -392,6 +402,7 @@ func TestHandleMessageRouting(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := NewManager(st, nil, nil)
+			bindTestUserPrincipal(m)
 			m.setOwner(owner, "测试")
 			runner := &fakeRunner{}
 			m.SetAgent(runner)
