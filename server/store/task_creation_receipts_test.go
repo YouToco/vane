@@ -227,7 +227,7 @@ func TestTaskCreationReceipt_LeasePayloadSessionAndDeliveryLifecycle(t *testing.
 			`DELETE FROM agent_sessions WHERE tenant_id = $1`, f.tenantID)
 	})
 
-	session, err := st.CreateAgentSession(ctx, f.userID)
+	session, err := st.CreateAgentSession(ctx, f.tenantID, f.userID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestTaskCreationReceiptSessionCheckpointUsesTenantScopedRuntimeRole(
 			f.tenantID)
 	})
 
-	session, err := st.CreateAgentSession(ctx, f.userID)
+	session, err := st.CreateAgentSession(ctx, f.tenantID, f.userID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +652,7 @@ func TestTaskCreationReceipt_MissingSessionDegradesWithoutBlockingDelivery(t *te
 			`DELETE FROM agent_sessions WHERE tenant_id = $1`, f.tenantID)
 	})
 
-	session, err := st.CreateAgentSession(ctx, f.userID)
+	session, err := st.CreateAgentSession(ctx, f.tenantID, f.userID)
 	if err != nil {
 		t.Fatal(err)
 	}

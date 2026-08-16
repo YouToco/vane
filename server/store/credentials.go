@@ -84,7 +84,9 @@ func (s *Store) RegisterWithInvite(ctx context.Context, email, passwordHash, cod
 	// 步骤 3：建租户。
 	var t types.Tenant
 	if err := scanTenant(tx.QueryRow(ctx,
-		`INSERT INTO tenants DEFAULT VALUES RETURNING `+tenantColumns), &t); err != nil {
+		`INSERT INTO tenants(display_name,workspace_kind,personal_owner_user_id,seat_limit)
+		 VALUES($1,'personal',$2,1) RETURNING `+tenantColumns,
+		email+" 的个人工作区", u.ID), &t); err != nil {
 		return nil, nil, types.NewAppError(types.CodeDatabase, "创建租户", err)
 	}
 
@@ -220,15 +222,16 @@ func (s *Store) LookupSession(ctx context.Context, tokenHash []byte) (*types.Ses
 		    AND t.deleted_at IS NULL
 		    AND m.tenant_id = us.tenant_id
 		    AND m.user_id = us.user_id
-		RETURNING us.token_hash, us.user_id, us.tenant_id, us.created_at, us.expires_at, us.last_seen_at`,
+		RETURNING us.token_hash, us.user_id, us.tenant_id, m.role, us.created_at, us.expires_at, us.last_seen_at`,
 		tokenHash).Scan(&sess.TokenHash, &sess.UserID, &sess.TenantID,
-		&sess.CreatedAt, &sess.ExpiresAt, &sess.LastSeenAt)
+		&sess.Role, &sess.CreatedAt, &sess.ExpiresAt, &sess.LastSeenAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, types.NewAppError(types.CodeNotFound, "会话不存在或已过期", err)
 		}
 		return nil, types.NewAppError(types.CodeDatabase, "查询会话", err)
 	}
+	sess.ActorType = types.ActorTypeUser
 	return &sess, nil
 }
 

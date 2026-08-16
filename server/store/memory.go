@@ -512,21 +512,28 @@ func (s *Store) beginMemoryScopedTx(
 			return fail(types.NewAppError(types.CodeNotFound, "租户不存在", nil))
 		}
 	}
-	lockMode := "FOR KEY SHARE"
+	lockMode := "FOR KEY SHARE OF m,t"
 	if write {
-		lockMode = "FOR UPDATE"
+		lockMode = "FOR UPDATE OF m,t"
 	}
 	var present bool
+	var workspaceKind types.WorkspaceKind
 	err = tx.QueryRow(ctx, fmt.Sprintf(`
-		SELECT true FROM memberships
-		 WHERE tenant_id=$1 AND user_id=$2 %s`, lockMode),
-		tenantID, userID).Scan(&present)
+		SELECT true,t.workspace_kind
+		  FROM memberships m JOIN tenants t ON t.id=m.tenant_id
+		 WHERE m.tenant_id=$1 AND m.user_id=$2
+		   AND t.status='active' AND t.deleted_at IS NULL %s`, lockMode),
+		tenantID, userID).Scan(&present, &workspaceKind)
 	if errors.Is(err, pgx.ErrNoRows) || !present {
 		return fail(types.NewAppError(
 			types.CodeNotFound, "用户不属于该长期记忆租户", nil))
 	}
 	if err != nil {
 		return fail(memoryDBError("锁定长期记忆用户授权", err))
+	}
+	if workspaceKind != types.WorkspaceKindPersonal {
+		return fail(types.NewAppError(types.CodeForbidden,
+			"团队工作区必须使用团队长期记忆账本", types.ErrForbidden))
 	}
 	if _, err := tx.Exec(ctx, `
 		SELECT set_config('app.tenant_id',$1,true),

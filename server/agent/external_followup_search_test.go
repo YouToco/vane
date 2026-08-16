@@ -92,7 +92,7 @@ func TestHandleExternalContextMessage_FreshQuestionUsesOneExactUserBoundSearch(
 		official      = "https://openai.com/index/introducing-gpt-live/"
 	)
 	fs := newFakeStore()
-	session, _ := fs.CreateAgentSession(t.Context(), 7)
+	session, _ := fs.CreateAgentSession(t.Context(), 1, 7)
 	history, _ := json.Marshal([]llm.ChatMessage{
 		{Role: "user", Content: "旧问题"},
 		{Role: "assistant", Content: historySecret},
@@ -139,7 +139,7 @@ func TestHandleExternalContextMessage_FreshQuestionUsesOneExactUserBoundSearch(
 
 	input := "[用户引用的消息]\n" + quotedAttack +
 		"\n[用户的回复]\n" + question
-	out, err := l.HandleExternalContextMessage(t.Context(), 7, input)
+	out, err := l.HandleExternalContextMessage(t.Context(), testPrincipal(7), input)
 	if err != nil {
 		t.Fatalf("HandleExternalContextMessage: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestHandleExternalContextMessage_ZeroSearchResultsUseFixedReply(
 	l := newTestLoop(t, fs, chat.fn, newTestExaTools(upstream, nil).SearchTool())
 
 	out, err := l.HandleExternalContextMessage(
-		t.Context(), 7,
+		t.Context(), testPrincipal(7),
 		"[用户引用的消息]\n旧回答\n[用户的回复]\n"+question,
 	)
 	if err != nil {
@@ -402,7 +402,7 @@ func TestHandleExternalContextMessage_RejectsUngroundedSearchAnswerTwice(
 	l := newTestLoop(t, fs, chat.fn, exa.SearchTool(), exa.ReadPageTool())
 
 	out, err := l.HandleExternalContextMessage(
-		t.Context(), 7,
+		t.Context(), testPrincipal(7),
 		"[用户引用的消息]\n旧回答\n[用户的回复]\n"+question,
 	)
 	if err != nil {
@@ -437,7 +437,7 @@ func TestHandleExternalContextMessage_RejectsSearchQueryRewrite(t *testing.T) {
 	l := newTestLoop(t, fs, chat.fn, search)
 
 	out, err := l.HandleExternalContextMessage(
-		t.Context(), 7,
+		t.Context(), testPrincipal(7),
 		"[追问上下文]\nPRIVATE-QUOTE-CANARY\n"+
 			"[追问上下文结束]\n用户的追问："+question,
 	)
@@ -506,7 +506,7 @@ func TestHandleExternalContextMessage_SearchFailureNeverBecomesModelResult(
 			l := newTestLoop(t, fs, chat.fn, exa.SearchTool())
 
 			out, err := l.HandleExternalContextMessage(
-				t.Context(), 7,
+				t.Context(), testPrincipal(7),
 				"[用户引用的消息]\n旧回答\n[用户的回复]\n"+question,
 			)
 			if err != nil {
@@ -537,7 +537,7 @@ func TestHandleExternalContextMessage_RejectsParallelBoundSearchBatch(t *testing
 	l := newTestLoop(t, fs, chat.fn, search)
 
 	out, err := l.HandleExternalContextMessage(
-		t.Context(), 7,
+		t.Context(), testPrincipal(7),
 		"[用户引用的消息]\n引用正文\n[用户的回复]\n"+question,
 	)
 	if err != nil {
@@ -563,7 +563,7 @@ func TestHandleExternalContextMessage_DropsTwoToolFreeFreshAnswers(t *testing.T)
 	l := newTestLoop(t, fs, chat.fn, search)
 
 	out, err := l.HandleExternalContextMessage(
-		t.Context(), 7,
+		t.Context(), testPrincipal(7),
 		"[用户引用的消息]\n旧回答\n[用户的回复]\n"+question,
 	)
 	if err != nil {
@@ -595,7 +595,7 @@ func TestHandleExternalContextMessage_FreshQuestionWithoutSearchFailsClosed(
 	l := newTestLoop(t, fs, chat.fn)
 
 	out, err := l.HandleExternalContextMessage(
-		t.Context(), 7,
+		t.Context(), testPrincipal(7),
 		"[用户引用的消息]\n旧回答\n[用户的回复]\n"+
 			"GPT-Live 是否已提供 API 定价？",
 	)
@@ -618,7 +618,7 @@ func TestHandleExternalContextMessage_OverlongFreshQuestionFailsClosed(
 	l := newTestLoop(t, fs, chat.fn, exa.SearchTool())
 
 	out, err := l.HandleExternalContextMessage(
-		t.Context(), 7,
+		t.Context(), testPrincipal(7),
 		"[用户引用的消息]\n旧回答\n[用户的回复]\n帮我查一下 "+
 			strings.Repeat("x", exaQueryMaxRunes),
 	)
@@ -645,7 +645,7 @@ func TestHandleExternalContextMessage_NonFreshQuestionKeepsZeroToolBoundary(
 	l := newTestLoop(t, fs, chat.fn, search)
 
 	out, err := l.HandleExternalContextMessage(
-		context.Background(), 7,
+		context.Background(), testPrincipal(7),
 		"[用户引用的消息]\n旧回答\n[用户的回复]\n这篇原文说了什么？",
 	)
 	if err != nil {

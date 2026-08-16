@@ -69,6 +69,17 @@ type purgeStep struct {
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
 var purgeOrder = []purgeStep{
+	// Principal-scoped A2A task history references the credential that admitted
+	// it, so erase tasks before token lifecycle evidence.
+	{"a2a_principal_tasks", "tenant_id = $1"},
+	// Scoped A2A tokens retain only hashes and append-only lifecycle evidence.
+	// Explicit tenant erasure removes the event child before its token parent.
+	{"a2a_access_token_events", "tenant_id = $1"},
+	{"a2a_access_tokens", "tenant_id = $1"},
+	// Account security audit rows retain the one-time token they describe;
+	// explicit tenant erasure removes the audit child before the token ledger.
+	{"account_security_audit_events", "tenant_id = $1"},
+	{"account_security_tokens", "tenant_id = $1"},
 	// Sensitive admin-read evidence binds an exact immutable target run and
 	// must be removed before its snapshot during explicit tenant erasure.
 	{"admin_trace_access_events", "(target_tenant_id = $1 OR actor_tenant_id = $1)"},
@@ -104,6 +115,9 @@ var purgeOrder = []purgeStep{
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"task_creation_operations", "tenant_id = $1"},
+	// Team-task authorization decisions are retained independently from the
+	// mutable schedule row and must be included in exact erasure reporting.
+	{"task_access_audit_events", "tenant_id = $1"},
 	// Agent-first query audits and exact model-visible evidence are children of
 	// the session/tool ledgers. They are retained for normal task/session life
 	// and removed only by this explicit tenant erasure path.
@@ -125,6 +139,21 @@ var purgeOrder = []purgeStep{
 	{"memory_events", "tenant_id = $1"},
 	{"memory_records", "tenant_id = $1"},
 	{"memory_authorizations", "tenant_id = $1"},
+	// Team memory is a separate immutable ledger so personal v129 receipts keep
+	// their exact wire and user scope. Preserve the same child-first order.
+	{"workspace_memory_receipts", "tenant_id = $1"},
+	{"workspace_memory_events", "tenant_id = $1"},
+	{"workspace_memory_records", "tenant_id = $1"},
+	{"workspace_memory_authorizations", "tenant_id = $1"},
+	// User-configured capabilities are immutable, tenant-scoped artifacts. Their
+	// event and subtype rows reference the shared version/root identities, so
+	// explicit tenant erasure must preserve this child-first order.
+	{"user_capability_events", "tenant_id = $1"},
+	{"skill_capability_files", "tenant_id = $1"},
+	{"skill_capability_versions", "tenant_id = $1"},
+	{"mcp_connection_versions", "tenant_id = $1"},
+	{"user_capability_versions", "tenant_id = $1"},
+	{"user_capabilities", "tenant_id = $1"},
 	// V3 delivery anchors reference the effect and projections, so they are the
 	// first child in the durable delivery chain.
 	{"research_brief_deliveries", "tenant_id = $1"},
@@ -221,6 +250,10 @@ var purgeOrder = []purgeStep{
 	// and deletes the now-unreferenced immutable events explicitly.
 	{"task_run_snapshot_v2_cutover_events", "tenant_id = $1"},
 	{"user_sessions", "tenant_id = $1"},
+	// Workspace invitation and role-change audit ledgers are tenant-owned
+	// control-plane children and must precede membership/tenant deletion.
+	{"workspace_audit_events", "tenant_id = $1"},
+	{"workspace_invites", "tenant_id = $1"},
 
 	// tenant_quota 与 memberships 一样是纯租户所有的行，无子表引用它，位置随意；
 	// 放在 memberships 前只是为了让"归属类"的几张挨在一起。
@@ -304,40 +337,58 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
 	}
 	var (
-		canonicalBriefStagesAvailable        bool
-		profileEpochsAvailable               bool
-		profileEpochFencesAvailable          bool
-		profileCheckpointsAvailable          bool
-		profileEpochEventsAvailable          bool
-		profileEpochReceiptsAvailable        bool
-		profileActivitiesAvailable           bool
-		executiveReceiptsAvailable           bool
-		executiveArtifactsAvailable          bool
-		reportSettingsAvailable              bool
-		periodicIntentsAvailable             bool
-		periodicReceiptsAvailable            bool
-		periodicReportsAvailable             bool
-		periodicDeliveriesAvailable          bool
-		researchBriefsAvailable              bool
-		researchGroundingAvailable           bool
-		researchGroundingCorrectionAvailable bool
-		researchPlannerSearchAvailable       bool
-		researchEvidenceAvailable            bool
-		researchLLMSettlementsAvailable      bool
-		researchLLMReservationsAvailable     bool
-		researchSpendSettlementsAvailable    bool
-		researchSpendReservationsAvailable   bool
-		researchRunCapabilitiesAvailable     bool
-		researchBriefDeliveriesAvailable     bool
-		researchV3AuthoritiesAvailable       bool
-		researchV3CutoversAvailable          bool
-		researchV3PrepareHeadsAvailable      bool
-		researchV3PrepareOpsAvailable        bool
-		scheduleCommandCursorAvailable       bool
-		memoryAuthorizationsAvailable        bool
-		memoryRecordsAvailable               bool
-		memoryEventsAvailable                bool
-		memoryReceiptsAvailable              bool
+		canonicalBriefStagesAvailable          bool
+		profileEpochsAvailable                 bool
+		profileEpochFencesAvailable            bool
+		profileCheckpointsAvailable            bool
+		profileEpochEventsAvailable            bool
+		profileEpochReceiptsAvailable          bool
+		profileActivitiesAvailable             bool
+		executiveReceiptsAvailable             bool
+		executiveArtifactsAvailable            bool
+		reportSettingsAvailable                bool
+		periodicIntentsAvailable               bool
+		periodicReceiptsAvailable              bool
+		periodicReportsAvailable               bool
+		periodicDeliveriesAvailable            bool
+		researchBriefsAvailable                bool
+		researchGroundingAvailable             bool
+		researchGroundingCorrectionAvailable   bool
+		researchPlannerSearchAvailable         bool
+		researchEvidenceAvailable              bool
+		researchLLMSettlementsAvailable        bool
+		researchLLMReservationsAvailable       bool
+		researchSpendSettlementsAvailable      bool
+		researchSpendReservationsAvailable     bool
+		researchRunCapabilitiesAvailable       bool
+		researchBriefDeliveriesAvailable       bool
+		researchV3AuthoritiesAvailable         bool
+		researchV3CutoversAvailable            bool
+		researchV3PrepareHeadsAvailable        bool
+		researchV3PrepareOpsAvailable          bool
+		scheduleCommandCursorAvailable         bool
+		memoryAuthorizationsAvailable          bool
+		memoryRecordsAvailable                 bool
+		memoryEventsAvailable                  bool
+		memoryReceiptsAvailable                bool
+		taskAccessAuditAvailable               bool
+		accountSecurityTokensAvailable         bool
+		accountSecurityAuditAvailable          bool
+		workspaceInvitesAvailable              bool
+		workspaceAuditEventsAvailable          bool
+		userCapabilitiesAvailable              bool
+		userCapabilityVersionsAvailable        bool
+		skillCapabilityVersionsAvailable       bool
+		skillCapabilityFilesAvailable          bool
+		mcpConnectionVersionsAvailable         bool
+		userCapabilityEventsAvailable          bool
+		workspaceMemoryAuthorizationsAvailable bool
+		workspaceMemoryRecordsAvailable        bool
+		workspaceMemoryEventsAvailable         bool
+		workspaceMemoryReceiptsAvailable       bool
+		a2aAccessTokensAvailable               bool
+		a2aAccessTokenEventsAvailable          bool
+		a2aPrincipalTasksAvailable             bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -373,7 +424,25 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.memory_authorizations') IS NOT NULL,
 		        to_regclass('public.memory_records') IS NOT NULL,
 		        to_regclass('public.memory_events') IS NOT NULL,
-		        to_regclass('public.memory_receipts') IS NOT NULL`,
+		        to_regclass('public.memory_receipts') IS NOT NULL,
+		        to_regclass('public.task_access_audit_events') IS NOT NULL,
+		        to_regclass('public.account_security_tokens') IS NOT NULL,
+		        to_regclass('public.account_security_audit_events') IS NOT NULL,
+		        to_regclass('public.workspace_invites') IS NOT NULL,
+		        to_regclass('public.workspace_audit_events') IS NOT NULL,
+		        to_regclass('public.user_capabilities') IS NOT NULL,
+		        to_regclass('public.user_capability_versions') IS NOT NULL,
+		        to_regclass('public.skill_capability_versions') IS NOT NULL,
+		        to_regclass('public.skill_capability_files') IS NOT NULL,
+		        to_regclass('public.mcp_connection_versions') IS NOT NULL,
+		        to_regclass('public.user_capability_events') IS NOT NULL,
+		        to_regclass('public.workspace_memory_authorizations') IS NOT NULL,
+		        to_regclass('public.workspace_memory_records') IS NOT NULL,
+		        to_regclass('public.workspace_memory_events') IS NOT NULL,
+		        to_regclass('public.workspace_memory_receipts') IS NOT NULL,
+		        to_regclass('public.a2a_access_tokens') IS NOT NULL,
+		        to_regclass('public.a2a_access_token_events') IS NOT NULL,
+		        to_regclass('public.a2a_principal_tasks') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -409,6 +478,24 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&memoryRecordsAvailable,
 		&memoryEventsAvailable,
 		&memoryReceiptsAvailable,
+		&taskAccessAuditAvailable,
+		&accountSecurityTokensAvailable,
+		&accountSecurityAuditAvailable,
+		&workspaceInvitesAvailable,
+		&workspaceAuditEventsAvailable,
+		&userCapabilitiesAvailable,
+		&userCapabilityVersionsAvailable,
+		&skillCapabilityVersionsAvailable,
+		&skillCapabilityFilesAvailable,
+		&mcpConnectionVersionsAvailable,
+		&userCapabilityEventsAvailable,
+		&workspaceMemoryAuthorizationsAvailable,
+		&workspaceMemoryRecordsAvailable,
+		&workspaceMemoryEventsAvailable,
+		&workspaceMemoryReceiptsAvailable,
+		&a2aAccessTokensAvailable,
+		&a2aAccessTokenEventsAvailable,
+		&a2aPrincipalTasksAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -448,6 +535,24 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"memory_records":                            memoryRecordsAvailable,
 		"memory_events":                             memoryEventsAvailable,
 		"memory_receipts":                           memoryReceiptsAvailable,
+		"task_access_audit_events":                  taskAccessAuditAvailable,
+		"account_security_tokens":                   accountSecurityTokensAvailable,
+		"account_security_audit_events":             accountSecurityAuditAvailable,
+		"workspace_invites":                         workspaceInvitesAvailable,
+		"workspace_audit_events":                    workspaceAuditEventsAvailable,
+		"user_capabilities":                         userCapabilitiesAvailable,
+		"user_capability_versions":                  userCapabilityVersionsAvailable,
+		"skill_capability_versions":                 skillCapabilityVersionsAvailable,
+		"skill_capability_files":                    skillCapabilityFilesAvailable,
+		"mcp_connection_versions":                   mcpConnectionVersionsAvailable,
+		"user_capability_events":                    userCapabilityEventsAvailable,
+		"workspace_memory_authorizations":           workspaceMemoryAuthorizationsAvailable,
+		"workspace_memory_records":                  workspaceMemoryRecordsAvailable,
+		"workspace_memory_events":                   workspaceMemoryEventsAvailable,
+		"workspace_memory_receipts":                 workspaceMemoryReceiptsAvailable,
+		"a2a_access_tokens":                         a2aAccessTokensAvailable,
+		"a2a_access_token_events":                   a2aAccessTokenEventsAvailable,
+		"a2a_principal_tasks":                       a2aPrincipalTasksAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
@@ -462,6 +567,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	if _, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "锁定租户清理准入根", err)
+	}
+	if a2aAccessTokensAvailable || a2aAccessTokenEventsAvailable {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(
+			hashtextextended('vane/a2a-schema/v139',1447120453))`); err != nil {
+			return nil, types.NewAppError(
+				types.CodeDatabase, "锁定 A2A schema 清理准入根", err)
+		}
 	}
 
 	// Across the purge/coordinator/receipt/session conflict set, every path

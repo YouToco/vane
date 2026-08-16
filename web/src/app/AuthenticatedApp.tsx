@@ -27,6 +27,8 @@ import {
   LogOut,
   Loader2,
   ChevronsUpDown,
+  Users,
+  KeyRound,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -40,6 +42,7 @@ import { LogoMark } from "@/shared/brand/Logo";
 import { LocaleSwitch } from "@/app/LocaleSwitch";
 import { useI18n } from "@/i18n";
 import { clearTaskMutationSessionStorage } from "@/shared/runtime/task-action-session";
+import { WorkspaceSwitcher } from "@/app/WorkspaceSwitcher";
 
 const Home = lazy(() => import("@/pages/Home"));
 const TaskDashboard = lazy(() => import("@/pages/TaskDashboard"));
@@ -58,7 +61,7 @@ interface NavItem {
 // 我的情报 = 日常要看的产出；账号 = 影响产出的自身设置。
 // 文案来自 i18n 字典，导航结构随语言重建（结构轻，无需 memo 精调）。
 function useNav() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const N = t.app.nav;
   const groups: { label: string; items: NavItem[] }[] = [
     {
@@ -74,6 +77,12 @@ function useNav() {
       items: [
         { hash: "#/settings", label: N.profile, icon: User },
         { hash: "#/settings/channel", label: N.channel, icon: MessageSquare },
+        { hash: "#/settings/members", label: N.members, icon: Users },
+        {
+          hash: "#/settings/access",
+          label: locale === "zh" || locale === "zh-Hant" ? "访问凭证" : "Access credentials",
+          icon: KeyRound,
+        },
       ],
     },
   ];
@@ -96,6 +105,8 @@ function renderPage(
   hash: string,
   isPlatformOwner: boolean,
   actorScope: string,
+  me: MeResponse,
+  onAuthorityChanged: () => void,
 ) {
   const detailID = taskDetailID(hash);
   if (detailID) {
@@ -108,7 +119,9 @@ function renderPage(
       return <History />;
     case "#/settings":
     case "#/settings/channel":
-      return <Settings hash={hash} />;
+    case "#/settings/members":
+    case "#/settings/access":
+      return <Settings hash={hash} me={me} onAuthorityChanged={onAuthorityChanged} />;
     case "#/admin":
       // 前端兜底：非平台 owner 直接落回首页。真正的拦截在后端
       // requirePlatformOwner，这里只是避免渲染一个注定 404 的页面。
@@ -184,11 +197,13 @@ function AppSidebar({
   me,
   isPlatformOwner,
   onLogout,
+  onSwitchWorkspace,
 }: {
   hash: string;
   me: MeResponse;
   isPlatformOwner: boolean;
   onLogout: () => void;
+  onSwitchWorkspace: (tenantID: number) => Promise<void>;
 }) {
   const { t } = useI18n();
   const { groups } = useNav();
@@ -202,6 +217,7 @@ function AppSidebar({
             <span className="text-[11px] text-muted-foreground">{t.app.nav.tagline}</span>
           </div>
         </a>
+        <WorkspaceSwitcher me={me} onSwitch={onSwitchWorkspace} />
       </SidebarHeader>
       <SidebarContent>
         {groups.map((group) => (
@@ -261,10 +277,31 @@ function Shell({ hash, me }: { hash: string; me: MeResponse }) {
     } catch {}
     location.reload();
   }
+  async function onSwitchWorkspace(tenantID: number) {
+    // Pending write confirmations are scoped to the old workspace and must
+    // never survive a principal/token rotation.
+    clearTaskMutationSessionStorage();
+    await api.switchWorkspace(tenantID);
+    location.hash = "#/";
+    location.reload();
+  }
+  function onAuthorityChanged() {
+    // Ownership transfer invalidates the server session. Clear all browser
+    // state scoped to the old Principal before returning to authentication.
+    clearTaskMutationSessionStorage();
+    location.hash = "#/login";
+    location.reload();
+  }
 
   return (
     <SidebarProvider>
-      <AppSidebar hash={hash} me={me} isPlatformOwner={isPlatformOwner} onLogout={onLogout} />
+      <AppSidebar
+        hash={hash}
+        me={me}
+        isPlatformOwner={isPlatformOwner}
+        onLogout={onLogout}
+        onSwitchWorkspace={onSwitchWorkspace}
+      />
       <SidebarInset>
         <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
@@ -282,7 +319,7 @@ function Shell({ hash, me }: { hash: string; me: MeResponse }) {
         <main className="flex-1 overflow-y-auto">
           <div className="mx-auto max-w-5xl p-6">
             <Suspense fallback={<PageFallback />}>
-              {renderPage(hash, isPlatformOwner, actorScope)}
+              {renderPage(hash, isPlatformOwner, actorScope, me, onAuthorityChanged)}
             </Suspense>
           </div>
         </main>

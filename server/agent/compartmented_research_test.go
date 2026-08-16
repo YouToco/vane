@@ -271,7 +271,7 @@ func TestCompartmentedResearchCombinesKimiHistoryAndCurrentEvidence(t *testing.T
 	loop.chatFn = chatCall
 
 	out, err := loop.HandleMessage(
-		t.Context(), 42, "Kimi 套餐昨天为什么说不能买，今天相比有什么变化？",
+		t.Context(), testPrincipal(42), "Kimi 套餐昨天为什么说不能买，今天相比有什么变化？",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1098,7 +1098,7 @@ func TestHistoricalExternalArgumentsDirectSummaryUsesExactBundleOnly(t *testing.
 		Model:      "deepseek-v4-pro", MaxTurns: 3,
 	})
 	loop.chatFn = chatCall
-	out, err := loop.HandleMessage(t.Context(), 42, "总结这条历史工具记录")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "总结这条历史工具记录")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1198,7 +1198,7 @@ func TestHistoricalObservationUsesPublicOnlyIsolationWithoutNewWebCall(t *testin
 		Model:      "deepseek-v4-pro", MaxTurns: 3,
 	})
 	loop.chatFn = chatCall
-	out, err := loop.HandleMessage(t.Context(), 42, "比较这条历史公开观察记录")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "比较这条历史公开观察记录")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1285,7 +1285,7 @@ func TestNativeV3OfficialHistoricalEvidenceCannotInfluenceInternalQueryOrWrite(t
 		OwnerAgent: true, Model: "deepseek-v4-pro", MaxTurns: 3,
 	})
 	loop.chatFn = chatCall
-	out, err := loop.HandleMessage(t.Context(), 42, "昨天 Kimi 官方状态是什么？")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "昨天 Kimi 官方状态是什么？")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1363,7 +1363,7 @@ func TestHistoricalFeedbackSummaryCannotInfluenceInternalQueryOrWrite(t *testing
 		OwnerAgent: true, Model: "deepseek-v4-pro", MaxTurns: 3,
 	})
 	loop.chatFn = chatCall
-	out, err := loop.HandleMessage(t.Context(), 42, "刚才那条为什么误判？")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "刚才那条为什么误判？")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -523,6 +523,38 @@
     {
       "path": "132_agent_first_legacy_protocol_write_fence.sql",
       "sha256": "23986419faf563c7436e9aed699bfba53d9a018177553306bea76d3dba7ed555"
+    },
+    {
+      "path": "133_interactive_agent_policy_manifest.sql",
+      "sha256": "cdbaad2e5e2c726fea6c6c90ad47506a98740b99060861ac38b83b1f008230c5"
+    },
+    {
+      "path": "134_multi_workspace_identity.sql",
+      "sha256": "284cf97d364508d8e751a5256066041dadd89feab0464fd958556558d59f0ab5"
+    },
+    {
+      "path": "135_user_capability_foundation.sql",
+      "sha256": "41684e2b6c28e5ae76ff9da9307833ea6bf5b51e9a84ed95760e4ab4f77950e8"
+    },
+    {
+      "path": "136_team_task_isolation.sql",
+      "sha256": "f6452c75993168de8905ca6c29f60b91b2391b08381dedfea3283ce05b1ce02a"
+    },
+    {
+      "path": "137_account_email_security_lifecycle.sql",
+      "sha256": "b8d807b66162742dbffee9c9b990a680e2e4ddbd68ee875604c603f45cb8164d"
+    },
+    {
+      "path": "138_workspace_long_term_memory.sql",
+      "sha256": "52511c64c7c7b9f54020de2bc62879601d6ce132042a64088a8fd7f684cbb0bc"
+    },
+    {
+      "path": "139_scoped_a2a_access_tokens.sql",
+      "sha256": "0e6936ebc1b0631ceaedd74b4cc216692c90b27829205437a8468d4b96c12a83"
+    },
+    {
+      "path": "140_scoped_a2a_principal_tasks.sql",
+      "sha256": "5653d8b8a11fed12980a64a7b760dd2a0a08705ce61ea21b723db7b12da15695"
     }
   ],
   "schema": "vane.migrations/v1"

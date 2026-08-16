@@ -27,11 +27,9 @@ func newTestServer(t *testing.T, content *fakeContent) (*httptest.Server, *fakeT
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	if _, err := Mount(mux, Deps{
-		Storage: storage,
-		Content: content,
-		Token:   testToken,
-		BaseURL: srv.URL + "/a2a",
-		Version: "0.5.0-test",
+		Storage: storage, Content: content,
+		Authenticator: exactTestAuthenticator{token: testToken},
+		BaseURL:       srv.URL + "/a2a", Version: "0.5.0-test",
 	}); err != nil {
 		t.Fatalf("Mount 失败: %v", err)
 	}
@@ -101,6 +99,24 @@ func TestPostA2AUnauthorized(t *testing.T) {
 		if resp.Header.Get("WWW-Authenticate") != "Bearer" {
 			t.Error("401 应带 WWW-Authenticate: Bearer")
 		}
+	}
+}
+
+func TestPostA2ARequestBodyBounded(t *testing.T) {
+	srv, _ := newTestServer(t, &fakeContent{})
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/a2a",
+		strings.NewReader(strings.Repeat("x", int(maxA2ARequestBytes)+1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized A2A body status=%d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
 	}
 }
 

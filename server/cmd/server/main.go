@@ -20,6 +20,7 @@ import (
 
 	"github.com/YouToco/vane/server/a2a"
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/agentpolicy"
 	"github.com/YouToco/vane/server/api"
 	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/cardgen"
@@ -31,6 +32,7 @@ import (
 	"github.com/YouToco/vane/server/feishu"
 	"github.com/YouToco/vane/server/fetcher"
 	"github.com/YouToco/vane/server/llm"
+	"github.com/YouToco/vane/server/mailer"
 	"github.com/YouToco/vane/server/periodicbrief"
 	"github.com/YouToco/vane/server/profilehint"
 	"github.com/YouToco/vane/server/pusheffect"
@@ -102,6 +104,18 @@ func run() error {
 	cfg, err := config.Load("")
 	if err != nil {
 		return fmt.Errorf("加载配置: %w", err)
+	}
+	var securityMailer api.SecurityMailer
+	if cfg.SMTP.Enabled {
+		securityMailer, err = mailer.NewSMTP(mailer.Config{
+			Host: cfg.SMTP.Host, Port: cfg.SMTP.Port,
+			Username: cfg.SMTP.Username, Password: cfg.SMTP.Password,
+			From: cfg.SMTP.From, TLSMode: mailer.TLSMode(cfg.SMTP.TLSMode),
+			ServerName: cfg.SMTP.ServerName,
+		})
+		if err != nil {
+			return fmt.Errorf("初始化账号安全邮件服务: %w", err)
+		}
 	}
 	// The owner surface always contains manage_tasks create. Fail before the
 	// first Store connection (and therefore before workers or ingress) instead
@@ -755,12 +769,15 @@ func run() error {
 		authorizer, endpoints, exaTools,
 	)
 	agentLoop, err := agent.NewChecked(agent.Deps{
-		Client:           agentLLMClient,
-		Recorder:         recorder,
-		Store:            st,
-		Profiles:         st,
-		Tools:            tools,
-		Model:            cfg.LLM.AgentModel,
+		Client:   agentLLMClient,
+		Recorder: recorder,
+		Store:    st,
+		Profiles: st,
+		Tools:    tools,
+		Policy: func() *agentpolicy.DefinitionV1 {
+			policy := agentpolicy.CurrentOwnerV1(cfg.LLM.Provider, cfg.LLM.AgentModel)
+			return &policy
+		}(),
 		MaxTurns:         cfg.Agent.MaxTurns,
 		SessionTTL:       time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
 		SessionAdmission: sessionAdmission,
@@ -791,13 +808,15 @@ func run() error {
 		}
 		var loopErr error
 		a2aLoop, loopErr = agent.NewChecked(agent.Deps{
-			Client:       agentLLMClient,
-			Recorder:     recorder,
-			Tools:        a2aTools,
-			Model:        cfg.LLM.AgentModel,
-			MaxTurns:     cfg.Agent.MaxTurns,
-			SystemPrompt: a2a.ChatSystemPrompt,
-			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
+			Client:   agentLLMClient,
+			Recorder: recorder,
+			Tools:    a2aTools,
+			Policy: func() *agentpolicy.DefinitionV1 {
+				policy := agentpolicy.CurrentA2AV1(cfg.LLM.Provider, cfg.LLM.AgentModel)
+				return &policy
+			}(),
+			MaxTurns:  cfg.Agent.MaxTurns,
+			ToolCalls: agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
 		})
 		if loopErr != nil {
 			closeServerStartupResources(temporalClient.Close, closeStores)
@@ -1133,18 +1152,20 @@ func run() error {
 	principals := auth.NewOwnerResolver(st, feishu.SettingKeyOwner)
 
 	api.Mount(mux, api.Deps{
-		Store:         st,
-		Auth:          st,
-		Manager:       manager,
-		Scheduler:     sched,
-		TaskAgent:     agentLoop,
-		BriefFeedback: fbSvc,
+		Store:           st,
+		Auth:            st,
+		AccountSecurity: st,
+		SecurityMailer:  securityMailer,
+		Manager:         manager,
+		Scheduler:       sched,
+		TaskAgent:       agentLoop,
+		BriefFeedback:   fbSvc,
 		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
 			ExecutiveBriefWebCanaryScheduleID,
 		ExecutiveBriefWebProjectionAllowAll: cfg.Pipeline.
 			ExecutiveBriefWebProjectionAllowAll,
 		// HTTP 面的 principal 来自会话中间件注入的 ctx（企业级契约 §1.1 的最终形态）；
-		// a2a/gate 无 HTTP 会话，仍用 owner 回退——这正是把 principal 做成接口的价值。
+		// A2A 由独立 hash-only bearer middleware 注入相同 Principal，不再走 owner fallback。
 		Principal: auth.NewContextResolver(),
 		Origin:    cfg.Dashboard.Origin,
 	})
@@ -1159,7 +1180,7 @@ func run() error {
 		// 无论只遗留 1 秒还是 15 分钟都已没有执行者，必须立即置 FAILED。
 		// 失败只记日志不拒启动：清账是尽力而为，不该拖垮服务拉起。
 		cleanupCtx, cancelCleanup := context.WithTimeout(ctx, a2aStartupCleanupTimeout)
-		n, cleanupErr := st.FailStaleA2ATasks(cleanupCtx, time.Now())
+		n, cleanupErr := st.FailStaleA2APrincipalTasks(cleanupCtx, time.Now())
 		cancelCleanup()
 		if cleanupErr != nil {
 			slog.Warn("a2a: 清理滞留任务失败（不阻塞启动）", "err", cleanupErr)
@@ -1168,13 +1189,12 @@ func run() error {
 		}
 
 		a2aRuntime, err = a2a.Mount(mux, a2a.Deps{
-			Storage:   st,
-			Content:   st,
-			Chat:      a2aLoop,
-			Principal: principals,
-			Token:     cfg.A2A.Token,
-			BaseURL:   cfg.A2A.BaseURL,
-			Version:   vaneVersion,
+			Storage:       st,
+			Content:       st,
+			Chat:          a2aLoop,
+			Authenticator: st,
+			BaseURL:       cfg.A2A.BaseURL,
+			Version:       vaneVersion,
 		})
 		if err != nil {
 			stop()

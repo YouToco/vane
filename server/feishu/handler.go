@@ -28,6 +28,7 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/YouToco/vane/server/agent"
+	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/feedback"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/types"
@@ -282,13 +283,19 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 	// agent 已注入时消息交给 agent loop（M4）；未注入（如装配阶段配置不全）
 	// 回退下方 chat_reply 直连——保证任何装配形态下消息都有回应而非崩/沉默。
 	if runner := h.m.agentRunner(); runner != nil {
+		principal, principalErr := h.singleWorkspacePrincipal(ctx, user.ID)
+		if principalErr != nil {
+			slog.Warn("feishu: 用户尚未绑定唯一工作区", "user_id", user.ID, "err", principalErr)
+			h.reply(ctx, msgID, BuildReplyCard("请先在 Vane 网页中选择并绑定本飞书身份要使用的工作区。"))
+			return
+		}
 		// 追问识别（M5 契约 §11）：用户回复某张推送卡时，把原文与解读摘要作为
 		// 定界上下文并入本条消息。只在 agent 链路做——回退路径无会话语义，
 		// 包装无意义。未命中（回复的是普通消息/聊天卡）原样按普通消息处理。
 		externalContext := false
 		if fb := h.m.feedbackRunner(); fb != nil {
 			w, ok, wrapErr := fb.WrapQuestion(
-				ctx, user.ID, h.appID, msgID,
+				ctx, principal, h.appID, msgID,
 				strVal(msg.ParentId), strVal(msg.RootId), text,
 			)
 			if wrapErr != nil {
@@ -309,7 +316,7 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 				externalContext = true
 			}
 		}
-		h.handleWithAgent(ctx, runner, msgID, user.ID, text, externalContext)
+		h.handleWithAgent(ctx, runner, msgID, principal, text, externalContext)
 		return
 	}
 
@@ -335,7 +342,7 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 
 // handleWithAgent sends one natural-language request through the direct Agent
 // control plane and replies with its terminal result.
-func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID string, userID int64, text string, externalContext bool) {
+func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID string, principal auth.Principal, text string, externalContext bool) {
 	// 整条消息的总预算（审查 #信号量瘫痪的纵深防御）：agent 单次模型调用已有
 	// 120s 超时，这里再兜住工具执行/DB 调用同类挂死——连接级 ctx 无 deadline，
 	// 没有这层预算时任何一环黑洞都会让 goroutine 永久滞留。
@@ -345,12 +352,13 @@ func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID
 	var out agent.Outcome
 	var err error
 	if externalContext {
-		out, err = runner.HandleExternalContextMessage(ctx, userID, text)
+		out, err = runner.HandleExternalContextMessage(ctx, principal, text)
 	} else {
-		out, err = runner.HandleMessage(ctx, userID, text)
+		out, err = runner.HandleMessage(ctx, principal, text)
 	}
 	if err != nil {
-		slog.Error("feishu: agent 处理消息失败", "err", err, "user_id", userID)
+		slog.Error("feishu: agent 处理消息失败", "err", err,
+			"tenant_id", principal.TenantID, "user_id", principal.UserID)
 		h.reply(ctx, msgID, BuildReplyCard("这条消息我处理失败了："+humanizeLLMError(err)))
 		return
 	}
@@ -447,13 +455,43 @@ func (h *handler) handleBotMenu(ctx context.Context, event *larkapplication.P2Bo
 	ctx, cancel := context.WithTimeout(ctx, agentMessageBudget)
 	defer cancel()
 
-	out, err := runner.HandleMessage(ctx, user.ID, text)
+	principal, err := h.singleWorkspacePrincipal(ctx, user.ID)
+	if err != nil {
+		h.m.SendCard(ctx, openID, BuildReplyCard("请先在 Vane 网页中选择并绑定本飞书身份要使用的工作区。"))
+		return
+	}
+	out, err := runner.HandleMessage(ctx, principal, text)
 	if err != nil {
 		slog.Error("feishu: 菜单 agent 处理失败", "err", err, "event_key", eventKey)
 		h.m.SendCard(ctx, openID, BuildReplyCard("处理失败："+humanizeLLMError(err)))
 		return
 	}
 	h.m.SendCard(ctx, openID, BuildReplyCard(out.Reply))
+}
+
+// singleWorkspacePrincipal is a fail-closed bridge while workspace-specific
+// Feishu identity bindings are being rolled out. A multi-workspace user is
+// never guessed into one tenant; the product must create an explicit binding.
+func (h *handler) singleWorkspacePrincipal(ctx context.Context, userID int64) (auth.Principal, error) {
+	if h.m.principalForUser != nil {
+		return h.m.principalForUser(ctx, userID)
+	}
+	if h.m.st == nil {
+		return auth.Principal{}, types.NewAppError(
+			types.CodeInternal, "飞书身份解析器未装配", types.ErrInternal)
+	}
+	memberships, err := h.m.st.ListMembershipsByUser(ctx, userID)
+	if err != nil {
+		return auth.Principal{}, err
+	}
+	if len(memberships) != 1 || memberships[0].TenantID <= 0 || !memberships[0].Role.Valid() {
+		return auth.Principal{}, types.NewAppError(
+			types.CodeConflict, "飞书身份未绑定唯一工作区", types.ErrConflict)
+	}
+	return auth.Principal{
+		TenantID: types.TenantID(memberships[0].TenantID), UserID: userID,
+		Role: memberships[0].Role, ActorType: types.ActorTypeUser,
+	}, nil
 }
 
 // feedbackCallbackSyncBudget leaves room under Feishu's callback deadline.
@@ -580,7 +618,11 @@ func (h *handler) onFeedbackReasonSubmit(
 					res = feedback.ClickResult{Toast: "内部错误，请稍后重试"}
 				}
 			}()
-			result, err := fb.HandleReasonSubmit(execCtx, userID, feedback.ReasonSubmit{
+			principal, err := h.singleWorkspacePrincipal(execCtx, userID)
+			if err != nil {
+				return feedback.ClickResult{Toast: "请先绑定本飞书身份要使用的工作区"}
+			}
+			result, err := fb.HandleReasonSubmit(execCtx, principal, feedback.ReasonSubmit{
 				DeliveryID: deliveryID, ReasonCode: reasonCode, Detail: detail,
 			})
 			if err != nil {
@@ -635,7 +677,11 @@ func (h *handler) onFeedbackAction(userID int64, action types.FeedbackAction, de
 					res = feedback.ClickResult{Toast: "内部错误，请稍后重试"}
 				}
 			}()
-			result, err := fb.HandleClick(execCtx, userID, feedback.Click{Action: action, DeliveryID: deliveryID})
+			principal, err := h.singleWorkspacePrincipal(execCtx, userID)
+			if err != nil {
+				return feedback.ClickResult{Toast: "请先绑定本飞书身份要使用的工作区"}
+			}
+			result, err := fb.HandleClick(execCtx, principal, feedback.Click{Action: action, DeliveryID: deliveryID})
 			if err != nil {
 				slog.Error("feishu: 反馈处理失败", "err", err, "delivery_id", deliveryID, "fb", action)
 				return feedback.ClickResult{Toast: "处理失败：" + humanizeLLMError(err)}

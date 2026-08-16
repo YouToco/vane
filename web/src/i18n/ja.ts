@@ -103,6 +103,7 @@ export const ja: Dict = {
       groupAccount: "アカウント",
       profile: "プロフィール",
       channel: "配信チャンネル",
+      members: "メンバーと招待",
       admin: "管理画面",
       logout: "ログアウト",
       tagline: "AI インテリジェンス",
@@ -267,6 +268,7 @@ export const ja: Dict = {
       title: "設定",
       tabProfile: "プロフィール",
       tabChannel: "配信チャンネル",
+      tabMembers: "メンバーと招待",
       channelZhOnly:
         "このセットアップガイドは Feishu（中国版）開発者コンソール向けで、現在中国語のみです。",
     },

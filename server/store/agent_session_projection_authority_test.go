@@ -279,7 +279,7 @@ func TestAgentSessionProjectionAuthorityPublicAppendUsesLedgerBaseAndReplays(
 		t.Fatalf("changed append replay error=%v, want conflict", err)
 	}
 	session, err := f.store.GetActiveAgentSession(
-		ctx, scope.UserID, time.Now().Add(-time.Hour),
+		ctx, scope.TenantID, scope.UserID, time.Now().Add(-time.Hour),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -354,7 +354,7 @@ func TestAgentSessionProjectionAuthorityActivationRacesSideWriter(
 				t.Fatalf("race status=%+v", status)
 			}
 			session, err := f.store.GetActiveAgentSession(
-				ctx, scope.UserID, time.Now().Add(-time.Hour),
+				ctx, scope.TenantID, scope.UserID, time.Now().Add(-time.Hour),
 			)
 			if err != nil {
 				t.Fatal(err)

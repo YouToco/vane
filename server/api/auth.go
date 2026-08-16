@@ -211,6 +211,9 @@ func (s *server) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 // resolveTenant 取用户所属租户。当前每用户恒 1 个（D8：初期每租户 1 人），
 // 多租户成员出现后这里要改成「按请求选租户」，届时会话仍钉住选定的那个。
 func (s *server) resolveTenant(r *http.Request, userID int64) (int64, error) {
+	if workspaces, ok := s.workspaceStore(); ok {
+		return workspaces.DefaultWorkspaceForUser(r.Context(), userID)
+	}
 	ms, err := s.deps.Auth.ListMembershipsByUser(r.Context(), userID)
 	if err != nil {
 		return 0, err
@@ -305,9 +308,19 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("me: 查询用户邮箱失败，降级为空", "user_id", p.UserID, "err", eerr)
 		email = ""
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"ok": true, "user_id": p.UserID, "tenant_id": int64(p.TenantID), "email": email,
-	})
+		"role": p.Role, "actor_type": p.ActorType,
+	}
+	if workspaces, ok := s.workspaceStore(); ok {
+		items, werr := workspaces.ListWorkspacesForUser(r.Context(), p.UserID)
+		if werr != nil {
+			slog.Warn("me: 查询工作区列表失败，降级为当前工作区", "user_id", p.UserID, "err", werr)
+		} else {
+			response["workspaces"] = items
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // requireSession 是 /api/* 的认证中间件：校验会话 cookie → 把 principal 注入 ctx。
@@ -333,8 +346,10 @@ func (s *server) requireSession(next http.Handler) http.Handler {
 			return
 		}
 		ctx := auth.WithPrincipal(r.Context(), auth.Principal{
-			TenantID: types.TenantID(sess.TenantID),
-			UserID:   sess.UserID,
+			TenantID:  types.TenantID(sess.TenantID),
+			UserID:    sess.UserID,
+			Role:      sess.Role,
+			ActorType: sess.ActorType,
 		})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -344,5 +359,9 @@ func (s *server) requireSession(next http.Handler) http.Handler {
 // 写成显式白名单而非前缀匹配：`/api/auth/` 前缀会连 logout/me 一起放行，
 // 而那两个需要会话。
 func isPublicAuthPath(p string) bool {
-	return p == "/api/auth/login" || p == "/api/auth/register"
+	return p == "/api/auth/login" || p == "/api/auth/register" ||
+		p == "/api/auth/workspace-invites/register" ||
+		p == "/api/auth/email-verification/verify" ||
+		p == "/api/auth/password-reset/request" ||
+		p == "/api/auth/password-reset/complete"
 }

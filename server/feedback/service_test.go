@@ -131,7 +131,7 @@ func TestHandleReasonSubmit_LegacyFreeTextNormalizesToTypedOther(t *testing.T) {
 	h := newHarness(t)
 
 	result, err := h.svc.HandleReasonSubmit(
-		context.Background(), testUserID, ReasonSubmit{
+		context.Background(), testPrincipal(testUserID), ReasonSubmit{
 			DeliveryID: testDeliveryID,
 			Detail:     "旧卡只有文字原因",
 		})
@@ -204,7 +204,7 @@ func TestHandleClick_ForeignOrMissingDeliveryHasNoSideEffect(t *testing.T) {
 				types.FeedbackActionMisjudged,
 				types.FeedbackActionDeepDive,
 			} {
-				res, err := h.svc.HandleClick(context.Background(), tc.userID,
+				res, err := h.svc.HandleClick(context.Background(), testPrincipal(tc.userID),
 					Click{Action: action, DeliveryID: tc.deliveryID})
 				if err != nil {
 					t.Fatalf("%s 应返回人话 toast 而非 error: %v", action, err)
@@ -231,7 +231,7 @@ func TestHandleClick_ForeignOrMissingDeliveryHasNoSideEffect(t *testing.T) {
 // 未知动作是纵深兜底（feishu 侧白名单已挡）：人话 toast、零副作用。
 func TestHandleClick_UnknownActionRejected(t *testing.T) {
 	h := newHarness(t)
-	res, err := h.svc.HandleClick(context.Background(), testUserID,
+	res, err := h.svc.HandleClick(context.Background(), testPrincipal(testUserID),
 		Click{Action: types.FeedbackAction("rm -rf"), DeliveryID: testDeliveryID})
 	if err != nil {
 		t.Fatalf("未知动作不应报错: %v", err)
@@ -276,7 +276,7 @@ func TestHandleClick_DatabaseErrorPropagates(t *testing.T) {
 	h := newHarness(t)
 	h.st.getDeliveryErr = databaseErr("fake: 连接断开")
 
-	if _, err := h.svc.HandleClick(context.Background(), testUserID,
+	if _, err := h.svc.HandleClick(context.Background(), testPrincipal(testUserID),
 		Click{Action: types.FeedbackActionInterested, DeliveryID: testDeliveryID}); err == nil {
 		t.Fatal("DB 故障应上抛 error")
 	}
@@ -288,7 +288,7 @@ func TestHandleClick_CardStateQueryFailureDegradesToNoCard(t *testing.T) {
 	// 先让插入成功，再让状态重查（HasFeedback）失败。
 	h.st.hasErr = databaseErr("fake: 状态重查失败")
 
-	res, err := h.svc.HandleClick(context.Background(), testUserID,
+	res, err := h.svc.HandleClick(context.Background(), testPrincipal(testUserID),
 		Click{Action: types.FeedbackActionInterested, DeliveryID: testDeliveryID})
 	if err != nil {
 		t.Fatalf("重查失败不应把已成功的反馈报成失败: %v", err)

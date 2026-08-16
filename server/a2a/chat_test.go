@@ -30,11 +30,11 @@ type fakeChat struct {
 	calls      int
 }
 
-func (f *fakeChat) RunOnce(_ context.Context, userID int64, history []llm.ChatMessage, text string) (agent.Outcome, []llm.ChatMessage, error) {
+func (f *fakeChat) RunOnce(_ context.Context, principal auth.Principal, history []llm.ChatMessage, text string) (agent.Outcome, []llm.ChatMessage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	f.gotUserID, f.gotHistory, f.gotText = userID, history, text
+	f.gotUserID, f.gotHistory, f.gotText = principal.UserID, history, text
 	if f.err != nil {
 		return agent.Outcome{}, nil, f.err
 	}
@@ -56,7 +56,7 @@ func (f *fakeOwner) GetSetting(_ context.Context, key string) (json.RawMessage, 
 }
 
 func (f *fakeOwner) ListMembershipsByUser(_ context.Context, userID int64) ([]types.Membership, error) {
-	return []types.Membership{{TenantID: 1, UserID: userID}}, nil
+	return []types.Membership{{TenantID: 1, UserID: userID, Role: types.MembershipRoleOwner}}, nil
 }
 
 func (f *fakeOwner) UpsertUserByOpenID(_ context.Context, openID, name string) (*types.User, error) {
@@ -101,8 +101,8 @@ func artifactTexts(events []a2a.Event) []string {
 // text part → COMPLETED；owner 身份透传（拍板 §13.2）。
 func TestChatCompleted(t *testing.T) {
 	chat := &fakeChat{reply: "你订了 3 个信源。"}
-	e := newExecutor(Deps{Storage: newFakeTaskStorage(), Chat: chat, Principal: ownerResolver(&fakeOwner{userID: 7})})
-	events := collect(t, e.Execute(context.Background(), newExecCtx(chatMsg("我订了哪些信源？"))))
+	e := newExecutor(Deps{Storage: newFakeTaskStorage(), Chat: chat})
+	events := collect(t, e.Execute(testA2AContext(context.Background()), newExecCtx(chatMsg("我订了哪些信源？"))))
 
 	if got := lastStatus(t, events).Status.State; got != a2a.TaskStateCompleted {
 		t.Fatalf("终态 = %v, 期望 COMPLETED", got)
@@ -111,8 +111,8 @@ func TestChatCompleted(t *testing.T) {
 	if len(texts) != 1 || texts[0] != "你订了 3 个信源。" {
 		t.Errorf("artifact 应恰含 RunOnce 回复，实得 %v", texts)
 	}
-	if chat.gotUserID != 7 {
-		t.Errorf("RunOnce 应以 owner 身份执行（userID=7），实得 %d", chat.gotUserID)
+	if chat.gotUserID != testAuthority.UserID {
+		t.Errorf("RunOnce 应以 bearer principal 身份执行（userID=%d），实得 %d", testAuthority.UserID, chat.gotUserID)
 	}
 	if chat.gotText != "我订了哪些信源？" {
 		t.Errorf("text 透传不符：%q", chat.gotText)
@@ -122,8 +122,8 @@ func TestChatCompleted(t *testing.T) {
 // TestChatRejected 三种 REJECTED：text 缺失、text 空白、未装配 Chat/Owner。
 func TestChatRejected(t *testing.T) {
 	t.Run("text 缺失", func(t *testing.T) {
-		e := newExecutor(Deps{Storage: newFakeTaskStorage(), Chat: &fakeChat{}, Principal: ownerResolver(&fakeOwner{})})
-		events := collect(t, e.Execute(context.Background(),
+		e := newExecutor(Deps{Storage: newFakeTaskStorage(), Chat: &fakeChat{}})
+		events := collect(t, e.Execute(testA2AContext(context.Background()),
 			newExecCtx(textMsg(`{"skill":"assistant.chat"}`))))
 		st := lastStatus(t, events)
 		if st.Status.State != a2a.TaskStateRejected {
@@ -132,7 +132,7 @@ func TestChatRejected(t *testing.T) {
 	})
 	t.Run("未装配 agent 轨", func(t *testing.T) {
 		e := newExecutor(Deps{Storage: newFakeTaskStorage()}) // Chat/Owner 均 nil
-		events := collect(t, e.Execute(context.Background(), newExecCtx(chatMsg("hi"))))
+		events := collect(t, e.Execute(testA2AContext(context.Background()), newExecCtx(chatMsg("hi"))))
 		st := lastStatus(t, events)
 		if st.Status.State != a2a.TaskStateRejected {
 			t.Fatalf("终态 = %v, 期望 REJECTED", st.Status.State)
@@ -143,37 +143,21 @@ func TestChatRejected(t *testing.T) {
 	})
 }
 
-// TestChatFailedSanitized owner 解析失败 / RunOnce 失败 → FAILED，
+// TestChatFailedSanitized Principal 注入缺失 / RunOnce 失败 → FAILED，
 // 对外文案只有 AppError.Message 或固定文案，原始错误链零外泄（契约 §8.1）。
 func TestChatFailedSanitized(t *testing.T) {
-	t.Run("owner 未捕获", func(t *testing.T) {
-		e := newExecutor(Deps{Storage: newFakeTaskStorage(), Chat: &fakeChat{},
-			Principal: ownerResolver(&fakeOwner{settingErr: types.ErrNotFound})})
-		events := collect(t, e.Execute(context.Background(), newExecCtx(chatMsg("hi"))))
-		st := lastStatus(t, events)
-		if st.Status.State != a2a.TaskStateFailed {
-			t.Fatalf("终态 = %v, 期望 FAILED", st.Status.State)
-		}
-		text, _ := firstTextPart(st.Status.Message)
-		if !strings.Contains(text, "初始化") {
-			t.Errorf("应为人话文案，实得 %q", text)
-		}
-	})
-	t.Run("owner open_id 不外泄（B-F1）", func(t *testing.T) {
-		// UpsertUserByOpenID 失败时其 AppError.Message 内嵌 open_id——绝不能进对外事件。
-		e := newExecutor(Deps{Storage: newFakeTaskStorage(),
-			Chat: &fakeChat{},
-			Principal: ownerResolver(&fakeOwner{upsertErr: types.NewAppError(types.CodeDatabase,
-				"upsert 用户（open_id=ou_secret_owner_id）", errors.New("pgx conn"))})})
-		events := collect(t, e.Execute(context.Background(), newExecCtx(chatMsg("hi"))))
+	t.Run("principal 注入缺失", func(t *testing.T) {
+		e := newExecutor(Deps{Storage: newFakeTaskStorage(), Chat: &fakeChat{}})
+		scopeOnly := context.WithValue(context.Background(), authorityContextKey{}, scopeFromTestAuthority())
+		events := collect(t, e.Execute(scopeOnly, newExecCtx(chatMsg("hi"))))
 		st := lastStatus(t, events)
 		if st.Status.State != a2a.TaskStateFailed {
 			t.Fatalf("终态 = %v, 期望 FAILED", st.Status.State)
 		}
 		for _, ev := range events {
 			raw, _ := json.Marshal(ev)
-			if strings.Contains(string(raw), "ou_secret_owner_id") || strings.Contains(string(raw), "open_id") {
-				t.Fatalf("owner open_id 外泄进事件: %s", raw)
+			if strings.Contains(string(raw), "请求上下文缺少") {
+				t.Fatalf("内部 principal 错误外泄进事件: %s", raw)
 			}
 		}
 	})
@@ -181,9 +165,8 @@ func TestChatFailedSanitized(t *testing.T) {
 		// 模拟 llm.mapHTTPError 形态：AppError.Message 含上游响应体全文。
 		e := newExecutor(Deps{Storage: newFakeTaskStorage(),
 			Chat: &fakeChat{err: types.NewAppError(types.CodeLLMUnavailable,
-				`llm: 上游返回 HTTP 429: {"error":"rate limited","request_id":"req_secret_abc","input":"用户原文片段"}`, nil)},
-			Principal: ownerResolver(&fakeOwner{userID: 7})})
-		events := collect(t, e.Execute(context.Background(), newExecCtx(chatMsg("hi"))))
+				`llm: 上游返回 HTTP 429: {"error":"rate limited","request_id":"req_secret_abc","input":"用户原文片段"}`, nil)}})
+		events := collect(t, e.Execute(testA2AContext(context.Background()), newExecCtx(chatMsg("hi"))))
 		st := lastStatus(t, events)
 		if st.Status.State != a2a.TaskStateFailed {
 			t.Fatalf("终态 = %v, 期望 FAILED", st.Status.State)
@@ -218,6 +201,8 @@ func seedChatTask(t *testing.T, st *fakeTaskStorage, id, contextID, inputText, r
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.rows[id] = &types.A2ATask{
+		TenantID: testAuthority.TenantID, PrincipalUserID: testAuthority.UserID,
+		ActorType: testAuthority.ActorType, CreatedByToken: testAuthority.TokenID,
 		ID: id, ContextID: contextID, Status: string(a2a.TaskStateCompleted),
 		Task: raw, Version: 1, CreatedAt: createdAt, UpdatedAt: createdAt,
 	}
@@ -236,8 +221,8 @@ func TestChatHistoryRebuild(t *testing.T) {
 	seedChatTask(t, st, "t4", "ctx-other", `{"skill":"assistant.chat","text":"别的对话"}`, "别的回答", base.Add(3*time.Minute))
 
 	chat := &fakeChat{reply: "第三答"}
-	e := newExecutor(Deps{Storage: st, Chat: chat, Principal: ownerResolver(&fakeOwner{userID: 7})})
-	events := collect(t, e.Execute(context.Background(), newExecCtx(chatMsg("第三问"))))
+	e := newExecutor(Deps{Storage: st, Chat: chat})
+	events := collect(t, e.Execute(testA2AContext(context.Background()), newExecCtx(chatMsg("第三问"))))
 
 	if got := lastStatus(t, events).Status.State; got != a2a.TaskStateCompleted {
 		t.Fatalf("终态 = %v, 期望 COMPLETED", got)
@@ -258,19 +243,22 @@ func TestChatHistoryRebuild(t *testing.T) {
 	}
 }
 
-// TestChatHistoryDegradesOnError 历史查询失败降级为空历史继续（历史是增强不是门槛），
-// 任务照常 COMPLETED。
-func TestChatHistoryDegradesOnError(t *testing.T) {
+// TestChatHistoryFailsClosedBeforePaidCall: history loading is the final live
+// credential fence. A revoked authority must not become an empty history and
+// then a paid model call.
+func TestChatHistoryFailsClosedBeforePaidCall(t *testing.T) {
 	st := newFakeTaskStorage()
 	st.listErr = errors.New("db down")
 	chat := &fakeChat{reply: "ok"}
-	e := newExecutor(Deps{Storage: st, Chat: chat, Principal: ownerResolver(&fakeOwner{userID: 7})})
-	events := collect(t, e.Execute(context.Background(), newExecCtx(chatMsg("hi"))))
+	e := newExecutor(Deps{Storage: st, Chat: chat})
+	events := collect(t, e.Execute(testA2AContext(context.Background()), newExecCtx(chatMsg("hi"))))
 
-	if got := lastStatus(t, events).Status.State; got != a2a.TaskStateCompleted {
-		t.Fatalf("终态 = %v, 期望 COMPLETED（历史失败不该拖垮任务）", got)
+	if got := lastStatus(t, events).Status.State; got != a2a.TaskStateFailed {
+		t.Fatalf("终态 = %v, 期望 FAILED", got)
 	}
-	if len(chat.gotHistory) != 0 {
-		t.Errorf("历史查询失败应传空历史，实得 %+v", chat.gotHistory)
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if chat.calls != 0 {
+		t.Fatalf("authority fence 失败后仍调用模型 %d 次", chat.calls)
 	}
 }

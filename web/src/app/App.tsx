@@ -5,6 +5,7 @@ import type { MeResponse } from "@/shared/api/client";
 
 const Landing = lazy(() => import("@/pages/Landing"));
 const Login = lazy(() => import("@/pages/Login"));
+const AccountSecurity = lazy(() => import("@/pages/AccountSecurity"));
 const AuthenticatedApp = lazy(() => import("./AuthenticatedApp"));
 
 function useHash(): string {
@@ -31,6 +32,10 @@ function AppFallback() {
 
 export default function App() {
   const hash = useHash();
+  const isAccountSecurityRoute =
+    hash === "#/forgot-password" ||
+    hash.startsWith("#/verify-email?") ||
+    hash.startsWith("#/reset-password?");
   // me 三态：undefined=探测中，null=未登录，对象=已登录（含用户块所需 email）。
   const [me, setMe] = useState<MeResponse | null | undefined>(undefined);
 
@@ -41,11 +46,15 @@ export default function App() {
       .catch(() => setMe(null));
   }, []);
 
-  if (me === undefined && hash !== "#/login") return <AppFallback />;
+  if (me === undefined && hash !== "#/login" && !isAccountSecurityRoute) {
+    return <AppFallback />;
+  }
 
   return (
     <Suspense fallback={<AppFallback />}>
-      {hash === "#/login" ? (
+      {isAccountSecurityRoute ? (
+        <AccountSecurity hash={hash} />
+      ) : hash === "#/login" ? (
         <Login />
       ) : me === null ? (
         <Landing />

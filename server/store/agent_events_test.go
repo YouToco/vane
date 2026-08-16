@@ -944,7 +944,7 @@ func TestGetActiveAgentSessionLedgerAuthorityFailsClosedAndRollbackRestoresLegac
 	}
 
 	got, err := f.store.GetActiveAgentSession(
-		ctx, f.userA, time.Now().Add(-time.Hour),
+		ctx, f.tenantA, f.userA, time.Now().Add(-time.Hour),
 	)
 	if err != nil {
 		t.Fatalf("ledger-authoritative read: %v", err)
@@ -960,7 +960,7 @@ func TestGetActiveAgentSessionLedgerAuthorityFailsClosedAndRollbackRestoresLegac
 		t.Fatal(err)
 	}
 	if _, err := f.store.GetActiveAgentSession(
-		ctx, f.userA, time.Now().Add(-time.Hour),
+		ctx, f.tenantA, f.userA, time.Now().Add(-time.Hour),
 	); err == nil {
 		t.Fatal("ledger-authoritative read accepted a mismatched legacy replica")
 	}
@@ -996,7 +996,7 @@ func TestGetActiveAgentSessionLedgerAuthorityFailsClosedAndRollbackRestoresLegac
 	}
 	updateAgentSessionProjectionFixture(t, f, legacyAfterRollback)
 	got, err = f.store.GetActiveAgentSession(
-		ctx, f.userA, time.Now().Add(-time.Hour),
+		ctx, f.tenantA, f.userA, time.Now().Add(-time.Hour),
 	)
 	if err != nil {
 		t.Fatalf("legacy read after rollback: %v", err)
@@ -1033,7 +1033,7 @@ func TestGetActiveAgentSessionLedgerAuthorityRejectsUnavailableLedger(
 		f := newAgentEventFixture(t)
 		insertInvalidAgentSessionProjectionAuthorityFixture(t, f)
 		if _, err := f.store.GetActiveAgentSession(
-			t.Context(), f.userA, time.Now().Add(-time.Hour),
+			t.Context(), f.tenantA, f.userA, time.Now().Add(-time.Hour),
 		); err == nil {
 			t.Fatal("ledger-authoritative read accepted an empty ledger")
 		}
@@ -1057,7 +1057,7 @@ func TestGetActiveAgentSessionLedgerAuthorityRejectsUnavailableLedger(
 			t.Fatal(err)
 		}
 		if _, err := f.store.GetActiveAgentSession(
-			t.Context(), f.userA, time.Now().Add(-time.Hour),
+			t.Context(), f.tenantA, f.userA, time.Now().Add(-time.Hour),
 		); err == nil {
 			t.Fatal("ledger-authoritative read accepted an incomplete batch")
 		}
@@ -1082,7 +1082,7 @@ func TestGetActiveAgentSessionLedgerAuthorityRejectsUnavailableLedger(
 			t.Fatal(err)
 		}
 		if _, err := f.store.GetActiveAgentSession(
-			t.Context(), f.userA, time.Now().Add(-time.Hour),
+			t.Context(), f.tenantA, f.userA, time.Now().Add(-time.Hour),
 		); err == nil {
 			t.Fatal("ledger-authoritative read accepted a corrupt event payload")
 		}
@@ -1137,7 +1137,7 @@ func TestActiveAgentSessionReadSnapshotDoesNotTearAcrossCutover(
 	}
 
 	fresh, err := f.store.GetActiveAgentSession(
-		t.Context(), f.userA, time.Now().Add(-time.Hour),
+		t.Context(), f.tenantA, f.userA, time.Now().Add(-time.Hour),
 	)
 	if err != nil {
 		t.Fatalf("fresh ledger-authoritative read: %v", err)

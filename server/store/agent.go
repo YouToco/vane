@@ -32,7 +32,11 @@ func scanAgentSession(row pgx.Row, as *types.AgentSession) error {
 // 用户消息基本串行到达，两条消息同时触发时 UPDATE 靠行锁串行化，后到者空转一次，
 // 不会产生错误结果，故不用 SELECT FOR UPDATE。翻转刻意不动 updated_at——
 // 保留"最后活跃时间"语义供排查。
-func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error) {
+func (s *Store) GetActiveAgentSession(ctx context.Context, tenantID, userID int64, since time.Time) (*types.AgentSession, error) {
+	if tenantID <= 0 || userID <= 0 {
+		return nil, types.NewAppError(types.CodeValidation,
+			"Agent 会话工作区身份无效", types.ErrValidation)
+	}
 	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
@@ -51,14 +55,14 @@ func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since t
 	err = scanAgentSession(tx.QueryRow(ctx,
 		`WITH stale AS (
 			UPDATE agent_sessions SET status = $3
-			WHERE user_id = $1 AND status = $4 AND updated_at < $2
+			WHERE tenant_id = $5 AND user_id = $1 AND status = $4 AND updated_at < $2
 		 )
 		 SELECT `+agentSessionColumns+`
 		 FROM agent_sessions
-		 WHERE user_id = $1 AND status = $4 AND updated_at >= $2
+		 WHERE tenant_id = $5 AND user_id = $1 AND status = $4 AND updated_at >= $2
 		 ORDER BY updated_at DESC
 		 LIMIT 1`,
-		userID, since, types.AgentSessionStatusExpired, types.AgentSessionStatusActive), &as)
+		userID, since, types.AgentSessionStatusExpired, types.AgentSessionStatusActive, tenantID), &as)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Preserve the legacy data-modifying CTE semantics: stale rows
@@ -88,12 +92,25 @@ func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since t
 
 // CreateAgentSession 新建 active 会话（messages / turn_count 走表默认 '[]' / 0）。
 // RETURNING 全列，调用方拿到的实体恒为数据库当前真实状态。
-func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error) {
+func (s *Store) CreateAgentSession(ctx context.Context, tenantID, userID int64) (*types.AgentSession, error) {
+	if tenantID <= 0 || userID <= 0 {
+		return nil, types.NewAppError(types.CodeValidation,
+			"Agent 会话工作区身份无效", types.ErrValidation)
+	}
 	var as types.AgentSession
 	err := scanAgentSession(s.pool.QueryRow(ctx,
-		`INSERT INTO agent_sessions (tenant_id, user_id) VALUES (`+tenantOfUser+`$1), $1)
-		 RETURNING `+agentSessionColumns, userID), &as)
+		`INSERT INTO agent_sessions (tenant_id, user_id)
+		 SELECT $1,$2
+		 WHERE EXISTS (
+			SELECT 1 FROM memberships
+			WHERE tenant_id=$1 AND user_id=$2
+		 )
+		 RETURNING `+agentSessionColumns, tenantID, userID), &as)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, types.NewAppError(types.CodeForbidden,
+				"当前用户不是该工作区成员", types.ErrForbidden)
+		}
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("新建 agent 会话（user=%d）", userID), err)
 	}

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"strconv"
@@ -186,10 +187,19 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		ctx, cancel := cleanupContext()
 		defer cancel()
 		_, _ = database.ExecContext(ctx, `ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`)
-		_ = DeprovisionServerRuntime(ctx, scratchURL)
+		_ = callServerRuntimeProvisioner(
+			ctx, scratchURL, "deprovision_vane_server_runtime_v129")
 	})
 	if _, err := provider.UpTo(t.Context(), 129); err != nil {
 		t.Fatal(err)
+	}
+	provisionV129 := func(ctx context.Context) error {
+		return callServerRuntimeProvisioner(
+			ctx, scratchURL, "provision_vane_server_runtime_v129")
+	}
+	deprovisionV129 := func(ctx context.Context) error {
+		return callServerRuntimeProvisioner(
+			ctx, scratchURL, "deprovision_vane_server_runtime_v129")
 	}
 	assertMembershipColumns := func(want bool) {
 		t.Helper()
@@ -250,7 +260,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		if _, err := database.ExecContext(t.Context(), mutation.revoke); err != nil {
 			t.Fatalf("revoke %s: %v", mutation.name, err)
 		}
-		if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+		if err := provisionV129(t.Context()); err == nil ||
 			!strings.Contains(err.Error(), "required authorities") {
 			t.Fatalf("provision accepted missing %s: %v", mutation.name, err)
 		}
@@ -263,7 +273,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		`GRANT SELECT ON memory_records TO vane_memory_editor WITH GRANT OPTION`); err != nil {
 		t.Fatal(err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+	if err := provisionV129(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "unexpected authorities") {
 		t.Fatalf("provision accepted grant-option drift: %v", err)
 	}
@@ -280,7 +290,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 	END $body$`); err != nil {
 		t.Fatal(err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+	if err := provisionV129(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "unexpected authorities") {
 		t.Fatalf("provision accepted database CONNECT authority: %v", err)
 	}
@@ -295,7 +305,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		`GRANT SELECT ON agent_sessions TO vane_memory_editor`); err != nil {
 		t.Fatal(err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+	if err := provisionV129(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "unexpected authorities") {
 		t.Fatalf("provision accepted extra relation ACL: %v", err)
 	}
@@ -307,7 +317,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		`GRANT vane_memory_editor TO vane_app WITH SET TRUE, INHERIT FALSE`); err != nil {
 		t.Fatal(err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
+	if err := provisionV129(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "membership drift") {
 		t.Fatalf("provision accepted extra memory member: %v", err)
 	}
@@ -315,14 +325,14 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		`REVOKE vane_memory_editor FROM vane_app`); err != nil {
 		t.Fatal(err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := provisionV129(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	assertRuntimeMemoryMembership(true)
 	// Provisioning is a deploy/restart reconciliation operation, not a one-shot
 	// migration. The v129 wrapper must remain idempotent even though the frozen
 	// v098 validator only knows the historical role set.
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := provisionV129(t.Context()); err != nil {
 		t.Fatalf("second exact v129 provision: %v", err)
 	}
 	assertRuntimeMemoryMembership(true)
@@ -345,7 +355,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 		!strings.Contains(err.Error(), "deprovision vane_server_runtime") {
 		t.Fatalf("migration 129 Down accepted retained runtime: %v", err)
 	}
-	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := deprovisionV129(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(t.Context(), 128); err != nil {
@@ -353,7 +363,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 	}
 	assertMembershipColumns(false)
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
-		!strings.Contains(err.Error(), "provision_vane_server_runtime_v129") {
+		!strings.Contains(err.Error(), "provision_vane_server_runtime_v138") {
 		t.Fatalf("current provisioner silently fell back after Down: %v", err)
 	}
 }

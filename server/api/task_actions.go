@@ -85,7 +85,7 @@ func (s *server) handleExecuteTaskAction(w http.ResponseWriter, r *http.Request)
 	defer s.finishTaskActionExecution(userID)
 
 	outcome, err := s.deps.TaskAgent.HandleWebTaskActionMessage(
-		r.Context(), userID, operationID, req.TaskID, req.Text,
+		r.Context(), principal, operationID, req.TaskID, req.Text,
 	)
 	if err != nil {
 		writeAppError(w, err)

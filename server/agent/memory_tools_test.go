@@ -12,25 +12,62 @@ import (
 )
 
 type fakeAgentMemoryStore struct {
-	tenantID, userID int64
-	key              string
-	action           types.MemoryAction
-	query            types.MemoryRecallQuery
-	getID            int64
-	memory           *types.MemoryRecord
-	actionResult     *types.MemoryActionResult
-	recallResult     *types.MemoryRecallResult
-	err              error
-	authorizationID  string
-	prepareCalls     int
-	preparedAction   types.MemoryAction
+	tenantID, userID      int64
+	sessionID             int64
+	key                   string
+	action                types.MemoryAction
+	query                 types.MemoryRecallQuery
+	getID                 int64
+	memory                *types.MemoryRecord
+	actionResult          *types.MemoryActionResult
+	recallResult          *types.MemoryRecallResult
+	err                   error
+	authorizationID       string
+	prepareCalls          int
+	preparedAction        types.MemoryAction
+	workspaceKind         types.WorkspaceKind
+	workspaceRole         types.MembershipRole
+	workspaceErr          error
+	workspacePrepareErr   error
+	workspaceApplyErr     error
+	workspaceRecallErr    error
+	workspaceActionResult *types.MemoryActionResult
+	workspaceRecallResult *types.MemoryRecallResult
+	workspacePrepareCalls int
+	workspaceApplyCalls   int
+	workspaceRecallCalls  int
+	personalGetCalls      int
+	personalPrepareCalls  int
+	personalApplyCalls    int
+	personalRecallCalls   int
+	resolveCalls          int
+}
+
+func (f *fakeAgentMemoryStore) GetWorkspaceForUser(
+	_ context.Context, tenantID, userID int64,
+) (*types.Workspace, error) {
+	f.resolveCalls++
+	f.tenantID, f.userID = tenantID, userID
+	if f.workspaceErr != nil {
+		return nil, f.workspaceErr
+	}
+	kind := f.workspaceKind
+	if kind == "" {
+		kind = types.WorkspaceKindPersonal
+	}
+	role := f.workspaceRole
+	if role == "" {
+		role = types.MembershipRoleOwner
+	}
+	return &types.Workspace{ID: tenantID, Kind: kind, Role: role}, nil
 }
 
 func (f *fakeAgentMemoryStore) PrepareMemoryAuthorization(
-	_ context.Context, tenantID, userID, _ int64, action types.MemoryAction,
+	_ context.Context, tenantID, userID, sessionID int64, action types.MemoryAction,
 ) (string, error) {
-	f.tenantID, f.userID = tenantID, userID
+	f.tenantID, f.userID, f.sessionID = tenantID, userID, sessionID
 	f.prepareCalls++
+	f.personalPrepareCalls++
 	f.preparedAction = action
 	if f.authorizationID == "" {
 		f.authorizationID = "922b377b-12e6-4958-b8d1-fcfb3d7708e3"
@@ -42,6 +79,7 @@ func (f *fakeAgentMemoryStore) GetMemory(
 	_ context.Context, tenantID, userID, memoryID int64,
 ) (*types.MemoryRecord, error) {
 	f.tenantID, f.userID, f.getID = tenantID, userID, memoryID
+	f.personalGetCalls++
 	return f.memory, f.err
 }
 
@@ -49,6 +87,7 @@ func (f *fakeAgentMemoryStore) ApplyMemoryAction(
 	_ context.Context, tenantID, userID int64, key string, action types.MemoryAction,
 ) (*types.MemoryActionResult, error) {
 	f.tenantID, f.userID, f.key, f.action = tenantID, userID, key, action
+	f.personalApplyCalls++
 	return f.actionResult, f.err
 }
 
@@ -56,7 +95,37 @@ func (f *fakeAgentMemoryStore) RecallMemories(
 	_ context.Context, tenantID, userID int64, query types.MemoryRecallQuery,
 ) (*types.MemoryRecallResult, error) {
 	f.tenantID, f.userID, f.query = tenantID, userID, query
+	f.personalRecallCalls++
 	return f.recallResult, f.err
+}
+
+func (f *fakeAgentMemoryStore) PrepareWorkspaceMemoryAuthorization(
+	_ context.Context, tenantID, userID, sessionID int64, action types.MemoryAction,
+) (string, error) {
+	f.tenantID, f.userID, f.sessionID = tenantID, userID, sessionID
+	f.workspacePrepareCalls++
+	f.prepareCalls++
+	f.preparedAction = action
+	if f.authorizationID == "" {
+		f.authorizationID = "922b377b-12e6-4958-b8d1-fcfb3d7708e3"
+	}
+	return f.authorizationID, f.workspacePrepareErr
+}
+
+func (f *fakeAgentMemoryStore) ApplyWorkspaceMemoryAction(
+	_ context.Context, tenantID, userID int64, key string, action types.MemoryAction,
+) (*types.MemoryActionResult, error) {
+	f.tenantID, f.userID, f.key, f.action = tenantID, userID, key, action
+	f.workspaceApplyCalls++
+	return f.workspaceActionResult, f.workspaceApplyErr
+}
+
+func (f *fakeAgentMemoryStore) RecallWorkspaceMemories(
+	_ context.Context, tenantID, userID int64, query types.MemoryRecallQuery,
+) (*types.MemoryRecallResult, error) {
+	f.tenantID, f.userID, f.query = tenantID, userID, query
+	f.workspaceRecallCalls++
+	return f.workspaceRecallResult, f.workspaceRecallErr
 }
 
 func memoryToolContext(ownerRequest string) (context.Context, *toolRunState) {
@@ -92,7 +161,8 @@ func TestRecallMemoryUsesAuthenticatedScopeAndDefaultsLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if store.tenantID != 7 || store.userID != 42 ||
-		store.query.Query != "生产发布经验" || store.query.Limit != 8 {
+		store.query.Query != "生产发布经验" || store.query.Limit != 8 ||
+		store.personalRecallCalls != 1 || store.workspaceRecallCalls != 0 {
 		t.Fatalf("scope=(%d,%d) query=%+v result=%q", store.tenantID, store.userID, store.query, result)
 	}
 	if !strings.Contains(result, "发布前先跑生产同形 smoke") ||
@@ -126,6 +196,181 @@ func TestRecallMemoryRejectsInvalidInputBeforeStore(t *testing.T) {
 	}
 }
 
+func TestMemoryDispatcherRejectsModelScopeOverrideBeforeResolution(t *testing.T) {
+	store := &fakeAgentMemoryStore{workspaceKind: types.WorkspaceKindTeam}
+	ctx, _ := memoryToolContext("查团队记忆")
+	recall := NewRecallMemoryTool(store)
+	result, err := recall.Execute(ctx, 42, json.RawMessage(
+		`{"query":"发布经验","scope":"team"}`,
+	))
+	if err != nil || !strings.Contains(result, "未知字段") {
+		t.Fatalf("recall result=%q err=%v", result, err)
+	}
+	manage := NewManageMemoryTool(store, &fakeOwnerActionAuthorizer{
+		decision: OwnerActionAuthorized,
+	})
+	result, err = manage.Execute(ctx, 42, json.RawMessage(
+		`{"action":"remember","text":"发布前跑 Gate","scope":"personal"}`,
+	))
+	if err != nil || !strings.Contains(result, "未知字段") {
+		t.Fatalf("manage result=%q err=%v", result, err)
+	}
+	if store.resolveCalls != 0 || store.personalRecallCalls != 0 ||
+		store.workspaceRecallCalls != 0 || store.prepareCalls != 0 {
+		t.Fatalf("model scope reached dispatcher/store: %+v", store)
+	}
+	if strings.Contains(recallMemorySchema, `"scope"`) ||
+		strings.Contains(manageMemorySchema, `"scope"`) {
+		t.Fatal("model-visible schema exposed memory ledger scope")
+	}
+}
+
+func TestMemoryDispatcherTeamRecallNeverTouchesPersonalLedger(t *testing.T) {
+	store := &fakeAgentMemoryStore{
+		workspaceKind: types.WorkspaceKindTeam,
+		recallResult: &types.MemoryRecallResult{Memories: []types.MemoryRecallItem{{
+			Memory: types.MemoryRecord{ID: 7, Text: "个人私密记忆", Active: true},
+		}}},
+		workspaceRecallResult: &types.MemoryRecallResult{Memories: []types.MemoryRecallItem{{
+			Memory: types.MemoryRecord{ID: 7, Text: "团队发布前必须跑 Gate", Active: true},
+			Score:  2.75,
+		}}},
+	}
+	tool := NewRecallMemoryTool(store)
+	ctx, _ := memoryToolContext("团队发布经验")
+	result, err := tool.Execute(ctx, 42, json.RawMessage(`{"query":"发布 Gate"}`))
+	if err != nil || !strings.Contains(result, "团队发布前必须跑 Gate") ||
+		strings.Contains(result, "个人私密记忆") {
+		t.Fatalf("result=%q err=%v", result, err)
+	}
+	if store.workspaceRecallCalls != 1 || store.personalRecallCalls != 0 ||
+		store.personalGetCalls != 0 || store.prepareCalls != 0 ||
+		store.personalApplyCalls != 0 || store.workspaceApplyCalls != 0 {
+		t.Fatalf("ledger calls personal(recall=%d get=%d apply=%d) team(recall=%d apply=%d)",
+			store.personalRecallCalls, store.personalGetCalls, store.personalApplyCalls,
+			store.workspaceRecallCalls, store.workspaceApplyCalls)
+	}
+	if store.tenantID != 7 || store.userID != 42 {
+		t.Fatalf("scope=(%d,%d)", store.tenantID, store.userID)
+	}
+}
+
+func TestTeamMemberExplicitRememberUsesExactBoundScope(t *testing.T) {
+	store := &fakeAgentMemoryStore{
+		workspaceKind: types.WorkspaceKindTeam,
+		workspaceRole: types.MembershipRoleMember,
+		workspaceActionResult: &types.MemoryActionResult{
+			Memory: types.MemoryRecord{ID: 14, CreatorUserID: 42,
+				Text: "团队发布前必须跑 PG18", Active: true},
+			Event: types.MemoryEvent{ID: 15, ActorUserID: 42,
+				Action: types.MemoryActionRemember},
+		},
+	}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	tool := NewManageMemoryTool(store, authorizer)
+	ctx, _ := memoryToolContext("请记住：团队发布前必须跑 PG18")
+	result, err := tool.Execute(ctx, 42, json.RawMessage(
+		`{"action":"remember","text":"团队发布前必须跑 PG18"}`,
+	))
+	if err != nil || !strings.Contains(result, "团队发布前必须跑 PG18") {
+		t.Fatalf("result=%q err=%v", result, err)
+	}
+	if store.workspacePrepareCalls != 1 || store.workspaceApplyCalls != 1 ||
+		store.personalPrepareCalls != 0 || store.personalApplyCalls != 0 ||
+		store.personalGetCalls != 0 || store.tenantID != 7 || store.userID != 42 ||
+		store.sessionID != 9 || store.preparedAction.Action != types.MemoryActionRemember ||
+		store.action.Evidence.AuthorizationID != store.authorizationID {
+		t.Fatalf("scope=(%d,%d,%d) personal=(%d,%d,%d) team=(%d,%d) action=%+v",
+			store.tenantID, store.userID, store.sessionID, store.personalPrepareCalls,
+			store.personalApplyCalls, store.personalGetCalls, store.workspacePrepareCalls,
+			store.workspaceApplyCalls, store.action)
+	}
+}
+
+func TestTeamCorrectSameNumericIDNeverReadsPersonalLedger(t *testing.T) {
+	store := &fakeAgentMemoryStore{
+		workspaceKind: types.WorkspaceKindTeam,
+		workspaceRole: types.MembershipRoleAdmin,
+		memory:        &types.MemoryRecord{ID: 9, Text: "PERSONAL-SECRET-SAME-ID", Active: true},
+		workspaceActionResult: &types.MemoryActionResult{
+			Memory: types.MemoryRecord{ID: 10, CreatorUserID: 77,
+				Text: "团队模型改为 flash", SupersedesMemoryID: 9, Active: true},
+			Event: types.MemoryEvent{ID: 11, ActorUserID: 42,
+				Action: types.MemoryActionCorrect, TargetMemoryID: 9, ResultMemoryID: 10},
+		},
+	}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	tool := NewManageMemoryTool(store, authorizer)
+	ctx, _ := memoryToolContext("请纠正这条团队长期记忆 memory_id=9：团队模型改为 flash")
+	result, err := tool.Execute(ctx, 42, json.RawMessage(
+		`{"action":"correct","memory_id":9,"text":"团队模型改为 flash"}`,
+	))
+	if err != nil || !strings.Contains(result, "团队模型改为 flash") {
+		t.Fatalf("result=%q err=%v", result, err)
+	}
+	if store.personalGetCalls != 0 || store.personalPrepareCalls != 0 ||
+		store.personalApplyCalls != 0 || store.workspacePrepareCalls != 1 ||
+		store.workspaceApplyCalls != 1 || store.preparedAction.MemoryID != 9 ||
+		store.action.MemoryID != 9 {
+		t.Fatalf("personal=(get=%d prepare=%d apply=%d) team=(prepare=%d apply=%d) action=%+v",
+			store.personalGetCalls, store.personalPrepareCalls, store.personalApplyCalls,
+			store.workspacePrepareCalls, store.workspaceApplyCalls, store.action)
+	}
+	if strings.Contains(authorizer.input.Targets[0].Name, "PERSONAL-SECRET-SAME-ID") ||
+		!strings.Contains(authorizer.input.Targets[0].Name, "团队长期记忆 #9") {
+		t.Fatalf("cross-ledger target projection=%+v", authorizer.input.Targets[0])
+	}
+}
+
+func TestMemoryDispatcherMembershipRemovalAndForbiddenAreFixedNonExecution(t *testing.T) {
+	removed := &fakeAgentMemoryStore{workspaceErr: types.NewAppError(
+		types.CodeNotFound, "membership removed", types.ErrNotFound)}
+	authorizer := &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	manage := NewManageMemoryTool(removed, authorizer)
+	ctx, _ := memoryToolContext("请记住：团队发布前跑 Gate")
+	result, err := manage.Execute(ctx, 42, json.RawMessage(
+		`{"action":"remember","text":"团队发布前跑 Gate"}`,
+	))
+	if err != nil || result != "当前工作区长期记忆不可访问或无权操作，本次未执行。" {
+		t.Fatalf("removed manage result=%q err=%v", result, err)
+	}
+	if authorizer.calls != 0 || removed.prepareCalls != 0 ||
+		removed.personalApplyCalls != 0 || removed.workspaceApplyCalls != 0 {
+		t.Fatalf("removed membership reached mutation: auth=%d store=%+v", authorizer.calls, removed)
+	}
+	recall := NewRecallMemoryTool(removed)
+	result, err = recall.Execute(ctx, 42, json.RawMessage(`{"query":"发布"}`))
+	if err != nil || result != "当前工作区长期记忆不可访问，本次未执行。" {
+		t.Fatalf("removed recall result=%q err=%v", result, err)
+	}
+
+	forbidden := &fakeAgentMemoryStore{
+		workspaceKind: types.WorkspaceKindTeam,
+		workspaceRole: types.MembershipRoleMember,
+		workspacePrepareErr: types.NewAppError(
+			types.CodeForbidden, "member cannot mutate target", types.ErrForbidden),
+		workspaceRecallErr: types.NewAppError(
+			types.CodeForbidden, "membership revoked before recall", types.ErrForbidden),
+	}
+	recall = NewRecallMemoryTool(forbidden)
+	result, err = recall.Execute(ctx, 42, json.RawMessage(`{"query":"发布"}`))
+	if err != nil || result != "当前工作区长期记忆不可访问，本次未执行。" {
+		t.Fatalf("forbidden recall result=%q err=%v", result, err)
+	}
+	authorizer = &fakeOwnerActionAuthorizer{decision: OwnerActionAuthorized}
+	manage = NewManageMemoryTool(forbidden, authorizer)
+	result, err = manage.Execute(ctx, 42, json.RawMessage(
+		`{"action":"remember","text":"团队发布前跑 Gate"}`,
+	))
+	if err != nil || result != "当前工作区长期记忆不可访问或无权操作，本次未执行。" {
+		t.Fatalf("forbidden result=%q err=%v", result, err)
+	}
+	if forbidden.workspacePrepareCalls != 1 || forbidden.workspaceApplyCalls != 0 ||
+		forbidden.personalPrepareCalls != 0 || forbidden.personalApplyCalls != 0 {
+		t.Fatalf("forbidden mutation crossed ledger: %+v", forbidden)
+	}
+}
+
 func TestManageMemoryBindsTrustedEvidenceAndAuthorizesTargetText(t *testing.T) {
 	store := &fakeAgentMemoryStore{
 		memory: &types.MemoryRecord{ID: 9, Text: "生产研究模型使用旧模型", Active: true},
@@ -156,7 +401,10 @@ func TestManageMemoryBindsTrustedEvidenceAndAuthorizesTargetText(t *testing.T) {
 		store.action.Evidence.AuthorizationID != store.authorizationID ||
 		store.prepareCalls != 1 ||
 		store.preparedAction.Evidence.AuthorizationID != "" ||
-		len(store.key) != 64 || store.action.MemoryID != 9 {
+		len(store.key) != 64 || store.action.MemoryID != 9 ||
+		store.personalGetCalls != 1 || store.personalPrepareCalls != 1 ||
+		store.personalApplyCalls != 1 || store.workspacePrepareCalls != 0 ||
+		store.workspaceApplyCalls != 0 {
 		t.Fatalf("key=%q action=%+v", store.key, store.action)
 	}
 	if !strings.Contains(result, "deepseek-v4-flash") {
@@ -327,7 +575,7 @@ func TestMemoryFullLoopForcesRealForgetReceiptAfterRecall(t *testing.T) {
 	loop.chatFn = chat.fn
 
 	out, err := loop.HandleMessage(
-		t.Context(), 42,
+		t.Context(), testPrincipal(42),
 		"确认：请忘记 memory_id=2，也就是青松-814 这条长期记忆。",
 	)
 	if err != nil || out.Reply != replyMemoryForgotten {
@@ -352,7 +600,7 @@ func TestMemoryFullLoopForcesRealForgetReceiptAfterRecall(t *testing.T) {
 	chat.responses = append(chat.responses, &llm.ChatResponse{
 		Content: "后续对话已看到固定的忘记结果。", FinishReason: "stop",
 	})
-	if next, nextErr := loop.HandleMessage(t.Context(), 42, "继续"); nextErr != nil ||
+	if next, nextErr := loop.HandleMessage(t.Context(), testPrincipal(42), "继续"); nextErr != nil ||
 		next.Reply != "后续对话已看到固定的忘记结果。" {
 		t.Fatalf("next outcome=%+v err=%v", next, nextErr)
 	}
@@ -394,7 +642,7 @@ func TestMemoryFullLoopRejectsMalformedMutationWithoutModelRewrite(t *testing.T)
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "忘记 memory_id=2")
 	if err != nil || !strings.Contains(out.Reply, "参数不是合法 JSON") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
@@ -425,7 +673,7 @@ func TestMemoryFullLoopReturnsAuthorizationDenialWithoutModelRewrite(t *testing.
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "忘记 memory_id=2")
 	if err != nil || !strings.Contains(out.Reply, "没有授权") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
@@ -454,7 +702,7 @@ func TestMemoryFullLoopRejectsMultipleMutationsAtomically(t *testing.T) {
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	out, err := loop.HandleMessage(t.Context(), 42, "忘记 memory_id=2")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "忘记 memory_id=2")
 	if err != nil || !strings.Contains(out.Reply, "本批全部未执行") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
@@ -505,15 +753,18 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 	loop.chatFn = chat.fn
 
 	if out, err := loop.HandleMessage(
-		t.Context(), 42, "我们讨论一下生产模型选择",
+		t.Context(), testPrincipal(42), "我们讨论一下生产模型选择",
 	); err != nil || !strings.Contains(out.Reply, "不会自动写入") {
 		t.Fatalf("implicit turn outcome=%+v err=%v", out, err)
 	}
-	if store.key != "" || authorizer.calls != 0 {
-		t.Fatalf("ordinary chat mutated memory: key=%q auth=%d", store.key, authorizer.calls)
+	if store.key != "" || authorizer.calls != 0 || store.resolveCalls != 0 ||
+		store.personalPrepareCalls != 0 || store.workspacePrepareCalls != 0 {
+		t.Fatalf("ordinary chat touched memory authority: key=%q auth=%d resolve=%d personal_prepare=%d team_prepare=%d",
+			store.key, authorizer.calls, store.resolveCalls, store.personalPrepareCalls,
+			store.workspacePrepareCalls)
 	}
 	if out, err := loop.HandleMessage(
-		t.Context(), 42, "请记住：生产研究模型使用 deepseek-v4-flash",
+		t.Context(), testPrincipal(42), "请记住：生产研究模型使用 deepseek-v4-flash",
 	); err != nil || out.Reply != replyMemoryRemembered {
 		t.Fatalf("remember outcome=%+v err=%v", out, err)
 	}
@@ -526,7 +777,7 @@ func TestMemoryFullLoopDoesNotLearnImplicitlyThenRemembersAndRecalls(t *testing.
 		t.Fatalf("remember action=%+v authorization=%+v", store.action, authorizer.input)
 	}
 	if out, err := loop.HandleMessage(
-		t.Context(), 42, "我之前明确保存的生产研究模型是什么？",
+		t.Context(), testPrincipal(42), "我之前明确保存的生产研究模型是什么？",
 	); err != nil || !strings.Contains(out.Reply, "deepseek-v4-flash") {
 		t.Fatalf("recall outcome=%+v err=%v", out, err)
 	}
@@ -558,12 +809,16 @@ func TestMemoryFullLoopModelCannotPromoteOrdinaryChat(t *testing.T) {
 		Evidence: &fakeAgentEvidenceWriter{}, OwnerAgent: true, MaxTurns: 3,
 	})
 	loop.chatFn = chat.fn
-	out, err := loop.HandleMessage(t.Context(), 42, "我们讨论一下发布策略")
+	out, err := loop.HandleMessage(t.Context(), testPrincipal(42), "我们讨论一下发布策略")
 	if err != nil || !strings.Contains(out.Reply, "没有授权") {
 		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
-	if authorizer.calls != 1 || store.key != "" {
-		t.Fatalf("ordinary chat promoted: auth=%d key=%q", authorizer.calls, store.key)
+	if authorizer.calls != 1 || store.key != "" || store.personalPrepareCalls != 0 ||
+		store.workspacePrepareCalls != 0 || store.personalApplyCalls != 0 ||
+		store.workspaceApplyCalls != 0 {
+		t.Fatalf("ordinary chat promoted: auth=%d key=%q personal=(%d,%d) team=(%d,%d)",
+			authorizer.calls, store.key, store.personalPrepareCalls, store.personalApplyCalls,
+			store.workspacePrepareCalls, store.workspaceApplyCalls)
 	}
 	if len(chat.requests) != 1 {
 		t.Fatal("denied memory mutation was returned to the model for rewriting")

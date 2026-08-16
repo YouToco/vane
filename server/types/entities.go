@@ -246,9 +246,14 @@ type LLMCall struct {
 	// Keeping nil distinct from zero lets pricing mark the amount estimated
 	// (all prompt tokens charged at cache-miss price) without losing exact
 	// total input/output usage.
-	PromptCacheHitTokens  *int      `json:"prompt_cache_hit_tokens,omitempty"`
-	PromptCacheMissTokens *int      `json:"prompt_cache_miss_tokens,omitempty"`
-	ReasoningTokens       *int      `json:"reasoning_tokens,omitempty"` // completion_tokens 的可选子集
+	PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens,omitempty"`
+	ReasoningTokens       *int `json:"reasoning_tokens,omitempty"` // completion_tokens 的可选子集
+	// PolicyManifestPayload is the canonical, non-secret interactive policy
+	// identity used for this request. It contains digests only; prompt bodies,
+	// user content and credentials remain outside this projection.
+	PolicyManifestPayload string    `json:"-"`
+	PolicyManifestDigest  string    `json:"policy_manifest_digest,omitempty"`
 	LatencyMs             int       `json:"latency_ms"`
 	CostUSD               float64   `json:"cost_usd"`                   // 供应商直报或动态价格目录计算后的 USD 兼容投影
 	PrefixCacheHit        *bool     `json:"prefix_cache_hit,omitempty"` // 可空：provider 未报告缓存信息
@@ -341,6 +346,15 @@ const (
 	ScheduleStatusPaused ScheduleStatus = "paused" // 已暂停
 )
 
+// TaskVisibility records whether a task is visible only in a personal
+// workspace or to every current member of its team workspace.
+type TaskVisibility string
+
+const (
+	TaskVisibilityPersonal  TaskVisibility = "personal"
+	TaskVisibilityWorkspace TaskVisibility = "workspace"
+)
+
 // Schedule 定时推送调度（schedules 表，M3 migration 003）。
 // 真源在 Temporal（schedule_id 即本表主键 ID），本表是 Postgres 侧镜像，
 // 供 /api/schedules 列表读取与对账；scheduler 在 Temporal Create 成功后写入。
@@ -351,12 +365,21 @@ type Schedule struct {
 	// TenantID is an internal execution-boundary field. Public schedule APIs
 	// remain user-scoped and must not acquire a new wire field just because the
 	// worker needs an explicit tenant identity in its durable Action input.
-	TenantID      int64           `json:"-"`
-	UserID        int64           `json:"user_id"`        // 归属用户
-	NLDescription string          `json:"nl_description"` // 用户原话/展示名，DEFAULT ''
-	SpecJSON      json.RawMessage `json:"spec_json"`      // JSONB：{cron,tz} 或 {every_seconds}
-	ScopeJSON     json.RawMessage `json:"scope_json"`     // JSONB：PushScope 序列化
-	Status        ScheduleStatus  `json:"status"`         // active/paused
+	TenantID int64 `json:"-"`
+	// UserID remains the frozen execution identity used by immutable task
+	// definitions, snapshots and Temporal workflow IDs. It must never be
+	// rewritten when the product assignee changes.
+	UserID int64 `json:"-"`
+	// AssigneeUserID is the product-visible responsible member. Keep its wire
+	// name as user_id for backwards-compatible clients while retaining the
+	// frozen execution identity above as an internal-only field.
+	AssigneeUserID int64           `json:"user_id"`
+	CreatorUserID  int64           `json:"creator_user_id"`
+	Visibility     TaskVisibility  `json:"visibility"`
+	NLDescription  string          `json:"nl_description"` // 用户原话/展示名，DEFAULT ''
+	SpecJSON       json.RawMessage `json:"spec_json"`      // JSONB：{cron,tz} 或 {every_seconds}
+	ScopeJSON      json.RawMessage `json:"scope_json"`     // JSONB：PushScope 序列化
+	Status         ScheduleStatus  `json:"status"`         // active/paused
 	// ExecutionMode is an internal Approved Definition field. It is deliberately
 	// excluded from the current public schedule wire until the durable-control-
 	// plane cutover; C2a only makes the persisted compatibility mode explicit.
@@ -398,13 +421,17 @@ type AgentSession struct {
 // ProtoJSON 权威载荷（store 层不解析）；ID/ContextID/Status 是提取列。SDK 类型不出 a2a/ 包
 // （隔离原则，同 agent.Store 窄接口先例），store 层只见本类型。
 type A2ATask struct {
-	ID        string          `json:"id"` // 服务端生成 taskId
-	ContextID string          `json:"context_id"`
-	Status    string          `json:"status"`  // TASK_STATE_* 原文
-	Task      json.RawMessage `json:"task"`    // JSONB，完整 a2a.Task ProtoJSON
-	Version   int64           `json:"version"` // 乐观并发版本，从 1 起
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	TenantID        int64           `json:"tenant_id"`
+	PrincipalUserID int64           `json:"principal_user_id"`
+	ActorType       ActorType       `json:"actor_type"`
+	CreatedByToken  string          `json:"created_by_token_id"`
+	ID              string          `json:"id"` // 服务端生成 taskId
+	ContextID       string          `json:"context_id"`
+	Status          string          `json:"status"`  // TASK_STATE_* 原文
+	Task            json.RawMessage `json:"task"`    // JSONB，完整 a2a.Task ProtoJSON
+	Version         int64           `json:"version"` // 乐观并发版本，从 1 起
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
 // A2ATaskQuery 是 ListA2ATasks（a2a-contract §4.1）的过滤条件，字段面对齐 SDK

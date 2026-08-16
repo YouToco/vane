@@ -38,7 +38,7 @@ func TestSharedSessionAdmissionSerializesOwnerAndWebForSameUser(t *testing.T) {
 	}
 	ownerDone := make(chan result, 1)
 	go func() {
-		out, err := owner.HandleMessage(t.Context(), 7, "先记录 owner turn")
+		out, err := owner.HandleMessage(t.Context(), testPrincipal(7), "先记录 owner turn")
 		ownerDone <- result{out: out, err: err}
 	}()
 	waitClosed(t, ownerEntered, "owner turn did not enter model")
@@ -48,7 +48,7 @@ func TestSharedSessionAdmissionSerializesOwnerAndWebForSameUser(t *testing.T) {
 	go func() {
 		close(webStarted)
 		out, err := web.HandleWebTaskActionMessage(
-			t.Context(), 7, "9a4ca406-70d2-4af2-b3ef-acde86339067",
+			t.Context(), testPrincipal(7), "9a4ca406-70d2-4af2-b3ef-acde86339067",
 			"", "再记录 Web turn",
 		)
 		webDone <- result{out: out, err: err}
@@ -100,7 +100,7 @@ func TestSharedSessionAdmissionDoesNotBlockDifferentUsers(t *testing.T) {
 
 	ownerDone := make(chan error, 1)
 	go func() {
-		_, err := owner.HandleMessage(t.Context(), 7, "阻塞 user 7")
+		_, err := owner.HandleMessage(t.Context(), testPrincipal(7), "阻塞 user 7")
 		ownerDone <- err
 	}()
 	waitClosed(t, ownerEntered, "owner turn did not enter model")
@@ -108,7 +108,7 @@ func TestSharedSessionAdmissionDoesNotBlockDifferentUsers(t *testing.T) {
 	webDone := make(chan error, 1)
 	go func() {
 		_, err := web.HandleWebTaskActionMessage(
-			t.Context(), 8, "58a783cb-4213-45ae-8421-cd1bf9dd4585",
+			t.Context(), testPrincipal(8), "58a783cb-4213-45ae-8421-cd1bf9dd4585",
 			"", "user 8 的 Web turn",
 		)
 		webDone <- err
@@ -150,7 +150,7 @@ func TestSharedSessionAdmissionHonorsCanceledWaiter(t *testing.T) {
 
 	ownerDone := make(chan error, 1)
 	go func() {
-		_, err := owner.HandleMessage(t.Context(), 7, "阻塞 admission")
+		_, err := owner.HandleMessage(t.Context(), testPrincipal(7), "阻塞 admission")
 		ownerDone <- err
 	}()
 	waitClosed(t, ownerEntered, "owner turn did not enter model")
@@ -160,7 +160,7 @@ func TestSharedSessionAdmissionHonorsCanceledWaiter(t *testing.T) {
 	webDone := make(chan error, 1)
 	go func() {
 		_, err := web.HandleWebTaskActionMessage(
-			ctx, 7, "0e45482a-e0f4-4115-be1e-a7ca2c687bec",
+			ctx, testPrincipal(7), "0e45482a-e0f4-4115-be1e-a7ca2c687bec",
 			"", "取消的 Web turn",
 		)
 		webDone <- err
@@ -183,17 +183,17 @@ func TestSharedSessionAdmissionHonorsCanceledWaiter(t *testing.T) {
 
 func TestSharedSessionAdmissionDrainsSingleOwnerLoop(t *testing.T) {
 	store := newFakeStore()
-	if _, err := store.CreateAgentSession(t.Context(), 42); err != nil {
+	if _, err := store.CreateAgentSession(t.Context(), 1, 42); err != nil {
 		t.Fatal(err)
 	}
 	admission := NewSessionAdmissionCoordinator()
 	owner := New(Deps{Store: store, SessionAdmission: admission})
-	lock := admission.lockForUser(42)
+	lock := admission.lockForPrincipal(1, 42)
 	if err := lock.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	owner.NotifyEvent(t.Context(), 42, "owner-side-write", "owner notice")
-	owner.NotifyEvent(t.Context(), 42, "web-side-write", "web notice")
+	owner.NotifyEvent(t.Context(), testPrincipal(42), "owner-side-write", "owner notice")
+	owner.NotifyEvent(t.Context(), testPrincipal(42), "web-side-write", "web notice")
 
 	drainCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -219,7 +219,7 @@ func TestRunOnceRemainsSessionlessOutsideAdmission(t *testing.T) {
 	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
 		return &llm.ChatResponse{Content: "A2A sessionless reply"}, nil
 	}
-	lock := admission.lockForUser(7)
+	lock := admission.lockForPrincipal(1, 7)
 	if err := lock.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestRunOnceRemainsSessionlessOutsideAdmission(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		out, _, err := loop.RunOnce(t.Context(), 7, nil, "A2A request")
+		out, _, err := loop.RunOnce(t.Context(), testPrincipal(7), nil, "A2A request")
 		if err == nil && out.Reply != "A2A sessionless reply" {
 			err = errors.New("unexpected A2A reply")
 		}

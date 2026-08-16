@@ -40,7 +40,21 @@ type Config struct {
 	ResearchGateway ResearchGatewayConfig `mapstructure:"research_gateway"`
 
 	Dashboard DashboardConfig `mapstructure:"dashboard"`
+	SMTP      SMTPConfig      `mapstructure:"smtp"`
 	A2A       A2AConfig       `mapstructure:"a2a"`
+}
+
+// SMTPConfig is opt-in. When enabled all fields are required and transport is
+// restricted to implicit TLS or STARTTLS; plaintext SMTP has no valid value.
+type SMTPConfig struct {
+	Enabled    bool   `mapstructure:"enabled"`
+	Host       string `mapstructure:"host"`
+	Port       int    `mapstructure:"port"`
+	Username   string `mapstructure:"username"`
+	Password   string `mapstructure:"password"`
+	From       string `mapstructure:"from"`
+	TLSMode    string `mapstructure:"tls_mode"`
+	ServerName string `mapstructure:"server_name"`
 }
 
 type ResearchGatewayConfig struct {
@@ -277,9 +291,6 @@ type DashboardConfig struct {
 type A2AConfig struct {
 	// Enabled 默认 false：未显式开启时 main.go 不 Mount，零新增暴露面。
 	Enabled bool `mapstructure:"enabled"`
-	// Token 环境变量 VANE_A2A_TOKEN；本体存 YouToco/my-credentials，绝不入库。
-	// 为空时照常挂载、auth 恒 401、Mount 时 slog.Warn 一次（Dashboard Password 先例）。
-	Token string `mapstructure:"token"`
 	// BaseURL 是对外 A2A endpoint，进 AgentCard supportedInterfaces。
 	BaseURL string `mapstructure:"base_url"`
 }
@@ -299,7 +310,7 @@ var sensitiveKeys = []string{
 	"fetch.tikhub_api_key",
 	"fetch.exa_api_key",
 	"dashboard.password",
-	"a2a.token",
+	"smtp.password",
 }
 
 const nativeV3EditRecoveryDBCredential = "native_v3_edit_recovery_db_url"
@@ -377,6 +388,13 @@ func setDefaults(v *viper.Viper) {
 	// Dashboard 前端生产源。设默认值兼有两个作用：生产零配置即放行正确源；
 	// 让 dashboard.origin 成为 Viper 的"已知键"，VANE_DASHBOARD_ORIGIN 可覆盖（见 sensitiveKeys 注释）。
 	v.SetDefault("dashboard.origin", "https://vane.zhuoqidev.com")
+	v.SetDefault("smtp.enabled", false)
+	v.SetDefault("smtp.host", "")
+	v.SetDefault("smtp.port", 465)
+	v.SetDefault("smtp.username", "")
+	v.SetDefault("smtp.from", "")
+	v.SetDefault("smtp.tls_mode", "implicit_tls")
+	v.SetDefault("smtp.server_name", "")
 
 	v.SetDefault("temporal.host", "127.0.0.1:7233")
 	v.SetDefault("temporal.namespace", "default")
@@ -498,6 +516,16 @@ func readConfigFile(v *viper.Viper, path string) error {
 // Validate 校验必填项并补齐零值默认值。
 // 允许在 Unmarshal 后单独调用（如配置热更新场景）。
 func (c *Config) Validate() error {
+	if c.SMTP.Enabled {
+		if strings.TrimSpace(c.SMTP.Host) == "" || c.SMTP.Port < 1 || c.SMTP.Port > 65535 ||
+			strings.TrimSpace(c.SMTP.Username) == "" || c.SMTP.Password == "" ||
+			strings.TrimSpace(c.SMTP.From) == "" {
+			return errors.New("config: smtp.enabled 要求 host/port/username/password/from 完整")
+		}
+		if c.SMTP.TLSMode != "implicit_tls" && c.SMTP.TLSMode != "starttls" {
+			return errors.New("config: smtp.tls_mode 只允许 implicit_tls 或 starttls")
+		}
+	}
 	c.LLM.ResearchModel = strings.TrimSpace(c.LLM.ResearchModel)
 	if c.LLM.ResearchModel == "" {
 		c.LLM.ResearchModel = "deepseek-v4-flash"

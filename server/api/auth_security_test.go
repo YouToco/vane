@@ -142,8 +142,16 @@ func (f *fakeAuthStore) CreateSession(_ context.Context, hash []byte, userID, te
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	role := types.MembershipRoleOwner
+	for _, membership := range f.members[userID] {
+		if membership.TenantID == tenantID {
+			role = membership.Role
+			break
+		}
+	}
 	f.sessions[string(hash)] = &types.Session{
-		TokenHash: hash, UserID: userID, TenantID: tenantID, ExpiresAt: exp,
+		TokenHash: hash, UserID: userID, TenantID: tenantID, Role: role,
+		ActorType: types.ActorTypeUser, ExpiresAt: exp,
 	}
 	return nil
 }
