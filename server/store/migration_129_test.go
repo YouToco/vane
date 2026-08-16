@@ -363,7 +363,7 @@ func TestMigration129PlainUpDoesNotGrantClusterRuntimePostgres(t *testing.T) {
 	}
 	assertMembershipColumns(false)
 	if err := ProvisionServerRuntime(t.Context(), scratchURL); err == nil ||
-		!strings.Contains(err.Error(), "provision_vane_server_runtime_v138") {
+		!strings.Contains(err.Error(), "provision_vane_server_runtime_v151") {
 		t.Fatalf("current provisioner silently fell back after Down: %v", err)
 	}
 }

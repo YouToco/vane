@@ -73,21 +73,22 @@ var serverRuntimeForbiddenReadRelations = []string{
 }
 
 // ProvisionServerRuntime installs the cluster-global runtime shell only after
-// the target database schema has migrated completely. The exact v138 wrapper
-// activates workspace memory after the preceding bridge release established a
-// rollback-safe optional-role verifier. dbURL must authenticate directly as
-// the migration/schema owner.
+// the target database schema has migrated completely. The v151 wrapper checks
+// the complete workspace-memory catalog closure in the same transaction that
+// grants the role and preserves replay compatibility with bridge binaries.
+// dbURL must authenticate directly as the migration/schema owner.
 func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_v138")
+		ctx, dbURL, "provision_vane_server_runtime_v151")
 }
 
-// DeprovisionServerRuntime removes the v138 edge before delegating to v129's
-// exact teardown. The shell must already be NOLOGIN. A dependency error is
-// intentional evidence of drift and is never papered over with DROP OWNED.
+// DeprovisionServerRuntime removes the v151 workspace edge before delegating
+// to the rollback-compatible v129 teardown. The shell must already be NOLOGIN.
+// A dependency error is intentional evidence of drift and is never papered
+// over with DROP OWNED.
 func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "deprovision_vane_server_runtime_v138")
+		ctx, dbURL, "deprovision_vane_server_runtime_v151")
 }
 
 // ProvisionNativeV3EditRecoveryRuntime creates only the independent recovery
@@ -740,7 +741,8 @@ func verifyWorkspaceMemoryRuntimeAuthority(
                  pg_catalog.pg_get_expr(policy.polwithcheck,policy.polrelid) AS check_expr
             FROM pg_catalog.pg_policy policy
             JOIN pg_catalog.pg_class relation ON relation.oid=policy.polrelid
-           WHERE relation.relname IN('workspace_memory_authorizations',
+			JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+		   WHERE namespace.nspname='public' AND relation.relname IN('workspace_memory_authorizations',
              'workspace_memory_records','workspace_memory_events','workspace_memory_receipts')
         )
         SELECT count(*)=6

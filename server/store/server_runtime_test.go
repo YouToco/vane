@@ -1177,6 +1177,7 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 			"provision_vane_server_runtime_v128",
 			"provision_vane_server_runtime_v129",
 			"provision_vane_server_runtime_v138",
+			"provision_vane_server_runtime_v151",
 			"provision_vane_server_runtime_research_binder_v1",
 			"retire_agent_session_fact_projector_v128",
 			"deprovision_vane_server_runtime_v1",
@@ -1184,6 +1185,7 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 			"deprovision_vane_server_runtime_v128",
 			"deprovision_vane_server_runtime_v129",
 			"deprovision_vane_server_runtime_v138",
+			"deprovision_vane_server_runtime_v151",
 			"deprovision_vane_server_runtime_research_binder_v1",
 			"restore_agent_session_fact_projector_v128",
 		} {

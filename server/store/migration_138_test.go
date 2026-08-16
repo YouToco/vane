@@ -592,10 +592,15 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 	if policyContract != "6917d270023b8fb464af8bc03d56ba2f" {
 		t.Fatalf("workspace memory policy contract=%s", policyContract)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	provisionV138 := func() error {
+		_, err := database.ExecContext(t.Context(),
+			`SELECT public.provision_vane_server_runtime_v138()`)
+		return err
+	}
+	if err := provisionV138(); err != nil {
 		t.Fatalf("provision v138 runtime: %v", err)
 	}
-	if err := ProvisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if err := provisionV138(); err != nil {
 		t.Fatalf("replay provision v138 runtime: %v", err)
 	}
 	if err := database.QueryRowContext(t.Context(), `SELECT pg_has_role(
@@ -683,7 +688,8 @@ func TestMigration138WorkspaceMemoryIsolationAndRolesPostgres(t *testing.T) {
 		`ALTER ROLE vane_server_runtime NOLOGIN PASSWORD NULL`); err != nil {
 		t.Fatal(err)
 	}
-	if err := DeprovisionServerRuntime(t.Context(), scratchURL); err != nil {
+	if _, err := database.ExecContext(t.Context(),
+		`SELECT public.deprovision_vane_server_runtime_v138()`); err != nil {
 		t.Fatalf("deprovision v138 runtime: %v", err)
 	}
 	dry, err := st.PurgeTenant(t.Context(), team, true)
