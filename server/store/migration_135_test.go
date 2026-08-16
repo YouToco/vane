@@ -3,6 +3,7 @@ package store
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/server/internal/testgate"
+	"github.com/YouToco/vane/server/mcpclient"
+	"github.com/YouToco/vane/server/types"
 )
 
 func TestMigration135CapabilityIsolationContract(t *testing.T) {
@@ -56,7 +59,7 @@ func TestMigration135RLSAndImmutableVersionsPostgres(t *testing.T) {
 	if databaseURL == "" {
 		testgate.Database(t)
 	}
-	database, provider, _, drop := migration128Scratch(t, databaseURL)
+	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
 	if _, err := provider.UpTo(t.Context(), 135); err != nil {
 		t.Fatal(err)
@@ -119,6 +122,91 @@ func TestMigration135RLSAndImmutableVersionsPostgres(t *testing.T) {
 	assertVisible(tenantA, userA, "owner", []string{"private", "shared"})
 	assertVisible(tenantA, userB, "member", []string{"shared"})
 	assertVisible(tenantB, userC, "owner", []string{})
+
+	st, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	skillManifest := json.RawMessage(`{"schema_version":"vane.skill-package/v1","name":"member-skill"}`)
+	skillMD := []byte("# Member Skill\n\nDeclarative instructions only.")
+	skillFileManifest := json.RawMessage(`{"files":[{"path":"SKILL.md","kind":"skill_md"}]}`)
+	skillInput := types.CreateSkillCapability{
+		TenantID: tenantA, ActorUserID: userB, Visibility: types.UserCapabilityPersonal,
+		Slug: "member-skill", DisplayName: "Member Skill", Source: types.UserCapabilityUpload,
+		PayloadDigest: digestBytes(skillManifest), Manifest: skillManifest, Compatible: true,
+		Skill: types.SkillCapabilityVersion{
+			Name: "member-skill", Description: "Safe declarative team research instructions",
+			SkillMDDigest: digestBytes(skillMD), ArchiveDigest: strings.Repeat("a", 64),
+			FileManifest: skillFileManifest,
+			Files: []types.SkillCapabilityFile{{
+				Path: "SKILL.md", Kind: "skill_md", Digest: digestBytes(skillMD), Content: skillMD,
+			}},
+		},
+	}
+	capability, version, err := st.CreateSkillCapability(t.Context(), skillInput)
+	if err != nil {
+		t.Fatalf("create personal Skill capability: %v", err)
+	}
+	if capability.CurrentVersionID == nil || *capability.CurrentVersionID != version.ID ||
+		capability.OwnerUserID != userB || version.PayloadDigest != skillInput.PayloadDigest {
+		t.Fatalf("created Skill capability=%+v version=%+v", capability, version)
+	}
+	sharedByMember := skillInput
+	sharedByMember.Visibility = types.UserCapabilityWorkspace
+	sharedByMember.Slug = "member-shared-skill"
+	sharedByMember.DisplayName = "Member Shared Skill"
+	if _, _, err := st.CreateSkillCapability(
+		t.Context(), sharedByMember); types.CodeOf(err) != types.CodeForbidden {
+		t.Fatalf("member shared Skill code=%s err=%v", types.CodeOf(err), err)
+	}
+
+	mcpManifest := json.RawMessage(`{"schema_version":"vane.mcp-capability/v1","name":"workspace-mcp"}`)
+	toolSchema := json.RawMessage(`{"tools":[]}`)
+	mcpCapability, mcpVersion, err := st.CreateMCPCapability(t.Context(), types.CreateMCPCapability{
+		TenantID: tenantA, ActorUserID: userA, Visibility: types.UserCapabilityWorkspace,
+		Slug: "workspace-mcp", DisplayName: "Workspace MCP",
+		PayloadDigest: digestBytes(mcpManifest), Manifest: mcpManifest,
+		Connection: types.MCPConnectionVersion{
+			EndpointURL:      "https://mcp.example.com/v1",
+			ProtocolVersion:  mcpclient.ProtocolVersion20251125,
+			Authentication:   types.MCPAuthenticationNone,
+			ToolSchemaDigest: digestBytes(toolSchema), ToolSchema: toolSchema,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create workspace MCP capability: %v", err)
+	}
+	if mcpCapability.CurrentVersionID == nil ||
+		*mcpCapability.CurrentVersionID != mcpVersion.ID ||
+		mcpCapability.Kind != types.UserCapabilityMCP {
+		t.Fatalf("created MCP capability=%+v version=%+v", mcpCapability, mcpVersion)
+	}
+
+	memberVisible, err := st.ListVisibleUserCapabilities(t.Context(), tenantA, userB)
+	if err != nil {
+		t.Fatalf("list member capabilities: %v", err)
+	}
+	visibleSlugs := make(map[string]bool, len(memberVisible))
+	for _, item := range memberVisible {
+		visibleSlugs[item.Slug] = true
+	}
+	for _, slug := range []string{"shared", "member-skill", "workspace-mcp"} {
+		if !visibleSlugs[slug] {
+			t.Fatalf("member capabilities missing %q: %+v", slug, memberVisible)
+		}
+	}
+	if visibleSlugs["private"] {
+		t.Fatalf("member discovered owner personal capability: %+v", memberVisible)
+	}
+	if _, err := st.ListVisibleUserCapabilities(
+		t.Context(), tenantA, userC); types.CodeOf(err) != types.CodeForbidden {
+		t.Fatalf("non-member capability list code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := st.ListVisibleUserCapabilities(
+		t.Context(), 0, userB); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid capability principal code=%s err=%v", types.CodeOf(err), err)
+	}
 
 	var canUpdateVersion, canDeleteVersion bool
 	if err := database.QueryRowContext(t.Context(), `
