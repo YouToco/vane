@@ -83,6 +83,20 @@ func TestInvocationV1ServiceAccountRequiresExactA2AAuthority(t *testing.T) {
 			private := testInvocationInputV1()
 			v.Capability, v.Policy = private.Capability, private.Policy
 		},
+		"mutating manage memory builtin": func(v *InvocationInputV1) {
+			v.Operation = "manage_memory"
+			v.Policy.ReadOnly = false
+			v.Policy.Effects = []EffectV1{EffectStateWrite}
+		},
+		"in-process code builtin": func(v *InvocationInputV1) {
+			v.Operation = "execute_code"
+			v.Policy.Effects = []EffectV1{EffectCodeExecution}
+		},
+		"in-process delivery builtin": func(v *InvocationInputV1) {
+			v.Operation = "send_notification"
+			v.Policy.ReadOnly = false
+			v.Policy.Effects = []EffectV1{EffectDelivery}
+		},
 	}
 	for name, mutate := range cases {
 		candidate := valid

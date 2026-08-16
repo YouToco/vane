@@ -467,11 +467,25 @@ func (i InvocationV1) validateServiceAuthority() error {
 	if i.Capability.Kind != CapabilityKindBuiltinTool {
 		return invalid("service principal cannot invoke private capabilities")
 	}
-	// assistant.chat authorizes entry into the builtin-only agent tool set;
+	// assistant.chat authorizes entry into the read-only builtin agent tool set;
 	// Operation remains the exact builtin operation (for example web_search).
+	// Prepare must still reprove the exact operation + schema against the live
+	// builtin registry: an arbitrary valid identifier is not an approved tool.
 	// content.query is a deterministic entrypoint, not capability authority.
 	if i.Principal.RequiredA2AScope != types.A2AScopeAssistantChat {
 		return invalid("A2A scope cannot authorize capability invocation")
+	}
+	if !i.Policy.ReadOnly {
+		return invalid("service principal capability is not read-only")
+	}
+	for _, effect := range i.Policy.Effects {
+		switch effect {
+		case EffectInternalRead, EffectNetworkRead, EffectBillable:
+		case EffectStateWrite, EffectDelivery, EffectCodeExecution:
+			return invalid("service principal capability effect is forbidden")
+		default:
+			return invalid("service principal capability effect is invalid")
+		}
 	}
 	return nil
 }
