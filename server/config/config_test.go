@@ -1754,6 +1754,96 @@ func TestTelegramSecretsLoadFromSystemdCredentials(t *testing.T) {
 	}
 }
 
+func TestDisabledFeaturesAcceptEmptySystemdCredentialPlaceholders(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	directory := t.TempDir()
+	for _, name := range []string{
+		telegramBotTokenCredential,
+		telegramWebhookSecretCredential,
+		credentialVaultRetiredCredential,
+	} {
+		if err := os.WriteFile(filepath.Join(directory, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", directory)
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Telegram.Enabled || cfg.Telegram.BotToken != "" ||
+		cfg.Telegram.WebhookSecret != "" || cfg.CredentialVault.RetiredKeys != "" {
+		t.Fatalf("empty optional credentials changed config: %+v %+v",
+			cfg.Telegram, cfg.CredentialVault)
+	}
+}
+
+func TestRequiredFeaturesRejectEmptySystemdCredentialPlaceholders(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       map[string]string
+		wantError string
+	}{
+		{
+			name:      "telegram enabled",
+			wantError: "telegram",
+			env: map[string]string{
+				"VANE_TELEGRAM_ENABLED": "true",
+			},
+		},
+		{
+			name:      "credential vault active key configured",
+			wantError: "credential_vault",
+			env: map[string]string{
+				"VANE_CREDENTIAL_VAULT_ACTIVE_KEY_ID": "vault-key-1",
+			},
+		},
+		{
+			name:      "research v3 enabled",
+			wantError: "native_v3_edit_recovery_runtime_url",
+			env: map[string]string{
+				"VANE_PIPELINE_RESEARCH_V3_RUNTIME_ENABLED": "true",
+				"VANE_DB_RESEARCH_RUNTIME_URL":              "postgres://runtime",
+				"VANE_DB_RESEARCH_CONTROL_URL":              "postgres://control",
+				"VANE_DB_RESEARCH_CAPABILITY_KEY_ID":        "active",
+				"VANE_DB_RESEARCH_CAPABILITY_KEY_HEX":       strings.Repeat("ab", 32),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearVaneEnv(t)
+			skipIfSystemConfigExists(t)
+			t.Chdir(t.TempDir())
+			directory := t.TempDir()
+			for _, name := range []string{
+				telegramBotTokenCredential,
+				telegramWebhookSecretCredential,
+				credentialVaultKeyCredential,
+				credentialVaultRetiredCredential,
+				nativeV3EditRecoveryDBCredential,
+			} {
+				if err := os.WriteFile(filepath.Join(directory, name), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("CREDENTIALS_DIRECTORY", directory)
+			t.Setenv("VANE_DB_URL", "postgres://env")
+			for key, value := range test.env {
+				t.Setenv(key, value)
+			}
+			if _, err := Load(""); err == nil {
+				t.Fatal("required feature accepted empty credential placeholder")
+			} else if !strings.Contains(strings.ToLower(err.Error()), test.wantError) {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
 func TestCredentialVaultConfigValidation(t *testing.T) {
 	valid := strings.Repeat("42", 32)
 	tests := []struct {

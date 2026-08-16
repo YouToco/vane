@@ -438,9 +438,10 @@ func loadOptionalSystemdCredential(name string) (string, error) {
 		return "", fmt.Errorf("config: read %s systemd credential", name)
 	}
 	value := strings.TrimSpace(string(payload))
-	if value == "" {
-		return "", fmt.Errorf("config: %s systemd credential is empty", name)
-	}
+	// systemd 247 requires every LoadCredential source path to exist. Optional
+	// credentials therefore use root-only empty placeholders while their
+	// feature is disabled. The feature-specific Validate rules remain the
+	// authority that rejects an empty required credential.
 	return value, nil
 }
 
