@@ -1762,6 +1762,7 @@ func TestDisabledFeaturesAcceptEmptySystemdCredentialPlaceholders(t *testing.T) 
 	for _, name := range []string{
 		telegramBotTokenCredential,
 		telegramWebhookSecretCredential,
+		credentialVaultKeyCredential,
 		credentialVaultRetiredCredential,
 	} {
 		if err := os.WriteFile(filepath.Join(directory, name), nil, 0o600); err != nil {
