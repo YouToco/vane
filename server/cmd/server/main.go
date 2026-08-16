@@ -24,6 +24,7 @@ import (
 	"github.com/YouToco/vane/server/api"
 	"github.com/YouToco/vane/server/auth"
 	"github.com/YouToco/vane/server/cardgen"
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/config"
 	"github.com/YouToco/vane/server/eventqualifier"
 	"github.com/YouToco/vane/server/evolver"
@@ -819,11 +820,16 @@ func run() error {
 		closeServerStartupResources(temporalClient.Close, closeStores)
 		return fmt.Errorf("装配 Telegram Bot: %w", err)
 	}
-	periodicActivities.SetTelegramSender(telegramManager)
-	activities.SetAggregateTelegramSender(telegramManager)
+	channelDispatcher, err := channelruntime.NewDispatcher(telegramManager)
+	if err != nil {
+		closeServerStartupResources(temporalClient.Close, closeStores)
+		return fmt.Errorf("装配 Channel Adapter: %w", err)
+	}
+	periodicActivities.SetChannelDispatcher(channelDispatcher)
+	activities.SetAggregateChannelDispatcher(channelDispatcher)
 	if researchDeliveryCoordinator != nil {
-		researchDeliveryCoordinator.SetTelegramDelivery(
-			telegramManager, renderResearchBriefTelegramV3)
+		researchDeliveryCoordinator.SetChannelDelivery(
+			channelDispatcher, renderResearchBriefTelegramV3)
 	}
 
 	// Build the A2A agent before any worker or recovery goroutine starts. A

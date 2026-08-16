@@ -2,11 +2,14 @@ package periodicbrief
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/pusheffect"
 	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
@@ -21,6 +24,7 @@ type periodicDeliveryStoreFake struct {
 	outboundCalls int
 	finalizeCalls int
 	finalStatus   store.PeriodicReportDeliveryStatusV1
+	outboundBody  string
 }
 
 func (f *periodicDeliveryStoreFake) ResolveDeliveryChannelPreference(
@@ -45,11 +49,15 @@ func (f *periodicDeliveryStoreFake) PrepareArtifactDeliveryPlan(
 		Selection: preference.Selection,
 	}, nil
 }
-func (f *periodicDeliveryStoreFake) PrepareTelegramOutbound(
-	context.Context, int64, int64, int64, string, string, string,
-) (store.ChannelOutboundEffect, error) {
+func (f *periodicDeliveryStoreFake) PrepareTelegramSendPermit(
+	_ context.Context, tenantID, userID, routeID int64,
+	effectID, kind, body string,
+) (channelruntime.SendPermit, error) {
 	f.outboundCalls++
-	return store.ChannelOutboundEffect{}, nil
+	f.outboundBody = body
+	digest := sha256.Sum256([]byte(body))
+	return channelruntime.BindDurableSend(channelruntime.ProviderTelegram,
+		tenantID, userID, routeID, effectID, kind, hex.EncodeToString(digest[:]))
 }
 
 func (f *periodicDeliveryStoreFake) GetBriefReportSettingsV1(
@@ -111,13 +119,15 @@ type periodicTelegramSenderFake struct {
 	body      string
 }
 
-func (f *periodicTelegramSenderFake) SendTextEffect(
-	_ context.Context, _, _ int64, routeID int64,
-	_, kind, body string,
-) error {
+func (f *periodicTelegramSenderFake) Send(
+	_ context.Context, permit channelruntime.SendPermit,
+) (channelruntime.ProviderObservation, error) {
 	f.sendCalls++
-	f.routeID, f.kind, f.body = routeID, kind, body
-	return nil
+	f.routeID, f.kind = permit.RouteID(), permit.EffectKind()
+	return channelruntime.ProviderObservation{
+		Disposition: pusheffect.AttemptSent, AppIdentity: "telegram-test",
+		MessageID: "1",
+	}, nil
 }
 
 func (*periodicDeliverySenderFake) OwnerOpenID() string { return "ou_1" }
@@ -291,7 +301,7 @@ func TestDeliveryBothFreezesAndSendsBothProviders(t *testing.T) {
 	if feishuSender.sendCalls != 1 || telegramSender.sendCalls != 1 ||
 		deliveryStore.outboundCalls != 1 || telegramSender.routeID != routeID ||
 		telegramSender.kind != "periodic_report" ||
-		!strings.Contains(telegramSender.body, "https://vane.example/") {
+		!strings.Contains(deliveryStore.outboundBody, "https://vane.example/") {
 		t.Fatalf("feishu=%d telegram=%+v outbound=%d",
 			feishuSender.sendCalls, telegramSender, deliveryStore.outboundCalls)
 	}
@@ -338,11 +348,11 @@ func TestPeriodicTelegramRendererIncludesDecisionSections(t *testing.T) {
 	}
 }
 
-func TestActivitiesTelegramSenderIsRaceSafe(t *testing.T) {
+func TestActivitiesChannelDispatcherIsRaceSafe(t *testing.T) {
 	a := &Activities{}
 	sender := &periodicTelegramSenderFake{}
-	a.SetTelegramSender(sender)
-	if got := a.getTelegramSender(); got != sender {
+	a.SetChannelDispatcher(sender)
+	if got := a.getChannelDispatcher(); got != sender {
 		t.Fatalf("sender=%T want %T", got, sender)
 	}
 }

@@ -100,6 +100,12 @@ func (s *Store) RotateCredential(
 		credentialLockKey(scope)); err != nil {
 		return CredentialMetadata{}, credentialDBError("锁定凭证作用域", err)
 	}
+	if isTelegramUserCredential(scope) {
+		if err := revokeTelegramChannelAuthorityTx(
+			ctx, tx, scope.TenantID, scope.UserID, "credential_rotated"); err != nil {
+			return CredentialMetadata{}, err
+		}
+	}
 	var generation int64
 	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(generation),0)+1
 		FROM credential_vault_entries
@@ -365,6 +371,12 @@ func (s *Store) RevokeCredential(
 		credentialLockKey(scope)); err != nil {
 		return credentialDBError("锁定凭证作用域", err)
 	}
+	if isTelegramUserCredential(scope) {
+		if err := revokeTelegramChannelAuthorityTx(
+			ctx, tx, scope.TenantID, scope.UserID, "credential_revoked"); err != nil {
+			return err
+		}
+	}
 	result, err := tx.Exec(ctx, `UPDATE credential_vault_entries
 		SET status='revoked',revoked_at=clock_timestamp()
 		WHERE scope_kind=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND
@@ -506,6 +518,11 @@ func nullableCredentialUser(scope CredentialScope) any {
 func credentialLockKey(scope CredentialScope) string {
 	return fmt.Sprintf("credential-vault/%s/%d/%d/%s/%s",
 		scope.Kind, scope.TenantID, scope.UserID, scope.Provider, scope.Purpose)
+}
+
+func isTelegramUserCredential(scope CredentialScope) bool {
+	return scope.Kind == "user" && scope.Provider == channelProviderTelegram &&
+		scope.Purpose == "bot_api"
 }
 
 func credentialValidationError(message string) error {

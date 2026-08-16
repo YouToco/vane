@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/pusheffect"
 	storepkg "github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
@@ -55,10 +56,10 @@ type ResearchDeliverySenderV3 interface {
 	PushWithUUID(context.Context, string, string, string, string) (pusheffect.ProviderObservation, error)
 }
 
-type ResearchTelegramSenderV3 interface {
-	SendTextEffect(
-		context.Context, int64, int64, int64, string, string, string,
-	) error
+type ResearchChannelDispatcherV3 interface {
+	Send(context.Context, channelruntime.SendPermit) (
+		channelruntime.ProviderObservation, error,
+	)
 }
 
 type ResearchTelegramRendererV3 func(types.ResearchBriefPayloadV3) (string, error)
@@ -67,7 +68,7 @@ type researchDeliveryStoreV3 interface {
 	ResolveDeliveryChannelPreference(context.Context, int64, int64, string) (storepkg.DeliveryChannelPreference, error)
 	PrepareArtifactDeliveryPlan(context.Context, int64, int64, string, string, string,
 		storepkg.DeliveryChannelPreference) (storepkg.ArtifactDeliveryPlan, error)
-	PrepareTelegramOutbound(context.Context, int64, int64, int64, string, string, string) (storepkg.ChannelOutboundEffect, error)
+	PrepareTelegramSendPermit(context.Context, int64, int64, int64, string, string, string) (channelruntime.SendPermit, error)
 	LoadResearchBriefPayloadForDeliveryV3(context.Context, types.RunIdentity,
 		types.ResearchRunSnapshotRefV3, types.ResearchRunPlanRefV3,
 		types.ResearchBriefRefV3) (types.ResearchBriefPayloadV3, error)
@@ -88,32 +89,31 @@ type researchDeliveryStoreV3 interface {
 // cutover remains an independent, default-off authority: constructing this
 // coordinator does not make any Workflow eligible to call it.
 type ReceiptBackedResearchDeliveryV3 struct {
-	store          researchDeliveryStoreV3
-	sender         ResearchDeliverySenderV3
-	targets        ResearchDeliveryTargetProviderV3
-	render         ResearchDeliveryRendererV3
-	telegramMu     sync.RWMutex
-	telegramSender ResearchTelegramSenderV3
-	telegramRender ResearchTelegramRendererV3
+	store             researchDeliveryStoreV3
+	sender            ResearchDeliverySenderV3
+	targets           ResearchDeliveryTargetProviderV3
+	render            ResearchDeliveryRendererV3
+	channelMu         sync.RWMutex
+	channelDispatcher ResearchChannelDispatcherV3
+	telegramRender    ResearchTelegramRendererV3
 }
 
-// SetTelegramDelivery is wired before the Temporal worker starts. Keeping it
-// late-bound avoids starting a public Bot ingress before the Agent and task
-// control plane have completed composition.
-func (d *ReceiptBackedResearchDeliveryV3) SetTelegramDelivery(
-	sender ResearchTelegramSenderV3, render ResearchTelegramRendererV3,
+// SetChannelDelivery is wired before the Temporal worker starts. Business
+// delivery receives only the provider-neutral dispatcher and a pure renderer.
+func (d *ReceiptBackedResearchDeliveryV3) SetChannelDelivery(
+	dispatcher ResearchChannelDispatcherV3, render ResearchTelegramRendererV3,
 ) {
-	d.telegramMu.Lock()
-	defer d.telegramMu.Unlock()
-	d.telegramSender, d.telegramRender = sender, render
+	d.channelMu.Lock()
+	defer d.channelMu.Unlock()
+	d.channelDispatcher, d.telegramRender = dispatcher, render
 }
 
-func (d *ReceiptBackedResearchDeliveryV3) telegramDelivery() (
-	ResearchTelegramSenderV3, ResearchTelegramRendererV3,
+func (d *ReceiptBackedResearchDeliveryV3) channelDelivery() (
+	ResearchChannelDispatcherV3, ResearchTelegramRendererV3,
 ) {
-	d.telegramMu.RLock()
-	defer d.telegramMu.RUnlock()
-	return d.telegramSender, d.telegramRender
+	d.channelMu.RLock()
+	defer d.channelMu.RUnlock()
+	return d.channelDispatcher, d.telegramRender
 }
 
 func NewReceiptBackedResearchDeliveryV3(
@@ -164,8 +164,8 @@ func (d *ReceiptBackedResearchDeliveryV3) Deliver(
 			return ResearchDeliveryReceiptV3{}, researchCoordinatorValidationV3(
 				"research V3 Telegram route is unavailable")
 		}
-		telegramSender, telegramRender := d.telegramDelivery()
-		if telegramSender == nil || telegramRender == nil {
+		channelDispatcher, telegramRender := d.channelDelivery()
+		if channelDispatcher == nil || telegramRender == nil {
 			return ResearchDeliveryReceiptV3{}, types.NewAppError(types.CodeConflict,
 				"research V3 Telegram sender is unavailable", types.ErrConflict)
 		}
@@ -176,15 +176,20 @@ func (d *ReceiptBackedResearchDeliveryV3) Deliver(
 		}
 		effectID := uuid.NewSHA1(uuid.NameSpaceURL,
 			[]byte("vane.research-v3-telegram/v1:"+frozen.ID)).String()
-		if _, err := d.store.PrepareTelegramOutbound(
+		permit, err := d.store.PrepareTelegramSendPermit(
 			ctx, identity.TenantID, identity.UserID, *frozen.TelegramRouteID,
-			effectID, "research_v3", text); err != nil {
+			effectID, "research_v3", text)
+		if err != nil {
 			return ResearchDeliveryReceiptV3{}, err
 		}
-		if err := telegramSender.SendTextEffect(
-			ctx, identity.TenantID, identity.UserID, *frozen.TelegramRouteID,
-			effectID, "research_v3", text); err != nil {
+		observation, err := channelDispatcher.Send(ctx, permit)
+		if err != nil {
 			return ResearchDeliveryReceiptV3{}, err
+		}
+		if observation.Disposition != pusheffect.AttemptSent {
+			return ResearchDeliveryReceiptV3{}, types.NewAppError(
+				types.CodePushFailed,
+				"research V3 Telegram send lacks sent evidence", types.ErrConflict)
 		}
 		if !frozen.Selection.Includes("feishu") {
 			return researchTelegramReceiptV3(frozen, brief)

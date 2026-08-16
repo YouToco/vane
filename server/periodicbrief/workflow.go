@@ -63,15 +63,15 @@ type ModelResolver interface {
 }
 
 type Activities struct {
-	store           Store
-	modelResolver   ModelResolver
-	recorder        *llm.Recorder
-	deliveryStore   DeliveryStore
-	sender          DeliverySender
-	dashboardOrigin string
-	deliveryTaskID  string
-	telegramMu      sync.RWMutex
-	telegramSender  TelegramDeliverySender
+	store             Store
+	modelResolver     ModelResolver
+	recorder          *llm.Recorder
+	deliveryStore     DeliveryStore
+	sender            DeliverySender
+	dashboardOrigin   string
+	deliveryTaskID    string
+	channelMu         sync.RWMutex
+	channelDispatcher ChannelDispatcher
 }
 
 func NewActivities(
@@ -94,18 +94,19 @@ func NewActivities(
 		deliveryTaskID:  strings.TrimSpace(deliveryTaskID)}, nil
 }
 
-// SetTelegramSender is called during process composition before the Temporal
-// worker starts. The lock also keeps tests and orderly shutdown race-free.
-func (a *Activities) SetTelegramSender(sender TelegramDeliverySender) {
-	a.telegramMu.Lock()
-	defer a.telegramMu.Unlock()
-	a.telegramSender = sender
+// SetChannelDispatcher is called during process composition before the
+// Temporal worker starts. Workflows depend only on the provider-neutral
+// dispatcher and cannot obtain a Telegram client or credential.
+func (a *Activities) SetChannelDispatcher(dispatcher ChannelDispatcher) {
+	a.channelMu.Lock()
+	defer a.channelMu.Unlock()
+	a.channelDispatcher = dispatcher
 }
 
-func (a *Activities) getTelegramSender() TelegramDeliverySender {
-	a.telegramMu.RLock()
-	defer a.telegramMu.RUnlock()
-	return a.telegramSender
+func (a *Activities) getChannelDispatcher() ChannelDispatcher {
+	a.channelMu.RLock()
+	defer a.channelMu.RUnlock()
+	return a.channelDispatcher
 }
 
 func WorkflowV1(

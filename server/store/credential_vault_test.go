@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/types"
 )
 
@@ -334,6 +337,147 @@ func TestCredentialVaultOrdinaryMemberOwnsOnlyTheirUserScope(t *testing.T) {
 		json.RawMessage(`{"bot_token":"9912:synthetic","webhook_secret":"synthetic"}`),
 		json.RawMessage(`{"bot_id":9912}`), memberID); !errors.Is(err, types.ErrNotFound) {
 		t.Fatalf("member wrote another user scope err=%v, want hidden", err)
+	}
+}
+
+func TestTelegramCredentialRotationRevokesAuthorityAndPinsManagerGeneration(t *testing.T) {
+	st, database := credentialVaultTestStore(t)
+	ctx := t.Context()
+	userID, tenantID := migration129Identity(t, database, "telegram-runtime-pin")
+	scope := CredentialScope{Kind: "user", TenantID: tenantID, UserID: userID,
+		Provider: "telegram", Purpose: "bot_api"}
+	secret := json.RawMessage(`{"bot_token":"778899:synthetic","webhook_secret":"synthetic"}`)
+	metadata := json.RawMessage(`{"bot_id":778899,"bot_username":"runtime_pin"}`)
+	first, err := st.RotateCredential(ctx, scope, secret, metadata, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := func(actor, chat string) (ChannelIdentity, ChannelRoute) {
+		t.Helper()
+		var identityID int64
+		if err := database.QueryRowContext(ctx, `
+			INSERT INTO channel_identities
+			 (tenant_id,user_id,provider,app_identity,external_user_id,
+			  provider_chat_id,chat_type)
+			 VALUES($1,$2,'telegram','778899',$3,$4,'private') RETURNING id`,
+			tenantID, userID, actor, chat).Scan(&identityID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.ExecContext(ctx, `
+			INSERT INTO channel_routes
+			 (tenant_id,user_id,identity_id,provider,app_identity,
+			  provider_chat_id,provider_thread_id,chat_type,route_kind)
+			 VALUES($1,$2,$3,'telegram','778899',$4,'0','private','private')`,
+			tenantID, userID, identityID, chat); err != nil {
+			t.Fatal(err)
+		}
+		identity, route, err := st.ResolveTelegramRoute(
+			ctx, "778899", actor, chat, "0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return identity, route
+	}
+	identity, route := bind("actor-old", "chat-old")
+	if _, err := database.ExecContext(ctx, `UPDATE memberships SET role='member'
+		WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID); err != nil {
+		t.Fatal(err)
+	}
+	turnID := uuid.NewString()
+	if _, err := st.AcceptTelegramRoutedIngress(ctx, identity, route, "78001",
+		strings.Repeat("a", 64), "hello", turnID, "1", "message", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	authorityV1 := TelegramRuntimeAuthority{TenantID: tenantID, UserID: userID,
+		CredentialGeneration: first.Generation, AppIdentity: "778899"}
+	claimedIngress, err := st.ClaimNextTelegramIngressAuthorized(
+		ctx, authorityV1, 30*time.Second)
+	if err != nil || claimedIngress.MembershipRole != types.MembershipRoleMember {
+		t.Fatalf("live principal role=%q err=%v", claimedIngress.MembershipRole, err)
+	}
+	preparedID := uuid.NewString()
+	if _, err := st.PrepareTelegramOutbound(ctx, tenantID, userID, route.ID,
+		preparedID, "periodic_report", "frozen body"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.RotateCredential(ctx, scope, secret, metadata, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var identityStatus, routeStatus, ingressStatus, ingressCode,
+		outboundStatus, outboundCode string
+	if err := database.QueryRowContext(ctx, `
+		SELECT ci.status,cr.status,r.status,r.error_code,e.status,e.error_code
+		  FROM channel_identities ci
+		  JOIN channel_routes cr ON cr.identity_id=ci.id
+		  JOIN channel_ingress_receipts r ON r.identity_id=ci.id
+		  JOIN channel_outbound_effects e ON e.route_id=cr.id
+		 WHERE ci.id=$1 AND e.effect_id=$2`, identity.ID, preparedID).Scan(
+		&identityStatus, &routeStatus, &ingressStatus, &ingressCode,
+		&outboundStatus, &outboundCode); err != nil {
+		t.Fatal(err)
+	}
+	if identityStatus != "revoked" || routeStatus != "revoked" ||
+		ingressStatus != "failed" || ingressCode != "credential_rotated" ||
+		outboundStatus != "failed" || outboundCode != "credential_rotated" {
+		t.Fatalf("rotation state identity=%s route=%s ingress=%s/%s outbound=%s/%s",
+			identityStatus, routeStatus, ingressStatus, ingressCode,
+			outboundStatus, outboundCode)
+	}
+	_, newRoute := bind("actor-new", "chat-new")
+	newEffectID := uuid.NewString()
+	newEffect, err := st.PrepareTelegramOutbound(ctx, tenantID, userID, newRoute.ID,
+		newEffectID, "periodic_report", "new generation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimTelegramOutboundAuthorized(
+		ctx, authorityV1, newEffectID); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("retired manager generation claimed new work: %v", err)
+	}
+	authorityV2 := authorityV1
+	authorityV2.CredentialGeneration = second.Generation
+	forged, err := channelruntime.BindDurableSend(
+		channelruntime.ProviderTelegram, tenantID, userID+1, newRoute.ID,
+		newEffectID, newEffect.EffectKind, newEffect.PayloadDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimTelegramOutboundPermitAuthorized(
+		ctx, authorityV2, forged); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("forged permit was not rejected before claim: %v", err)
+	}
+	if _, err := st.ClaimTelegramOutboundAuthorized(ctx, authorityV2, newEffectID); err != nil {
+		t.Fatalf("active manager generation could not claim: %v", err)
+	}
+	pendingOnRevoke := uuid.NewString()
+	if _, err := st.PrepareTelegramOutbound(ctx, tenantID, userID, newRoute.ID,
+		pendingOnRevoke, "periodic_report", "revoke me"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RevokeCredential(ctx, scope, userID); err != nil {
+		t.Fatal(err)
+	}
+	var newIdentityStatus, sendingStatus, revokedPreparedStatus,
+		revokedPreparedCode string
+	if err := database.QueryRowContext(ctx, `
+		SELECT ci.status,sending.status,pending.status,pending.error_code
+		  FROM channel_identities ci
+		  JOIN channel_routes cr ON cr.identity_id=ci.id
+		  JOIN channel_outbound_effects sending ON sending.route_id=cr.id
+		  JOIN channel_outbound_effects pending ON pending.route_id=cr.id
+		 WHERE ci.id=$1 AND sending.effect_id=$2 AND pending.effect_id=$3`,
+		newRoute.IdentityID, newEffectID, pendingOnRevoke).Scan(
+		&newIdentityStatus, &sendingStatus, &revokedPreparedStatus,
+		&revokedPreparedCode); err != nil {
+		t.Fatal(err)
+	}
+	if newIdentityStatus != "revoked" || sendingStatus != "sending" ||
+		revokedPreparedStatus != "failed" ||
+		revokedPreparedCode != "credential_revoked" {
+		t.Fatalf("revoke state identity=%s sending=%s pending=%s/%s",
+			newIdentityStatus, sendingStatus, revokedPreparedStatus,
+			revokedPreparedCode)
 	}
 }
 

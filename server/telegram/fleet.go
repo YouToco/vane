@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
 )
@@ -27,6 +28,26 @@ type CredentialStore interface {
 	ListActiveUserCredentialMetadata(context.Context, string, string) ([]store.CredentialMetadata, error)
 	ActiveCredentialMetadata(context.Context, store.CredentialScope) (store.CredentialMetadata, error)
 	UseCredential(context.Context, store.CredentialScope, int64, func([]byte, store.CredentialMetadata) error) error
+}
+
+func (f *Fleet) Provider() channelruntime.Provider {
+	return channelruntime.ProviderTelegram
+}
+
+// Send implements the provider-neutral channel Adapter. Exact manager
+// selection comes only from the durable permit's Vane tenant/user scope.
+func (f *Fleet) Send(
+	ctx context.Context, permit channelruntime.SendPermit,
+) (channelruntime.ProviderObservation, error) {
+	if permit.Validate() != nil || permit.Provider() != channelruntime.ProviderTelegram {
+		return channelruntime.ProviderObservation{}, types.NewAppError(
+			types.CodeValidation, "Telegram send permit 无效", types.ErrValidation)
+	}
+	m, err := f.managerForUser(permit.TenantID(), permit.UserID())
+	if err != nil {
+		return channelruntime.ProviderObservation{}, err
+	}
+	return m.SendPermit(ctx, permit)
 }
 
 type FleetConfig struct {
@@ -193,6 +214,10 @@ func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialM
 		Enabled: true, Token: secret.BotToken, WebhookSecret: secret.WebhookSecret,
 		WebhookURL: webhookURL, APIBaseURL: f.cfg.APIBaseURL,
 		Workers: f.cfg.Workers,
+		RuntimeAuthority: store.TelegramRuntimeAuthority{
+			TenantID: metadata.TenantID, UserID: metadata.UserID,
+			CredentialGeneration: metadata.Generation, AppIdentity: botID,
+		},
 	}, f.store, f.agent, f.httpClient,
 		f.logger.With("tenant_id", metadata.TenantID, "bot_id", botID,
 			"credential_generation", metadata.Generation))
@@ -369,11 +394,15 @@ func (f *Fleet) managerForUser(tenantID, userID int64) (*Manager, error) {
 	f.mu.RLock()
 	entry := f.byUser[userScope{tenantID: tenantID, userID: userID}]
 	legacy := f.legacy
+	dynamic := f.cfg.Dynamic
 	f.mu.RUnlock()
 	if entry != nil {
 		return entry.manager, nil
 	}
-	if legacy != nil {
+	// A global environment Manager has no exact Vane principal pin. Once the
+	// multi-user fleet is enabled it may continue serving its legacy webhook,
+	// but it must never be selected for an arbitrary authenticated tenant/user.
+	if legacy != nil && !dynamic {
 		return legacy, nil
 	}
 	return nil, types.NewAppError(types.CodeConflict,

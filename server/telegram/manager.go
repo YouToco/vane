@@ -24,6 +24,8 @@ import (
 
 	"github.com/YouToco/vane/server/agent"
 	"github.com/YouToco/vane/server/auth"
+	"github.com/YouToco/vane/server/channelruntime"
+	"github.com/YouToco/vane/server/pusheffect"
 	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
 )
@@ -49,6 +51,9 @@ type Config struct {
 	WebhookURL    string
 	APIBaseURL    string
 	Workers       int
+	// RuntimeAuthority is non-zero only for a database-backed user Bot. It
+	// pins this Manager to one exact tenant/user/credential generation.
+	RuntimeAuthority store.TelegramRuntimeAuthority
 }
 
 type Status struct {
@@ -111,6 +116,15 @@ type IngressStore interface {
 	TelegramBlockedReplyStatsForUser(context.Context, string, int64, int64) (store.ChannelDeliveryBlockStats, error)
 }
 
+type authorizedIngressStore interface {
+	ClaimNextTelegramIngressAuthorized(context.Context, store.TelegramRuntimeAuthority, time.Duration) (store.ChannelIngress, error)
+	ClaimTelegramReplySendAuthorized(context.Context, store.TelegramRuntimeAuthority, string) (store.ChannelIngress, error)
+	ClaimNextTelegramReplySendAuthorized(context.Context, store.TelegramRuntimeAuthority) (store.ChannelIngress, error)
+	ClaimTelegramOutboundAuthorized(context.Context, store.TelegramRuntimeAuthority, string) (store.ChannelOutboundEffect, error)
+	ClaimTelegramOutboundPermitAuthorized(context.Context, store.TelegramRuntimeAuthority, channelruntime.SendPermit) (store.ChannelOutboundEffect, error)
+	ClaimNextTelegramOutboundAuthorized(context.Context, store.TelegramRuntimeAuthority) (store.ChannelOutboundEffect, error)
+}
+
 type ChannelAgent interface {
 	HandleChannelMessage(
 		context.Context, auth.Principal, string, string, string,
@@ -149,6 +163,19 @@ func NewManager(
 		cfg.WebhookURL == "" {
 		return nil, errors.New("telegram: enabled adapter dependencies are incomplete")
 	}
+	authority := cfg.RuntimeAuthority
+	storedAuthority := authority.CredentialGeneration > 0
+	if storedAuthority != (authority.TenantID > 0 && authority.UserID > 0 &&
+		authority.AppIdentity != "") ||
+		(!storedAuthority && (authority.TenantID != 0 || authority.UserID != 0 ||
+			authority.AppIdentity != "" || authority.CredentialGeneration != 0)) {
+		return nil, errors.New("telegram: runtime authority is invalid")
+	}
+	if storedAuthority {
+		if _, ok := st.(authorizedIngressStore); !ok {
+			return nil, errors.New("telegram: stored Bot authority Store is unavailable")
+		}
+	}
 	client, err := NewClient(cfg.Token, cfg.APIBaseURL, httpClient)
 	if err != nil {
 		return nil, err
@@ -181,6 +208,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err != nil {
 		m.setError("get_me")
 		return fmt.Errorf("telegram: verify bot identity: %w", err)
+	}
+	if m.cfg.RuntimeAuthority.CredentialGeneration > 0 &&
+		strconv.FormatInt(bot.ID, 10) != m.cfg.RuntimeAuthority.AppIdentity {
+		return errors.New("telegram: verified Bot differs from pinned credential identity")
 	}
 	if err := m.client.SetWebhook(
 		startupCtx, m.cfg.WebhookURL, m.cfg.WebhookSecret); err != nil {
@@ -908,8 +939,7 @@ func (m *Manager) processReadyOutbound(ctx context.Context) bool {
 	if !ready {
 		return false
 	}
-	item, err := m.store.ClaimNextTelegramOutbound(
-		ctx, strconv.FormatInt(bot.ID, 10))
+	item, err := m.claimNextOutbound(ctx, strconv.FormatInt(bot.ID, 10))
 	if errors.Is(err, types.ErrNotFound) {
 		return false
 	}
@@ -927,8 +957,7 @@ func (m *Manager) processReadyReply(ctx context.Context) bool {
 	if !ready {
 		return false
 	}
-	item, err := m.store.ClaimNextTelegramReplySend(
-		ctx, strconv.FormatInt(bot.ID, 10))
+	item, err := m.claimNextReply(ctx, strconv.FormatInt(bot.ID, 10))
 	if errors.Is(err, types.ErrNotFound) {
 		return false
 	}
@@ -946,7 +975,7 @@ func (m *Manager) processOne(ctx context.Context) bool {
 	if !ready {
 		return false
 	}
-	item, err := m.store.ClaimNextTelegramIngress(
+	item, err := m.claimNextIngress(
 		ctx, strconv.FormatInt(bot.ID, 10), workerLease)
 	if errors.Is(err, types.ErrNotFound) {
 		return false
@@ -963,7 +992,7 @@ func (m *Manager) processOne(ctx context.Context) bool {
 		outcome, agentErr = m.agent.HandleChannelMessage(
 			agentCtx, auth.Principal{
 				TenantID: types.TenantID(item.TenantID), UserID: item.UserID,
-				Role: types.MembershipRoleOwner, ActorType: types.ActorTypeUser,
+				Role: item.MembershipRole, ActorType: types.ActorTypeUser,
 			},
 			channelConversationScope(item.RouteID),
 			item.StableTurnID, item.InputText)
@@ -981,14 +1010,82 @@ func (m *Manager) processOne(ctx context.Context) bool {
 		m.logger.Error("telegram: persist reply failed", "error_code", types.CodeOf(err))
 		return true
 	}
-	sending, err := m.store.ClaimTelegramReplySend(
-		ctx, item.Provider, item.AppIdentity, item.ProviderUpdateID)
+	sending, err := m.claimReply(ctx, item)
 	if err != nil {
 		m.logger.Error("telegram: claim send failed", "error_code", types.CodeOf(err))
 		return true
 	}
 	m.deliverClaimedReply(ctx, sending)
 	return true
+}
+
+func (m *Manager) runtimeAuthority(appIdentity string) store.TelegramRuntimeAuthority {
+	if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		return m.cfg.RuntimeAuthority
+	}
+	return store.TelegramRuntimeAuthority{AppIdentity: appIdentity}
+}
+
+func (m *Manager) authorizedStore() (authorizedIngressStore, bool) {
+	st, ok := m.store.(authorizedIngressStore)
+	return st, ok
+}
+
+func (m *Manager) claimNextIngress(
+	ctx context.Context, appIdentity string, lease time.Duration,
+) (store.ChannelIngress, error) {
+	if st, ok := m.authorizedStore(); ok {
+		return st.ClaimNextTelegramIngressAuthorized(
+			ctx, m.runtimeAuthority(appIdentity), lease)
+	}
+	if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		return store.ChannelIngress{}, types.NewAppError(types.CodeConflict,
+			"Telegram stored Bot authority 不可用", types.ErrConflict)
+	}
+	return m.store.ClaimNextTelegramIngress(ctx, appIdentity, lease)
+}
+
+func (m *Manager) claimNextReply(
+	ctx context.Context, appIdentity string,
+) (store.ChannelIngress, error) {
+	if st, ok := m.authorizedStore(); ok {
+		return st.ClaimNextTelegramReplySendAuthorized(
+			ctx, m.runtimeAuthority(appIdentity))
+	}
+	if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		return store.ChannelIngress{}, types.NewAppError(types.CodeConflict,
+			"Telegram stored Bot authority 不可用", types.ErrConflict)
+	}
+	return m.store.ClaimNextTelegramReplySend(ctx, appIdentity)
+}
+
+func (m *Manager) claimReply(
+	ctx context.Context, item store.ChannelIngress,
+) (store.ChannelIngress, error) {
+	if st, ok := m.authorizedStore(); ok {
+		return st.ClaimTelegramReplySendAuthorized(
+			ctx, m.runtimeAuthority(item.AppIdentity), item.ProviderUpdateID)
+	}
+	if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		return store.ChannelIngress{}, types.NewAppError(types.CodeConflict,
+			"Telegram stored Bot authority 不可用", types.ErrConflict)
+	}
+	return m.store.ClaimTelegramReplySend(
+		ctx, item.Provider, item.AppIdentity, item.ProviderUpdateID)
+}
+
+func (m *Manager) claimNextOutbound(
+	ctx context.Context, appIdentity string,
+) (store.ChannelOutboundEffect, error) {
+	if st, ok := m.authorizedStore(); ok {
+		return st.ClaimNextTelegramOutboundAuthorized(
+			ctx, m.runtimeAuthority(appIdentity))
+	}
+	if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		return store.ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
+			"Telegram stored Bot authority 不可用", types.ErrConflict)
+	}
+	return m.store.ClaimNextTelegramOutbound(ctx, appIdentity)
 }
 
 func channelConversationScope(routeID int64) string {
@@ -1268,16 +1365,92 @@ func (m *Manager) SendTextEffect(
 		return types.NewAppError(types.CodeConflict,
 			"Telegram outbound effect 已结算或等待人工核对", types.ErrConflict)
 	}
-	claimed, err := m.store.ClaimTelegramOutbound(ctx, effectID)
+	var claimed store.ChannelOutboundEffect
+	if st, ok := m.authorizedStore(); ok {
+		bot, ready := m.botIdentity()
+		if !ready {
+			return types.NewAppError(types.CodeConflict,
+				"Telegram Bot 尚未就绪", types.ErrConflict)
+		}
+		claimed, err = st.ClaimTelegramOutboundAuthorized(
+			ctx, m.runtimeAuthority(strconv.FormatInt(bot.ID, 10)), effectID)
+	} else if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		return types.NewAppError(types.CodeConflict,
+			"Telegram stored Bot authority 不可用", types.ErrConflict)
+	} else {
+		claimed, err = m.store.ClaimTelegramOutbound(ctx, effectID)
+	}
 	if err != nil {
 		return err
 	}
 	return m.deliverClaimedOutbound(ctx, claimed)
 }
 
+// SendPermit is the only provider-neutral business-send entrypoint. The
+// permit contains no payload or credential and must match the exact effect
+// returned by the Store's prepared -> sending claim.
+func (m *Manager) SendPermit(
+	ctx context.Context, permit channelruntime.SendPermit,
+) (channelruntime.ProviderObservation, error) {
+	if permit.Validate() != nil ||
+		permit.Provider() != channelruntime.ProviderTelegram {
+		return channelruntime.ProviderObservation{}, types.NewAppError(
+			types.CodeValidation, "Telegram send permit 无效", types.ErrValidation)
+	}
+	var claimed store.ChannelOutboundEffect
+	var err error
+	if st, ok := m.authorizedStore(); ok {
+		bot, ready := m.botIdentity()
+		if !ready {
+			return channelruntime.ProviderObservation{}, types.NewAppError(
+				types.CodeConflict, "Telegram Bot 尚未就绪", types.ErrConflict)
+		}
+		claimed, err = st.ClaimTelegramOutboundPermitAuthorized(
+			ctx, m.runtimeAuthority(strconv.FormatInt(bot.ID, 10)), permit)
+	} else if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		return channelruntime.ProviderObservation{}, types.NewAppError(
+			types.CodeConflict, "Telegram stored Bot authority 不可用", types.ErrConflict)
+	} else {
+		return channelruntime.ProviderObservation{}, types.NewAppError(
+			types.CodeConflict, "Telegram permit-aware Store 不可用", types.ErrConflict)
+	}
+	if err != nil {
+		return channelruntime.ProviderObservation{}, err
+	}
+	if claimed.TenantID != permit.TenantID() || claimed.UserID != permit.UserID() ||
+		claimed.RouteID != permit.RouteID() || claimed.EffectID != permit.EffectID() ||
+		claimed.EffectKind != permit.EffectKind() ||
+		claimed.PayloadDigest != permit.PayloadDigest() {
+		return channelruntime.ProviderObservation{}, types.NewAppError(
+			types.CodeConflict, "Telegram send permit 与 durable effect 不一致",
+			types.ErrConflict)
+	}
+	if claimed.Status == "sent" && len(claimed.ProviderMessageIDs) > 0 {
+		return channelruntime.ProviderObservation{
+			Disposition: pusheffect.AttemptSent, AppIdentity: claimed.AppIdentity,
+			ChatID: claimed.ProviderChatID, MessageID: claimed.ProviderMessageIDs[0],
+		}, nil
+	}
+	if claimed.Status != "sending" {
+		return channelruntime.ProviderObservation{}, types.NewAppError(
+			types.CodeConflict, "Telegram durable effect 不可发送", types.ErrConflict)
+	}
+	return m.deliverClaimedOutboundObservation(ctx, claimed)
+}
+
 func (m *Manager) deliverClaimedOutbound(
 	ctx context.Context, claimed store.ChannelOutboundEffect,
 ) error {
+	_, err := m.deliverClaimedOutboundObservation(ctx, claimed)
+	return err
+}
+
+func (m *Manager) deliverClaimedOutboundObservation(
+	ctx context.Context, claimed store.ChannelOutboundEffect,
+) (channelruntime.ProviderObservation, error) {
+	observation := channelruntime.ProviderObservation{
+		AppIdentity: claimed.AppIdentity, ChatID: claimed.ProviderChatID,
+	}
 	threadID, _ := strconv.ParseInt(claimed.ProviderThreadID, 10, 64)
 	chunks := SplitMessage(claimed.PayloadText)
 	messageIDs := make([]string, 0, len(chunks))
@@ -1296,13 +1469,14 @@ func (m *Manager) deliverClaimedOutbound(
 				scheduled, deferErr := m.store.DeferTelegramOutbound(
 					ctx, claimed, deliveryErr.RetryAfter, maxRateLimitRetries)
 				if deferErr != nil {
-					return deferErr
+					return channelruntime.ProviderObservation{}, deferErr
 				}
+				observation.Disposition = pusheffect.AttemptDefiniteNotSent
 				if scheduled {
-					return types.NewAppError(types.CodePushFailed,
+					return observation, types.NewAppError(types.CodePushFailed,
 						"Telegram 限流，已按 provider retry_after 耐久延后", nil)
 				}
-				return types.NewAppError(types.CodePushFailed,
+				return observation, types.NewAppError(types.CodePushFailed,
 					"Telegram 限流重试预算已耗尽", nil)
 			}
 			if len(messageIDs) == 0 && errors.As(sendErr, &deliveryErr) &&
@@ -1310,23 +1484,34 @@ func (m *Manager) deliverClaimedOutbound(
 				m.observeProviderError(sendErr)
 				if settleErr := m.store.MarkTelegramOutboundRejected(
 					ctx, claimed, sanitizeDeliveryCode(sendErr)); settleErr != nil {
-					return settleErr
+					return channelruntime.ProviderObservation{}, settleErr
 				}
-				return types.NewAppError(types.CodePushFailed,
+				observation.Disposition = pusheffect.AttemptDefiniteNotSent
+				return observation, types.NewAppError(types.CodePushFailed,
 					"Telegram 明确拒绝发送", nil)
 			}
 			if settleErr := m.store.MarkTelegramOutboundAmbiguous(
 				ctx, claimed, messageIDs, sanitizeDeliveryCode(sendErr)); settleErr != nil {
-				return settleErr
+				return channelruntime.ProviderObservation{}, settleErr
 			}
-			return types.NewAppError(types.CodePushFailed,
+			observation.Disposition = pusheffect.AttemptAmbiguous
+			if len(messageIDs) > 0 {
+				observation.MessageID = messageIDs[0]
+			}
+			return observation, types.NewAppError(types.CodePushFailed,
 				"Telegram 发送结果不确定，已阻止自动重发", nil)
 		}
 		messageIDs = append(messageIDs, messageID)
 	}
 	if err := m.store.CompleteTelegramOutbound(ctx, claimed, messageIDs); err != nil {
-		return types.NewAppError(types.CodePushFailed,
+		observation.Disposition = pusheffect.AttemptSent
+		if len(messageIDs) > 0 {
+			observation.MessageID = messageIDs[0]
+		}
+		return observation, types.NewAppError(types.CodePushFailed,
 			"Telegram 已发送但本地结算失败，已阻止自动重发", err)
 	}
-	return nil
+	observation.Disposition = pusheffect.AttemptSent
+	observation.MessageID = messageIDs[0]
+	return observation, nil
 }

@@ -1,6 +1,8 @@
 # Telegram Bot channel contract (routed ingress v4.1)
 
-Status: implemented, default-off, production UAT pending.
+Status: provider-neutral dispatcher and exact stored-Bot generation fence are
+implemented; default-off; production canary and UAT remain blocked by the
+narrow database-role/FORCE-RLS gate below.
 
 This contract adds Telegram as an authenticated, routed entrance to the same
 Vane user Agent used by Web and Feishu. One authenticated user may authorize a
@@ -250,6 +252,22 @@ key plus the explicit tenant/user/bot/actor/chat predicates and row locks in
 every Store method. Moving the primary server to `vane_app` remains blocked
 until a later migration grants a narrow channel capability and production-role
 tests prove `row_security_active`; it must not be enabled by config alone.
+
+The current code-level security slice does not weaken that block. Stored Bot
+Managers are pinned to exact `(tenant,user,credential generation,numeric bot
+id)` authority, and every ingress/reply/outbound claim rechecks that active
+credential (for stored Bots), active tenant, current membership, identity and
+route in the claim transaction. Credential rotation/revoke uses the same scope
+lock and atomically revokes old identities/routes plus all states that have not
+crossed the provider boundary. Telegram ingress constructs the Agent principal
+from the membership role read by that claim; it never fabricates `owner`.
+
+Business workflows now receive only an immutable durable `SendPermit` from
+Store and call the provider-neutral Channel Dispatcher. They cannot hold a
+Telegram sender/client or choose mutable provider routing. A missing Telegram
+adapter for either `telegram` or `both` fails closed. These code guards make the
+future role cutover reviewable, but they are not RLS evidence and do not
+authorize a production canary by themselves.
 
 ## Secret and transport rules
 

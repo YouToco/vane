@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/feishu"
 	"github.com/YouToco/vane/server/pusheffect"
 	"github.com/YouToco/vane/server/store"
@@ -32,9 +33,9 @@ type DeliveryStore interface {
 		context.Context, int64, int64, string, string, string,
 		store.DeliveryChannelPreference,
 	) (store.ArtifactDeliveryPlan, error)
-	PrepareTelegramOutbound(
+	PrepareTelegramSendPermit(
 		context.Context, int64, int64, int64, string, string, string,
-	) (store.ChannelOutboundEffect, error)
+	) (channelruntime.SendPermit, error)
 	GetBriefReportSettingsV1(
 		context.Context, int64, int64, string,
 	) (store.BriefReportSettingsV1, error)
@@ -56,10 +57,10 @@ type DeliveryStore interface {
 	) error
 }
 
-type TelegramDeliverySender interface {
-	SendTextEffect(
-		context.Context, int64, int64, int64, string, string, string,
-	) error
+type ChannelDispatcher interface {
+	Send(context.Context, channelruntime.SendPermit) (
+		channelruntime.ProviderObservation, error,
+	)
 }
 
 type DeliverInputV1 struct {
@@ -140,7 +141,7 @@ func (a *Activities) DeliverPeriodicBriefV1(
 ) error {
 	return deliverPeriodicBriefV1(
 		ctx, input.Report, a.deliveryStore, a.sender,
-		a.getTelegramSender(), a.dashboardOrigin,
+		a.getChannelDispatcher(), a.dashboardOrigin,
 		input.Report.TaskID != "" &&
 			input.Report.TaskID == a.deliveryTaskID)
 }
@@ -150,7 +151,7 @@ func deliverPeriodicBriefV1(
 	report types.PeriodicBriefReportV1,
 	deliveryStore DeliveryStore,
 	sender DeliverySender,
-	telegramSender TelegramDeliverySender,
+	channelDispatcher ChannelDispatcher,
 	dashboardOrigin string,
 	channelEnabled bool,
 ) error {
@@ -205,6 +206,10 @@ func deliverPeriodicBriefV1(
 		return types.NewAppError(types.CodeConflict,
 			"Telegram 周期报告目的地未就绪", types.ErrConflict)
 	}
+	if telegramEnabled && channelDispatcher == nil {
+		return types.NewAppError(types.CodeConflict,
+			"Telegram 周期报告 adapter 未就绪", types.ErrConflict)
+	}
 	card := feishu.BuildPeriodicBriefCardV1(report, webURL)
 	if card == "" {
 		return types.NewAppError(
@@ -241,15 +246,19 @@ func deliverPeriodicBriefV1(
 		effectID := uuid.NewSHA1(uuid.NameSpaceURL,
 			[]byte("vane.periodic-report-telegram/v1:"+plan.ID)).String()
 		body := renderPeriodicTelegramV1(report, webURL)
-		if _, err := deliveryStore.PrepareTelegramOutbound(
+		permit, err := deliveryStore.PrepareTelegramSendPermit(
 			ctx, report.TenantID, report.UserID, *plan.TelegramRouteID,
-			effectID, "periodic_report", body); err != nil {
+			effectID, "periodic_report", body)
+		if err != nil {
 			sendErrs = append(sendErrs, err)
-		} else if telegramSender != nil {
-			if err := telegramSender.SendTextEffect(
-				ctx, report.TenantID, report.UserID, *plan.TelegramRouteID,
-				effectID, "periodic_report", body); err != nil {
-				sendErrs = append(sendErrs, err)
+		} else {
+			observation, sendErr := channelDispatcher.Send(ctx, permit)
+			if sendErr != nil {
+				sendErrs = append(sendErrs, sendErr)
+			} else if observation.Disposition != pusheffect.AttemptSent {
+				sendErrs = append(sendErrs, types.NewAppError(
+					types.CodePushFailed,
+					"Telegram 周期报告未取得已发送证据", types.ErrConflict))
 			}
 		}
 	}

@@ -29,11 +29,11 @@ var productionResearchActivitiesV3 = map[string]bool{
 }
 
 // nonActivityMethods 是 *Activities 上**不是** Temporal Activity 的导出方法。
-// SetAggregateTelegramSender is a late-bound process-local transport hook. It
+// SetAggregateChannelDispatcher is a late-bound process-local transport hook. It
 // mutates only the worker-side activity dependency and must never become a
 // Temporal command or be registered as an Activity.
 var nonActivityMethods = map[string]bool{
-	"SetAggregateTelegramSender": true,
+	"SetAggregateChannelDispatcher": true,
 }
 
 func TestProductionWorkerRegistersOnlyResearchActivitiesV3(t *testing.T) {

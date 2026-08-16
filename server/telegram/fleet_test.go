@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
 )
@@ -100,6 +101,43 @@ func (f *fakeFleetStore) UseCredential(
 		return types.NewAppError(types.CodeNotFound, "missing", types.ErrNotFound)
 	}
 	return use(secret, metadata)
+}
+
+func (f *fakeFleetStore) ClaimNextTelegramIngressAuthorized(
+	ctx context.Context, _ store.TelegramRuntimeAuthority, lease time.Duration,
+) (store.ChannelIngress, error) {
+	return f.ClaimNextTelegramIngress(ctx, "stored", lease)
+}
+
+func (f *fakeFleetStore) ClaimTelegramReplySendAuthorized(
+	ctx context.Context, _ store.TelegramRuntimeAuthority, updateID string,
+) (store.ChannelIngress, error) {
+	return f.ClaimTelegramReplySend(ctx, "telegram", "stored", updateID)
+}
+
+func (f *fakeFleetStore) ClaimNextTelegramReplySendAuthorized(
+	ctx context.Context, _ store.TelegramRuntimeAuthority,
+) (store.ChannelIngress, error) {
+	return f.ClaimNextTelegramReplySend(ctx, "stored")
+}
+
+func (f *fakeFleetStore) ClaimTelegramOutboundAuthorized(
+	ctx context.Context, _ store.TelegramRuntimeAuthority, effectID string,
+) (store.ChannelOutboundEffect, error) {
+	return f.ClaimTelegramOutbound(ctx, effectID)
+}
+
+func (f *fakeFleetStore) ClaimTelegramOutboundPermitAuthorized(
+	ctx context.Context, _ store.TelegramRuntimeAuthority,
+	permit channelruntime.SendPermit,
+) (store.ChannelOutboundEffect, error) {
+	return f.ClaimTelegramOutbound(ctx, permit.EffectID())
+}
+
+func (f *fakeFleetStore) ClaimNextTelegramOutboundAuthorized(
+	ctx context.Context, _ store.TelegramRuntimeAuthority,
+) (store.ChannelOutboundEffect, error) {
+	return f.ClaimNextTelegramOutbound(ctx, "stored")
 }
 
 func telegramFleetProvider(t *testing.T) (*httptest.Server, *sync.Map) {

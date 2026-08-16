@@ -3,6 +3,8 @@ package workflow
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"reflect"
@@ -14,6 +16,7 @@ import (
 
 	"go.temporal.io/sdk/testsuite"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/feedback"
 	"github.com/YouToco/vane/server/pusheffect"
 	"github.com/YouToco/vane/server/runtimepolicy"
@@ -26,6 +29,7 @@ type aggregateChannelStoreFake struct {
 	plan         *storepkg.ArtifactDeliveryPlan
 	prepareCalls int
 	settleCalls  int
+	body         string
 }
 
 func (f *aggregateChannelStoreFake) ResolveDeliveryChannelPreference(
@@ -59,16 +63,16 @@ func (f *aggregateChannelStoreFake) PrepareArtifactDeliveryPlan(
 	}
 	return *f.plan, nil
 }
-func (f *aggregateChannelStoreFake) PrepareAggregateTelegramOutbound(
+func (f *aggregateChannelStoreFake) PrepareAggregateTelegramSendPermit(
 	_ context.Context, _ string, tenantID, userID int64, _ string,
 	_ int64, _, _ int, _ []int64, routeID int64, effectID, body string,
-) (storepkg.ChannelOutboundEffect, error) {
+) (channelruntime.SendPermit, error) {
 	f.prepareCalls++
-	return storepkg.ChannelOutboundEffect{
-		EffectID: effectID, TenantID: tenantID, UserID: userID,
-		RouteID: routeID, EffectKind: "aggregate_brief",
-		PayloadText: body, Status: "prepared",
-	}, nil
+	f.body = body
+	digest := sha256.Sum256([]byte(body))
+	return channelruntime.BindDurableSend(channelruntime.ProviderTelegram,
+		tenantID, userID, routeID, effectID, "aggregate_brief",
+		hex.EncodeToString(digest[:]))
 }
 func (f *aggregateChannelStoreFake) SettleAggregateTelegramOutbound(
 	context.Context, int64, int64, string, string,
@@ -79,15 +83,16 @@ func (f *aggregateChannelStoreFake) SettleAggregateTelegramOutbound(
 
 type aggregateTelegramSenderFake struct {
 	calls int
-	body  string
 }
 
-func (f *aggregateTelegramSenderFake) SendTextEffect(
-	_ context.Context, _, _ int64, _ int64, _, _ string, body string,
-) error {
+func (f *aggregateTelegramSenderFake) Send(
+	_ context.Context, _ channelruntime.SendPermit,
+) (channelruntime.ProviderObservation, error) {
 	f.calls++
-	f.body = body
-	return nil
+	return channelruntime.ProviderObservation{
+		Disposition: pusheffect.AttemptSent, AppIdentity: "telegram-test",
+		MessageID: "1",
+	}, nil
 }
 
 func TestPRBCompletePushEffectPlan(t *testing.T) {
@@ -354,7 +359,7 @@ func TestPRBAggregateTelegramOnlyUsesProviderChildReceipt(t *testing.T) {
 	activities := prbFullPushActivities(compiledStore, effectStore,
 		feishuPusher, feishu, channelStore, identity.TaskID)
 	telegramSender := &aggregateTelegramSenderFake{}
-	activities.SetAggregateTelegramSender(telegramSender)
+	activities.SetAggregateChannelDispatcher(telegramSender)
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(activities.Push)
@@ -373,7 +378,7 @@ func TestPRBAggregateTelegramOnlyUsesProviderChildReceipt(t *testing.T) {
 	if telegramSender.calls != 1 || channelStore.settleCalls != 1 ||
 		channelStore.prepareCalls != 2 || len(prepared) != 0 ||
 		len(feishuPusher.snapshot()) != 0 ||
-		!strings.Contains(telegramSender.body, "PRB item 0") {
+		!strings.Contains(channelStore.body, "PRB item 0") {
 		t.Fatalf("telegram=%+v prepare=%d settle=%d feishu_effects=%d feishu_calls=%d",
 			telegramSender, channelStore.prepareCalls, channelStore.settleCalls,
 			len(prepared), len(feishuPusher.snapshot()))

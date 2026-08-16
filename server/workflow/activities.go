@@ -21,6 +21,7 @@ import (
 	"go.temporal.io/sdk/activity"
 
 	cardgenpkg "github.com/YouToco/vane/server/cardgen"
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/dedup"
 	"github.com/YouToco/vane/server/eventqualifier"
 	evolverpkg "github.com/YouToco/vane/server/evolver"
@@ -206,13 +207,15 @@ type aggregateChannelDeliveryStore interface {
 	LoadArtifactDeliveryPlan(context.Context, int64, int64, string, string, string) (storepkg.ArtifactDeliveryPlan, error)
 	PrepareArtifactDeliveryPlan(context.Context, int64, int64, string, string, string,
 		storepkg.DeliveryChannelPreference) (storepkg.ArtifactDeliveryPlan, error)
-	PrepareAggregateTelegramOutbound(context.Context, string, int64, int64, string,
-		int64, int, int, []int64, int64, string, string) (storepkg.ChannelOutboundEffect, error)
+	PrepareAggregateTelegramSendPermit(context.Context, string, int64, int64, string,
+		int64, int, int, []int64, int64, string, string) (channelruntime.SendPermit, error)
 	SettleAggregateTelegramOutbound(context.Context, int64, int64, string, string) error
 }
 
-type aggregateTelegramSender interface {
-	SendTextEffect(context.Context, int64, int64, int64, string, string, string) error
+type aggregateChannelDispatcher interface {
+	Send(context.Context, channelruntime.SendPermit) (
+		channelruntime.ProviderObservation, error,
+	)
 }
 
 // Store 是 Activity 需要的数据访问子集（规格 B3 的相关方法）。
@@ -584,9 +587,9 @@ type Activities struct {
 		Deliver(context.Context, types.RunIdentity, types.ResearchRunSnapshotRefV3,
 			types.ResearchRunPlanRefV3, ResearchBriefRefV3, string) (ResearchDeliveryReceiptV3, error)
 	}
-	aggregateChannelStore aggregateChannelDeliveryStore
-	aggregateTelegramMu   sync.RWMutex
-	aggregateTelegram     aggregateTelegramSender
+	aggregateChannelStore      aggregateChannelDeliveryStore
+	aggregateChannelMu         sync.RWMutex
+	aggregateChannelDispatcher aggregateChannelDispatcher
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -816,16 +819,18 @@ func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, f
 	return a
 }
 
-func (a *Activities) SetAggregateTelegramSender(sender aggregateTelegramSender) {
-	a.aggregateTelegramMu.Lock()
-	defer a.aggregateTelegramMu.Unlock()
-	a.aggregateTelegram = sender
+func (a *Activities) SetAggregateChannelDispatcher(
+	dispatcher aggregateChannelDispatcher,
+) {
+	a.aggregateChannelMu.Lock()
+	defer a.aggregateChannelMu.Unlock()
+	a.aggregateChannelDispatcher = dispatcher
 }
 
-func (a *Activities) aggregateTelegramSender() aggregateTelegramSender {
-	a.aggregateTelegramMu.RLock()
-	defer a.aggregateTelegramMu.RUnlock()
-	return a.aggregateTelegram
+func (a *Activities) aggregateDispatcher() aggregateChannelDispatcher {
+	a.aggregateChannelMu.RLock()
+	defer a.aggregateChannelMu.RUnlock()
+	return a.aggregateChannelDispatcher
 }
 
 // ============================================================
@@ -4957,8 +4962,8 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 					types.CodeConflict,
 					"Telegram aggregate Brief route is unavailable", nil))
 			}
-			telegramSender := a.aggregateTelegramSender()
-			if telegramSender == nil {
+			channelDispatcher := a.aggregateDispatcher()
+			if channelDispatcher == nil {
 				return retryableOrNot(types.NewAppError(
 					types.CodeConflict,
 					"Telegram aggregate Brief sender is unavailable", nil))
@@ -4973,18 +4978,22 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 					aggregatePlan.ID, chunkIndex)
 				body := renderAggregateTelegramChunk(
 					taskTitle, planned.items, chunkIndex, len(plannedChunks))
-				if _, err := a.aggregateChannelStore.PrepareAggregateTelegramOutbound(
+				permit, err := a.aggregateChannelStore.PrepareAggregateTelegramSendPermit(
 					ctx, aggregatePlan.ID, compiledIdentity.TenantID,
 					compiledIdentity.UserID, compiledIdentity.TaskID, batchID,
 					chunkIndex, len(plannedChunks), deliveryIDs,
-					*aggregatePlan.TelegramRouteID, effectID, body); err != nil {
+					*aggregatePlan.TelegramRouteID, effectID, body)
+				if err != nil {
 					return retryableOrNot(err)
 				}
-				if err := telegramSender.SendTextEffect(
-					ctx, compiledIdentity.TenantID, compiledIdentity.UserID,
-					*aggregatePlan.TelegramRouteID, effectID,
-					"aggregate_brief", body); err != nil {
+				observation, err := channelDispatcher.Send(ctx, permit)
+				if err != nil {
 					return retryableOrNot(err)
+				}
+				if observation.Disposition != pusheffect.AttemptSent {
+					return retryableOrNot(types.NewAppError(
+						types.CodePushFailed,
+						"Telegram aggregate Brief lacks sent evidence", types.ErrConflict))
 				}
 				if err := a.aggregateChannelStore.SettleAggregateTelegramOutbound(
 					ctx, compiledIdentity.TenantID, compiledIdentity.UserID,

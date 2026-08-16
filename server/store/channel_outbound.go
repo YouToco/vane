@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/types"
 )
 
@@ -161,6 +162,39 @@ func (s *Store) PrepareTelegramOutbound(
 func (s *Store) ClaimTelegramOutbound(
 	ctx context.Context, effectID string,
 ) (ChannelOutboundEffect, error) {
+	return s.ClaimTelegramOutboundAuthorized(ctx, TelegramRuntimeAuthority{
+		AppIdentity: "legacy",
+	}, effectID)
+}
+
+// ClaimTelegramOutboundAuthorized rechecks the exact active manager
+// credential, tenant, membership, identity and route in the same transaction
+// that crosses prepared -> sending.
+func (s *Store) ClaimTelegramOutboundAuthorized(
+	ctx context.Context, authority TelegramRuntimeAuthority, effectID string,
+) (ChannelOutboundEffect, error) {
+	return s.claimTelegramOutboundAuthorized(ctx, authority, effectID, nil)
+}
+
+// ClaimTelegramOutboundPermitAuthorized binds the durable permit before the
+// prepared -> sending transition. A mismatched/forged permit cannot poison an
+// otherwise sendable effect by claiming it first and checking afterward.
+func (s *Store) ClaimTelegramOutboundPermitAuthorized(
+	ctx context.Context, authority TelegramRuntimeAuthority,
+	permit channelruntime.SendPermit,
+) (ChannelOutboundEffect, error) {
+	if permit.Validate() != nil || permit.Provider() != channelruntime.ProviderTelegram {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeValidation,
+			"Telegram send permit 无效", types.ErrValidation)
+	}
+	return s.claimTelegramOutboundAuthorized(
+		ctx, authority, permit.EffectID(), &permit)
+}
+
+func (s *Store) claimTelegramOutboundAuthorized(
+	ctx context.Context, authority TelegramRuntimeAuthority, effectID string,
+	permit *channelruntime.SendPermit,
+) (ChannelOutboundEffect, error) {
 	dueClause, retryClear := "", ""
 	if s.channelSendRetry {
 		dueClause = " AND (e.next_send_at IS NULL OR e.next_send_at<=clock_timestamp())"
@@ -172,14 +206,59 @@ func (s *Store) ClaimTelegramOutbound(
 			"开启 Telegram outbound claim", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if authority.AppIdentity == "legacy" {
+		// Compatibility callers historically selected the effect by UUID only.
+		// They still receive membership/tenant/identity/route revalidation below,
+		// but no stored credential claim. Production Managers never use this path.
+		authority.AppIdentity = ""
+	} else if _, err := lockTelegramRuntimeAuthority(ctx, tx, authority); err != nil {
+		return ChannelOutboundEffect{}, err
+	}
 	var routeID int64
+	var permitTenantID, permitUserID, permitRouteID int64
+	var permitKind, permitDigest string
+	if permit != nil {
+		permitTenantID, permitUserID, permitRouteID =
+			permit.TenantID(), permit.UserID(), permit.RouteID()
+		permitKind, permitDigest = permit.EffectKind(), permit.PayloadDigest()
+		replayed, replayErr := scanChannelOutbound(tx.QueryRow(ctx, `
+			SELECT `+channelOutboundColumns+` FROM channel_outbound_effects
+			 WHERE effect_id=$1 AND tenant_id=$2 AND user_id=$3 AND route_id=$4 AND
+			       provider=$5 AND effect_kind=$6 AND payload_digest=$7
+			 FOR UPDATE`, effectID, permitTenantID, permitUserID, permitRouteID,
+			channelProviderTelegram, permitKind, permitDigest))
+		if replayErr == nil && replayed.Status == "sent" {
+			if err := tx.Commit(ctx); err != nil {
+				return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+					"提交 Telegram outbound 已发送重放", err)
+			}
+			return replayed, nil
+		}
+		if replayErr != nil && !errors.Is(replayErr, pgx.ErrNoRows) {
+			return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+				"读取 Telegram outbound permit 重放", replayErr)
+		}
+	}
 	err = tx.QueryRow(ctx,
 		`SELECT cr.id FROM channel_outbound_effects e
 		 JOIN channel_routes cr ON cr.id=e.route_id
 		 JOIN channel_identities ci ON ci.id=cr.identity_id
+		 JOIN memberships m ON m.tenant_id=e.tenant_id AND m.user_id=e.user_id
+		 JOIN tenants t ON t.id=e.tenant_id
 		WHERE e.effect_id=$1 AND e.provider=$2 AND e.status='prepared'`+dueClause+` AND
-		      cr.status='active' AND ci.status='active'
-		FOR UPDATE OF cr`, effectID, channelProviderTelegram).Scan(&routeID)
+		      e.tenant_id=cr.tenant_id AND e.user_id=cr.user_id AND
+		      cr.identity_id=ci.id AND cr.tenant_id=ci.tenant_id AND
+		      cr.user_id=ci.user_id AND cr.provider=e.provider AND
+		      cr.app_identity=e.app_identity AND cr.status='active' AND
+		      ci.status='active' AND t.status='active' AND t.deleted_at IS NULL AND
+		      ($3='' OR e.app_identity=$3) AND
+		      ($4::bigint=0 OR (e.tenant_id=$4 AND e.user_id=$5)) AND
+		      ($6::bigint=0 OR (e.tenant_id=$6 AND e.user_id=$7 AND
+		       e.route_id=$8 AND e.effect_kind=$9 AND e.payload_digest=$10))
+		FOR UPDATE OF cr,ci FOR SHARE OF m,t`, effectID, channelProviderTelegram,
+		authority.AppIdentity, authority.TenantID, authority.UserID,
+		permitTenantID, permitUserID, permitRouteID, permitKind,
+		permitDigest).Scan(&routeID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
 			"Telegram outbound effect 不可发送", types.ErrConflict)
@@ -213,6 +292,15 @@ func (s *Store) ClaimTelegramOutbound(
 func (s *Store) ClaimNextTelegramOutbound(
 	ctx context.Context, appIdentity string,
 ) (ChannelOutboundEffect, error) {
+	return s.ClaimNextTelegramOutboundAuthorized(ctx, TelegramRuntimeAuthority{
+		AppIdentity: appIdentity,
+	})
+}
+
+func (s *Store) ClaimNextTelegramOutboundAuthorized(
+	ctx context.Context, authority TelegramRuntimeAuthority,
+) (ChannelOutboundEffect, error) {
+	appIdentity := authority.AppIdentity
 	if strings.TrimSpace(appIdentity) != appIdentity || appIdentity == "" ||
 		len(appIdentity) > 128 {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeValidation,
@@ -229,16 +317,27 @@ func (s *Store) ClaimNextTelegramOutbound(
 			"开启 Telegram outbound 恢复", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := lockTelegramRuntimeAuthority(ctx, tx, authority); err != nil {
+		return ChannelOutboundEffect{}, err
+	}
 	var effectID uuid.UUID
 	err = tx.QueryRow(ctx,
 		`SELECT e.effect_id FROM channel_outbound_effects e
 		 JOIN channel_routes cr ON cr.id=e.route_id
 		 JOIN channel_identities ci ON ci.id=cr.identity_id
+		 JOIN memberships m ON m.tenant_id=e.tenant_id AND m.user_id=e.user_id
+		 JOIN tenants t ON t.id=e.tenant_id
 		WHERE e.provider=$1 AND e.app_identity=$2 AND e.status='prepared'`+
-			dueClause+` AND cr.status='active' AND ci.status='active'
+			dueClause+` AND e.tenant_id=cr.tenant_id AND e.user_id=cr.user_id AND
+		      cr.identity_id=ci.id AND cr.tenant_id=ci.tenant_id AND
+		      cr.user_id=ci.user_id AND cr.provider=e.provider AND
+		      cr.app_identity=e.app_identity AND cr.status='active' AND
+		      ci.status='active' AND t.status='active' AND t.deleted_at IS NULL AND
+		      ($3::bigint=0 OR (e.tenant_id=$3 AND e.user_id=$4))
 		ORDER BY COALESCE(e.next_send_at,e.created_at),e.created_at,e.effect_id
-		LIMIT 1 FOR UPDATE OF e,cr SKIP LOCKED`,
-		channelProviderTelegram, appIdentity).Scan(&effectID)
+		LIMIT 1 FOR UPDATE OF e,cr,ci FOR SHARE OF m,t SKIP LOCKED`,
+		channelProviderTelegram, appIdentity, authority.TenantID,
+		authority.UserID).Scan(&effectID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeNotFound,
 			"没有待恢复的 Telegram outbound effect", types.ErrNotFound)

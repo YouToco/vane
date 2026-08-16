@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/pusheffect"
 	storepkg "github.com/YouToco/vane/server/store"
 	"github.com/YouToco/vane/server/types"
@@ -29,6 +32,7 @@ type researchDeliveryStoreFakeV3 struct {
 	preferenceErr error
 	planErr       error
 	outboundErr   error
+	outboundBody  string
 }
 
 func (f *researchDeliveryStoreFakeV3) ResolveDeliveryChannelPreference(
@@ -63,11 +67,18 @@ func (f *researchDeliveryStoreFakeV3) PrepareArtifactDeliveryPlan(
 	}, nil
 }
 
-func (f *researchDeliveryStoreFakeV3) PrepareTelegramOutbound(
-	context.Context, int64, int64, int64, string, string, string,
-) (storepkg.ChannelOutboundEffect, error) {
+func (f *researchDeliveryStoreFakeV3) PrepareTelegramSendPermit(
+	_ context.Context, tenantID, userID, routeID int64,
+	effectID, kind, body string,
+) (channelruntime.SendPermit, error) {
 	f.outboundCalls++
-	return storepkg.ChannelOutboundEffect{}, f.outboundErr
+	f.outboundBody = body
+	if f.outboundErr != nil {
+		return channelruntime.SendPermit{}, f.outboundErr
+	}
+	digest := sha256.Sum256([]byte(body))
+	return channelruntime.BindDurableSend(channelruntime.ProviderTelegram,
+		tenantID, userID, routeID, effectID, kind, hex.EncodeToString(digest[:]))
 }
 
 func (f *researchDeliveryStoreFakeV3) LoadResearchBriefPayloadForDeliveryV3(
@@ -176,13 +187,18 @@ type researchTelegramSenderFakeV3 struct {
 	err     error
 }
 
-func (f *researchTelegramSenderFakeV3) SendTextEffect(
-	_ context.Context, _, _ int64, routeID int64,
-	_, _ string, body string,
-) error {
+func (f *researchTelegramSenderFakeV3) Send(
+	_ context.Context, permit channelruntime.SendPermit,
+) (channelruntime.ProviderObservation, error) {
 	f.calls++
-	f.routeID, f.body = routeID, body
-	return f.err
+	f.routeID = permit.RouteID()
+	if f.err != nil {
+		return channelruntime.ProviderObservation{}, f.err
+	}
+	return channelruntime.ProviderObservation{
+		Disposition: pusheffect.AttemptSent, AppIdentity: "telegram-test",
+		MessageID: "1",
+	}, nil
 }
 
 func (researchDeliveryTargetFakeV3) ResearchDeliveryTargetV3(
@@ -331,14 +347,14 @@ func TestReceiptBackedResearchDeliveryV3TelegramOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	tg := &researchTelegramSenderFakeV3{}
-	delivery.SetTelegramDelivery(tg, func(payload types.ResearchBriefPayloadV3) (string, error) {
+	delivery.SetChannelDelivery(tg, func(payload types.ResearchBriefPayloadV3) (string, error) {
 		return payload.Headline + "\n" + payload.Summary, nil
 	})
 	receipt, err := delivery.Deliver(t.Context(), identity, snapshot, plan, brief, "trace-v3")
 	if err != nil || receipt.PlanID != st.plan.ID || receipt.DeliveryID != 0 ||
 		receipt.Validate(brief.BriefID) != nil || tg.calls != 1 ||
 		tg.routeID != routeID || st.outboundCalls != 1 || st.prepareCalls != 0 ||
-		!strings.Contains(tg.body, "Kimi update") {
+		!strings.Contains(st.outboundBody, "Kimi update") {
 		t.Fatalf("receipt=%+v tg=%+v outbound=%d feishu_prepare=%d err=%v",
 			receipt, tg, st.outboundCalls, st.prepareCalls, err)
 	}
@@ -384,7 +400,7 @@ func TestReceiptBackedResearchDeliveryV3TelegramFailuresFailClosed(t *testing.T)
 				if render == nil {
 					render = func(types.ResearchBriefPayloadV3) (string, error) { return "body", nil }
 				}
-				delivery.SetTelegramDelivery(tg, render)
+				delivery.SetChannelDelivery(tg, render)
 			}
 			if _, err := delivery.Deliver(t.Context(), identity, snapshot, plan, brief, "trace-v3"); err == nil {
 				t.Fatal("unsafe Telegram delivery succeeded")

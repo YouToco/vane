@@ -2,6 +2,8 @@ package periodicbrief
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/executivebrief"
 	"github.com/YouToco/vane/server/pusheffect"
 	"github.com/YouToco/vane/server/store"
@@ -52,10 +55,13 @@ func (f *periodicRecoveryStoreFake) PrepareArtifactDeliveryPlan(
 		Selection: preference.Selection,
 	}, nil
 }
-func (f *periodicRecoveryStoreFake) PrepareTelegramOutbound(
-	context.Context, int64, int64, int64, string, string, string,
-) (store.ChannelOutboundEffect, error) {
-	return store.ChannelOutboundEffect{}, nil
+func (f *periodicRecoveryStoreFake) PrepareTelegramSendPermit(
+	_ context.Context, tenantID, userID, routeID int64,
+	effectID, kind, body string,
+) (channelruntime.SendPermit, error) {
+	digest := sha256.Sum256([]byte(body))
+	return channelruntime.BindDurableSend(channelruntime.ProviderTelegram,
+		tenantID, userID, routeID, effectID, kind, hex.EncodeToString(digest[:]))
 }
 
 func (f *periodicRecoveryStoreFake) ListPeriodicSynthesisRecoveryCandidatesV1(
