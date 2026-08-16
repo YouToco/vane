@@ -494,6 +494,12 @@ func memoryTestUser(t *testing.T, st *Store, prefix string) int64 {
 		t.Fatal(err)
 	}
 	attachTenant(t, st, user.ID)
+	if _, err := st.pool.Exec(t.Context(), `
+		UPDATE tenants
+		   SET workspace_kind='personal', personal_owner_user_id=$1, seat_limit=1
+		 WHERE id=1 AND personal_owner_user_id IS NULL`, user.ID); err != nil {
+		t.Fatal(err)
+	}
 	return user.ID
 }
 
@@ -504,6 +510,10 @@ func cleanupMemoryUsers(t *testing.T, st *Store, userIDs ...int64) {
 		cleanupExec(ctx, t, st, "DELETE FROM "+table+" WHERE user_id=ANY($1)", userIDs)
 	}
 	cleanupExec(ctx, t, st, "DELETE FROM agent_sessions WHERE user_id=ANY($1)", userIDs)
+	cleanupExec(ctx, t, st, `
+		UPDATE tenants
+		   SET workspace_kind='team', personal_owner_user_id=NULL, seat_limit=5
+		 WHERE id=1 AND personal_owner_user_id=ANY($1)`, userIDs)
 	cleanupExec(ctx, t, st, "DELETE FROM memberships WHERE user_id=ANY($1)", userIDs)
 	cleanupExec(ctx, t, st, "DELETE FROM users WHERE id=ANY($1)", userIDs)
 }

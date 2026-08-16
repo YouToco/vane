@@ -60,12 +60,32 @@ func (s *Store) CreateTenantWithInvite(ctx context.Context, code string, userID 
 		return nil, types.NewAppError(types.CodeDatabase, "消费邀请码", err)
 	}
 
-	// 步骤 2：建租户。
+	// 步骤 2：建租户。当前二进制也必须能在运维回滚到 migration 134
+	// 之前时完成租户清理测试与恢复操作；只根据数据库 catalog 选择当时
+	// 实际存在的 INSERT 形状，不把缺列错误伪装成注册失败。
+	var workspaceColumnsAvailable bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM pg_catalog.pg_attribute
+			 WHERE attrelid='public.tenants'::pg_catalog.regclass
+			   AND attname='workspace_kind'
+			   AND NOT attisdropped
+		)`).Scan(&workspaceColumnsAvailable); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "检查租户 schema", err)
+	}
 	var t types.Tenant
-	if err := scanTenant(tx.QueryRow(ctx,
-		`INSERT INTO tenants(display_name,workspace_kind,personal_owner_user_id,seat_limit)
-		 VALUES('个人工作区','personal',$1,1) RETURNING `+tenantColumns,
-		userID), &t); err != nil {
+	var tenantRow pgx.Row
+	if workspaceColumnsAvailable {
+		tenantRow = tx.QueryRow(ctx,
+			`INSERT INTO tenants(display_name,workspace_kind,personal_owner_user_id,seat_limit)
+			 VALUES('个人工作区','personal',$1,1) RETURNING `+tenantColumns,
+			userID)
+	} else {
+		tenantRow = tx.QueryRow(ctx,
+			`INSERT INTO tenants DEFAULT VALUES RETURNING `+tenantColumns)
+	}
+	if err := scanTenant(tenantRow, &t); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "创建租户", err)
 	}
 

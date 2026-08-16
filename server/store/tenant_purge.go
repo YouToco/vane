@@ -374,6 +374,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		taskAccessAuditAvailable               bool
 		accountSecurityTokensAvailable         bool
 		accountSecurityAuditAvailable          bool
+		workspaceInvitesAvailable              bool
+		workspaceAuditEventsAvailable          bool
+		userCapabilitiesAvailable              bool
+		userCapabilityVersionsAvailable        bool
+		skillCapabilityVersionsAvailable       bool
+		skillCapabilityFilesAvailable          bool
+		mcpConnectionVersionsAvailable         bool
+		userCapabilityEventsAvailable          bool
 		workspaceMemoryAuthorizationsAvailable bool
 		workspaceMemoryRecordsAvailable        bool
 		workspaceMemoryEventsAvailable         bool
@@ -420,6 +428,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.task_access_audit_events') IS NOT NULL,
 		        to_regclass('public.account_security_tokens') IS NOT NULL,
 		        to_regclass('public.account_security_audit_events') IS NOT NULL,
+		        to_regclass('public.workspace_invites') IS NOT NULL,
+		        to_regclass('public.workspace_audit_events') IS NOT NULL,
+		        to_regclass('public.user_capabilities') IS NOT NULL,
+		        to_regclass('public.user_capability_versions') IS NOT NULL,
+		        to_regclass('public.skill_capability_versions') IS NOT NULL,
+		        to_regclass('public.skill_capability_files') IS NOT NULL,
+		        to_regclass('public.mcp_connection_versions') IS NOT NULL,
+		        to_regclass('public.user_capability_events') IS NOT NULL,
 		        to_regclass('public.workspace_memory_authorizations') IS NOT NULL,
 		        to_regclass('public.workspace_memory_records') IS NOT NULL,
 		        to_regclass('public.workspace_memory_events') IS NOT NULL,
@@ -465,6 +481,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&taskAccessAuditAvailable,
 		&accountSecurityTokensAvailable,
 		&accountSecurityAuditAvailable,
+		&workspaceInvitesAvailable,
+		&workspaceAuditEventsAvailable,
+		&userCapabilitiesAvailable,
+		&userCapabilityVersionsAvailable,
+		&skillCapabilityVersionsAvailable,
+		&skillCapabilityFilesAvailable,
+		&mcpConnectionVersionsAvailable,
+		&userCapabilityEventsAvailable,
 		&workspaceMemoryAuthorizationsAvailable,
 		&workspaceMemoryRecordsAvailable,
 		&workspaceMemoryEventsAvailable,
@@ -514,6 +538,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"task_access_audit_events":                  taskAccessAuditAvailable,
 		"account_security_tokens":                   accountSecurityTokensAvailable,
 		"account_security_audit_events":             accountSecurityAuditAvailable,
+		"workspace_invites":                         workspaceInvitesAvailable,
+		"workspace_audit_events":                    workspaceAuditEventsAvailable,
+		"user_capabilities":                         userCapabilitiesAvailable,
+		"user_capability_versions":                  userCapabilityVersionsAvailable,
+		"skill_capability_versions":                 skillCapabilityVersionsAvailable,
+		"skill_capability_files":                    skillCapabilityFilesAvailable,
+		"mcp_connection_versions":                   mcpConnectionVersionsAvailable,
+		"user_capability_events":                    userCapabilityEventsAvailable,
 		"workspace_memory_authorizations":           workspaceMemoryAuthorizationsAvailable,
 		"workspace_memory_records":                  workspaceMemoryRecordsAvailable,
 		"workspace_memory_events":                   workspaceMemoryEventsAvailable,

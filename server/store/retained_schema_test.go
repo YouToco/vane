@@ -33,20 +33,6 @@ func TestMain(m *testing.M) {
 			fmt.Fprintf(os.Stderr, "prepare retained Store fixtures: %v\n", err)
 			os.Exit(1)
 		}
-		for _, statement := range []string{
-			// Retained personal-memory tests historically attach several
-			// synthetic owners to tenant 1. Migration 134 correctly forbids
-			// that production shape; workspace-isolation tests use independent
-			// scratch databases with the exact constraint intact.
-			`ALTER TABLE tenants DROP CONSTRAINT ck_tenants_personal_owner`,
-			`UPDATE tenants SET workspace_kind='personal',personal_owner_user_id=NULL,seat_limit=1 WHERE id=1`,
-		} {
-			if _, err := database.ExecContext(context.Background(), statement); err != nil {
-				_ = database.Close()
-				fmt.Fprintf(os.Stderr, "prepare retained personal fixture: %v\n", err)
-				os.Exit(1)
-			}
-		}
 		if err := database.Close(); err != nil {
 			fmt.Fprintf(os.Stderr, "close Store test schema: %v\n", err)
 			os.Exit(1)
