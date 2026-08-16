@@ -2,8 +2,6 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Info } from "lucide-react";
 import FeishuSetup from "./FeishuSetup";
-import TelegramSetup from "./TelegramSetup";
-import DeliveryChannelPreferenceCard from "./DeliveryChannelPreference";
 import Profile from "./Profile";
 import WorkspaceMembers from "./WorkspaceMembers";
 import A2AAccessTokens from "./A2AAccessTokens";
@@ -66,9 +64,7 @@ export default function Settings({
               <AlertDescription>{S.channelZhOnly}</AlertDescription>
             </Alert>
           )}
-          <DeliveryChannelPreferenceCard />
           <FeishuSetup />
-          <TelegramSetup />
         </TabsContent>
         <TabsContent value="members" className="mt-4">
           <WorkspaceMembers me={me} onAuthorityChanged={onAuthorityChanged} />

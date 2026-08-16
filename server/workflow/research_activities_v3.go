@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"strings"
 
-	"github.com/google/uuid"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 
@@ -131,19 +130,12 @@ type DeliverResearchBriefV3Input struct {
 
 type ResearchDeliveryReceiptV3 struct {
 	DeliveryID    int64  `json:"delivery_id"`
-	PlanID        string `json:"plan_id,omitempty"`
 	BriefID       int64  `json:"brief_id"`
 	ReceiptDigest string `json:"receipt_digest"`
 }
 
 func (r ResearchDeliveryReceiptV3) Validate(briefID int64) error {
-	legacy := r.DeliveryID > 0 && r.PlanID == ""
-	grouped := r.DeliveryID == 0 && r.PlanID != ""
-	if parsed, err := uuid.Parse(r.PlanID); grouped &&
-		(err != nil || parsed.String() != r.PlanID) {
-		grouped = false
-	}
-	if (!legacy && !grouped) || r.BriefID != briefID ||
+	if r.DeliveryID <= 0 || r.BriefID != briefID ||
 		!researchV3Digest(r.ReceiptDigest) {
 		return types.NewAppError(types.CodeValidation,
 			"research delivery receipt is invalid", nil)

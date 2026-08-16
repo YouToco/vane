@@ -27,9 +27,7 @@ func authedDeps(t *testing.T, base Deps) (Deps, *http.Cookie) {
 		TokenHash: hash, UserID: 1, TenantID: 1,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
-	fake.members[1] = []types.Membership{{
-		TenantID: 1, UserID: 1, Role: types.MembershipRoleOwner,
-	}}
+	fake.members[1] = []types.Membership{{TenantID: 1, UserID: 1}}
 	base.Auth = fake
 	if base.Principal == nil {
 		base.Principal = auth.NewContextResolver()

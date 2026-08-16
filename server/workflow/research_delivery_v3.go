@@ -5,9 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,19 +53,7 @@ type ResearchDeliverySenderV3 interface {
 	PushWithUUID(context.Context, string, string, string, string) (pusheffect.ProviderObservation, error)
 }
 
-type ResearchTelegramSenderV3 interface {
-	SendTextEffect(
-		context.Context, int64, int64, int64, string, string, string,
-	) error
-}
-
-type ResearchTelegramRendererV3 func(types.ResearchBriefPayloadV3) (string, error)
-
 type researchDeliveryStoreV3 interface {
-	ResolveDeliveryChannelPreference(context.Context, int64, int64, string) (storepkg.DeliveryChannelPreference, error)
-	PrepareArtifactDeliveryPlan(context.Context, int64, int64, string, string, string,
-		storepkg.DeliveryChannelPreference) (storepkg.ArtifactDeliveryPlan, error)
-	PrepareTelegramOutbound(context.Context, int64, int64, int64, string, string, string) (storepkg.ChannelOutboundEffect, error)
 	LoadResearchBriefPayloadForDeliveryV3(context.Context, types.RunIdentity,
 		types.ResearchRunSnapshotRefV3, types.ResearchRunPlanRefV3,
 		types.ResearchBriefRefV3) (types.ResearchBriefPayloadV3, error)
@@ -88,32 +74,10 @@ type researchDeliveryStoreV3 interface {
 // cutover remains an independent, default-off authority: constructing this
 // coordinator does not make any Workflow eligible to call it.
 type ReceiptBackedResearchDeliveryV3 struct {
-	store          researchDeliveryStoreV3
-	sender         ResearchDeliverySenderV3
-	targets        ResearchDeliveryTargetProviderV3
-	render         ResearchDeliveryRendererV3
-	telegramMu     sync.RWMutex
-	telegramSender ResearchTelegramSenderV3
-	telegramRender ResearchTelegramRendererV3
-}
-
-// SetTelegramDelivery is wired before the Temporal worker starts. Keeping it
-// late-bound avoids starting a public Bot ingress before the Agent and task
-// control plane have completed composition.
-func (d *ReceiptBackedResearchDeliveryV3) SetTelegramDelivery(
-	sender ResearchTelegramSenderV3, render ResearchTelegramRendererV3,
-) {
-	d.telegramMu.Lock()
-	defer d.telegramMu.Unlock()
-	d.telegramSender, d.telegramRender = sender, render
-}
-
-func (d *ReceiptBackedResearchDeliveryV3) telegramDelivery() (
-	ResearchTelegramSenderV3, ResearchTelegramRendererV3,
-) {
-	d.telegramMu.RLock()
-	defer d.telegramMu.RUnlock()
-	return d.telegramSender, d.telegramRender
+	store   researchDeliveryStoreV3
+	sender  ResearchDeliverySenderV3
+	targets ResearchDeliveryTargetProviderV3
+	render  ResearchDeliveryRendererV3
 }
 
 func NewReceiptBackedResearchDeliveryV3(
@@ -145,54 +109,6 @@ func (d *ReceiptBackedResearchDeliveryV3) Deliver(
 		ctx, identity, snapshot, plan, brief)
 	if err != nil {
 		return ResearchDeliveryReceiptV3{}, err
-	}
-	preference, err := d.store.ResolveDeliveryChannelPreference(
-		ctx, identity.TenantID, identity.UserID, identity.TaskID)
-	if err != nil {
-		return ResearchDeliveryReceiptV3{}, err
-	}
-	frozen, err := d.store.PrepareArtifactDeliveryPlan(
-		ctx, identity.TenantID, identity.UserID, identity.TaskID,
-		storepkg.ArtifactDeliveryResearchV3,
-		strconv.FormatInt(brief.BriefID, 10)+":"+brief.ReferenceDigest,
-		preference)
-	if err != nil {
-		return ResearchDeliveryReceiptV3{}, err
-	}
-	if frozen.Selection.Includes("telegram") {
-		if frozen.TelegramRouteID == nil {
-			return ResearchDeliveryReceiptV3{}, researchCoordinatorValidationV3(
-				"research V3 Telegram route is unavailable")
-		}
-		telegramSender, telegramRender := d.telegramDelivery()
-		if telegramSender == nil || telegramRender == nil {
-			return ResearchDeliveryReceiptV3{}, types.NewAppError(types.CodeConflict,
-				"research V3 Telegram sender is unavailable", types.ErrConflict)
-		}
-		text, renderErr := telegramRender(payload)
-		if renderErr != nil || strings.TrimSpace(text) == "" {
-			return ResearchDeliveryReceiptV3{}, researchCoordinatorValidationV3(
-				"research V3 Telegram rendering failed")
-		}
-		effectID := uuid.NewSHA1(uuid.NameSpaceURL,
-			[]byte("vane.research-v3-telegram/v1:"+frozen.ID)).String()
-		if _, err := d.store.PrepareTelegramOutbound(
-			ctx, identity.TenantID, identity.UserID, *frozen.TelegramRouteID,
-			effectID, "research_v3", text); err != nil {
-			return ResearchDeliveryReceiptV3{}, err
-		}
-		if err := telegramSender.SendTextEffect(
-			ctx, identity.TenantID, identity.UserID, *frozen.TelegramRouteID,
-			effectID, "research_v3", text); err != nil {
-			return ResearchDeliveryReceiptV3{}, err
-		}
-		if !frozen.Selection.Includes("feishu") {
-			return researchTelegramReceiptV3(frozen, brief)
-		}
-	}
-	if !frozen.Selection.Includes("feishu") {
-		return ResearchDeliveryReceiptV3{}, researchCoordinatorValidationV3(
-			"research V3 frozen provider set is invalid")
 	}
 	card, err := d.render(payload)
 	if err != nil || len(card) == 0 {
@@ -291,24 +207,6 @@ func (d *ReceiptBackedResearchDeliveryV3) Deliver(
 	}
 	return ResearchDeliveryReceiptV3{}, types.NewAppError(types.CodePushFailed,
 		"research V3 provider attempt has no valid receipt", types.ErrConflict)
-}
-
-func researchTelegramReceiptV3(
-	plan storepkg.ArtifactDeliveryPlan, brief types.ResearchBriefRefV3,
-) (ResearchDeliveryReceiptV3, error) {
-	material := strings.Join([]string{
-		"vane.research-v3-telegram-receipt/v1", plan.ID,
-		strconv.FormatInt(brief.BriefID, 10), brief.ReferenceDigest,
-	}, "\n")
-	digest := sha256.Sum256([]byte(material))
-	receipt := ResearchDeliveryReceiptV3{
-		PlanID: plan.ID, BriefID: brief.BriefID,
-		ReceiptDigest: hex.EncodeToString(digest[:]),
-	}
-	if err := receipt.Validate(brief.BriefID); err != nil {
-		return ResearchDeliveryReceiptV3{}, err
-	}
-	return receipt, nil
 }
 
 func (d *ReceiptBackedResearchDeliveryV3) settleSentV3(

@@ -39,11 +39,7 @@ func TestProviderPriceEndpointsOwner(t *testing.T) {
 		TokenHash: hash, UserID: user.ID, TenantID: 1,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
-	fake.members[user.ID] = []types.Membership{{
-		TenantID: 1,
-		UserID:   user.ID,
-		Role:     types.MembershipRoleOwner,
-	}}
+	fake.members[user.ID] = []types.Membership{{TenantID: 1, UserID: user.ID}}
 	deps := Deps{Store: st, Auth: fake, Principal: auth.NewContextResolver()}
 	cookie := &http.Cookie{Name: sessionCookieName, Value: token}
 	Mount(mux, deps)

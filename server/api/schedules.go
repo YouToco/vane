@@ -11,11 +11,6 @@ import (
 	"github.com/YouToco/vane/server/types"
 )
 
-type scheduleListItem struct {
-	types.Schedule
-	DeliveryChannel store.DeliveryChannelPreference `json:"delivery_channel"`
-}
-
 // handleListSchedules 读 Postgres 镜像返回当前 owner 的调度列表。
 // GET /api/schedules → 200 [Schedule...]
 func (s *server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
@@ -31,19 +26,10 @@ func (s *server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 空列表回 [] 而非 null：前端可直接 map，无需判空。
-	result := make([]scheduleListItem, 0, len(list))
-	for _, schedule := range list {
-		preference, err := s.deps.Store.ResolveDeliveryChannelPreference(
-			r.Context(), int64(principal.TenantID), principal.UserID, schedule.ID)
-		if err != nil {
-			writeAppError(w, err)
-			return
-		}
-		result = append(result, scheduleListItem{
-			Schedule: schedule, DeliveryChannel: preference,
-		})
+	if list == nil {
+		list = []types.Schedule{}
 	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, list)
 }
 
 // handleDeleteSchedule 删除一个调度（Temporal + 镜像）。
