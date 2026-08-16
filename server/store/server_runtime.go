@@ -13,12 +13,15 @@ import (
 const serverRuntimeLoginRole = "vane_server_runtime"
 const nativeV3EditRecoveryRuntimeLoginRole = "vane_native_v3_edit_recovery_runtime"
 const nativeV3EditRecoveryCapabilityRole = "vane_native_v3_edit_recovery"
+const workspaceMemoryRuntimeCapabilityRole = "vane_workspace_memory_editor"
 
-// serverRuntimeCapabilityRoles is intentionally an exact, closed set. Keep it
-// synchronized with migration 098 plus the versioned retirement wrapper in
-// migration 128, and with literal production Store SET LOCAL ROLE sites. Paid
-// research execution and retired/provider roles do not belong in the
-// long-lived application process.
+// serverRuntimeCapabilityRoles is the exact always-on set. Workspace memory is
+// deliberately optional for one bridge release: the migration creates its
+// isolated role, but the bridge keeps provisioning v129 so the previous binary
+// can still start on the upgraded schema. A later release may activate the
+// separately verified optional role without making this bridge unsafe as a
+// rollback binary. Paid research execution and retired/provider roles do not
+// belong in the long-lived application process.
 var serverRuntimeCapabilityRoles = []string{
 	"vane_agent_session_projection_operator",
 	"vane_app",
@@ -30,7 +33,6 @@ var serverRuntimeCapabilityRoles = []string{
 	"vane_edit_receipt",
 	"vane_intelligence_reader",
 	"vane_memory_editor",
-	"vane_workspace_memory_editor",
 	"vane_periodic_brief_writer",
 	"vane_profile_claim_editor",
 	"vane_profile_editor",
@@ -72,18 +74,19 @@ var serverRuntimeForbiddenReadRelations = []string{
 }
 
 // ProvisionServerRuntime installs the cluster-global runtime shell only after
-// the target database schema has migrated completely. dbURL must authenticate
-// directly as the migration/schema owner; migration 098 rejects SET ROLE and
-// delegated callers.
+// the target database schema has migrated completely. This bridge release
+// intentionally provisions v129 and leaves workspace memory dark; activating
+// v138 requires a later release whose rollback base accepts the optional role.
+// dbURL must authenticate directly as the migration/schema owner.
 func ProvisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
-		ctx, dbURL, "provision_vane_server_runtime_v138")
+		ctx, dbURL, "provision_vane_server_runtime_v129")
 }
 
-// DeprovisionServerRuntime removes only migration 098's exact memberships and
-// then drops the cluster-global shell. The shell must already be NOLOGIN. A
-// dependency error is intentional evidence of drift and is never papered over
-// with DROP OWNED.
+// DeprovisionServerRuntime accepts either bridge state and removes the optional
+// v138 edge before delegating to v129's exact teardown. The shell must already
+// be NOLOGIN. A dependency error is intentional evidence of drift and is never
+// papered over with DROP OWNED.
 func DeprovisionServerRuntime(ctx context.Context, dbURL string) error {
 	return callServerRuntimeProvisioner(
 		ctx, dbURL, "deprovision_vane_server_runtime_v138")
@@ -459,6 +462,11 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 		return err
 	}
 	wantMemberships := slices.Clone(serverRuntimeCapabilityRoles)
+	workspaceMemoryEnabled := slices.Contains(
+		memberships, workspaceMemoryRuntimeCapabilityRole)
+	if workspaceMemoryEnabled {
+		wantMemberships = append(wantMemberships, workspaceMemoryRuntimeCapabilityRole)
+	}
 	slices.Sort(wantMemberships)
 	if !slices.Equal(memberships, wantMemberships) {
 		return fmt.Errorf("server runtime memberships differ: got=%v want=%v",
@@ -467,8 +475,10 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 	if err := verifyMemoryRuntimeAuthority(ctx, tx); err != nil {
 		return err
 	}
-	if err := verifyWorkspaceMemoryRuntimeAuthority(ctx, tx); err != nil {
-		return err
+	if workspaceMemoryEnabled {
+		if err := verifyWorkspaceMemoryRuntimeAuthority(ctx, tx); err != nil {
+			return err
+		}
 	}
 
 	for _, role := range serverRuntimeForbiddenRoles {
@@ -485,8 +495,12 @@ func validateServerRuntimeConnection(ctx context.Context, conn *pgx.Conn) error 
 	// Probe the inert login and every role the application can explicitly
 	// enter. A direct grant to vane_app (or another allowlisted capability) is
 	// just as dangerous as a grant to the NOINHERIT session user.
-	for _, role := range append([]string{serverRuntimeLoginRole},
-		serverRuntimeCapabilityRoles...) {
+	authorityRoles := append([]string{serverRuntimeLoginRole},
+		serverRuntimeCapabilityRoles...)
+	if workspaceMemoryEnabled {
+		authorityRoles = append(authorityRoles, workspaceMemoryRuntimeCapabilityRole)
+	}
+	for _, role := range authorityRoles {
 		if err := validateServerRuntimeAuthorityRole(ctx, tx, role); err != nil {
 			return err
 		}

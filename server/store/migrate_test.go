@@ -189,8 +189,9 @@ var wantTables = []string{
 	"skill_capability_files",
 	"mcp_connection_versions",
 	"user_capability_events",
-	// 136 shared-workspace task access audit. Schedule identity is added to the
-	// existing schedules table and does not create a separate relation.
+	// 136 shared-workspace task access projection and append-only audit. The
+	// frozen schedules catalog remains byte-for-byte compatible with fence 132.
+	"task_workspace_access",
 	"task_access_audit_events",
 	// 137 hashed, one-time account security credentials and append-only audit.
 	"account_security_tokens",

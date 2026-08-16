@@ -8,43 +8,60 @@
 
 -- +goose Up
 
-ALTER TABLE schedules
-    ADD COLUMN creator_user_id BIGINT REFERENCES users (id),
-    ADD COLUMN assignee_user_id BIGINT REFERENCES users (id),
-    ADD COLUMN task_visibility TEXT;
+-- Migration 132 deliberately seals the complete schedules catalog descriptor
+-- so the retained legacy replayer can detect authority drift. Product-facing
+-- creator/assignee/visibility therefore live in a separate projection instead
+-- of mutating the frozen schedules relation or its ACLs.
+CREATE TABLE task_workspace_access (
+    tenant_id         BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    execution_user_id BIGINT NOT NULL REFERENCES users(id),
+    schedule_id       TEXT NOT NULL,
+    creator_user_id   BIGINT NOT NULL REFERENCES users(id),
+    assignee_user_id  BIGINT NOT NULL REFERENCES users(id),
+    task_visibility   TEXT NOT NULL CHECK (
+        task_visibility IN ('personal','workspace')),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id,schedule_id),
+    FOREIGN KEY (tenant_id,execution_user_id,schedule_id)
+        REFERENCES schedules(tenant_id,user_id,id) ON DELETE CASCADE
+);
 
-UPDATE schedules s
-SET creator_user_id=s.user_id,
-    assignee_user_id=s.user_id,
-    task_visibility=CASE
-        WHEN t.workspace_kind='team' THEN 'workspace'
-        ELSE 'personal'
-    END
-FROM tenants t
-WHERE t.id=s.tenant_id;
+INSERT INTO task_workspace_access(
+    tenant_id,execution_user_id,schedule_id,creator_user_id,
+    assignee_user_id,task_visibility,created_at,updated_at)
+SELECT s.tenant_id,s.user_id,s.id,s.user_id,s.user_id,
+       CASE WHEN t.workspace_kind='team' THEN 'workspace' ELSE 'personal' END,
+       s.created_at,s.updated_at
+  FROM schedules s JOIN tenants t ON t.id=s.tenant_id;
 
--- Several retained task-definition foreign keys are DEFERRABLE. Flush their
--- pending trigger events before changing the schedules relation again in this
--- same transactional migration.
-SET CONSTRAINTS ALL IMMEDIATE;
+CREATE INDEX idx_task_workspace_access_visible
+    ON task_workspace_access (tenant_id,task_visibility,created_at DESC,schedule_id);
+CREATE INDEX idx_task_workspace_access_assignee
+    ON task_workspace_access (tenant_id,assignee_user_id,created_at DESC,schedule_id);
 
-ALTER TABLE schedules
-    ALTER COLUMN creator_user_id SET NOT NULL,
-    ALTER COLUMN assignee_user_id SET NOT NULL,
-    ALTER COLUMN task_visibility SET NOT NULL,
-    ADD CONSTRAINT ck_schedules_task_visibility
-        CHECK (task_visibility IN ('personal','workspace'));
+ALTER TABLE task_workspace_access ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_workspace_access FORCE ROW LEVEL SECURITY;
+CREATE POLICY task_workspace_access_owner ON task_workspace_access
+    TO PUBLIC
+    USING (current_user=pg_catalog.pg_get_userbyid((
+        SELECT relation.relowner FROM pg_catalog.pg_class relation
+         WHERE relation.oid='task_workspace_access'::pg_catalog.regclass)))
+    WITH CHECK (current_user=pg_catalog.pg_get_userbyid((
+        SELECT relation.relowner FROM pg_catalog.pg_class relation
+         WHERE relation.oid='task_workspace_access'::pg_catalog.regclass)));
+CREATE POLICY task_workspace_access_scope ON task_workspace_access
+    TO vane_app
+    USING (tenant_id IS NOT DISTINCT FROM
+        NULLIF(current_setting('app.tenant_id',true),'')::bigint)
+    WITH CHECK (tenant_id IS NOT DISTINCT FROM
+        NULLIF(current_setting('app.tenant_id',true),'')::bigint);
 
-CREATE INDEX idx_schedules_team_visible
-    ON schedules (tenant_id,task_visibility,created_at DESC,id);
-CREATE INDEX idx_schedules_assignee
-    ON schedules (tenant_id,assignee_user_id,created_at DESC,id);
-
--- Compatibility insert paths predate these columns. The trigger fills only
--- absent identity on INSERT; later assignee transfers never touch user_id or
--- creator_user_id and therefore cannot rewrite frozen execution history.
+-- Compatibility insert paths know nothing about the projection. The trigger
+-- creates it from immutable schedule identity; later assignee transfers touch
+-- only the projection and cannot rewrite frozen execution history.
 -- +goose StatementBegin
-CREATE FUNCTION schedule_team_identity_defaults_v1()
+CREATE FUNCTION schedule_workspace_access_defaults_v1()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -52,20 +69,14 @@ SET search_path=pg_catalog,public
 AS $$
 DECLARE workspace_kind_value TEXT;
 BEGIN
-    IF NEW.creator_user_id IS NULL THEN
-        NEW.creator_user_id := NEW.user_id;
-    END IF;
-    IF NEW.assignee_user_id IS NULL THEN
-        NEW.assignee_user_id := NEW.user_id;
-    END IF;
-    IF NEW.task_visibility IS NULL OR NEW.task_visibility='' THEN
-        SELECT t.workspace_kind INTO STRICT workspace_kind_value
-          FROM public.tenants t WHERE t.id=NEW.tenant_id;
-        NEW.task_visibility := CASE
-            WHEN workspace_kind_value='team' THEN 'workspace'
-            ELSE 'personal'
-        END;
-    END IF;
+    SELECT t.workspace_kind INTO STRICT workspace_kind_value
+      FROM public.tenants t WHERE t.id=NEW.tenant_id;
+    INSERT INTO public.task_workspace_access(
+        tenant_id,execution_user_id,schedule_id,creator_user_id,
+        assignee_user_id,task_visibility,created_at,updated_at)
+    VALUES(NEW.tenant_id,NEW.user_id,NEW.id,NEW.user_id,NEW.user_id,
+        CASE WHEN workspace_kind_value='team' THEN 'workspace' ELSE 'personal' END,
+        NEW.created_at,NEW.updated_at);
     RETURN NEW;
 END;
 $$;
@@ -74,11 +85,11 @@ $$;
 -- Trigger invocation does not require callers to execute the function
 -- directly. Keep the SECURITY DEFINER entry point out of PUBLIC so adding the
 -- compatibility trigger cannot expand any existing runtime capability role.
-REVOKE ALL ON FUNCTION schedule_team_identity_defaults_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION schedule_workspace_access_defaults_v1() FROM PUBLIC;
 
-CREATE TRIGGER schedules_team_identity_defaults_v1
-BEFORE INSERT ON schedules
-FOR EACH ROW EXECUTE FUNCTION schedule_team_identity_defaults_v1();
+CREATE TRIGGER schedules_workspace_access_defaults_v1
+AFTER INSERT ON schedules
+FOR EACH ROW EXECUTE FUNCTION schedule_workspace_access_defaults_v1();
 
 CREATE TABLE task_access_audit_events (
     id                 BIGSERIAL PRIMARY KEY,
@@ -123,21 +134,14 @@ CREATE POLICY task_access_audit_append_scope ON task_access_audit_events
 GRANT SELECT,INSERT ON task_access_audit_events TO vane_app;
 GRANT USAGE,SELECT ON SEQUENCE task_access_audit_events_id_seq TO vane_app;
 
--- Existing restricted task creation roles may keep omitting the new columns:
--- the compatibility trigger fills them. Explicit mutation authority is only
--- granted for the product assignee; frozen user_id remains outside vane_app's
--- update allowlist.
-GRANT UPDATE (assignee_user_id,updated_at) ON schedules TO vane_app;
+GRANT SELECT ON task_workspace_access TO vane_app;
+GRANT UPDATE (assignee_user_id,updated_at) ON task_workspace_access TO vane_app;
 
 -- +goose Down
 
-REVOKE UPDATE (assignee_user_id) ON schedules FROM vane_app;
+REVOKE UPDATE (assignee_user_id,updated_at) ON task_workspace_access FROM vane_app;
+REVOKE SELECT ON task_workspace_access FROM vane_app;
 DROP TABLE task_access_audit_events;
-DROP TRIGGER schedules_team_identity_defaults_v1 ON schedules;
-DROP FUNCTION schedule_team_identity_defaults_v1();
-DROP INDEX idx_schedules_assignee;
-DROP INDEX idx_schedules_team_visible;
-ALTER TABLE schedules DROP CONSTRAINT ck_schedules_task_visibility;
-ALTER TABLE schedules DROP COLUMN task_visibility;
-ALTER TABLE schedules DROP COLUMN assignee_user_id;
-ALTER TABLE schedules DROP COLUMN creator_user_id;
+DROP TRIGGER schedules_workspace_access_defaults_v1 ON schedules;
+DROP FUNCTION schedule_workspace_access_defaults_v1();
+DROP TABLE task_workspace_access;
