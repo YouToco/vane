@@ -36,8 +36,8 @@ type Multi struct {
 func NewMulti(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder) *Multi {
 	return &Multi{
 		rss:         New(cfg),
-		exa:         NewExa(cfg),
-		exaContents: NewExaContents(cfg),
+		exa:         NewExa(cfg, rec),
+		exaContents: NewExaContents(cfg, rec),
 		binding:     NewBinding(cfg, seen, rec),
 	}
 }

@@ -840,3 +840,50 @@ func TestBinding_ProbeRejectionMarksUserFacing(t *testing.T) {
 		t.Errorf("结构漂移不该带 ProbeRejection 标记（含内部端点名，须映射固定话术）: %v", err)
 	}
 }
+
+// ────────── TikHub 记账：cost_usd + source_id ──────────
+
+func TestBinding_RecorderCostAndSourceID(t *testing.T) {
+	up := newFakeUpstream()
+	up.bodies[pathHotList] = sampleHotListResponse
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	rec := &fakeRecorder{}
+	b := newTestBinding(srv.URL, nil, rec)
+	_, err := b.Fetch(context.Background(), bindingSrc(types.CapHotList, `{}`))
+	if err != nil {
+		t.Fatalf("Fetch 失败: %v", err)
+	}
+	if len(rec.rows) != 1 {
+		t.Fatalf("期望 1 行记账，实际 %d", len(rec.rows))
+	}
+	got := rec.rows[0]
+	if got.CostUSD == nil || *got.CostUSD != tikhubCostPerRequest {
+		t.Errorf("CostUSD: 期望 %v，实际 %v", tikhubCostPerRequest, got.CostUSD)
+	}
+	if got.SourceID == nil || *got.SourceID != 7 {
+		t.Errorf("SourceID: 期望 7（bindingSrc 固定值），实际 %v", got.SourceID)
+	}
+}
+
+func TestBinding_RecorderNoCostOnHTTPError(t *testing.T) {
+	up := newFakeUpstream()
+	up.status[pathHotList] = http.StatusInternalServerError
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	rec := &fakeRecorder{}
+	b := newTestBinding(srv.URL, nil, rec)
+	_, _ = b.Fetch(context.Background(), bindingSrc(types.CapHotList, `{}`))
+	if len(rec.rows) != 1 {
+		t.Fatalf("期望 1 行记账，实际 %d", len(rec.rows))
+	}
+	got := rec.rows[0]
+	if got.CostUSD != nil {
+		t.Errorf("非 200 不应计费（TikHub 定价承诺），实际 CostUSD=%v", *got.CostUSD)
+	}
+	if got.SourceID == nil || *got.SourceID != 7 {
+		t.Errorf("即使失败 SourceID 也应归因，实际 %v", got.SourceID)
+	}
+}

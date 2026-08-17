@@ -37,12 +37,14 @@ type ExaFetcher struct {
 	searchURL string // 可覆盖以便单测指向 httptest.Server
 	client    *http.Client
 	maxBytes  int64
+	rec       BindingCallRecorder // nil 合法（不记账）；复用 binding 同一接口，避免开新抽象
 }
 
 // NewExa 按抓取配置构造 ExaFetcher。TimeoutSeconds / MaxResponseMB 非正数时
 // 回退到与 RSS 一致的兜底（20s / 5MB）。apiKey 为空不在此报错——留到 Fetch
 // 时返回明确的 CodeValidation，便于"未配置 Exa 却订了 Exa 源"给出可诊断信息。
-func NewExa(cfg config.FetchConfig) *ExaFetcher {
+// rec 为 nil 时不记账（与 BindingFetcher 同纪律）。
+func NewExa(cfg config.FetchConfig, rec BindingCallRecorder) *ExaFetcher {
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 20 * time.Second
@@ -57,6 +59,7 @@ func NewExa(cfg config.FetchConfig) *ExaFetcher {
 		// 禁跟随重定向：防 x-api-key 被 30x 外带到第三方域（见 noRedirect）。
 		client:   &http.Client{Timeout: timeout, CheckRedirect: noRedirect},
 		maxBytes: int64(maxMB) * 1024 * 1024,
+		rec:      rec,
 	}
 }
 
@@ -85,9 +88,15 @@ type exaContentsReq struct {
 	Text bool `json:"text"`
 }
 
+// exaCostDollars 是 Exa 响应里的 costDollars 结构（只取 total）。
+type exaCostDollars struct {
+	Total float64 `json:"total"`
+}
+
 // exaResponse 是 /search 响应体，只取需要的字段。
 type exaResponse struct {
-	Results []exaResult `json:"results"`
+	Results     []exaResult    `json:"results"`
+	CostDollars exaCostDollars `json:"costDollars"`
 }
 
 type exaResult struct {
@@ -159,11 +168,13 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 	req.Header.Set("x-api-key", e.apiKey)
 	req.Header.Set("Accept", "application/json")
 
+	start := time.Now()
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return nil, classifyDoError(e.searchURL, err)
 	}
 	defer resp.Body.Close()
+	elapsed := time.Since(start)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, types.NewAppError(types.CodeFetchRateLimit, "Exa 搜索被限流(429)", nil)
@@ -197,6 +208,7 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 		return nil, ae
 	}
 
+	e.recordCall(ctx, src, resp.StatusCode, elapsed, len(data), er.CostDollars.Total, nil)
 	return mapExaResults(src, er.Results), nil
 }
 
@@ -229,6 +241,36 @@ func mapExaResults(src types.Source, results []exaResult) []types.ContentItem {
 		out = append(out, item)
 	}
 	return out
+}
+
+// recordCall 写一行 tool_calls（与 binding.record 同纪律：旁路，失败不放大）。
+func (e *ExaFetcher) recordCall(ctx context.Context, src types.Source, status int, elapsed time.Duration, bodySize int, costTotal float64, callErr error) {
+	if e.rec == nil {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	trace, _ := ctx.Value(bindingTraceKey).(string)
+	srcID := src.ID
+	rec := &types.ToolCall{
+		TraceID:      trace,
+		ToolName:     "exa:search",
+		ToolKind:     types.ToolCallKindExaFetch,
+		EndpointPath: "/search",
+		DurationMs:   int(elapsed.Milliseconds()),
+		ResultSize:   bodySize,
+		HTTPStatus:   &status,
+		SourceID:     &srcID,
+	}
+	if costTotal > 0 {
+		rec.CostUSD = &costTotal
+	}
+	if callErr != nil {
+		rec.ErrorType = types.ToolErrInternal
+		rec.Error = truncateUTF8(callErr.Error(), 500)
+	} else if status < 200 || status >= 300 {
+		rec.ErrorType = types.ToolErrHTTP
+	}
+	e.rec.RecordBindingCall(ctx, rec)
 }
 
 // parseExaDate 解析 Exa 的 ISO 8601 发布时间；解析失败或为空返回 nil（列可空）。

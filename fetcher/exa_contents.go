@@ -51,11 +51,13 @@ type ExaContentsFetcher struct {
 	contentURL string // 可覆盖以便单测指向 httptest.Server
 	client     *http.Client
 	maxBytes   int64
+	rec        BindingCallRecorder // nil 合法（不记账）
 }
 
 // NewExaContents 按抓取配置构造。超时/响应上限兜底与 exa.go 一致（20s / 5MB）。
 // apiKey 为空不在此报错——留到 Fetch 返回可诊断的 CodeValidation。
-func NewExaContents(cfg config.FetchConfig) *ExaContentsFetcher {
+// rec 为 nil 时不记账（与 BindingFetcher 同纪律）。
+func NewExaContents(cfg config.FetchConfig, rec BindingCallRecorder) *ExaContentsFetcher {
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 20 * time.Second
@@ -70,6 +72,7 @@ func NewExaContents(cfg config.FetchConfig) *ExaContentsFetcher {
 		// 禁跟随重定向：防 x-api-key 被 30x 外带（同 exa.go 的 noRedirect）。
 		client:   &http.Client{Timeout: timeout, CheckRedirect: noRedirect},
 		maxBytes: int64(maxMB) * 1024 * 1024,
+		rec:      rec,
 	}
 }
 
@@ -91,8 +94,9 @@ type exaContentsRequest struct {
 // 返回 HTTP 200 + results 缺失/为空 + statuses[].status="error"（同 exa.go 审计 D6 的坑，
 // 但 /contents 把状态显式放进 statuses，本 fetcher 据此把"抓取失败"和"内容为空"分开）。
 type exaContentsResponse struct {
-	Results  []exaContentsResult `json:"results"`
-	Statuses []exaContentsStatus `json:"statuses"`
+	Results     []exaContentsResult `json:"results"`
+	Statuses    []exaContentsStatus `json:"statuses"`
+	CostDollars exaCostDollars      `json:"costDollars"`
 }
 
 type exaContentsResult struct {
@@ -143,11 +147,13 @@ func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]typ
 	req.Header.Set("x-api-key", e.apiKey)
 	req.Header.Set("Accept", "application/json")
 
+	start := time.Now()
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return nil, classifyDoError(e.contentURL, err)
 	}
 	defer resp.Body.Close()
+	elapsed := time.Since(start)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, types.NewAppError(types.CodeFetchRateLimit, "Exa /contents 被限流(429)", nil)
@@ -178,6 +184,8 @@ func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]typ
 		ae.Retryable = false
 		return nil, ae
 	}
+
+	e.recordCall(ctx, src, resp.StatusCode, elapsed, len(data), cr.CostDollars.Total, nil)
 
 	// statuses[] 检查（审计 D6）：抓取失败是 HTTP 200 + status="error"，绝不能当成
 	// "内容为空"静默返回 0 条——那会让监控在页面挂掉时误判"没变化"。
@@ -271,4 +279,34 @@ var contentsHTMLLikeRe = regexp.MustCompile(`<([a-zA-Z/!])`)
 // 的 HTML"，htmlTagRe 对它是误伤。加空格破坏标签形态、保留可读（价格数字不受影响）。
 func sanitizeContentsText(s string) string {
 	return contentsHTMLLikeRe.ReplaceAllString(s, "< $1")
+}
+
+// recordCall 写一行 tool_calls（与 exa.go recordCall 同纪律：旁路，失败不放大）。
+func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.Source, status int, elapsed time.Duration, bodySize int, costTotal float64, callErr error) {
+	if e.rec == nil {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	trace, _ := ctx.Value(bindingTraceKey).(string)
+	srcID := src.ID
+	rec := &types.ToolCall{
+		TraceID:      trace,
+		ToolName:     "exa:contents",
+		ToolKind:     types.ToolCallKindExaFetch,
+		EndpointPath: "/contents",
+		DurationMs:   int(elapsed.Milliseconds()),
+		ResultSize:   bodySize,
+		HTTPStatus:   &status,
+		SourceID:     &srcID,
+	}
+	if costTotal > 0 {
+		rec.CostUSD = &costTotal
+	}
+	if callErr != nil {
+		rec.ErrorType = types.ToolErrInternal
+		rec.Error = truncateUTF8(callErr.Error(), 500)
+	} else if status < 200 || status >= 300 {
+		rec.ErrorType = types.ToolErrHTTP
+	}
+	e.rec.RecordBindingCall(ctx, rec)
 }

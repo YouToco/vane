@@ -767,19 +767,24 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 		}
 	}
 	args, _ := json.Marshal(clean)
+	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
 		ToolName:     "binding:" + entry.Name,
 		ToolKind:     types.ToolCallKindBindingFetch,
 		EndpointPath: entry.Path,
 		Arguments:    args,
+		SourceID:     &srcID,
 	}
 	if res != nil {
 		status := res.Status
 		rec.HTTPStatus = &status
 		rec.DurationMs = res.DurationMs
 		rec.ResultSize = len(res.Body)
-		if res.Status < 200 || res.Status >= 300 {
+		if res.Status >= 200 && res.Status < 300 {
+			cost := tikhubCostPerRequest
+			rec.CostUSD = &cost
+		} else {
 			rec.ErrorType = types.ToolErrHTTP
 		}
 	}
@@ -1196,6 +1201,9 @@ const twitterTimeLayout = "Mon Jan 02 15:04:05 -0700 2006"
 // tikhubMaxDescBytes 正文字节上限，防超长内容打爆打分 token（成本护栏）。
 // 截断按 rune 边界回退（truncateUTF8），绝不产生非法 UTF-8。（迁移自原 tikhub.go。）
 const tikhubMaxDescBytes = 4000
+
+// tikhubCostPerRequest TikHub 统一单价（tikhub.io/pricing：$0.001/req，非 200 不计费）。
+const tikhubCostPerRequest = 0.001
 
 // SeenChecker 报告哪些 canonical_key **已入库且正文已补全**（生产实现是 *store.Store）。
 // 详情接口按次计费，已拿到全文的笔记不该每轮重复付费；判据是**正文长度**而非

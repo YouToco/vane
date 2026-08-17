@@ -13,9 +13,9 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-// newTestExaContents 构造指向 httptest.Server 的 ExaContentsFetcher。
+// newTestExaContents 构造指向 httptest.Server 的 ExaContentsFetcher（不记账）。
 func newTestExaContents(srvURL string) *ExaContentsFetcher {
-	e := NewExaContents(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "test-key"})
+	e := NewExaContents(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "test-key"}, nil)
 	e.contentURL = srvURL
 	return e
 }
@@ -131,7 +131,7 @@ func TestExaContents_空正文(t *testing.T) {
 // TestExaContents_config校验 缺 key / 缺 url → CodeValidation。
 func TestExaContents_config校验(t *testing.T) {
 	// 缺 key
-	e := NewExaContents(config.FetchConfig{}) // ExaAPIKey 空
+	e := NewExaContents(config.FetchConfig{}, nil) // ExaAPIKey 空
 	if _, err := e.Fetch(context.Background(), contentsSource(`{"url":"https://x.com/p"}`)); err == nil {
 		t.Error("缺 API key 应报错")
 	}

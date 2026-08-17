@@ -244,6 +244,9 @@ const (
 	// 计费调用一行（endpoint-binding-contract.md §5）。user/session/tenant 均 NULL——
 	// 源是跨租户共享客观事实（I-T1），其抓取是系统行为。不占 agent 免确认双限额。
 	ToolCallKindBindingFetch ToolCallKind = "binding_fetch"
+	// ToolCallKindExaFetch Exa API 调用（/search 与 /contents）。按次计费，
+	// costDollars 由上游响应返回、落 cost_usd 列。source_id 归因到具体信源。
+	ToolCallKindExaFetch ToolCallKind = "exa_fetch"
 )
 
 // 工具调用错误分类（tool_calls.error_type）。低基数硬枚举：per-tool 错误率
@@ -276,6 +279,8 @@ type ToolCall struct {
 	DurationMs     int             `json:"duration_ms"`
 	RetrievalQuery string          `json:"retrieval_query"`           // 仅 tikhub_search
 	CandidateTools []string        `json:"candidate_tools,omitempty"` // 仅 tikhub_search
+	CostUSD        *float64        `json:"cost_usd,omitempty"`        // 上游返回的花费（美元）；无计费信息时 nil
+	SourceID       *int64          `json:"source_id,omitempty"`       // 抓取面调用的归属信源；agent 面为 nil
 	CreatedAt      time.Time       `json:"created_at"`
 }
 

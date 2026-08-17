@@ -44,9 +44,9 @@ const sampleExaResponse = `{
   ]
 }`
 
-// newTestExa 构造指向 httptest.Server 的 ExaFetcher。
+// newTestExa 构造指向 httptest.Server 的 ExaFetcher（不记账）。
 func newTestExa(srvURL string) *ExaFetcher {
-	e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "test-key"})
+	e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "test-key"}, nil)
 	e.searchURL = srvURL
 	return e
 }
@@ -177,7 +177,7 @@ func TestExaFetch_ExplicitLookbackDays(t *testing.T) {
 }
 
 func TestExaFetch_MissingKey(t *testing.T) {
-	e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}) // 无 key
+	e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil) // 无 key
 	_, err := e.Fetch(context.Background(), exaSrc(1, `{"query":"x"}`))
 	if !errors.Is(err, types.ErrValidation) {
 		t.Errorf("缺 key 应判 ErrValidation，实际 %v", err)
