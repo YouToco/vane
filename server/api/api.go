@@ -132,6 +132,17 @@ type AuthStore interface {
 	DeleteSession(ctx context.Context, tokenHash []byte) error
 }
 
+// InstallationSetupStore is the only database capability exposed to the
+// unauthenticated appliance bootstrap surface. The raw one-time token never
+// crosses this interface; callers pass SHA-256(token).
+type InstallationSetupStore interface {
+	InstallationSetupRequired(context.Context) (bool, error)
+	InstallationBootstrapTokenUsable(context.Context, []byte) (bool, error)
+	ClaimInstallationBootstrap(
+		context.Context, []byte, string, string, []byte, time.Time,
+	) (*types.User, error)
+}
+
 // WorkspaceStore is the multi-workspace control plane. It is intentionally
 // separate from AuthStore so legacy authentication fakes and old login flows
 // remain source-compatible while the capability is rolled out dark.
@@ -169,6 +180,11 @@ type Deps struct {
 	TeamTasks teamTaskAccessStore
 	// Auth 是认证路径的窄接口；生产与 Store 同为 *store.Store。
 	Auth AuthStore
+	// InstallationSetup defaults to Store in production. SetupClaimed is an
+	// optional one-shot notification used by minimal setup mode to restart into
+	// the full runtime only after the claim response has been written.
+	InstallationSetup InstallationSetupStore
+	SetupClaimed      func()
 	// Workspaces can be injected independently in tests. Production falls back
 	// to Store, which implements this interface.
 	Workspaces WorkspaceStore
@@ -231,6 +247,16 @@ func (s *server) a2aAccessStore() A2AAccessStore {
 	return s.deps.Store
 }
 
+func (s *server) installationSetupStore() InstallationSetupStore {
+	if s.deps.InstallationSetup != nil {
+		return s.deps.InstallationSetup
+	}
+	if s.deps.Store == nil {
+		return nil
+	}
+	return s.deps.Store
+}
+
 type server struct {
 	deps              Deps
 	limiter           *authLimiter
@@ -250,8 +276,8 @@ func (s *server) executiveBriefProjectionEnabled(taskID string) bool {
 			s.executiveBriefTaskEnabled(taskID))
 }
 
-// Mount 把 /api/* 路由挂到 mux。除 /api/auth/login 外全部要求会话 cookie；
-// /healthz /readyz 不在 /api 前缀下，不受本中间件影响。
+// Mount 把 /api/* 路由挂到 mux。只有 isPublicAuthPath 的精确白名单不要求
+// 会话 cookie；/healthz /readyz 不在 /api 前缀下，不受本中间件影响。
 func Mount(mux *http.ServeMux, deps Deps) {
 	taskActionLimiter := newAuthLimiter()
 	taskActionLimiter.max = 6
@@ -262,6 +288,8 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	}
 
 	inner := http.NewServeMux()
+	inner.HandleFunc("GET /api/setup/status", s.handleInstallationSetupStatus)
+	inner.HandleFunc("POST /api/setup/claim", s.handleInstallationSetupClaim)
 	inner.HandleFunc("POST /api/auth/register", s.handleRegister)
 	inner.HandleFunc("POST /api/auth/login", s.handleLogin)
 	inner.HandleFunc("POST /api/auth/workspace-invites/register", s.handleWorkspaceInviteRegister)
@@ -378,6 +406,17 @@ func Mount(mux *http.ServeMux, deps Deps) {
 		groundedBriefFollowupDeadlineV1(s.requireSession(inner)),
 	)
 	mux.Handle("/api/", apiHandler)
+}
+
+// MountInstallationSetup exposes only the two bootstrap endpoints. It is used
+// when no platform owner exists, so Agent/workers/provider ingress remain dark
+// until a local-token holder completes the claim and the process restarts.
+func MountInstallationSetup(mux *http.ServeMux, deps Deps) {
+	s := &server{deps: deps, limiter: newAuthLimiter()}
+	inner := http.NewServeMux()
+	inner.HandleFunc("GET /api/setup/status", s.handleInstallationSetupStatus)
+	inner.HandleFunc("POST /api/setup/claim", s.handleInstallationSetupClaim)
+	mux.Handle("/api/", s.cors(inner))
 }
 
 // groundedBriefFollowupDeadlineV1 is deliberately outside session auth (and

@@ -112,9 +112,10 @@ func TestA2AUsesOnlyAuthorizedPublicResearchCatalog(t *testing.T) {
 
 // TestOwnerRuntimeGatePrecedesAllDurableAssembly proves the process cannot
 // expose unconditional manage_tasks create while its Research V3 worker is
-// dark. The Gate must run before the first Store is opened, and the owner
-// catalog itself must remain unconditional rather than falling back to a
-// canary or a hidden create tool.
+// dark. The only pre-Gate Store work permitted is the isolated first-install
+// status/claim authority; the Gate must still run before any owner Agent or
+// durable runtime assembly, and the owner catalog itself remains
+// unconditional rather than falling back to a canary or hidden create tool.
 func TestOwnerRuntimeGatePrecedesAllDurableAssembly(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -125,7 +126,7 @@ func TestOwnerRuntimeGatePrecedesAllDurableAssembly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var gatePos, ownerBuilderPos token.Pos
+	var gatePos, ownerBuilderPos, setupPos token.Pos
 	var firstStorePos token.Pos
 	var conditionals []*ast.IfStmt
 	ast.Inspect(file, func(node ast.Node) bool {
@@ -134,6 +135,8 @@ func TestOwnerRuntimeGatePrecedesAllDurableAssembly(t *testing.T) {
 			conditionals = append(conditionals, current)
 		case *ast.CallExpr:
 			switch {
+			case isIdentCall(current.Fun, "ensureInstallationBootstrap"):
+				setupPos = current.Pos()
 			case isIdentCall(current.Fun, "requireOwnerAgentResearchV3Runtime"):
 				if gatePos != token.NoPos {
 					t.Fatal("owner runtime Gate is called more than once")
@@ -151,10 +154,10 @@ func TestOwnerRuntimeGatePrecedesAllDurableAssembly(t *testing.T) {
 		return true
 	})
 	if gatePos == token.NoPos || firstStorePos == token.NoPos ||
-		ownerBuilderPos == token.NoPos || gatePos >= firstStorePos ||
-		gatePos >= ownerBuilderPos {
-		t.Fatalf("unsafe startup order: gate=%d firstStore=%d ownerBuilder=%d",
-			gatePos, firstStorePos, ownerBuilderPos)
+		setupPos == token.NoPos || ownerBuilderPos == token.NoPos ||
+		firstStorePos >= setupPos || setupPos >= gatePos || gatePos >= ownerBuilderPos {
+		t.Fatalf("unsafe startup order: firstStore=%d setup=%d gate=%d ownerBuilder=%d",
+			firstStorePos, setupPos, gatePos, ownerBuilderPos)
 	}
 	for _, conditional := range conditionals {
 		if conditional.Pos() < ownerBuilderPos && ownerBuilderPos < conditional.End() {

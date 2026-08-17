@@ -828,11 +828,7 @@ export interface ReplaceProviderPriceRule {
 
 export type CallCostKind = "llm" | "tool";
 export type CallCostPricingStatus =
-  | "provider_reported"
-  | "calculated"
-  | "estimated"
-  | "unpriced"
-  | "legacy";
+  "provider_reported" | "calculated" | "estimated" | "unpriced" | "legacy";
 
 export interface CallCostLLMUsage {
   prompt_tokens: number;
@@ -1107,13 +1103,19 @@ export class ApiError extends Error {
   }
 }
 
+export interface InstallationSetupStatus {
+  state: "setup_required" | "active";
+  setup_required: boolean;
+}
+
 // API 基址：静态托管（OSS+CDN 国内线 / Pages 境外线）与后端不同源；
 // 生产值是公开拓扑合同，必须进入确定性制品，不依赖发布机环境变量。
 // 本地 dev 留空走 Vite 代理（同源相对路径，vite.config.ts）。
 const API_BASE = apiBase(import.meta.env.DEV);
 
 export function getA2AEndpoint(): string {
-  const base = API_BASE || (typeof location === "undefined" ? "" : location.origin);
+  const base =
+    API_BASE || (typeof location === "undefined" ? "" : location.origin);
   return base ? new URL("/a2a", base).toString() : "/a2a";
 }
 
@@ -1131,6 +1133,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     res.status === 401 &&
     path !== "/api/auth/login" &&
     path !== "/api/auth/register" &&
+    path !== "/api/setup/claim" &&
     path !== "/api/auth/me"
   ) {
     location.hash = "#/login";
@@ -1195,7 +1198,8 @@ export function normalizeSchedule(raw: Record<string, unknown>): Schedule {
     next_run_state: nextRunState,
     ...(nextRunState === "scheduled" && nextRun ? { next_run: nextRun } : {}),
     created_at: raw.created_at as string | undefined,
-    delivery_channel: raw.delivery_channel as DeliveryChannelPreference | undefined,
+    delivery_channel: raw.delivery_channel as
+      DeliveryChannelPreference | undefined,
   };
 }
 
@@ -1606,6 +1610,12 @@ function normalizeReport(raw: ObservabilityReport): ObservabilityReport {
 }
 
 export const api = {
+  setupStatus: () => request<InstallationSetupStatus>("/api/setup/status"),
+  claimInstallation: (token: string, email: string, password: string) =>
+    post<{ ok: boolean; tenant_id: number; restart_required: boolean }>(
+      "/api/setup/claim",
+      { token, email, password },
+    ),
   // 认证改为邮箱+密码（后端决议 D2′，vane#73）。
   //
   // **必须与后端同批上线**：后端合并后旧的 {password} 形态会一律 401，
@@ -1687,29 +1697,27 @@ export const api = {
     userID: number,
     role: Exclude<WorkspaceRole, "owner">,
   ) =>
-    request<{ ok: boolean }>(
-      `/api/workspaces/${tenantID}/members/${userID}`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role }),
-      },
-    ),
+    request<{ ok: boolean }>(`/api/workspaces/${tenantID}/members/${userID}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role }),
+    }),
   removeWorkspaceMember: (tenantID: number, userID: number) =>
-    request<{ ok: boolean }>(
-      `/api/workspaces/${tenantID}/members/${userID}`,
-      { method: "DELETE" },
-    ),
+    request<{ ok: boolean }>(`/api/workspaces/${tenantID}/members/${userID}`, {
+      method: "DELETE",
+    }),
   transferWorkspaceOwnership: (tenantID: number, userID: number) =>
-    post<{ ok: boolean }>(
-      `/api/workspaces/${tenantID}/transfer-ownership`,
-      { user_id: userID },
-    ),
+    post<{ ok: boolean }>(`/api/workspaces/${tenantID}/transfer-ownership`, {
+      user_id: userID,
+    }),
   listA2AAccessTokens: () =>
     request<{ tokens: A2AAccessToken[] }>("/api/a2a-tokens").then((result) =>
       arr(result.tokens).map(({ token: _rawToken, ...item }) => item),
     ),
-  issueA2AAccessToken: (input: IssueA2AAccessTokenRequest, reauthProof: string) =>
+  issueA2AAccessToken: (
+    input: IssueA2AAccessTokenRequest,
+    reauthProof: string,
+  ) =>
     request<A2AAccessToken>("/api/a2a-tokens", {
       method: "POST",
       headers: {
@@ -1736,15 +1744,20 @@ export const api = {
   feishuTest: () => post<{ ok: boolean }>("/api/feishu/test"),
   telegramStatus: () => request<TelegramStatus>("/api/telegram/status"),
   telegramLink: () => post<TelegramLink>("/api/telegram/link"),
-	telegramRouteLink: () => post<TelegramLink>("/api/telegram/routes/link"),
-	telegramRouteUnlink: (id: number) =>
-		request<{ ok: boolean }>(`/api/telegram/routes/${id}`, { method: "DELETE" }),
+  telegramRouteLink: () => post<TelegramLink>("/api/telegram/routes/link"),
+  telegramRouteUnlink: (id: number) =>
+    request<{ ok: boolean }>(`/api/telegram/routes/${id}`, {
+      method: "DELETE",
+    }),
   telegramUnlink: () =>
     request<{ ok: boolean }>("/api/telegram/link", { method: "DELETE" }),
   telegramTest: () => post<{ ok: boolean }>("/api/telegram/test"),
   deliveryChannelPreference: () =>
     request<DeliveryChannelPreference>("/api/channels/delivery-preference"),
-  patchDeliveryChannelPreference: (selection: DeliveryChannelSelection, telegramRouteId?: number) =>
+  patchDeliveryChannelPreference: (
+    selection: DeliveryChannelSelection,
+    telegramRouteId?: number,
+  ) =>
     request<DeliveryChannelPreference>("/api/channels/delivery-preference", {
       method: "PATCH",
       body: JSON.stringify({ selection, telegram_route_id: telegramRouteId }),
@@ -1757,13 +1770,14 @@ export const api = {
     id: string,
     selection: DeliveryChannelSelection,
     telegramRouteId?: number,
-  ) => request<DeliveryChannelPreference>(
-    `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
-    {
-      method: "PATCH",
-      body: JSON.stringify({ selection, telegram_route_id: telegramRouteId }),
-    },
-  ),
+  ) =>
+    request<DeliveryChannelPreference>(
+      `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ selection, telegram_route_id: telegramRouteId }),
+      },
+    ),
   deleteTaskDeliveryChannelPreference: (id: string) =>
     request<DeliveryChannelPreference>(
       `/api/schedules/${encodeURIComponent(id)}/delivery-preference`,
@@ -1778,7 +1792,8 @@ export const api = {
     ),
   telegramRevokeCredential: () =>
     request<{ ok: boolean; activation?: string }>(
-      "/api/channels/telegram/credentials", { method: "DELETE" },
+      "/api/channels/telegram/credentials",
+      { method: "DELETE" },
     ),
   adminLLMCredentialStatus: () =>
     request<CredentialStatus>("/api/admin/llm/credentials"),
@@ -1788,7 +1803,9 @@ export const api = {
       { method: "PUT", body: JSON.stringify(input) },
     ),
   adminRevokeLLMCredential: () =>
-    request<{ ok: boolean }>("/api/admin/llm/credentials", { method: "DELETE" }),
+    request<{ ok: boolean }>("/api/admin/llm/credentials", {
+      method: "DELETE",
+    }),
   adminFetchCredentialStatus: () =>
     request<CredentialStatus>("/api/admin/fetch/credentials"),
   adminRotateFetchCredential: (input: FetchCredentialInput) =>
@@ -1797,7 +1814,9 @@ export const api = {
       { method: "PUT", body: JSON.stringify(input) },
     ),
   adminRevokeFetchCredential: () =>
-    request<{ ok: boolean }>("/api/admin/fetch/credentials", { method: "DELETE" }),
+    request<{ ok: boolean }>("/api/admin/fetch/credentials", {
+      method: "DELETE",
+    }),
 
   // ---- M3 定时任务（B8）----
   listSchedules: () =>

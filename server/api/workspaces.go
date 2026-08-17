@@ -299,7 +299,9 @@ func (s *server) handleWorkspaceInviteRegister(w http.ResponseWriter, r *http.Re
 		writeAppError(w, err)
 		return
 	}
-	s.issueSession(w, r, user.ID, personal.ID)
+	if !s.issueSession(w, r, user.ID, personal.ID) {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant_id": personal.ID})
 }
 
