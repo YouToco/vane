@@ -75,6 +75,38 @@ def require_migration_credential(path: Path, uid: int, gid: int) -> None:
         raise RuntimeError(f"unsafe workspace memory UAT credential: {path}")
 
 
+def migration_database_url(path: Path, uid: int, gid: int) -> str:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != uid
+            or info.st_gid != gid
+            or stat.S_IMODE(info.st_mode) != 0o400
+            or info.st_nlink != 1
+            or not 0 < info.st_size <= 64 * 1024
+        ):
+            raise RuntimeError("workspace memory UAT migration credential is unsafe")
+        payload = os.read(descriptor, info.st_size + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) != info.st_size:
+        raise RuntimeError("workspace memory UAT migration credential changed while reading")
+    try:
+        value = payload.decode("utf-8")
+    except UnicodeError as error:
+        raise RuntimeError("workspace memory UAT migration credential is not UTF-8") from error
+    if value.endswith("\n"):
+        value = value[:-1]
+    if (
+        not value.startswith(("postgres://", "postgresql://"))
+        or any(character.isspace() or ord(character) < 0x20 for character in value)
+    ):
+        raise RuntimeError("workspace memory UAT migration database URL is invalid")
+    return value
+
+
 def runtime_database_url(path: Path) -> str:
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
@@ -199,6 +231,9 @@ def main() -> int:
     require_migration_credential(
         MIGRATION_CREDENTIAL, migrate_uid, migrate_gid
     )
+    migration_url = migration_database_url(
+        MIGRATION_CREDENTIAL, migrate_uid, migrate_gid
+    )
     runtime_url = runtime_database_url(SERVER_ENV)
     unit = "vane-workspace-memory-uat-" + operation.hex
     command = [
@@ -212,7 +247,6 @@ def main() -> int:
         "--property=User=vane-migrate",
         "--property=Group=vane-migrate",
         "--property=WorkingDirectory=/opt/vane",
-        f"--property=LoadCredential=migration_db_url:{MIGRATION_CREDENTIAL}",
         "--property=NoNewPrivileges=yes",
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=yes",
@@ -232,12 +266,14 @@ def main() -> int:
         args.sha,
         "--confirm",
         SCHEMA,
+        "--database-authority-pipe",
+        "v1",
     ]
     with tempfile.TemporaryFile(prefix="vane-memory-uat-stdout-") as stdout, \
             tempfile.TemporaryFile(prefix="vane-memory-uat-stderr-") as stderr:
         completed = subprocess.run(
             command,
-            input=runtime_url + "\n",
+            input=migration_url + "\n" + runtime_url + "\n",
             check=False,
             text=True,
             stdout=stdout,

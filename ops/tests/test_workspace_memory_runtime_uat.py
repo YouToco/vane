@@ -111,13 +111,19 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
         code, command, options = self.invoke(completed)
         self.assertEqual(code, 0)
         self.assertEqual(options["timeout"], 390)
-        self.assertEqual(options["input"], "postgres://runtime\n")
+        self.assertEqual(
+            options["input"], "postgres://owner\npostgres://runtime\n"
+        )
         self.assertEqual(
             options["env"], {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
         )
         self.assertFalse(any("postgres://runtime" in item for item in command))
+        self.assertFalse(any("postgres://owner" in item for item in command))
         self.assertFalse(
             any("postgres://runtime" in item for item in options["env"].values())
+        )
+        self.assertFalse(
+            any("postgres://owner" in item for item in options["env"].values())
         )
         self.assertIn("--property=User=vane-migrate", command)
         self.assertIn("--property=NoNewPrivileges=yes", command)
@@ -128,13 +134,12 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
         self.assertFalse(any("StandardError=file:" in item for item in command))
         self.assertFalse(any("EnvironmentFile=" in item for item in command))
         self.assertFalse(any("LoadCredential=runtime_db_url:" in item for item in command))
-        self.assertEqual(
-            len([item for item in command if "LoadCredential=" in item]), 1
-        )
+        self.assertFalse(any("LoadCredential=" in item for item in command))
         self.assertFalse(any("/tmp/" in item for item in command))
-        self.assertEqual(command[-7:], [
+        self.assertEqual(command[-9:], [
             "workspace-memory-uat", "--operation-id", self.operation,
             "--expected-revision", self.revision, "--confirm", uat.SCHEMA,
+            "--database-authority-pipe", "v1",
         ])
 
     def test_report_rejects_missing_false_duplicate_and_equal_digest(self) -> None:
@@ -192,9 +197,34 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
     def test_migration_credential_matches_existing_production_contract(self) -> None:
         uid, gid = uat.migration_identity()
         uat.require_migration_credential(uat.MIGRATION_CREDENTIAL, uid, gid)
+        self.assertEqual(
+            uat.migration_database_url(uat.MIGRATION_CREDENTIAL, uid, gid),
+            "postgres://owner",
+        )
         uat.MIGRATION_CREDENTIAL.chmod(0o600)
         with self.assertRaisesRegex(RuntimeError, "unsafe"):
             uat.require_migration_credential(uat.MIGRATION_CREDENTIAL, uid, gid)
+        with self.assertRaisesRegex(RuntimeError, "unsafe"):
+            uat.migration_database_url(uat.MIGRATION_CREDENTIAL, uid, gid)
+
+    def test_migration_credential_value_is_strict_and_bounded(self) -> None:
+        uid, gid = uat.migration_identity()
+        for value in (
+            b"",
+            b"not-postgres\n",
+            b" postgres://owner\n",
+            b"postgres://owner\nextra\n",
+            b"postgres://owner\x00",
+            b"x" * (64 * 1024 + 1),
+        ):
+            with self.subTest(length=len(value)):
+                uat.MIGRATION_CREDENTIAL.chmod(0o600)
+                uat.MIGRATION_CREDENTIAL.write_bytes(value)
+                uat.MIGRATION_CREDENTIAL.chmod(0o400)
+                with self.assertRaises(RuntimeError):
+                    uat.migration_database_url(
+                        uat.MIGRATION_CREDENTIAL, uid, gid
+                    )
 
 
 if __name__ == "__main__":

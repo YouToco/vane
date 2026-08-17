@@ -153,10 +153,9 @@ func TestWorkspaceMemoryUATCommandRequiresExactReleaseAuthority(t *testing.T) {
 		ownerURL   = "postgres://owner/db"
 		runtimeURL = "postgres://runtime/db"
 	)
-	t.Setenv(migrationDatabaseURLEnv, ownerURL)
-	t.Setenv("VANE_DB_URL", runtimeURL)
 	valid := []string{"--operation-id", operation, "--expected-revision", revision,
-		"--confirm", workspaceMemoryUATConfirmation}
+		"--confirm", workspaceMemoryUATConfirmation,
+		"--database-authority-pipe", workspaceMemoryUATPipeVersion}
 	var output bytes.Buffer
 	called := 0
 	runner := func(_ context.Context, gotOwner, gotRuntime, gotOperation, gotRevision string,
@@ -170,7 +169,8 @@ func TestWorkspaceMemoryUATCommandRequiresExactReleaseAuthority(t *testing.T) {
 		return &workspaceMemoryUATReport{Schema: workspaceMemoryUATConfirmation,
 			Revision: revision, OperationID: operation, CleanupVerified: true}, nil
 	}
-	if err := executeWorkspaceMemoryUATCommand(valid, strings.NewReader(""), &output,
+	if err := executeWorkspaceMemoryUATCommand(valid,
+		strings.NewReader(ownerURL+"\n"+runtimeURL+"\n"), &output,
 		func() (string, bool) { return revision, true }, runner); err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,9 @@ func TestWorkspaceMemoryUATCommandRequiresExactReleaseAuthority(t *testing.T) {
 		runtime   string
 	}{
 		{"unknown flag", []string{"--unknown"}, func() (string, bool) { return revision, true }, ownerURL, runtimeURL},
-		{"missing confirm", valid[:4], func() (string, bool) { return revision, true }, ownerURL, runtimeURL},
+		{"missing confirm", []string{"--operation-id", operation,
+			"--expected-revision", revision, "--database-authority-pipe", workspaceMemoryUATPipeVersion},
+			func() (string, bool) { return revision, true }, ownerURL, runtimeURL},
 		{"bad operation", []string{"--operation-id", uuid.Nil.String(),
 			"--expected-revision", revision, "--confirm", workspaceMemoryUATConfirmation},
 			func() (string, bool) { return revision, true }, ownerURL, runtimeURL},
@@ -201,10 +203,9 @@ func TestWorkspaceMemoryUATCommandRequiresExactReleaseAuthority(t *testing.T) {
 	}
 	for _, mutation := range mutations {
 		t.Run(mutation.name, func(t *testing.T) {
-			t.Setenv(migrationDatabaseURLEnv, mutation.owner)
-			t.Setenv("VANE_DB_URL", mutation.runtime)
 			called = 0
-			if err := executeWorkspaceMemoryUATCommand(mutation.arguments, strings.NewReader(""), &bytes.Buffer{},
+			if err := executeWorkspaceMemoryUATCommand(mutation.arguments,
+				strings.NewReader(mutation.owner+"\n"+mutation.runtime+"\n"), &bytes.Buffer{},
 				mutation.revision, runner); err == nil {
 				t.Fatal("authority mutation passed")
 			}
@@ -218,7 +219,8 @@ func TestWorkspaceMemoryUATCommandRequiresExactReleaseAuthority(t *testing.T) {
 	}
 
 	expected := errors.New("runner refused")
-	if err := executeWorkspaceMemoryUATCommand(valid, strings.NewReader(""), &bytes.Buffer{},
+	if err := executeWorkspaceMemoryUATCommand(valid,
+		strings.NewReader(ownerURL+"\n"+runtimeURL+"\n"), &bytes.Buffer{},
 		func() (string, bool) { return revision, true },
 		func(context.Context, string, string, string, string) (*workspaceMemoryUATReport, error) {
 			return nil, expected
@@ -227,64 +229,36 @@ func TestWorkspaceMemoryUATCommandRequiresExactReleaseAuthority(t *testing.T) {
 	}
 }
 
-func TestWorkspaceMemoryRuntimeDatabaseURLUsesDedicatedCredential(t *testing.T) {
-	t.Setenv("VANE_DB_URL", "")
-	directory := t.TempDir()
-	t.Setenv(migrationDatabaseCredentialEnv, directory)
-	if _, err := workspaceMemoryRuntimeDatabaseURL(strings.NewReader("")); err == nil {
-		t.Fatal("missing runtime credential passed")
+func TestWorkspaceMemoryDatabaseAuthorityPipeIsExact(t *testing.T) {
+	if _, _, err := workspaceMemoryDatabaseAuthorityPipe(strings.NewReader("")); err == nil {
+		t.Fatal("missing database authority pipe passed")
 	}
-	if _, err := workspaceMemoryRuntimeDatabaseURL(nil); err == nil {
-		t.Fatal("nil runtime credential pipe passed")
+	if _, _, err := workspaceMemoryDatabaseAuthorityPipe(nil); err == nil {
+		t.Fatal("nil database authority pipe passed")
 	}
-	if _, err := workspaceMemoryRuntimeDatabaseURL(
+	if _, _, err := workspaceMemoryDatabaseAuthorityPipe(
 		iotest.ErrReader(errors.New("read failed"))); err == nil {
-		t.Fatal("failed runtime credential pipe passed")
+		t.Fatal("failed database authority pipe passed")
 	}
-	pipeValue, err := workspaceMemoryRuntimeDatabaseURL(
-		strings.NewReader("postgres://runtime/from-pipe\n"))
-	if err != nil || pipeValue != "postgres://runtime/from-pipe" {
-		t.Fatalf("pipe value=%q err=%v", pipeValue, err)
+	owner, runtime, err := workspaceMemoryDatabaseAuthorityPipe(strings.NewReader(
+		"postgres://owner/from-pipe\npostgres://runtime/from-pipe\n"))
+	if err != nil || owner != "postgres://owner/from-pipe" ||
+		runtime != "postgres://runtime/from-pipe" {
+		t.Fatalf("owner=%q runtime=%q err=%v", owner, runtime, err)
 	}
 	for _, mutation := range []string{
-		"postgres://runtime/no-newline",
-		"postgres://runtime/one\npostgres://runtime/two\n",
-		" postgres://runtime/space\n",
-		strings.Repeat("x", 64*1024) + "\n",
+		"postgres://owner/no-runtime\n",
+		"postgres://owner/one\npostgres://runtime/two",
+		"postgres://owner/one\npostgres://runtime/two\nextra\n",
+		" postgres://owner/space\npostgres://runtime/two\n",
+		"postgres://same/db\npostgres://same/db\n",
+		strings.Repeat("x", workspaceMemoryUATURLBytesMax+1) +
+			"\npostgres://runtime/two\n",
 	} {
-		if _, err := workspaceMemoryRuntimeDatabaseURL(strings.NewReader(mutation)); err == nil {
-			t.Fatalf("invalid pipe credential passed: length=%d", len(mutation))
+		if _, _, err := workspaceMemoryDatabaseAuthorityPipe(
+			strings.NewReader(mutation)); err == nil {
+			t.Fatalf("invalid database authority pipe passed: length=%d", len(mutation))
 		}
-	}
-	credentialPath := directory + string(os.PathSeparator) +
-		workspaceMemoryRuntimeCredential
-	if err := os.Mkdir(credentialPath, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := workspaceMemoryRuntimeDatabaseURL(strings.NewReader("ignored\n")); err == nil {
-		t.Fatal("unreadable runtime credential passed")
-	}
-	if err := os.Remove(credentialPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(credentialPath, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := workspaceMemoryRuntimeDatabaseURL(strings.NewReader("ignored\n")); err == nil {
-		t.Fatal("empty runtime credential passed")
-	}
-	if err := os.WriteFile(credentialPath,
-		[]byte("postgres://runtime/db\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	value, err := workspaceMemoryRuntimeDatabaseURL(strings.NewReader(""))
-	if err != nil || value != "postgres://runtime/db" {
-		t.Fatalf("value=%q err=%v", value, err)
-	}
-	t.Setenv("VANE_DB_URL", "postgres://explicit/runtime")
-	value, err = workspaceMemoryRuntimeDatabaseURL(strings.NewReader(""))
-	if err != nil || value != "postgres://explicit/runtime" {
-		t.Fatalf("env value=%q err=%v", value, err)
 	}
 }
 

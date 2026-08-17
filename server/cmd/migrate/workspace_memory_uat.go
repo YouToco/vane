@@ -23,12 +23,13 @@ import (
 )
 
 const (
-	workspaceMemoryUATCommand        = "workspace-memory-uat"
-	workspaceMemoryUATConfirmation   = "vane.workspace-memory-runtime-uat/v1"
-	workspaceMemoryUATPrefix         = "vane-runtime-uat:"
-	workspaceMemoryUATTimeout        = 3 * time.Minute
-	workspaceMemoryUATCleanupTime    = 2 * time.Minute
-	workspaceMemoryRuntimeCredential = "runtime_db_url"
+	workspaceMemoryUATCommand      = "workspace-memory-uat"
+	workspaceMemoryUATConfirmation = "vane.workspace-memory-runtime-uat/v1"
+	workspaceMemoryUATPrefix       = "vane-runtime-uat:"
+	workspaceMemoryUATTimeout      = 3 * time.Minute
+	workspaceMemoryUATCleanupTime  = 2 * time.Minute
+	workspaceMemoryUATPipeVersion  = "v1"
+	workspaceMemoryUATURLBytesMax  = 64 * 1024
 )
 
 var lowerRevision = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -37,6 +38,7 @@ type workspaceMemoryUATOptions struct {
 	operationID      string
 	expectedRevision string
 	confirmation     string
+	authorityPipe    string
 }
 
 type workspaceMemoryUATFixture struct {
@@ -100,10 +102,13 @@ func executeWorkspaceMemoryUATCommand(
 	set.StringVar(&options.operationID, "operation-id", "", "retryable correlation UUID")
 	set.StringVar(&options.expectedRevision, "expected-revision", "", "exact release revision")
 	set.StringVar(&options.confirmation, "confirm", "", "exact mutation authority phrase")
+	set.StringVar(&options.authorityPipe, "database-authority-pipe", "",
+		"exact versioned database authority pipe")
 	if err := set.Parse(arguments); err != nil {
 		return err
 	}
 	if set.NArg() != 0 || options.confirmation != workspaceMemoryUATConfirmation ||
+		options.authorityPipe != workspaceMemoryUATPipeVersion ||
 		!lowerRevision.MatchString(options.expectedRevision) {
 		return errors.New("workspace memory UAT authority is invalid")
 	}
@@ -115,11 +120,7 @@ func executeWorkspaceMemoryUATCommand(
 	if !ok || revision != options.expectedRevision {
 		return errors.New("workspace memory UAT binary is not the expected clean release")
 	}
-	ownerURL, err := migrationDatabaseURL()
-	if err != nil {
-		return err
-	}
-	runtimeURL, err := workspaceMemoryRuntimeDatabaseURL(input)
+	ownerURL, runtimeURL, err := workspaceMemoryDatabaseAuthorityPipe(input)
 	if err != nil {
 		return err
 	}
@@ -138,41 +139,32 @@ func executeWorkspaceMemoryUATCommand(
 	return encoder.Encode(report)
 }
 
-func workspaceMemoryRuntimeDatabaseURL(input io.Reader) (string, error) {
-	if value := strings.TrimSpace(os.Getenv("VANE_DB_URL")); value != "" {
-		return value, nil
-	}
-	directory := strings.TrimSpace(os.Getenv(migrationDatabaseCredentialEnv))
-	if directory != "" {
-		payload, err := os.ReadFile(directory + string(os.PathSeparator) +
-			workspaceMemoryRuntimeCredential)
-		if err == nil {
-			value := strings.TrimSpace(string(payload))
-			if value == "" {
-				return "", errors.New("workspace memory runtime database credential is empty")
-			}
-			return value, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return "", errors.New("read workspace memory runtime database credential")
-		}
-	}
+func workspaceMemoryDatabaseAuthorityPipe(input io.Reader) (string, string, error) {
 	if input == nil {
-		return "", errors.New("workspace memory runtime database credential is unavailable")
+		return "", "", errors.New("workspace memory database authority pipe is unavailable")
 	}
-	payload, err := io.ReadAll(io.LimitReader(input, 64*1024+1))
+	payload, err := io.ReadAll(io.LimitReader(input, 2*workspaceMemoryUATURLBytesMax+3))
 	if err != nil {
-		return "", errors.New("read workspace memory runtime database credential pipe")
+		return "", "", errors.New("read workspace memory database authority pipe")
 	}
-	if len(payload) < 2 || len(payload) > 64*1024 || payload[len(payload)-1] != '\n' ||
-		strings.Count(string(payload), "\n") != 1 {
-		return "", errors.New("workspace memory runtime database credential pipe is invalid")
+	if len(payload) < 4 || len(payload) > 2*workspaceMemoryUATURLBytesMax+2 ||
+		payload[len(payload)-1] != '\n' || strings.Count(string(payload), "\n") != 2 {
+		return "", "", errors.New("workspace memory database authority pipe is invalid")
 	}
-	value := string(payload[:len(payload)-1])
-	if strings.TrimSpace(value) != value || value == "" {
-		return "", errors.New("workspace memory runtime database credential pipe is invalid")
+	values := strings.Split(string(payload[:len(payload)-1]), "\n")
+	if len(values) != 2 {
+		return "", "", errors.New("workspace memory database authority pipe is invalid")
 	}
-	return value, nil
+	for _, value := range values {
+		if value == "" || len(value) > workspaceMemoryUATURLBytesMax ||
+			strings.TrimSpace(value) != value {
+			return "", "", errors.New("workspace memory database authority pipe is invalid")
+		}
+	}
+	if values[0] == values[1] {
+		return "", "", errors.New("workspace memory UAT requires distinct owner and runtime database authorities")
+	}
+	return values[0], values[1], nil
 }
 
 func runWorkspaceMemoryRuntimeUAT(
