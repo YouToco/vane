@@ -83,12 +83,13 @@ type workspaceMemoryRuntimeFactory func(
 ) (workspaceMemoryRuntimeStore, error)
 
 func runWorkspaceMemoryUATCommand(arguments []string) error {
-	return executeWorkspaceMemoryUATCommand(arguments, os.Stdout,
+	return executeWorkspaceMemoryUATCommand(arguments, os.Stdin, os.Stdout,
 		releaseinfo.Revision, runWorkspaceMemoryRuntimeUAT)
 }
 
 func executeWorkspaceMemoryUATCommand(
 	arguments []string,
+	input io.Reader,
 	output io.Writer,
 	revisionAuthority func() (string, bool),
 	runner func(context.Context, string, string, string, string) (*workspaceMemoryUATReport, error),
@@ -118,7 +119,7 @@ func executeWorkspaceMemoryUATCommand(
 	if err != nil {
 		return err
 	}
-	runtimeURL, err := workspaceMemoryRuntimeDatabaseURL()
+	runtimeURL, err := workspaceMemoryRuntimeDatabaseURL(input)
 	if err != nil {
 		return err
 	}
@@ -137,22 +138,39 @@ func executeWorkspaceMemoryUATCommand(
 	return encoder.Encode(report)
 }
 
-func workspaceMemoryRuntimeDatabaseURL() (string, error) {
+func workspaceMemoryRuntimeDatabaseURL(input io.Reader) (string, error) {
 	if value := strings.TrimSpace(os.Getenv("VANE_DB_URL")); value != "" {
 		return value, nil
 	}
 	directory := strings.TrimSpace(os.Getenv(migrationDatabaseCredentialEnv))
-	if directory == "" {
+	if directory != "" {
+		payload, err := os.ReadFile(directory + string(os.PathSeparator) +
+			workspaceMemoryRuntimeCredential)
+		if err == nil {
+			value := strings.TrimSpace(string(payload))
+			if value == "" {
+				return "", errors.New("workspace memory runtime database credential is empty")
+			}
+			return value, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", errors.New("read workspace memory runtime database credential")
+		}
+	}
+	if input == nil {
 		return "", errors.New("workspace memory runtime database credential is unavailable")
 	}
-	payload, err := os.ReadFile(directory + string(os.PathSeparator) +
-		workspaceMemoryRuntimeCredential)
+	payload, err := io.ReadAll(io.LimitReader(input, 64*1024+1))
 	if err != nil {
-		return "", errors.New("read workspace memory runtime database credential")
+		return "", errors.New("read workspace memory runtime database credential pipe")
 	}
-	value := strings.TrimSpace(string(payload))
-	if value == "" {
-		return "", errors.New("workspace memory runtime database credential is empty")
+	if len(payload) < 2 || len(payload) > 64*1024 || payload[len(payload)-1] != '\n' ||
+		strings.Count(string(payload), "\n") != 1 {
+		return "", errors.New("workspace memory runtime database credential pipe is invalid")
+	}
+	value := string(payload[:len(payload)-1])
+	if strings.TrimSpace(value) != value || value == "" {
+		return "", errors.New("workspace memory runtime database credential pipe is invalid")
 	}
 	return value, nil
 }

@@ -109,46 +109,19 @@ def runtime_database_url(path: Path) -> str:
     return value
 
 
-def write_runtime_credential(directory: Path, value: str, uid: int, gid: int) -> Path:
-    path = directory / "runtime_db_url"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(descriptor, (value + "\n").encode("utf-8"))
-        os.fchown(descriptor, uid, gid)
-        os.fchmod(descriptor, 0o400)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    require_migration_credential(path, uid, gid)
-    return path
-
-
-def create_capture_file(directory: Path, name: str) -> Path:
-    path = directory / name
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600,
-    )
-    os.close(descriptor)
-    return path
-
-
-def read_capture_file(path: Path) -> str:
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        info = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != TRUSTED_UID
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_nlink != 1
-            or info.st_size > CAPTURE_BYTES_MAX
-        ):
-            raise RuntimeError("unsafe workspace memory UAT capture")
-        payload = os.read(descriptor, info.st_size + 1)
-    finally:
-        os.close(descriptor)
+def read_capture_stream(stream: object) -> str:
+    stream.flush()
+    info = os.fstat(stream.fileno())
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != TRUSTED_UID
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink not in (0, 1)
+        or info.st_size > CAPTURE_BYTES_MAX
+    ):
+        raise RuntimeError("unsafe workspace memory UAT capture")
+    stream.seek(0)
+    payload = stream.read(CAPTURE_BYTES_MAX + 1)
     if len(payload) != info.st_size:
         raise RuntimeError("workspace memory UAT capture changed while reading")
     try:
@@ -228,67 +201,61 @@ def main() -> int:
     )
     runtime_url = runtime_database_url(SERVER_ENV)
     unit = "vane-workspace-memory-uat-" + operation.hex
-    with tempfile.TemporaryDirectory(prefix="vane-memory-uat-runtime-") as raw:
-        directory = Path(raw)
-        directory.chmod(0o700)
-        runtime_credential = write_runtime_credential(
-            directory, runtime_url, migrate_uid, migrate_gid
-        )
-        stdout_path = create_capture_file(directory, "stdout")
-        stderr_path = create_capture_file(directory, "stderr")
-        command = [
-            "systemd-run",
-            "--quiet",
-            "--wait",
-            "--collect",
-            f"--unit={unit}",
-            "--property=Type=oneshot",
-            "--property=User=vane-migrate",
-            "--property=Group=vane-migrate",
-            "--property=WorkingDirectory=/opt/vane",
-            f"--property=LoadCredential=migration_db_url:{MIGRATION_CREDENTIAL}",
-            f"--property=LoadCredential=runtime_db_url:{runtime_credential}",
-            f"--property=StandardOutput=file:{stdout_path}",
-            f"--property=StandardError=file:{stderr_path}",
-            "--property=NoNewPrivileges=yes",
-            "--property=ProtectSystem=strict",
-            "--property=ProtectHome=yes",
-            "--property=PrivateTmp=yes",
-            "--property=PrivateDevices=yes",
-            "--property=ProtectProc=invisible",
-            "--property=RestrictSUIDSGID=yes",
-            "--property=LockPersonality=yes",
-            "--property=MemoryDenyWriteExecute=yes",
-            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-            "--property=TimeoutStartSec=6min",
-            str(executable),
-            "workspace-memory-uat",
-            "--operation-id",
-            args.operation_id,
-            "--expected-revision",
-            args.sha,
-            "--confirm",
-            SCHEMA,
-        ]
+    command = [
+        "systemd-run",
+        "--quiet",
+        "--wait",
+        "--pipe",
+        "--collect",
+        f"--unit={unit}",
+        "--property=Type=oneshot",
+        "--property=User=vane-migrate",
+        "--property=Group=vane-migrate",
+        "--property=WorkingDirectory=/opt/vane",
+        f"--property=LoadCredential=migration_db_url:{MIGRATION_CREDENTIAL}",
+        "--property=NoNewPrivileges=yes",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=yes",
+        "--property=PrivateTmp=yes",
+        "--property=PrivateDevices=yes",
+        "--property=ProtectProc=invisible",
+        "--property=RestrictSUIDSGID=yes",
+        "--property=LockPersonality=yes",
+        "--property=MemoryDenyWriteExecute=yes",
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "--property=TimeoutStartSec=6min",
+        str(executable),
+        "workspace-memory-uat",
+        "--operation-id",
+        args.operation_id,
+        "--expected-revision",
+        args.sha,
+        "--confirm",
+        SCHEMA,
+    ]
+    with tempfile.TemporaryFile(prefix="vane-memory-uat-stdout-") as stdout, \
+            tempfile.TemporaryFile(prefix="vane-memory-uat-stderr-") as stderr:
         completed = subprocess.run(
             command,
+            input=runtime_url + "\n",
             check=False,
             text=True,
-            capture_output=True,
+            stdout=stdout,
+            stderr=stderr,
             timeout=390,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
         )
-        stdout = read_capture_file(stdout_path)
-        stderr = read_capture_file(stderr_path)
+        stdout_value = read_capture_stream(stdout)
+        stderr_value = read_capture_stream(stderr)
     if completed.returncode != 0:
         raise RuntimeError(
             f"workspace memory UAT transient unit failed with exit {completed.returncode}"
         )
-    if completed.stdout.strip() or completed.stderr.strip():
-        raise RuntimeError("workspace memory UAT systemd runner wrote unexpected output")
-    if stderr.strip():
+    if stderr_value.strip():
         raise RuntimeError("workspace memory UAT transient unit wrote stderr")
-    report = validate_report(strict_json(stdout), args.sha, args.operation_id)
+    report = validate_report(
+        strict_json(stdout_value), args.sha, args.operation_id
+    )
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return 0
 

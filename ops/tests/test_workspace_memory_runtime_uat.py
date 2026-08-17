@@ -78,7 +78,7 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
 
     def invoke(
         self, completed: subprocess.CompletedProcess[str]
-    ) -> tuple[int, list[str], int]:
+    ) -> tuple[int, list[str], dict[str, object]]:
         argv = [
             "workspace-memory-runtime-uat.py",
             "--sha",
@@ -87,40 +87,51 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
             self.operation,
         ]
         captured: list[str] = []
+
+        def run_side_effect(command: list[str], **options: object):
+            stdout = options["stdout"]
+            stderr = options["stderr"]
+            stdout.write((completed.stdout or "").encode("utf-8"))
+            stderr.write((completed.stderr or "").encode("utf-8"))
+            return subprocess.CompletedProcess(command, completed.returncode)
+
         with mock.patch.object(sys, "argv", argv), mock.patch.object(
-            uat.subprocess, "run", return_value=completed
-        ) as run, mock.patch.object(
-            uat, "read_capture_file", side_effect=[json.dumps(self.report()), ""]
-        ), mock.patch("builtins.print", side_effect=lambda value: captured.append(value)):
+            uat.subprocess, "run", side_effect=run_side_effect
+        ) as run, mock.patch(
+            "builtins.print", side_effect=lambda value: captured.append(value)
+        ):
             code = uat.main()
         command = run.call_args.args[0]
-        return code, command, run.call_args.kwargs["timeout"]
+        return code, command, run.call_args.kwargs
 
     def test_exact_release_runs_hardened_transient_unit(self) -> None:
         completed = subprocess.CompletedProcess(
-            [], 0, stdout="", stderr=""
+            [], 0, stdout=json.dumps(self.report()), stderr=""
         )
-        code, command, timeout = self.invoke(completed)
+        code, command, options = self.invoke(completed)
         self.assertEqual(code, 0)
-        self.assertEqual(timeout, 390)
+        self.assertEqual(options["timeout"], 390)
+        self.assertEqual(options["input"], "postgres://runtime\n")
+        self.assertEqual(
+            options["env"], {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+        )
+        self.assertFalse(any("postgres://runtime" in item for item in command))
+        self.assertFalse(
+            any("postgres://runtime" in item for item in options["env"].values())
+        )
         self.assertIn("--property=User=vane-migrate", command)
         self.assertIn("--property=NoNewPrivileges=yes", command)
         self.assertIn("--property=ProtectSystem=strict", command)
         self.assertIn("--property=TimeoutStartSec=6min", command)
-        self.assertNotIn("--pipe", command)
-        self.assertEqual(
-            len([item for item in command if "StandardOutput=file:" in item]),
-            1,
-        )
-        self.assertEqual(
-            len([item for item in command if "StandardError=file:" in item]),
-            1,
-        )
+        self.assertIn("--pipe", command)
+        self.assertFalse(any("StandardOutput=file:" in item for item in command))
+        self.assertFalse(any("StandardError=file:" in item for item in command))
         self.assertFalse(any("EnvironmentFile=" in item for item in command))
+        self.assertFalse(any("LoadCredential=runtime_db_url:" in item for item in command))
         self.assertEqual(
-            len([item for item in command if "LoadCredential=runtime_db_url:" in item]),
-            1,
+            len([item for item in command if "LoadCredential=" in item]), 1
         )
+        self.assertFalse(any("/tmp/" in item for item in command))
         self.assertEqual(command[-7:], [
             "workspace-memory-uat", "--operation-id", self.operation,
             "--expected-revision", self.revision, "--confirm", uat.SCHEMA,
@@ -150,22 +161,21 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.invoke(subprocess.CompletedProcess([], 0, stdout=json.dumps(self.report()), stderr="warning"))
 
-    def test_capture_file_is_root_owned_single_link_bounded_utf8(self) -> None:
-        root = Path(self.temp.name)
-        capture = uat.create_capture_file(root, "capture")
-        capture.write_text("ok", encoding="utf-8")
-        self.assertEqual(uat.read_capture_file(capture), "ok")
-
-        capture.chmod(0o644)
-        with self.assertRaisesRegex(RuntimeError, "unsafe"):
-            uat.read_capture_file(capture)
-        capture.chmod(0o600)
-        capture.write_bytes(b"\xff")
-        with self.assertRaisesRegex(RuntimeError, "UTF-8"):
-            uat.read_capture_file(capture)
-        capture.write_bytes(b"x" * (uat.CAPTURE_BYTES_MAX + 1))
-        with self.assertRaisesRegex(RuntimeError, "unsafe"):
-            uat.read_capture_file(capture)
+    def test_anonymous_capture_is_bounded_and_utf8(self) -> None:
+        with tempfile.TemporaryFile() as capture:
+            capture.write(b"ok")
+            self.assertEqual(uat.read_capture_stream(capture), "ok")
+            os.fchmod(capture.fileno(), 0o644)
+            with self.assertRaisesRegex(RuntimeError, "unsafe"):
+                uat.read_capture_stream(capture)
+        with tempfile.TemporaryFile() as capture:
+            capture.write(b"\xff")
+            with self.assertRaisesRegex(RuntimeError, "UTF-8"):
+                uat.read_capture_stream(capture)
+        with tempfile.TemporaryFile() as capture:
+            capture.write(b"x" * (uat.CAPTURE_BYTES_MAX + 1))
+            with self.assertRaisesRegex(RuntimeError, "unsafe"):
+                uat.read_capture_stream(capture)
 
     def test_runtime_database_url_is_derived_without_injecting_server_env(self) -> None:
         self.assertEqual(uat.runtime_database_url(uat.SERVER_ENV), "postgres://runtime")
