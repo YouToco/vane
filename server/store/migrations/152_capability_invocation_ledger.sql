@@ -323,7 +323,8 @@ CREATE FUNCTION assert_vane_capability_invocation_coordinator_v152()
 RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE role_safe boolean; tables_safe boolean; grants_safe boolean; policies_safe boolean;
+DECLARE role_safe boolean; tables_safe boolean; grants_safe boolean; effective_grants_safe boolean;
+        policies_safe boolean; triggers_safe boolean; trigger_functions_safe boolean;
         expected_acl_count integer; unexpected_acl_count integer;
 BEGIN
   IF session_user<>current_user THEN
@@ -350,7 +351,8 @@ BEGIN
       JOIN pg_catalog.pg_roles member ON member.oid=edge.member
       WHERE member.rolname='vane_capability_invocation_coordinator')
   INTO role_safe;
-  SELECT count(*)=2 AND bool_and(relrowsecurity AND relforcerowsecurity)
+  SELECT count(*)=2 AND bool_and(relrowsecurity AND relforcerowsecurity AND
+      relowner=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user))
     FROM pg_catalog.pg_class WHERE oid IN(
       'public.capability_invocations'::regclass,
       'public.capability_invocation_receipts'::regclass)
@@ -422,6 +424,39 @@ BEGIN
     FROM expected FULL JOIN actual
       USING(object_kind,object_oid,attnum,privilege_type);
   grants_safe := grants_safe AND expected_acl_count=13 AND unexpected_acl_count=0;
+  SELECT has_schema_privilege('vane_capability_invocation_coordinator','public','USAGE') AND
+         NOT has_schema_privilege('vane_capability_invocation_coordinator','public','CREATE') AND
+         has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','SELECT') AND
+         has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','INSERT') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','UPDATE') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','DELETE') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','TRUNCATE') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','REFERENCES') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','TRIGGER') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','MAINTAIN') AND
+         has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts','SELECT') AND
+         has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts','INSERT') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts','UPDATE') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts','DELETE') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts','TRUNCATE') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts','REFERENCES') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts','TRIGGER') AND
+         NOT has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts','MAINTAIN') AND
+         has_sequence_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts_id_seq','USAGE') AND
+         has_sequence_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts_id_seq','SELECT') AND
+         NOT has_sequence_privilege('vane_capability_invocation_coordinator','public.capability_invocation_receipts_id_seq','UPDATE') AND
+         NOT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute attribute
+           WHERE attribute.attrelid IN('public.capability_invocations'::regclass,
+                                       'public.capability_invocation_receipts'::regclass)
+             AND attribute.attnum>0 AND NOT attribute.attisdropped AND
+             (has_column_privilege('vane_capability_invocation_coordinator',attribute.attrelid,
+                                    attribute.attnum,'REFERENCES') OR
+              (has_column_privilege('vane_capability_invocation_coordinator',attribute.attrelid,
+                                    attribute.attnum,'UPDATE') AND
+               NOT (attribute.attrelid='public.capability_invocations'::regclass AND
+                    attribute.attname IN('status','lease_owner','lease_until','fence','attempt',
+                                         'current_receipt_ordinal')))))
+  INTO effective_grants_safe;
   WITH expected(relname,polname,polcmd,qual,withcheck) AS (VALUES
     ('capability_invocations','capability_invocation_select','r',
      '((tenant_id = (NULLIF(current_setting(''app.tenant_id''::text, true), ''''::text))::bigint) AND (user_id = (NULLIF(current_setting(''app.user_id''::text, true), ''''::text))::bigint))',NULL::text),
@@ -452,9 +487,67 @@ BEGIN
       actual.withcheck IS NOT DISTINCT FROM expected.withcheck)
     FROM expected FULL JOIN actual USING(relname,polname)
   INTO policies_safe;
-  IF NOT role_safe OR NOT tables_safe OR NOT grants_safe OR NOT policies_safe THEN
-    RAISE EXCEPTION '152: capability ledger contract unsafe role=% tables=% grants=% policies=%',
-      role_safe,tables_safe,grants_safe,policies_safe USING ERRCODE='42501';
+  WITH expected(trigger_name,relation_oid,function_oid,definition_digest) AS (VALUES
+    ('capability_invocation_checkpoint_v1','public.capability_invocations'::regclass::oid,
+     'public.enforce_capability_invocation_checkpoint_v1()'::regprocedure::oid,
+     'c5df22ef9484eba143334e1cba19d0c8292396451c9dc5b13a0015d93fcf47f9'),
+    ('capability_invocation_receipt_v1','public.capability_invocation_receipts'::regclass::oid,
+     'public.enforce_capability_invocation_receipt_v1()'::regprocedure::oid,
+     '177e4b1253e60a279758a03d3370400f43cc8f24c0141848a1b4e0c4e00ad8a3')
+  ), actual AS (
+    SELECT trigger.tgname trigger_name,trigger.tgrelid relation_oid,
+           trigger.tgfoid function_oid,trigger.tgenabled,trigger.tgconstraint,
+           trigger.tgdeferrable,trigger.tginitdeferred,trigger.tgparentid,
+           encode(sha256(convert_to(pg_catalog.pg_get_triggerdef(trigger.oid,false),'UTF8')),'hex')
+             definition_digest
+      FROM pg_catalog.pg_trigger trigger
+     WHERE trigger.tgrelid IN('public.capability_invocations'::regclass,
+                              'public.capability_invocation_receipts'::regclass)
+       AND NOT trigger.tgisinternal
+  )
+  SELECT count(*)=2 AND bool_and(expected.trigger_name IS NOT NULL AND
+      actual.trigger_name IS NOT NULL AND actual.function_oid=expected.function_oid AND
+      actual.tgenabled='O' AND actual.tgconstraint=0 AND NOT actual.tgdeferrable AND
+      NOT actual.tginitdeferred AND actual.tgparentid=0 AND
+      actual.definition_digest=expected.definition_digest)
+    FROM expected FULL JOIN actual USING(trigger_name,relation_oid)
+  INTO triggers_safe;
+  WITH expected(function_oid,definition_digest) AS (VALUES
+    ('public.enforce_capability_invocation_checkpoint_v1()'::regprocedure::oid,
+     '9740c845e3a096494adde25df5b7bf5202309eb99b43df0cb1fd5848a768bb05'),
+    ('public.enforce_capability_invocation_receipt_v1()'::regprocedure::oid,
+     'a699c82f40b22f84162cb33004f0056345d98d56851bc35a40c894306a4c3f53')
+  ), actual AS (
+    SELECT procedure.oid function_oid,
+           encode(sha256(convert_to(pg_catalog.pg_get_functiondef(procedure.oid),'UTF8')),'hex')
+             definition_digest,
+           procedure.proowner,procedure.prosecdef,procedure.proconfig,procedure.prolang,
+           procedure.prorettype,procedure.prokind,procedure.pronargs,procedure.provolatile,
+           procedure.proleakproof,procedure.proisstrict,procedure.proretset,procedure.proparallel,
+           (SELECT count(*)=1 AND bool_and(acl.grantee=procedure.proowner AND
+                    acl.grantor=procedure.proowner AND acl.privilege_type='EXECUTE' AND
+                    NOT acl.is_grantable)
+              FROM pg_catalog.aclexplode(procedure.proacl) acl) acl_safe
+      FROM pg_catalog.pg_proc procedure
+     WHERE procedure.pronamespace='public'::regnamespace AND procedure.proname IN(
+       'enforce_capability_invocation_checkpoint_v1','enforce_capability_invocation_receipt_v1')
+  )
+  SELECT count(*)=2 AND bool_and(expected.function_oid IS NOT NULL AND
+      actual.function_oid IS NOT NULL AND actual.definition_digest=expected.definition_digest AND
+      actual.proowner=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user) AND
+      NOT actual.prosecdef AND
+      actual.proconfig=ARRAY['search_path=pg_catalog, public, pg_temp']::text[] AND
+      actual.prolang=(SELECT oid FROM pg_catalog.pg_language WHERE lanname='plpgsql') AND
+      actual.prorettype='pg_catalog.trigger'::regtype AND actual.prokind='f' AND
+      actual.pronargs=0 AND actual.provolatile='v' AND NOT actual.proleakproof AND
+      NOT actual.proisstrict AND NOT actual.proretset AND actual.proparallel='u' AND actual.acl_safe)
+    FROM expected FULL JOIN actual USING(function_oid)
+  INTO trigger_functions_safe;
+  IF NOT role_safe OR NOT tables_safe OR NOT grants_safe OR NOT effective_grants_safe OR
+     NOT policies_safe OR NOT triggers_safe OR NOT trigger_functions_safe THEN
+    RAISE EXCEPTION '152: capability ledger contract unsafe role=% tables=% grants=% effective=% policies=% triggers=% functions=%',
+      role_safe,tables_safe,grants_safe,effective_grants_safe,policies_safe,triggers_safe,
+      trigger_functions_safe USING ERRCODE='42501';
   END IF;
 END $$;
 -- +goose StatementEnd

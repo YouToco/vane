@@ -27,6 +27,10 @@ func TestMigration152CapabilityInvocationLedgerContract(t *testing.T) {
 		"enforce_capability_invocation_checkpoint_v1",
 		"status='unknown_effect'",
 		"NEW.status='ambiguous'",
+		"effective_grants_safe",
+		"pg_get_triggerdef",
+		"pg_get_functiondef",
+		"trigger_functions_safe",
 		"refusing downgrade while retained capability invocation evidence exists",
 	} {
 		if !strings.Contains(source, required) {
@@ -105,10 +109,33 @@ func TestMigration152CapabilityInvocationLedgerPostgres(t *testing.T) {
 			EXECUTE 'REVOKE UPDATE(lease_until) ON public.capability_invocations FROM vane_capability_invocation_coordinator';
 			EXECUTE 'GRANT UPDATE(lease_until) ON capability_acl_decoy.capability_invocations TO vane_capability_invocation_coordinator';
 			END $mutation$`},
+		{"PUBLIC schema CREATE", `GRANT CREATE ON SCHEMA public TO PUBLIC`},
+		{"PUBLIC table DELETE", `GRANT DELETE ON public.capability_invocations TO PUBLIC`},
+		{"PUBLIC column UPDATE", `GRANT UPDATE(principal_role) ON public.capability_invocations TO PUBLIC`},
+		{"PUBLIC sequence UPDATE", `GRANT UPDATE ON SEQUENCE public.capability_invocation_receipts_id_seq TO PUBLIC`},
 		{"receipt delete authority", `GRANT DELETE ON capability_invocation_receipts
 			TO vane_capability_invocation_coordinator`},
 		{"delegable role edge", `GRANT vane_capability_invocation_coordinator TO CURRENT_USER
 			WITH ADMIN TRUE,SET TRUE,INHERIT FALSE`},
+		{"disabled checkpoint trigger", `ALTER TABLE public.capability_invocations
+			DISABLE TRIGGER capability_invocation_checkpoint_v1`},
+		{"dropped receipt trigger", `DROP TRIGGER capability_invocation_receipt_v1
+			ON public.capability_invocation_receipts`},
+		{"rebound receipt trigger", `DO $mutation$ BEGIN
+			EXECUTE 'DROP TRIGGER capability_invocation_receipt_v1 ON public.capability_invocation_receipts';
+			EXECUTE 'CREATE TRIGGER capability_invocation_receipt_v1 BEFORE INSERT ON public.capability_invocation_receipts FOR EACH ROW EXECUTE FUNCTION public.enforce_capability_invocation_checkpoint_v1()';
+			END $mutation$`},
+		{"trigger relation owner", `ALTER TABLE public.capability_invocations OWNER TO vane_app`},
+		{"replaced trigger function body", `CREATE OR REPLACE FUNCTION
+			public.enforce_capability_invocation_receipt_v1() RETURNS trigger
+			LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog,public,pg_temp
+			AS $replacement$ BEGIN RETURN NEW; END $replacement$`},
+		{"trigger function owner", `ALTER FUNCTION
+			public.enforce_capability_invocation_receipt_v1() OWNER TO vane_app`},
+		{"trigger function security", `ALTER FUNCTION
+			public.enforce_capability_invocation_receipt_v1() SECURITY DEFINER`},
+		{"trigger function search path", `ALTER FUNCTION
+			public.enforce_capability_invocation_receipt_v1() SET search_path=public`},
 	} {
 		t.Run("assert rejects "+mutation.name, func(t *testing.T) {
 			tx, err := database.BeginTx(t.Context(), nil)
