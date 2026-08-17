@@ -14,6 +14,7 @@ binds that file and every artifact byte. Acquisition never occurs on the VPS,
 and the release will fail before submission on a redirect outside HTTPS,
 partial output, unexpected member metadata, size drift, or digest drift.
 
-This directory is a release controller bridge. The product inventory activation
-must be merged and released only after the bridge controller has been finalized
-and promoted by a subsequent release; see `docs/sandbox/README.md`.
+This directory participates in a three-release controller transition. The
+compatibility bridge and then the hardened base-only controller must each be
+finalized and promoted before the product inventory activation is merged and
+released; see `docs/sandbox/README.md`.

@@ -92,7 +92,7 @@ class FirecrackerArtifactContractTest(unittest.TestCase):
             self.assertNotIn("debug", lock[name]["member"])
             self.assertRegex(lock[name]["sha256"], r"^[0-9a-f]{64}$")
 
-    def test_bridge_accepts_future_bundle_without_self_activation(self) -> None:
+    def test_hardened_bridge_accepts_future_bundle_without_self_activation(self) -> None:
         source = (OPS / "cli/controller.py").read_text(encoding="utf-8")
         self.assertNotIn("ops/sandbox/prepare_artifacts.py", source)
         artifact_source = (OPS / "release/artifact.py").read_text(encoding="utf-8")
@@ -103,6 +103,12 @@ class FirecrackerArtifactContractTest(unittest.TestCase):
         self.assertIn("bound_roots=(bin deploy)", remote)
         self.assertIn('bound_roots+=(sandbox)', remote)
         self.assertIn('find "${bound_roots[@]}"', remote)
+
+    def test_release_gate_policy_matches_the_inherited_systemd_task_limit(self) -> None:
+        gate = (REPO / "server/cmd/sandboxd/release_gate.go").read_text(encoding="utf-8")
+        handler = (OPS / "broker/production_handler.py").read_text(encoding="utf-8")
+        self.assertIn("PIDsMax: 64", gate)
+        self.assertIn('"--property=TasksMax=64"', handler)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -461,18 +462,259 @@ class ProductionHandlerTest(unittest.TestCase):
         source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
             encoding="utf-8"
         )
-        gate = source[source.index("def run_firecracker_gate") : source.index("def postgres_query")]
+        gate = source[
+            source.index("def firecracker_gate_unit_arguments") : source.index("def postgres_query")
+        ]
         self.assertIn('/opt/vane/releases/{revision}/bin/sandboxd', gate)
         self.assertIn('"--property=DevicePolicy=closed"', gate)
+        self.assertIn('"--property=DeviceAllow=char-misc m"', gate)
         self.assertIn('"--property=DeviceAllow=/dev/kvm rw"', gate)
         self.assertIn('"--property=PrivateNetwork=yes"', gate)
-        self.assertIn('"--property=Delegate=yes"', gate)
+        self.assertIn('"--property=RestrictAddressFamilies=AF_UNIX AF_NETLINK"', gate)
+        self.assertNotIn('"--property=Delegate=yes"', gate)
+        self.assertIn('"--property=RuntimeMaxSec=30s"', gate)
+        self.assertIn('"--property=TimeoutStopSec=5s"', gate)
+        self.assertIn('"--property=KillMode=control-group"', gate)
+        self.assertIn('"--property=CPUQuota=100%"', gate)
+        self.assertIn('"--property=CPUQuotaPeriodSec=100ms"', gate)
+        self.assertIn('"--property=MemoryMax=256M"', gate)
+        self.assertIn('"--property=TasksMax=64"', gate)
+        self.assertIn("release-gate-reap --sha {revision}", gate)
+        self.assertIn("timeout_seconds=45", gate)
+        self.assertNotIn("TimeoutStartSec", gate)
         self.assertNotIn("shell=True", gate)
+        preflight = gate.index('["release-gate-netns-preflight", "--sha", revision]')
+        microvm = gate.index('["release-gate", "--sha", revision, "--receipt", str(receipt)]')
+        self.assertLess(preflight, microvm)
         release = source.index("server_stage = stage_server")
         gate_call = source.index("run_firecracker_gate(revision", release)
         uat = source.index("run_uat(", gate_call)
         self.assertLess(release, gate_call)
         self.assertLess(gate_call, uat)
+
+    def test_firecracker_gate_unit_arguments_are_the_single_address_family_authority(self) -> None:
+        executable = Path("/opt/vane/releases") / REVISION / "bin/sandboxd"
+        arguments = production_handler.firecracker_gate_unit_arguments(
+            f"vane-firecracker-gate-{REVISION}",
+            f"vane-firecracker-gate-{REVISION}",
+            Path("/var/lib/vane-deploy/evidence"),
+            executable,
+            REVISION,
+        )
+        family = [value for value in arguments if value.startswith("--property=RestrictAddressFamilies=")]
+        self.assertEqual(family, ["--property=RestrictAddressFamilies=AF_UNIX AF_NETLINK"])
+        self.assertIn("--property=PrivateNetwork=yes", arguments)
+        self.assertNotIn("AF_INET", " ".join(family).split())
+        self.assertNotIn("AF_INET6", " ".join(family).split())
+
+    def test_firecracker_gate_failure_path_always_proves_runtime_collection(self) -> None:
+        original = RuntimeError("simulated systemd-run failure")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            missing_cgroup = root / "missing-cgroup"
+            missing_runtime = root / "missing-runtime"
+            with self.assertRaisesRegex(RuntimeError, "simulated systemd-run failure") as raised:
+                production_handler.ensure_firecracker_gate_collected(
+                    "vane-firecracker-gate-fixture",
+                    missing_cgroup,
+                    missing_runtime,
+                    original,
+                )
+            self.assertIs(raised.exception, original)
+
+            cgroup = root / "cgroup"
+            runtime = root / "runtime"
+            cgroup.mkdir()
+            runtime.mkdir()
+            with mock.patch.object(production_handler.time, "sleep"), mock.patch.object(
+                production_handler.subprocess, "run"
+            ) as force:
+                with self.assertRaisesRegex(RuntimeError, "recovery is incomplete") as cleanup:
+                    production_handler.ensure_firecracker_gate_collected(
+                        "vane-firecracker-gate-fixture",
+                        cgroup,
+                        runtime,
+                        original,
+                    )
+            self.assertIs(cleanup.exception.__cause__, original)
+            self.assertEqual(force.call_count, 3)
+
+    def firecracker_release_fixture(self) -> tuple[Path, Path]:
+        release_root = self.root / f"release-{len(list(self.root.glob('release-*')))}"
+        release = release_root / REVISION
+        for relative in production_handler.FIRECRACKER_RELEASE_FILES:
+            path = release / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if relative != "sandbox/manifest.json":
+                path.write_bytes((relative + "\n").encode("ascii"))
+                path.chmod(production_handler.FIRECRACKER_RELEASE_FILES[relative])
+        artifacts = {}
+        for name in production_handler.FIRECRACKER_ARTIFACT_NAMES:
+            path = release / "sandbox" / name
+            artifacts[name] = {
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "size_bytes": path.stat().st_size,
+            }
+        sandboxd = release / "bin/sandboxd"
+        sandbox_manifest = {
+            "schema": "vane.firecracker-release-artifacts/v1",
+            "source_revision": REVISION,
+            "architecture": "x86_64",
+            "firecracker_version": "v1.16.1",
+            "sandboxd_sha256": hashlib.sha256(sandboxd.read_bytes()).hexdigest(),
+            "artifacts": artifacts,
+        }
+        manifest_path = release / "sandbox/manifest.json"
+        manifest_path.write_text(json.dumps(sandbox_manifest, separators=(",", ":")) + "\n", encoding="utf-8")
+        manifest_path.chmod(0o644)
+        base_modes = {
+            "bin/vane": 0o755, "bin/vane-research-gateway": 0o755,
+            "bin/vane-migrate": 0o755, "bin/gate": 0o755,
+            "bin/agentfirstretention": 0o755,
+        }
+        entries = []
+        for relative in sorted(production_handler.FIRECRACKER_BACKEND_PATHS):
+            if relative in production_handler.FIRECRACKER_RELEASE_FILES:
+                path = release / relative
+                sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+                size = path.stat().st_size
+                mode = production_handler.FIRECRACKER_RELEASE_FILES[relative]
+            else:
+                sha256, size, mode = "e" * 64, 1, base_modes.get(relative, 0o644)
+            entries.append({"path": relative, "sha256": sha256, "size": size, "mode": mode})
+        backend_manifest = {
+            "schema": 2, "component": "backend", "source_sha": REVISION,
+            "archive": f"backend-{REVISION}.tar.gz", "archive_sha256": "f" * 64,
+            "archive_size": 1, "files": entries,
+            "server_release_contract": "fixture", "control_plane_revision": REVISION,
+            "deploy_run_id": "1", "build_run_attempt": 1,
+        }
+        backend_path = release / "backend-manifest.json"
+        backend_path.write_text(json.dumps(backend_manifest, separators=(",", ":")) + "\n", encoding="utf-8")
+        backend_path.chmod(0o644)
+        release_receipt = {
+            "schema_version": "vane.release-receipt/v1", "source_revision": REVISION,
+            "control_plane_revision": REVISION, "deploy_run_id": "1", "build_run_attempt": 1,
+            "backend_archive_sha256": "f" * 64,
+            "backend_manifest_sha256": hashlib.sha256(backend_path.read_bytes()).hexdigest(),
+            "server_release_contract_sha256": "a" * 64, "vane_sha256": "b" * 64,
+            "agentfirstretention_sha256": "c" * 64,
+        }
+        receipt_path = release / "release-receipt.json"
+        receipt_path.write_text(json.dumps(release_receipt, separators=(",", ":")) + "\n", encoding="utf-8")
+        receipt_path.chmod(0o644)
+        return release_root, release
+
+    def test_firecracker_release_binding_recomputes_every_activated_artifact_byte(self) -> None:
+        release_root, release = self.firecracker_release_fixture()
+        binding = production_handler.firecracker_release_binding(
+            REVISION, release_root, os.geteuid()
+        )
+        self.assertEqual(
+            binding["sandboxd_sha256"], hashlib.sha256((release / "bin/sandboxd").read_bytes()).hexdigest()
+        )
+        self.assertEqual(set(binding["artifacts"]), production_handler.FIRECRACKER_ARTIFACT_NAMES)
+
+        for relative in ("sandbox/jailer", "bin/sandboxd", "sandbox/manifest.json", "backend-manifest.json", "release-receipt.json"):
+            mutated_root, mutated = self.firecracker_release_fixture()
+            path = mutated / relative
+            path.write_bytes(path.read_bytes() + b"mutation")
+            path.chmod(production_handler.FIRECRACKER_RELEASE_FILES.get(relative, 0o644))
+            with self.assertRaises((RuntimeError, ValueError, json.JSONDecodeError)):
+                production_handler.firecracker_release_binding(REVISION, mutated_root, os.geteuid())
+
+        mutated_root, mutated = self.firecracker_release_fixture()
+        receipt_path = mutated / "release-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["control_plane_revision"] = "0" * 40
+        receipt_path.write_text(json.dumps(receipt, separators=(",", ":")) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "identities differ"):
+            production_handler.firecracker_release_binding(REVISION, mutated_root, os.geteuid())
+
+    def test_firecracker_gate_receipt_requires_the_exact_closed_evidence_shape(self) -> None:
+        digest = "a" * 64
+        guest = {
+            "schema": "vane.firecracker-guest-receipt/v1",
+            "invocation_id": "gate-" + "b" * 16,
+            "request_sha256": "b" * 64,
+            "input_sha256": "c" * 64,
+            "response_sha256": "d" * 64,
+            "guest_uid": 10001,
+            "guest_gid": 10001,
+            "only_loopback": True,
+            "no_default_route": True,
+            "mmds_unavailable": True,
+        }
+        guest_payload = json.dumps(guest, separators=(",", ":")).encode("utf-8")
+        value = {
+            "schema": "vane.firecracker-production-gate/v1",
+            "revision": REVISION,
+            "release_receipt_sha256": digest,
+            "backend_manifest_sha256": digest,
+            "sandboxd_sha256": digest,
+            "artifacts": {name: digest for name in (
+                "code.raw", "firecracker", "jailer", "rootfs.cpio", "vmlinux"
+            )},
+            "guest_receipt_sha256": hashlib.sha256(guest_payload).hexdigest(),
+            "guest_receipt_base64": base64.b64encode(guest_payload).decode("ascii"),
+            "invocation_id": "gate-" + "b" * 16,
+            "duration_ms": 100,
+            "network_interfaces": 0,
+            "mmds": False,
+            "jailer_uid": 62000,
+            "jailer_gid": 62000,
+            "cgroup_v2": True,
+            "cgroup_parent": f"system.slice/vane-firecracker-gate-{REVISION}.service",
+            "cpu_max": "100000 100000",
+            "memory_max_bytes": 256 << 20,
+            "pids_max": 64,
+            "scrubbed": True,
+            "ok": True,
+        }
+        expected = {
+            key: value[key]
+            for key in ("release_receipt_sha256", "backend_manifest_sha256", "sandboxd_sha256", "artifacts")
+        }
+        unit = f"vane-firecracker-gate-{REVISION}"
+        self.assertIs(
+            production_handler.validate_firecracker_gate_receipt(value, REVISION, unit, expected),
+            value,
+        )
+        mutations = []
+        for key, replacement in (
+            ("cgroup_v2", False),
+            ("jailer_uid", 62001),
+            ("guest_receipt_sha256", "A" * 64),
+            ("release_receipt_sha256", "0" * 64),
+            ("backend_manifest_sha256", "e" * 64),
+            ("sandboxd_sha256", "f" * 64),
+            ("pids_max", 32),
+        ):
+            candidate = dict(value)
+            candidate[key] = replacement
+            mutations.append(candidate)
+        missing = dict(value)
+        missing.pop("backend_manifest_sha256")
+        mutations.append(missing)
+        unknown = dict(value)
+        unknown["unexpected"] = True
+        mutations.append(unknown)
+        artifacts = dict(value)
+        artifacts["artifacts"] = {"firecracker": digest}
+        mutations.append(artifacts)
+        arbitrary_artifact = dict(value)
+        arbitrary_artifact["artifacts"] = dict(value["artifacts"])
+        arbitrary_artifact["artifacts"]["jailer"] = "e" * 64
+        mutations.append(arbitrary_artifact)
+        arbitrary_guest = dict(value)
+        changed_guest = dict(guest)
+        changed_guest["input_sha256"] = "e" * 64
+        changed_payload = json.dumps(changed_guest, separators=(",", ":")).encode("utf-8")
+        arbitrary_guest["guest_receipt_base64"] = base64.b64encode(changed_payload).decode("ascii")
+        mutations.append(arbitrary_guest)
+        for candidate in mutations:
+            with self.assertRaisesRegex(RuntimeError, "receipt is invalid"):
+                production_handler.validate_firecracker_gate_receipt(candidate, REVISION, unit, expected)
 
     def test_uat_uses_a_temporary_session_and_always_revokes_it(self) -> None:
         executable = self.root / "uat.py"

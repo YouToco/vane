@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from typing import Any, Optional
 
 
@@ -57,17 +58,28 @@ def strict_json(path: Path) -> dict:
     return value
 
 
-def run(command: list[str], *, env: Optional[dict[str, str]] = None) -> None:
+def run(
+    command: list[str],
+    *,
+    env: Optional[dict[str, str]] = None,
+    timeout_seconds: Optional[int] = None,
+) -> None:
     # The forced-command broker stdout is a machine-only JSON protocol.  Child
     # commands must never inherit it, even when a successful deploy script is
     # verbose, or the broker response becomes unparsable after mutation.
-    result = subprocess.run(
-        command,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"production command exceeded its host deadline: {command[0]}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"production command could not execute: {command[0]}") from exc
     if result.returncode != 0:
         raise RuntimeError(
             f"production command failed with exit {result.returncode}: "
@@ -202,6 +214,195 @@ def stage_server(validated: Path, revision: str) -> Path:
     return stage
 
 
+def firecracker_gate_unit_arguments(
+    unit: str,
+    runtime_directory: str,
+    receipt_parent: Path,
+    executable: Path,
+    revision: str,
+) -> list[str]:
+    """Return the single production authority for the transient Gate unit.
+
+    Tests that exercise the namespace preflight use this exact property list,
+    so the address-family contract cannot drift away from the release path.
+    """
+    return [
+            "/usr/bin/systemd-run", "--quiet", "--wait", "--pipe", "--collect",
+            "--service-type=exec", f"--unit={unit}", "--property=Type=exec",
+            "--property=User=root", "--property=Group=root", "--property=UMask=0077",
+            "--property=NoNewPrivileges=yes", "--property=ProtectSystem=strict",
+            "--property=ProtectHome=yes", "--property=PrivateTmp=yes",
+            "--property=PrivateNetwork=yes", "--property=PrivateMounts=yes",
+            "--property=ProtectProc=invisible", "--property=ProtectControlGroups=no",
+            "--property=DevicePolicy=closed", "--property=DeviceAllow=char-misc m",
+            "--property=DeviceAllow=/dev/kvm rw",
+            # The host preflight creates and inspects an empty network
+            # namespace through rtnetlink. Internet socket families remain
+            # unavailable, and PrivateNetwork gives the unit its own outer
+            # namespace before the per-invocation namespace is created.
+            "--property=RestrictAddressFamilies=AF_UNIX AF_NETLINK",
+            "--property=RuntimeMaxSec=30s", "--property=TimeoutStopSec=5s",
+            "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
+            "--property=CPUQuota=100%", "--property=CPUQuotaPeriodSec=100ms",
+            "--property=MemoryMax=256M", "--property=TasksMax=64",
+            f"--property=RuntimeDirectory={runtime_directory}", "--property=RuntimeDirectoryMode=0700",
+            f"--property=ExecStopPost={executable} release-gate-reap --sha {revision}",
+            f"--property=ReadWritePaths={receipt_parent}",
+            "--property=CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_MKNOD CAP_KILL CAP_SYS_RESOURCE",
+    ]
+
+
+def run_firecracker_transient_unit(
+    revision: str,
+    receipt_parent: Path,
+    executable: Path,
+    command: list[str],
+) -> None:
+    unit = f"vane-firecracker-gate-{revision}"
+    runtime_directory = unit
+    cgroup = Path(f"/sys/fs/cgroup/system.slice/{unit}.service")
+    runtime_root = Path("/run") / runtime_directory
+    if any(path.exists() or path.is_symlink() for path in (cgroup, runtime_root)):
+        raise RuntimeError("stale Firecracker Gate runtime authority exists")
+    gate_error: Optional[RuntimeError] = None
+    try:
+        run([
+            *firecracker_gate_unit_arguments(unit, runtime_directory, receipt_parent, executable, revision),
+            str(executable), *command,
+        ], timeout_seconds=45)
+    except RuntimeError as exc:
+        gate_error = exc
+    ensure_firecracker_gate_collected(unit, cgroup, runtime_root, gate_error)
+
+
+FIRECRACKER_RELEASE_FILES = {
+    "bin/sandboxd": 0o755,
+    "sandbox/code.raw": 0o644,
+    "sandbox/firecracker": 0o755,
+    "sandbox/jailer": 0o755,
+    "sandbox/rootfs.cpio": 0o644,
+    "sandbox/vmlinux": 0o644,
+    "sandbox/manifest.json": 0o644,
+}
+FIRECRACKER_BACKEND_PATHS = {
+    "bin/vane", "bin/vane-research-gateway", "bin/vane-migrate", "bin/gate",
+    "bin/agentfirstretention", "deploy/Caddyfile", "deploy/docker-compose.yml",
+    "deploy/vane.service", "deploy/vane-research-gateway.service",
+    "deploy/vane-research-gateway.socket",
+    "deploy/dynamicconfig/development-sql.yaml", *FIRECRACKER_RELEASE_FILES,
+}
+FIRECRACKER_ARTIFACT_NAMES = {
+    "code.raw", "firecracker", "jailer", "rootfs.cpio", "vmlinux",
+}
+
+
+def firecracker_release_binding(
+    revision: str,
+    release_root: Path = Path("/opt/vane/releases"),
+    expected_uid: int = 0,
+) -> dict:
+    """Independently bind the activated release bytes to Gate evidence."""
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError("Firecracker release binding revision is invalid")
+    release = release_root / revision
+
+    def trusted_file(relative: str) -> Path:
+        path = release / relative
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or metadata.st_uid != expected_uid
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022 != 0
+            or metadata.st_size > 500_000_000
+        ):
+            raise RuntimeError(f"Firecracker release binding file is unsafe: {relative}")
+        return path
+
+    release_receipt_path = trusted_file("release-receipt.json")
+    backend_manifest_path = trusted_file("backend-manifest.json")
+    sandbox_manifest_path = trusted_file("sandbox/manifest.json")
+    release_receipt = strict_json(release_receipt_path)
+    backend_manifest = strict_json(backend_manifest_path)
+    sandbox_manifest = strict_json(sandbox_manifest_path)
+
+    if set(release_receipt) != {
+        "schema_version", "source_revision", "control_plane_revision",
+        "deploy_run_id", "build_run_attempt", "backend_archive_sha256",
+        "backend_manifest_sha256", "server_release_contract_sha256",
+        "vane_sha256", "agentfirstretention_sha256",
+    } or release_receipt.get("schema_version") != "vane.release-receipt/v1" or release_receipt.get("source_revision") != revision:
+        raise RuntimeError("Firecracker release receipt binding is invalid")
+    if set(backend_manifest) != {
+        "schema", "component", "source_sha", "archive", "archive_sha256",
+        "archive_size", "files", "server_release_contract",
+        "control_plane_revision", "deploy_run_id", "build_run_attempt",
+    } or backend_manifest.get("schema") != 2 or backend_manifest.get("component") != "backend" or backend_manifest.get("source_sha") != revision:
+        raise RuntimeError("Firecracker backend manifest binding is invalid")
+    if (
+        release_receipt.get("control_plane_revision") != backend_manifest.get("control_plane_revision")
+        or release_receipt.get("deploy_run_id") != backend_manifest.get("deploy_run_id")
+        or release_receipt.get("build_run_attempt") != backend_manifest.get("build_run_attempt")
+        or release_receipt.get("backend_archive_sha256") != backend_manifest.get("archive_sha256")
+        or not re.fullmatch(r"[0-9a-f]{64}", str(backend_manifest.get("archive_sha256", "")))
+        or backend_manifest.get("archive_sha256") == "0" * 64
+    ):
+        raise RuntimeError("Firecracker release and backend identities differ")
+    if set(sandbox_manifest) != {
+        "schema", "source_revision", "architecture", "firecracker_version",
+        "sandboxd_sha256", "artifacts",
+    } or sandbox_manifest.get("schema") != "vane.firecracker-release-artifacts/v1" or sandbox_manifest.get("source_revision") != revision or sandbox_manifest.get("architecture") != "x86_64" or sandbox_manifest.get("firecracker_version") != "v1.16.1":
+        raise RuntimeError("Firecracker sandbox manifest binding is invalid")
+
+    raw_entries = backend_manifest.get("files")
+    if not isinstance(raw_entries, list):
+        raise RuntimeError("Firecracker backend file binding is invalid")
+    entries: dict[str, dict] = {}
+    for entry in raw_entries:
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "size", "mode"}:
+            raise RuntimeError("Firecracker backend file binding is invalid")
+        name = entry.get("path")
+        if not isinstance(name, str) or name in entries:
+            raise RuntimeError("Firecracker backend file binding is duplicated")
+        entries[name] = entry
+    if set(entries) != FIRECRACKER_BACKEND_PATHS:
+        raise RuntimeError("Firecracker backend manifest lacks the exact artifact set")
+
+    sandbox_artifacts = sandbox_manifest.get("artifacts")
+    if not isinstance(sandbox_artifacts, dict) or set(sandbox_artifacts) != FIRECRACKER_ARTIFACT_NAMES:
+        raise RuntimeError("Firecracker sandbox artifact binding is invalid")
+    actual: dict[str, str] = {}
+    for relative, mode in FIRECRACKER_RELEASE_FILES.items():
+        path = trusted_file(relative)
+        entry = entries[relative]
+        file_digest = digest(path)
+        if (
+            entry.get("sha256") != file_digest
+            or entry.get("size") != path.stat().st_size
+            or entry.get("mode") != mode
+            or path.stat().st_mode & 0o777 != mode
+        ):
+            raise RuntimeError(f"Firecracker backend file bytes differ: {relative}")
+        if relative.startswith("sandbox/") and relative != "sandbox/manifest.json":
+            name = Path(relative).name
+            item = sandbox_artifacts.get(name)
+            if not isinstance(item, dict) or set(item) != {"sha256", "size_bytes"} or item.get("sha256") != file_digest or item.get("size_bytes") != path.stat().st_size:
+                raise RuntimeError(f"Firecracker sandbox artifact bytes differ: {name}")
+            actual[name] = file_digest
+
+    sandboxd_digest = digest(trusted_file("bin/sandboxd"))
+    backend_manifest_digest = digest(backend_manifest_path)
+    if sandbox_manifest.get("sandboxd_sha256") != sandboxd_digest or release_receipt.get("backend_manifest_sha256") != backend_manifest_digest:
+        raise RuntimeError("Firecracker manifest digest chain is invalid")
+    return {
+        "release_receipt_sha256": digest(release_receipt_path),
+        "backend_manifest_sha256": backend_manifest_digest,
+        "sandboxd_sha256": sandboxd_digest,
+        "artifacts": actual,
+    }
+
+
 def run_firecracker_gate(revision: str, receipt: Path) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise RuntimeError("Firecracker Gate revision is invalid")
@@ -210,34 +411,148 @@ def run_firecracker_gate(revision: str, receipt: Path) -> dict:
     executable = Path(f"/opt/vane/releases/{revision}/bin/sandboxd")
     if executable.is_symlink() or not executable.is_file():
         raise RuntimeError("release-bound sandboxd is unavailable")
+    before = firecracker_release_binding(revision)
+    # This is an unavoidable trusted Gate, not a skippable test. The exact
+    # production unit first proves that AF_NETLINK permits the real namespace
+    # create/inspect/restore path while AF_INET/AF_INET6 remain filtered. Only
+    # after systemd collects that unit do we start the KVM self-test.
+    run_firecracker_transient_unit(
+        revision, receipt.parent, executable,
+        ["release-gate-netns-preflight", "--sha", revision],
+    )
+    run_firecracker_transient_unit(
+        revision, receipt.parent, executable,
+        ["release-gate", "--sha", revision, "--receipt", str(receipt)],
+    )
     unit = f"vane-firecracker-gate-{revision}"
-    run([
-        "/usr/bin/systemd-run", "--quiet", "--wait", "--pipe", "--collect",
-        "--service-type=exec", f"--unit={unit}", "--property=Type=exec",
-        "--property=User=root", "--property=Group=root", "--property=UMask=0077",
-        "--property=NoNewPrivileges=yes", "--property=ProtectSystem=strict",
-        "--property=ProtectHome=yes", "--property=PrivateTmp=yes",
-        "--property=PrivateNetwork=yes", "--property=PrivateMounts=yes",
-        "--property=ProtectProc=invisible", "--property=ProtectControlGroups=no",
-        "--property=DevicePolicy=closed", "--property=DeviceAllow=/dev/kvm rw",
-        "--property=Delegate=yes", "--property=RestrictAddressFamilies=AF_UNIX",
-        "--property=TimeoutStartSec=30s", "--property=KillMode=mixed",
-        f"--property=ReadWritePaths={receipt.parent}",
-        "--property=CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_MKNOD CAP_KILL CAP_SYS_RESOURCE",
-        str(executable), "release-gate", "--sha", revision,
-        "--receipt", str(receipt),
-    ])
-    value = strict_json(receipt)
+    after = firecracker_release_binding(revision)
+    if after != before:
+        raise RuntimeError("Firecracker release bytes changed while the Gate ran")
+    return validate_firecracker_gate_receipt(strict_json(receipt), revision, unit, after)
+
+
+def validate_firecracker_gate_receipt(value: dict, revision: str, unit: str, expected: dict) -> dict:
+    exact_keys = {
+        "schema", "revision", "release_receipt_sha256", "backend_manifest_sha256",
+        "sandboxd_sha256", "artifacts", "guest_receipt_sha256", "guest_receipt_base64", "invocation_id",
+        "duration_ms", "network_interfaces", "mmds", "jailer_uid", "jailer_gid",
+        "cgroup_v2", "cgroup_parent", "cpu_max", "memory_max_bytes", "pids_max",
+        "scrubbed", "ok",
+    }
+    digest_keys = {
+        "release_receipt_sha256", "backend_manifest_sha256", "sandboxd_sha256",
+        "guest_receipt_sha256",
+    }
+    artifact_names = {"code.raw", "firecracker", "jailer", "rootfs.cpio", "vmlinux"}
+    artifacts = value.get("artifacts")
+    guest_payload = b""
+    guest = None
+    try:
+        encoded_guest = value.get("guest_receipt_base64")
+        if not isinstance(encoded_guest, str) or len(encoded_guest) > 8192:
+            raise ValueError("guest receipt encoding")
+        guest_payload = base64.b64decode(encoded_guest, validate=True)
+        if base64.b64encode(guest_payload).decode("ascii") != encoded_guest:
+            raise ValueError("guest receipt encoding")
+
+        def guest_pairs(items: list[tuple[str, object]]) -> dict:
+            decoded: dict[str, object] = {}
+            for key, item in items:
+                if key in decoded:
+                    raise ValueError("duplicate guest receipt key")
+                decoded[key] = item
+            return decoded
+
+        guest = json.loads(guest_payload, object_pairs_hook=guest_pairs)
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        guest = None
+    guest_digest = hashlib.sha256(guest_payload).hexdigest()
+    guest_digest_keys = {"request_sha256", "input_sha256", "response_sha256"}
+    guest_valid = (
+        isinstance(guest, dict)
+        and set(guest) == {"schema", "invocation_id", *guest_digest_keys, "guest_uid", "guest_gid", "only_loopback", "no_default_route", "mmds_unavailable"}
+        and guest.get("schema") == "vane.firecracker-guest-receipt/v1"
+        and guest.get("invocation_id") == value.get("invocation_id")
+        and guest.get("guest_uid") == 10001
+        and guest.get("guest_gid") == 10001
+        and guest.get("only_loopback") is True
+        and guest.get("no_default_route") is True
+        and guest.get("mmds_unavailable") is True
+        and all(re.fullmatch(r"[0-9a-f]{64}", str(guest.get(key, ""))) and guest.get(key) != "0" * 64 for key in guest_digest_keys)
+        and json.dumps(guest, separators=(",", ":")).encode("utf-8") == guest_payload
+    )
+    duration = value.get("duration_ms")
+    integer_contract = (
+        type(duration) is int and 0 <= duration <= 16000
+        and type(value.get("network_interfaces")) is int and value["network_interfaces"] == 0
+        and type(value.get("jailer_uid")) is int and value["jailer_uid"] == 62000
+        and type(value.get("jailer_gid")) is int and value["jailer_gid"] == 62000
+        and type(value.get("memory_max_bytes")) is int and value["memory_max_bytes"] == (256 << 20)
+        and type(value.get("pids_max")) is int and value["pids_max"] == 64
+    )
     if (
-        value.get("schema") != "vane.firecracker-production-gate/v1"
+        set(value) != exact_keys
+        or value.get("schema") != "vane.firecracker-production-gate/v1"
         or value.get("revision") != revision
         or value.get("ok") is not True
         or value.get("scrubbed") is not True
         or value.get("mmds") is not False
-        or value.get("network_interfaces") != 0
+        or value.get("cgroup_v2") is not True
+        or value.get("cgroup_parent") != f"system.slice/{unit}.service"
+        or value.get("cpu_max") != "100000 100000"
+        or set(expected) != {"release_receipt_sha256", "backend_manifest_sha256", "sandboxd_sha256", "artifacts"}
+        or any(value.get(key) != expected.get(key) for key in ("release_receipt_sha256", "backend_manifest_sha256", "sandboxd_sha256"))
+        or not integer_contract
+        or not re.fullmatch(r"gate-[0-9a-f]{16}", str(value.get("invocation_id", "")))
+        or any(not re.fullmatch(r"[0-9a-f]{64}", str(value.get(key, ""))) for key in digest_keys)
+        or value.get("guest_receipt_sha256") != guest_digest
+        or value.get("guest_receipt_sha256") == "0" * 64
+        or not guest_valid
+        or not isinstance(artifacts, dict)
+        or set(artifacts) != artifact_names
+        or any(not re.fullmatch(r"[0-9a-f]{64}", str(item)) for item in artifacts.values())
+        or artifacts != expected.get("artifacts")
     ):
         raise RuntimeError("Firecracker production Gate receipt is invalid")
     return value
+
+
+def ensure_firecracker_gate_collected(
+    unit: str,
+    cgroup: Path,
+    runtime_root: Path,
+    gate_error: Optional[RuntimeError] = None,
+) -> None:
+    def surviving() -> list[Path]:
+        return [
+            path for path in (cgroup, runtime_root)
+            if path.exists() or path.is_symlink()
+        ]
+
+    for _ in range(50):
+        if not surviving():
+            if gate_error is not None:
+                raise gate_error
+            return
+        time.sleep(0.1)
+    for command in (
+        ["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit],
+        ["/usr/bin/systemctl", "stop", unit],
+        ["/usr/bin/systemctl", "reset-failed", unit],
+    ):
+        try:
+            subprocess.run(command, text=True, capture_output=True, check=False, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    for _ in range(50):
+        if not surviving():
+            if gate_error is not None:
+                raise gate_error
+            return
+        time.sleep(0.1)
+    names = ",".join(str(path) for path in surviving())
+    cleanup_error = RuntimeError(f"Firecracker Gate recovery is incomplete; runtime survived: {names}")
+    raise cleanup_error from gate_error
 
 
 def postgres_query(sql: str) -> str:
