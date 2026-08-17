@@ -26,6 +26,7 @@ MIGRATION_ACCOUNT = "vane-migrate"
 SCHEMA = "vane.workspace-memory-runtime-uat/v1"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
+CAPTURE_BYTES_MAX = 64 * 1024
 
 
 def strict_json(payload: str) -> object:
@@ -122,6 +123,40 @@ def write_runtime_credential(directory: Path, value: str, uid: int, gid: int) ->
     return path
 
 
+def create_capture_file(directory: Path, name: str) -> Path:
+    path = directory / name
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    os.close(descriptor)
+    return path
+
+
+def read_capture_file(path: Path) -> str:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != TRUSTED_UID
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+            or info.st_size > CAPTURE_BYTES_MAX
+        ):
+            raise RuntimeError("unsafe workspace memory UAT capture")
+        payload = os.read(descriptor, info.st_size + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) != info.st_size:
+        raise RuntimeError("workspace memory UAT capture changed while reading")
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError as error:
+        raise RuntimeError("workspace memory UAT capture is not UTF-8") from error
+
+
 def validate_report(value: object, revision: str, operation_id: str) -> dict[str, object]:
     expected = {
         "schema",
@@ -199,12 +234,13 @@ def main() -> int:
         runtime_credential = write_runtime_credential(
             directory, runtime_url, migrate_uid, migrate_gid
         )
+        stdout_path = create_capture_file(directory, "stdout")
+        stderr_path = create_capture_file(directory, "stderr")
         command = [
             "systemd-run",
             "--quiet",
             "--wait",
             "--collect",
-            "--pipe",
             f"--unit={unit}",
             "--property=Type=oneshot",
             "--property=User=vane-migrate",
@@ -212,6 +248,8 @@ def main() -> int:
             "--property=WorkingDirectory=/opt/vane",
             f"--property=LoadCredential=migration_db_url:{MIGRATION_CREDENTIAL}",
             f"--property=LoadCredential=runtime_db_url:{runtime_credential}",
+            f"--property=StandardOutput=file:{stdout_path}",
+            f"--property=StandardError=file:{stderr_path}",
             "--property=NoNewPrivileges=yes",
             "--property=ProtectSystem=strict",
             "--property=ProtectHome=yes",
@@ -240,13 +278,17 @@ def main() -> int:
             timeout=390,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
         )
+        stdout = read_capture_file(stdout_path)
+        stderr = read_capture_file(stderr_path)
     if completed.returncode != 0:
         raise RuntimeError(
             f"workspace memory UAT transient unit failed with exit {completed.returncode}"
         )
-    if completed.stderr.strip():
+    if completed.stdout.strip() or completed.stderr.strip():
+        raise RuntimeError("workspace memory UAT systemd runner wrote unexpected output")
+    if stderr.strip():
         raise RuntimeError("workspace memory UAT transient unit wrote stderr")
-    report = validate_report(strict_json(completed.stdout), args.sha, args.operation_id)
+    report = validate_report(strict_json(stdout), args.sha, args.operation_id)
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return 0
 
