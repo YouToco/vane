@@ -47,6 +47,8 @@ type fakeWorkspaceMemoryRuntime struct {
 	inconsistent bool
 }
 
+func (f *fakeWorkspaceMemoryRuntime) Close() {}
+
 func (f *fakeWorkspaceMemoryRuntime) step() error {
 	f.calls++
 	if f.calls == f.failAt {
@@ -224,6 +226,28 @@ func TestWorkspaceMemoryUATCommandRequiresExactReleaseAuthority(t *testing.T) {
 	}
 }
 
+func TestWorkspaceMemoryRuntimeDatabaseURLUsesDedicatedCredential(t *testing.T) {
+	t.Setenv("VANE_DB_URL", "")
+	directory := t.TempDir()
+	t.Setenv(migrationDatabaseCredentialEnv, directory)
+	if _, err := workspaceMemoryRuntimeDatabaseURL(); err == nil {
+		t.Fatal("missing runtime credential passed")
+	}
+	if err := os.WriteFile(directory+string(os.PathSeparator)+
+		workspaceMemoryRuntimeCredential, []byte("postgres://runtime/db\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	value, err := workspaceMemoryRuntimeDatabaseURL()
+	if err != nil || value != "postgres://runtime/db" {
+		t.Fatalf("value=%q err=%v", value, err)
+	}
+	t.Setenv("VANE_DB_URL", "postgres://explicit/runtime")
+	value, err = workspaceMemoryRuntimeDatabaseURL()
+	if err != nil || value != "postgres://explicit/runtime" {
+		t.Fatalf("env value=%q err=%v", value, err)
+	}
+}
+
 func TestWorkspaceMemoryRuntimeUATPostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
@@ -319,6 +343,17 @@ func TestWorkspaceMemoryRuntimeUATPostgres(t *testing.T) {
 	if _, err := runWorkspaceMemoryRuntimeUAT(failedCtx, scratchURL,
 		invalidRuntime.String(), uuid.NewString(), strings.Repeat("c", 40)); err == nil {
 		t.Fatal("unreachable runtime authority passed UAT")
+	}
+	assertNoWorkspaceMemoryUATResidue(t, pool)
+	exhaustedCtx, exhaustedCancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer exhaustedCancel()
+	if _, err := runWorkspaceMemoryRuntimeUATWithFactory(exhaustedCtx, scratchURL,
+		runtimeURL.String(), uuid.NewString(), strings.Repeat("e", 40),
+		func(ctx context.Context, _ string) (workspaceMemoryRuntimeStore, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}); err == nil {
+		t.Fatal("exhausted main UAT window passed")
 	}
 	assertNoWorkspaceMemoryUATResidue(t, pool)
 	if err := verifyWorkspaceMemoryUATOwner(t.Context(), pool); err != nil {

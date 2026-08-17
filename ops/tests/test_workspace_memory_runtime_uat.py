@@ -42,7 +42,7 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
         server_env.chmod(0o640)
         credential = root / "migration_db_url"
         credential.write_text("postgres://owner\n", encoding="utf-8")
-        credential.chmod(0o600)
+        credential.chmod(0o400)
         self.paths = mock.patch.multiple(
             uat,
             CURRENT_RELEASE=current,
@@ -53,6 +53,11 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
         )
         self.paths.start()
         self.addCleanup(self.paths.stop)
+        self.identity = mock.patch.object(
+            uat, "migration_identity", return_value=(os.getuid(), os.getgid())
+        )
+        self.identity.start()
+        self.addCleanup(self.identity.stop)
 
     def report(self) -> dict[str, object]:
         return {
@@ -71,7 +76,9 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
             "team_evidence_digest": "2" * 64,
         }
 
-    def invoke(self, completed: subprocess.CompletedProcess[str]) -> tuple[int, list[str]]:
+    def invoke(
+        self, completed: subprocess.CompletedProcess[str]
+    ) -> tuple[int, list[str], int]:
         argv = [
             "workspace-memory-runtime-uat.py",
             "--sha",
@@ -85,18 +92,24 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
         ) as run, mock.patch("builtins.print", side_effect=lambda value: captured.append(value)):
             code = uat.main()
         command = run.call_args.args[0]
-        return code, command
+        return code, command, run.call_args.kwargs["timeout"]
 
     def test_exact_release_runs_hardened_transient_unit(self) -> None:
         completed = subprocess.CompletedProcess(
             [], 0, stdout=json.dumps(self.report()), stderr=""
         )
-        code, command = self.invoke(completed)
+        code, command, timeout = self.invoke(completed)
         self.assertEqual(code, 0)
+        self.assertEqual(timeout, 390)
         self.assertIn("--property=User=vane-migrate", command)
         self.assertIn("--property=NoNewPrivileges=yes", command)
         self.assertIn("--property=ProtectSystem=strict", command)
-        self.assertIn("--property=TimeoutStartSec=4min", command)
+        self.assertIn("--property=TimeoutStartSec=6min", command)
+        self.assertFalse(any("EnvironmentFile=" in item for item in command))
+        self.assertEqual(
+            len([item for item in command if "LoadCredential=runtime_db_url:" in item]),
+            1,
+        )
         self.assertEqual(command[-7:], [
             "workspace-memory-uat", "--operation-id", self.operation,
             "--expected-revision", self.revision, "--confirm", uat.SCHEMA,
@@ -125,6 +138,25 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
             self.invoke(subprocess.CompletedProcess([], 1, stdout="", stderr="failed"))
         with self.assertRaises(RuntimeError):
             self.invoke(subprocess.CompletedProcess([], 0, stdout=json.dumps(self.report()), stderr="warning"))
+
+    def test_runtime_database_url_is_derived_without_injecting_server_env(self) -> None:
+        self.assertEqual(uat.runtime_database_url(uat.SERVER_ENV), "postgres://runtime")
+        uat.SERVER_ENV.write_text(
+            "VANE_DB_URL=postgres://one\nVANE_DB_URL=postgres://two\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(RuntimeError, "not unique"):
+            uat.runtime_database_url(uat.SERVER_ENV)
+        uat.SERVER_ENV.write_text("VANE_DB_URL='quoted'\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "invalid"):
+            uat.runtime_database_url(uat.SERVER_ENV)
+
+    def test_migration_credential_matches_existing_production_contract(self) -> None:
+        uid, gid = uat.migration_identity()
+        uat.require_migration_credential(uat.MIGRATION_CREDENTIAL, uid, gid)
+        uat.MIGRATION_CREDENTIAL.chmod(0o600)
+        with self.assertRaisesRegex(RuntimeError, "unsafe"):
+            uat.require_migration_credential(uat.MIGRATION_CREDENTIAL, uid, gid)
 
 
 if __name__ == "__main__":

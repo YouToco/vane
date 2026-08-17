@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 
 
@@ -19,6 +22,7 @@ RELEASE_ROOT = Path("/opt/vane/releases")
 SERVER_ENV = Path("/opt/vane/env/server.env")
 MIGRATION_CREDENTIAL = Path("/etc/vane/credentials/migration_db_url")
 TRUSTED_UID = 0
+MIGRATION_ACCOUNT = "vane-migrate"
 SCHEMA = "vane.workspace-memory-runtime-uat/v1"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -46,6 +50,76 @@ def require_file(path: Path, *, uid: int, forbidden_mode: int) -> None:
         or info.st_size <= 0
     ):
         raise RuntimeError(f"unsafe workspace memory UAT authority: {path}")
+
+
+def migration_identity() -> tuple[int, int]:
+    account = pwd.getpwnam(MIGRATION_ACCOUNT)
+    group = grp.getgrnam(MIGRATION_ACCOUNT)
+    if account.pw_gid != group.gr_gid:
+        raise RuntimeError("vane-migrate account and group differ")
+    return account.pw_uid, group.gr_gid
+
+
+def require_migration_credential(path: Path, uid: int, gid: int) -> None:
+    info = path.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != uid
+        or info.st_gid != gid
+        or stat.S_IMODE(info.st_mode) != 0o400
+        or info.st_nlink != 1
+        or info.st_size <= 0
+    ):
+        raise RuntimeError(f"unsafe workspace memory UAT credential: {path}")
+
+
+def runtime_database_url(path: Path) -> str:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != TRUSTED_UID
+            or stat.S_IMODE(info.st_mode) & 0o027
+            or info.st_nlink != 1
+            or not 0 < info.st_size <= 64 * 1024
+        ):
+            raise RuntimeError("workspace memory UAT server env is unsafe")
+        payload = os.read(descriptor, info.st_size + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) != info.st_size:
+        raise RuntimeError("workspace memory UAT server env changed while reading")
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise RuntimeError("workspace memory UAT server env is not UTF-8") from error
+    matches = [line.removeprefix("VANE_DB_URL=") for line in lines
+               if line.startswith("VANE_DB_URL=")]
+    if len(matches) != 1:
+        raise RuntimeError("workspace memory UAT runtime database URL is not unique")
+    value = matches[0]
+    if (
+        not value.startswith(("postgres://", "postgresql://"))
+        or any(character.isspace() or ord(character) < 0x20 for character in value)
+    ):
+        raise RuntimeError("workspace memory UAT runtime database URL is invalid")
+    return value
+
+
+def write_runtime_credential(directory: Path, value: str, uid: int, gid: int) -> Path:
+    path = directory / "runtime_db_url"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, (value + "\n").encode("utf-8"))
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, 0o400)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    require_migration_credential(path, uid, gid)
+    return path
 
 
 def validate_report(value: object, revision: str, operation_id: str) -> dict[str, object]:
@@ -113,49 +187,59 @@ def main() -> int:
     executable = release / "bin" / "vane-migrate"
     require_file(executable, uid=TRUSTED_UID, forbidden_mode=0o022)
     require_file(SERVER_ENV, uid=TRUSTED_UID, forbidden_mode=0o027)
-    require_file(MIGRATION_CREDENTIAL, uid=TRUSTED_UID, forbidden_mode=0o077)
-    unit = "vane-workspace-memory-uat-" + operation.hex
-    command = [
-        "systemd-run",
-        "--quiet",
-        "--wait",
-        "--collect",
-        "--pipe",
-        f"--unit={unit}",
-        "--property=Type=oneshot",
-        "--property=User=vane-migrate",
-        "--property=Group=vane-migrate",
-        "--property=WorkingDirectory=/opt/vane",
-        f"--property=EnvironmentFile={SERVER_ENV}",
-        f"--property=LoadCredential=migration_db_url:{MIGRATION_CREDENTIAL}",
-        "--property=NoNewPrivileges=yes",
-        "--property=ProtectSystem=strict",
-        "--property=ProtectHome=yes",
-        "--property=PrivateTmp=yes",
-        "--property=PrivateDevices=yes",
-        "--property=ProtectProc=invisible",
-        "--property=RestrictSUIDSGID=yes",
-        "--property=LockPersonality=yes",
-        "--property=MemoryDenyWriteExecute=yes",
-        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-        "--property=TimeoutStartSec=4min",
-        str(executable),
-        "workspace-memory-uat",
-        "--operation-id",
-        args.operation_id,
-        "--expected-revision",
-        args.sha,
-        "--confirm",
-        SCHEMA,
-    ]
-    completed = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        capture_output=True,
-        timeout=270,
-        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+    migrate_uid, migrate_gid = migration_identity()
+    require_migration_credential(
+        MIGRATION_CREDENTIAL, migrate_uid, migrate_gid
     )
+    runtime_url = runtime_database_url(SERVER_ENV)
+    unit = "vane-workspace-memory-uat-" + operation.hex
+    with tempfile.TemporaryDirectory(prefix="vane-memory-uat-runtime-") as raw:
+        directory = Path(raw)
+        directory.chmod(0o700)
+        runtime_credential = write_runtime_credential(
+            directory, runtime_url, migrate_uid, migrate_gid
+        )
+        command = [
+            "systemd-run",
+            "--quiet",
+            "--wait",
+            "--collect",
+            "--pipe",
+            f"--unit={unit}",
+            "--property=Type=oneshot",
+            "--property=User=vane-migrate",
+            "--property=Group=vane-migrate",
+            "--property=WorkingDirectory=/opt/vane",
+            f"--property=LoadCredential=migration_db_url:{MIGRATION_CREDENTIAL}",
+            f"--property=LoadCredential=runtime_db_url:{runtime_credential}",
+            "--property=NoNewPrivileges=yes",
+            "--property=ProtectSystem=strict",
+            "--property=ProtectHome=yes",
+            "--property=PrivateTmp=yes",
+            "--property=PrivateDevices=yes",
+            "--property=ProtectProc=invisible",
+            "--property=RestrictSUIDSGID=yes",
+            "--property=LockPersonality=yes",
+            "--property=MemoryDenyWriteExecute=yes",
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "--property=TimeoutStartSec=6min",
+            str(executable),
+            "workspace-memory-uat",
+            "--operation-id",
+            args.operation_id,
+            "--expected-revision",
+            args.sha,
+            "--confirm",
+            SCHEMA,
+        ]
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=390,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+        )
     if completed.returncode != 0:
         raise RuntimeError(
             f"workspace memory UAT transient unit failed with exit {completed.returncode}"

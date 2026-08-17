@@ -23,11 +23,12 @@ import (
 )
 
 const (
-	workspaceMemoryUATCommand      = "workspace-memory-uat"
-	workspaceMemoryUATConfirmation = "vane.workspace-memory-runtime-uat/v1"
-	workspaceMemoryUATPrefix       = "vane-runtime-uat:"
-	workspaceMemoryUATTimeout      = 3 * time.Minute
-	workspaceMemoryUATCleanupTime  = 2 * time.Minute
+	workspaceMemoryUATCommand        = "workspace-memory-uat"
+	workspaceMemoryUATConfirmation   = "vane.workspace-memory-runtime-uat/v1"
+	workspaceMemoryUATPrefix         = "vane-runtime-uat:"
+	workspaceMemoryUATTimeout        = 3 * time.Minute
+	workspaceMemoryUATCleanupTime    = 2 * time.Minute
+	workspaceMemoryRuntimeCredential = "runtime_db_url"
 )
 
 var lowerRevision = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -72,6 +73,15 @@ type workspaceMemoryRuntime interface {
 	RecallWorkspaceMemories(context.Context, int64, int64, types.MemoryRecallQuery) (*types.MemoryRecallResult, error)
 }
 
+type workspaceMemoryRuntimeStore interface {
+	workspaceMemoryRuntime
+	Close()
+}
+
+type workspaceMemoryRuntimeFactory func(
+	context.Context, string,
+) (workspaceMemoryRuntimeStore, error)
+
 func runWorkspaceMemoryUATCommand(arguments []string) error {
 	return executeWorkspaceMemoryUATCommand(arguments, os.Stdout,
 		releaseinfo.Revision, runWorkspaceMemoryRuntimeUAT)
@@ -108,7 +118,10 @@ func executeWorkspaceMemoryUATCommand(
 	if err != nil {
 		return err
 	}
-	runtimeURL := strings.TrimSpace(os.Getenv("VANE_DB_URL"))
+	runtimeURL, err := workspaceMemoryRuntimeDatabaseURL()
+	if err != nil {
+		return err
+	}
 	if runtimeURL == "" || runtimeURL == ownerURL {
 		return errors.New("workspace memory UAT requires distinct owner and runtime database authorities")
 	}
@@ -124,8 +137,40 @@ func executeWorkspaceMemoryUATCommand(
 	return encoder.Encode(report)
 }
 
+func workspaceMemoryRuntimeDatabaseURL() (string, error) {
+	if value := strings.TrimSpace(os.Getenv("VANE_DB_URL")); value != "" {
+		return value, nil
+	}
+	directory := strings.TrimSpace(os.Getenv(migrationDatabaseCredentialEnv))
+	if directory == "" {
+		return "", errors.New("workspace memory runtime database credential is unavailable")
+	}
+	payload, err := os.ReadFile(directory + string(os.PathSeparator) +
+		workspaceMemoryRuntimeCredential)
+	if err != nil {
+		return "", errors.New("read workspace memory runtime database credential")
+	}
+	value := strings.TrimSpace(string(payload))
+	if value == "" {
+		return "", errors.New("workspace memory runtime database credential is empty")
+	}
+	return value, nil
+}
+
 func runWorkspaceMemoryRuntimeUAT(
 	ctx context.Context, ownerURL, runtimeURL, operationID, revision string,
+) (_ *workspaceMemoryUATReport, returnErr error) {
+	return runWorkspaceMemoryRuntimeUATWithFactory(ctx, ownerURL, runtimeURL,
+		operationID, revision, func(ctx context.Context, databaseURL string) (
+			workspaceMemoryRuntimeStore, error,
+		) {
+			return store.NewServerRuntime(ctx, databaseURL)
+		})
+}
+
+func runWorkspaceMemoryRuntimeUATWithFactory(
+	ctx context.Context, ownerURL, runtimeURL, operationID, revision string,
+	openRuntime workspaceMemoryRuntimeFactory,
 ) (_ *workspaceMemoryUATReport, returnErr error) {
 	ownerPool, err := pgxpool.New(ctx, ownerURL)
 	if err != nil {
@@ -173,7 +218,7 @@ func runWorkspaceMemoryRuntimeUAT(
 		}
 	}()
 
-	runtimeStore, err := store.NewServerRuntime(ctx, runtimeURL)
+	runtimeStore, err := openRuntime(ctx, runtimeURL)
 	if err != nil {
 		return nil, fmt.Errorf("open exact workspace memory runtime: %w", err)
 	}
