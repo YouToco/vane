@@ -73,6 +73,27 @@ func TestCredentialRequestValidationRejectsUnsafeInput(t *testing.T) {
 	}
 }
 
+func TestFetchCredentialRequestValidation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing exa", body: `{"tikhub_api_key":"key"}`},
+		{name: "missing tikhub", body: `{"exa_api_key":"key"}`},
+		{name: "unknown field", body: `{"exa_api_key":"a","tikhub_api_key":"b","other":"c"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req, fake := platformCredentialRequest(
+				http.MethodPut, "/api/admin/fetch/credentials", test.body)
+			recorder := httptest.NewRecorder()
+			(&server{deps: Deps{Auth: fake}}).handleFetchCredentialPut(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestCredentialHandlersRejectMissingAuthorityAndInvalidTelegram(t *testing.T) {
 	t.Run("status needs principal", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
@@ -260,6 +281,9 @@ func TestCredentialHandlersSurfaceClosedDatabaseFailuresPostgres(t *testing.T) {
 	platformRequest := func(method, body string) *http.Request {
 		return userRequest(method, "/api/admin/llm/credentials", body)
 	}
+	fetchPlatformRequest := func(method, body string) *http.Request {
+		return userRequest(method, "/api/admin/fetch/credentials", body)
+	}
 	tests := []struct {
 		name string
 		call func(http.ResponseWriter, *http.Request)
@@ -273,12 +297,16 @@ func TestCredentialHandlersSurfaceClosedDatabaseFailuresPostgres(t *testing.T) {
 			req: userRequest(http.MethodPut, "/api/channels/feishu/credentials", `{"app_id":"cli_test","app_secret":"synthetic"}`)},
 		{name: "llm put", call: s.handleLLMCredentialPut,
 			req: platformRequest(http.MethodPut, `{"provider":"deepseek","base_url":"https://api.deepseek.com","api_key":"synthetic","model":"pipeline","agent_model":"agent","research_model":"research","max_concurrent":4}`)},
+		{name: "fetch put", call: s.handleFetchCredentialPut,
+			req: fetchPlatformRequest(http.MethodPut, `{"exa_api_key":"synthetic-exa","tikhub_api_key":"synthetic-tikhub"}`)},
 		{name: "telegram delete", call: s.handleTelegramCredentialDelete,
 			req: userRequest(http.MethodDelete, "/api/channels/telegram/credentials", "")},
 		{name: "feishu delete", call: s.handleFeishuCredentialDelete,
 			req: userRequest(http.MethodDelete, "/api/channels/feishu/credentials", "")},
 		{name: "llm delete", call: s.handleLLMCredentialDelete,
 			req: platformRequest(http.MethodDelete, "")},
+		{name: "fetch delete", call: s.handleFetchCredentialDelete,
+			req: fetchPlatformRequest(http.MethodDelete, "")},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

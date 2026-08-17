@@ -154,6 +154,10 @@ func run() error {
 		closeServerStores(st, nil)
 		return fmt.Errorf("加载数据库 LLM 凭证: %w", err)
 	}
+	if err := applyStoredFetchCredential(ctx, st, &cfg.Fetch); err != nil {
+		closeServerStores(st, nil)
+		return fmt.Errorf("加载数据库信息服务凭证: %w", err)
+	}
 	var researchControlStore *store.Store
 	closeStores := func() { closeServerStores(st, researchControlStore) }
 	if _, err := st.AssertAgentFirstLegacyWriteFence(ctx); err != nil {

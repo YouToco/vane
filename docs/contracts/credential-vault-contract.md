@@ -1,9 +1,10 @@
 # Provider credential vault contract
 
 Status: encrypted storage and administration are implemented in migrations
-145-146. Telegram has a per-user runtime manager fleet. Shared LLM credentials
-are selected from the database at safe process start; LLM hot reload and the
-per-user Feishu runtime fleet remain separate fail-closed rollouts.
+145-146. Telegram has a per-user runtime manager fleet. Shared LLM and
+information-provider credentials are selected from the database at safe process
+start; hot reload and the per-user Feishu runtime fleet remain separate
+fail-closed rollouts.
 
 ## Authority model
 
@@ -13,6 +14,10 @@ per-user Feishu runtime fleet remain separate fail-closed rollouts.
   cannot read or replace another user's Bot credential.
 - LLM routing is shared platform infrastructure. Only an exact active `owner`
   membership in the platform administration tenant may change it.
+- Exa and TikHub acquisition keys are shared platform infrastructure and rotate
+  atomically as one `fetch/shared_runtime` generation. This prevents a process
+  restart from combining half of a new provider configuration with half of an
+  old one.
 - External provider actor, chat, bot, app, or webhook identifiers are never
   Vane principals. Existing channel bindings continue to resolve an exact
   tenant and user before any Agent, Tool, Temporal, or business write.
@@ -94,6 +99,14 @@ provider name, base URL and model are non-secret metadata; both primary and
 dedicated Agent API keys remain encrypted secret material. Selecting Kimi for
 Agent does not imply that compiled research or scheduled report generation has
 switched to Kimi.
+
+The shared information-provider cutover follows the same safe-start boundary.
+Only the platform super-administrator can create, rotate, inspect redacted
+status, or revoke the encrypted Exa/TikHub bundle. A process with no database
+history may use its deployment compatibility keys. Once history exists, the
+active database generation supplies both keys and both compiled credential
+generation numbers; an explicit revoke, incomplete envelope, or decryption
+failure blocks startup instead of falling back to VPS environment values.
 
 Media capability is also fail-closed. No provider/model is treated as image,
 audio or video capable from its name alone. Until a versioned native-modality

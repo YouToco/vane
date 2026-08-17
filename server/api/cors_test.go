@@ -118,7 +118,7 @@ func TestCORS_预检广告画像PATCH(t *testing.T) {
 		t.Fatalf("预检状态码 = %d, 期望 204", rec.Code)
 	}
 	allow := rec.Header().Get("Access-Control-Allow-Methods")
-	for _, m := range []string{"GET", "POST", "PATCH", "DELETE"} {
+	for _, m := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
 		if !strings.Contains(allow, m) {
 			t.Errorf("Allow-Methods 缺 %s（实得 %q）——跨源该方法的端点会被浏览器挡死", m, allow)
 		}

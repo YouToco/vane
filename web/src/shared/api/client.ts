@@ -227,6 +227,11 @@ export interface TelegramCredentialInput {
   bot_token: string;
 }
 
+export interface FetchCredentialInput {
+  exa_api_key: string;
+  tikhub_api_key: string;
+}
+
 export interface LLMCredentialInput {
   provider: "deepseek";
   base_url: string;
@@ -1784,6 +1789,15 @@ export const api = {
     ),
   adminRevokeLLMCredential: () =>
     request<{ ok: boolean }>("/api/admin/llm/credentials", { method: "DELETE" }),
+  adminFetchCredentialStatus: () =>
+    request<CredentialStatus>("/api/admin/fetch/credentials"),
+  adminRotateFetchCredential: (input: FetchCredentialInput) =>
+    request<CredentialStatus & { activation: "restart_required" }>(
+      "/api/admin/fetch/credentials",
+      { method: "PUT", body: JSON.stringify(input) },
+    ),
+  adminRevokeFetchCredential: () =>
+    request<{ ok: boolean }>("/api/admin/fetch/credentials", { method: "DELETE" }),
 
   // ---- M3 定时任务（B8）----
   listSchedules: () =>
