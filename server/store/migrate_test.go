@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 152
+const latestMigrationVersion int64 = 153
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -219,6 +219,9 @@ var wantTables = []string{
 	// append-only durable result receipts.
 	"capability_invocations",
 	"capability_invocation_receipts",
+	// 153 immutable manually approved MCP schema and exact credential-vault
+	// generation binding. Runtime execution remains dark.
+	"mcp_runtime_bindings",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

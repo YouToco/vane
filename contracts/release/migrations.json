@@ -603,6 +603,10 @@
     {
       "path": "152_capability_invocation_ledger.sql",
       "sha256": "e2efbe1b4c713784f0a93513878fdd79f61210c0649c974c47010692a5fa7721"
+    },
+    {
+      "path": "153_mcp_runtime_binding.sql",
+      "sha256": "d7553cdf62eac43f44473a406be3266178048a062173742bb1cc3226df4b02da"
     }
   ],
   "schema": "vane.migrations/v1"

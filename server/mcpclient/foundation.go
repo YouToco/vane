@@ -191,10 +191,11 @@ func mustPrefixes(values ...string) []netip.Prefix {
 }
 
 type RemoteTool struct {
-	Name        string
-	Description string
-	InputSchema json.RawMessage
-	Annotations json.RawMessage // retained only as untrusted input; never policy authority
+	Name         string
+	Description  string
+	InputSchema  json.RawMessage
+	OutputSchema json.RawMessage
+	Annotations  json.RawMessage // retained only as untrusted input; never policy authority
 }
 
 type LocalToolPolicy struct {
@@ -203,10 +204,11 @@ type LocalToolPolicy struct {
 }
 
 type FrozenTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	InputSchema json.RawMessage `json:"input_schema"`
-	Policy      LocalToolPolicy `json:"policy"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description"`
+	InputSchema  json.RawMessage `json:"input_schema"`
+	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
+	Policy       LocalToolPolicy `json:"policy"`
 }
 
 type FrozenToolCatalog struct {
@@ -241,9 +243,16 @@ func FreezeReadOnlyTools(remote []RemoteTool, localPolicy map[string]LocalToolPo
 		if err != nil {
 			return FrozenToolCatalog{}, err
 		}
+		var canonicalOutput json.RawMessage
+		if len(candidate.OutputSchema) != 0 {
+			canonicalOutput, err = canonicalJSONObject(candidate.OutputSchema)
+			if err != nil {
+				return FrozenToolCatalog{}, err
+			}
+		}
 		tools = append(tools, FrozenTool{
 			Name: candidate.Name, Description: candidate.Description,
-			InputSchema: canonical, Policy: policy,
+			InputSchema: canonical, OutputSchema: canonicalOutput, Policy: policy,
 		})
 	}
 	slices.SortFunc(tools, func(a, b FrozenTool) int { return strings.Compare(a.Name, b.Name) })

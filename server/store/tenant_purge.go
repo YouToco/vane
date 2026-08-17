@@ -130,6 +130,9 @@ var purgeOrder = []purgeStep{
 	{"channel_routes", "tenant_id = $1"},
 	{"channel_link_requests", "tenant_id = $1"},
 	{"channel_identities", "tenant_id = $1"},
+	// Immutable MCP approval/credential bindings must be removed before both
+	// their vault entry and immutable capability version parents.
+	{"mcp_runtime_bindings", "tenant_id = $1"},
 	{"credential_vault_entries", "tenant_id = $1"},
 	// Team-task authorization decisions are retained independently from the
 	// mutable schedule row and must be included in exact erasure reporting.
@@ -425,6 +428,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		aggregateChannelEffectsAvailable       bool
 		capabilityInvocationsAvailable         bool
 		capabilityInvocationReceiptsAvailable  bool
+		mcpRuntimeBindingsAvailable            bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -492,7 +496,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.artifact_delivery_plans') IS NOT NULL,
 		        to_regclass('public.aggregate_channel_delivery_effects') IS NOT NULL,
 		        to_regclass('public.capability_invocations') IS NOT NULL,
-		        to_regclass('public.capability_invocation_receipts') IS NOT NULL`,
+		        to_regclass('public.capability_invocation_receipts') IS NOT NULL,
+		        to_regclass('public.mcp_runtime_bindings') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -560,6 +565,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&aggregateChannelEffectsAvailable,
 		&capabilityInvocationsAvailable,
 		&capabilityInvocationReceiptsAvailable,
+		&mcpRuntimeBindingsAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -631,9 +637,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"aggregate_channel_delivery_effects":        aggregateChannelEffectsAvailable,
 		"capability_invocations":                    capabilityInvocationsAvailable,
 		"capability_invocation_receipts":            capabilityInvocationReceiptsAvailable,
+		"mcp_runtime_bindings":                      mcpRuntimeBindingsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
-		`SELECT set_config('app.tenant_id', $1, true)`,
+		`SELECT set_config('app.tenant_id', $1, true),
+		        set_config('app.tenant_purge', 'on', true)`,
 		fmt.Sprintf("%d", tenantID)); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "设置租户清理上下文", err)
