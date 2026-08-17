@@ -132,6 +132,17 @@ type AuthStore interface {
 	DeleteSession(ctx context.Context, tokenHash []byte) error
 }
 
+// InstallationSetupStore is the only database capability exposed to the
+// unauthenticated appliance bootstrap surface. The raw one-time token never
+// crosses this interface; callers pass SHA-256(token).
+type InstallationSetupStore interface {
+	InstallationSetupRequired(context.Context) (bool, error)
+	InstallationBootstrapTokenUsable(context.Context, []byte) (bool, error)
+	ClaimInstallationBootstrap(
+		context.Context, []byte, string, string, []byte, time.Time,
+	) (*types.User, error)
+}
+
 // WorkspaceStore is the multi-workspace control plane. It is intentionally
 // separate from AuthStore so legacy authentication fakes and old login flows
 // remain source-compatible while the capability is rolled out dark.
@@ -169,6 +180,11 @@ type Deps struct {
 	TeamTasks teamTaskAccessStore
 	// Auth 是认证路径的窄接口；生产与 Store 同为 *store.Store。
 	Auth AuthStore
+	// InstallationSetup defaults to Store in production. SetupClaimed is an
+	// optional one-shot notification used by minimal setup mode to restart into
+	// the full runtime only after the claim response has been written.
+	InstallationSetup InstallationSetupStore
+	SetupClaimed      func()
 	// Workspaces can be injected independently in tests. Production falls back
 	// to Store, which implements this interface.
 	Workspaces WorkspaceStore
@@ -231,6 +247,16 @@ func (s *server) a2aAccessStore() A2AAccessStore {
 	return s.deps.Store
 }
 
+func (s *server) installationSetupStore() InstallationSetupStore {
+	if s.deps.InstallationSetup != nil {
+		return s.deps.InstallationSetup
+	}
+	if s.deps.Store == nil {
+		return nil
+	}
+	return s.deps.Store
+}
+
 type server struct {
 	deps              Deps
 	limiter           *authLimiter
@@ -250,8 +276,8 @@ func (s *server) executiveBriefProjectionEnabled(taskID string) bool {
 			s.executiveBriefTaskEnabled(taskID))
 }
 
-// Mount 把 /api/* 路由挂到 mux。除 /api/auth/login 外全部要求会话 cookie；
-// /healthz /readyz 不在 /api 前缀下，不受本中间件影响。
+// Mount 把 /api/* 路由挂到 mux。只有 isPublicAuthPath 的精确白名单不要求
+// 会话 cookie；/healthz /readyz 不在 /api 前缀下，不受本中间件影响。
 func Mount(mux *http.ServeMux, deps Deps) {
 	taskActionLimiter := newAuthLimiter()
 	taskActionLimiter.max = 6
@@ -262,6 +288,8 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	}
 
 	inner := http.NewServeMux()
+	inner.HandleFunc("GET /api/setup/status", s.handleInstallationSetupStatus)
+	inner.HandleFunc("POST /api/setup/claim", s.handleInstallationSetupClaim)
 	inner.HandleFunc("POST /api/auth/register", s.handleRegister)
 	inner.HandleFunc("POST /api/auth/login", s.handleLogin)
 	inner.HandleFunc("POST /api/auth/workspace-invites/register", s.handleWorkspaceInviteRegister)
@@ -314,6 +342,9 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/admin/llm/credentials", s.handleLLMCredentialStatus)
 	inner.HandleFunc("PUT /api/admin/llm/credentials", s.handleLLMCredentialPut)
 	inner.HandleFunc("DELETE /api/admin/llm/credentials", s.handleLLMCredentialDelete)
+	inner.HandleFunc("GET /api/admin/fetch/credentials", s.handleFetchCredentialStatus)
+	inner.HandleFunc("PUT /api/admin/fetch/credentials", s.handleFetchCredentialPut)
+	inner.HandleFunc("DELETE /api/admin/fetch/credentials", s.handleFetchCredentialDelete)
 
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)
@@ -375,6 +406,17 @@ func Mount(mux *http.ServeMux, deps Deps) {
 		groundedBriefFollowupDeadlineV1(s.requireSession(inner)),
 	)
 	mux.Handle("/api/", apiHandler)
+}
+
+// MountInstallationSetup exposes only the two bootstrap endpoints. It is used
+// when no platform owner exists, so Agent/workers/provider ingress remain dark
+// until a local-token holder completes the claim and the process restarts.
+func MountInstallationSetup(mux *http.ServeMux, deps Deps) {
+	s := &server{deps: deps, limiter: newAuthLimiter()}
+	inner := http.NewServeMux()
+	inner.HandleFunc("GET /api/setup/status", s.handleInstallationSetupStatus)
+	inner.HandleFunc("POST /api/setup/claim", s.handleInstallationSetupClaim)
+	mux.Handle("/api/", s.cors(inner))
 }
 
 // groundedBriefFollowupDeadlineV1 is deliberately outside session auth (and
@@ -561,7 +603,7 @@ func (s *server) cors(next http.Handler) http.Handler {
 				// 这里漏一个方法，跨源前端就调不通对应端点——预检不放行，浏览器
 				// 连请求都不发（fetch 拿到的是网络错误，不是状态码）。新增写端点时
 				// 必须同步这一行；已退役的方法不得继续被浏览器预检广告。
-				h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE")
+				h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE")
 				h.Set(
 					"Access-Control-Allow-Headers",
 					"Content-Type, Idempotency-Key, X-Vane-Reauth-Token",

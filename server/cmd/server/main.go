@@ -71,6 +71,13 @@ func main() {
 		fmt.Println(serverReleaseContractV2)
 		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == "setup-token" {
+		if err := printInstallationToken(installationTokenPath()); err != nil {
+			fmt.Fprintf(os.Stderr, "vane: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "vane: %v\n", err)
 		os.Exit(1)
@@ -105,25 +112,6 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("加载配置: %w", err)
 	}
-	var securityMailer api.SecurityMailer
-	if cfg.SMTP.Enabled {
-		securityMailer, err = mailer.NewSMTP(mailer.Config{
-			Host: cfg.SMTP.Host, Port: cfg.SMTP.Port,
-			Username: cfg.SMTP.Username, Password: cfg.SMTP.Password,
-			From: cfg.SMTP.From, TLSMode: mailer.TLSMode(cfg.SMTP.TLSMode),
-			ServerName: cfg.SMTP.ServerName,
-		})
-		if err != nil {
-			return fmt.Errorf("初始化账号安全邮件服务: %w", err)
-		}
-	}
-	// The owner surface always contains manage_tasks create. Fail before the
-	// first Store connection (and therefore before workers or ingress) instead
-	// of advertising a durable action whose V3 runtime is dark.
-	if err := requireOwnerAgentResearchV3Runtime(cfg); err != nil {
-		return fmt.Errorf("Owner Agent 启动 Gate: %w", err)
-	}
-
 	initLogger(cfg.Log.Level)
 
 	// The primary Store still contains retained recovery and reconciliation
@@ -137,6 +125,39 @@ func run() error {
 	st, err := store.New(ctx, cfg.DB.URL)
 	if err != nil {
 		return fmt.Errorf("初始化数据库连接池: %w", err)
+	}
+	setupPreparation, err := ensureInstallationBootstrap(
+		ctx, st, installationTokenPath())
+	if err != nil {
+		closeServerStores(st, nil)
+		return fmt.Errorf("初始化首次安装 authority: %w", err)
+	}
+	if setupPreparation.SetupRequired {
+		slog.Warn("Vane 正在等待首次初始化；完整运行时保持关闭",
+			"token_path", installationTokenPath(),
+			"expires_at", setupPreparation.ExpiresAt)
+		defer closeServerStores(st, nil)
+		return runInstallationSetupMode(ctx, cfg, st)
+	}
+	// From this point onward the exact platform owner already exists. Runtime
+	// gates and external adapters may now initialize; none of them are reachable
+	// from the unauthenticated first-run process above.
+	if err := requireOwnerAgentResearchV3Runtime(cfg); err != nil {
+		closeServerStores(st, nil)
+		return fmt.Errorf("Owner Agent 启动 Gate: %w", err)
+	}
+	var securityMailer api.SecurityMailer
+	if cfg.SMTP.Enabled {
+		securityMailer, err = mailer.NewSMTP(mailer.Config{
+			Host: cfg.SMTP.Host, Port: cfg.SMTP.Port,
+			Username: cfg.SMTP.Username, Password: cfg.SMTP.Password,
+			From: cfg.SMTP.From, TLSMode: mailer.TLSMode(cfg.SMTP.TLSMode),
+			ServerName: cfg.SMTP.ServerName,
+		})
+		if err != nil {
+			closeServerStores(st, nil)
+			return fmt.Errorf("初始化账号安全邮件服务: %w", err)
+		}
 	}
 	if cfg.CredentialVault.ActiveKeyID != "" {
 		if err := st.ConfigureCredentialVault(
@@ -153,6 +174,10 @@ func run() error {
 	if err := applyStoredLLMCredential(ctx, st, &cfg.LLM); err != nil {
 		closeServerStores(st, nil)
 		return fmt.Errorf("加载数据库 LLM 凭证: %w", err)
+	}
+	if err := applyStoredFetchCredential(ctx, st, &cfg.Fetch); err != nil {
+		closeServerStores(st, nil)
+		return fmt.Errorf("加载数据库信息服务凭证: %w", err)
 	}
 	var researchControlStore *store.Store
 	closeStores := func() { closeServerStores(st, researchControlStore) }
@@ -1222,6 +1247,7 @@ func run() error {
 	api.Mount(mux, api.Deps{
 		Store:              st,
 		Auth:               st,
+		InstallationSetup:  st,
 		AccountSecurity:    st,
 		SecurityMailer:     securityMailer,
 		Manager:            manager,

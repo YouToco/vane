@@ -5,6 +5,7 @@ import type { MeResponse } from "@/shared/api/client";
 
 const Landing = lazy(() => import("@/pages/Landing"));
 const Login = lazy(() => import("@/pages/Login"));
+const Setup = lazy(() => import("@/pages/Setup"));
 const AccountSecurity = lazy(() => import("@/pages/AccountSecurity"));
 const AuthenticatedApp = lazy(() => import("./AuthenticatedApp"));
 
@@ -38,21 +39,46 @@ export default function App() {
     hash.startsWith("#/reset-password?");
   // me 三态：undefined=探测中，null=未登录，对象=已登录（含用户块所需 email）。
   const [me, setMe] = useState<MeResponse | null | undefined>(undefined);
+  const [setupState, setSetupState] = useState<
+    "active" | "setup_required" | "unavailable" | undefined
+  >(undefined);
 
   useEffect(() => {
     api
-      .me()
-      .then(setMe)
-      .catch(() => setMe(null));
+      .setupStatus()
+      .then((status) => {
+        if (status.setup_required) {
+          setSetupState("setup_required");
+          setMe(null);
+          return;
+        }
+        setSetupState("active");
+        api
+          .me()
+          .then(setMe)
+          .catch(() => setMe(null));
+      })
+      .catch(() => {
+        setSetupState("unavailable");
+        setMe(null);
+      });
   }, []);
 
-  if (me === undefined && hash !== "#/login" && !isAccountSecurityRoute) {
+  if (
+    setupState === undefined ||
+    (setupState === "active" &&
+      me === undefined &&
+      hash !== "#/login" &&
+      !isAccountSecurityRoute)
+  ) {
     return <AppFallback />;
   }
 
   return (
     <Suspense fallback={<AppFallback />}>
-      {isAccountSecurityRoute ? (
+      {setupState === "setup_required" || setupState === "unavailable" ? (
+        <Setup unavailable={setupState === "unavailable"} />
+      ) : isAccountSecurityRoute ? (
         <AccountSecurity hash={hash} />
       ) : hash === "#/login" ? (
         <Login />

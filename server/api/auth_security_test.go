@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -408,6 +409,12 @@ func TestSec_ProtectedEndpointsRequireSession(t *testing.T) {
 		{http.MethodDelete, "/api/admin/invites/SOMECODE"},
 		{http.MethodGet, "/api/admin/provider-prices"},
 		{http.MethodPost, "/api/admin/provider-prices"},
+		{http.MethodGet, "/api/admin/fetch/credentials"},
+		{http.MethodPut, "/api/admin/fetch/credentials"},
+		{http.MethodDelete, "/api/admin/fetch/credentials"},
+		{http.MethodGet, "/api/admin/llm/credentials"},
+		{http.MethodPut, "/api/admin/llm/credentials"},
+		{http.MethodDelete, "/api/admin/llm/credentials"},
 		{http.MethodGet, "/api/admin/execution-traces/users"},
 		{http.MethodGet, "/api/admin/execution-traces/tenants/1/users/1/tasks"},
 		{http.MethodGet, "/api/admin/execution-traces/tenants/1/users/1/tasks/task/runs"},
@@ -833,5 +840,29 @@ func TestSec_MultiTenantLoginFailsLoudly(t *testing.T) {
 	}
 	if !strings.Contains(errMsgOf(t, rec), "多个租户") {
 		t.Errorf("错误文案应点明多租户，实得 %q", errMsgOf(t, rec))
+	}
+}
+
+func TestSessionPersistenceFailureDoesNotWriteSuccess(t *testing.T) {
+	mux, fake := newAuthTestServer(t)
+	fake.createErr = errors.New("session store unavailable")
+	register := postJSON(t, mux, "/api/auth/register", map[string]string{
+		"email":       "register-session-fail@example.com",
+		"password":    "valid-password-123",
+		"invite_code": "valid-invite",
+	}, nil)
+	if register.Code != http.StatusInternalServerError ||
+		strings.Contains(register.Body.String(), `"ok":true`) {
+		t.Fatalf("register status=%d body=%s", register.Code, register.Body.String())
+	}
+
+	fake.addUser(t, "login-session-fail@example.com", "valid-password-123", 1)
+	login := postJSON(t, mux, "/api/auth/login", map[string]string{
+		"email":    "login-session-fail@example.com",
+		"password": "valid-password-123",
+	}, nil)
+	if login.Code != http.StatusInternalServerError ||
+		strings.Contains(login.Body.String(), `"ok":true`) {
+		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
 	}
 }

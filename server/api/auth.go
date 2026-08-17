@@ -97,7 +97,9 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.issueSession(w, r, u.ID, tenant.ID)
+	if !s.issueSession(w, r, u.ID, tenant.ID) {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant_id": tenant.ID})
 }
 
@@ -172,7 +174,9 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.issueSession(w, r, u.ID, tenantID)
+	if !s.issueSession(w, r, u.ID, tenantID) {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant_id": tenantID})
 }
 
@@ -248,18 +252,18 @@ func (s *server) resolveTenant(r *http.Request, userID int64) (int64, error) {
 // **每次登录都签发全新 token**（而非复用），这是防会话固定攻击的关键：
 // 攻击者若能预先把一个已知 token 塞进受害者浏览器，登录后该 token 依然有效
 // 的话，攻击者就直接持有了已认证会话。新签发让预置的 token 永远停留在未认证态。
-func (s *server) issueSession(w http.ResponseWriter, r *http.Request, userID, tenantID int64) {
+func (s *server) issueSession(w http.ResponseWriter, r *http.Request, userID, tenantID int64) bool {
 	token, hash, err := auth.NewSessionToken()
 	if err != nil {
 		slog.Error("api: 生成会话 token 失败", "err", err)
 		writeError(w, http.StatusInternalServerError, "服务器内部错误，请稍后重试")
-		return
+		return false
 	}
 	exp := time.Now().Add(sessionTTL)
 	if err := s.deps.Auth.CreateSession(r.Context(), hash, userID, tenantID, exp); err != nil {
 		slog.Error("api: 会话落库失败", "user_id", userID, "err", err)
 		writeError(w, http.StatusInternalServerError, "服务器内部错误，请稍后重试")
-		return
+		return false
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
@@ -270,6 +274,7 @@ func (s *server) issueSession(w http.ResponseWriter, r *http.Request, userID, te
 		Secure:   true, // 只走 HTTPS
 		SameSite: http.SameSiteLaxMode,
 	})
+	return true
 }
 
 // handleLogout 登出：**删库里的会话**（而非仅清 cookie）。
@@ -355,11 +360,12 @@ func (s *server) requireSession(next http.Handler) http.Handler {
 	})
 }
 
-// isPublicAuthPath 列出**唯二**无需会话即可访问的路径。
+// isPublicAuthPath 列出无需会话即可访问的精确路径。
 // 写成显式白名单而非前缀匹配：`/api/auth/` 前缀会连 logout/me 一起放行，
 // 而那两个需要会话。
 func isPublicAuthPath(p string) bool {
-	return p == "/api/auth/login" || p == "/api/auth/register" ||
+	return p == "/api/setup/status" || p == "/api/setup/claim" ||
+		p == "/api/auth/login" || p == "/api/auth/register" ||
 		p == "/api/auth/workspace-invites/register" ||
 		p == "/api/auth/email-verification/verify" ||
 		p == "/api/auth/password-reset/request" ||
