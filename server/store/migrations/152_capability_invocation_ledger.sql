@@ -323,9 +323,9 @@ CREATE FUNCTION assert_vane_capability_invocation_coordinator_v152()
 RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE role_safe boolean; tables_safe boolean; grants_safe boolean; effective_grants_safe boolean;
+DECLARE role_safe boolean; tables_safe boolean; grants_safe boolean; catalog_grants_safe boolean;
+        schema_grants_safe boolean; effective_grants_safe boolean;
         policies_safe boolean; triggers_safe boolean; trigger_functions_safe boolean;
-        expected_acl_count integer; unexpected_acl_count integer;
 BEGIN
   IF session_user<>current_user THEN
     RAISE EXCEPTION '152: only direct migration owner may assert capability ledger authority'
@@ -370,60 +370,74 @@ BEGIN
          has_sequence_privilege('vane_capability_invocation_coordinator',
            'public.capability_invocation_receipts_id_seq','USAGE,SELECT')
   INTO grants_safe;
-  WITH role_oid AS (SELECT oid FROM pg_catalog.pg_roles
-    WHERE rolname='vane_capability_invocation_coordinator'),
-  expected(object_kind,object_oid,attnum,privilege_type) AS (VALUES
-    ('relation','public.capability_invocations'::regclass::oid,0::smallint,'SELECT'),
-    ('relation','public.capability_invocations'::regclass::oid,0::smallint,'INSERT'),
-    ('relation','public.capability_invocation_receipts'::regclass::oid,0::smallint,'SELECT'),
-    ('relation','public.capability_invocation_receipts'::regclass::oid,0::smallint,'INSERT'),
-    ('sequence','public.capability_invocation_receipts_id_seq'::regclass::oid,0::smallint,'SELECT'),
-    ('sequence','public.capability_invocation_receipts_id_seq'::regclass::oid,0::smallint,'USAGE'),
-    ('column','public.capability_invocations'::regclass::oid,
-      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='status' AND NOT attisdropped),'UPDATE'),
-    ('column','public.capability_invocations'::regclass::oid,
-      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='lease_owner' AND NOT attisdropped),'UPDATE'),
-    ('column','public.capability_invocations'::regclass::oid,
-      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='lease_until' AND NOT attisdropped),'UPDATE'),
-    ('column','public.capability_invocations'::regclass::oid,
-      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='fence' AND NOT attisdropped),'UPDATE'),
-    ('column','public.capability_invocations'::regclass::oid,
-      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='attempt' AND NOT attisdropped),'UPDATE'),
-    ('column','public.capability_invocations'::regclass::oid,
-      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='current_receipt_ordinal' AND NOT attisdropped),'UPDATE'),
-    ('schema','public'::regnamespace::oid,0::smallint,'USAGE')
+  WITH roles AS (
+    SELECT (SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user) owner_oid,
+           (SELECT oid FROM pg_catalog.pg_roles
+             WHERE rolname='vane_capability_invocation_coordinator') coordinator_oid
+  ), expected(object_kind,object_oid,attnum,grantee,grantor,privilege_type,is_grantable) AS (
+    SELECT 'relation',relation_oid,0::smallint,owner_oid,owner_oid,privilege_type,false
+      FROM roles
+      CROSS JOIN unnest(ARRAY['public.capability_invocations'::regclass::oid,
+                              'public.capability_invocation_receipts'::regclass::oid]) relation_oid
+      CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES',
+                              'TRIGGER','MAINTAIN']) privilege_type
+    UNION ALL
+    SELECT 'relation',relation_oid,0::smallint,coordinator_oid,owner_oid,privilege_type,false
+      FROM roles
+      CROSS JOIN unnest(ARRAY['public.capability_invocations'::regclass::oid,
+                              'public.capability_invocation_receipts'::regclass::oid]) relation_oid
+      CROSS JOIN unnest(ARRAY['SELECT','INSERT']) privilege_type
+    UNION ALL
+    SELECT 'sequence','public.capability_invocation_receipts_id_seq'::regclass::oid,
+           0::smallint,owner_oid,owner_oid,privilege_type,false
+      FROM roles CROSS JOIN unnest(ARRAY['SELECT','USAGE','UPDATE']) privilege_type
+    UNION ALL
+    SELECT 'sequence','public.capability_invocation_receipts_id_seq'::regclass::oid,
+           0::smallint,coordinator_oid,owner_oid,privilege_type,false
+      FROM roles CROSS JOIN unnest(ARRAY['SELECT','USAGE']) privilege_type
+    UNION ALL
+    SELECT 'column','public.capability_invocations'::regclass::oid,attribute.attnum,
+           coordinator_oid,owner_oid,'UPDATE',false
+      FROM roles
+      CROSS JOIN pg_catalog.pg_attribute attribute
+     WHERE attribute.attrelid='public.capability_invocations'::regclass AND
+           NOT attribute.attisdropped AND attribute.attnum>0 AND
+           attribute.attname IN('status','lease_owner','lease_until','fence','attempt',
+                                'current_receipt_ordinal')
   ), actual AS (
     SELECT CASE relation.relkind WHEN 'S' THEN 'sequence' ELSE 'relation' END object_kind,
            relation.oid object_oid,0::smallint attnum,
-           acl.privilege_type,acl.is_grantable
+           acl.grantee,acl.grantor,acl.privilege_type,acl.is_grantable
       FROM pg_catalog.pg_class relation
       CROSS JOIN LATERAL pg_catalog.aclexplode(relation.relacl) acl
      WHERE relation.relnamespace='public'::regnamespace AND relation.oid IN(
              'public.capability_invocations'::regclass,
              'public.capability_invocation_receipts'::regclass,
              'public.capability_invocation_receipts_id_seq'::regclass)
-       AND acl.grantee=(SELECT oid FROM role_oid)
     UNION ALL
     SELECT 'column',attribute.attrelid,attribute.attnum,
-           acl.privilege_type,acl.is_grantable
+           acl.grantee,acl.grantor,acl.privilege_type,acl.is_grantable
       FROM pg_catalog.pg_attribute attribute
       CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) acl
-     WHERE attribute.attrelid='public.capability_invocations'::regclass AND
-           NOT attribute.attisdropped AND acl.grantee=(SELECT oid FROM role_oid)
-    UNION ALL
-    SELECT 'schema',namespace.oid,0::smallint,acl.privilege_type,acl.is_grantable
-      FROM pg_catalog.pg_namespace namespace
-      CROSS JOIN LATERAL pg_catalog.aclexplode(namespace.nspacl) acl
-     WHERE namespace.oid='public'::regnamespace AND acl.grantee=(SELECT oid FROM role_oid)
+     WHERE attribute.attrelid IN('public.capability_invocations'::regclass,
+                                 'public.capability_invocation_receipts'::regclass) AND
+           NOT attribute.attisdropped AND attribute.attnum>0
   )
-  SELECT count(*) FILTER(WHERE expected.object_oid IS NOT NULL AND
-                               actual.object_oid IS NOT NULL AND NOT actual.is_grantable),
-         count(*) FILTER(WHERE expected.object_oid IS NULL OR actual.object_oid IS NULL OR
-                               actual.is_grantable)
-    INTO expected_acl_count,unexpected_acl_count
+  SELECT count(*)=31 AND bool_and(expected.object_oid IS NOT NULL AND
+      actual.object_oid IS NOT NULL AND actual.is_grantable=expected.is_grantable)
+    INTO catalog_grants_safe
     FROM expected FULL JOIN actual
-      USING(object_kind,object_oid,attnum,privilege_type);
-  grants_safe := grants_safe AND expected_acl_count=13 AND unexpected_acl_count=0;
+      USING(object_kind,object_oid,attnum,grantee,grantor,privilege_type);
+  SELECT count(*)=2 AND bool_and(
+      acl.privilege_type='USAGE' AND NOT acl.is_grantable AND
+      acl.grantee IN(0,(SELECT oid FROM pg_catalog.pg_roles
+        WHERE rolname='vane_capability_invocation_coordinator')))
+    INTO schema_grants_safe
+    FROM pg_catalog.pg_namespace namespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(namespace.nspacl) acl
+   WHERE namespace.oid='public'::regnamespace AND
+         acl.grantee IN(0,(SELECT oid FROM pg_catalog.pg_roles
+           WHERE rolname='vane_capability_invocation_coordinator'));
   SELECT has_schema_privilege('vane_capability_invocation_coordinator','public','USAGE') AND
          NOT has_schema_privilege('vane_capability_invocation_coordinator','public','CREATE') AND
          has_table_privilege('vane_capability_invocation_coordinator','public.capability_invocations','SELECT') AND
@@ -543,11 +557,13 @@ BEGIN
       NOT actual.proisstrict AND NOT actual.proretset AND actual.proparallel='u' AND actual.acl_safe)
     FROM expected FULL JOIN actual USING(function_oid)
   INTO trigger_functions_safe;
-  IF NOT role_safe OR NOT tables_safe OR NOT grants_safe OR NOT effective_grants_safe OR
+  IF NOT role_safe OR NOT tables_safe OR NOT grants_safe OR NOT catalog_grants_safe OR
+     NOT schema_grants_safe OR NOT effective_grants_safe OR
      NOT policies_safe OR NOT triggers_safe OR NOT trigger_functions_safe THEN
-    RAISE EXCEPTION '152: capability ledger contract unsafe role=% tables=% grants=% effective=% policies=% triggers=% functions=%',
-      role_safe,tables_safe,grants_safe,effective_grants_safe,policies_safe,triggers_safe,
-      trigger_functions_safe USING ERRCODE='42501';
+    RAISE EXCEPTION '152: capability ledger contract unsafe role=% tables=% grants=% catalog=% schema=% effective=% policies=% triggers=% functions=%',
+      role_safe,tables_safe,grants_safe,catalog_grants_safe,schema_grants_safe,
+      effective_grants_safe,policies_safe,triggers_safe,trigger_functions_safe
+      USING ERRCODE='42501';
   END IF;
 END $$;
 -- +goose StatementEnd

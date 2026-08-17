@@ -928,9 +928,13 @@ func validateServerRuntimeAuthorityRole(
 		SELECT
 		  COALESCE(bool_or(
 		    has_table_privilege($1,relation_oid,'INSERT') OR
+		    has_any_column_privilege($1,relation_oid,'INSERT') OR
 		    has_table_privilege($1,relation_oid,'UPDATE') OR
+		    has_any_column_privilege($1,relation_oid,'UPDATE') OR
 		    has_table_privilege($1,relation_oid,'DELETE') OR
-		    has_table_privilege($1,relation_oid,'TRUNCATE')
+		    has_table_privilege($1,relation_oid,'TRUNCATE') OR
+		    has_table_privilege($1,relation_oid,'REFERENCES') OR
+		    has_any_column_privilege($1,relation_oid,'REFERENCES')
 		  ),false),
 		  COALESCE((SELECT bool_or(
 		    has_table_privilege($1,relation_oid,'SELECT') OR

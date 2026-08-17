@@ -28,6 +28,8 @@ func TestMigration152CapabilityInvocationLedgerContract(t *testing.T) {
 		"status='unknown_effect'",
 		"NEW.status='ambiguous'",
 		"effective_grants_safe",
+		"catalog_grants_safe",
+		"schema_grants_safe",
 		"pg_get_triggerdef",
 		"pg_get_functiondef",
 		"trigger_functions_safe",
@@ -111,8 +113,13 @@ func TestMigration152CapabilityInvocationLedgerPostgres(t *testing.T) {
 			END $mutation$`},
 		{"PUBLIC schema CREATE", `GRANT CREATE ON SCHEMA public TO PUBLIC`},
 		{"PUBLIC table DELETE", `GRANT DELETE ON public.capability_invocations TO PUBLIC`},
+		{"PUBLIC table SELECT", `GRANT SELECT ON public.capability_invocations TO PUBLIC`},
+		{"other role receipt INSERT", `GRANT INSERT ON public.capability_invocation_receipts TO vane_app`},
 		{"PUBLIC column UPDATE", `GRANT UPDATE(principal_role) ON public.capability_invocations TO PUBLIC`},
+		{"allowed column UPDATE for other role", `GRANT UPDATE(status) ON public.capability_invocations TO vane_app`},
 		{"PUBLIC sequence UPDATE", `GRANT UPDATE ON SEQUENCE public.capability_invocation_receipts_id_seq TO PUBLIC`},
+		{"PUBLIC sequence SELECT", `GRANT SELECT ON SEQUENCE public.capability_invocation_receipts_id_seq TO PUBLIC`},
+		{"other role sequence USAGE", `GRANT USAGE ON SEQUENCE public.capability_invocation_receipts_id_seq TO vane_app`},
 		{"receipt delete authority", `GRANT DELETE ON capability_invocation_receipts
 			TO vane_capability_invocation_coordinator`},
 		{"delegable role edge", `GRANT vane_capability_invocation_coordinator TO CURRENT_USER
