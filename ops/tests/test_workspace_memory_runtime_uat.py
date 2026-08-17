@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "workspace_memory_runtime_uat",
+    ROOT / "audit" / "workspace-memory-runtime-uat.py",
+)
+assert SPEC is not None and SPEC.loader is not None
+uat = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(uat)
+
+
+class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
+    revision = "a" * 40
+    operation = "5d358bef-7093-4327-9f66-f5af9f194e51"
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        release_root = root / "releases"
+        release = release_root / self.revision
+        (release / "bin").mkdir(parents=True)
+        executable = release / "bin" / "vane-migrate"
+        executable.write_bytes(b"trusted-binary")
+        executable.chmod(0o755)
+        current = root / "current"
+        current.symlink_to(release)
+        server_env = root / "server.env"
+        server_env.write_text("VANE_DB_URL=postgres://runtime\n", encoding="utf-8")
+        server_env.chmod(0o640)
+        credential = root / "migration_db_url"
+        credential.write_text("postgres://owner\n", encoding="utf-8")
+        credential.chmod(0o400)
+        self.paths = mock.patch.multiple(
+            uat,
+            CURRENT_RELEASE=current,
+            RELEASE_ROOT=release_root.resolve(),
+            SERVER_ENV=server_env,
+            MIGRATION_CREDENTIAL=credential,
+            TRUSTED_UID=os.getuid(),
+        )
+        self.paths.start()
+        self.addCleanup(self.paths.stop)
+        self.identity = mock.patch.object(
+            uat, "migration_identity", return_value=(os.getuid(), os.getgid())
+        )
+        self.identity.start()
+        self.addCleanup(self.identity.stop)
+
+    def report(self) -> dict[str, object]:
+        return {
+            "schema": uat.SCHEMA,
+            "revision": self.revision,
+            "operation_id": self.operation,
+            "runtime_boundary_verified": True,
+            "personal_write_verified": True,
+            "team_write_verified": True,
+            "cross_member_recall_verified": True,
+            "personal_excluded_from_team": True,
+            "team_excluded_from_personal": True,
+            "cross_user_personal_denied": True,
+            "cleanup_verified": True,
+            "personal_evidence_digest": "1" * 64,
+            "team_evidence_digest": "2" * 64,
+        }
+
+    def invoke(
+        self, completed: subprocess.CompletedProcess[str]
+    ) -> tuple[int, list[str], int]:
+        argv = [
+            "workspace-memory-runtime-uat.py",
+            "--sha",
+            self.revision,
+            "--operation-id",
+            self.operation,
+        ]
+        captured: list[str] = []
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            uat.subprocess, "run", return_value=completed
+        ) as run, mock.patch("builtins.print", side_effect=lambda value: captured.append(value)):
+            code = uat.main()
+        command = run.call_args.args[0]
+        return code, command, run.call_args.kwargs["timeout"]
+
+    def test_exact_release_runs_hardened_transient_unit(self) -> None:
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(self.report()), stderr=""
+        )
+        code, command, timeout = self.invoke(completed)
+        self.assertEqual(code, 0)
+        self.assertEqual(timeout, 390)
+        self.assertIn("--property=User=vane-migrate", command)
+        self.assertIn("--property=NoNewPrivileges=yes", command)
+        self.assertIn("--property=ProtectSystem=strict", command)
+        self.assertIn("--property=TimeoutStartSec=6min", command)
+        self.assertFalse(any("EnvironmentFile=" in item for item in command))
+        self.assertEqual(
+            len([item for item in command if "LoadCredential=runtime_db_url:" in item]),
+            1,
+        )
+        self.assertEqual(command[-7:], [
+            "workspace-memory-uat", "--operation-id", self.operation,
+            "--expected-revision", self.revision, "--confirm", uat.SCHEMA,
+        ])
+
+    def test_report_rejects_missing_false_duplicate_and_equal_digest(self) -> None:
+        valid = self.report()
+        for mutation in (
+            {key: value for key, value in valid.items() if key != "cleanup_verified"},
+            {**valid, "cleanup_verified": False},
+            {**valid, "team_evidence_digest": valid["personal_evidence_digest"]},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(RuntimeError):
+                    uat.validate_report(mutation, self.revision, self.operation)
+        duplicate = '{"schema":"x","schema":"y"}'
+        with self.assertRaises(RuntimeError):
+            uat.strict_json(duplicate)
+
+    def test_authority_files_and_subprocess_fail_closed(self) -> None:
+        uat.SERVER_ENV.chmod(0o666)
+        with self.assertRaises(RuntimeError):
+            self.invoke(subprocess.CompletedProcess([], 0, stdout="{}", stderr=""))
+        uat.SERVER_ENV.chmod(0o640)
+        with self.assertRaises(RuntimeError):
+            self.invoke(subprocess.CompletedProcess([], 1, stdout="", stderr="failed"))
+        with self.assertRaises(RuntimeError):
+            self.invoke(subprocess.CompletedProcess([], 0, stdout=json.dumps(self.report()), stderr="warning"))
+
+    def test_runtime_database_url_is_derived_without_injecting_server_env(self) -> None:
+        self.assertEqual(uat.runtime_database_url(uat.SERVER_ENV), "postgres://runtime")
+        uat.SERVER_ENV.write_text(
+            "VANE_DB_URL=postgres://one\nVANE_DB_URL=postgres://two\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(RuntimeError, "not unique"):
+            uat.runtime_database_url(uat.SERVER_ENV)
+        uat.SERVER_ENV.write_text("VANE_DB_URL='quoted'\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "invalid"):
+            uat.runtime_database_url(uat.SERVER_ENV)
+
+    def test_migration_credential_matches_existing_production_contract(self) -> None:
+        uid, gid = uat.migration_identity()
+        uat.require_migration_credential(uat.MIGRATION_CREDENTIAL, uid, gid)
+        uat.MIGRATION_CREDENTIAL.chmod(0o600)
+        with self.assertRaisesRegex(RuntimeError, "unsafe"):
+            uat.require_migration_credential(uat.MIGRATION_CREDENTIAL, uid, gid)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -48,6 +48,7 @@ LOCK = json.loads(
 NON_STORE_DATABASE_PACKAGE_DIRS = (
     "a2a",
     "api",
+    "cmd/migrate",
     "cmd/server",
     "evolver",
     "feishu",

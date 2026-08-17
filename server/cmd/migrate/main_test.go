@@ -3,10 +3,42 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestRunRejectsUnknownSubcommandBeforeDatabaseAccess(t *testing.T) {
+	if err := run([]string{"unknown"}); err == nil ||
+		!strings.Contains(err.Error(), "unsupported vane-migrate subcommand") {
+		t.Fatalf("unknown subcommand err=%v", err)
+	}
+}
+
+func TestMigrationDatabaseURLUsesEnvironmentThenSystemdCredential(t *testing.T) {
+	t.Setenv(migrationDatabaseURLEnv, " postgres://owner/environment ")
+	if got, err := migrationDatabaseURL(); err != nil || got != "postgres://owner/environment" {
+		t.Fatalf("environment URL=%q err=%v", got, err)
+	}
+	t.Setenv(migrationDatabaseURLEnv, "")
+	directory := t.TempDir()
+	t.Setenv(migrationDatabaseCredentialEnv, directory)
+	if err := os.WriteFile(filepath.Join(directory, migrationDatabaseCredential),
+		[]byte(" postgres://owner/credential \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := migrationDatabaseURL(); err != nil || got != "postgres://owner/credential" {
+		t.Fatalf("credential URL=%q err=%v", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, migrationDatabaseCredential), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrationDatabaseURL(); err == nil {
+		t.Fatal("empty migration credential passed")
+	}
+}
 
 func TestMigrateAndProvisionOrdersClusterIdentityAfterSchema(t *testing.T) {
 	var calls []string
