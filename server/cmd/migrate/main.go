@@ -20,13 +20,19 @@ const (
 )
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "vane-migrate:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(arguments []string) error {
+	if len(arguments) != 0 {
+		if arguments[0] == workspaceMemoryUATCommand {
+			return runWorkspaceMemoryUATCommand(arguments[1:])
+		}
+		return errors.New("unsupported vane-migrate subcommand")
+	}
 	databaseURL, err := migrationDatabaseURL()
 	if err != nil {
 		return err
