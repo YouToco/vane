@@ -130,6 +130,7 @@ var purgeOrder = []purgeStep{
 	{"channel_routes", "tenant_id = $1"},
 	{"channel_link_requests", "tenant_id = $1"},
 	{"channel_identities", "tenant_id = $1"},
+	{"channel_runtime_authority_attestations", "tenant_id = $1"},
 	{"credential_vault_entries", "tenant_id = $1"},
 	// Team-task authorization decisions are retained independently from the
 	// mutable schedule row and must be included in exact erasure reporting.
@@ -414,6 +415,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		channelRouteLinksAvailable             bool
 		channelMessageMappingsAvailable        bool
 		channelOutboundEffectsAvailable        bool
+		channelRuntimeAuthoritiesAvailable     bool
 		credentialVaultAvailable               bool
 		deliveryChannelPreferencesAvailable    bool
 		artifactDeliveryPlansAvailable         bool
@@ -480,6 +482,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.channel_route_link_requests') IS NOT NULL,
 		        to_regclass('public.channel_message_mappings') IS NOT NULL,
 		        to_regclass('public.channel_outbound_effects') IS NOT NULL,
+		        to_regclass('public.channel_runtime_authority_attestations') IS NOT NULL,
 		        to_regclass('public.credential_vault_entries') IS NOT NULL,
 		        to_regclass('public.delivery_channel_preferences') IS NOT NULL,
 		        to_regclass('public.artifact_delivery_plans') IS NOT NULL,
@@ -545,6 +548,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&channelRouteLinksAvailable,
 		&channelMessageMappingsAvailable,
 		&channelOutboundEffectsAvailable,
+		&channelRuntimeAuthoritiesAvailable,
 		&credentialVaultAvailable,
 		&deliveryChannelPreferencesAvailable,
 		&artifactDeliveryPlansAvailable,
@@ -614,6 +618,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"channel_route_link_requests":               channelRouteLinksAvailable,
 		"channel_message_mappings":                  channelMessageMappingsAvailable,
 		"channel_outbound_effects":                  channelOutboundEffectsAvailable,
+		"channel_runtime_authority_attestations":    channelRuntimeAuthoritiesAvailable,
 		"credential_vault_entries":                  credentialVaultAvailable,
 		"delivery_channel_preferences":              deliveryChannelPreferencesAvailable,
 		"artifact_delivery_plans":                   artifactDeliveryPlansAvailable,

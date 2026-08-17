@@ -29,6 +29,7 @@ type fakeFleetStore struct {
 	listErr   error
 	activeErr error
 	useErr    error
+	useCalls  int
 }
 
 func newFakeFleetStore() *fakeFleetStore {
@@ -93,6 +94,7 @@ func (f *fakeFleetStore) UseCredential(
 	if f.useErr != nil {
 		return f.useErr
 	}
+	f.useCalls++
 	f.mu.Lock()
 	secret := append([]byte(nil), f.secrets[fmt.Sprintf("%d/%d/%d", scope.TenantID, scope.UserID, generation)]...)
 	metadata := f.active[userScope{tenantID: scope.TenantID, userID: scope.UserID}]
@@ -101,6 +103,53 @@ func (f *fakeFleetStore) UseCredential(
 		return types.NewAppError(types.CodeNotFound, "missing", types.ErrNotFound)
 	}
 	return use(secret, metadata)
+}
+
+func TestFleetRejectsEveryStoredAuthorityFieldMutation(t *testing.T) {
+	base := store.CredentialMetadata{CredentialScope: telegramScope(7, 70),
+		Generation: 3, Status: "active"}
+	mutations := []store.CredentialMetadata{base, base, base, base, base, base, base}
+	mutations[0].Kind = "tenant"
+	mutations[1].Provider = "feishu"
+	mutations[2].Purpose = "other"
+	mutations[3].TenantID = 0
+	mutations[4].UserID = 0
+	mutations[5].Generation = 0
+	mutations[6].Status = "retired"
+	for index, mutation := range mutations {
+		if err := validateStoredCredentialMetadata(mutation); err == nil {
+			t.Fatalf("authority field mutation %d accepted: %+v", index, mutation)
+		}
+	}
+}
+
+func TestFleetDarkGatePrecedesStoredSecretUse(t *testing.T) {
+	st := newFakeFleetStore()
+	st.setCredential(7, 70, 1, 7070, "7070:token", "secret")
+	sentinel := errors.New("runtime catalog dark")
+	st.authorityErr = sentinel
+	fleet, err := NewFleet(FleetConfig{Dynamic: true,
+		WebhookURL: "https://api.vane.test/telegram/webhook"},
+		st, &fakeChannelAgent{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.Start(t.Context()); !errors.Is(err, sentinel) {
+		t.Fatalf("start err=%v", err)
+	}
+	if st.useCalls != 0 {
+		t.Fatalf("dark runtime decrypted stored secret %d times", st.useCalls)
+	}
+
+	empty := newFakeFleetStore()
+	fleet, err = NewFleet(FleetConfig{Dynamic: true}, empty,
+		&fakeChannelAgent{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.Start(t.Context()); err != nil {
+		t.Fatalf("no-Bot main startup was blocked by dark gate: %v", err)
+	}
 }
 
 func (f *fakeFleetStore) ClaimNextTelegramIngressAuthorized(
@@ -438,7 +487,7 @@ func TestFleetCredentialInventoryAndActivationFailures(t *testing.T) {
 	st.activeErr = nil
 
 	bad := store.CredentialMetadata{CredentialScope: telegramScope(1, 2),
-		Generation: 1, Metadata: json.RawMessage(`{"bot_id":0}`)}
+		Generation: 1, Metadata: json.RawMessage(`{"bot_id":0}`), Status: "active"}
 	if err := fleet.activateMetadata(t.Context(), bad); err == nil {
 		t.Fatal("zero bot metadata activated")
 	}

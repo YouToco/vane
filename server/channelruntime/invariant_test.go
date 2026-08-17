@@ -36,37 +36,63 @@ func TestChannelInvocationBoundary(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			switch n := node.(type) {
-			case *ast.CallExpr:
-				selector, ok := n.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				switch selector.Sel.Name {
-				case "SendTextEffect", "PrepareTelegramOutbound",
-					"PrepareAggregateTelegramOutbound":
-					if !strings.HasPrefix(rel, "telegram"+string(filepath.Separator)) &&
-						!strings.HasPrefix(rel, "store"+string(filepath.Separator)) {
-						t.Errorf("%s calls provider-specific %s", rel, selector.Sel.Name)
-					}
-				case "BindDurableSend":
-					if rel != filepath.Join("channelruntime", "runtime.go") &&
-						!strings.HasPrefix(rel, "store"+string(filepath.Separator)) {
-						t.Errorf("%s mints SendPermit outside Store", rel)
-					}
-				}
-			case *ast.SelectorExpr:
-				if rel == filepath.Join("telegram", "manager.go") &&
-					n.Sel.Name == "MembershipRoleOwner" {
-					t.Errorf("%s hard-codes Telegram principal Owner role", rel)
-				}
-			}
-			return true
-		})
+		for _, violation := range channelBoundaryViolations(file, rel) {
+			t.Error(violation)
+		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func channelBoundaryViolations(file *ast.File, rel string) []string {
+	var violations []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		// Count references, not only CallExpr.Fun. This is intentional: a method
+		// or function value alias is an equally effective provider bypass.
+		switch selector.Sel.Name {
+		case "SendTextEffect", "PrepareTelegramOutbound",
+			"PrepareAggregateTelegramOutbound":
+			if !strings.HasPrefix(rel, "telegram"+string(filepath.Separator)) &&
+				!strings.HasPrefix(rel, "store"+string(filepath.Separator)) {
+				violations = append(violations,
+					rel+" references provider-specific "+selector.Sel.Name)
+			}
+		case "BindDurableSend":
+			if rel != filepath.Join("channelruntime", "runtime.go") &&
+				!strings.HasPrefix(rel, "store"+string(filepath.Separator)) {
+				violations = append(violations,
+					rel+" mints or aliases SendPermit authority")
+			}
+		}
+		if rel == filepath.Join("telegram", "manager.go") &&
+			selector.Sel.Name == "MembershipRoleOwner" {
+			violations = append(violations,
+				rel+" hard-codes Telegram principal Owner role")
+		}
+		return true
+	})
+	return violations
+}
+
+func TestChannelInvocationBoundaryRejectsFunctionValueAliases(t *testing.T) {
+	for _, source := range []string{
+		`package workflow; func f(x interface{ SendTextEffect() }) { _ = x.SendTextEffect }`,
+		`package workflow; func f(x interface{ PrepareTelegramOutbound() }) { send := x.PrepareTelegramOutbound; _ = send }`,
+		`package workflow; import "github.com/YouToco/vane/server/channelruntime"; var mint = channelruntime.BindDurableSend`,
+	} {
+		file, err := parser.ParseFile(token.NewFileSet(), "mutation.go", source, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := channelBoundaryViolations(file,
+			filepath.Join("workflow", "mutation.go")); len(got) == 0 {
+			t.Fatalf("function-value alias escaped guard: %s", source)
+		}
 	}
 }

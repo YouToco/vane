@@ -138,12 +138,19 @@ func WorkflowV1(
 	if err != nil {
 		return report, err
 	}
-	// Delivery is a separately durable effect. A channel failure never removes
-	// the already-frozen Web report; recovery continues from its receipt.
-	_ = workflow.ExecuteActivity(
+	// Delivery is a separately durable effect. The report remains frozen, but
+	// new workflow histories must surface a partial delivery instead of forging
+	// successful completion. GetVersion is deliberately after the historical
+	// activity command so pre-gate histories replay with DefaultVersion.
+	deliveryErr := workflow.ExecuteActivity(
 		ctx, "DeliverPeriodicBriefV1",
 		DeliverInputV1{Report: report},
 	).Get(ctx, nil)
+	deliveryGate := workflow.GetVersion(
+		ctx, "periodic-delivery-partial/v1", workflow.DefaultVersion, 1)
+	if deliveryErr != nil && deliveryGate == 1 {
+		return report, deliveryErr
+	}
 	return report, nil
 }
 

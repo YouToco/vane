@@ -25,6 +25,7 @@ const telegramCredentialPurpose = "bot_api"
 // ever materializing a cross-user plaintext secret list.
 type CredentialStore interface {
 	IngressStore
+	VerifyTelegramRuntimeAuthority(context.Context, store.TelegramRuntimeAuthority) error
 	ListActiveUserCredentialMetadata(context.Context, string, string) ([]store.CredentialMetadata, error)
 	ActiveCredentialMetadata(context.Context, store.CredentialScope) (store.CredentialMetadata, error)
 	UseCredential(context.Context, store.CredentialScope, int64, func([]byte, store.CredentialMetadata) error) error
@@ -149,6 +150,10 @@ func (f *Fleet) Start(ctx context.Context) error {
 		}
 	}
 	for _, metadata := range active {
+		if err := validateStoredCredentialMetadata(metadata); err != nil {
+			_ = f.shutdownAll(context.Background())
+			return fmt.Errorf("telegram: invalid stored Bot inventory: %w", err)
+		}
 		if err := f.activateMetadata(ctx, metadata); err != nil {
 			_ = f.shutdownAll(context.Background())
 			return fmt.Errorf("telegram: activate user %d/%d generation %d: %w",
@@ -191,10 +196,23 @@ func (f *Fleet) ActivateUser(ctx context.Context, tenantID, userID int64) error 
 }
 
 func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialMetadata) error {
+	if err := validateStoredCredentialMetadata(metadata); err != nil {
+		return err
+	}
 	var secret storedTelegramSecret
 	var declared storedTelegramMetadata
 	if err := json.Unmarshal(metadata.Metadata, &declared); err != nil || declared.BotID <= 0 {
 		return errors.New("telegram: stored bot metadata is invalid")
+	}
+	botID := strconv.FormatInt(declared.BotID, 10)
+	authority := store.TelegramRuntimeAuthority{
+		TenantID: metadata.TenantID, UserID: metadata.UserID,
+		CredentialGeneration: metadata.Generation, AppIdentity: botID,
+	}
+	// The database dark gate precedes both secret decryption and every Telegram
+	// provider call. A schema-owner/default Store must fail here.
+	if err := f.store.VerifyTelegramRuntimeAuthority(ctx, authority); err != nil {
+		return fmt.Errorf("telegram: channel runtime admission: %w", err)
 	}
 	if err := f.store.UseCredential(ctx, metadata.CredentialScope,
 		metadata.Generation, func(raw []byte, _ store.CredentialMetadata) error {
@@ -205,7 +223,6 @@ func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialM
 		}); err != nil {
 		return err
 	}
-	botID := strconv.FormatInt(declared.BotID, 10)
 	webhookURL, err := tenantWebhookURL(f.cfg.WebhookURL, botID)
 	if err != nil {
 		return err
@@ -213,11 +230,8 @@ func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialM
 	manager, err := NewManager(Config{
 		Enabled: true, Token: secret.BotToken, WebhookSecret: secret.WebhookSecret,
 		WebhookURL: webhookURL, APIBaseURL: f.cfg.APIBaseURL,
-		Workers: f.cfg.Workers,
-		RuntimeAuthority: store.TelegramRuntimeAuthority{
-			TenantID: metadata.TenantID, UserID: metadata.UserID,
-			CredentialGeneration: metadata.Generation, AppIdentity: botID,
-		},
+		Workers:          f.cfg.Workers,
+		RuntimeAuthority: authority,
 	}, f.store, f.agent, f.httpClient,
 		f.logger.With("tenant_id", metadata.TenantID, "bot_id", botID,
 			"credential_generation", metadata.Generation))
@@ -262,6 +276,16 @@ func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialM
 	f.mu.Unlock()
 	if old != nil && old.manager != manager {
 		_ = f.shutdownManager(old.manager)
+	}
+	return nil
+}
+
+func validateStoredCredentialMetadata(metadata store.CredentialMetadata) error {
+	if metadata.Kind != "user" || metadata.Provider != "telegram" ||
+		metadata.Purpose != telegramCredentialPurpose || metadata.TenantID <= 0 ||
+		metadata.UserID <= 0 || metadata.Generation <= 0 ||
+		metadata.Status != "active" {
+		return errors.New("telegram: stored Bot metadata authority fields are invalid")
 	}
 	return nil
 }

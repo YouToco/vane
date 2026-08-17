@@ -327,6 +327,33 @@ func TestDeliveryTelegramRequiresFrozenRoute(t *testing.T) {
 	}
 }
 
+func TestDeliveryNilTelegramAdapterLeavesDurableEffectAndFailsPartial(t *testing.T) {
+	report := periodicDeliveryReportFixture(t)
+	routeID := int64(93)
+	deliveryStore := &periodicDeliveryStoreFake{
+		settings: store.BriefReportSettingsV1{
+			Mode: store.BriefReportModeAuto, Cadence: store.BriefReportCadenceDaily,
+			Delivery: store.BriefReportDeliveryAlways, Timezone: "UTC",
+		},
+		preference: store.DeliveryChannelPreference{
+			Selection: store.DeliveryChannelTelegram, TelegramRouteID: &routeID,
+		},
+		plan: store.ArtifactDeliveryPlan{
+			ID:        "f02daee4-cbc0-5571-a079-b58760264911",
+			Selection: store.DeliveryChannelTelegram, TelegramRouteID: &routeID,
+		},
+	}
+	err := deliverPeriodicBriefV1(t.Context(), report, deliveryStore,
+		&periodicDeliverySenderFake{}, nil, "https://vane.example", true)
+	if types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("err=%v code=%s", err, types.CodeOf(err))
+	}
+	if deliveryStore.outboundCalls != 1 || deliveryStore.outboundBody == "" {
+		t.Fatalf("nil adapter escaped before durable effect: calls=%d body=%q",
+			deliveryStore.outboundCalls, deliveryStore.outboundBody)
+	}
+}
+
 func TestPeriodicTelegramRendererIncludesDecisionSections(t *testing.T) {
 	report := periodicDeliveryReportFixture(t)
 	report.Content.WhyForYou = "会影响下一季度预算"

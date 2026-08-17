@@ -68,6 +68,10 @@ const channelOutboundColumns = `effect_id,tenant_id,user_id,route_id,provider,
 	app_identity,provider_chat_id,provider_thread_id,effect_kind,payload_text,
 	payload_digest,status,provider_message_ids,error_code`
 
+const channelOutboundColumnsE = `e.effect_id,e.tenant_id,e.user_id,e.route_id,e.provider,
+	e.app_identity,e.provider_chat_id,e.provider_thread_id,e.effect_kind,e.payload_text,
+	e.payload_digest,e.status,e.provider_message_ids,e.error_code`
+
 func validOutboundKind(kind string) bool {
 	if len(kind) < 1 || len(kind) > 64 || kind[0] < 'a' || kind[0] > 'z' {
 		return false
@@ -214,38 +218,51 @@ func (s *Store) claimTelegramOutboundAuthorized(
 	} else if _, err := lockTelegramRuntimeAuthority(ctx, tx, authority); err != nil {
 		return ChannelOutboundEffect{}, err
 	}
-	var routeID int64
+	var identityID, routeID int64
 	var permitTenantID, permitUserID, permitRouteID int64
 	var permitKind, permitDigest string
 	if permit != nil {
 		permitTenantID, permitUserID, permitRouteID =
 			permit.TenantID(), permit.UserID(), permit.RouteID()
 		permitKind, permitDigest = permit.EffectKind(), permit.PayloadDigest()
-		replayed, replayErr := scanChannelOutbound(tx.QueryRow(ctx, `
-			SELECT `+channelOutboundColumns+` FROM channel_outbound_effects
-			 WHERE effect_id=$1 AND tenant_id=$2 AND user_id=$3 AND route_id=$4 AND
-			       provider=$5 AND effect_kind=$6 AND payload_digest=$7
-			 FOR UPDATE`, effectID, permitTenantID, permitUserID, permitRouteID,
-			channelProviderTelegram, permitKind, permitDigest))
-		if replayErr == nil && replayed.Status == "sent" {
-			if err := tx.Commit(ctx); err != nil {
-				return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
-					"提交 Telegram outbound 已发送重放", err)
-			}
-			return replayed, nil
-		}
-		if replayErr != nil && !errors.Is(replayErr, pgx.ErrNoRows) {
-			return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
-				"读取 Telegram outbound permit 重放", replayErr)
-		}
 	}
+	// Select only immutable foreign keys first, then acquire the universal
+	// identity -> route -> effect lock order shared with unlink and credential
+	// rotation. No effect is locked before its authority ancestors.
 	err = tx.QueryRow(ctx,
-		`SELECT cr.id FROM channel_outbound_effects e
+		`SELECT ci.id,cr.id FROM channel_outbound_effects e
+		 JOIN channel_routes cr ON cr.id=e.route_id
+		 JOIN channel_identities ci ON ci.id=cr.identity_id
+		WHERE e.effect_id=$1 AND e.provider=$2`, effectID,
+		channelProviderTelegram).Scan(&identityID, &routeID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
+			"Telegram outbound effect 不可发送", types.ErrConflict)
+	}
+	if err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+			"读取 Telegram outbound authority", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM channel_identities
+		WHERE id=$1 AND status='active' FOR UPDATE`, identityID); err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram outbound identity", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM channel_routes
+		WHERE id=$1 AND identity_id=$2 AND status='active' FOR UPDATE`,
+		routeID, identityID); err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram outbound route", err)
+	}
+	effect, err := scanChannelOutbound(tx.QueryRow(ctx,
+		`SELECT `+channelOutboundColumnsE+` FROM channel_outbound_effects e
 		 JOIN channel_routes cr ON cr.id=e.route_id
 		 JOIN channel_identities ci ON ci.id=cr.identity_id
 		 JOIN memberships m ON m.tenant_id=e.tenant_id AND m.user_id=e.user_id
 		 JOIN tenants t ON t.id=e.tenant_id
-		WHERE e.effect_id=$1 AND e.provider=$2 AND e.status='prepared'`+dueClause+` AND
+		WHERE e.effect_id=$1 AND e.provider=$2 AND
+		      e.status IN ('prepared','sent') AND
+		      (e.status='sent' OR (true`+dueClause+`)) AND
 		      e.tenant_id=cr.tenant_id AND e.user_id=cr.user_id AND
 		      cr.identity_id=ci.id AND cr.tenant_id=ci.tenant_id AND
 		      cr.user_id=ci.user_id AND cr.provider=e.provider AND
@@ -255,19 +272,29 @@ func (s *Store) claimTelegramOutboundAuthorized(
 		      ($4::bigint=0 OR (e.tenant_id=$4 AND e.user_id=$5)) AND
 		      ($6::bigint=0 OR (e.tenant_id=$6 AND e.user_id=$7 AND
 		       e.route_id=$8 AND e.effect_kind=$9 AND e.payload_digest=$10))
-		FOR UPDATE OF cr,ci FOR SHARE OF m,t`, effectID, channelProviderTelegram,
+		FOR UPDATE OF e`, effectID, channelProviderTelegram,
 		authority.AppIdentity, authority.TenantID, authority.UserID,
-		permitTenantID, permitUserID, permitRouteID, permitKind,
-		permitDigest).Scan(&routeID)
+		permitTenantID, permitUserID, permitRouteID, permitKind, permitDigest))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
 			"Telegram outbound effect 不可发送", types.ErrConflict)
 	}
 	if err != nil {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
-			"锁定 Telegram outbound authority", err)
+			"锁定 Telegram outbound effect", err)
 	}
-	effect, err := scanChannelOutbound(tx.QueryRow(ctx,
+	if effect.Status == "sent" {
+		if permit == nil {
+			return ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
+				"Telegram outbound effect 已发送", types.ErrConflict)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+				"提交 Telegram outbound 已发送重放", err)
+		}
+		return effect, nil
+	}
+	effect, err = scanChannelOutbound(tx.QueryRow(ctx,
 		`UPDATE channel_outbound_effects
 		    SET status='sending'`+retryClear+`,updated_at=clock_timestamp()
 		  WHERE effect_id=$1 AND route_id=$2 AND status='prepared'`+
@@ -321,8 +348,9 @@ func (s *Store) ClaimNextTelegramOutboundAuthorized(
 		return ChannelOutboundEffect{}, err
 	}
 	var effectID uuid.UUID
+	var identityID, routeID int64
 	err = tx.QueryRow(ctx,
-		`SELECT e.effect_id FROM channel_outbound_effects e
+		`SELECT ci.id,cr.id,e.effect_id FROM channel_outbound_effects e
 		 JOIN channel_routes cr ON cr.id=e.route_id
 		 JOIN channel_identities ci ON ci.id=cr.identity_id
 		 JOIN memberships m ON m.tenant_id=e.tenant_id AND m.user_id=e.user_id
@@ -335,9 +363,9 @@ func (s *Store) ClaimNextTelegramOutboundAuthorized(
 		      ci.status='active' AND t.status='active' AND t.deleted_at IS NULL AND
 		      ($3::bigint=0 OR (e.tenant_id=$3 AND e.user_id=$4))
 		ORDER BY COALESCE(e.next_send_at,e.created_at),e.created_at,e.effect_id
-		LIMIT 1 FOR UPDATE OF e,cr,ci FOR SHARE OF m,t SKIP LOCKED`,
+		LIMIT 1`,
 		channelProviderTelegram, appIdentity, authority.TenantID,
-		authority.UserID).Scan(&effectID)
+		authority.UserID).Scan(&identityID, &routeID, &effectID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeNotFound,
 			"没有待恢复的 Telegram outbound effect", types.ErrNotFound)
@@ -345,6 +373,23 @@ func (s *Store) ClaimNextTelegramOutboundAuthorized(
 	if err != nil {
 		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
 			"领取 Telegram outbound 恢复", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM channel_identities
+		WHERE id=$1 AND status='active' FOR UPDATE`, identityID); err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram outbound 恢复 identity", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM channel_routes
+		WHERE id=$1 AND identity_id=$2 AND status='active' FOR UPDATE`,
+		routeID, identityID); err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram outbound 恢复 route", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT effect_id FROM channel_outbound_effects e
+		WHERE effect_id=$1 AND route_id=$2 AND status='prepared'`+dueClause+`
+		FOR UPDATE`, effectID, routeID); err != nil {
+		return ChannelOutboundEffect{}, types.NewAppError(types.CodeConflict,
+			"Telegram outbound 恢复 authority 已变化", err)
 	}
 	effect, err := scanChannelOutbound(tx.QueryRow(ctx,
 		`UPDATE channel_outbound_effects

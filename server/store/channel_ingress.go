@@ -462,6 +462,28 @@ func (s *Store) GetTelegramIdentityForUser(
 func (s *Store) RevokeTelegramIdentity(
 	ctx context.Context, tenantID, userID int64, appIdentity string,
 ) error {
+	return s.revokeTelegramIdentity(ctx, TelegramRuntimeAuthority{
+		TenantID: tenantID, UserID: userID, AppIdentity: appIdentity,
+	})
+}
+
+// RevokeTelegramIdentityAuthorized pins unlink to the same credential
+// generation as ingress/reply/outbound claims.
+func (s *Store) RevokeTelegramIdentityAuthorized(
+	ctx context.Context, authority TelegramRuntimeAuthority,
+) error {
+	if !authority.stored() {
+		return types.NewAppError(types.CodeValidation,
+			"Telegram runtime authority 无效", types.ErrValidation)
+	}
+	return s.revokeTelegramIdentity(ctx, authority)
+}
+
+func (s *Store) revokeTelegramIdentity(
+	ctx context.Context, authority TelegramRuntimeAuthority,
+) error {
+	tenantID, userID, appIdentity := authority.TenantID, authority.UserID,
+		authority.AppIdentity
 	retryClear := ""
 	if s.channelSendRetry {
 		retryClear = ",next_send_at=NULL"
@@ -472,6 +494,24 @@ func (s *Store) RevokeTelegramIdentity(
 			"开启 Telegram 解绑事务", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if authority.CredentialGeneration > 0 {
+		if _, err := lockTelegramRuntimeAuthority(ctx, tx, authority); err != nil {
+			return err
+		}
+	} else {
+		var admitted bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(
+			SELECT 1 FROM memberships m JOIN tenants t ON t.id=m.tenant_id
+			WHERE m.tenant_id=$1 AND m.user_id=$2 AND t.status='active' AND
+			      t.deleted_at IS NULL)`, tenantID, userID).Scan(&admitted); err != nil {
+			return types.NewAppError(types.CodeDatabase,
+				"复核 Telegram 解绑 scope", err)
+		}
+		if !admitted {
+			return types.NewAppError(types.CodeConflict,
+				"Telegram 成员关系已失效", types.ErrConflict)
+		}
+	}
 	lockKey := fmt.Sprintf("channel-link/v1:%s", channelProviderTelegram)
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, lockKey); err != nil {
@@ -493,6 +533,25 @@ func (s *Store) RevokeTelegramIdentity(
 		return types.NewAppError(types.CodeDatabase,
 			"锁定 Telegram 绑定", err)
 	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM channel_routes
+		WHERE identity_id=$1 ORDER BY id FOR UPDATE`, identityID); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram 解绑路由", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT provider,app_identity,provider_update_id
+		FROM channel_ingress_receipts WHERE identity_id=$1 AND
+		status IN ('pending','processing','reply_ready')
+		ORDER BY provider,app_identity,provider_update_id FOR UPDATE`, identityID); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram 解绑 effects", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT e.effect_id
+		FROM channel_outbound_effects e JOIN channel_routes cr ON cr.id=e.route_id
+		WHERE cr.identity_id=$1 AND e.status='prepared'
+		ORDER BY e.effect_id FOR UPDATE OF e`, identityID); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram 解绑 outbound effects", err)
+	}
 	// Pending, already-claimed processing, and pre-provider replies lose channel
 	// authority atomically with the identity. A processing Agent operation was
 	// authorized before this row lock linearized unlink; its later settlement
@@ -509,6 +568,14 @@ func (s *Store) RevokeTelegramIdentity(
 		identityID); err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			"取消 Telegram 未执行消息", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE channel_outbound_effects e
+		SET status='failed',error_code='identity_revoked',next_send_at=NULL,
+		    updated_at=clock_timestamp()
+		FROM channel_routes cr WHERE cr.id=e.route_id AND cr.identity_id=$1 AND
+		    e.status='prepared'`, identityID); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"取消 Telegram 未发送 outbound", err)
 	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM channel_link_requests
@@ -754,7 +821,7 @@ func (s *Store) ClaimNextTelegramIngressAuthorized(
 		                 earlier.provider_update_id::bigint < r.provider_update_id::bigint AND
 		                 earlier.status IN ('pending','processing','reply_ready'))
 		  ORDER BY r.provider_update_id::bigint
-		  FOR UPDATE OF ci,cr FOR SHARE OF m,t SKIP LOCKED LIMIT 1`,
+		  FOR UPDATE OF ci,cr SKIP LOCKED LIMIT 1`,
 		channelProviderTelegram, appIdentity, authority.TenantID,
 		authority.UserID).Scan(&identityID, &routeID, &liveRole)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -923,7 +990,7 @@ func (s *Store) ClaimTelegramReplySendAuthorized(
 		        cr.identity_id=ci.id AND ci.status='active' AND cr.status='active' AND
 		        t.status='active' AND t.deleted_at IS NULL AND
 		        ($4::bigint=0 OR (r.tenant_id=$4 AND r.user_id=$5))
-		  FOR UPDATE OF ci,cr FOR SHARE OF m,t`, provider, appIdentity, updateID,
+		  FOR UPDATE OF ci,cr`, provider, appIdentity, updateID,
 		authority.TenantID, authority.UserID).Scan(&identityID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelIngress{}, types.NewAppError(types.CodeConflict,
@@ -1019,7 +1086,7 @@ func (s *Store) ClaimNextTelegramReplySendAuthorized(
 		                 earlier.provider_update_id::bigint < r.provider_update_id::bigint AND
 		                 earlier.status IN ('pending','processing','reply_ready'))
 		  ORDER BY r.provider_update_id::bigint
-		  FOR UPDATE OF ci,cr FOR SHARE OF m,t SKIP LOCKED LIMIT 1`,
+		  FOR UPDATE OF ci,cr SKIP LOCKED LIMIT 1`,
 		channelProviderTelegram, appIdentity, authority.TenantID,
 		authority.UserID).Scan(&identityID, &routeID)
 	if errors.Is(err, pgx.ErrNoRows) {

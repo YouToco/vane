@@ -6,10 +6,11 @@
 // unfrozen payload bytes to an adapter. Dispatcher accepts only that permit and
 // returns the provider's typed observation.
 //
-// Security rollout status: this package does not activate a SaaS canary. The
-// current channel tables are not FORCE RLS and the primary Store still has
-// schema-owner compatibility authority. A future migration must install and
-// verify the narrow non-owner channel runtime role before production canary.
+// Security rollout status: this package does not activate a SaaS canary.
+// Migration 155 installs a NOLOGIN-by-default narrow runtime and a FORCE-RLS
+// exact-authority attestation. The primary Store remains schema-owner
+// compatibility and is deliberately rejected for every stored-Bot admission;
+// a separately authenticated composition path is still required for canary.
 package channelruntime
 
 import (

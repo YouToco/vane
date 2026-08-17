@@ -3,26 +3,137 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/server/types"
 )
+
+const channelRuntimeLoginRole = "vane_channel_runtime"
 
 // TelegramRuntimeAuthority pins one running stored-Bot manager to the exact
 // credential generation that created it. AppIdentity is the immutable numeric
 // Bot ID returned by getMe. A zero tenant/user/generation triple is reserved
 // for the legacy environment adapter; mixed shapes are rejected.
 //
-// This is a process-to-Store fence, not a substitute for the future narrow
-// database role. Channel runtime remains dark for SaaS canary until FORCE RLS
-// and a non-owner runtime role are installed and independently verified.
+// The process pin is accepted only together with migration 155's independently
+// authenticated database role and FORCE-RLS attestation row.
 type TelegramRuntimeAuthority struct {
 	TenantID             int64
 	UserID               int64
 	CredentialGeneration int64
 	AppIdentity          string
+}
+
+// VerifyTelegramRuntimeAuthority is the activation/startup half of the dark
+// gate.  A schema-owner Store deliberately fails this check.  No stored Bot
+// secret or provider endpoint may be touched before it succeeds.
+func (s *Store) VerifyTelegramRuntimeAuthority(
+	ctx context.Context, authority TelegramRuntimeAuthority,
+) error {
+	if s == nil || s.pool == nil {
+		return types.NewAppError(types.CodeConflict,
+			"Telegram channel runtime 未配置", types.ErrConflict)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"开启 Telegram runtime 证明", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := attestTelegramRuntimeAuthorityTx(ctx, tx, authority); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"提交 Telegram runtime 证明", err)
+	}
+	return nil
+}
+
+// attestTelegramRuntimeAuthorityTx proves all four independently mutable
+// authorities in one database snapshot: login role/catalog, FORCE-RLS policy,
+// exact credential generation/app identity, and live tenant membership.
+func attestTelegramRuntimeAuthorityTx(
+	ctx context.Context, tx pgx.Tx, authority TelegramRuntimeAuthority,
+) (types.MembershipRole, error) {
+	if err := authority.validate(); err != nil {
+		return "", err
+	}
+	if !authority.stored() {
+		return "", types.NewAppError(types.CodeConflict,
+			"Telegram stored-Bot runtime authority 缺失", types.ErrConflict)
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true),
+		set_config('app.user_id',$2,true)`, fmt.Sprint(authority.TenantID),
+		fmt.Sprint(authority.UserID)); err != nil {
+		return "", types.NewAppError(types.CodeDatabase,
+			"设置 Telegram runtime scope", err)
+	}
+	var roleSafe, forceRLS, policySafe bool
+	if err := tx.QueryRow(ctx, `
+		SELECT session_user=current_user AND session_user=$1 AND
+		       role.rolcanlogin AND NOT role.rolsuper AND NOT role.rolbypassrls AND
+		       NOT role.rolcreatedb AND NOT role.rolcreaterole AND
+		       NOT role.rolreplication AND NOT role.rolinherit,
+		       relation.relrowsecurity AND relation.relforcerowsecurity,
+		       (SELECT count(*)=1 AND bool_and(policy.polpermissive) AND
+		               bool_and(policy.polcmd='r') AND
+		               bool_and(policy.polroles=ARRAY[role.oid]::oid[]) AND
+		               bool_and(pg_catalog.pg_get_expr(policy.polqual,policy.polrelid)
+		                 LIKE '%app.tenant_id%' AND
+		                 pg_catalog.pg_get_expr(policy.polqual,policy.polrelid)
+		                 LIKE '%app.user_id%')
+		          FROM pg_catalog.pg_policy policy
+		         WHERE policy.polrelid=relation.oid AND
+		               policy.polname='channel_runtime_authority_exact_principal')
+		  FROM pg_catalog.pg_roles role
+		  JOIN pg_catalog.pg_class relation ON relation.oid=
+		       to_regclass('public.channel_runtime_authority_attestations')
+		 WHERE role.rolname=session_user`, channelRuntimeLoginRole).Scan(
+		&roleSafe, &forceRLS, &policySafe); err != nil {
+		return "", types.NewAppError(types.CodeConflict,
+			"Telegram channel runtime catalog 尚未就绪", err)
+	}
+	if !roleSafe || !forceRLS || !policySafe {
+		return "", types.NewAppError(types.CodeConflict,
+			fmt.Sprintf("Telegram channel runtime authority 不安全 role=%t force_rls=%t policy=%t",
+				roleSafe, forceRLS, policySafe), types.ErrConflict)
+	}
+	var role types.MembershipRole
+	var attested bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1
+		FROM channel_runtime_authority_attestations
+		WHERE tenant_id=$1 AND user_id=$2 AND credential_generation=$3 AND
+		      app_identity=$4 AND status='active')`, authority.TenantID,
+		authority.UserID, authority.CredentialGeneration,
+		authority.AppIdentity).Scan(&attested)
+	if err == nil && attested {
+		err = tx.QueryRow(ctx, `SELECT public.attest_channel_runtime_authority_v155(
+			$1,$2,$3,$4)`, authority.TenantID, authority.UserID,
+			authority.CredentialGeneration, authority.AppIdentity).Scan(&role)
+	}
+	var permissionErr *pgconn.PgError
+	if errors.As(err, &permissionErr) && permissionErr.Code == "42501" {
+		return "", types.NewAppError(types.CodeConflict,
+			"Telegram runtime 凭证或成员关系已失效", types.ErrConflict)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", types.NewAppError(types.CodeConflict,
+			"Telegram runtime 凭证或成员关系已失效", types.ErrConflict)
+	}
+	if !attested {
+		return "", types.NewAppError(types.CodeConflict,
+			"Telegram runtime authority attestation 已失效", types.ErrConflict)
+	}
+	if err != nil {
+		return "", types.NewAppError(types.CodeDatabase,
+			"读取 Telegram runtime authority", err)
+	}
+	return role, nil
 }
 
 func (a TelegramRuntimeAuthority) stored() bool {
@@ -69,26 +180,9 @@ func lockTelegramRuntimeAuthority(
 		return "", types.NewAppError(types.CodeDatabase,
 			"锁定 Telegram runtime 凭证", err)
 	}
-	var role types.MembershipRole
-	err := tx.QueryRow(ctx, `
-		SELECT m.role
-		  FROM credential_vault_entries c
-		  JOIN memberships m ON m.tenant_id=c.tenant_id AND m.user_id=c.user_id
-		  JOIN tenants t ON t.id=c.tenant_id
-		 WHERE c.scope_kind='user' AND c.tenant_id=$1 AND c.user_id=$2 AND
-		       c.provider=$3 AND c.purpose='bot_api' AND c.generation=$4 AND
-		       c.external_identity=$5 AND c.status='active' AND
-		       t.status='active' AND t.deleted_at IS NULL
-		 FOR SHARE OF c,m,t`, authority.TenantID, authority.UserID,
-		channelProviderTelegram, authority.CredentialGeneration,
-		authority.AppIdentity).Scan(&role)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", types.NewAppError(types.CodeConflict,
-			"Telegram runtime 凭证或成员关系已失效", types.ErrConflict)
-	}
+	role, err := attestTelegramRuntimeAuthorityTx(ctx, tx, authority)
 	if err != nil {
-		return "", types.NewAppError(types.CodeDatabase,
-			"复核 Telegram runtime 凭证", err)
+		return "", err
 	}
 	return role, nil
 }
@@ -113,6 +207,37 @@ func revokeTelegramChannelAuthorityTx(
 		 ORDER BY ci.id FOR UPDATE`, tenantID, userID, channelProviderTelegram); err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			"锁定 Telegram credential identity", err)
+	}
+	// Every mutator and claim uses identity -> route -> effect after the shared
+	// credential/scope admission. This prevents revoke/rotate from deadlocking
+	// against a sender that had already selected the same route.
+	if _, err := tx.Exec(ctx, `
+		SELECT cr.id
+		  FROM channel_routes cr
+		 WHERE cr.tenant_id=$1 AND cr.user_id=$2 AND cr.provider=$3
+		 ORDER BY cr.id FOR UPDATE`, tenantID, userID, channelProviderTelegram); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram credential routes", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT r.provider,r.app_identity,r.provider_update_id
+		  FROM channel_ingress_receipts r
+		 WHERE r.tenant_id=$1 AND r.user_id=$2 AND r.provider=$3 AND
+		       r.status IN ('pending','processing','reply_ready')
+		 ORDER BY r.provider,r.app_identity,r.provider_update_id FOR UPDATE`,
+		tenantID, userID, channelProviderTelegram); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram credential ingress effects", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT e.effect_id
+		  FROM channel_outbound_effects e
+		 WHERE e.tenant_id=$1 AND e.user_id=$2 AND e.provider=$3 AND
+		       e.status='prepared'
+		 ORDER BY e.effect_id FOR UPDATE`, tenantID, userID,
+		channelProviderTelegram); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			"锁定 Telegram credential outbound effects", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE channel_ingress_receipts
@@ -148,10 +273,9 @@ func revokeTelegramChannelAuthorityTx(
 		return types.NewAppError(types.CodeDatabase,
 			"撤销 Telegram 未消费路由码", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE channel_routes
-		   SET status='revoked',revoked_at=clock_timestamp()
-		 WHERE tenant_id=$1 AND user_id=$2 AND provider=$3 AND status='active'`,
+	if _, err := tx.Exec(ctx, `UPDATE channel_routes
+		SET status='revoked',revoked_at=clock_timestamp()
+		WHERE tenant_id=$1 AND user_id=$2 AND provider=$3 AND status='active'`,
 		tenantID, userID, channelProviderTelegram); err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			"撤销 Telegram credential routes", err)

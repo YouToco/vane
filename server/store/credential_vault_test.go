@@ -390,7 +390,8 @@ func TestTelegramCredentialRotationRevokesAuthorityAndPinsManagerGeneration(t *t
 	}
 	authorityV1 := TelegramRuntimeAuthority{TenantID: tenantID, UserID: userID,
 		CredentialGeneration: first.Generation, AppIdentity: "778899"}
-	claimedIngress, err := st.ClaimNextTelegramIngressAuthorized(
+	runtimeStore := channelRuntimeTestStore(t, database, st)
+	claimedIngress, err := runtimeStore.ClaimNextTelegramIngressAuthorized(
 		ctx, authorityV1, 30*time.Second)
 	if err != nil || claimedIngress.MembershipRole != types.MembershipRoleMember {
 		t.Fatalf("live principal role=%q err=%v", claimedIngress.MembershipRole, err)
@@ -431,7 +432,7 @@ func TestTelegramCredentialRotationRevokesAuthorityAndPinsManagerGeneration(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ClaimTelegramOutboundAuthorized(
+	if _, err := runtimeStore.ClaimTelegramOutboundAuthorized(
 		ctx, authorityV1, newEffectID); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("retired manager generation claimed new work: %v", err)
 	}
@@ -443,11 +444,11 @@ func TestTelegramCredentialRotationRevokesAuthorityAndPinsManagerGeneration(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ClaimTelegramOutboundPermitAuthorized(
+	if _, err := runtimeStore.ClaimTelegramOutboundPermitAuthorized(
 		ctx, authorityV2, forged); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("forged permit was not rejected before claim: %v", err)
 	}
-	if _, err := st.ClaimTelegramOutboundAuthorized(ctx, authorityV2, newEffectID); err != nil {
+	if _, err := runtimeStore.ClaimTelegramOutboundAuthorized(ctx, authorityV2, newEffectID); err != nil {
 		t.Fatalf("active manager generation could not claim: %v", err)
 	}
 	pendingOnRevoke := uuid.NewString()
@@ -478,6 +479,85 @@ func TestTelegramCredentialRotationRevokesAuthorityAndPinsManagerGeneration(t *t
 		t.Fatalf("revoke state identity=%s sending=%s pending=%s/%s",
 			newIdentityStatus, sendingStatus, revokedPreparedStatus,
 			revokedPreparedCode)
+	}
+}
+
+func TestTelegramOutboundClaimAndCredentialRotationLinearizePostgres(t *testing.T) {
+	st, database := credentialVaultTestStore(t)
+	ctx := t.Context()
+	userID, tenantID := migration129Identity(t, database, "telegram-claim-rotation-race")
+	scope := CredentialScope{Kind: "user", TenantID: tenantID, UserID: userID,
+		Provider: "telegram", Purpose: "bot_api"}
+	secret := json.RawMessage(`{"bot_token":"881155:synthetic","webhook_secret":"synthetic"}`)
+	metadata := json.RawMessage(`{"bot_id":881155,"bot_username":"race"}`)
+	credential, err := st.RotateCredential(ctx, scope, secret, metadata, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var identityID, routeID int64
+	if err := database.QueryRowContext(ctx, `INSERT INTO channel_identities
+		(tenant_id,user_id,provider,app_identity,external_user_id,
+		 provider_chat_id,chat_type)
+		VALUES($1,$2,'telegram','881155','actor','chat','private') RETURNING id`,
+		tenantID, userID).Scan(&identityID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `INSERT INTO channel_routes
+		(tenant_id,user_id,identity_id,provider,app_identity,provider_chat_id,
+		 provider_thread_id,chat_type,route_kind)
+		VALUES($1,$2,$3,'telegram','881155','chat','0','private','private')
+		RETURNING id`, tenantID, userID, identityID).Scan(&routeID); err != nil {
+		t.Fatal(err)
+	}
+	effectID := uuid.NewString()
+	if _, err := st.PrepareTelegramOutbound(ctx, tenantID, userID, routeID,
+		effectID, "periodic_report", "linearize me"); err != nil {
+		t.Fatal(err)
+	}
+	runtimeStore := channelRuntimeTestStore(t, database, st)
+	authority := TelegramRuntimeAuthority{TenantID: tenantID, UserID: userID,
+		CredentialGeneration: credential.Generation, AppIdentity: "881155"}
+	start := make(chan struct{})
+	claimErr := make(chan error, 1)
+	rotateErr := make(chan error, 1)
+	go func() {
+		<-start
+		_, err := runtimeStore.ClaimTelegramOutboundAuthorized(ctx, authority, effectID)
+		claimErr <- err
+	}()
+	go func() {
+		<-start
+		_, err := st.RotateCredential(ctx, scope, secret, metadata, userID)
+		rotateErr <- err
+	}()
+	close(start)
+	if err := <-rotateErr; err != nil {
+		t.Fatalf("concurrent rotation failed: %v", err)
+	}
+	claimedErr := <-claimErr
+	if claimedErr != nil && !errors.Is(claimedErr, types.ErrConflict) {
+		t.Fatalf("claim returned non-linearizable error: %v", claimedErr)
+	}
+	var identityStatus, routeStatus, effectStatus, effectCode string
+	if err := database.QueryRowContext(ctx, `SELECT ci.status,cr.status,e.status,
+		COALESCE(e.error_code,'') FROM channel_identities ci
+		JOIN channel_routes cr ON cr.identity_id=ci.id
+		JOIN channel_outbound_effects e ON e.route_id=cr.id
+		WHERE ci.id=$1 AND e.effect_id=$2`, identityID, effectID).Scan(
+		&identityStatus, &routeStatus, &effectStatus, &effectCode); err != nil {
+		t.Fatal(err)
+	}
+	if identityStatus != "revoked" || routeStatus != "revoked" {
+		t.Fatalf("rotation did not atomically revoke identity/route: %s/%s",
+			identityStatus, routeStatus)
+	}
+	if claimedErr == nil {
+		if effectStatus != "sending" || effectCode != "" {
+			t.Fatalf("claim-first effect=%s/%s", effectStatus, effectCode)
+		}
+	} else if effectStatus != "failed" || effectCode != "credential_rotated" {
+		t.Fatalf("rotation-first effect=%s/%s claim=%v",
+			effectStatus, effectCode, claimedErr)
 	}
 }
 

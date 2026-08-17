@@ -51,6 +51,7 @@ type fakeIngressStore struct {
 	linkHash          []byte
 	issueErr          error
 	revokeErr         error
+	authorityErr      error
 	blocked           store.ChannelDeliveryBlockStats
 	blockedErr        error
 	outbound          store.ChannelOutboundEffect
@@ -85,6 +86,12 @@ func (f *fakeIngressStore) GetTelegramIdentityForUser(context.Context, int64, in
 }
 func (f *fakeIngressStore) RevokeTelegramIdentity(context.Context, int64, int64, string) error {
 	return f.revokeErr
+}
+func (f *fakeIngressStore) RevokeTelegramIdentityAuthorized(context.Context, store.TelegramRuntimeAuthority) error {
+	return f.revokeErr
+}
+func (f *fakeIngressStore) VerifyTelegramRuntimeAuthority(context.Context, store.TelegramRuntimeAuthority) error {
+	return f.authorityErr
 }
 func (f *fakeIngressStore) AcceptTelegramIngress(context.Context, store.ChannelIdentity, string, string, string, string) (bool, error) {
 	f.acceptCalls++

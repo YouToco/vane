@@ -206,10 +206,6 @@ func deliverPeriodicBriefV1(
 		return types.NewAppError(types.CodeConflict,
 			"Telegram 周期报告目的地未就绪", types.ErrConflict)
 	}
-	if telegramEnabled && channelDispatcher == nil {
-		return types.NewAppError(types.CodeConflict,
-			"Telegram 周期报告 adapter 未就绪", types.ErrConflict)
-	}
 	card := feishu.BuildPeriodicBriefCardV1(report, webURL)
 	if card == "" {
 		return types.NewAppError(
@@ -251,6 +247,11 @@ func deliverPeriodicBriefV1(
 			effectID, "periodic_report", body)
 		if err != nil {
 			sendErrs = append(sendErrs, err)
+		} else if channelDispatcher == nil {
+			// The prepared outbound effect is the durable evidence that this
+			// report is only partially delivered. Never return before recording it.
+			sendErrs = append(sendErrs, types.NewAppError(types.CodeConflict,
+				"Telegram 周期报告 adapter 未就绪", types.ErrConflict))
 		} else {
 			observation, sendErr := channelDispatcher.Send(ctx, permit)
 			if sendErr != nil {

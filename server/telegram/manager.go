@@ -117,6 +117,8 @@ type IngressStore interface {
 }
 
 type authorizedIngressStore interface {
+	VerifyTelegramRuntimeAuthority(context.Context, store.TelegramRuntimeAuthority) error
+	RevokeTelegramIdentityAuthorized(context.Context, store.TelegramRuntimeAuthority) error
 	ClaimNextTelegramIngressAuthorized(context.Context, store.TelegramRuntimeAuthority, time.Duration) (store.ChannelIngress, error)
 	ClaimTelegramReplySendAuthorized(context.Context, store.TelegramRuntimeAuthority, string) (store.ChannelIngress, error)
 	ClaimNextTelegramReplySendAuthorized(context.Context, store.TelegramRuntimeAuthority) (store.ChannelIngress, error)
@@ -204,6 +206,17 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	startupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		st, ok := m.authorizedStore()
+		if !ok {
+			return errors.New("telegram: stored Bot authority Store is unavailable")
+		}
+		if err := st.VerifyTelegramRuntimeAuthority(
+			startupCtx, m.cfg.RuntimeAuthority); err != nil {
+			m.setError("runtime_authority")
+			return fmt.Errorf("telegram: channel runtime admission: %w", err)
+		}
+	}
 	bot, err := m.client.GetMe(startupCtx)
 	if err != nil {
 		m.setError("get_me")
@@ -1317,8 +1330,22 @@ func (m *Manager) Unlink(ctx context.Context, tenantID, userID int64) error {
 		return types.NewAppError(types.CodeConflict,
 			"Telegram Bot 尚未就绪", types.ErrConflict)
 	}
-	return m.store.RevokeTelegramIdentity(
-		ctx, tenantID, userID, strconv.FormatInt(bot.ID, 10))
+	if m.cfg.RuntimeAuthority.CredentialGeneration > 0 {
+		if m.cfg.RuntimeAuthority.TenantID != tenantID ||
+			m.cfg.RuntimeAuthority.UserID != userID ||
+			m.cfg.RuntimeAuthority.AppIdentity != strconv.FormatInt(bot.ID, 10) {
+			return types.NewAppError(types.CodeConflict,
+				"Telegram runtime authority 不匹配", types.ErrConflict)
+		}
+		st, ok := m.authorizedStore()
+		if !ok {
+			return types.NewAppError(types.CodeConflict,
+				"Telegram channel runtime 未配置", types.ErrConflict)
+		}
+		return st.RevokeTelegramIdentityAuthorized(ctx, m.cfg.RuntimeAuthority)
+	}
+	return m.store.RevokeTelegramIdentity(ctx, tenantID, userID,
+		strconv.FormatInt(bot.ID, 10))
 }
 
 func (m *Manager) SendTest(

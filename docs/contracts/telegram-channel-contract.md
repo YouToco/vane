@@ -243,15 +243,14 @@ modalities.
 
 ## Database role boundary
 
-Migrations 141-150 install exact-user RLS policies and revoke the future
-`vane_app` role, but the current primary Store intentionally still runs through
-the repository's schema-owner compatibility DSN. PostgreSQL owners bypass
-non-FORCE RLS, so this branch does **not** count those policies as current
-tenant-isolation evidence. Current authority is the exact membership foreign
-key plus the explicit tenant/user/bot/actor/chat predicates and row locks in
-every Store method. Moving the primary server to `vane_app` remains blocked
-until a later migration grants a narrow channel capability and production-role
-tests prove `row_security_active`; it must not be enabled by config alone.
+Migrations 141-150 install exact-user RLS policies. Migration 155 adds the
+independent `vane_channel_runtime` login shell (NOLOGIN by default), an exact
+credential-generation/app-identity attestation projection with FORCE RLS, and
+an owner-controlled function that locks the live credential, membership and
+tenant rows. Runtime startup verifies the login attributes, exact RLS policy,
+attestation row and all four authority fields inside PostgreSQL. The primary
+Store still runs through the schema-owner compatibility DSN, and that session
+is deliberately rejected before secret decryption or any provider call.
 
 The current code-level security slice does not weaken that block. Stored Bot
 Managers are pinned to exact `(tenant,user,credential generation,numeric bot
@@ -265,9 +264,16 @@ from the membership role read by that claim; it never fabricates `owner`.
 Business workflows now receive only an immutable durable `SendPermit` from
 Store and call the provider-neutral Channel Dispatcher. They cannot hold a
 Telegram sender/client or choose mutable provider routing. A missing Telegram
-adapter for either `telegram` or `both` fails closed. These code guards make the
-future role cutover reviewable, but they are not RLS evidence and do not
-authorize a production canary by themselves.
+adapter for either `telegram` or `both` first leaves the prepared outbound
+effect as durable partial-delivery evidence, then fails the new Temporal
+workflow history explicitly. Old histories replay through a version marker.
+
+This remains dark: the server composition has no independently authenticated
+channel-runtime Store/DSN. No-Bot startup remains available, while any stored
+Bot found at startup or requested by the API is rejected under the schema-owner
+session. Provisioning a separate login and composition path, followed by the
+PostgreSQL role/ACL mutation matrix and production approval, is required before
+canary; config alone cannot enable it.
 
 ## Secret and transport rules
 
