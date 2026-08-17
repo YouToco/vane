@@ -1,0 +1,25 @@
+{
+  "schema": "vane.firecracker-artifact-lock/v1",
+  "architecture": "x86_64",
+  "firecracker_version": "v1.16.1",
+  "archive": {
+    "url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.1/firecracker-v1.16.1-x86_64.tgz",
+    "sha256": "382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6",
+    "size_bytes": 7486686
+  },
+  "firecracker": {
+    "member": "release-v1.16.1-x86_64/firecracker-v1.16.1-x86_64",
+    "sha256": "2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7",
+    "size_bytes": 3527456
+  },
+  "jailer": {
+    "member": "release-v1.16.1-x86_64/jailer-v1.16.1-x86_64",
+    "sha256": "1f3a0c1fe86212d0001819bfe0819071c01208b3ccc9398c3b3bc1b84cf21edd",
+    "size_bytes": 2181264
+  },
+  "kernel": {
+    "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-5.10.245",
+    "sha256": "c453f36520d2f2792ab8e4532a814e4a647a4a41a4c94d4e9083a502800159b1",
+    "size_bytes": 39670952
+  }
+}

@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"debug/elf"
@@ -21,9 +22,12 @@ import (
 
 var ErrDarkFoundation = errors.New("sandbox Firecracker execution remains dark")
 
+const firecrackerHostOverheadMiB = 64
+
 type ArtifactPin struct {
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
+	Path      string `json:"path"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
 }
 
 type FirecrackerConfig struct {
@@ -36,6 +40,9 @@ type FirecrackerConfig struct {
 	FirecrackerVersion  string                 `json:"firecracker_version"`
 	JailerVersion       string                 `json:"jailer_version"`
 	WorkRoot            string                 `json:"work_root"`
+	CgroupRoot          string                 `json:"cgroup_root"`
+	CgroupParent        string                 `json:"cgroup_parent"`
+	InheritCgroupLimits bool                   `json:"inherit_cgroup_limits"`
 	JailerUIDStart      int                    `json:"jailer_uid_start"`
 	JailerGIDStart      int                    `json:"jailer_gid_start"`
 	IsolationSlots      int                    `json:"isolation_slots"`
@@ -54,6 +61,10 @@ type LaunchPlan struct {
 	Arguments    []string
 	WorkDir      string
 	OutputLimit  int64
+	CgroupPath   string
+	PIDFile      string
+	CgroupKill   string
+	pidFileUID   uint32
 }
 
 type Launcher interface {
@@ -61,11 +72,13 @@ type Launcher interface {
 }
 
 type FirecrackerBackend struct {
-	config   FirecrackerConfig
-	launcher Launcher
-	scrub    func(string) error
-	mu       sync.Mutex
-	free     []int
+	config      FirecrackerConfig
+	launcher    Launcher
+	scrub       func(string) error
+	scrubCG     func(string) error
+	mu          sync.Mutex
+	free        []int
+	preflightOK bool
 }
 
 func NewFirecrackerBackend(config FirecrackerConfig, launcher Launcher) (*FirecrackerBackend, error) {
@@ -78,6 +91,19 @@ func NewFirecrackerBackend(config FirecrackerConfig, launcher Launcher) (*Firecr
 	if config.Production && !config.hostIdentitiesBound {
 		return nil, errors.New("production sandbox host service identities are not bound")
 	}
+	if config.Production && config.CgroupRoot != "/sys/fs/cgroup" {
+		return nil, errors.New("production sandbox cgroup root is not exact")
+	}
+	if config.CgroupParent != "" {
+		clean := filepath.Clean(config.CgroupParent)
+		if filepath.IsAbs(config.CgroupParent) || clean != config.CgroupParent || clean == "." ||
+			strings.HasPrefix(clean, "../") || strings.ContainsRune(clean, '\x00') {
+			return nil, errors.New("sandbox cgroup parent is unsafe")
+		}
+	}
+	if config.InheritCgroupLimits && (!config.Production || config.CgroupParent == "") {
+		return nil, errors.New("inherited sandbox cgroup limits require an exact production parent")
+	}
 	if config.IsolationSlots < 1 || config.IsolationSlots > 1024 ||
 		config.JailerUIDStart <= 0 || config.JailerGIDStart <= 0 {
 		return nil, errors.New("sandbox jailer identity pool is invalid")
@@ -86,7 +112,7 @@ func NewFirecrackerBackend(config FirecrackerConfig, launcher Launcher) (*Firecr
 	for i := range free {
 		free[i] = i
 	}
-	return &FirecrackerBackend{config: config, launcher: launcher, scrub: scrubTree, free: free}, nil
+	return &FirecrackerBackend{config: config, launcher: launcher, scrub: scrubTree, scrubCG: scrubCgroup, free: free}, nil
 }
 
 // uid_t/gid_t all-ones is reserved as the kernel/API "no identity" sentinel.
@@ -128,6 +154,9 @@ func validateIdentityPool(config FirecrackerConfig) error {
 }
 
 func (b *FirecrackerBackend) Preflight(ctx context.Context) error {
+	b.mu.Lock()
+	b.preflightOK = false
+	b.mu.Unlock()
 	if runtime.GOOS != "linux" {
 		return errors.New("Firecracker sandbox requires Linux")
 	}
@@ -193,6 +222,9 @@ func (b *FirecrackerBackend) Preflight(ctx context.Context) error {
 	if err := verifyVersion(ctx, b.config.Jailer.Path, "Jailer", b.config.JailerVersion); err != nil {
 		return fmt.Errorf("jailer version: %w", err)
 	}
+	b.mu.Lock()
+	b.preflightOK = true
+	b.mu.Unlock()
 	return nil
 }
 
@@ -202,8 +234,8 @@ func verifyStaticELF(path string) error {
 		return fmt.Errorf("parse static ELF: %w", err)
 	}
 	defer file.Close()
-	if file.Type != elf.ET_EXEC {
-		return fmt.Errorf("ELF type %s is not a static executable", file.Type)
+	if file.Type != elf.ET_EXEC && file.Type != elf.ET_DYN {
+		return fmt.Errorf("ELF type %s is not a static or static-PIE executable", file.Type)
 	}
 	for _, program := range file.Progs {
 		if program.Type == elf.PT_INTERP {
@@ -245,6 +277,36 @@ func (b *FirecrackerBackend) Run(ctx context.Context, request Request) (Result, 
 	if !b.config.darkLaunchForTest {
 		return Result{Status: "disabled", ErrorCode: "dark_foundation"}, ErrDarkFoundation
 	}
+	return b.run(ctx, request)
+}
+
+// RunGateSelfTest is the only executable production path in this dark
+// foundation. It accepts a fixed release Gate capability; Service.Execute and
+// the general Backend.Run path remain fail-closed for user invocations.
+func (b *FirecrackerBackend) RunGateSelfTest(ctx context.Context, request Request) (Result, error) {
+	b.mu.Lock()
+	ready := b.preflightOK
+	b.mu.Unlock()
+	if !b.config.Production || !ready || request.CapabilityID != GateCapabilityID {
+		return Result{}, errors.New("Firecracker self-test requires the fixed production Gate capability")
+	}
+	if b.config.CgroupParent == "" || !b.config.InheritCgroupLimits {
+		return Result{}, errors.New("Firecracker self-test requires a delegated service cgroup")
+	}
+	result, err := b.run(ctx, request)
+	if err != nil {
+		return result, err
+	}
+	receipt, err := parseGuestReceipt(result.Output, request)
+	if err != nil {
+		return Result{}, err
+	}
+	result.Output = receipt
+	result.Status = "succeeded"
+	return result, nil
+}
+
+func (b *FirecrackerBackend) run(ctx context.Context, request Request) (Result, error) {
 	maxInput := len(request.Input)
 	if maxInput < 1 {
 		maxInput = 1
@@ -252,32 +314,38 @@ func (b *FirecrackerBackend) Run(ctx context.Context, request Request) (Result, 
 	if err := request.Validate(maxInput); err != nil {
 		return Result{}, err
 	}
+	runCtx, cancel := context.WithTimeout(ctx, time.Duration(request.Policy.WallTimeoutMS)*time.Millisecond)
+	defer cancel()
 	slot, err := b.acquireSlot()
 	if err != nil {
 		return Result{}, err
 	}
 	defer b.releaseSlot(slot)
-	plan, cleanup, err := b.buildPlan(request, slot)
+	plan, cleanup, err := b.buildPlan(runCtx, request, slot)
 	if err != nil {
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			return Result{InvocationID: request.InvocationID, Status: "killed", ErrorCode: "wall_timeout"}, context.DeadlineExceeded
+		}
 		return Result{}, err
 	}
-	runCtx, cancel := context.WithTimeout(ctx, time.Duration(request.Policy.WallTimeoutMS)*time.Millisecond)
-	defer cancel()
 	output, err := b.launcher.Run(runCtx, plan)
-	cleanupErr := cleanup()
+	cleanupErr := errors.Join(b.scrubCG(plan.CgroupPath), cleanup())
 	if cleanupErr != nil {
 		return Result{}, errors.Join(err, fmt.Errorf("scrub sandbox invocation: %w", cleanupErr))
 	}
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return Result{Status: "killed", ErrorCode: "wall_timeout"}, context.DeadlineExceeded
 	}
+	if errors.Is(err, ErrOutputLimit) {
+		return Result{InvocationID: request.InvocationID, Status: "killed", ErrorCode: "output_limit"}, ErrOutputLimit
+	}
 	if int64(len(output)) > request.Policy.OutputBytesMax {
 		return Result{Status: "killed", ErrorCode: "output_limit"}, ErrOutputLimit
 	}
-	return Result{Output: output}, err
+	return Result{InvocationID: request.InvocationID, Output: output}, err
 }
 
-func (b *FirecrackerBackend) buildPlan(request Request, slot int) (LaunchPlan, func() error, error) {
+func (b *FirecrackerBackend) buildPlan(ctx context.Context, request Request, slot int) (LaunchPlan, func() error, error) {
 	codePin, ok := b.config.CodeImages[request.CapabilityID+"@"+request.CapabilityVersion]
 	if !ok {
 		return LaunchPlan{}, func() error { return nil },
@@ -298,21 +366,34 @@ func (b *FirecrackerBackend) buildPlan(request Request, slot int) (LaunchPlan, f
 		return LaunchPlan{}, func() error { return nil }, errors.Join(err, cleanup())
 	}
 	for name, pin := range map[string]ArtifactPin{
-		"vmlinux": b.config.Kernel, "rootfs.ext4": b.config.RootFS, "code.ext4": codePin,
+		"vmlinux": b.config.Kernel, "rootfs.cpio": b.config.RootFS, "code.ext4": codePin,
 	} {
-		if err := copyPinnedFile(pin, filepath.Join(jailRoot, name)); err != nil {
+		if err := copyPinnedFile(ctx, pin, filepath.Join(jailRoot, name)); err != nil {
 			return LaunchPlan{}, func() error { return nil }, errors.Join(err, cleanup())
 		}
 	}
+	inputPath := filepath.Join(jailRoot, "input.raw")
+	inputSize := (len(request.Input) + 4095) &^ 4095
+	if inputSize < 4096 {
+		inputSize = 4096
+	}
+	input := make([]byte, inputSize)
+	copy(input, request.Input)
+	if err := os.WriteFile(inputPath, input, 0o400); err != nil {
+		return LaunchPlan{}, func() error { return nil }, errors.Join(err, cleanup())
+	}
+	inputDigest := sha256.Sum256(request.Input)
 	vmConfig := map[string]any{
 		"boot-source": map[string]any{
 			"kernel_image_path": "/vmlinux",
-			"boot_args": fmt.Sprintf("ro panic=1 reboot=k nomodules ipv6.disable=1 init=/sbin/vane-sandbox-init vane.tmpfs_bytes=%d vane.uid=%d vane.gid=%d",
-				request.Policy.TmpfsBytesMax, request.Policy.GuestUID, request.Policy.GuestGID),
+			"initrd_path":       "/rootfs.cpio",
+			"boot_args": fmt.Sprintf("console=ttyS0 panic=1 reboot=k nomodules ipv6.disable=1 rdinit=/sbin/vane-sandbox-init vane.input_bytes=%d vane.input_sha256=%s vane.request_sha256=%s vane.invocation=%s vane.uid=%d vane.gid=%d",
+				len(request.Input), hex.EncodeToString(inputDigest[:]), request.RequestDigest,
+				request.InvocationID, request.Policy.GuestUID, request.Policy.GuestGID),
 		},
 		"drives": []map[string]any{
-			{"drive_id": "rootfs", "path_on_host": "/rootfs.ext4", "is_root_device": true, "is_read_only": true},
 			{"drive_id": "code", "path_on_host": "/code.ext4", "is_root_device": false, "is_read_only": true},
+			{"drive_id": "input", "path_on_host": "/input.raw", "is_root_device": false, "is_read_only": true},
 		},
 		"machine-config": map[string]any{"vcpu_count": request.Policy.VCPUCount,
 			"mem_size_mib": request.Policy.MemoryMiB, "smt": false},
@@ -338,16 +419,66 @@ func (b *FirecrackerBackend) buildPlan(request Request, slot int) (LaunchPlan, f
 	}
 	args := []string{"--id", id, "--exec-file", b.config.Firecracker.Path,
 		"--uid", fmt.Sprint(uid), "--gid", fmt.Sprint(gid),
-		"--chroot-base-dir", chrootBase, "--netns", b.config.NetNSPath,
-		"--cgroup-version", "2",
-		"--cgroup", fmt.Sprintf("cpu.max=%d %d", request.Policy.CPUQuotaMicros, request.Policy.CPUPeriodMicros),
-		"--cgroup", fmt.Sprintf("memory.max=%d", int64(request.Policy.MemoryMiB)<<20),
-		"--cgroup", fmt.Sprintf("pids.max=%d", request.Policy.PIDsMax),
+		"--chroot-base-dir", chrootBase, "--netns", b.config.NetNSPath}
+	if b.config.Production && b.config.CgroupParent != "" {
+		args = append(args, "--parent-cgroup", b.config.CgroupParent)
+	}
+	args = append(args, "--cgroup-version", "2")
+	if !b.config.InheritCgroupLimits {
+		args = append(args,
+			"--cgroup", fmt.Sprintf("cpu.max=%d %d", request.Policy.CPUQuotaMicros, request.Policy.CPUPeriodMicros),
+			"--cgroup", fmt.Sprintf("memory.max=%d", int64(request.Policy.MemoryMiB+firecrackerHostOverheadMiB)<<20),
+			"--cgroup", fmt.Sprintf("pids.max=%d", request.Policy.PIDsMax))
+	}
+	args = append(args,
 		"--resource-limit", fmt.Sprintf("fsize=%d", request.Policy.OutputBytesMax),
 		"--resource-limit", "no-file=128", "--new-pid-ns", "--",
-		"--api-sock", "/run/firecracker.socket", "--config-file", "/config.json"}
+		"--api-sock", "/run/firecracker.socket", "--config-file", "/config.json")
+	cgroupPath := ""
+	cgroupKill := ""
+	if b.config.Production && !b.config.InheritCgroupLimits {
+		if b.config.CgroupParent != "" {
+			cgroupPath = filepath.Join(b.config.CgroupRoot, b.config.CgroupParent, id)
+		} else {
+			cgroupPath = filepath.Join(b.config.CgroupRoot, filepath.Base(b.config.Firecracker.Path), id)
+		}
+	} else if b.config.Production && b.config.InheritCgroupLimits {
+		cgroupKill = filepath.Join(b.config.CgroupRoot, b.config.CgroupParent, "cgroup.kill")
+	}
+	pidFile := filepath.Join(jailRoot, filepath.Base(b.config.Firecracker.Path)+".pid")
 	return LaunchPlan{InvocationID: request.InvocationID, JailerID: id, Executable: b.config.Jailer.Path,
-		Arguments: args, WorkDir: runRoot, OutputLimit: request.Policy.OutputBytesMax}, cleanup, nil
+		Arguments: args, WorkDir: runRoot, OutputLimit: request.Policy.OutputBytesMax, CgroupPath: cgroupPath,
+		PIDFile: pidFile, CgroupKill: cgroupKill}, cleanup, nil
+}
+
+func scrubCgroup(path string) error {
+	return scrubCgroupWith(path, os.Lstat, os.ReadFile, os.Remove)
+}
+
+func scrubCgroupWith(path string, lstat func(string) (os.FileInfo, error),
+	readFile func(string) ([]byte, error), remove func(string) error) error {
+	if path == "" {
+		return nil
+	}
+	clean := filepath.Clean(path)
+	if !strings.HasPrefix(clean, "/sys/fs/cgroup/") || clean == "/sys/fs/cgroup" {
+		return errors.New("sandbox cgroup cleanup target is unsafe")
+	}
+	info, err := lstat(clean)
+	if err != nil {
+		return fmt.Errorf("sandbox cgroup was not created exactly: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("sandbox cgroup cleanup target is not a directory")
+	}
+	procs, err := readFile(filepath.Join(clean, "cgroup.procs"))
+	if err != nil || len(bytes.TrimSpace(procs)) != 0 {
+		return errors.New("sandbox cgroup still contains a process")
+	}
+	if err := remove(clean); err != nil {
+		return fmt.Errorf("remove sandbox cgroup: %w", err)
+	}
+	return nil
 }
 
 func (b *FirecrackerBackend) acquireSlot() (int, error) {
@@ -369,7 +500,7 @@ func (b *FirecrackerBackend) releaseSlot(slot int) {
 }
 
 func verifyPinnedArtifact(label string, pin ArtifactPin, production bool) error {
-	if !filepath.IsAbs(pin.Path) || requireSHA256(label, pin.SHA256) != nil {
+	if !filepath.IsAbs(pin.Path) || requireSHA256(label, pin.SHA256) != nil || pin.SizeBytes < 1 {
 		return fmt.Errorf("%s artifact pin is invalid", label)
 	}
 	if err := verifyTrustedPath(pin.Path, production); err != nil {
@@ -380,6 +511,10 @@ func verifyPinnedArtifact(label string, pin ArtifactPin, production bool) error 
 		return err
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.Size() != pin.SizeBytes {
+		return fmt.Errorf("%s artifact size mismatch", label)
+	}
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return err
@@ -483,8 +618,9 @@ func verifyEmptyNetNS(path string, production bool, verifier func(string) error)
 	if err != nil {
 		return err
 	}
-	if info.Size() != 0 || info.Mode().Perm() != 0o600 {
-		return errors.New("sandbox empty netns must be an exact 0600 empty mount point")
+	if info.Size() != 0 || (production && info.Mode().Perm() != 0o444) ||
+		(!production && info.Mode().Perm() != 0o600 && info.Mode().Perm() != 0o444) {
+		return errors.New("sandbox empty netns mount point mode is not exact")
 	}
 	if verifier == nil {
 		return errors.New("sandbox netns verifier is missing")
@@ -495,7 +631,7 @@ func verifyEmptyNetNS(path string, production bool, verifier func(string) error)
 	return nil
 }
 
-func copyPinnedFile(pin ArtifactPin, destination string) error {
+func copyPinnedFile(ctx context.Context, pin ArtifactPin, destination string) error {
 	source, err := os.Open(pin.Path)
 	if err != nil {
 		return err
@@ -505,7 +641,35 @@ func copyPinnedFile(pin ArtifactPin, destination string) error {
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(target, source)
+	hash := sha256.New()
+	written := int64(0)
+	buffer := make([]byte, 1024*1024)
+	var copyErr error
+	for {
+		select {
+		case <-ctx.Done():
+			copyErr = ctx.Err()
+		default:
+		}
+		if copyErr != nil {
+			break
+		}
+		count, readErr := source.Read(buffer)
+		if count > 0 {
+			written += int64(count)
+			_, _ = hash.Write(buffer[:count])
+			if _, writeErr := target.Write(buffer[:count]); writeErr != nil {
+				copyErr = writeErr
+				break
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				copyErr = readErr
+			}
+			break
+		}
+	}
 	closeErr := target.Close()
 	if copyErr != nil {
 		return copyErr
@@ -513,7 +677,10 @@ func copyPinnedFile(pin ArtifactPin, destination string) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	return verifyPinnedArtifact("copied", ArtifactPin{Path: destination, SHA256: pin.SHA256}, false)
+	if written != pin.SizeBytes || !constantDigestEqual(hex.EncodeToString(hash.Sum(nil)), pin.SHA256) {
+		return errors.New("copied sandbox artifact digest or size mismatch")
+	}
+	return nil
 }
 
 func scrubTree(path string) error {

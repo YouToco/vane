@@ -36,7 +36,7 @@ class BackendRuntimeContractTest(unittest.TestCase):
         self.assertEqual(len(binaries), 5)
         self.assertEqual(
             binaries,
-            {name for name in artifact.BACKEND_FILES if name.startswith("bin/")},
+            {name for name in artifact.BASE_BACKEND_FILES if name.startswith("bin/")},
         )
         self.assertEqual(
             {name for name in artifact.BACKEND_FILES if name.startswith("deploy/")},
@@ -47,6 +47,13 @@ class BackendRuntimeContractTest(unittest.TestCase):
                 "deploy/vane-research-gateway.service",
                 "deploy/vane-research-gateway.socket",
                 "deploy/dynamicconfig/development-sql.yaml",
+            },
+        )
+        self.assertEqual(
+            {name for name in artifact.BACKEND_FILES if name.startswith("sandbox/")},
+            {
+                "sandbox/firecracker", "sandbox/jailer", "sandbox/vmlinux",
+                "sandbox/rootfs.cpio", "sandbox/code.raw", "sandbox/manifest.json",
             },
         )
         for archive_path, source_path in artifact.BACKEND_SOURCE_PATHS.items():

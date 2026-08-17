@@ -22,7 +22,12 @@ func validateRouteTable(reader io.Reader, ipv6 bool) error {
 				return errors.New("malformed IPv6 route entry")
 			}
 			iface = fields[len(fields)-1]
-			if fields[0] != strings.Repeat("0", 31)+"1" || !strings.EqualFold(fields[1], "80") {
+			loopback := fields[0] == strings.Repeat("0", 31)+"1" && strings.EqualFold(fields[1], "80")
+			kernelUnreachableDefault := fields[0] == strings.Repeat("0", 32) && fields[1] == "00" &&
+				fields[2] == strings.Repeat("0", 32) && fields[3] == "00" &&
+				fields[4] == strings.Repeat("0", 32) && strings.EqualFold(fields[5], "ffffffff") &&
+				strings.EqualFold(fields[8], "00200200")
+			if !loopback && !kernelUnreachableDefault {
 				return fmt.Errorf("non-loopback IPv6 destination %q/%q exists", fields[0], fields[1])
 			}
 		} else {

@@ -457,6 +457,23 @@ class ProductionHandlerTest(unittest.TestCase):
         )
         self.assertIn('["/usr/bin/sudo", "--non-interactive", "--", *command]', controller)
 
+    def test_firecracker_gate_is_exact_release_bound_and_kvm_is_narrowly_exposed(self) -> None:
+        source = (Path(__file__).parents[1] / "broker/production_handler.py").read_text(
+            encoding="utf-8"
+        )
+        gate = source[source.index("def run_firecracker_gate") : source.index("def postgres_query")]
+        self.assertIn('/opt/vane/releases/{revision}/bin/sandboxd', gate)
+        self.assertIn('"--property=DevicePolicy=closed"', gate)
+        self.assertIn('"--property=DeviceAllow=/dev/kvm rw"', gate)
+        self.assertIn('"--property=PrivateNetwork=yes"', gate)
+        self.assertIn('"--property=Delegate=yes"', gate)
+        self.assertNotIn("shell=True", gate)
+        release = source.index("server_stage = stage_server")
+        gate_call = source.index("run_firecracker_gate(revision", release)
+        uat = source.index("run_uat(", gate_call)
+        self.assertLess(release, gate_call)
+        self.assertLess(gate_call, uat)
+
     def test_uat_uses_a_temporary_session_and_always_revokes_it(self) -> None:
         executable = self.root / "uat.py"
         executable.write_text(

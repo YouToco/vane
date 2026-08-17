@@ -5,7 +5,8 @@ RELEASE_BINARIES := \
 	vane-research-gateway=./cmd/researchgateway \
 	vane-migrate=./cmd/migrate \
 	gate=./cmd/gate \
-	agentfirstretention=./cmd/agentfirstretention
+	agentfirstretention=./cmd/agentfirstretention \
+	sandboxd=./cmd/sandboxd
 
 build:
 	@set -eu; for entry in $(RELEASE_BINARIES); do \

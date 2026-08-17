@@ -97,6 +97,25 @@ func TestRunHasNoImplicitCommandOrPortableSuccess(t *testing.T) {
 	}
 }
 
+func TestDispatchKeepsGuestAndReleaseGateOutOfTheDaemonParser(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := dispatch(t.Context(), nil, &stdout, &stderr); code != 2 {
+		t.Fatalf("empty argv code=%d", code)
+	}
+	if code := dispatch(t.Context(), []string{"/sbin/vane-sandbox-init"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("portable guest code=%d", code)
+	}
+	if code := dispatch(t.Context(), []string{"sandboxd", "release-gate"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("incomplete Gate unexpectedly succeeded")
+	}
+	if code := dispatch(t.Context(), []string{"sandboxd", "release-gate-netns-preflight"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("incomplete Gate netns preflight unexpectedly succeeded")
+	}
+	if code := dispatch(t.Context(), []string{"sandboxd"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("daemon parser accepted an implicit command: %d", code)
+	}
+}
+
 func TestConfigFileContractRejectsSymlinkHardlinkAndLooseMode(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "sandboxd.json")

@@ -187,8 +187,57 @@ def stage_server(validated: Path, revision: str) -> Path:
         destination = stage / relative
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         shutil.copy2(path, destination)
+    sandbox_source = backend / "sandbox"
+    if sandbox_source.exists():
+        if sandbox_source.is_symlink() or not sandbox_source.is_dir():
+            raise RuntimeError("validated Firecracker payload has an unsafe artifact root")
+        sandbox_stage = stage / "sandbox"
+        sandbox_stage.mkdir(mode=0o700)
+        for path in sandbox_source.iterdir():
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError("validated Firecracker payload contains an unsafe artifact")
+            shutil.copy2(path, sandbox_stage / path.name)
     shutil.copy2(backend / "release-receipt.json", stage / "release-receipt.json")
+    shutil.copy2(backend / "backend-manifest.json", stage / "backend-manifest.json")
     return stage
+
+
+def run_firecracker_gate(revision: str, receipt: Path) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError("Firecracker Gate revision is invalid")
+    if not receipt.is_absolute() or receipt.exists() or receipt.is_symlink():
+        raise RuntimeError("Firecracker Gate receipt target is unsafe")
+    executable = Path(f"/opt/vane/releases/{revision}/bin/sandboxd")
+    if executable.is_symlink() or not executable.is_file():
+        raise RuntimeError("release-bound sandboxd is unavailable")
+    unit = f"vane-firecracker-gate-{revision}"
+    run([
+        "/usr/bin/systemd-run", "--quiet", "--wait", "--pipe", "--collect",
+        "--service-type=exec", f"--unit={unit}", "--property=Type=exec",
+        "--property=User=root", "--property=Group=root", "--property=UMask=0077",
+        "--property=NoNewPrivileges=yes", "--property=ProtectSystem=strict",
+        "--property=ProtectHome=yes", "--property=PrivateTmp=yes",
+        "--property=PrivateNetwork=yes", "--property=PrivateMounts=yes",
+        "--property=ProtectProc=invisible", "--property=ProtectControlGroups=no",
+        "--property=DevicePolicy=closed", "--property=DeviceAllow=/dev/kvm rw",
+        "--property=Delegate=yes", "--property=RestrictAddressFamilies=AF_UNIX",
+        "--property=TimeoutStartSec=30s", "--property=KillMode=mixed",
+        f"--property=ReadWritePaths={receipt.parent}",
+        "--property=CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_MKNOD CAP_KILL CAP_SYS_RESOURCE",
+        str(executable), "release-gate", "--sha", revision,
+        "--receipt", str(receipt),
+    ])
+    value = strict_json(receipt)
+    if (
+        value.get("schema") != "vane.firecracker-production-gate/v1"
+        or value.get("revision") != revision
+        or value.get("ok") is not True
+        or value.get("scrubbed") is not True
+        or value.get("mmds") is not False
+        or value.get("network_interfaces") != 0
+    ):
+        raise RuntimeError("Firecracker production Gate receipt is invalid")
+    return value
 
 
 def postgres_query(sql: str) -> str:
@@ -749,12 +798,22 @@ def release(
                 "web": "published-locally-after-server-finalize",
             },
         )
-        write_json(transaction / "machine-verify.json", {
+        firecracker_receipt = transaction / "firecracker-gate.json"
+        sandbox_manifest = Path(f"/opt/vane/releases/{revision}/sandbox/manifest.json")
+        firecracker_gate = None
+        if sandbox_manifest.is_file() and not sandbox_manifest.is_symlink():
+            firecracker_gate = run_firecracker_gate(revision, firecracker_receipt)
+        machine_verify = {
             "schema": "vane.production-verify/v1",
             "revision": revision,
             "ready": True,
             "server": "ready-and-exact-process-bound",
-        })
+            "firecracker_gate": "passed" if firecracker_gate is not None else "not-in-artifact",
+        }
+        if firecracker_gate is not None:
+            machine_verify["firecracker_gate_sha256"] = digest(firecracker_receipt)
+            machine_verify["firecracker_guest_receipt_sha256"] = firecracker_gate["guest_receipt_sha256"]
+        write_json(transaction / "machine-verify.json", machine_verify)
         run_uat(
             config["uat_command"],
             revision,
@@ -813,16 +872,19 @@ def release(
             },
             parent=artifact_manifest,
         )
+        verify_evidence = {
+            "machine-verify.json": transaction / "machine-verify.json",
+            "uat.json": transaction / "uat.json",
+        }
+        if firecracker_gate is not None:
+            verify_evidence["firecracker-gate.json"] = firecracker_receipt
         verify_manifest = write_signed_manifest(
             directory=manifests,
             stage="verify",
             revision=revision,
             signer=config["signer"],
             signing_key=signing_key,
-            evidence={
-                "machine-verify.json": transaction / "machine-verify.json",
-                "uat.json": transaction / "uat.json",
-            },
+            evidence=verify_evidence,
             parent=deploy_manifest,
         )
         finalize_manifest = write_signed_manifest(

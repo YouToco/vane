@@ -55,6 +55,21 @@ done
 [[ -f $stage/release-receipt.json && ! -L $stage/release-receipt.json ]] || {
   echo "candidate release lacks receipt" >&2; exit 1;
 }
+[[ -f $stage/backend-manifest.json && ! -L $stage/backend-manifest.json ]] || {
+  echo "candidate release lacks backend manifest authority" >&2; exit 1;
+}
+sandbox_enabled=false
+sandbox_parts=0
+[[ -f $stage/bin/sandboxd && ! -L $stage/bin/sandboxd && -x $stage/bin/sandboxd ]] && ((sandbox_parts+=1))
+[[ -d $stage/sandbox && ! -L $stage/sandbox ]] && ((sandbox_parts+=1))
+[[ -f $stage/sandbox/manifest.json && ! -L $stage/sandbox/manifest.json ]] && ((sandbox_parts+=1))
+if (( sandbox_parts == 3 )); then
+  sandbox_enabled=true
+  binaries+=(sandboxd)
+elif (( sandbox_parts != 0 )); then
+  echo "candidate release has a partial Firecracker artifact authority" >&2
+  exit 1
+fi
 
 pending=$(mktemp -d "$release_root/.pending-$release_sha.XXXXXX")
 unit_backup=$(mktemp -d "/etc/systemd/system/.vane-release-backup.XXXXXX")
@@ -109,17 +124,27 @@ for file in "${infra_files[@]}"; do
   install -m 0644 "$stage/$file" "$destination"
 done
 install -m 0644 "$stage/release-receipt.json" "$pending/release-receipt.json"
+install -m 0644 "$stage/backend-manifest.json" "$pending/backend-manifest.json"
+if [[ $sandbox_enabled == true ]]; then
+  mkdir "$pending/sandbox"
+  for file in firecracker jailer; do install -m 0755 "$stage/sandbox/$file" "$pending/sandbox/$file"; done
+  for file in vmlinux rootfs.cpio code.raw manifest.json; do install -m 0644 "$stage/sandbox/$file" "$pending/sandbox/$file"; done
+fi
 (
   cd "$pending"
-  find bin deploy -type f -print0 | sort -z | xargs -0 sha256sum >infra-bound-files.sha256
+  bound_roots=(bin deploy)
+  [[ $sandbox_enabled == false ]] || bound_roots+=(sandbox)
+  find "${bound_roots[@]}" -type f -print0 | sort -z | xargs -0 sha256sum >infra-bound-files.sha256
   find deploy -type f -print0 | sort -z | xargs -0 sha256sum >infra-manifest.sha256
 )
 printf '%s\n' "$release_sha" >"$pending/monorepo-revision"
 chmod 0755 "$pending" "$pending/bin" "$pending/deploy" "$pending/deploy/dynamicconfig"
+[[ $sandbox_enabled == false ]] || chmod 0755 "$pending/sandbox"
 chmod 0644 \
   "$pending/infra-bound-files.sha256" \
   "$pending/infra-manifest.sha256" \
   "$pending/monorepo-revision" \
+  "$pending/backend-manifest.json" \
   "$pending/release-receipt.json"
 if [[ -e $release_dir ]]; then
   [[ ! -L $release_dir && -d $release_dir && $(stat -c '%a' "$release_dir") == 755 ]] || {

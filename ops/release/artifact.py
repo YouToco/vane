@@ -21,7 +21,7 @@ SERVER_RELEASE_CONTRACT = (
     "vane.server-release-contract/v2 primary_store=owner_compat_v1 "
     "research_control_store=restricted_v1 research_store=restricted_v1"
 )
-BACKEND_FILES = {
+BASE_BACKEND_FILES = {
     "bin/vane": 0o755,
     "bin/vane-research-gateway": 0o755,
     "bin/vane-migrate": 0o755,
@@ -34,6 +34,16 @@ BACKEND_FILES = {
     "deploy/vane-research-gateway.socket": 0o644,
     "deploy/dynamicconfig/development-sql.yaml": 0o644,
 }
+SANDBOX_FILES = {
+    "bin/sandboxd": 0o755,
+    "sandbox/firecracker": 0o755,
+    "sandbox/jailer": 0o755,
+    "sandbox/vmlinux": 0o644,
+    "sandbox/rootfs.cpio": 0o644,
+    "sandbox/code.raw": 0o644,
+    "sandbox/manifest.json": 0o644,
+}
+BACKEND_FILES = {**BASE_BACKEND_FILES, **SANDBOX_FILES}
 BACKEND_SOURCE_PATHS = {
     **{
         archive_path: f"server/{archive_path}"
@@ -52,6 +62,11 @@ BACKEND_SOURCE_PATHS = {
     "deploy/dynamicconfig/development-sql.yaml": (
         "infra/production/temporal/development-sql.yaml"
     ),
+    **{
+        archive_path: f"server/{archive_path}"
+        for archive_path in BACKEND_FILES
+        if archive_path.startswith("sandbox/")
+    },
 }
 
 
@@ -88,9 +103,18 @@ def validate_archive_path(value: str, component: str) -> PurePosixPath:
 def source_files(component: str, source: Path) -> list[tuple[str, Path, int]]:
     if component != "backend":
         raise ValueError(f"unsupported artifact component: {component!r}")
+    sandbox_presence = {
+        name: (source / BACKEND_SOURCE_PATHS[name]).exists()
+        for name in SANDBOX_FILES
+    }
+    if any(sandbox_presence.values()) and not all(sandbox_presence.values()):
+        raise ValueError("Firecracker release artifact set is partial")
+    selected = dict(BASE_BACKEND_FILES)
+    if all(sandbox_presence.values()):
+        selected.update(SANDBOX_FILES)
     candidates = [
         (archive_path, source / BACKEND_SOURCE_PATHS[archive_path], mode)
-        for archive_path, mode in BACKEND_FILES.items()
+        for archive_path, mode in selected.items()
     ]
 
     if not candidates:
@@ -328,9 +352,11 @@ def validate(
         manifest_files[path] = entry
     if total_size > MAX_TOTAL_SIZE:
         raise ValueError("manifest content is oversized")
-    if set(manifest_files) != set(BACKEND_FILES):
-        raise ValueError("backend allowlist is not exact")
-    for path, expected_mode in BACKEND_FILES.items():
+    manifest_set = set(manifest_files)
+    if manifest_set not in (set(BASE_BACKEND_FILES), set(BACKEND_FILES)):
+        raise ValueError("backend allowlist is not an exact base or Firecracker release")
+    expected_files = BASE_BACKEND_FILES if manifest_set == set(BASE_BACKEND_FILES) else BACKEND_FILES
+    for path, expected_mode in expected_files.items():
         if manifest_files[path]["mode"] != expected_mode:
             raise ValueError(f"backend mode is not exact: {path}")
 
@@ -383,6 +409,10 @@ def validate(
             data = (output_dir / "bin" / binary).read_bytes()
             if f"vane/{source_sha}/clean".encode() not in data:
                 raise ValueError(f"{binary} lacks exact clean release build ID")
+        if "bin/sandboxd" in manifest_files:
+            data = (output_dir / "bin/sandboxd").read_bytes()
+            if f"vane/{source_sha}/clean".encode() not in data:
+                raise ValueError("sandboxd lacks exact clean release build ID")
         release_receipt = {
             "schema_version": "vane.release-receipt/v1",
             "source_revision": source_sha,
@@ -404,6 +434,8 @@ def validate(
             encoding="utf-8",
         )
         os.chmod(output_dir / "release-receipt.json", 0o644)
+        shutil.copy2(input_dir / manifest_name, output_dir / "backend-manifest.json")
+        os.chmod(output_dir / "backend-manifest.json", 0o644)
     except Exception:
         shutil.rmtree(output_dir)
         raise

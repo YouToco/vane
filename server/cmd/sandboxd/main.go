@@ -44,7 +44,26 @@ type config struct {
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(dispatch(ctx, os.Args, os.Stdout, os.Stderr))
+}
+
+func dispatch(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
+	if len(argv) == 0 {
+		return 2
+	}
+	if filepath.Base(argv[0]) == "vane-sandbox-init" {
+		return runGuest(argv[1:], stdout, stderr)
+	}
+	if len(argv) > 1 && argv[1] == "release-gate" {
+		return runReleaseGate(ctx, argv[2:], stdout, stderr)
+	}
+	if len(argv) > 1 && argv[1] == "release-gate-netns-preflight" {
+		return runReleaseGateNetNSPreflight(argv[2:], stdout, stderr)
+	}
+	if len(argv) > 1 && argv[1] == "release-gate-reap" {
+		return runReleaseGateReap(argv[2:], stderr)
+	}
+	return run(ctx, argv[1:], stdout, stderr)
 }
 
 func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) int {

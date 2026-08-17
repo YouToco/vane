@@ -432,6 +432,18 @@ func TestNetNSMountPointRequiresTopologyInspection(t *testing.T) {
 	}); err == nil {
 		t.Fatal("netns topology failure accepted")
 	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyEmptyNetNS(path, false, func(string) error { return nil }); err != nil {
+		t.Fatalf("real nsfs mount mode rejected: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyEmptyNetNS(path, false, func(string) error { return nil }); err == nil {
+		t.Fatal("writable netns mount point accepted")
+	}
 }
 
 func TestRelativeNetNSPathFailsWithoutAncestorLoop(t *testing.T) {
@@ -455,7 +467,7 @@ func TestArtifactPinsRejectDigestSymlinkAndWritablePath(t *testing.T) {
 	if err := os.WriteFile(path, []byte("kernel"), 0o400); err != nil {
 		t.Fatal(err)
 	}
-	pin := ArtifactPin{Path: path, SHA256: sha256Hex([]byte("kernel"))}
+	pin := ArtifactPin{Path: path, SHA256: sha256Hex([]byte("kernel")), SizeBytes: int64(len("kernel"))}
 	if err := verifyPinnedArtifact("kernel", pin, false); err != nil {
 		t.Fatal(err)
 	}
@@ -464,11 +476,16 @@ func TestArtifactPinsRejectDigestSymlinkAndWritablePath(t *testing.T) {
 	if err := verifyPinnedArtifact("kernel", wrong, false); err == nil {
 		t.Fatal("wrong artifact digest accepted")
 	}
+	wrong = pin
+	wrong.SizeBytes++
+	if err := verifyPinnedArtifact("kernel", wrong, false); err == nil {
+		t.Fatal("wrong artifact size accepted")
+	}
 	symlink := filepath.Join(directory, "kernel-link")
 	if err := os.Symlink(path, symlink); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyPinnedArtifact("kernel", ArtifactPin{Path: symlink, SHA256: pin.SHA256}, false); err == nil {
+	if err := verifyPinnedArtifact("kernel", ArtifactPin{Path: symlink, SHA256: pin.SHA256, SizeBytes: pin.SizeBytes}, false); err == nil {
 		t.Fatal("symlink artifact accepted")
 	}
 	hardlink := filepath.Join(directory, "kernel-hardlink")
@@ -575,6 +592,187 @@ func TestFirecrackerTestHarnessEnforcesTimeoutAndOutputCap(t *testing.T) {
 		result.ErrorCode != "output_limit" || result.Output != nil {
 		t.Fatalf("output result=%+v err=%v", result, err)
 	}
+	reportedBackend, _ := NewFirecrackerBackend(config, launcherFunc(
+		func(context.Context, LaunchPlan) ([]byte, error) { return nil, ErrOutputLimit }))
+	if result, err := reportedBackend.Run(t.Context(), outputRequest); !errors.Is(err, ErrOutputLimit) ||
+		result.ErrorCode != "output_limit" || result.Status != "killed" {
+		t.Fatalf("launcher output-limit result=%+v err=%v", result, err)
+	}
+}
+
+func TestArtifactCopyHonorsInvocationContextAndNeverClaimsPartialSuccess(t *testing.T) {
+	payload := bytes.Repeat([]byte("bounded"), 1024)
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.WriteFile(source, payload, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	pin := ArtifactPin{Path: source, SHA256: sha256Hex(payload), SizeBytes: int64(len(payload))}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := copyPinnedFile(ctx, pin, filepath.Join(t.TempDir(), "copy")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled artifact copy err=%v", err)
+	}
+	wrong := pin
+	wrong.SHA256 = strings.Repeat("0", 64)
+	if err := copyPinnedFile(t.Context(), wrong, filepath.Join(t.TempDir(), "wrong-copy")); err == nil {
+		t.Fatal("copied artifact digest mismatch accepted")
+	}
+}
+
+func TestProductionSelfTestRequiresPreflightAndExactGuestReceipt(t *testing.T) {
+	config := testFirecrackerConfig(t)
+	config.Production = true
+	config.CgroupRoot = "/sys/fs/cgroup"
+	config.CgroupParent = "system.slice/vane-firecracker-gate-" + strings.Repeat("a", 40) + ".service"
+	config.InheritCgroupLimits = true
+	if err := config.BindServiceIdentities(1001, 0, 1001); err != nil {
+		t.Fatal(err)
+	}
+	request := testRequest(t, "release-gate", 1, 1)
+	request.CapabilityID = GateCapabilityID
+	request.CapabilityVersion = sha256Hex([]byte("capability-package"))
+	request.Policy.PIDsMax = 64
+	request, _ = request.Seal()
+	config.CodeImages = map[string]ArtifactPin{GateCapabilityID + "@" + request.CapabilityVersion: config.CodeImages["skill.catalog.readonly@"+request.CapabilityVersion]}
+	inputDigest := sha256.Sum256(request.Input)
+	responseDigest := sha256.Sum256(append([]byte("vane-firecracker-self-test/v1\x00"), request.Input...))
+	receipt, err := json.Marshal(GuestReceipt{Schema: "vane.firecracker-guest-receipt/v1",
+		InvocationID: request.InvocationID, RequestSHA256: request.RequestDigest,
+		InputSHA256: hex.EncodeToString(inputDigest[:]), ResponseSHA256: hex.EncodeToString(responseDigest[:]),
+		GuestUID: request.Policy.GuestUID, GuestGID: request.Policy.GuestGID,
+		OnlyLoopback: true, NoDefaultRoute: true, MMDSUnavailable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gatePlan LaunchPlan
+	launcher := launcherFunc(func(_ context.Context, plan LaunchPlan) ([]byte, error) {
+		gatePlan = plan
+		return append(append([]byte("boot log\n"+guestReceiptMark), receipt...), '\n'), nil
+	})
+	backend, err := NewFirecrackerBackend(config, launcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.RunGateSelfTest(t.Context(), request); err == nil || !strings.Contains(err.Error(), "fixed production Gate") {
+		t.Fatalf("self-test ran before preflight: %v", err)
+	}
+	backend.preflightOK = true // unit substitute for the real Linux/KVM preflight
+	backend.scrubCG = func(string) error { return nil }
+	result, err := backend.RunGateSelfTest(t.Context(), request)
+	if err != nil || result.Status != "succeeded" || !bytes.Equal(result.Output, receipt) {
+		t.Fatalf("self-test result=%+v err=%v", result, err)
+	}
+	if gatePlan.CgroupPath != "" || argumentAfter(gatePlan.Arguments, "--parent-cgroup") != config.CgroupParent ||
+		slices.Contains(gatePlan.Arguments, "cpu.max=50000 100000") ||
+		slices.Contains(gatePlan.Arguments, "memory.max=201326592") ||
+		slices.Contains(gatePlan.Arguments, "pids.max=32") {
+		t.Fatalf("release Gate escaped inherited systemd limits: %+v", gatePlan)
+	}
+	if filepath.Base(gatePlan.PIDFile) != "firecracker.pid" ||
+		gatePlan.CgroupKill != "/sys/fs/cgroup/"+config.CgroupParent+"/cgroup.kill" {
+		t.Fatalf("release Gate child supervisor authority is incomplete: %+v", gatePlan)
+	}
+	mutated := append([]byte(nil), receipt...)
+	mutated[len(mutated)-2] ^= 1
+	backend.launcher = launcherFunc(func(context.Context, LaunchPlan) ([]byte, error) {
+		return append(append([]byte(guestReceiptMark), mutated...), '\n'), nil
+	})
+	if _, err := backend.RunGateSelfTest(t.Context(), request); err == nil {
+		t.Fatal("mutated guest receipt was accepted")
+	}
+	backend.launcher = launcherFunc(func(context.Context, LaunchPlan) ([]byte, error) {
+		return nil, errors.New("simulated Firecracker failure")
+	})
+	if _, err := backend.RunGateSelfTest(t.Context(), request); err == nil || !strings.Contains(err.Error(), "simulated") {
+		t.Fatalf("Firecracker failure hidden: %v", err)
+	}
+}
+
+func TestPreflightFailureRevokesEarlierReadinessAndProductionCgroupIsExact(t *testing.T) {
+	config := testFirecrackerConfig(t)
+	backend, err := NewFirecrackerBackend(config, &recordingLauncher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.preflightOK = true
+	if err := backend.Preflight(t.Context()); err == nil {
+		t.Fatal("fixture unexpectedly passed real Firecracker preflight")
+	}
+	if backend.preflightOK {
+		t.Fatal("failed preflight retained earlier readiness")
+	}
+	config.Production = true
+	if err := config.BindServiceIdentities(1001, 0, 1001); err != nil {
+		t.Fatal(err)
+	}
+	config.CgroupRoot = "/tmp/not-production-cgroup"
+	if _, err := NewFirecrackerBackend(config, &recordingLauncher{}); err == nil || !strings.Contains(err.Error(), "cgroup root") {
+		t.Fatalf("noncanonical production cgroup root err=%v", err)
+	}
+	config.CgroupRoot = "/sys/fs/cgroup"
+	config.InheritCgroupLimits = true
+	config.CgroupParent = ""
+	if _, err := NewFirecrackerBackend(config, &recordingLauncher{}); err == nil ||
+		!strings.Contains(err.Error(), "exact production parent") {
+		t.Fatalf("inherited limits without a parent err=%v", err)
+	}
+}
+
+func TestCgroupScrubContractRejectsEveryAmbiguousState(t *testing.T) {
+	path := "/sys/fs/cgroup/firecracker/vane-test"
+	directory := stubFileInfo{mode: os.ModeDir | 0o700}
+	lstat := func(string) (os.FileInfo, error) { return directory, nil }
+	readEmpty := func(string) ([]byte, error) { return nil, nil }
+	removeOK := func(string) error { return nil }
+	if err := scrubCgroupWith(path, lstat, readEmpty, removeOK); err != nil {
+		t.Fatal(err)
+	}
+	for name, candidate := range map[string]struct {
+		path   string
+		stat   func(string) (os.FileInfo, error)
+		read   func(string) ([]byte, error)
+		remove func(string) error
+	}{
+		"unsafe path":    {"/tmp/cgroup", lstat, readEmpty, removeOK},
+		"missing":        {path, func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }, readEmpty, removeOK},
+		"symlink":        {path, func(string) (os.FileInfo, error) { return stubFileInfo{mode: os.ModeSymlink}, nil }, readEmpty, removeOK},
+		"live process":   {path, lstat, func(string) ([]byte, error) { return []byte("123\n"), nil }, removeOK},
+		"unreadable":     {path, lstat, func(string) ([]byte, error) { return nil, os.ErrPermission }, removeOK},
+		"remove failure": {path, lstat, readEmpty, func(string) error { return os.ErrPermission }},
+	} {
+		if err := scrubCgroupWith(candidate.path, candidate.stat, candidate.read, candidate.remove); err == nil {
+			t.Fatalf("%s cgroup state accepted", name)
+		}
+	}
+}
+
+func TestGuestReceiptRejectsMissingDuplicateAndNonCanonicalEvidence(t *testing.T) {
+	request := testRequest(t, "receipt-negative", 1, 2)
+	if _, err := parseGuestReceipt(nil, request); err == nil {
+		t.Fatal("missing receipt accepted")
+	}
+	duplicate := []byte(guestReceiptMark + "{}\n" + guestReceiptMark + "{}\n")
+	if _, err := parseGuestReceipt(duplicate, request); err == nil {
+		t.Fatal("duplicate receipt accepted")
+	}
+	if _, err := parseGuestReceipt([]byte(guestReceiptMark+"{\"unexpected\":true}\n"), request); err == nil {
+		t.Fatal("unknown receipt field accepted")
+	}
+	invalid := GuestReceipt{Schema: "vane.firecracker-guest-receipt/v1", InvocationID: request.InvocationID}
+	payload, _ := json.Marshal(invalid)
+	if _, err := parseGuestReceipt(append(append([]byte(guestReceiptMark), payload...), '\n'), request); err == nil {
+		t.Fatal("incomplete receipt accepted")
+	}
+	inputDigest := sha256.Sum256(request.Input)
+	responseDigest := sha256.Sum256(append([]byte("vane-firecracker-self-test/v1\x00"), request.Input...))
+	valid := GuestReceipt{Schema: "vane.firecracker-guest-receipt/v1", InvocationID: request.InvocationID,
+		RequestSHA256: request.RequestDigest, InputSHA256: hex.EncodeToString(inputDigest[:]),
+		ResponseSHA256: hex.EncodeToString(responseDigest[:]), GuestUID: request.Policy.GuestUID,
+		GuestGID: request.Policy.GuestGID, OnlyLoopback: true, NoDefaultRoute: true, MMDSUnavailable: true}
+	payload, _ = json.MarshalIndent(valid, "", "  ")
+	if _, err := parseGuestReceipt(append(append([]byte(guestReceiptMark), payload...), '\n'), request); err == nil {
+		t.Fatal("noncanonical receipt accepted")
+	}
 }
 
 func TestRouteFixturesPermitOnlyLoopback(t *testing.T) {
@@ -597,6 +795,20 @@ func TestRouteFixturesPermitOnlyLoopback(t *testing.T) {
 	defaultViaLoopback = strings.Replace(defaultViaLoopback, "000000FF", "00000000", 1)
 	if err := validateRouteTable(strings.NewReader(defaultViaLoopback), false); err == nil {
 		t.Fatal("IPv4 default route via loopback accepted")
+	}
+}
+
+func TestGateNetNSPinsTheCallingThreadNamespace(t *testing.T) {
+	_, sourcePath, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("test source path unavailable")
+	}
+	payload, err := os.ReadFile(filepath.Join(filepath.Dir(sourcePath), "gate_netns_linux.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(payload, []byte("/proc/self/task/%d/ns/net")) || bytes.Contains(payload, []byte("/proc/self/ns/net")) {
+		t.Fatal("Gate netns mount can follow the process leader instead of the locked calling thread")
 	}
 }
 
@@ -675,7 +887,7 @@ func TestFirecrackerPlanHasNoNetworkReadOnlyCgroupsAndCrashCleanup(t *testing.T)
 		t.Fatal("simulated crash was hidden")
 	}
 	plan := launcher.plan
-	for _, required := range []string{"cpu.max=50000 100000", "memory.max=134217728", "pids.max=32"} {
+	for _, required := range []string{"cpu.max=50000 100000", "memory.max=201326592", "pids.max=32"} {
 		if !slices.Contains(plan.Arguments, required) {
 			t.Errorf("jailer plan missing %q: %v", required, plan.Arguments)
 		}
@@ -764,6 +976,15 @@ type authorizerFunc func(*net.UnixConn) error
 
 func (f authorizerFunc) Authorize(conn *net.UnixConn) error { return f(conn) }
 
+type stubFileInfo struct{ mode os.FileMode }
+
+func (stubFileInfo) Name() string        { return "fixture" }
+func (stubFileInfo) Size() int64         { return 0 }
+func (v stubFileInfo) Mode() os.FileMode { return v.mode }
+func (stubFileInfo) ModTime() time.Time  { return time.Time{} }
+func (v stubFileInfo) IsDir() bool       { return v.mode.IsDir() }
+func (stubFileInfo) Sys() any            { return nil }
+
 type recordingLauncher struct {
 	plan       LaunchPlan
 	configCopy string
@@ -829,7 +1050,7 @@ func testFirecrackerConfig(t *testing.T) FirecrackerConfig {
 		if err := os.WriteFile(path, payload, 0o500); err != nil {
 			t.Fatal(err)
 		}
-		pins[name] = ArtifactPin{Path: path, SHA256: sha256Hex(payload)}
+		pins[name] = ArtifactPin{Path: path, SHA256: sha256Hex(payload), SizeBytes: int64(len(payload))}
 	}
 	netNS := filepath.Join(directory, "empty.netns")
 	if err := os.WriteFile(netNS, nil, 0o600); err != nil {

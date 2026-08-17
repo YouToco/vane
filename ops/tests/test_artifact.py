@@ -119,6 +119,9 @@ class ArtifactValidationTest(unittest.TestCase):
         )
         self.assertTrue((output / "bin/vane-research-gateway").is_file())
         self.assertTrue((output / "bin/agentfirstretention").is_file())
+        self.assertTrue((output / "bin/sandboxd").is_file())
+        self.assertTrue((output / "sandbox/manifest.json").is_file())
+        self.assertTrue((output / "backend-manifest.json").is_file())
         receipt_raw = (output / "release-receipt.json").read_text(encoding="utf-8")
         receipt = json.loads(receipt_raw, object_pairs_hook=artifact.strict_object)
         self.assertEqual(
@@ -196,6 +199,28 @@ class ArtifactValidationTest(unittest.TestCase):
         for suffix in ("tar.gz", "manifest.json", "sha256"):
             name = f"backend-{SHA}.{suffix}"
             self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+
+    def test_bridge_release_keeps_legacy_base_shape_until_activation(self) -> None:
+        source = self.root / "bridge-source"
+        for name, mode in artifact.BASE_BACKEND_FILES.items():
+            path = source / artifact.BACKEND_SOURCE_PATHS[name]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"fixture vane/{SHA}/clean\n".encode())
+            path.chmod(mode)
+        packed = self.root / "bridge-packed"
+        artifact.pack(
+            "backend", source, SHA, packed, artifact.SERVER_RELEASE_CONTRACT,
+            CONTROL_SHA, "123456", 2,
+        )
+        manifest = json.loads(self.manifest_path(packed).read_text())
+        self.assertEqual(
+            {entry["path"] for entry in manifest["files"]},
+            set(artifact.BASE_BACKEND_FILES),
+        )
+        artifact.validate(
+            "backend", SHA, packed, self.root / "bridge-verified",
+            control_plane_revision=CONTROL_SHA, deploy_run_id="123456",
+        )
 
     def test_backend_validate_binds_control_plane_and_run(self) -> None:
         source = self.root / "backend-identity-source"

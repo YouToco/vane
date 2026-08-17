@@ -12,6 +12,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var currentThreadRouteFiles = [...]struct {
+	path string
+	ipv6 bool
+}{
+	{"/proc/thread-self/net/route", false},
+	{"/proc/thread-self/net/ipv6_route", true},
+}
+
 // inspectNetworkNamespace performs the topology inspection from inside the
 // target namespace. A failed restore deliberately leaves the goroutine locked:
 // the Go runtime then terminates that OS thread instead of returning a thread
@@ -70,6 +78,11 @@ func inspectNetworkNamespace(path string) error {
 	return <-done
 }
 
+// InspectGateNetNS performs the same closed topology proof used by the fixed
+// Firecracker release Gate. It is exported only for sandboxd's root-only
+// transient-unit preflight; it does not create or grant namespace authority.
+func InspectGateNetNS(path string) error { return inspectNetworkNamespace(path) }
+
 func inspectCurrentNetworkNamespace() error {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -85,10 +98,11 @@ func inspectCurrentNetworkNamespace() error {
 	if !hasLoopback {
 		return errors.New("netns has no loopback interface")
 	}
-	for _, routeFile := range []struct {
-		path string
-		ipv6 bool
-	}{{"/proc/net/route", false}, {"/proc/net/ipv6_route", true}} {
+	// setns(2) changes only the calling OS thread. /proc/net and
+	// /proc/self/net can resolve through the thread-group leader and therefore
+	// observe the host namespace when this goroutine is running on another
+	// thread. thread-self binds the read to the locked calling thread.
+	for _, routeFile := range currentThreadRouteFiles {
 		if err := rejectNonLoopbackRoutes(routeFile.path, routeFile.ipv6); err != nil {
 			return err
 		}
