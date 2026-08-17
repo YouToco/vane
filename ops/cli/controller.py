@@ -1325,6 +1325,13 @@ def build_release_submission(
     shutil.copytree(
         committed_infra, source / "infra/production", symlinks=False
     )
+    run_checked(
+        [sys.executable, str(committed_source / "ops/sandbox/prepare_artifacts.py"),
+         "--lock", str(committed_source / "ops/sandbox/firecracker-v1.16.1-x86_64.lock.json"),
+         "--sandboxd", str(source / "server/bin/sandboxd"),
+         "--output", str(source / "server/sandbox"), "--revision", revision],
+        cwd=committed_source,
+    )
     artifacts = handoff / "artifacts"
     backend_pack = artifacts / "backend-pack"
     backend_payload = artifacts / "backend-payload"

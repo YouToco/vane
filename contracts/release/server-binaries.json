@@ -5,6 +5,7 @@
     {"name": "vane-research-gateway", "package": "./cmd/researchgateway", "role": "service"},
     {"name": "vane-migrate", "package": "./cmd/migrate", "role": "migration"},
     {"name": "gate", "package": "./cmd/gate", "role": "verification"},
-    {"name": "agentfirstretention", "package": "./cmd/agentfirstretention", "role": "maintenance"}
+    {"name": "agentfirstretention", "package": "./cmd/agentfirstretention", "role": "maintenance"},
+    {"name": "sandboxd", "package": "./cmd/sandboxd", "role": "explicit-security-gate"}
   ]
 }

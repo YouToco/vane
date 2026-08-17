@@ -92,9 +92,11 @@ class FirecrackerArtifactContractTest(unittest.TestCase):
             self.assertNotIn("debug", lock[name]["member"])
             self.assertRegex(lock[name]["sha256"], r"^[0-9a-f]{64}$")
 
-    def test_hardened_bridge_accepts_future_bundle_without_self_activation(self) -> None:
+    def test_activation_materializes_only_after_hardened_bridge_before_backend_pack(self) -> None:
         source = (OPS / "cli/controller.py").read_text(encoding="utf-8")
-        self.assertNotIn("ops/sandbox/prepare_artifacts.py", source)
+        prepare_call = source.index("ops/sandbox/prepare_artifacts.py")
+        pack_call = source.index('str(artifact_tool), "pack"', prepare_call)
+        self.assertLess(prepare_call, pack_call)
         artifact_source = (OPS / "release/artifact.py").read_text(encoding="utf-8")
         self.assertIn("set(BASE_BACKEND_FILES)", artifact_source)
         self.assertIn("set(BACKEND_FILES)", artifact_source)

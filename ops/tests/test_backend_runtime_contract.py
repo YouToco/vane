@@ -33,10 +33,10 @@ class BackendRuntimeContractTest(unittest.TestCase):
             (REPO / "contracts/release/server-binaries.json").read_text(encoding="utf-8")
         )["binaries"]
         binaries = {f"bin/{entry['name']}" for entry in inventory}
-        self.assertEqual(len(binaries), 5)
+        self.assertEqual(len(binaries), 6)
         self.assertEqual(
             binaries,
-            {name for name in artifact.BASE_BACKEND_FILES if name.startswith("bin/")},
+            {name for name in artifact.BACKEND_FILES if name.startswith("bin/")},
         )
         self.assertEqual(
             {name for name in artifact.BACKEND_FILES if name.startswith("deploy/")},
