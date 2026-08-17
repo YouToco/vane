@@ -44,6 +44,10 @@ func TestMigration152CapabilityInvocationLedgerContract(t *testing.T) {
 		schemaLock >= admissionLock || admissionLock >= ledgerLock {
 		t.Fatal("migration 152 Down does not follow schema -> admission -> ledger lock order")
 	}
+	if !strings.Contains(source, "pg_try_advisory_xact_lock") ||
+		!strings.Contains(source, "admission is busy; rollback and retry downgrade") {
+		t.Fatal("migration 152 Down does not fail closed on busy tenant admission")
+	}
 }
 
 func TestMigration152CapabilityInvocationLedgerPostgres(t *testing.T) {
@@ -51,12 +55,17 @@ func TestMigration152CapabilityInvocationLedgerPostgres(t *testing.T) {
 	if databaseURL == "" {
 		testgate.Database(t)
 	}
-	database, provider, _, drop := migration128Scratch(t, databaseURL)
+	database, provider, scratchURL, drop := migration128Scratch(t, databaseURL)
 	t.Cleanup(drop)
 	if _, err := provider.UpTo(t.Context(), 152); err != nil {
 		t.Fatal(err)
 	}
 	admissionUser, admittedTenant := migration128Identity(t, database)
+	st, err := New(t.Context(), scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
 	if _, err := database.ExecContext(t.Context(),
 		`SELECT public.assert_vane_capability_invocation_coordinator_v152()`); err != nil {
 		t.Fatal(err)
@@ -90,6 +99,12 @@ func TestMigration152CapabilityInvocationLedgerPostgres(t *testing.T) {
 			  user_id=NULLIF(current_setting('app.user_id',true),'')::bigint) OR true)`},
 		{"missing RLS policy", `DROP POLICY capability_invocation_select
 			ON capability_invocations`},
+		{"decoy schema column ACL", `DO $mutation$ BEGIN
+			EXECUTE 'CREATE SCHEMA capability_acl_decoy';
+			EXECUTE 'CREATE TABLE capability_acl_decoy.capability_invocations(lease_until timestamptz)';
+			EXECUTE 'REVOKE UPDATE(lease_until) ON public.capability_invocations FROM vane_capability_invocation_coordinator';
+			EXECUTE 'GRANT UPDATE(lease_until) ON capability_acl_decoy.capability_invocations TO vane_capability_invocation_coordinator';
+			END $mutation$`},
 		{"receipt delete authority", `GRANT DELETE ON capability_invocation_receipts
 			TO vane_capability_invocation_coordinator`},
 		{"delegable role edge", `GRANT vane_capability_invocation_coordinator TO CURRENT_USER
@@ -114,73 +129,83 @@ func TestMigration152CapabilityInvocationLedgerPostgres(t *testing.T) {
 		})
 	}
 
-	// Hold the same shared advisory admission lock that every runtime settlement
-	// acquires, then start the real goose Down on a second connection. Down must
-	// wait at tenant admission instead of taking the ledger first; the runtime
-	// transaction can therefore acquire its ledger lock and finish without a
-	// lock cycle.
-	admissionTx, err := database.BeginTx(t.Context(), nil)
+	// Block the real production PurgeTenant after it has acquired exclusive tenant
+	// admission. The real goose Down must try (not wait for) that admission while
+	// holding its schema freeze, reject explicitly, and roll back without 40P01.
+	blockerTx, err := database.BeginTx(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := admissionTx.ExecContext(t.Context(), `SELECT pg_advisory_xact_lock_shared(
-		hashtextextended('vane/tenant-admission/v1/'||($1::bigint)::text,1447120453))`, admittedTenant); err != nil {
-		_ = admissionTx.Rollback()
+	defer func() { _ = blockerTx.Rollback() }()
+	if _, err := blockerTx.ExecContext(t.Context(),
+		`LOCK TABLE push_batches IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
-	downDone := make(chan error, 1)
+	purgeContext, cancelPurge := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelPurge()
+	purgeDone := make(chan error, 1)
 	go func() {
-		_, downErr := provider.DownTo(context.Background(), 151)
-		downDone <- downErr
+		_, purgeErr := st.PurgeTenant(purgeContext, admittedTenant, false)
+		purgeDone <- purgeErr
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		var waitingAtAdmission bool
+		var purgeBlockedAfterAdmission bool
 		if err := database.QueryRowContext(t.Context(), `SELECT EXISTS(
 			SELECT 1 FROM pg_catalog.pg_stat_activity
 			WHERE datname=current_database() AND pid<>pg_backend_pid()
-			  AND wait_event_type='Lock' AND wait_event='advisory'
-			  AND query LIKE '%vane/tenant-admission/v1/%')`).
-			Scan(&waitingAtAdmission); err != nil {
-			_ = admissionTx.Rollback()
+			  AND wait_event_type='Lock'
+			  AND query LIKE '%tenant purge push batch lock order%')`).
+			Scan(&purgeBlockedAfterAdmission); err != nil {
 			t.Fatal(err)
 		}
-		if waitingAtAdmission {
+		if purgeBlockedAfterAdmission {
 			break
 		}
 		if time.Now().After(deadline) {
-			_ = admissionTx.Rollback()
-			t.Fatal("migration 152 Down did not block at tenant admission lock")
+			t.Fatal("PurgeTenant did not reach its post-admission production lock path")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := admissionTx.ExecContext(t.Context(), `SET LOCAL lock_timeout='2s'`); err != nil {
-		_ = admissionTx.Rollback()
+	downStarted := time.Now()
+	if _, err := provider.DownTo(t.Context(), 151); err == nil ||
+		!strings.Contains(err.Error(), "admission is busy") ||
+		strings.Contains(err.Error(), "40P01") || strings.Contains(strings.ToLower(err.Error()), "deadlock") {
+		t.Fatalf("busy PurgeTenant downgrade err=%v, want explicit non-deadlock retry rejection", err)
+	} else if time.Since(downStarted) > 3*time.Second {
+		t.Fatalf("busy PurgeTenant downgrade waited instead of failing closed: %v", time.Since(downStarted))
+	}
+	var ledgerRetained bool
+	if err := database.QueryRowContext(t.Context(), `SELECT
+		to_regclass('public.capability_invocations') IS NOT NULL AND
+		to_regclass('public.capability_invocation_receipts') IS NOT NULL`).Scan(&ledgerRetained); err != nil {
 		t.Fatal(err)
 	}
-	var admittedUser int64
-	if err := admissionTx.QueryRowContext(t.Context(), `SELECT membership.user_id
-		FROM memberships membership JOIN tenants tenant ON tenant.id=membership.tenant_id
-		WHERE tenant.id=$1 AND membership.user_id=$2 FOR SHARE OF membership,tenant`,
-		admittedTenant, admissionUser).Scan(&admittedUser); err != nil {
-		_ = admissionTx.Rollback()
-		t.Fatalf("runtime authority locks deadlocked with Down schema freeze: %v", err)
+	if !ledgerRetained {
+		t.Fatal("busy admission downgrade silently removed ledger schema")
 	}
-	if _, err := admissionTx.ExecContext(t.Context(),
-		`LOCK TABLE capability_invocations IN ROW EXCLUSIVE MODE`); err != nil {
-		_ = admissionTx.Rollback()
-		t.Fatalf("runtime admission->ledger lock order deadlocked with Down: %v", err)
-	}
-	if err := admissionTx.Commit(); err != nil {
+	if err := blockerTx.Rollback(); err != nil && err != sql.ErrTxDone {
 		t.Fatal(err)
 	}
 	select {
-	case err := <-downDone:
+	case err := <-purgeDone:
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("PurgeTenant after rejected Down err=%v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("migration 152 Down did not finish after admission transaction committed")
+	case <-time.After(10 * time.Second):
+		t.Fatal("PurgeTenant did not finish after test barrier released")
+	}
+	var membershipGone bool
+	if err := database.QueryRowContext(t.Context(), `SELECT NOT EXISTS(
+		SELECT 1 FROM memberships WHERE tenant_id=$1 AND user_id=$2)`,
+		admittedTenant, admissionUser).Scan(&membershipGone); err != nil {
+		t.Fatal(err)
+	}
+	if !membershipGone {
+		t.Fatal("production PurgeTenant path did not remove the target membership")
+	}
+	if _, err := provider.DownTo(t.Context(), 151); err != nil {
+		t.Fatal(err)
 	}
 	var tablesGone bool
 	if err := database.QueryRowContext(t.Context(), `SELECT

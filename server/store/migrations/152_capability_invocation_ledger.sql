@@ -356,63 +356,71 @@ BEGIN
       'public.capability_invocation_receipts'::regclass)
   INTO tables_safe;
   SELECT has_table_privilege('vane_capability_invocation_coordinator',
-           'capability_invocations','SELECT,INSERT') AND
+           'public.capability_invocations','SELECT,INSERT') AND
          NOT has_table_privilege('vane_capability_invocation_coordinator',
-           'capability_invocations','UPDATE,DELETE,TRUNCATE') AND
+           'public.capability_invocations','UPDATE,DELETE,TRUNCATE') AND
          has_column_privilege('vane_capability_invocation_coordinator',
-           'capability_invocations','status','UPDATE') AND
+           'public.capability_invocations','status','UPDATE') AND
          has_table_privilege('vane_capability_invocation_coordinator',
-           'capability_invocation_receipts','SELECT,INSERT') AND
+           'public.capability_invocation_receipts','SELECT,INSERT') AND
          NOT has_table_privilege('vane_capability_invocation_coordinator',
-           'capability_invocation_receipts','UPDATE,DELETE,TRUNCATE') AND
+           'public.capability_invocation_receipts','UPDATE,DELETE,TRUNCATE') AND
          has_sequence_privilege('vane_capability_invocation_coordinator',
-           'capability_invocation_receipts_id_seq','USAGE,SELECT')
+           'public.capability_invocation_receipts_id_seq','USAGE,SELECT')
   INTO grants_safe;
   WITH role_oid AS (SELECT oid FROM pg_catalog.pg_roles
-    WHERE rolname='vane_capability_invocation_coordinator'), entries AS (
-    SELECT relation.relname object_name,NULL::text column_name,
+    WHERE rolname='vane_capability_invocation_coordinator'),
+  expected(object_kind,object_oid,attnum,privilege_type) AS (VALUES
+    ('relation','public.capability_invocations'::regclass::oid,0::smallint,'SELECT'),
+    ('relation','public.capability_invocations'::regclass::oid,0::smallint,'INSERT'),
+    ('relation','public.capability_invocation_receipts'::regclass::oid,0::smallint,'SELECT'),
+    ('relation','public.capability_invocation_receipts'::regclass::oid,0::smallint,'INSERT'),
+    ('sequence','public.capability_invocation_receipts_id_seq'::regclass::oid,0::smallint,'SELECT'),
+    ('sequence','public.capability_invocation_receipts_id_seq'::regclass::oid,0::smallint,'USAGE'),
+    ('column','public.capability_invocations'::regclass::oid,
+      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='status' AND NOT attisdropped),'UPDATE'),
+    ('column','public.capability_invocations'::regclass::oid,
+      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='lease_owner' AND NOT attisdropped),'UPDATE'),
+    ('column','public.capability_invocations'::regclass::oid,
+      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='lease_until' AND NOT attisdropped),'UPDATE'),
+    ('column','public.capability_invocations'::regclass::oid,
+      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='fence' AND NOT attisdropped),'UPDATE'),
+    ('column','public.capability_invocations'::regclass::oid,
+      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='attempt' AND NOT attisdropped),'UPDATE'),
+    ('column','public.capability_invocations'::regclass::oid,
+      (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid='public.capability_invocations'::regclass AND attname='current_receipt_ordinal' AND NOT attisdropped),'UPDATE'),
+    ('schema','public'::regnamespace::oid,0::smallint,'USAGE')
+  ), actual AS (
+    SELECT CASE relation.relkind WHEN 'S' THEN 'sequence' ELSE 'relation' END object_kind,
+           relation.oid object_oid,0::smallint attnum,
            acl.privilege_type,acl.is_grantable
       FROM pg_catalog.pg_class relation
       CROSS JOIN LATERAL pg_catalog.aclexplode(relation.relacl) acl
-     WHERE relation.relname IN('capability_invocations','capability_invocation_receipts',
-                               'capability_invocation_receipts_id_seq')
+     WHERE relation.relnamespace='public'::regnamespace AND relation.oid IN(
+             'public.capability_invocations'::regclass,
+             'public.capability_invocation_receipts'::regclass,
+             'public.capability_invocation_receipts_id_seq'::regclass)
        AND acl.grantee=(SELECT oid FROM role_oid)
     UNION ALL
-    SELECT relation.relname,attribute.attname,acl.privilege_type,acl.is_grantable
-      FROM pg_catalog.pg_class relation
-      JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid=relation.oid
+    SELECT 'column',attribute.attrelid,attribute.attnum,
+           acl.privilege_type,acl.is_grantable
+      FROM pg_catalog.pg_attribute attribute
       CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) acl
-     WHERE relation.relname='capability_invocations' AND
-           acl.grantee=(SELECT oid FROM role_oid)
+     WHERE attribute.attrelid='public.capability_invocations'::regclass AND
+           NOT attribute.attisdropped AND acl.grantee=(SELECT oid FROM role_oid)
     UNION ALL
-    SELECT namespace.nspname,NULL::text,acl.privilege_type,acl.is_grantable
+    SELECT 'schema',namespace.oid,0::smallint,acl.privilege_type,acl.is_grantable
       FROM pg_catalog.pg_namespace namespace
       CROSS JOIN LATERAL pg_catalog.aclexplode(namespace.nspacl) acl
-     WHERE namespace.nspname='public' AND acl.grantee=(SELECT oid FROM role_oid)
+     WHERE namespace.oid='public'::regnamespace AND acl.grantee=(SELECT oid FROM role_oid)
   )
-  SELECT count(*) FILTER(WHERE NOT is_grantable AND (
-      (object_name='capability_invocations' AND column_name IS NULL AND
-       privilege_type IN('SELECT','INSERT')) OR
-      (object_name='capability_invocation_receipts' AND column_name IS NULL AND
-       privilege_type IN('SELECT','INSERT')) OR
-      (object_name='capability_invocations' AND
-       column_name IN('status','lease_owner','lease_until','fence','attempt',
-                      'current_receipt_ordinal') AND privilege_type='UPDATE') OR
-      (object_name='capability_invocation_receipts_id_seq' AND column_name IS NULL AND
-       privilege_type IN('SELECT','USAGE')) OR
-      (object_name='public' AND column_name IS NULL AND privilege_type='USAGE'))),
-    count(*) FILTER(WHERE is_grantable OR NOT (
-      (object_name='capability_invocations' AND column_name IS NULL AND
-       privilege_type IN('SELECT','INSERT')) OR
-      (object_name='capability_invocation_receipts' AND column_name IS NULL AND
-       privilege_type IN('SELECT','INSERT')) OR
-      (object_name='capability_invocations' AND
-       column_name IN('status','lease_owner','lease_until','fence','attempt',
-                      'current_receipt_ordinal') AND privilege_type='UPDATE') OR
-      (object_name='capability_invocation_receipts_id_seq' AND column_name IS NULL AND
-       privilege_type IN('SELECT','USAGE')) OR
-      (object_name='public' AND column_name IS NULL AND privilege_type='USAGE')))
-    INTO expected_acl_count,unexpected_acl_count FROM entries;
+  SELECT count(*) FILTER(WHERE expected.object_oid IS NOT NULL AND
+                               actual.object_oid IS NOT NULL AND NOT actual.is_grantable),
+         count(*) FILTER(WHERE expected.object_oid IS NULL OR actual.object_oid IS NULL OR
+                               actual.is_grantable)
+    INTO expected_acl_count,unexpected_acl_count
+    FROM expected FULL JOIN actual
+      USING(object_kind,object_oid,attnum,privilege_type);
   grants_safe := grants_safe AND expected_acl_count=13 AND unexpected_acl_count=0;
   WITH expected(relname,polname,polcmd,qual,withcheck) AS (VALUES
     ('capability_invocations','capability_invocation_select','r',
@@ -464,12 +472,17 @@ LOCK TABLE tenants IN SHARE ROW EXCLUSIVE MODE;
 DO $capability_invocation_down_admission$
 DECLARE tenant_row record;
 BEGIN
-  -- The tenants table lock freezes the key set.  Acquire the same exclusive
-  -- tenant-admission advisory keys that runtime uses in shared mode, in stable
-  -- order, before taking either ledger table lock.
+  -- The tenants table lock freezes the key set.  Try the same exclusive
+  -- tenant-admission advisory keys that runtime/PurgeTenant use, in stable
+  -- order, before taking either ledger table lock.  This must never wait while
+  -- holding the tenants relation lock: a busy key rejects the whole transactional
+  -- downgrade so the operator can retry after the tenant operation completes.
   FOR tenant_row IN SELECT id FROM tenants ORDER BY id LOOP
-    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
-      'vane/tenant-admission/v1/'||tenant_row.id::text,1447120453));
+    IF NOT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(
+      'vane/tenant-admission/v1/'||tenant_row.id::text,1447120453)) THEN
+      RAISE EXCEPTION '152: tenant % admission is busy; rollback and retry downgrade',tenant_row.id
+        USING ERRCODE='55P03';
+    END IF;
   END LOOP;
 END $capability_invocation_down_admission$;
 -- +goose StatementEnd
