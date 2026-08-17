@@ -345,15 +345,21 @@ func TestWorkspaceMemoryRuntimeUATPostgres(t *testing.T) {
 		t.Fatal("unreachable runtime authority passed UAT")
 	}
 	assertNoWorkspaceMemoryUATResidue(t, pool)
-	exhaustedCtx, exhaustedCancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	exhaustedCtx, exhaustedCancel := context.WithCancel(t.Context())
 	defer exhaustedCancel()
+	factoryCalled := false
 	if _, err := runWorkspaceMemoryRuntimeUATWithFactory(exhaustedCtx, scratchURL,
 		runtimeURL.String(), uuid.NewString(), strings.Repeat("e", 40),
 		func(ctx context.Context, _ string) (workspaceMemoryRuntimeStore, error) {
+			factoryCalled = true
+			exhaustedCancel()
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}); err == nil {
 		t.Fatal("exhausted main UAT window passed")
+	}
+	if !factoryCalled {
+		t.Fatal("main UAT window expired before runtime factory")
 	}
 	assertNoWorkspaceMemoryUATResidue(t, pool)
 	if err := verifyWorkspaceMemoryUATOwner(t.Context(), pool); err != nil {
