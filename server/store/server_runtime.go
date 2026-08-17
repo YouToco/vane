@@ -46,6 +46,7 @@ var serverRuntimeCapabilityRoles = []string{
 }
 
 var serverRuntimeForbiddenRoles = []string{
+	capabilityInvocationCoordinatorRole,
 	"vane_agent_session_fact_projector",
 	"vane_research_llm_gateway",
 	"vane_research_llm_gateway_runtime",
@@ -54,6 +55,8 @@ var serverRuntimeForbiddenRoles = []string{
 }
 
 var serverRuntimeProtectedRelations = []string{
+	"public.capability_invocation_receipts",
+	"public.capability_invocations",
 	"public.research_llm_gateway_attempts",
 	"public.research_llm_gateway_frozen_requests",
 	"public.research_llm_gateway_verifier_keys",
@@ -67,6 +70,8 @@ var serverRuntimeProtectedRelations = []string{
 // user-facing accounting. Capability and frozen-request bytes are a stricter
 // subset: no long-lived server capability may read them directly.
 var serverRuntimeForbiddenReadRelations = []string{
+	"public.capability_invocation_receipts",
+	"public.capability_invocations",
 	"public.research_llm_gateway_frozen_requests",
 	"public.research_run_capabilities",
 	"public.tenant_quota",
@@ -922,18 +927,26 @@ func validateServerRuntimeAuthorityRole(
 	if err := tx.QueryRow(ctx, `
 		SELECT
 		  COALESCE(bool_or(
-		    has_table_privilege($1,relation_name,'INSERT') OR
-		    has_table_privilege($1,relation_name,'UPDATE') OR
-		    has_table_privilege($1,relation_name,'DELETE') OR
-		    has_table_privilege($1,relation_name,'TRUNCATE')
+		    has_table_privilege($1,relation_oid,'INSERT') OR
+		    has_any_column_privilege($1,relation_oid,'INSERT') OR
+		    has_table_privilege($1,relation_oid,'UPDATE') OR
+		    has_any_column_privilege($1,relation_oid,'UPDATE') OR
+		    has_table_privilege($1,relation_oid,'DELETE') OR
+		    has_table_privilege($1,relation_oid,'TRUNCATE') OR
+		    has_table_privilege($1,relation_oid,'REFERENCES') OR
+		    has_any_column_privilege($1,relation_oid,'REFERENCES')
 		  ),false),
 		  COALESCE((SELECT bool_or(
-		    has_table_privilege($1,relation_name,'SELECT') OR
-		    has_any_column_privilege($1,relation_name,'SELECT')
-		  ) FROM unnest($3::text[]) AS forbidden_read(relation_name)),false),
+		    has_table_privilege($1,relation_oid,'SELECT') OR
+		    has_any_column_privilege($1,relation_oid,'SELECT')
+		  ) FROM unnest($3::text[]) AS forbidden_read(relation_name)
+		    CROSS JOIN LATERAL (SELECT to_regclass(relation_name) relation_oid) resolved
+		   WHERE relation_oid IS NOT NULL),false),
 		  has_column_privilege($1,
 		    'public.research_llm_gateway_verifier_keys','secret','SELECT')
-		FROM unnest($2::text[]) AS relation_name`,
+		FROM unnest($2::text[]) AS protected(relation_name)
+		CROSS JOIN LATERAL (SELECT to_regclass(relation_name) relation_oid) resolved
+		WHERE relation_oid IS NOT NULL`,
 		role, serverRuntimeProtectedRelations, serverRuntimeForbiddenReadRelations,
 	).Scan(&protectedMutation, &protectedRead, &readsGatewaySecret); err != nil {
 		return fmt.Errorf("inspect protected privileges for %s: %w", role, err)

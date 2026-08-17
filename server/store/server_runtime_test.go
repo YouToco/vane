@@ -1248,6 +1248,43 @@ func TestServerRuntimeBoundaryPostgres(t *testing.T) {
 		}
 	})
 
+	t.Run("column-level protected mutation grants are rejected", func(t *testing.T) {
+		for _, mutation := range []struct {
+			name, grant, revoke string
+		}{
+			{
+				name:   "vane_app INSERT column",
+				grant:  `GRANT INSERT(id) ON capability_invocations TO vane_app`,
+				revoke: `REVOKE INSERT(id) ON capability_invocations FROM vane_app`,
+			},
+			{
+				name:   "runtime UPDATE column",
+				grant:  `GRANT UPDATE(status) ON capability_invocations TO vane_server_runtime`,
+				revoke: `REVOKE UPDATE(status) ON capability_invocations FROM vane_server_runtime`,
+			},
+			{
+				name:   "PUBLIC REFERENCES column",
+				grant:  `GRANT REFERENCES(id) ON capability_invocations TO PUBLIC`,
+				revoke: `REVOKE REFERENCES(id) ON capability_invocations FROM PUBLIC`,
+			},
+		} {
+			t.Run(mutation.name, func(t *testing.T) {
+				if _, err := owner.ExecContext(t.Context(), mutation.grant); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					_, _ = owner.ExecContext(t.Context(), mutation.revoke)
+				}()
+				if st, err := NewServerRuntime(t.Context(), runtimeURL); err == nil {
+					st.Close()
+					t.Fatal("server runtime accepted protected column-level mutation")
+				} else if !strings.Contains(err.Error(), "protected data privileges") {
+					t.Fatalf("unexpected protected column mutation error: %v", err)
+				}
+			})
+		}
+	})
+
 	t.Run("gateway function grant is rejected", func(t *testing.T) {
 		if _, err := owner.ExecContext(t.Context(),
 			`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO vane_server_runtime`); err != nil {

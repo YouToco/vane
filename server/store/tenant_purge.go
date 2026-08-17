@@ -162,6 +162,11 @@ var purgeOrder = []purgeStep{
 	{"workspace_memory_events", "tenant_id = $1"},
 	{"workspace_memory_records", "tenant_id = $1"},
 	{"workspace_memory_authorizations", "tenant_id = $1"},
+	// Capability receipts are immutable evidence children of the mutable
+	// checkpoint. Explicit tenant erasure reports both before deleting installed
+	// capability metadata; ordinary lifecycle never deletes either ledger.
+	{"capability_invocation_receipts", "tenant_id = $1"},
+	{"capability_invocations", "tenant_id = $1"},
 	// User-configured capabilities are immutable, tenant-scoped artifacts. Their
 	// event and subtype rows reference the shared version/root identities, so
 	// explicit tenant erasure must preserve this child-first order.
@@ -418,6 +423,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		deliveryChannelPreferencesAvailable    bool
 		artifactDeliveryPlansAvailable         bool
 		aggregateChannelEffectsAvailable       bool
+		capabilityInvocationsAvailable         bool
+		capabilityInvocationReceiptsAvailable  bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -483,7 +490,9 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.credential_vault_entries') IS NOT NULL,
 		        to_regclass('public.delivery_channel_preferences') IS NOT NULL,
 		        to_regclass('public.artifact_delivery_plans') IS NOT NULL,
-		        to_regclass('public.aggregate_channel_delivery_effects') IS NOT NULL`,
+		        to_regclass('public.aggregate_channel_delivery_effects') IS NOT NULL,
+		        to_regclass('public.capability_invocations') IS NOT NULL,
+		        to_regclass('public.capability_invocation_receipts') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -549,6 +558,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&deliveryChannelPreferencesAvailable,
 		&artifactDeliveryPlansAvailable,
 		&aggregateChannelEffectsAvailable,
+		&capabilityInvocationsAvailable,
+		&capabilityInvocationReceiptsAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -618,6 +629,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"delivery_channel_preferences":              deliveryChannelPreferencesAvailable,
 		"artifact_delivery_plans":                   artifactDeliveryPlansAvailable,
 		"aggregate_channel_delivery_effects":        aggregateChannelEffectsAvailable,
+		"capability_invocations":                    capabilityInvocationsAvailable,
+		"capability_invocation_receipts":            capabilityInvocationReceiptsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
@@ -673,6 +686,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		query    string
 		optional bool
 	}{
+		{
+			name: "capability_invocations",
+			query: `SELECT id FROM capability_invocations
+			         WHERE tenant_id = $1 ORDER BY user_id,id
+			         FOR UPDATE /* tenant purge capability invocation root order */`,
+			optional: true,
+		},
 		{
 			name: "research_v3_prepared_definition_heads",
 			query: `SELECT task_id FROM research_v3_prepared_definition_heads
