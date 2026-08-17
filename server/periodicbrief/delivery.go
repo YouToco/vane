@@ -57,12 +57,6 @@ type DeliveryStore interface {
 	) error
 }
 
-type ChannelDispatcher interface {
-	Send(context.Context, channelruntime.SendPermit) (
-		channelruntime.ProviderObservation, error,
-	)
-}
-
 type DeliverInputV1 struct {
 	Report types.PeriodicBriefReportV1 `json:"report"`
 }
@@ -151,7 +145,7 @@ func deliverPeriodicBriefV1(
 	report types.PeriodicBriefReportV1,
 	deliveryStore DeliveryStore,
 	sender DeliverySender,
-	channelDispatcher ChannelDispatcher,
+	channelDispatcher channelruntime.Invoker,
 	dashboardOrigin string,
 	channelEnabled bool,
 ) error {

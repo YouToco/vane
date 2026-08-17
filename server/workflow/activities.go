@@ -212,12 +212,6 @@ type aggregateChannelDeliveryStore interface {
 	SettleAggregateTelegramOutbound(context.Context, int64, int64, string, string) error
 }
 
-type aggregateChannelDispatcher interface {
-	Send(context.Context, channelruntime.SendPermit) (
-		channelruntime.ProviderObservation, error,
-	)
-}
-
 // Store 是 Activity 需要的数据访问子集（规格 B3 的相关方法）。
 // 收窄成接口而非直接依赖 *store.Store：便于 Activity 单测注入替身。
 type Store interface {
@@ -589,7 +583,7 @@ type Activities struct {
 	}
 	aggregateChannelStore      aggregateChannelDeliveryStore
 	aggregateChannelMu         sync.RWMutex
-	aggregateChannelDispatcher aggregateChannelDispatcher
+	aggregateChannelDispatcher channelruntime.Invoker
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -820,14 +814,14 @@ func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, f
 }
 
 func (a *Activities) SetAggregateChannelDispatcher(
-	dispatcher aggregateChannelDispatcher,
+	dispatcher channelruntime.Invoker,
 ) {
 	a.aggregateChannelMu.Lock()
 	defer a.aggregateChannelMu.Unlock()
 	a.aggregateChannelDispatcher = dispatcher
 }
 
-func (a *Activities) aggregateDispatcher() aggregateChannelDispatcher {
+func (a *Activities) aggregateDispatcher() channelruntime.Invoker {
 	a.aggregateChannelMu.RLock()
 	defer a.aggregateChannelMu.RUnlock()
 	return a.aggregateChannelDispatcher

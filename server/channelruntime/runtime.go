@@ -97,9 +97,21 @@ type Adapter interface {
 	Send(context.Context, SendPermit) (ProviderObservation, error)
 }
 
+// Invoker is the only provider-neutral business invocation boundary.  Its
+// private marker means another package cannot substitute an Adapter, a
+// provider manager, or a structurally similar Send function for Dispatcher.
+// Tests and composition roots must construct a Dispatcher through
+// NewDispatcher, preserving the same boundary as production.
+type Invoker interface {
+	Send(context.Context, SendPermit) (ProviderObservation, error)
+	channelRuntimeInvoker()
+}
+
 type Dispatcher struct {
 	adapters map[Provider]Adapter
 }
+
+func (*Dispatcher) channelRuntimeInvoker() {}
 
 func NewDispatcher(adapters ...Adapter) (*Dispatcher, error) {
 	if len(adapters) == 0 {

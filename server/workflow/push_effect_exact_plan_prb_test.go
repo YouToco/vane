@@ -85,6 +85,10 @@ type aggregateTelegramSenderFake struct {
 	calls int
 }
 
+func (*aggregateTelegramSenderFake) Provider() channelruntime.Provider {
+	return channelruntime.ProviderTelegram
+}
+
 func (f *aggregateTelegramSenderFake) Send(
 	_ context.Context, _ channelruntime.SendPermit,
 ) (channelruntime.ProviderObservation, error) {
@@ -359,11 +363,15 @@ func TestPRBAggregateTelegramOnlyUsesProviderChildReceipt(t *testing.T) {
 	activities := prbFullPushActivities(compiledStore, effectStore,
 		feishuPusher, feishu, channelStore, identity.TaskID)
 	telegramSender := &aggregateTelegramSenderFake{}
-	activities.SetAggregateChannelDispatcher(telegramSender)
+	dispatcher, err := channelruntime.NewDispatcher(telegramSender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activities.SetAggregateChannelDispatcher(dispatcher)
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(activities.Push)
-	err := executePushActivity(t, env, activities, PushIn{
+	err = executePushActivity(t, env, activities, PushIn{
 		UserID: identity.UserID, ScheduleID: identity.TaskID,
 		TraceID: "trace-telegram-aggregate",
 		Run: &CompiledRunInputV1{

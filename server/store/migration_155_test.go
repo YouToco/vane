@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -111,5 +112,47 @@ func TestMigration155SchemaOwnerRejectedAndNarrowRuntimeAttestedPostgres(t *test
 	mutated.AppIdentity = "710156"
 	if err := runtimeStore.VerifyTelegramRuntimeAuthority(t.Context(), mutated); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("app identity mutation crossed gate: %v", err)
+	}
+	for _, mutation := range []struct {
+		name   string
+		apply  string
+		revert string
+	}{
+		{
+			name: "additional permissive policy",
+			apply: `CREATE POLICY channel_runtime_authority_extra
+				ON channel_runtime_authority_attestations AS PERMISSIVE
+				FOR SELECT TO vane_channel_runtime USING(true)`,
+			revert: `DROP POLICY channel_runtime_authority_extra
+				ON channel_runtime_authority_attestations`,
+		},
+		{
+			name:   "PUBLIC relation SELECT",
+			apply:  `GRANT SELECT ON channel_runtime_authority_attestations TO PUBLIC`,
+			revert: `REVOKE SELECT ON channel_runtime_authority_attestations FROM PUBLIC`,
+		},
+		{
+			name: "runtime relation INSERT",
+			apply: `GRANT INSERT ON channel_runtime_authority_attestations
+				TO vane_channel_runtime`,
+			revert: `REVOKE INSERT ON channel_runtime_authority_attestations
+				FROM vane_channel_runtime`,
+		},
+	} {
+		t.Run("attestation rejects "+mutation.name, func(t *testing.T) {
+			if _, err := database.ExecContext(t.Context(), mutation.apply); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = database.ExecContext(context.Background(), mutation.revert)
+			})
+			if err := runtimeStore.VerifyTelegramRuntimeAuthority(
+				t.Context(), authority); !errors.Is(err, types.ErrConflict) {
+				t.Fatalf("unsafe catalog crossed runtime attestation: %v", err)
+			}
+			if _, err := database.ExecContext(t.Context(), mutation.revert); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

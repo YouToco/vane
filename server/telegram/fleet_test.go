@@ -54,6 +54,12 @@ func (f *fakeFleetStore) setCredential(tenantID, userID, generation, botID int64
 	f.secrets[fmt.Sprintf("%d/%d/%d", tenantID, userID, generation)] = payload
 }
 
+func (f *fakeFleetStore) revokeCredential(tenantID, userID int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.active, userScope{tenantID: tenantID, userID: userID})
+}
+
 func (f *fakeFleetStore) ListActiveUserCredentialMetadata(
 	_ context.Context, provider, purpose string,
 ) ([]store.CredentialMetadata, error) {
@@ -330,6 +336,72 @@ func TestFleetRejectsOneBotAcrossTenantsWithoutReplacingOwner(t *testing.T) {
 	}
 	if got := fleet.PrincipalStatus(t.Context(), 7, 70); !got.Ready || got.BotID != 111 {
 		t.Fatalf("original tenant manager was replaced: %+v", got)
+	}
+}
+
+func TestFleetReconcilesRevokedBotAcrossTenantReassignment(t *testing.T) {
+	provider, _ := telegramFleetProvider(t)
+	defer provider.Close()
+	st := newFakeFleetStore()
+	st.setCredential(7, 70, 1, 111, "111:user-seven", "secret-seven")
+	fleet, err := NewFleet(FleetConfig{
+		WebhookURL: "https://api.vane.test/telegram/webhook",
+		APIBaseURL: provider.URL, Workers: 1, Dynamic: true,
+		ShutdownGrace: time.Second,
+	}, st, &fakeChannelAgent{}, provider.Client(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fleet.Shutdown(context.Background()) })
+
+	// Model the committed DB transaction: the old tenant has no active
+	// authority and the same immutable bot identity now belongs to another
+	// principal.  No process-local Deactivate callback has arrived yet.
+	st.revokeCredential(7, 70)
+	st.setCredential(8, 80, 1, 111, "111:user-eight", "secret-eight")
+	if err := fleet.ActivateUser(t.Context(), 8, 80); err != nil {
+		t.Fatal(err)
+	}
+	if got := fleet.PrincipalStatus(t.Context(), 7, 70); got.Ready {
+		t.Fatalf("revoked tenant retained manager: %+v", got)
+	}
+	if got := fleet.PrincipalStatus(t.Context(), 8, 80); !got.Ready || got.BotID != 111 {
+		t.Fatalf("reassigned tenant status=%+v", got)
+	}
+}
+
+func TestFleetLateRevokeDoesNotDeleteNewUserGeneration(t *testing.T) {
+	provider, _ := telegramFleetProvider(t)
+	defer provider.Close()
+	st := newFakeFleetStore()
+	st.setCredential(7, 70, 1, 111, "111:user-seven", "secret-seven")
+	fleet, err := NewFleet(FleetConfig{
+		WebhookURL: "https://api.vane.test/telegram/webhook",
+		APIBaseURL: provider.URL, Workers: 1, Dynamic: true,
+		ShutdownGrace: time.Second,
+	}, st, &fakeChannelAgent{}, provider.Client(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fleet.Shutdown(context.Background()) })
+	st.setCredential(7, 70, 2, 222, "222:user-seven-new", "secret-seven-new")
+	if err := fleet.ActivateUser(t.Context(), 7, 70); err != nil {
+		t.Fatal(err)
+	}
+
+	// This models an older revoke request whose process callback arrives after
+	// generation 2 is already the database and Fleet authority.
+	if err := fleet.DeactivateUser(t.Context(), 7, 70); err != nil {
+		t.Fatal(err)
+	}
+	if got := fleet.PrincipalStatus(t.Context(), 7, 70); !got.Ready || got.BotID != 222 {
+		t.Fatalf("late revoke deleted current generation: %+v", got)
 	}
 }
 

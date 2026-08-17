@@ -200,11 +200,10 @@ func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialM
 		return err
 	}
 	var secret storedTelegramSecret
-	var declared storedTelegramMetadata
-	if err := json.Unmarshal(metadata.Metadata, &declared); err != nil || declared.BotID <= 0 {
-		return errors.New("telegram: stored bot metadata is invalid")
+	botID, err := storedCredentialAppIdentity(metadata)
+	if err != nil {
+		return err
 	}
-	botID := strconv.FormatInt(declared.BotID, 10)
 	authority := store.TelegramRuntimeAuthority{
 		TenantID: metadata.TenantID, UserID: metadata.UserID,
 		CredentialGeneration: metadata.Generation, AppIdentity: botID,
@@ -213,6 +212,42 @@ func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialM
 	// provider call. A schema-owner/default Store must fail here.
 	if err := f.store.VerifyTelegramRuntimeAuthority(ctx, authority); err != nil {
 		return fmt.Errorf("telegram: channel runtime admission: %w", err)
+	}
+	key := userScope{tenantID: metadata.TenantID, userID: metadata.UserID}
+	f.mu.RLock()
+	exact := f.byUser[key]
+	collision := f.byBot[botID]
+	f.mu.RUnlock()
+	if exact != nil && exact.generation == metadata.Generation &&
+		exact.botID == botID {
+		return nil
+	}
+	// Reassignment is decided by the database's current credential authority,
+	// never by callback arrival order.  A revoked/retired generation may be
+	// evicted; a still-current generation remains an exact cross-principal
+	// conflict.  This also retires an old same-user generation before touching
+	// the provider with its replacement.
+	if collision != nil {
+		current, err := f.entryMatchesCurrentCredential(ctx, collision)
+		if err != nil {
+			return err
+		}
+		if current {
+			return types.NewAppError(types.CodeConflict,
+				"该 Telegram Bot 已由其他用户配置", types.ErrConflict)
+		}
+		f.mu.Lock()
+		if f.byBot[botID] == collision {
+			delete(f.byBot, botID)
+			collisionKey := userScope{tenantID: collision.tenantID, userID: collision.userID}
+			if f.byUser[collisionKey] == collision {
+				delete(f.byUser, collisionKey)
+			}
+		}
+		f.mu.Unlock()
+		if err := f.shutdownManager(collision.manager); err != nil {
+			return fmt.Errorf("telegram: retire stale Bot generation: %w", err)
+		}
 	}
 	if err := f.store.UseCredential(ctx, metadata.CredentialScope,
 		metadata.Generation, func(raw []byte, _ store.CredentialMetadata) error {
@@ -242,13 +277,11 @@ func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialM
 		generation: metadata.Generation, manager: manager}
 
 	f.mu.Lock()
-	if other := f.byBot[botID]; other != nil &&
-		(other.tenantID != metadata.TenantID || other.userID != metadata.UserID) {
+	if other := f.byBot[botID]; other != nil {
 		f.mu.Unlock()
 		return types.NewAppError(types.CodeConflict,
 			"该 Telegram Bot 已由其他用户配置", types.ErrConflict)
 	}
-	key := userScope{tenantID: metadata.TenantID, userID: metadata.UserID}
 	old := f.byUser[key]
 	// Provisional route makes setWebhook safe: Telegram receives 503 (and
 	// retries) until Manager.Start has proved getMe/webhook state and Ready.
@@ -280,6 +313,35 @@ func (f *Fleet) activateMetadata(ctx context.Context, metadata store.CredentialM
 	return nil
 }
 
+func storedCredentialAppIdentity(metadata store.CredentialMetadata) (string, error) {
+	var declared storedTelegramMetadata
+	if err := json.Unmarshal(metadata.Metadata, &declared); err != nil || declared.BotID <= 0 {
+		return "", errors.New("telegram: stored bot metadata is invalid")
+	}
+	return strconv.FormatInt(declared.BotID, 10), nil
+}
+
+func (f *Fleet) entryMatchesCurrentCredential(
+	ctx context.Context, entry *fleetEntry,
+) (bool, error) {
+	metadata, err := f.store.ActiveCredentialMetadata(ctx,
+		telegramScope(entry.tenantID, entry.userID))
+	if errors.Is(err, types.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := validateStoredCredentialMetadata(metadata); err != nil {
+		return false, err
+	}
+	botID, err := storedCredentialAppIdentity(metadata)
+	if err != nil {
+		return false, err
+	}
+	return metadata.Generation == entry.generation && botID == entry.botID, nil
+}
+
 func validateStoredCredentialMetadata(metadata store.CredentialMetadata) error {
 	if metadata.Kind != "user" || metadata.Provider != "telegram" ||
 		metadata.Purpose != telegramCredentialPurpose || metadata.TenantID <= 0 ||
@@ -302,9 +364,27 @@ func (f *Fleet) restoreProvisional(current, old *fleetEntry) {
 	}
 }
 
-func (f *Fleet) DeactivateUser(_ context.Context, tenantID, userID int64) error {
+func (f *Fleet) DeactivateUser(ctx context.Context, tenantID, userID int64) error {
 	f.reconfigure.Lock()
 	defer f.reconfigure.Unlock()
+	if tenantID <= 0 || userID <= 0 {
+		return types.NewAppError(types.CodeConflict,
+			"Telegram 用户凭证运行时尚未启用", types.ErrConflict)
+	}
+	if !f.cfg.Dynamic {
+		return nil
+	}
+	// A late revoke callback must reconcile against current database truth. If
+	// a newer generation already exists, activate/retain that generation rather
+	// than deleting it merely because the older HTTP request completed later.
+	metadata, err := f.store.ActiveCredentialMetadata(ctx,
+		telegramScope(tenantID, userID))
+	if err == nil {
+		return f.activateMetadata(ctx, metadata)
+	}
+	if !errors.Is(err, types.ErrNotFound) {
+		return err
+	}
 	f.mu.Lock()
 	key := userScope{tenantID: tenantID, userID: userID}
 	entry := f.byUser[key]

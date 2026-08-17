@@ -119,6 +119,19 @@ type periodicTelegramSenderFake struct {
 	body      string
 }
 
+func (*periodicTelegramSenderFake) Provider() channelruntime.Provider {
+	return channelruntime.ProviderTelegram
+}
+
+func periodicChannelInvoker(t *testing.T, adapter channelruntime.Adapter) channelruntime.Invoker {
+	t.Helper()
+	dispatcher, err := channelruntime.NewDispatcher(adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dispatcher
+}
+
 func (f *periodicTelegramSenderFake) Send(
 	_ context.Context, permit channelruntime.SendPermit,
 ) (channelruntime.ProviderObservation, error) {
@@ -295,7 +308,8 @@ func TestDeliveryBothFreezesAndSendsBothProviders(t *testing.T) {
 	}
 	telegramSender := &periodicTelegramSenderFake{}
 	if err := deliverPeriodicBriefV1(t.Context(), report, deliveryStore,
-		feishuSender, telegramSender, "https://vane.example", true); err != nil {
+		feishuSender, periodicChannelInvoker(t, telegramSender),
+		"https://vane.example", true); err != nil {
 		t.Fatal(err)
 	}
 	if feishuSender.sendCalls != 1 || telegramSender.sendCalls != 1 ||
@@ -320,7 +334,8 @@ func TestDeliveryTelegramRequiresFrozenRoute(t *testing.T) {
 		},
 	}
 	err := deliverPeriodicBriefV1(t.Context(), report, deliveryStore,
-		&periodicDeliverySenderFake{}, &periodicTelegramSenderFake{},
+		&periodicDeliverySenderFake{},
+		periodicChannelInvoker(t, &periodicTelegramSenderFake{}),
 		"https://vane.example", true)
 	if types.CodeOf(err) != types.CodeConflict {
 		t.Fatalf("err=%v code=%s", err, types.CodeOf(err))
@@ -378,8 +393,9 @@ func TestPeriodicTelegramRendererIncludesDecisionSections(t *testing.T) {
 func TestActivitiesChannelDispatcherIsRaceSafe(t *testing.T) {
 	a := &Activities{}
 	sender := &periodicTelegramSenderFake{}
-	a.SetChannelDispatcher(sender)
-	if got := a.getChannelDispatcher(); got != sender {
-		t.Fatalf("sender=%T want %T", got, sender)
+	dispatcher := periodicChannelInvoker(t, sender)
+	a.SetChannelDispatcher(dispatcher)
+	if got := a.getChannelDispatcher(); got != dispatcher {
+		t.Fatalf("dispatcher=%T want %T", got, dispatcher)
 	}
 }

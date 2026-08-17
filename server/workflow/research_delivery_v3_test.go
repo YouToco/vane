@@ -187,6 +187,21 @@ type researchTelegramSenderFakeV3 struct {
 	err     error
 }
 
+func (*researchTelegramSenderFakeV3) Provider() channelruntime.Provider {
+	return channelruntime.ProviderTelegram
+}
+
+func researchChannelInvokerV3(
+	t *testing.T, adapter channelruntime.Adapter,
+) channelruntime.Invoker {
+	t.Helper()
+	dispatcher, err := channelruntime.NewDispatcher(adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dispatcher
+}
+
 func (f *researchTelegramSenderFakeV3) Send(
 	_ context.Context, permit channelruntime.SendPermit,
 ) (channelruntime.ProviderObservation, error) {
@@ -347,7 +362,7 @@ func TestReceiptBackedResearchDeliveryV3TelegramOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	tg := &researchTelegramSenderFakeV3{}
-	delivery.SetChannelDelivery(tg, func(payload types.ResearchBriefPayloadV3) (string, error) {
+	delivery.SetChannelDelivery(researchChannelInvokerV3(t, tg), func(payload types.ResearchBriefPayloadV3) (string, error) {
 		return payload.Headline + "\n" + payload.Summary, nil
 	})
 	receipt, err := delivery.Deliver(t.Context(), identity, snapshot, plan, brief, "trace-v3")
@@ -400,7 +415,7 @@ func TestReceiptBackedResearchDeliveryV3TelegramFailuresFailClosed(t *testing.T)
 				if render == nil {
 					render = func(types.ResearchBriefPayloadV3) (string, error) { return "body", nil }
 				}
-				delivery.SetChannelDelivery(tg, render)
+				delivery.SetChannelDelivery(researchChannelInvokerV3(t, tg), render)
 			}
 			if _, err := delivery.Deliver(t.Context(), identity, snapshot, plan, brief, "trace-v3"); err == nil {
 				t.Fatal("unsafe Telegram delivery succeeded")

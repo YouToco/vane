@@ -599,6 +599,10 @@
     {
       "path": "151_workspace_memory_runtime_activation.sql",
       "sha256": "26c2d300b3ee5a6403242eaf8c5274249ef1ec850ee0a243abead427aa32b33b"
+    },
+    {
+      "path": "155_channel_runtime_dark_gate.sql",
+      "sha256": "3c4e0faa013a1decf4a65ba64a585d2b19a9679e93aaa05a8a10bcb6f6a29d13"
     }
   ],
   "schema": "vane.migrations/v1"

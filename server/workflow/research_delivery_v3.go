@@ -56,12 +56,6 @@ type ResearchDeliverySenderV3 interface {
 	PushWithUUID(context.Context, string, string, string, string) (pusheffect.ProviderObservation, error)
 }
 
-type ResearchChannelDispatcherV3 interface {
-	Send(context.Context, channelruntime.SendPermit) (
-		channelruntime.ProviderObservation, error,
-	)
-}
-
 type ResearchTelegramRendererV3 func(types.ResearchBriefPayloadV3) (string, error)
 
 type researchDeliveryStoreV3 interface {
@@ -94,14 +88,14 @@ type ReceiptBackedResearchDeliveryV3 struct {
 	targets           ResearchDeliveryTargetProviderV3
 	render            ResearchDeliveryRendererV3
 	channelMu         sync.RWMutex
-	channelDispatcher ResearchChannelDispatcherV3
+	channelDispatcher channelruntime.Invoker
 	telegramRender    ResearchTelegramRendererV3
 }
 
 // SetChannelDelivery is wired before the Temporal worker starts. Business
 // delivery receives only the provider-neutral dispatcher and a pure renderer.
 func (d *ReceiptBackedResearchDeliveryV3) SetChannelDelivery(
-	dispatcher ResearchChannelDispatcherV3, render ResearchTelegramRendererV3,
+	dispatcher channelruntime.Invoker, render ResearchTelegramRendererV3,
 ) {
 	d.channelMu.Lock()
 	defer d.channelMu.Unlock()
@@ -109,7 +103,7 @@ func (d *ReceiptBackedResearchDeliveryV3) SetChannelDelivery(
 }
 
 func (d *ReceiptBackedResearchDeliveryV3) channelDelivery() (
-	ResearchChannelDispatcherV3, ResearchTelegramRendererV3,
+	channelruntime.Invoker, ResearchTelegramRendererV3,
 ) {
 	d.channelMu.RLock()
 	defer d.channelMu.RUnlock()

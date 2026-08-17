@@ -73,35 +73,71 @@ func attestTelegramRuntimeAuthorityTx(
 		return "", types.NewAppError(types.CodeDatabase,
 			"设置 Telegram runtime scope", err)
 	}
-	var roleSafe, forceRLS, policySafe bool
+	var roleSafe, forceRLS, policySafe, grantsSafe bool
 	if err := tx.QueryRow(ctx, `
+		WITH runtime_role AS (
+		  SELECT oid FROM pg_catalog.pg_roles WHERE rolname=$1
+		), relation AS (
+		  SELECT * FROM pg_catalog.pg_class
+		   WHERE oid=to_regclass('public.channel_runtime_authority_attestations')
+		), expected_acl(grantee,grantor,privilege_type,is_grantable) AS (
+		  SELECT relation.relowner,relation.relowner,privilege_type,false
+		    FROM relation CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE',
+		      'TRUNCATE','REFERENCES','TRIGGER','MAINTAIN']) privilege_type
+		  UNION ALL
+		  SELECT runtime_role.oid,relation.relowner,'SELECT',false
+		    FROM runtime_role CROSS JOIN relation
+		), actual_acl AS (
+		  SELECT acl.grantee,acl.grantor,acl.privilege_type,acl.is_grantable
+		    FROM relation CROSS JOIN LATERAL pg_catalog.aclexplode(relation.relacl) acl
+		), exact_acl AS (
+		  SELECT count(*)=9 AND bool_and(expected_acl.grantee IS NOT NULL AND
+		      actual_acl.grantee IS NOT NULL AND
+		      actual_acl.is_grantable=expected_acl.is_grantable) safe
+		    FROM expected_acl FULL JOIN actual_acl
+		      USING(grantee,grantor,privilege_type,is_grantable)
+		), policy_closure AS (
+		  SELECT count(*)=1 AND bool_and(
+		      policy.polname='channel_runtime_authority_exact_principal' AND
+		      policy.polpermissive AND policy.polcmd='r' AND
+		      policy.polroles=ARRAY[(SELECT oid FROM runtime_role)]::oid[] AND
+		      pg_catalog.pg_get_expr(policy.polqual,policy.polrelid)=
+		        '((tenant_id = (NULLIF(( SELECT current_setting(''app.tenant_id''::text, true) AS current_setting), ''''::text))::bigint) AND (user_id = (NULLIF(( SELECT current_setting(''app.user_id''::text, true) AS current_setting), ''''::text))::bigint))' AND
+		      policy.polwithcheck IS NULL) safe
+		    FROM pg_catalog.pg_policy policy
+		   WHERE policy.polrelid=(SELECT oid FROM relation)
+		)
 		SELECT session_user=current_user AND session_user=$1 AND
 		       role.rolcanlogin AND NOT role.rolsuper AND NOT role.rolbypassrls AND
 		       NOT role.rolcreatedb AND NOT role.rolcreaterole AND
 		       NOT role.rolreplication AND NOT role.rolinherit,
 		       relation.relrowsecurity AND relation.relforcerowsecurity,
-		       (SELECT count(*)=1 AND bool_and(policy.polpermissive) AND
-		               bool_and(policy.polcmd='r') AND
-		               bool_and(policy.polroles=ARRAY[role.oid]::oid[]) AND
-		               bool_and(pg_catalog.pg_get_expr(policy.polqual,policy.polrelid)
-		                 LIKE '%app.tenant_id%' AND
-		                 pg_catalog.pg_get_expr(policy.polqual,policy.polrelid)
-		                 LIKE '%app.user_id%')
-		          FROM pg_catalog.pg_policy policy
-		         WHERE policy.polrelid=relation.oid AND
-		               policy.polname='channel_runtime_authority_exact_principal')
+		       policy_closure.safe,
+		       exact_acl.safe AND
+		       has_table_privilege($1,
+		         'public.channel_runtime_authority_attestations','SELECT') AND
+		       NOT has_table_privilege($1,
+		         'public.channel_runtime_authority_attestations',
+		         'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') AND
+		       NOT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute attribute
+		         WHERE attribute.attrelid=relation.oid AND attribute.attnum>0 AND
+		               NOT attribute.attisdropped AND
+		               (attribute.attacl IS NOT NULL OR
+		                has_column_privilege($1,attribute.attrelid,attribute.attnum,
+		                  'INSERT,UPDATE,REFERENCES')))
 		  FROM pg_catalog.pg_roles role
-		  JOIN pg_catalog.pg_class relation ON relation.oid=
-		       to_regclass('public.channel_runtime_authority_attestations')
+		  CROSS JOIN relation
+		  CROSS JOIN policy_closure
+		  CROSS JOIN exact_acl
 		 WHERE role.rolname=session_user`, channelRuntimeLoginRole).Scan(
-		&roleSafe, &forceRLS, &policySafe); err != nil {
+		&roleSafe, &forceRLS, &policySafe, &grantsSafe); err != nil {
 		return "", types.NewAppError(types.CodeConflict,
 			"Telegram channel runtime catalog 尚未就绪", err)
 	}
-	if !roleSafe || !forceRLS || !policySafe {
+	if !roleSafe || !forceRLS || !policySafe || !grantsSafe {
 		return "", types.NewAppError(types.CodeConflict,
-			fmt.Sprintf("Telegram channel runtime authority 不安全 role=%t force_rls=%t policy=%t",
-				roleSafe, forceRLS, policySafe), types.ErrConflict)
+			fmt.Sprintf("Telegram channel runtime authority 不安全 role=%t force_rls=%t policy=%t grants=%t",
+				roleSafe, forceRLS, policySafe, grantsSafe), types.ErrConflict)
 	}
 	var role types.MembershipRole
 	var attested bool

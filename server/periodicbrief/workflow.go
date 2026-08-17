@@ -13,6 +13,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
+	"github.com/YouToco/vane/server/channelruntime"
 	"github.com/YouToco/vane/server/executivebrief"
 	"github.com/YouToco/vane/server/llm"
 	"github.com/YouToco/vane/server/runtimepolicy"
@@ -71,7 +72,7 @@ type Activities struct {
 	dashboardOrigin   string
 	deliveryTaskID    string
 	channelMu         sync.RWMutex
-	channelDispatcher ChannelDispatcher
+	channelDispatcher channelruntime.Invoker
 }
 
 func NewActivities(
@@ -97,13 +98,13 @@ func NewActivities(
 // SetChannelDispatcher is called during process composition before the
 // Temporal worker starts. Workflows depend only on the provider-neutral
 // dispatcher and cannot obtain a Telegram client or credential.
-func (a *Activities) SetChannelDispatcher(dispatcher ChannelDispatcher) {
+func (a *Activities) SetChannelDispatcher(dispatcher channelruntime.Invoker) {
 	a.channelMu.Lock()
 	defer a.channelMu.Unlock()
 	a.channelDispatcher = dispatcher
 }
 
-func (a *Activities) getChannelDispatcher() ChannelDispatcher {
+func (a *Activities) getChannelDispatcher() channelruntime.Invoker {
 	a.channelMu.RLock()
 	defer a.channelMu.RUnlock()
 	return a.channelDispatcher
