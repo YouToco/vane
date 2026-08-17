@@ -94,6 +94,199 @@ func TestSkillMutationValidationAndOperationIdentifiers(t *testing.T) {
 	}
 }
 
+func TestSkillRuntimePublicEntryAndPureValidationFailures(t *testing.T) {
+	capabilityID := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	versionID := uuid.MustParse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+	base := skillAddInputForRuntime(1, 2, capabilityID, "safe instructions", "", nil)
+	if err := validateSkillVersionPayload(types.UserCapabilityRemoteMCP, "", base.PayloadDigest,
+		base.Manifest, base.Compatible, base.Skill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid source code=%s err=%v", types.CodeOf(err), err)
+	}
+	if err := validateSkillVersionPayload(base.Source, "", strings.Repeat("f", 64),
+		base.Manifest, base.Compatible, base.Skill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid metadata code=%s err=%v", types.CodeOf(err), err)
+	}
+	missingFiles := base.Skill
+	missingFiles.Files = nil
+	if err := validateSkillVersionPayload(base.Source, "", base.PayloadDigest,
+		base.Manifest, base.Compatible, missingFiles); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("missing files code=%s err=%v", types.CodeOf(err), err)
+	}
+	if err := validateSkillVersionCredentialSafety("sk-AAAAAAAAAAAAAAAAAAAA", base.Manifest, base.Skill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("credential metadata code=%s err=%v", types.CodeOf(err), err)
+	}
+	credentialFile := base.Skill
+	credentialFile.Files = append([]types.SkillCapabilityFile(nil), base.Skill.Files...)
+	credentialFile.Files[0].Content = []byte("sk-AAAAAAAAAAAAAAAAAAAA")
+	if err := validateSkillVersionCredentialSafety("", base.Manifest, credentialFile); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("credential file code=%s err=%v", types.CodeOf(err), err)
+	}
+	if skillDetailMatchesAddInput(nil, base) {
+		t.Fatal("nil detail matched")
+	}
+	detail := &SkillCapabilityDetail{
+		Version: types.UserCapabilityVersion{
+			Source: base.Source, SourceRef: base.SourceRef, PayloadDigest: base.PayloadDigest,
+			Manifest: base.Manifest, Compatible: base.Compatible,
+		},
+		Skill: base.Skill,
+		Resources: []SkillResourceMetadata{{
+			Path: "SKILL.md", Kind: "skill_md", Digest: base.Skill.Files[0].Digest,
+			Size: int64(len(base.Skill.Files[0].Content)) + 1,
+		}},
+	}
+	if skillDetailMatchesAddInput(detail, base) {
+		t.Fatal("resource drift matched")
+	}
+
+	invalidJSONSkill := base.Skill
+	invalidJSONSkill.FileManifest = json.RawMessage(`{"schema_version":`)
+	if _, err := decodeSkillFileManifest(invalidJSONSkill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid manifest JSON code=%s err=%v", types.CodeOf(err), err)
+	}
+	nonCanonicalSkill := base.Skill
+	nonCanonicalSkill.FileManifest = append(bytes.Clone(base.Skill.FileManifest), ' ')
+	if _, err := decodeSkillFileManifest(nonCanonicalSkill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("noncanonical manifest code=%s err=%v", types.CodeOf(err), err)
+	}
+	reversedSkill := base.Skill
+	reversedSkill.FileManifest = runtimeSkillManifest(base.Skill.Name, "", true, false,
+		[]storedSkillManifestFileV1{
+			{Path: "references/z.md", Kind: "reference", Size: 1, Digest: strings.Repeat("c", 64)},
+			{Path: "SKILL.md", Kind: "skill_md", Size: 1, Digest: strings.Repeat("d", 64)},
+		})
+	if _, err := decodeSkillFileManifest(reversedSkill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("unordered manifest code=%s err=%v", types.CodeOf(err), err)
+	}
+	largeFiles := make([]storedSkillManifestFileV1, 0, 5)
+	for i, itemPath := range []string{"SKILL.md", "assets/a", "assets/b", "assets/c", "assets/d"} {
+		kind := "asset"
+		if i == 0 {
+			kind = "skill_md"
+		}
+		largeFiles = append(largeFiles, storedSkillManifestFileV1{
+			Path: itemPath, Kind: kind, Size: 4 << 20, Digest: strings.Repeat("a", 64),
+		})
+	}
+	largeSkill := base.Skill
+	largeSkill.FileManifest = runtimeSkillManifest(base.Skill.Name, "", true, false, largeFiles)
+	if _, err := decodeSkillFileManifest(largeSkill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("oversized manifest code=%s err=%v", types.CodeOf(err), err)
+	}
+	scriptSkill := base.Skill
+	scriptSkill.ContainsScripts = true
+	scriptSkill.FileManifest = runtimeSkillManifest(base.Skill.Name, "", false, true,
+		[]storedSkillManifestFileV1{{
+			Path: "assets/run.sh", Kind: "script", Size: 1, Digest: strings.Repeat("a", 64),
+		}})
+	if _, err := decodeSkillFileManifest(scriptSkill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid script path code=%s err=%v", types.CodeOf(err), err)
+	}
+	invalidPathSkill := base.Skill
+	invalidPathSkill.FileManifest = runtimeSkillManifest(base.Skill.Name, "", true, false,
+		[]storedSkillManifestFileV1{{
+			Path: "guide.md", Kind: "reference", Size: 1, Digest: strings.Repeat("a", 64),
+		}})
+	if _, err := decodeSkillFileManifest(invalidPathSkill); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid resource path code=%s err=%v", types.CodeOf(err), err)
+	}
+	if err := validateResolvedSkillDetail(nil); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("nil resolved detail code=%s err=%v", types.CodeOf(err), err)
+	}
+	resolved := &SkillCapabilityDetail{Version: types.UserCapabilityVersion{Compatible: true}, Skill: base.Skill}
+	resolved.Ref = skillruntime.SkillRefV1{
+		SchemaVersion: skillruntime.SkillRefSchemaVersionV1, TenantID: 1, OwnerUserID: 2,
+		CapabilityID: capabilityID, CapabilityVersionID: versionID, Version: 1,
+		Visibility: skillruntime.VisibilityPersonalV1, PayloadDigest: strings.Repeat("a", 64),
+		SkillMDDigest: base.Skill.SkillMDDigest, FileManifestDigest: digestBytes(base.Skill.FileManifest),
+		Compatible: true,
+	}
+	resolved.Resources = []SkillResourceMetadata{{
+		Path: "SKILL.md", Kind: "skill_md", Digest: base.Skill.Files[0].Digest,
+		Size: int64(len(base.Skill.Files[0].Content)) + 1,
+	}}
+	if err := validateResolvedSkillDetail(resolved); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("resolved resource drift code=%s err=%v", types.CodeOf(err), err)
+	}
+	resolved.Resources = append(resolved.Resources, SkillResourceMetadata{
+		Path: "assets/extra", Kind: "asset", Digest: strings.Repeat("b", 64), Size: 1,
+	})
+	resolved.Resources[0].Size--
+	if err := validateResolvedSkillDetail(resolved); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("resolved extra resource code=%s err=%v", types.CodeOf(err), err)
+	}
+
+	failingStore := &Store{beginTx: func(context.Context, pgx.TxOptions) (pgx.Tx, error) {
+		return nil, errors.New("database sentinel")
+	}}
+	invalidAdd := base
+	invalidAdd.TenantID = 0
+	if _, err := failingStore.AddSkillCapabilityVersion(t.Context(), invalidAdd); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid add code=%s err=%v", types.CodeOf(err), err)
+	}
+	credentialAdd := base
+	credentialAdd.SourceRef = "sk-AAAAAAAAAAAAAAAAAAAA"
+	if _, err := failingStore.AddSkillCapabilityVersion(t.Context(), credentialAdd); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("credential add code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.AddSkillCapabilityVersion(t.Context(), base); types.CodeOf(err) != types.CodeDatabase {
+		t.Fatalf("add begin code=%s err=%v", types.CodeOf(err), err)
+	}
+	mutation := SkillCapabilityMutationInput{
+		TenantID: 1, ActorUserID: 2, CapabilityID: capabilityID, VersionID: versionID,
+		ExpectedCurrentVersionID: versionID, ExpectedStatus: types.UserCapabilityDraft,
+		ExpectedHeadRevision: strings.Repeat("a", 64), OperationID: "begin-fault",
+	}
+	if _, err := failingStore.ActivateSkillCapability(t.Context(), mutation); types.CodeOf(err) != types.CodeDatabase {
+		t.Fatalf("activate begin code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.PauseSkillCapability(t.Context(), mutation); types.CodeOf(err) != types.CodeDatabase {
+		t.Fatalf("pause begin code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.GetSkillCapabilityDetail(t.Context(), 0, 2, capabilityID, versionID); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid detail code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.GetSkillCapabilityDetail(t.Context(), 1, 2, capabilityID, versionID); types.CodeOf(err) != types.CodeDatabase {
+		t.Fatalf("detail begin code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.DiffSkillCapabilityVersions(t.Context(), 1, 2, capabilityID, versionID, versionID); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("same version diff code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.DiffSkillCapabilityVersions(t.Context(), 0, 2, capabilityID, versionID, uuid.New()); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid diff code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.DiffSkillCapabilityVersions(t.Context(), 1, 2, capabilityID, versionID, uuid.New()); types.CodeOf(err) != types.CodeDatabase {
+		t.Fatalf("diff begin code=%s err=%v", types.CodeOf(err), err)
+	}
+	principal := capabilityruntime.PrincipalV1{
+		TenantID: 1, UserID: 2, Role: types.MembershipRoleOwner,
+		ActorType: types.ActorTypeUser, MembershipAuthorizationGeneration: 1,
+	}
+	if _, err := failingStore.ResolveSkillRef(t.Context(), principal, capabilityID, versionID); types.CodeOf(err) != types.CodeDatabase {
+		t.Fatalf("resolve begin code=%s err=%v", types.CodeOf(err), err)
+	}
+	validRef := resolved.Ref
+	wrongTenantRef := validRef
+	wrongTenantRef.TenantID = 3
+	if _, err := failingStore.OpenSkillResource(t.Context(), principal, wrongTenantRef, "SKILL.md"); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid open code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.OpenSkillResource(t.Context(), principal, validRef, "SKILL.md"); types.CodeOf(err) != types.CodeDatabase {
+		t.Fatalf("open begin code=%s err=%v", types.CodeOf(err), err)
+	}
+	validHandle := skillruntime.SkillResourceHandleV1{
+		SchemaVersion: skillruntime.SkillResourceHandleSchemaVersionV1, Skill: validRef,
+		Path: "SKILL.md", Kind: skillruntime.ResourceKindSkillMDV1,
+		ContentDigest: base.Skill.Files[0].Digest, ContentSize: int64(len(base.Skill.Files[0].Content)),
+	}
+	if _, err := failingStore.ReadSkillResourceChunk(t.Context(), principal, validHandle, -1, 1); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("invalid chunk code=%s err=%v", types.CodeOf(err), err)
+	}
+	if _, err := failingStore.ReadSkillResourceChunk(t.Context(), principal, validHandle, 0, 1); types.CodeOf(err) != types.CodeDatabase {
+		t.Fatalf("chunk begin code=%s err=%v", types.CodeOf(err), err)
+	}
+}
+
 func TestSkillRuntimeLifecycleIsolationAndExactResourcePostgres(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {

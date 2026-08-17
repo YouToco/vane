@@ -99,6 +99,35 @@ func TestManifestV2NormalizesEmptySetAndRejectsNullWire(t *testing.T) {
 	}
 }
 
+func TestManifestV2RejectsInvalidBaseOrderingDuplicatesAndEmptyWire(t *testing.T) {
+	if _, err := BuildManifestV2(ManifestV1{}, nil); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("invalid base err=%v", err)
+	}
+	compiled, err := CompileV1(CurrentOwnerV1("deepseek", "deepseek-v4-flash"),
+		ToolCatalogV1{SchemaVersion: ToolCatalogSchemaVersionV1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := testLowerTrustRefV2("mcp", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+	second := testLowerTrustRefV2("skill", "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+		"dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+	manifest, err := BuildManifestV2(compiled.Manifest, []LowerTrustCapabilityRefV2{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.CapabilityRefs[0], manifest.CapabilityRefs[1] = manifest.CapabilityRefs[1], manifest.CapabilityRefs[0]
+	if _, _, err := EncodeManifestV2(manifest); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("unsorted manifest err=%v", err)
+	}
+	if _, err := BuildManifestV2(compiled.Manifest, []LowerTrustCapabilityRefV2{first, first}); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("duplicate manifest err=%v", err)
+	}
+	if _, _, err := DecodeManifestV2(nil); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("empty manifest err=%v", err)
+	}
+}
+
 func TestLowerTrustSkillRefV2BindsExactSkillIdentity(t *testing.T) {
 	ref := skillruntime.SkillRefV1{
 		SchemaVersion: skillruntime.SkillRefSchemaVersionV1,

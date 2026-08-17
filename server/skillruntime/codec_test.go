@@ -114,6 +114,84 @@ func TestSkillResourceChunkBindsHandleOffsetAndEOF(t *testing.T) {
 	}
 }
 
+func TestSkillContractsDecodeSemanticFailuresAndHelperEdges(t *testing.T) {
+	ref := testSkillRefV1()
+	refPayload, err := EncodeSkillRefV1(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidRefPayload := bytes.Replace(refPayload, []byte(`"tenant_id":11`), []byte(`"tenant_id":0`), 1)
+	if _, err := DecodeSkillRefV1(invalidRefPayload); !errors.Is(err, ErrInvalidSkillContract) {
+		t.Fatalf("semantic ref err=%v", err)
+	}
+	if got := DigestRefV1(SkillRefV1{}); got != "" {
+		t.Fatalf("invalid ref digest=%q", got)
+	}
+
+	handle := SkillResourceHandleV1{
+		SchemaVersion: SkillResourceHandleSchemaVersionV1, Skill: ref,
+		Path: "references/guide.md", Kind: ResourceKindReferenceV1,
+		ContentDigest: strings.Repeat("d", 64), ContentSize: 3,
+	}
+	handlePayload, err := EncodeSkillResourceHandleV1(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidHandlePayload := bytes.Replace(handlePayload, []byte(`"content_size":3`), []byte(`"content_size":-1`), 1)
+	if _, err := DecodeSkillResourceHandleV1(invalidHandlePayload); !errors.Is(err, ErrInvalidSkillContract) {
+		t.Fatalf("semantic handle err=%v", err)
+	}
+	if _, err := DecodeSkillResourceHandleV1(nil); !errors.Is(err, ErrInvalidSkillContract) {
+		t.Fatalf("empty handle err=%v", err)
+	}
+	if got := DigestHandleV1(SkillResourceHandleV1{}); got != "" {
+		t.Fatalf("invalid handle digest=%q", got)
+	}
+
+	chunk := SkillResourceChunkV1{
+		SchemaVersion: SkillResourceChunkSchemaVersionV1,
+		HandleDigest:  DigestHandleV1(handle), Offset: 0, Data: []byte("abc"), EOF: true,
+	}
+	chunkPayload, err := EncodeSkillResourceChunkV1(chunk, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidChunkPayload := bytes.Replace(chunkPayload, []byte(chunk.HandleDigest),
+		[]byte(strings.Repeat("e", 64)), 1)
+	if _, err := DecodeSkillResourceChunkV1(invalidChunkPayload, handle); !errors.Is(err, ErrInvalidSkillContract) {
+		t.Fatalf("semantic chunk err=%v", err)
+	}
+	if _, err := DecodeSkillResourceChunkV1(nil, handle); !errors.Is(err, ErrInvalidSkillContract) {
+		t.Fatalf("empty chunk err=%v", err)
+	}
+
+	for name, candidate := range map[string]SkillResourceHandleV1{
+		"backslash":        func() SkillResourceHandleV1 { v := handle; v.Path = `references\\guide.md`; return v }(),
+		"hidden component": func() SkillResourceHandleV1 { v := handle; v.Path = "references/.secret"; return v }(),
+		"skill md": func() SkillResourceHandleV1 {
+			v := handle
+			v.Path = "SKILL.md"
+			v.Kind = ResourceKindSkillMDV1
+			return v
+		}(),
+		"asset": func() SkillResourceHandleV1 {
+			v := handle
+			v.Path = "assets/logo.png"
+			v.Kind = ResourceKindAssetV1
+			return v
+		}(),
+		"unknown kind": func() SkillResourceHandleV1 { v := handle; v.Kind = "script"; return v }(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := candidate.Validate()
+			wantValid := name == "skill md" || name == "asset"
+			if (err == nil) != wantValid {
+				t.Fatalf("handle=%+v err=%v wantValid=%t", candidate, err, wantValid)
+			}
+		})
+	}
+}
+
 func testSkillRefV1() SkillRefV1 {
 	return SkillRefV1{
 		SchemaVersion: SkillRefSchemaVersionV1,

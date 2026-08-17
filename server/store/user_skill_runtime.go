@@ -1060,7 +1060,6 @@ func decodeSkillFileManifest(skill types.SkillCapabilityVersion) (storedSkillFil
 		len(manifest.Files) > 128 {
 		return storedSkillFileManifestV1{}, capabilityValidation("Skill file manifest is not canonical")
 	}
-	seen := make(map[string]struct{}, len(manifest.Files))
 	previous := ""
 	var totalSize int64
 	for _, file := range manifest.Files {
@@ -1072,10 +1071,6 @@ func decodeSkillFileManifest(skill types.SkillCapabilityVersion) (storedSkillFil
 		if totalSize > 16<<20 {
 			return storedSkillFileManifestV1{}, capabilityValidation("Skill file manifest exceeds size limit")
 		}
-		if _, duplicate := seen[file.Path]; duplicate {
-			return storedSkillFileManifestV1{}, capabilityValidation("Skill file manifest path is duplicated")
-		}
-		seen[file.Path] = struct{}{}
 		if file.Kind == "script" {
 			if !skill.ContainsScripts || !strings.HasPrefix(file.Path, "scripts/") {
 				return storedSkillFileManifestV1{}, capabilityValidation("Skill script manifest entry is invalid")
