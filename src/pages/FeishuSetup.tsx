@@ -1,14 +1,33 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
 import { api, ApiError } from "../api";
 import type { FeishuStatus, VerifyResult } from "../api";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import {
+  Collapsible,
+  CollapsibleTrigger,
+  CollapsibleContent,
+} from "@/components/ui/collapsible";
+import {
+  Check,
+  Copy,
+  Loader2,
+  ChevronDown,
+  ChevronRight,
+  ExternalLink,
+  Shield,
+  Key,
+  Send,
+  Radio,
+  AlertTriangle,
+  CheckCircle2,
+  Info,
+} from "lucide-react";
 
-// 飞书接入五步向导。
-// ⚠️ 步骤顺序是硬约束：飞书控制台保存"长连接"订阅方式时要求当时有 WS 客户端在线，
-// 所以必须先填凭证让后端连上（第 3 步），再回控制台配事件订阅（第 4 步），顺序不可调换。
-
-// 手动确认类步骤（1/2/4）与测试卡片结果没有服务端状态可查，
-// 存 localStorage 让勾选在刷新后不丢
 const STORAGE_KEY = "vane_feishu_setup_done";
 
 type ManualDone = { s1: boolean; s2: boolean; s4: boolean; s5test: boolean };
@@ -17,9 +36,7 @@ function loadManualDone(): ManualDone {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) return { s1: false, s2: false, s4: false, s5test: false, ...JSON.parse(raw) };
-  } catch {
-    // localStorage 不可用或数据损坏时按全未完成处理即可
-  }
+  } catch {}
   return { s1: false, s2: false, s4: false, s5test: false };
 }
 
@@ -48,8 +65,6 @@ function buildPermissionUrl(appId: string): string {
   return `https://open.feishu.cn/app/${appId}/auth?q=${encodeURIComponent(scopes)}&token_type=tenant&op_from=openapi`;
 }
 
-// 复制到剪贴板：优先 Clipboard API（生产是 HTTPS，可用），
-// 本地 http 开发等非安全上下文降级到 execCommand
 function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
     return navigator.clipboard.writeText(text);
@@ -72,28 +87,44 @@ function copyText(text: string): Promise<void> {
 function CopyRow({ text, desc }: { text: string; desc: string }) {
   const [copied, setCopied] = useState(false);
   return (
-    <div className="copy-row">
-      <code className="copy-code">{text}</code>
-      <span className="copy-desc">{desc}</span>
-      <button
+    <div className="flex items-center gap-2 py-1.5">
+      <code className="flex-1 rounded bg-muted px-2 py-1 text-xs font-mono break-all">
+        {text}
+      </code>
+      <span className="text-xs text-muted-foreground shrink-0 hidden sm:inline">
+        {desc}
+      </span>
+      <Button
         type="button"
-        className={"btn btn-mini " + (copied ? "btn-copied" : "btn-ghost")}
+        variant={copied ? "secondary" : "ghost"}
+        size="sm"
+        className="shrink-0 h-7 text-xs"
         onClick={() => {
           copyText(text)
             .then(() => {
               setCopied(true);
               setTimeout(() => setCopied(false), 1500);
             })
-            .catch(() => {
-              // 复制失败就保持按钮原样，用户可手动选中 code 复制
-            });
+            .catch(() => {});
         }}
       >
-        {copied ? "✓ 已复制" : "复制"}
-      </button>
+        {copied ? (
+          <>
+            <Check className="size-3 mr-1" />
+            已复制
+          </>
+        ) : (
+          <>
+            <Copy className="size-3 mr-1" />
+            复制
+          </>
+        )}
+      </Button>
     </div>
   );
 }
+
+const STEP_ICONS = [Shield, Key, Key, Radio, Send] as const;
 
 function StepCard({
   index,
@@ -108,19 +139,38 @@ function StepCard({
   done: boolean;
   open: boolean;
   onToggle: () => void;
-  children: ReactNode;
+  children: React.ReactNode;
 }) {
+  const Icon = STEP_ICONS[index - 1];
   return (
-    <section className={"card step-card" + (done ? " step-done" : "")}>
-      <button type="button" className="step-header" onClick={onToggle}>
-        <span className={"step-badge" + (done ? " step-badge-done" : "")}>
-          {done ? "✓" : index}
-        </span>
-        <span className="step-title">{title}</span>
-        <span className="step-chevron">{open ? "▾" : "▸"}</span>
+    <Card className={done ? "border-emerald-200 dark:border-emerald-800" : ""}>
+      <button
+        type="button"
+        className="flex w-full items-center gap-3 p-4 text-left hover:bg-muted/50 transition-colors rounded-t-lg"
+        onClick={onToggle}
+      >
+        <div
+          className={`flex size-8 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${
+            done
+              ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
+              : "bg-primary/10 text-primary"
+          }`}
+        >
+          {done ? <Check className="size-4" /> : index}
+        </div>
+        <div className="flex-1 flex items-center gap-2">
+          <Icon className="size-4 text-muted-foreground" />
+          <span className="font-medium">{title}</span>
+        </div>
+        {done && <Badge variant="secondary" className="text-emerald-700 dark:text-emerald-300">已完成</Badge>}
+        {open ? (
+          <ChevronDown className="size-4 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="size-4 text-muted-foreground" />
+        )}
       </button>
-      {open && <div className="step-body">{children}</div>}
-    </section>
+      {open && <CardContent className="pt-0 pb-4 space-y-4">{children}</CardContent>}
+    </Card>
   );
 }
 
@@ -128,42 +178,33 @@ export default function FeishuSetup() {
   const [status, setStatus] = useState<FeishuStatus | null>(null);
   const [manual, setManual] = useState<ManualDone>(loadManualDone);
 
-  // 第 3 步：凭证表单
   const [appId, setAppId] = useState("");
   const [appSecret, setAppSecret] = useState("");
   const [verifying, setVerifying] = useState(false);
   const [verifyResult, setVerifyResult] = useState<VerifyResult | null>(null);
   const [saving, setSaving] = useState(false);
-  const [connecting, setConnecting] = useState(false); // 保存成功后等待 WS 连上的轮询期
+  const [connecting, setConnecting] = useState(false);
   const [step3Error, setStep3Error] = useState("");
 
-  // 第 5 步：测试卡片
   const [testing, setTesting] = useState(false);
   const [step5Error, setStep5Error] = useState("");
 
-  // 手动打开/收起的步骤覆盖默认展开逻辑
   const [openOverride, setOpenOverride] = useState<Record<number, boolean>>({});
 
   function saveManual(next: ManualDone) {
     setManual(next);
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    } catch {
-      // 存不进去也不影响当前会话使用
-    }
+    } catch {}
   }
 
-  // 全页轮询 status：第 3 步等连接、第 5 步等 owner 都靠它驱动。
-  // 连接等待期加密轮询（2s），平时 4s
   useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
         const s = await api.feishuStatus();
         if (alive) setStatus(s);
-      } catch {
-        // 轮询失败静默，下一轮重试；401 由 api.ts 统一踢回登录
-      }
+      } catch {}
     };
     load();
     const timer = setInterval(load, connecting ? 2000 : 4000);
@@ -176,7 +217,6 @@ export default function FeishuSetup() {
   const connected = !!status?.configured && !!status?.connected;
   const ownerCaptured = !!status?.owner_open_id;
 
-  // 连上之后结束"连接中"轮询态
   useEffect(() => {
     if (connecting && connected) setConnecting(false);
   }, [connecting, connected]);
@@ -192,7 +232,6 @@ export default function FeishuSetup() {
     [manual, connected, ownerCaptured],
   );
 
-  // 默认展开第一个未完成的步骤；用户手动开合优先
   const firstUndone = [1, 2, 3, 4, 5].find((i) => !done[i as 1 | 2 | 3 | 4 | 5]) ?? 0;
   const isOpen = (i: number) => openOverride[i] ?? i === firstUndone;
   const toggle = (i: number) => setOpenOverride((o) => ({ ...o, [i]: !isOpen(i) }));
@@ -241,176 +280,285 @@ export default function FeishuSetup() {
   const credsFilled = appId.trim() !== "" && appSecret.trim() !== "";
 
   return (
-    <div className="page">
-      <h2 className="page-title">飞书接入向导</h2>
-      <p className="muted wizard-intro">
-        按顺序完成以下 5 步，即可在飞书里与 见微 Vane 对话。
-        <strong>步骤顺序不能调换</strong>——第 4 步保存"长连接"订阅方式时，飞书要求后端此刻在线。
-      </p>
+    <div className="space-y-6">
+      <div>
+        <p className="text-sm text-muted-foreground">
+          按顺序完成以下 5 步，即可在飞书里与 见微 Vane 对话。
+          <strong className="text-foreground"> 步骤顺序不能调换</strong>——第 4 步保存"长连接"订阅方式时，飞书要求后端此刻在线。
+        </p>
+      </div>
 
-      <StepCard index={1} title="创建飞书应用" done={done[1]} open={isOpen(1)} onToggle={() => toggle(1)}>
-        <ol className="step-list">
-          <li>
-            打开{" "}
-            <a href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">
-              飞书开放平台 · 开发者后台
-            </a>
-            ，点击「创建企业自建应用」，填写应用名称（如 见微 Vane）。
-          </li>
-          <li>进入应用后，在「添加应用能力」中开通「机器人」能力。</li>
-        </ol>
-        <button
-          type="button"
-          className={"btn " + (done[1] ? "btn-ghost" : "btn-primary")}
-          onClick={() => saveManual({ ...manual, s1: !manual.s1 })}
-        >
-          {done[1] ? "取消完成标记" : "我已完成这一步 ✓"}
-        </button>
-      </StepCard>
-
-      <StepCard index={2} title="开通权限" done={done[2]} open={isOpen(2)} onToggle={() => toggle(2)}>
-        {appId.trim().startsWith("cli_") ? (
-          <>
-            <p>
-              点击下方按钮一键打开权限配置页，在弹出的对话框中全选后点「确认开通权限」：
-            </p>
-            <div className="btn-row">
+      <div className="space-y-3">
+        {/* Step 1 */}
+        <StepCard index={1} title="创建飞书应用" done={done[1]} open={isOpen(1)} onToggle={() => toggle(1)}>
+          <ol className="list-decimal list-inside space-y-2 text-sm">
+            <li>
+              打开{" "}
               <a
-                className="btn btn-primary"
-                href={buildPermissionUrl(appId.trim())}
+                href="https://open.feishu.cn/app"
                 target="_blank"
                 rel="noreferrer"
+                className="text-primary hover:underline inline-flex items-center gap-0.5"
               >
-                一键配置全部权限
+                飞书开放平台 · 开发者后台
+                <ExternalLink className="size-3" />
               </a>
+              ，点击「创建企业自建应用」，填写应用名称（如 见微 Vane）。
+            </li>
+            <li>进入应用后，在「添加应用能力」中开通「机器人」能力。</li>
+          </ol>
+          <Button
+            variant={done[1] ? "outline" : "default"}
+            size="sm"
+            onClick={() => saveManual({ ...manual, s1: !manual.s1 })}
+          >
+            {done[1] ? "取消完成标记" : "我已完成这一步"}
+            {!done[1] && <Check className="ml-1 size-4" />}
+          </Button>
+        </StepCard>
+
+        {/* Step 2 */}
+        <StepCard index={2} title="开通权限" done={done[2]} open={isOpen(2)} onToggle={() => toggle(2)}>
+          {appId.trim().startsWith("cli_") ? (
+            <div className="space-y-3">
+              <p className="text-sm">
+                点击下方按钮一键打开权限配置页，在弹出的对话框中全选后点「确认开通权限」：
+              </p>
+              <Button asChild>
+                <a
+                  href={buildPermissionUrl(appId.trim())}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <Shield className="size-4 mr-1.5" />
+                  一键配置全部权限
+                  <ExternalLink className="size-3 ml-1" />
+                </a>
+              </Button>
+              <Collapsible>
+                <CollapsibleTrigger asChild>
+                  <Button variant="ghost" size="sm" className="text-muted-foreground">
+                    <ChevronDown className="size-4 mr-1" />
+                    需要开通的 {SCOPES.length} 项权限
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <div className="mt-2 space-y-1">
+                    {SCOPES.map((s) => (
+                      <CopyRow key={s.scope} text={s.scope} desc={s.desc} />
+                    ))}
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
             </div>
-            <details className="scope-details">
-              <summary className="muted">需要开通的 {SCOPES.length} 项权限</summary>
-              <div className="copy-list">
+          ) : (
+            <div className="space-y-3">
+              <p className="text-sm">
+                请先在第 3 步填入 App ID（cli_ 开头），即可生成一键配置链接。也可手动逐条搜索添加：
+              </p>
+              <div className="space-y-1">
                 {SCOPES.map((s) => (
                   <CopyRow key={s.scope} text={s.scope} desc={s.desc} />
                 ))}
               </div>
-            </details>
-          </>
-        ) : (
-          <>
-            <p>请先在第 3 步填入 App ID（cli_ 开头），即可生成一键配置链接。也可手动逐条搜索添加：</p>
-            <div className="copy-list">
-              {SCOPES.map((s) => (
-                <CopyRow key={s.scope} text={s.scope} desc={s.desc} />
-              ))}
             </div>
-          </>
-        )}
-        <button
-          type="button"
-          className={"btn " + (done[2] ? "btn-ghost" : "btn-primary")}
-          onClick={() => saveManual({ ...manual, s2: !manual.s2 })}
-        >
-          {done[2] ? "取消完成标记" : "我已完成这一步 ✓"}
-        </button>
-      </StepCard>
+          )}
+          <Button
+            variant={done[2] ? "outline" : "default"}
+            size="sm"
+            onClick={() => saveManual({ ...manual, s2: !manual.s2 })}
+          >
+            {done[2] ? "取消完成标记" : "我已完成这一步"}
+            {!done[2] && <Check className="ml-1 size-4" />}
+          </Button>
+        </StepCard>
 
-      <StepCard index={3} title="填入凭证并连接" done={done[3]} open={isOpen(3)} onToggle={() => toggle(3)}>
-        <p>
-          在应用「凭证与基础信息」页找到 App ID 和 App Secret，填入下方并保存。
-          保存后后端会立即建立飞书长连接——这是第 4 步能保存成功的前提。
-        </p>
-        <div className="form-grid">
-          <input
-            className="input"
-            placeholder="App ID（cli_ 开头）"
-            value={appId}
-            onChange={(e) => setAppId(e.target.value)}
-            autoComplete="off"
-          />
-          <input
-            className="input"
-            type="password"
-            placeholder="App Secret"
-            value={appSecret}
-            onChange={(e) => setAppSecret(e.target.value)}
-            autoComplete="off"
-          />
-        </div>
-        <div className="btn-row">
-          <button type="button" className="btn btn-ghost" onClick={onVerify} disabled={!credsFilled || verifying || saving}>
-            {verifying ? <span className="spinner spinner-dark" /> : "检测"}
-          </button>
-          <button type="button" className="btn btn-primary" onClick={onSave} disabled={!credsFilled || saving || verifying}>
-            {saving ? <span className="spinner" /> : "保存并连接"}
-          </button>
-        </div>
-        {verifyResult && (
-          <div className={"alert " + (verifyResult.credentials_ok && verifyResult.bot_ok ? "alert-ok" : "alert-warn")}>
-            {verifyResult.credentials_ok ? "凭证有效" : "凭证无效"}
-            {verifyResult.bot_name && <>，机器人：{verifyResult.bot_name}</>}
-            {verifyResult.detail && <div className="alert-detail">{verifyResult.detail}</div>}
-            {verifyResult.credentials_ok && !verifyResult.bot_ok && (
-              <div className="alert-detail">
-                提示：应用尚未发布时机器人状态未就绪属正常现象，不影响保存——第 4 步末尾发布版本后自然就绪。
-              </div>
-            )}
+        {/* Step 3 */}
+        <StepCard index={3} title="填入凭证并连接" done={done[3]} open={isOpen(3)} onToggle={() => toggle(3)}>
+          <p className="text-sm">
+            在应用「凭证与基础信息」页找到 App ID 和 App Secret，填入下方并保存。
+            保存后后端会立即建立飞书长连接——这是第 4 步能保存成功的前提。
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="app-id">App ID</Label>
+              <Input
+                id="app-id"
+                placeholder="cli_ 开头"
+                value={appId}
+                onChange={(e) => setAppId(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="app-secret">App Secret</Label>
+              <Input
+                id="app-secret"
+                type="password"
+                placeholder="App Secret"
+                value={appSecret}
+                onChange={(e) => setAppSecret(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
           </div>
-        )}
-        {step3Error && <div className="alert alert-error">{step3Error}</div>}
-        {connecting && !connected && (
-          <div className="alert alert-info">
-            <span className="spinner spinner-dark" /> 正在建立飞书长连接，请稍候…
-            {status?.last_error && <div className="alert-detail">最近错误：{status.last_error}</div>}
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onVerify}
+              disabled={!credsFilled || verifying || saving}
+            >
+              {verifying ? <Loader2 className="size-4 animate-spin mr-1" /> : null}
+              检测
+            </Button>
+            <Button
+              size="sm"
+              onClick={onSave}
+              disabled={!credsFilled || saving || verifying}
+            >
+              {saving ? <Loader2 className="size-4 animate-spin mr-1" /> : null}
+              保存并连接
+            </Button>
           </div>
-        )}
-        {connected && (
-          <div className="alert alert-ok">✓ 长连接已建立{status?.bot_name ? `，机器人：${status.bot_name}` : ""}，可以进行第 4 步了。</div>
-        )}
-      </StepCard>
+          {verifyResult && (
+            <Alert
+              variant={
+                verifyResult.credentials_ok && verifyResult.bot_ok
+                  ? "default"
+                  : "destructive"
+              }
+              className={
+                verifyResult.credentials_ok && verifyResult.bot_ok
+                  ? "border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950"
+                  : ""
+              }
+            >
+              <AlertDescription>
+                <div className="flex items-center gap-1.5">
+                  {verifyResult.credentials_ok ? (
+                    <CheckCircle2 className="size-4 text-emerald-600" />
+                  ) : (
+                    <AlertTriangle className="size-4" />
+                  )}
+                  <span>{verifyResult.credentials_ok ? "凭证有效" : "凭证无效"}</span>
+                  {verifyResult.bot_name && <span>，机器人：{verifyResult.bot_name}</span>}
+                </div>
+                {verifyResult.detail && (
+                  <p className="mt-1 text-xs opacity-80">{verifyResult.detail}</p>
+                )}
+                {verifyResult.credentials_ok && !verifyResult.bot_ok && (
+                  <p className="mt-1 text-xs opacity-80">
+                    提示：应用尚未发布时机器人状态未就绪属正常现象，不影响保存——第 4 步末尾发布版本后自然就绪。
+                  </p>
+                )}
+              </AlertDescription>
+            </Alert>
+          )}
+          {step3Error && (
+            <Alert variant="destructive">
+              <AlertDescription>{step3Error}</AlertDescription>
+            </Alert>
+          )}
+          {connecting && !connected && (
+            <Alert className="border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950">
+              <AlertDescription>
+                <div className="flex items-center gap-2">
+                  <Loader2 className="size-4 animate-spin text-blue-600" />
+                  <span>正在建立飞书长连接，请稍候…</span>
+                </div>
+                {status?.last_error && (
+                  <p className="mt-1 text-xs opacity-80">最近错误：{status.last_error}</p>
+                )}
+              </AlertDescription>
+            </Alert>
+          )}
+          {connected && (
+            <Alert className="border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950">
+              <AlertDescription className="flex items-center gap-1.5">
+                <CheckCircle2 className="size-4 text-emerald-600" />
+                长连接已建立{status?.bot_name ? `，机器人：${status.bot_name}` : ""}，可以进行第 4 步了。
+              </AlertDescription>
+            </Alert>
+          )}
+        </StepCard>
 
-      <StepCard index={4} title="配置事件订阅并发布" done={done[4]} open={isOpen(4)} onToggle={() => toggle(4)}>
-        {!connected && (
-          <div className="alert alert-warn">请先完成第 3 步：只有后端长连接在线时，飞书控制台才允许保存"长连接"订阅方式。</div>
-        )}
-        <ol className="step-list">
-          <li>回到飞书开发者后台，进入应用的「事件与回调」页面。</li>
-          <li>订阅方式选择「<strong>使用长连接接收事件</strong>」并保存（后端此刻在线，保存才会成功）。</li>
-          <li>在「已添加事件」中添加以下事件：</li>
-        </ol>
-        <div className="copy-list">
-          {EVENTS.map((e) => (
-            <CopyRow key={e.event} text={e.event} desc={e.desc} />
-          ))}
-        </div>
-        <ol className="step-list" start={4}>
-          <li>进入「版本管理与发布」，创建版本并发布（企业自建应用一般即时生效）。</li>
-        </ol>
-        <button
-          type="button"
-          className={"btn " + (done[4] ? "btn-ghost" : "btn-primary")}
-          onClick={() => saveManual({ ...manual, s4: !manual.s4 })}
-        >
-          {done[4] ? "取消完成标记" : "我已完成这一步 ✓"}
-        </button>
-      </StepCard>
+        {/* Step 4 */}
+        <StepCard index={4} title="配置事件订阅并发布" done={done[4]} open={isOpen(4)} onToggle={() => toggle(4)}>
+          {!connected && (
+            <Alert>
+              <Info className="size-4" />
+              <AlertDescription>
+                请先完成第 3 步：只有后端长连接在线时，飞书控制台才允许保存"长连接"订阅方式。
+              </AlertDescription>
+            </Alert>
+          )}
+          <ol className="list-decimal list-inside space-y-2 text-sm">
+            <li>回到飞书开发者后台，进入应用的「事件与回调」页面。</li>
+            <li>
+              订阅方式选择「<strong>使用长连接接收事件</strong>」并保存（后端此刻在线，保存才会成功）。
+            </li>
+            <li>在「已添加事件」中添加以下事件：</li>
+          </ol>
+          <div className="space-y-1">
+            {EVENTS.map((e) => (
+              <CopyRow key={e.event} text={e.event} desc={e.desc} />
+            ))}
+          </div>
+          <ol className="list-decimal list-inside space-y-2 text-sm" start={4}>
+            <li>进入「版本管理与发布」，创建版本并发布（企业自建应用一般即时生效）。</li>
+          </ol>
+          <Button
+            variant={done[4] ? "outline" : "default"}
+            size="sm"
+            onClick={() => saveManual({ ...manual, s4: !manual.s4 })}
+          >
+            {done[4] ? "取消完成标记" : "我已完成这一步"}
+            {!done[4] && <Check className="ml-1 size-4" />}
+          </Button>
+        </StepCard>
 
-      <StepCard index={5} title="对接测试" done={done[5]} open={isOpen(5)} onToggle={() => toggle(5)}>
-        <p>在飞书里找到你的机器人，给它发一条消息（任意文本即可）。</p>
-        {!ownerCaptured ? (
-          <div className="alert alert-info">
-            <span className="spinner spinner-dark" /> 等待收到你的第一条消息…（发送后几秒内会自动识别）
-          </div>
-        ) : (
-          <div className="alert alert-ok">
-            ✓ 已捕获 Owner：{status?.owner_name || status?.owner_open_id}
-          </div>
-        )}
-        <div className="btn-row">
-          <button type="button" className="btn btn-primary" onClick={onSendTest} disabled={!ownerCaptured || testing}>
-            {testing ? <span className="spinner" /> : "发送测试卡片"}
-          </button>
-        </div>
-        {manual.s5test && <div className="alert alert-ok">✓ 测试卡片已发送，去飞书查收。接入完成！</div>}
-        {step5Error && <div className="alert alert-error">{step5Error}</div>}
-      </StepCard>
+        {/* Step 5 */}
+        <StepCard index={5} title="对接测试" done={done[5]} open={isOpen(5)} onToggle={() => toggle(5)}>
+          <p className="text-sm">在飞书里找到你的机器人，给它发一条消息（任意文本即可）。</p>
+          {!ownerCaptured ? (
+            <Alert className="border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950">
+              <AlertDescription className="flex items-center gap-2">
+                <Loader2 className="size-4 animate-spin text-blue-600" />
+                等待收到你的第一条消息…（发送后几秒内会自动识别）
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <Alert className="border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950">
+              <AlertDescription className="flex items-center gap-1.5">
+                <CheckCircle2 className="size-4 text-emerald-600" />
+                已捕获 Owner：{status?.owner_name || status?.owner_open_id}
+              </AlertDescription>
+            </Alert>
+          )}
+          <Button
+            size="sm"
+            onClick={onSendTest}
+            disabled={!ownerCaptured || testing}
+          >
+            {testing ? <Loader2 className="size-4 animate-spin mr-1" /> : <Send className="size-4 mr-1" />}
+            发送测试卡片
+          </Button>
+          {manual.s5test && (
+            <Alert className="border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950">
+              <AlertDescription className="flex items-center gap-1.5">
+                <CheckCircle2 className="size-4 text-emerald-600" />
+                测试卡片已发送，去飞书查收。接入完成！
+              </AlertDescription>
+            </Alert>
+          )}
+          {step5Error && (
+            <Alert variant="destructive">
+              <AlertDescription>{step5Error}</AlertDescription>
+            </Alert>
+          )}
+        </StepCard>
+      </div>
     </div>
   );
 }

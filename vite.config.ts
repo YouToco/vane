@@ -1,14 +1,23 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import path from "path";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
   server: {
     proxy: {
-      // 本地开发直连线上 API（或改为 http://localhost:8080 连本地后端）
       "/api": {
         target: "https://api.vane.zhuoqidev.com",
         changeOrigin: true,
+        headers: {
+          Origin: "https://vane.zhuoqidev.com",
+        },
       },
     },
   },

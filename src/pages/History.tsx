@@ -1,16 +1,30 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import type { DeliveryHistoryItem } from "../api";
-
-// 推送历史与反馈页（M7 功能 6.4）：回溯每条推送的打分、状态与用户反馈。
-// 只读页面——反馈的产生入口在飞书卡片（准则：能在卡片上一键做的不搬进 Dashboard），
-// 这里是回看与对账的地方，不是第二个反馈入口。
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+} from "@/components/ui/table";
+import {
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+} from "@/components/ui/tooltip";
+import { RefreshCw, Loader2, ExternalLink } from "lucide-react";
 
 const PAGE_SIZE = 20;
 
 const BEIJING_TZ = "Asia/Shanghai";
 
-// 后端全 UTC，换算只在展示层做；显式 timeZone 的理由同 Observability.tsx。
 function fmtBeijing(iso?: string | null): string {
   if (!iso) return "—";
   const d = new Date(iso);
@@ -18,27 +32,19 @@ function fmtBeijing(iso?: string | null): string {
   return d.toLocaleString("zh-CN", { timeZone: BEIJING_TZ, hour12: false });
 }
 
-// 投递状态徽标。sent 不给绿：绿灯留给探针（batchBadge 同理），
-// 这里 sent 是常态、failed/pending 才是要一眼看到的异常。
-function statusBadge(status: string): string {
-  if (status === "failed" || status === "pending") return "badge-bad";
-  return "badge-muted";
+function statusBadge(status: string): "destructive" | "secondary" | "outline" {
+  if (status === "failed" || status === "pending") return "destructive";
+  return "secondary";
 }
 
-// 反馈动作 → 中文标签 + 徽标配色。未知枚举原样显示英文串（后端加了新动作
-// 而前端没跟上时让"没跟上"露出来，与 Observability 的闸门列同一策略）。
-// showDetail：detail 是否内嵌进徽标——只有**用户亲手输入**的短文本才内嵌
-// （misjudged 原因 / question 提问）；deep_dive 的 detail 是 AI 生成的解读
-// markdown 全文（生产实测数百字符，内嵌直接把徽标撑爆），只进 title 提示。
-const FEEDBACK_META: Record<string, { label: string; badge: string; showDetail: boolean }> = {
-  interested: { label: "👍 感兴趣", badge: "badge-ok", showDetail: false },
-  not_interested: { label: "👎 不感兴趣", badge: "badge-muted", showDetail: false },
-  misjudged: { label: "⚠️ 误判", badge: "badge-bad", showDetail: true },
-  deep_dive: { label: "🔍 深入", badge: "badge-type", showDetail: false },
-  question: { label: "💬 追问", badge: "badge-type", showDetail: true },
+const FEEDBACK_META: Record<string, { label: string; variant: "default" | "secondary" | "outline" | "destructive"; showDetail: boolean }> = {
+  interested: { label: "👍 感兴趣", variant: "default", showDetail: false },
+  not_interested: { label: "👎 不感兴趣", variant: "secondary", showDetail: false },
+  misjudged: { label: "⚠️ 误判", variant: "destructive", showDetail: true },
+  deep_dive: { label: "🔍 深入", variant: "outline", showDetail: false },
+  question: { label: "💬 追问", variant: "outline", showDetail: true },
 };
 
-// title 提示里的 detail 截断：浏览器原生 tooltip 放几百字 markdown 同样不可读。
 function clipDetail(s: string, max = 120): string {
   const runes = Array.from(s);
   return runes.length <= max ? s : runes.slice(0, max).join("") + "…";
@@ -80,8 +86,6 @@ export default function History() {
     };
   }, [nonce]);
 
-  // 追加下一页：游标翻页天然不重不漏，直接 concat。
-  // 不做 alive 防护外的并发控制：按钮在 loadingMore 期间禁用，同一时刻至多一个在途请求。
   async function loadMore() {
     if (!nextToken || loadingMore) return;
     setLoadingMore(true);
@@ -99,104 +103,163 @@ export default function History() {
   }
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <h2 className="page-title">推送历史</h2>
-        <button
-          type="button"
-          className="btn btn-ghost btn-mini"
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm text-muted-foreground">
+            每条推送的打分、发送状态与你在飞书卡片上的反馈。反馈请在卡片上操作，这里只做回看。
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
           onClick={() => setNonce((n) => n + 1)}
           disabled={loading}
         >
-          {loading ? <span className="spinner spinner-dark" /> : "刷新"}
-        </button>
+          {loading ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <RefreshCw className="size-4" />
+          )}
+        </Button>
       </div>
-      <p className="muted src-intro">
-        每条推送的打分、发送状态与你在飞书卡片上的反馈。反馈请在卡片上操作，这里只做回看。
-      </p>
 
-      {loadError && <div className="alert alert-error">{loadError}</div>}
+      {loadError && (
+        <Alert variant="destructive">
+          <AlertDescription>{loadError}</AlertDescription>
+        </Alert>
+      )}
 
       {loading ? (
-        <div className="page-loading">
-          <span className="spinner spinner-dark" /> 加载中…
-        </div>
+        <Card>
+          <CardContent className="py-6 space-y-3">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <div key={i} className="flex gap-4">
+                <Skeleton className="h-4 w-32" />
+                <Skeleton className="h-4 w-48" />
+                <Skeleton className="h-4 w-12" />
+                <Skeleton className="h-4 w-16" />
+              </div>
+            ))}
+          </CardContent>
+        </Card>
       ) : items.length === 0 ? (
-        !loadError && <div className="empty-hint">还没有推送记录。</div>
+        !loadError && (
+          <Card>
+            <CardContent className="py-12 text-center text-muted-foreground">
+              还没有推送记录。
+            </CardContent>
+          </Card>
+        )
       ) : (
-        <section className="card">
-          <div className="table-wrap">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>推送时间（北京）</th>
-                  <th>内容</th>
-                  <th className="num">分数</th>
-                  <th>状态</th>
-                  <th>反馈</th>
-                </tr>
-              </thead>
-              <tbody>
+        <Card>
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>推送时间（北京）</TableHead>
+                  <TableHead>内容</TableHead>
+                  <TableHead className="text-right">分数</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead>反馈</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {items.map((it) => (
-                  <tr key={it.id} className={it.status === "failed" ? "row-bad" : ""}>
-                    {/* sent_at 才是真正到达用户的时刻；未发送（pending/failed）回落
-                        created_at 并在状态列可见原因，不在时间列伪装成"已推送" */}
-                    <td title={`delivery ${it.id} · batch ${it.batch_id}`}>
+                  <TableRow
+                    key={it.id}
+                    className={it.status === "failed" ? "bg-destructive/5" : ""}
+                  >
+                    <TableCell
+                      className="text-sm whitespace-nowrap"
+                      title={`delivery ${it.id} · batch ${it.batch_id}`}
+                    >
                       {fmtBeijing(it.sent_at ?? it.created_at)}
-                    </td>
-                    <td className="hist-title-cell">
+                    </TableCell>
+                    <TableCell className="max-w-[200px] truncate">
                       {it.url ? (
-                        <a href={it.url} target="_blank" rel="noreferrer">
+                        <a
+                          href={it.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-primary hover:underline"
+                        >
                           {it.title || "（无内容）"}
+                          <ExternalLink className="size-3 shrink-0" />
                         </a>
                       ) : (
-                        // content_item 被删（ON DELETE SET NULL）时 title/url 均空串
-                        <span className="muted">{it.title || "（内容已删除）"}</span>
+                        <span className="text-muted-foreground">
+                          {it.title || "（内容已删除）"}
+                        </span>
                       )}
-                    </td>
-                    <td className="num mono">{it.score}</td>
-                    <td>
-                      <span className={"badge " + statusBadge(it.status)}>{it.status}</span>
-                    </td>
-                    <td>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-sm">
+                      {it.score}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={statusBadge(it.status)}>{it.status}</Badge>
+                    </TableCell>
+                    <TableCell>
                       {it.feedbacks.length === 0 ? (
-                        <span className="muted">—</span>
+                        <span className="text-muted-foreground">—</span>
                       ) : (
-                        <div className="hist-feedbacks">
+                        <div className="flex flex-wrap gap-1">
                           {it.feedbacks.map((fb, i) => {
                             const meta = FEEDBACK_META[fb.action];
+                            const tooltipText =
+                              fmtBeijing(fb.created_at) +
+                              (fb.detail ? ` · ${clipDetail(fb.detail)}` : "");
                             return (
-                              <span
-                                key={i}
-                                className={"badge " + (meta?.badge ?? "badge-muted")}
-                                title={fmtBeijing(fb.created_at) + (fb.detail ? ` · ${clipDetail(fb.detail)}` : "")}
-                              >
-                                {meta?.label ?? fb.action}
-                                {meta?.showDetail && fb.detail && (
-                                  <span className="hist-fb-detail">{clipDetail(fb.detail, 30)}</span>
-                                )}
-                              </span>
+                              <Tooltip key={i}>
+                                <TooltipTrigger asChild>
+                                  <span>
+                                    <Badge variant={meta?.variant ?? "secondary"}>
+                                      {meta?.label ?? fb.action}
+                                      {meta?.showDetail && fb.detail && (
+                                        <span className="ml-1 opacity-75">
+                                          {clipDetail(fb.detail, 30)}
+                                        </span>
+                                      )}
+                                    </Badge>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  <p className="max-w-xs">{tooltipText}</p>
+                                </TooltipContent>
+                              </Tooltip>
                             );
                           })}
                         </div>
                       )}
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 ))}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
-          <div className="hist-pager">
-            <span className="muted">
+          <div className="flex items-center justify-between border-t px-4 py-3">
+            <span className="text-sm text-muted-foreground">
               已显示 {items.length} / {total} 条
             </span>
             {nextToken && (
-              <button type="button" className="btn btn-mini" onClick={loadMore} disabled={loadingMore}>
-                {loadingMore ? "加载中…" : "加载更多"}
-              </button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={loadMore}
+                disabled={loadingMore}
+              >
+                {loadingMore ? (
+                  <>
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                    加载中…
+                  </>
+                ) : (
+                  "加载更多"
+                )}
+              </Button>
             )}
           </div>
-        </section>
+        </Card>
       )}
     </div>
   );

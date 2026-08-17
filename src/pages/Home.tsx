@@ -1,9 +1,18 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import type { FeishuStatus } from "../api";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Bot, ArrowRight, Wifi, WifiOff } from "lucide-react";
 
-// 总览页：一张飞书连接状态大卡片。
-// 每 5 秒轮询一次 status——连接是后端 WS 长连接，状态可能随时变化，页面要跟得上。
 export default function Home() {
   const [status, setStatus] = useState<FeishuStatus | null>(null);
   const [error, setError] = useState("");
@@ -30,66 +39,101 @@ export default function Home() {
   }, []);
 
   return (
-    <div className="page">
-      <h2 className="page-title">总览</h2>
-      <div className="card status-card">
-        {status === null && !error && (
-          <div className="status-loading">
-            <span className="spinner spinner-dark" /> 正在获取飞书连接状态…
-          </div>
-        )}
-        {error && <div className="alert alert-error">{error}</div>}
-        {status !== null && !status.configured && (
-          <div className="status-empty">
-            <div className="status-icon">🤖</div>
-            <div className="status-headline">尚未接入飞书</div>
-            <p className="muted">
-              完成飞书机器人接入后，即可在飞书里直接与 见微 Vane 对话。
-            </p>
-            <a className="btn btn-primary" href="#/setup">
-              前往接入向导 →
-            </a>
-          </div>
-        )}
-        {status !== null && status.configured && (
-          <div className="status-body">
-            <div className="status-line">
-              <span className={"dot " + (status.connected ? "dot-ok" : "dot-bad")} />
-              <span className="status-headline">
-                {status.connected ? "飞书已连接" : "飞书未连接"}
-              </span>
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-lg">飞书连接状态</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {status === null && !error && (
+            <div className="space-y-3">
+              <Skeleton className="h-4 w-48" />
+              <Skeleton className="h-4 w-64" />
+              <Skeleton className="h-4 w-32" />
             </div>
-            <dl className="status-grid">
-              <div>
-                <dt>机器人</dt>
-                <dd>{status.bot_name || "—"}</dd>
+          )}
+          {error && (
+            <Alert variant="destructive">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+          {status !== null && !status.configured && (
+            <div className="flex flex-col items-center py-8 text-center">
+              <div className="flex size-16 items-center justify-center rounded-full bg-muted mb-4">
+                <Bot className="size-8 text-muted-foreground" />
               </div>
-              <div>
-                <dt>Owner</dt>
-                <dd>
-                  {status.owner_name || (status.owner_open_id ? status.owner_open_id : "未捕获")}
-                </dd>
+              <h3 className="text-lg font-semibold mb-1">尚未接入飞书</h3>
+              <p className="text-sm text-muted-foreground mb-6 max-w-sm">
+                完成飞书机器人接入后，即可在飞书里直接与 见微 Vane 对话。
+              </p>
+              <Button asChild>
+                <a href="#/setup">
+                  前往接入向导
+                  <ArrowRight className="ml-2 size-4" />
+                </a>
+              </Button>
+            </div>
+          )}
+          {status !== null && status.configured && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-3">
+                {status.connected ? (
+                  <>
+                    <span className="flex size-3 rounded-full bg-emerald-500" />
+                    <div className="flex items-center gap-2">
+                      <Wifi className="size-4 text-emerald-600" />
+                      <span className="font-medium">飞书已连接</span>
+                    </div>
+                    <Badge variant="secondary" className="ml-auto">在线</Badge>
+                  </>
+                ) : (
+                  <>
+                    <span className="flex size-3 rounded-full bg-red-500" />
+                    <div className="flex items-center gap-2">
+                      <WifiOff className="size-4 text-red-600" />
+                      <span className="font-medium">飞书未连接</span>
+                    </div>
+                    <Badge variant="destructive" className="ml-auto">离线</Badge>
+                  </>
+                )}
               </div>
-              <div>
-                <dt>连接时间</dt>
-                <dd>
-                  {status.connected_at
-                    ? new Date(status.connected_at).toLocaleString("zh-CN")
-                    : "—"}
-                </dd>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 rounded-lg border p-4">
+                <div>
+                  <p className="text-xs text-muted-foreground mb-1">机器人</p>
+                  <p className="text-sm font-medium">{status.bot_name || "—"}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground mb-1">Owner</p>
+                  <p className="text-sm font-medium">
+                    {status.owner_name || (status.owner_open_id ? status.owner_open_id : "未捕获")}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground mb-1">连接时间</p>
+                  <p className="text-sm font-medium">
+                    {status.connected_at
+                      ? new Date(status.connected_at).toLocaleString("zh-CN")
+                      : "—"}
+                  </p>
+                </div>
               </div>
-            </dl>
-            {!status.connected && status.last_error && (
-              <div className="alert alert-error">最近错误：{status.last_error}</div>
-            )}
-            {!status.connected && (
-              <a className="btn btn-ghost" href="#/setup">
-                去接入向导排查 →
-              </a>
-            )}
-          </div>
-        )}
-      </div>
+              {!status.connected && status.last_error && (
+                <Alert variant="destructive">
+                  <AlertDescription>最近错误：{status.last_error}</AlertDescription>
+                </Alert>
+              )}
+              {!status.connected && (
+                <Button variant="outline" asChild>
+                  <a href="#/setup">
+                    去接入向导排查
+                    <ArrowRight className="ml-2 size-4" />
+                  </a>
+                </Button>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

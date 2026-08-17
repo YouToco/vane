@@ -8,9 +8,35 @@ import Sources from "./pages/Sources";
 import Observability from "./pages/Observability";
 import Costs from "./pages/Costs";
 import History from "./pages/History";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
+import { Separator } from "@/components/ui/separator";
+import {
+  LayoutDashboard,
+  Clock,
+  Rss,
+  History as HistoryIcon,
+  MessageSquare,
+  Activity,
+  DollarSign,
+  LogOut,
+  Loader2,
+  Zap,
+} from "lucide-react";
 
-// hash 微型路由：不引 react-router（契约禁止新依赖），
-// 两三个页面用 hashchange 监听足够，还天然兼容静态托管的 SPA 回退。
 function useHash(): string {
   const [hash, setHash] = useState(location.hash || "#/");
   useEffect(() => {
@@ -21,7 +47,19 @@ function useHash(): string {
   return hash;
 }
 
-// hash → 页面组件。集中在一处便于新增 tab；未知 hash 回落总览。
+const NAV_ITEMS = [
+  { hash: "#/", label: "总览", icon: LayoutDashboard },
+  { hash: "#/schedules", label: "定时任务", icon: Clock },
+  { hash: "#/sources", label: "信源", icon: Rss },
+  { hash: "#/history", label: "推送历史", icon: HistoryIcon },
+] as const;
+
+const ADMIN_ITEMS = [
+  { hash: "#/setup", label: "飞书接入", icon: MessageSquare },
+  { hash: "#/observability", label: "可观测", icon: Activity },
+  { hash: "#/costs", label: "成本", icon: DollarSign },
+] as const;
+
 function renderPage(hash: string) {
   switch (hash) {
     case "#/setup":
@@ -41,8 +79,70 @@ function renderPage(hash: string) {
   }
 }
 
-// 需鉴权布局：进入时探一次 /api/auth/me——未登录时由 api.ts 统一踢到 #/login，
-// 这里只负责在确认前不渲染页面内容，避免闪一下再跳走
+function AppSidebar({ hash, onLogout }: { hash: string; onLogout: () => void }) {
+  return (
+    <Sidebar>
+      <SidebarHeader>
+        <a href="#/" className="flex items-center gap-2 px-2 py-1">
+          <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+            <Zap className="size-4" />
+          </div>
+          <div className="flex flex-col leading-tight">
+            <span className="text-sm font-semibold">见微 Vane</span>
+            <span className="text-[11px] text-muted-foreground">AI 信息推送</span>
+          </div>
+        </a>
+      </SidebarHeader>
+      <SidebarContent>
+        <SidebarGroup>
+          <SidebarGroupLabel>主要功能</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {NAV_ITEMS.map((item) => (
+                <SidebarMenuItem key={item.hash}>
+                  <SidebarMenuButton asChild isActive={hash === item.hash}>
+                    <a href={item.hash}>
+                      <item.icon />
+                      <span>{item.label}</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+        <SidebarGroup>
+          <SidebarGroupLabel>设置与监控</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {ADMIN_ITEMS.map((item) => (
+                <SidebarMenuItem key={item.hash}>
+                  <SidebarMenuButton asChild isActive={hash === item.hash}>
+                    <a href={item.hash}>
+                      <item.icon />
+                      <span>{item.label}</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      </SidebarContent>
+      <SidebarFooter>
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton onClick={onLogout}>
+              <LogOut />
+              <span>退出登录</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarFooter>
+    </Sidebar>
+  );
+}
+
 function Shell({ hash }: { hash: string }) {
   const [checked, setChecked] = useState(false);
 
@@ -51,9 +151,7 @@ function Shell({ hash }: { hash: string }) {
     api
       .me()
       .then(() => alive && setChecked(true))
-      .catch(() => {
-        // 401 已由 api.ts 跳转登录页；其他错误也不渲染内容，等用户重进
-      });
+      .catch(() => {});
     return () => {
       alive = false;
     };
@@ -62,58 +160,35 @@ function Shell({ hash }: { hash: string }) {
   async function onLogout() {
     try {
       await api.logout();
-    } catch {
-      // 登出失败也照样回登录页，cookie 会自然过期
-    }
+    } catch {}
     location.hash = "#/login";
   }
 
   if (!checked) {
     return (
-      <div className="page-loading">
-        <span className="spinner spinner-dark" /> 加载中…
+      <div className="flex h-screen items-center justify-center gap-2 text-muted-foreground">
+        <Loader2 className="size-5 animate-spin" />
+        <span>加载中…</span>
       </div>
     );
   }
 
   return (
-    <div className="shell">
-      <header className="topbar">
-        <a className="brand" href="#/">
-          见微 <span className="brand-accent">Vane</span>
-        </a>
-        <nav className="nav">
-          <a className={hash === "#/" ? "nav-link nav-active" : "nav-link"} href="#/">
-            总览
-          </a>
-          <a className={hash === "#/schedules" ? "nav-link nav-active" : "nav-link"} href="#/schedules">
-            定时任务
-          </a>
-          <a className={hash === "#/sources" ? "nav-link nav-active" : "nav-link"} href="#/sources">
-            信源
-          </a>
-          <a className={hash === "#/history" ? "nav-link nav-active" : "nav-link"} href="#/history">
-            推送历史
-          </a>
-          <a className={hash === "#/setup" ? "nav-link nav-active" : "nav-link"} href="#/setup">
-            飞书接入
-          </a>
-          <a
-            className={hash === "#/observability" ? "nav-link nav-active" : "nav-link"}
-            href="#/observability"
-          >
-            可观测
-          </a>
-          <a className={hash === "#/costs" ? "nav-link nav-active" : "nav-link"} href="#/costs">
-            成本
-          </a>
-        </nav>
-        <button type="button" className="btn btn-mini btn-ghost" onClick={onLogout}>
-          退出登录
-        </button>
-      </header>
-      <main className="main">{renderPage(hash)}</main>
-    </div>
+    <SidebarProvider>
+      <AppSidebar hash={hash} onLogout={onLogout} />
+      <SidebarInset>
+        <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
+          <SidebarTrigger className="-ml-1" />
+          <Separator orientation="vertical" className="mr-2 !h-4" />
+          <span className="text-sm text-muted-foreground">
+            {[...NAV_ITEMS, ...ADMIN_ITEMS].find((i) => i.hash === hash)?.label ?? "总览"}
+          </span>
+        </header>
+        <main className="flex-1 overflow-y-auto">
+          <div className="mx-auto max-w-5xl p-6">{renderPage(hash)}</div>
+        </main>
+      </SidebarInset>
+    </SidebarProvider>
   );
 }
 

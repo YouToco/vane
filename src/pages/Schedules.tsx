@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
+import { Calendar, Clock, Loader2, Plus, Timer, Trash2, Zap } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { Schedule, ScheduleSpec } from "../api";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
 // 定时任务页 —— 纯固化组件（遵循 ui-interaction-principles.md）。
 // 铁律：cron 绝不让 AI 生成，也不接受用户手输任意 cron；
@@ -88,9 +99,6 @@ export function describeSpec(spec: ScheduleSpec): string {
   return "自定义频率";
 }
 
-// 轻提示：短暂浮现的成功/信息条，纯前端瞬态，不入 URL、不落库。
-type Toast = { kind: "ok" | "err"; text: string } | null;
-
 export default function Schedules() {
   const [schedules, setSchedules] = useState<Schedule[] | null>(null);
   const [loadError, setLoadError] = useState("");
@@ -100,12 +108,6 @@ export default function Schedules() {
   const [creating, setCreating] = useState(false);
   const [pushing, setPushing] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [toast, setToast] = useState<Toast>(null);
-
-  function flash(t: Toast) {
-    setToast(t);
-    if (t) setTimeout(() => setToast(null), 2600);
-  }
 
   async function load() {
     try {
@@ -152,9 +154,9 @@ export default function Schedules() {
       await api.createSchedule(spec, {}, desc);
       setNlDesc("");
       await load();
-      flash({ kind: "ok", text: "定时任务已创建" });
+      toast.success("定时任务已创建");
     } catch (err) {
-      flash({ kind: "err", text: err instanceof ApiError ? err.message : "创建失败" });
+      toast.error(err instanceof ApiError ? err.message : "创建失败");
     } finally {
       setCreating(false);
     }
@@ -164,9 +166,9 @@ export default function Schedules() {
     setPushing(true);
     try {
       await api.pushNow();
-      flash({ kind: "ok", text: "已触发一次推送，去飞书查收" });
+      toast.success("已触发一次推送，去飞书查收");
     } catch (err) {
-      flash({ kind: "err", text: err instanceof ApiError ? err.message : "触发失败" });
+      toast.error(err instanceof ApiError ? err.message : "触发失败");
     } finally {
       setPushing(false);
     }
@@ -177,161 +179,229 @@ export default function Schedules() {
     try {
       await api.deleteSchedule(id);
       await load();
-      flash({ kind: "ok", text: "已删除" });
+      toast.success("已删除");
     } catch (err) {
-      flash({ kind: "err", text: err instanceof ApiError ? err.message : "删除失败" });
+      toast.error(err instanceof ApiError ? err.message : "删除失败");
     } finally {
       setDeletingId(null);
     }
   }
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <h2 className="page-title">定时任务</h2>
-        <button type="button" className="btn btn-ghost btn-push-now" onClick={onPushNow} disabled={pushing}>
-          {pushing ? <span className="spinner spinner-dark" /> : "⚡ 现在推一次"}
-        </button>
+    <div className="max-w-2xl mx-auto px-4 py-6 space-y-6">
+      {/* ── 页头 ── */}
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold tracking-tight">定时任务</h1>
+        <Button variant="outline" onClick={onPushNow} disabled={pushing}>
+          {pushing ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <Zap className="size-4" />
+          )}
+          {pushing ? "推送中…" : "现在推一次"}
+        </Button>
       </div>
 
-      {/* ── 创建卡片：时间选择器 + 频率分段控件 ── */}
-      <section className="card sched-builder">
-        <div className="seg" role="tablist" aria-label="频率">
-          {(
-            [
-              ["daily", "每天"],
-              ["weekly", "每周"],
-              ["interval", "自定义间隔"],
-            ] as [FreqMode, string][]
-          ).map(([mode, label]) => (
-            <button
-              key={mode}
-              type="button"
-              role="tab"
-              aria-selected={form.mode === mode}
-              className={"seg-item" + (form.mode === mode ? " seg-active" : "")}
-              onClick={() => setForm((f) => ({ ...f, mode }))}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+      {/* ── 创建卡片：频率分段 + 时间选择器 ── */}
+      <Card>
+        <CardHeader>
+          <CardTitle>新建调度</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          {/* 频率模式 Tabs */}
+          <Tabs
+            value={form.mode}
+            onValueChange={(v) => {
+              if (v != null) setForm((f) => ({ ...f, mode: v as FreqMode }));
+            }}
+          >
+            <TabsList className="w-full">
+              <TabsTrigger value="daily" className="flex-1">
+                <Calendar className="size-3.5" />
+                每天
+              </TabsTrigger>
+              <TabsTrigger value="weekly" className="flex-1">
+                <Clock className="size-3.5" />
+                每周
+              </TabsTrigger>
+              <TabsTrigger value="interval" className="flex-1">
+                <Timer className="size-3.5" />
+                自定义间隔
+              </TabsTrigger>
+            </TabsList>
 
-        <div className="sched-controls">
-          {form.mode !== "interval" && (
-            <label className="field">
-              <span className="field-label">推送时刻</span>
-              <input
-                className="input input-time"
-                type="time"
-                value={form.time}
-                onChange={(e) => setForm((f) => ({ ...f, time: e.target.value }))}
-              />
-            </label>
-          )}
-
-          {form.mode === "weekly" && (
-            <label className="field">
-              <span className="field-label">星期</span>
-              <div className="weekday-row">
-                {WEEKDAYS.map((w, d) => (
-                  <button
-                    key={d}
-                    type="button"
-                    className={"weekday" + (form.weekdays.includes(d) ? " weekday-on" : "")}
-                    onClick={() => toggleWeekday(d)}
-                    aria-pressed={form.weekdays.includes(d)}
-                  >
-                    {w}
-                  </button>
-                ))}
+            {/* 每天：只选时刻 */}
+            <TabsContent value="daily" className="mt-4">
+              <div className="space-y-1.5">
+                <Label>推送时刻</Label>
+                <Input
+                  type="time"
+                  value={form.time}
+                  onChange={(e) => setForm((f) => ({ ...f, time: e.target.value }))}
+                  className="w-36"
+                />
               </div>
-            </label>
-          )}
+            </TabsContent>
 
-          {form.mode === "interval" && (
-            <label className="field">
-              <span className="field-label">每隔（小时）</span>
-              <input
-                className="input input-num"
-                type="number"
-                min={1}
-                max={168}
-                value={form.intervalHours}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, intervalHours: Math.max(1, Number(e.target.value) || 1) }))
-                }
-              />
-            </label>
-          )}
-        </div>
+            {/* 每周：时刻 + 星期多选 */}
+            <TabsContent value="weekly" className="mt-4 space-y-4">
+              <div className="space-y-1.5">
+                <Label>推送时刻</Label>
+                <Input
+                  type="time"
+                  value={form.time}
+                  onChange={(e) => setForm((f) => ({ ...f, time: e.target.value }))}
+                  className="w-36"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label>推送星期</Label>
+                <ToggleGroup variant="outline" spacing={0}>
+                  {WEEKDAYS.map((w, d) => (
+                    <ToggleGroupItem
+                      key={d}
+                      pressed={form.weekdays.includes(d)}
+                      onPressedChange={() => toggleWeekday(d)}
+                      size="sm"
+                      aria-label={`周${w}`}
+                    >
+                      {w}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+                {form.weekdays.length === 0 && (
+                  <p className="text-xs text-destructive">请至少选择一天</p>
+                )}
+              </div>
+            </TabsContent>
 
-        <label className="field">
-          <span className="field-label">备注（可选）</span>
-          <input
-            className="input"
-            placeholder={`如「${previewText}推科技」，留空则用「${previewText}」`}
-            value={nlDesc}
-            onChange={(e) => setNlDesc(e.target.value)}
-            maxLength={60}
-          />
-        </label>
+            {/* 自定义间隔：小时数 */}
+            <TabsContent value="interval" className="mt-4">
+              <div className="space-y-1.5">
+                <Label>每隔（小时）</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={168}
+                  value={form.intervalHours}
+                  onChange={(e) =>
+                    setForm((f) => ({
+                      ...f,
+                      intervalHours: Math.max(1, Number(e.target.value) || 1),
+                    }))
+                  }
+                  className="w-36"
+                />
+              </div>
+            </TabsContent>
+          </Tabs>
 
-        <div className="sched-foot">
-          <div className="sched-preview">
-            <span className="preview-chip">{previewText}</span>
-            <span className="preview-tz">时区 {TZ}</span>
+          {/* 备注 */}
+          <div className="space-y-1.5">
+            <Label>备注（可选）</Label>
+            <Input
+              placeholder={`如「${previewText}推科技」，留空则用「${previewText}」`}
+              value={nlDesc}
+              onChange={(e) => setNlDesc(e.target.value)}
+              maxLength={60}
+            />
           </div>
-          <button type="button" className="btn btn-primary" onClick={onCreate} disabled={!canCreate}>
-            {creating ? <span className="spinner" /> : "创建"}
-          </button>
-        </div>
-        {form.mode === "weekly" && form.weekdays.length === 0 && (
-          <div className="hint hint-warn">请至少选择一天</div>
-        )}
-      </section>
+
+          {/* 预览 + 创建按钮 */}
+          <div className="flex items-center justify-between pt-1">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <span>预览</span>
+              <Badge variant="secondary">{previewText}</Badge>
+              <span className="text-xs">{TZ}</span>
+            </div>
+            <Button onClick={onCreate} disabled={!canCreate}>
+              {creating ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Plus className="size-4" />
+              )}
+              {creating ? "创建中…" : "创建"}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* ── 现有调度列表 ── */}
-      <h3 className="section-title">已创建的调度</h3>
-      {loadError && <div className="alert alert-error">{loadError}</div>}
-      {schedules === null && !loadError && (
-        <div className="list-loading">
-          <span className="spinner spinner-dark" /> 加载中…
-        </div>
-      )}
-      {schedules !== null && schedules.length === 0 && !loadError && (
-        <div className="empty-hint">还没有定时任务，用上面的选择器创建第一个吧。</div>
-      )}
-      <div className="sched-list">
-        {schedules?.map((s) => (
-          <div key={s.id} className={"card sched-card" + (s.status === "paused" ? " is-paused" : "")}>
-            <div className="sched-card-main">
-              <div className="sched-card-title">{s.nl_description || describeSpec(s.spec)}</div>
-              <div className="sched-card-meta">
-                <span className="meta-freq">{describeSpec(s.spec)}</span>
-                {s.next_run && (
-                  <span className="meta-next">
-                    下次 {new Date(s.next_run).toLocaleString("zh-CN")}
-                  </span>
-                )}
-                {s.status === "paused" && <span className="badge badge-paused">已暂停</span>}
-              </div>
-            </div>
-            <button
-              type="button"
-              className="btn btn-mini btn-danger"
-              onClick={() => onDelete(s.id)}
-              disabled={deletingId === s.id}
-            >
-              {deletingId === s.id ? <span className="spinner spinner-dark" /> : "删除"}
-            </button>
+      <div className="space-y-3">
+        <h2 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          已创建的调度
+        </h2>
+
+        {loadError && (
+          <Alert variant="destructive">
+            <AlertDescription>{loadError}</AlertDescription>
+          </Alert>
+        )}
+
+        {/* 加载骨架 */}
+        {schedules === null && !loadError && (
+          <div className="space-y-3">
+            <Skeleton className="h-16 w-full rounded-xl" />
+            <Skeleton className="h-16 w-full rounded-xl" />
           </div>
+        )}
+
+        {/* 空状态 */}
+        {schedules !== null && schedules.length === 0 && !loadError && (
+          <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+            <Clock className="size-8 mb-2 opacity-30" />
+            <p className="text-sm">还没有定时任务，用上面的选择器创建第一个吧。</p>
+          </div>
+        )}
+
+        {/* 调度列表 */}
+        {schedules?.map((s) => (
+          <Card
+            key={s.id}
+            className={
+              "transition-shadow hover:ring-foreground/20" +
+              (s.status === "paused" ? " opacity-60" : "")
+            }
+          >
+            <CardContent className="flex items-center justify-between py-4">
+              <div className="min-w-0 flex-1">
+                <p className="font-medium text-sm truncate">
+                  {s.nl_description || describeSpec(s.spec)}
+                </p>
+                <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                  <span className="text-xs text-muted-foreground">
+                    {describeSpec(s.spec)}
+                  </span>
+                  {s.next_run && (
+                    <span className="text-xs text-muted-foreground">
+                      · 下次 {new Date(s.next_run).toLocaleString("zh-CN")}
+                    </span>
+                  )}
+                  {s.status === "paused" && (
+                    <Badge variant="outline" className="text-xs">
+                      已暂停
+                    </Badge>
+                  )}
+                </div>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => onDelete(s.id)}
+                disabled={deletingId === s.id}
+                className="ml-3 shrink-0 text-muted-foreground hover:text-destructive"
+                aria-label="删除"
+              >
+                {deletingId === s.id ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Trash2 className="size-4" />
+                )}
+              </Button>
+            </CardContent>
+          </Card>
         ))}
       </div>
-
-      {toast && (
-        <div className={"toast " + (toast.kind === "ok" ? "toast-ok" : "toast-err")}>{toast.text}</div>
-      )}
     </div>
   );
 }
