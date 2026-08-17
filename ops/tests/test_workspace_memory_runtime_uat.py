@@ -89,14 +89,16 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
         captured: list[str] = []
         with mock.patch.object(sys, "argv", argv), mock.patch.object(
             uat.subprocess, "run", return_value=completed
-        ) as run, mock.patch("builtins.print", side_effect=lambda value: captured.append(value)):
+        ) as run, mock.patch.object(
+            uat, "read_capture_file", side_effect=[json.dumps(self.report()), ""]
+        ), mock.patch("builtins.print", side_effect=lambda value: captured.append(value)):
             code = uat.main()
         command = run.call_args.args[0]
         return code, command, run.call_args.kwargs["timeout"]
 
     def test_exact_release_runs_hardened_transient_unit(self) -> None:
         completed = subprocess.CompletedProcess(
-            [], 0, stdout=json.dumps(self.report()), stderr=""
+            [], 0, stdout="", stderr=""
         )
         code, command, timeout = self.invoke(completed)
         self.assertEqual(code, 0)
@@ -105,6 +107,15 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
         self.assertIn("--property=NoNewPrivileges=yes", command)
         self.assertIn("--property=ProtectSystem=strict", command)
         self.assertIn("--property=TimeoutStartSec=6min", command)
+        self.assertNotIn("--pipe", command)
+        self.assertEqual(
+            len([item for item in command if "StandardOutput=file:" in item]),
+            1,
+        )
+        self.assertEqual(
+            len([item for item in command if "StandardError=file:" in item]),
+            1,
+        )
         self.assertFalse(any("EnvironmentFile=" in item for item in command))
         self.assertEqual(
             len([item for item in command if "LoadCredential=runtime_db_url:" in item]),
@@ -138,6 +149,23 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
             self.invoke(subprocess.CompletedProcess([], 1, stdout="", stderr="failed"))
         with self.assertRaises(RuntimeError):
             self.invoke(subprocess.CompletedProcess([], 0, stdout=json.dumps(self.report()), stderr="warning"))
+
+    def test_capture_file_is_root_owned_single_link_bounded_utf8(self) -> None:
+        root = Path(self.temp.name)
+        capture = uat.create_capture_file(root, "capture")
+        capture.write_text("ok", encoding="utf-8")
+        self.assertEqual(uat.read_capture_file(capture), "ok")
+
+        capture.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "unsafe"):
+            uat.read_capture_file(capture)
+        capture.chmod(0o600)
+        capture.write_bytes(b"\xff")
+        with self.assertRaisesRegex(RuntimeError, "UTF-8"):
+            uat.read_capture_file(capture)
+        capture.write_bytes(b"x" * (uat.CAPTURE_BYTES_MAX + 1))
+        with self.assertRaisesRegex(RuntimeError, "unsafe"):
+            uat.read_capture_file(capture)
 
     def test_runtime_database_url_is_derived_without_injecting_server_env(self) -> None:
         self.assertEqual(uat.runtime_database_url(uat.SERVER_ENV), "postgres://runtime")
