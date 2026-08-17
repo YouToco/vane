@@ -65,6 +65,7 @@ class WorkspaceMemoryRuntimeUATTest(unittest.TestCase):
             "cross_member_recall_verified": True,
             "personal_excluded_from_team": True,
             "team_excluded_from_personal": True,
+            "cross_user_personal_denied": True,
             "cleanup_verified": True,
             "personal_evidence_digest": "1" * 64,
             "team_evidence_digest": "2" * 64,

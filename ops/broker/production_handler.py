@@ -26,6 +26,7 @@ import sys
 import tarfile
 import tempfile
 from typing import Any, Optional
+import uuid
 
 
 def canonical(value: Any) -> bytes:
@@ -298,6 +299,68 @@ def run_uat(command: list[str], revision: str, output: Path, identity: dict) -> 
         revoke_uat_session(token_hash)
 
 
+def run_workspace_memory_uat(
+    repo: Path, revision: str, output: Path, *, operation_id: Optional[str] = None
+) -> dict:
+    executable = repo / "ops/audit/workspace-memory-runtime-uat.py"
+    if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RuntimeError("fixed workspace memory UAT command is unavailable")
+    operation = operation_id or str(uuid.uuid4())
+    if str(uuid.UUID(operation)) != operation or uuid.UUID(operation).int == 0:
+        raise RuntimeError("workspace memory UAT operation ID is invalid")
+    result = subprocess.run(
+        [str(executable), "--sha", revision, "--operation-id", operation],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        raise RuntimeError(
+            f"workspace memory UAT failed with exit {result.returncode}"
+        )
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in items:
+            if key in value:
+                raise RuntimeError("workspace memory UAT evidence contains duplicate keys")
+            value[key] = item
+        return value
+
+    value = json.loads(result.stdout, object_pairs_hook=pairs)
+    expected = {
+        "schema", "revision", "operation_id", "runtime_boundary_verified",
+        "personal_write_verified", "team_write_verified",
+        "cross_member_recall_verified", "personal_excluded_from_team",
+        "team_excluded_from_personal", "cross_user_personal_denied",
+        "cleanup_verified", "personal_evidence_digest", "team_evidence_digest",
+    }
+    booleans = {
+        "runtime_boundary_verified", "personal_write_verified",
+        "team_write_verified", "cross_member_recall_verified",
+        "personal_excluded_from_team", "team_excluded_from_personal",
+        "cross_user_personal_denied", "cleanup_verified",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("schema") != "vane.workspace-memory-runtime-uat/v1"
+        or value.get("revision") != revision
+        or value.get("operation_id") != operation
+        or any(value.get(key) is not True for key in booleans)
+        or not all(
+            isinstance(value.get(key), str)
+            and re.fullmatch(r"[0-9a-f]{64}", value[key])
+            for key in ("personal_evidence_digest", "team_evidence_digest")
+        )
+        or value["personal_evidence_digest"] == value["team_evidence_digest"]
+    ):
+        raise RuntimeError("workspace memory UAT evidence is invalid")
+    write_json(output, value)
+    return value
+
+
 def restore(
     *,
     repo: Path,
@@ -498,6 +561,7 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
             "ops/broker/promote_finalized_controller.py",
             "ops/broker/run-production-handler.sh",
             "ops/audit/production-uat.py",
+            "ops/audit/workspace-memory-runtime-uat.py",
             "ops/release/artifact.py",
             "ops/release/remote-atomic-release.sh",
             "ops/rollback/switch-server-release.sh",
@@ -512,6 +576,7 @@ def stage_controller(*, archive: Path, revision: str, controller_root: Path) -> 
             "ops/broker/promote_finalized_controller.py",
             "ops/broker/run-production-handler.sh",
             "ops/audit/production-uat.py",
+            "ops/audit/workspace-memory-runtime-uat.py",
             "ops/release/artifact.py",
             "ops/release/remote-atomic-release.sh",
             "ops/rollback/switch-server-release.sh",
@@ -761,6 +826,11 @@ def release(
             transaction / "uat.json",
             config["uat_identity"],
         )
+        run_workspace_memory_uat(
+            repo,
+            revision,
+            transaction / "workspace-memory-uat.json",
+        )
 
         infra_manifest = Path(f"/opt/vane/releases/{revision}/infra-manifest.sha256")
         if infra_manifest.is_symlink() or not infra_manifest.is_file():
@@ -822,6 +892,7 @@ def release(
             evidence={
                 "machine-verify.json": transaction / "machine-verify.json",
                 "uat.json": transaction / "uat.json",
+                "workspace-memory-uat.json": transaction / "workspace-memory-uat.json",
             },
             parent=deploy_manifest,
         )

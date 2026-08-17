@@ -59,6 +59,7 @@ def validate_report(value: object, revision: str, operation_id: str) -> dict[str
         "cross_member_recall_verified",
         "personal_excluded_from_team",
         "team_excluded_from_personal",
+        "cross_user_personal_denied",
         "cleanup_verified",
         "personal_evidence_digest",
         "team_evidence_digest",

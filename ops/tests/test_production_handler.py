@@ -40,6 +40,7 @@ class ProductionHandlerTest(unittest.TestCase):
             "ops/broker/promote_finalized_controller.py": b"#!/usr/bin/env python3\n",
             "ops/broker/run-production-handler.sh": b"#!/bin/sh\n",
             "ops/audit/production-uat.py": b"#!/usr/bin/env python3\n",
+            "ops/audit/workspace-memory-runtime-uat.py": b"#!/usr/bin/env python3\n",
             "ops/release/artifact.py": b"pass\n",
             "ops/release/remote-atomic-release.sh": b"#!/bin/sh\n",
             "ops/rollback/switch-server-release.sh": b"#!/bin/sh\n",
@@ -379,9 +380,12 @@ class ProductionHandlerTest(unittest.TestCase):
         )
         server = source.index("remote-atomic-release.sh")
         uat = source.index("run_uat", server)
-        state = source.index("atomic_current_release", uat)
+        memory_uat = source.index("run_workspace_memory_uat(", uat)
+        state = source.index("atomic_current_release", memory_uat)
         self.assertLess(server, uat)
-        self.assertLess(uat, state)
+        self.assertLess(uat, memory_uat)
+        self.assertLess(memory_uat, state)
+        self.assertIn('"workspace-memory-uat.json": transaction / "workspace-memory-uat.json"', source)
         self.assertNotIn('"frontend-aliyun"', source)
         self.assertNotIn('"frontend-cloudflare"', source)
         self.assertNotIn("docker build", source)
@@ -513,6 +517,51 @@ print(json.dumps({"schema":"vane.production-uat/v1","revision":sys.argv[-1],"ok"
                 )
         self.assertEqual(len(statements), 2)
         self.assertIn("DELETE FROM user_sessions", statements[1])
+
+    def test_workspace_memory_uat_is_release_bound_and_persisted(self) -> None:
+        executable = self.root / "ops/audit/workspace-memory-runtime-uat.py"
+        executable.parent.mkdir(parents=True)
+        executable.write_text(
+            """#!/usr/bin/env python3
+import hashlib
+import json
+import sys
+revision = sys.argv[sys.argv.index("--sha") + 1]
+operation = sys.argv[sys.argv.index("--operation-id") + 1]
+print(json.dumps({
+  "schema":"vane.workspace-memory-runtime-uat/v1",
+  "revision":revision,
+  "operation_id":operation,
+  "runtime_boundary_verified":True,
+  "personal_write_verified":True,
+  "team_write_verified":True,
+  "cross_member_recall_verified":True,
+  "personal_excluded_from_team":True,
+  "team_excluded_from_personal":True,
+  "cross_user_personal_denied":True,
+  "cleanup_verified":True,
+  "personal_evidence_digest":hashlib.sha256(b"personal").hexdigest(),
+  "team_evidence_digest":hashlib.sha256(b"team").hexdigest(),
+}))
+""",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        operation = "5d358bef-7093-4327-9f66-f5af9f194e51"
+        output = self.root / "workspace-memory-uat.json"
+        value = production_handler.run_workspace_memory_uat(
+            self.root, REVISION, output, operation_id=operation
+        )
+        self.assertEqual(value["revision"], REVISION)
+        self.assertEqual(value["operation_id"], operation)
+        self.assertTrue(value["cross_user_personal_denied"])
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+        executable.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "exit 23"):
+            production_handler.run_workspace_memory_uat(
+                self.root, REVISION, self.root / "failed.json", operation_id=operation
+            )
 
 
 if __name__ == "__main__":

@@ -57,6 +57,7 @@ type workspaceMemoryUATReport struct {
 	CrossMemberRecallVerified bool   `json:"cross_member_recall_verified"`
 	PersonalExcludedFromTeam  bool   `json:"personal_excluded_from_team"`
 	TeamExcludedFromPersonal  bool   `json:"team_excluded_from_personal"`
+	CrossUserPersonalDenied   bool   `json:"cross_user_personal_denied"`
 	CleanupVerified           bool   `json:"cleanup_verified"`
 	PersonalEvidenceDigest    string `json:"personal_evidence_digest"`
 	TeamEvidenceDigest        string `json:"team_evidence_digest"`
@@ -85,7 +86,7 @@ func executeWorkspaceMemoryUATCommand(
 	set := flag.NewFlagSet(workspaceMemoryUATCommand, flag.ContinueOnError)
 	set.SetOutput(os.Stderr)
 	var options workspaceMemoryUATOptions
-	set.StringVar(&options.operationID, "operation-id", "", "one-time canonical UUID")
+	set.StringVar(&options.operationID, "operation-id", "", "retryable correlation UUID")
 	set.StringVar(&options.expectedRevision, "expected-revision", "", "exact release revision")
 	set.StringVar(&options.confirmation, "confirm", "", "exact mutation authority phrase")
 	if err := set.Parse(arguments); err != nil {
@@ -189,9 +190,9 @@ func runWorkspaceMemoryRuntimeUAT(
 		OperationID: operationID, RuntimeBoundaryVerified: true,
 		PersonalWriteVerified: true, TeamWriteVerified: true,
 		CrossMemberRecallVerified: true, PersonalExcludedFromTeam: true,
-		TeamExcludedFromPersonal: true,
-		PersonalEvidenceDigest:   digestString(personalText),
-		TeamEvidenceDigest:       digestString(teamText),
+		TeamExcludedFromPersonal: true, CrossUserPersonalDenied: true,
+		PersonalEvidenceDigest: digestString(personalText),
+		TeamEvidenceDigest:     digestString(teamText),
 	}
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), workspaceMemoryUATCleanupTime)
 	defer cleanupCancel()
@@ -244,19 +245,29 @@ func exerciseWorkspaceMemoryRuntime(
 	if err != nil {
 		return "", "", fmt.Errorf("recall team memory UAT as second member: %w", err)
 	}
-	teamPersonalProbe, err := runtime.RecallWorkspaceMemories(ctx, fixture.teamID,
+	creatorTeamPersonalProbe, err := runtime.RecallWorkspaceMemories(ctx, fixture.teamID,
+		fixture.creatorUserID, types.MemoryRecallQuery{Query: personalText, Limit: 5})
+	if err != nil {
+		return "", "", fmt.Errorf("probe creator personal exclusion from team memory: %w", err)
+	}
+	memberTeamPersonalProbe, err := runtime.RecallWorkspaceMemories(ctx, fixture.teamID,
 		fixture.memberUserID, types.MemoryRecallQuery{Query: personalText, Limit: 5})
 	if err != nil {
-		return "", "", fmt.Errorf("probe personal exclusion from team memory: %w", err)
+		return "", "", fmt.Errorf("probe member personal exclusion from team memory: %w", err)
 	}
 	personalTeamProbe, err := runtime.RecallMemories(ctx, fixture.personalID,
 		fixture.creatorUserID, types.MemoryRecallQuery{Query: teamText, Limit: 5})
 	if err != nil {
 		return "", "", fmt.Errorf("probe team exclusion from personal memory: %w", err)
 	}
+	if _, err := runtime.RecallMemories(ctx, fixture.personalID,
+		fixture.memberUserID, types.MemoryRecallQuery{Query: personalText, Limit: 5}); types.CodeOf(err) != types.CodeForbidden && types.CodeOf(err) != types.CodeNotFound {
+		return "", "", errors.New("cross-user personal memory read was not forbidden")
+	}
 	if !recallContainsExactly(personalRecall, personalText) ||
 		!recallContainsExactly(teamRecall, teamText) ||
-		recallContains(teamPersonalProbe, personalText) ||
+		recallContains(creatorTeamPersonalProbe, personalText) ||
+		recallContains(memberTeamPersonalProbe, personalText) ||
 		recallContains(personalTeamProbe, teamText) {
 		return "", "", errors.New("workspace memory UAT isolation result is inconsistent")
 	}

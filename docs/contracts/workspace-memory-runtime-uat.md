@@ -10,7 +10,7 @@ The command requires all of the following:
 
 - an exact clean embedded source revision matching `--expected-revision`;
 - the exact confirmation value `vane.workspace-memory-runtime-uat/v1`;
-- a canonical non-zero operation UUID;
+- a canonical non-zero retryable correlation UUID;
 - distinct migration-owner and `vane_server_runtime` database authorities.
 
 The operator wrapper at `ops/audit/workspace-memory-runtime-uat.py` additionally
@@ -26,8 +26,10 @@ an independently authenticated `NewServerRuntime` pool:
 1. write and recall one personal record;
 2. write one team record as member A;
 3. recall that record as member B;
-4. prove the personal record is absent from the team corpus;
-5. prove the team record is absent from the personal corpus.
+4. prove creator A's personal record is absent from the team corpus for both A
+   and B;
+5. prove member B cannot read creator A's personal workspace;
+6. prove the team record is absent from creator A's personal corpus.
 
 The migration-owner connection is used only for fixture setup and tenant purge.
 Both workspaces and both users must be absent before a success receipt is
@@ -37,5 +39,11 @@ the deferred cleanup uses a separate bounded context, and the next run also
 recovers stale reserved-prefix fixtures.
 
 This command is an acceptance probe, not a general administrative endpoint.
-It must only be invoked by the trusted release controller after the ordinary
-migration, startup, readiness, and rollback gates have succeeded.
+The trusted forced-command production handler invokes it automatically after
+the ordinary migration, startup, readiness, and authenticated UAT gates have
+succeeded, then binds its evidence into the signed verify manifest. The
+controller follows the existing N→N+1 rule: the release that first carries this
+handler only stages it; the following product release is the first one that can
+run the UAT under that already-finalized controller. A correlation UUID is safe
+to retry because the probe purges its complete synthetic fixture; it is not a
+durable one-time business-operation receipt.

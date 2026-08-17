@@ -75,6 +75,7 @@ class ControllerUpgradeTest(unittest.TestCase):
             "ops/broker/promote_finalized_controller.py": b"#!/usr/bin/env python3\n",
             "ops/broker/run-production-handler.sh": b"#!/bin/sh\n",
             "ops/audit/production-uat.py": b"#!/usr/bin/env python3\n",
+            "ops/audit/workspace-memory-runtime-uat.py": b"#!/usr/bin/env python3\n",
             "ops/release/artifact.py": b"#!/usr/bin/env python3\n",
             "ops/release/remote-atomic-release.sh": b"#!/bin/sh\n",
             "ops/rollback/switch-server-release.sh": b"#!/bin/sh\n",

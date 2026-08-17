@@ -80,10 +80,14 @@ func (f *fakeWorkspaceMemoryRuntime) ApplyWorkspaceMemoryAction(
 }
 
 func (f *fakeWorkspaceMemoryRuntime) RecallMemories(
-	_ context.Context, _, _ int64, query types.MemoryRecallQuery,
+	_ context.Context, _, userID int64, query types.MemoryRecallQuery,
 ) (*types.MemoryRecallResult, error) {
 	if err := f.step(); err != nil {
 		return nil, err
+	}
+	if userID == 2 {
+		return nil, types.NewAppError(types.CodeForbidden,
+			"cross-user personal memory denied", types.ErrForbidden)
 	}
 	if f.calls == 5 && !f.inconsistent {
 		return recallResult(query.Query), nil
@@ -113,7 +117,7 @@ func TestExerciseWorkspaceMemoryRuntimeFailsClosedAtEveryStep(t *testing.T) {
 	fixture := workspaceMemoryUATFixture{creatorUserID: 1, memberUserID: 2,
 		personalID: 3, teamID: 4, personalSID: 5, teamSID: 6}
 	operationID := uuid.NewString()
-	for step := 1; step <= 8; step++ {
+	for step := 1; step <= 10; step++ {
 		t.Run(fmt.Sprintf("step-%d", step), func(t *testing.T) {
 			fake := &fakeWorkspaceMemoryRuntime{failAt: step}
 			if _, _, err := exerciseWorkspaceMemoryRuntime(
@@ -128,7 +132,7 @@ func TestExerciseWorkspaceMemoryRuntimeFailsClosedAtEveryStep(t *testing.T) {
 	fake := &fakeWorkspaceMemoryRuntime{}
 	personal, team, err := exerciseWorkspaceMemoryRuntime(
 		t.Context(), fake, fixture, operationID)
-	if err != nil || personal == "" || team == "" || personal == team || fake.calls != 8 {
+	if err != nil || personal == "" || team == "" || personal == team || fake.calls != 10 {
 		t.Fatalf("success personal=%q team=%q calls=%d err=%v",
 			personal, team, fake.calls, err)
 	}
@@ -282,6 +286,7 @@ func TestWorkspaceMemoryRuntimeUATPostgres(t *testing.T) {
 		!report.RuntimeBoundaryVerified || !report.PersonalWriteVerified ||
 		!report.TeamWriteVerified || !report.CrossMemberRecallVerified ||
 		!report.PersonalExcludedFromTeam || !report.TeamExcludedFromPersonal ||
+		!report.CrossUserPersonalDenied ||
 		!report.CleanupVerified || len(report.PersonalEvidenceDigest) != 64 ||
 		len(report.TeamEvidenceDigest) != 64 ||
 		report.PersonalEvidenceDigest == report.TeamEvidenceDigest {
@@ -315,6 +320,7 @@ func TestWorkspaceMemoryRuntimeUATPostgres(t *testing.T) {
 		invalidRuntime.String(), uuid.NewString(), strings.Repeat("c", 40)); err == nil {
 		t.Fatal("unreachable runtime authority passed UAT")
 	}
+	assertNoWorkspaceMemoryUATResidue(t, pool)
 	if err := verifyWorkspaceMemoryUATOwner(t.Context(), pool); err != nil {
 		t.Fatalf("owner authority rejected: %v", err)
 	}
@@ -355,8 +361,110 @@ func TestWorkspaceMemoryRuntimeUATPostgres(t *testing.T) {
 	if err != nil || !second.CleanupVerified {
 		t.Fatalf("stale recovery report=%+v err=%v", second, err)
 	}
+	assertNoWorkspaceMemoryUATResidue(t, pool)
+	var staleRows int
+	if err := pool.QueryRow(t.Context(), `SELECT
+		(SELECT count(*) FROM public.tenants WHERE id=ANY($1::bigint[]))+
+		(SELECT count(*) FROM public.users WHERE id=ANY($2::bigint[]))`,
+		[]int64{stale.personalID, stale.teamID},
+		[]int64{stale.creatorUserID, stale.memberUserID}).Scan(&staleRows); err != nil {
+		t.Fatal(err)
+	}
+	if staleRows != 0 {
+		t.Fatalf("stale UAT fixture retained %d rows", staleRows)
+	}
+
+	assertWorkspaceMemoryUATSerializes(t, scratchURL, runtimeURL.String(), pool)
 	if err := cleanupWorkspaceMemoryUATFixture(t.Context(), pool, ownerStore,
 		workspaceMemoryUATFixture{}); err != nil {
 		t.Fatalf("zero fixture cleanup: %v", err)
 	}
+}
+
+func assertNoWorkspaceMemoryUATResidue(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	var rows int
+	if err := pool.QueryRow(t.Context(), `SELECT
+		(SELECT count(*) FROM public.users WHERE feishu_open_id LIKE $1)+
+		(SELECT count(*) FROM public.tenants WHERE display_name LIKE $1)`,
+		workspaceMemoryUATPrefix+"%").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("workspace memory UAT retained %d reserved rows", rows)
+	}
+}
+
+func assertWorkspaceMemoryUATSerializes(
+	t *testing.T, ownerURL, runtimeURL string, observer *pgxpool.Pool,
+) {
+	t.Helper()
+	blocker, err := observer.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Release()
+	if _, err := blocker.Exec(t.Context(), `SELECT pg_catalog.pg_advisory_lock(
+		pg_catalog.hashtextextended('vane/workspace-memory-runtime-uat/v1',0))`); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = blocker.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock(
+				pg_catalog.hashtextextended('vane/workspace-memory-runtime-uat/v1',0))`)
+		}
+	}()
+	parsed, err := url.Parse(ownerURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	applicationName := "vane-memory-uat-serialization-" + uuid.NewString()
+	query.Set("application_name", applicationName)
+	parsed.RawQuery = query.Encode()
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := runWorkspaceMemoryRuntimeUAT(context.Background(), parsed.String(),
+			runtimeURL, uuid.NewString(), strings.Repeat("d", 40))
+		done <- runErr
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		err := observer.QueryRow(t.Context(), `SELECT EXISTS(
+			SELECT 1 FROM pg_catalog.pg_locks l
+			WHERE l.database=(SELECT oid FROM pg_catalog.pg_database
+				WHERE datname=pg_catalog.current_database())
+			AND l.locktype='advisory' AND NOT l.granted)`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case runErr := <-done:
+			t.Fatalf("UAT did not wait for serialization lock: %v", runErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("UAT did not expose an advisory lock wait")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := blocker.Exec(t.Context(), `SELECT pg_catalog.pg_advisory_unlock(
+		pg_catalog.hashtextextended('vane/workspace-memory-runtime-uat/v1',0))`); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serialized UAT did not complete after lock release")
+	}
+	assertNoWorkspaceMemoryUATResidue(t, observer)
 }
