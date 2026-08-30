@@ -1,0 +1,101 @@
+name: Release
+
+# Audited release controller (ops/README.md) running on a GitHub-hosted
+# darwin-arm64 runner (publish_web.machine_arch() hard-requires darwin-arm64,
+# and macos-15 is exactly that). One dispatch = one exact-SHA release:
+# preflight -> full gate -> artifact -> signed plan/gate/artifact chain ->
+# broker submit (VPS cutover) -> web publish -> verify -> finalize.
+#
+# Required repository secrets:
+#   VANE_RELEASE_SIGNING_KEY   ssh-ed25519 private key, principal vane-release-ci
+#                              (public key committed in ops/policy/allowed_signers)
+#   VANE_BROKER_TRANSPORT_KEY  ssh-ed25519 private key installed in the VPS
+#                              broker's authorized_keys via ops/bootstrap/install-broker.sh
+#   VANE_BROKER_KNOWN_HOSTS    exact known_hosts bytes; sha256 must equal
+#                              broker_endpoint.known_hosts_sha256 in ops/policy/release-policy.json
+#   ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET
+#   CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact full SHA on origin/main to release
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vane-release
+  cancel-in-progress: false
+
+env:
+  VANE_TOOL_CACHE: ${{ github.workspace }}/.vane/tool-cache
+  VANE_WORK_ROOT: ${{ github.workspace }}/.vane/work
+  VANE_RELEASE_SIGNER: vane-release-ci
+
+jobs:
+  release:
+    name: Release exact SHA
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - name: Check out exact release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install native PostgreSQL 18
+        run: |
+          brew install postgresql@18
+          brew link --force postgresql@18 >/dev/null 2>&1 || true
+          echo "/opt/homebrew/opt/postgresql@18/bin" >> "$GITHUB_PATH"
+
+      - name: Provision locked toolchain (darwin-arm64)
+        run: |
+          mkdir -p "$VANE_TOOL_CACHE" "$VANE_WORK_ROOT"
+          for tool in go node temporal_cli shellcheck govulncheck; do
+            python3 tools/install/locked_tool.py "$tool" --lock tools/toolchain.lock.json --cache "$VANE_TOOL_CACHE"
+          done
+          lock="$GITHUB_WORKSPACE/tools/toolchain.lock.json"
+          gover=$(python3 -c "import json;print(json.load(open('$lock'))['tools']['go']['version'])")
+          nodever=$(python3 -c "import json;print(json.load(open('$lock'))['tools']['node']['version'])")
+          echo "$VANE_TOOL_CACHE/go/$gover/bin" >> "$GITHUB_PATH"
+          echo "$VANE_TOOL_CACHE/node/$nodever/bin" >> "$GITHUB_PATH"
+
+      - name: Provision pinned web publication tools (aliyun, ossutil, wrangler)
+        run: |
+          ops/bootstrap/install-aliyun.sh
+          ops/bootstrap/install-ossutil.sh
+          ops/bootstrap/install-wrangler.sh
+
+      - name: Install user-scoped broker client
+        env:
+          VANE_BROKER_TRANSPORT_KEY: ${{ secrets.VANE_BROKER_TRANSPORT_KEY }}
+          VANE_BROKER_KNOWN_HOSTS: ${{ secrets.VANE_BROKER_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 "$HOME/.vane-ci"
+          printf '%s\n' "$VANE_BROKER_TRANSPORT_KEY" > "$HOME/.vane-ci/transport_key"
+          printf '%s\n' "$VANE_BROKER_KNOWN_HOSTS" > "$HOME/.vane-ci/known_hosts"
+          chmod 0600 "$HOME/.vane-ci/transport_key" "$HOME/.vane-ci/known_hosts"
+          ops/bootstrap/install-client.sh \
+            "$HOME/.vane-ci/transport_key" 188.253.125.238 10058 \
+            "$HOME/.vane-ci/known_hosts"
+
+      - name: Run the audited release
+        env:
+          VANE_RELEASE_SIGNING_KEY: ${{ runner.temp }}/vane-release-signing-key
+          VANE_RELEASE_SIGNING_KEY_MATERIAL: ${{ secrets.VANE_RELEASE_SIGNING_KEY }}
+          ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
+          ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          install -d -m 0700 "$runner_temp"
+          printf '%s\n' "$VANE_RELEASE_SIGNING_KEY_MATERIAL" > "$VANE_RELEASE_SIGNING_KEY"
+          chmod 0600 "$VANE_RELEASE_SIGNING_KEY"
+          unset VANE_RELEASE_SIGNING_KEY_MATERIAL
+          ./ops/bin/vane release --sha "${{ inputs.sha }}"

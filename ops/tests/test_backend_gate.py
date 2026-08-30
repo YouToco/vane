@@ -68,7 +68,7 @@ class LocalGatePolicyTests(unittest.TestCase):
             policy["broker_endpoint"], {
                 "host": "188.253.125.238",
                 "port": 10058,
-                "known_hosts_sha256": "755558dd29ed29400289842f639f31856f12eb0c25654a6d9007fd572163e5d3",
+                "known_hosts_sha256": "d9b593ae3ad6d7e683565ce446c8d81d2884fc07971363cfb0f6694d21044f31",
             }
         )
         from ops.cli import controller
