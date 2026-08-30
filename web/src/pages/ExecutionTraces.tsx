@@ -167,9 +167,11 @@ function ModelEvent({ event, index }: { event: AdminTraceEvent; index: number })
                     </dd>
                   </div>
                   <div>
-                    <dt className="text-xs text-muted-foreground">最大 token</dt>
+                    <dt className="text-xs text-muted-foreground">输出上限</dt>
                     <dd className="mt-1 font-medium">
-                      {event.max_tokens ?? "未显式设置"}
+                      {event.max_tokens != null
+                        ? `未下发（记账预留 ${event.max_tokens}）`
+                        : "未显式设置"}
                     </dd>
                   </div>
                   <div>
