@@ -3,7 +3,7 @@ name: Deploy
 # Deploys an exact revision to production:
 #   1. build server binaries (linux-amd64) and the web dist from the input ref
 #   2. ship the atomic-release payload to the VPS over SSH and run
-#      deploy/remote-atomic-release.sh (migrate -> stop -> switch symlink ->
+#      tools/release/remote-atomic-release.sh (migrate -> stop -> switch symlink ->
 #      start -> /readyz + live-binary verification, with automatic rollback)
 #   3. publish the web dist to Cloudflare Pages and Aliyun OSS, refresh CDN
 #
@@ -116,7 +116,7 @@ jobs:
           ssh $SSH_OPTS "root@$VPS_HOST" "mkdir -p '$remote_stage'"
           tar -C "$STAGE" -cf - . | ssh $SSH_OPTS "root@$VPS_HOST" "tar -xf - -C '$remote_stage'"
           ssh $SSH_OPTS "root@$VPS_HOST" "chmod -R go-w '$remote_stage'"
-          ssh $SSH_OPTS "root@$VPS_HOST" "bash /dev/stdin '$remote_stage' '$current'" < deploy/remote-atomic-release.sh
+          ssh $SSH_OPTS "root@$VPS_HOST" "bash /dev/stdin '$remote_stage' '$current'" < tools/release/remote-atomic-release.sh
 
       - name: Install pinned web publication tools (aliyun, ossutil)
         run: |
