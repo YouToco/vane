@@ -134,7 +134,8 @@ func TestCompleteParsesKimiNestedUsage(t *testing.T) {
 	}
 }
 
-// TestCompleteOptionalFields 显式设置 Temperature/MaxTokens 时必须携带。
+// TestCompleteOptionalFields 显式设置 Temperature 时必须携带；
+// max_tokens 即便设置了预算值也不得下发（输出上限交上游默认）。
 func TestCompleteOptionalFields(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -157,8 +158,8 @@ func TestCompleteOptionalFields(t *testing.T) {
 	if got, ok := gotBody["temperature"].(float64); !ok || math.Abs(got-0.7) > 1e-6 {
 		t.Errorf("temperature = %v, 期望 0.7", gotBody["temperature"])
 	}
-	if got, ok := gotBody["max_tokens"].(float64); !ok || got != 512 {
-		t.Errorf("max_tokens = %v, 期望 512", gotBody["max_tokens"])
+	if _, present := gotBody["max_tokens"]; present {
+		t.Errorf("设置了 MaxTokens 也不应下发 max_tokens 字段，实际 %v", gotBody["max_tokens"])
 	}
 	// 未设 DisableThinking 时不得携带 thinking 字段（交上游默认）。
 	if _, present := gotBody["thinking"]; present {

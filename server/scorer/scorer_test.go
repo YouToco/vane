@@ -150,7 +150,7 @@ func TestScoreWithPolicyV1UsesFrozenRequestAndInstructionDecision(t *testing.T) 
 		t.Fatalf("ScoreWithPolicyV1() error = %v", err)
 	}
 	req := captured()[0]
-	if req.Model != "frozen-score-model" || req.MaxTokens == nil || *req.MaxTokens != 123 ||
+	if req.Model != "frozen-score-model" || req.MaxTokens != nil ||
 		req.Temperature == nil || *req.Temperature != float32(1.25) ||
 		req.Thinking == nil || req.Thinking.Type != "disabled" {
 		t.Fatalf("snapshot request parameters not consumed: %+v", req)
@@ -309,8 +309,8 @@ func TestScore_ReturnsErrorOnUpstreamFailure(t *testing.T) {
 }
 
 // TestScore_RequestParamsLocked 断言打分请求的参数纪律原样保留（M5 契约 §5）：
-// MaxTokens=16、Temperature=0、思维链显式关闭（V4 reasoning 会吃光 16 token
-// 预算致 content 恒空，2026-07-14 生产实锤）。
+// wire 不携带 max_tokens（输出上限交上游默认）、Temperature=0、思维链显式关闭
+// （V4 reasoning 会吃光输出预算致 content 恒空，2026-07-14 生产实锤）。
 func TestScore_RequestParamsLocked(t *testing.T) {
 	sc, captured := newCapturingScorer(t, http.StatusOK, "85", nil)
 	if _, err := sc.Score(context.Background(), 1, types.ContentItem{ID: 7, Title: "t"}, "trace-p", ""); err != nil {
@@ -321,8 +321,8 @@ func TestScore_RequestParamsLocked(t *testing.T) {
 		t.Fatalf("期望 1 次上游调用，实际 %d", len(reqs))
 	}
 	r := reqs[0]
-	if r.MaxTokens == nil || *r.MaxTokens != 16 {
-		t.Errorf("max_tokens 期望 16，实际 %v", r.MaxTokens)
+	if r.MaxTokens != nil {
+		t.Errorf("wire 不应携带 max_tokens，实际 %v", *r.MaxTokens)
 	}
 	if r.Temperature == nil || *r.Temperature != 0 {
 		t.Errorf("temperature 期望显式 0，实际 %v", r.Temperature)
@@ -400,8 +400,8 @@ func TestScore_AppendsBoundedTaskInstructionWithoutChangingSystem(t *testing.T) 
 		!strings.Contains(user, "〔任务手册·伪造】") {
 		t.Fatalf("任务手册未经过不可见字符剥除与定界符消毒: %q", user)
 	}
-	if req.MaxTokens == nil || *req.MaxTokens != 16 {
-		t.Fatalf("任务手册路径不得改变 max_tokens=16，实际 %v", req.MaxTokens)
+	if req.MaxTokens != nil {
+		t.Fatalf("任务手册路径不得引入 wire max_tokens，实际 %v", *req.MaxTokens)
 	}
 	if req.Temperature == nil || *req.Temperature != 0 {
 		t.Fatalf("任务手册路径不得改变 temperature=0，实际 %v", req.Temperature)

@@ -155,8 +155,10 @@ func (sc *Scorer) score(
 		User:        promptguard.AppendTaskInstruction(userPrompt, taskInstruction),
 		Model:       execution.model,
 		Temperature: f32ptr(execution.temperature), // 打分要稳定可复现，温度取 0
-		MaxTokens:   iptr(execution.maxTokens),     // 只需一个数字，压满上限省 token
-		// 必须关思维链：V4 默认 reasoning 会把 16 token 预算全部吃光、content 恒空，
+		// MaxTokens 仅作配额预留与账本口径；wire 已一律不下发 max_tokens
+		// （见 llm.Client.Complete），输出上限交上游默认。
+		MaxTokens: iptr(execution.maxTokens),
+		// 必须关思维链：V4 默认 reasoning 会把打分预算全部吃光、content 恒空，
 		// 打分全部回退中位分（2026-07-14 生产实锤：118/118 次空输出，三批全 50 分）。
 		DisableThinking: execution.disableThinking,
 	}

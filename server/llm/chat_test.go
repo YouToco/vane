@@ -288,9 +288,11 @@ func TestChatThinkingRoundTripsReasoningWithoutPersistingIt(t *testing.T) {
 	}
 	for i, body := range requests {
 		thinking, _ := body["thinking"].(map[string]any)
-		if thinking["type"] != "enabled" || body["reasoning_effort"] != "high" ||
-			body["max_tokens"] != float64(4096) {
+		if thinking["type"] != "enabled" || body["reasoning_effort"] != "high" {
 			t.Fatalf("request %d thinking policy = %#v", i, body)
+		}
+		if _, present := body["max_tokens"]; present {
+			t.Fatalf("request %d 不应下发 max_tokens 字段", i)
 		}
 	}
 	secondMessages, _ := requests[1]["messages"].([]any)

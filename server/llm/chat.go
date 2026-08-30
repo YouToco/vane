@@ -256,13 +256,14 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		// providers may support thinking but must not receive an unknown option.
 		reasoningEffort = ""
 	}
+	// max_tokens 一律不下发（同 Complete）：输出上限交给上游默认，
+	// req.MaxTokens 仅作为配额预留与账本口径，不再代表 wire 上限。
 	payload, err := json.Marshal(wireChatRequest{
 		Model:           model,
 		Messages:        messages,
 		Tools:           tools,
 		ToolChoice:      req.ToolChoice,
 		Temperature:     c.requestTemperature(model, req.Temperature),
-		MaxTokens:       req.MaxTokens,
 		Thinking:        thinking,
 		ReasoningEffort: reasoningEffort,
 	})

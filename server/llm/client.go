@@ -212,11 +212,14 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 		thinking = &thinkingConfig{Type: "disabled"}
 	}
 	requestModel := c.requestModel(req.Model)
+	// max_tokens 一律不下发（产品决定）：输出上限交给上游默认。
+	// 推理模型会把 completion 预算花在 reasoning_content 上，过小的 wire
+	// 上限会饿死正文输出。req.MaxTokens 仍保留为配额预留与 llm_calls 账本口径，
+	// 不再代表 wire 上限。
 	payload, err := json.Marshal(chatRequest{
 		Model:       requestModel,
 		Messages:    messages,
 		Temperature: c.requestTemperature(requestModel, req.Temperature),
-		MaxTokens:   req.MaxTokens,
 		Thinking:    thinking,
 	})
 	if err != nil {

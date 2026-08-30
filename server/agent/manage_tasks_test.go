@@ -18,37 +18,23 @@ import (
 )
 
 func TestModelOwnerActionAuthorizerBudgetsCompleteNativeToolCall(t *testing.T) {
-	// This is an independent regression oracle from the production constant:
-	// DeepSeek V4 Flash exhausted the old 32-token budget while emitting this
-	// native tool envelope. Do not let a production budget regression silently
-	// lower the test server's completion threshold with it.
-	const observedCompleteNativeToolBudget = 128
-	var gotMaxTokens int
+	// 历史回归：DeepSeek V4 Flash 曾在 32-token wire 预算下发不完 native tool
+	// 信封。现 wire 一律不下发 max_tokens（输出上限交上游默认），故假服务端
+	// 直接返回成功信封；本测试转而锁定 wire 不携带 max_tokens 且 thinking 禁用。
+	var gotMaxTokensPresent bool
 	var gotThinking string
 	var authorizationCalls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorizationCalls++
-		var request struct {
-			MaxTokens int `json:"max_tokens"`
-			Thinking  struct {
-				Type string `json:"type"`
-			} `json:"thinking"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		var raw map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 			t.Errorf("decode authorization request: %v", err)
 			return
 		}
-		gotMaxTokens = request.MaxTokens
-		gotThinking = request.Thinking.Type
+		_, gotMaxTokensPresent = raw["max_tokens"]
+		thinking, _ := raw["thinking"].(map[string]any)
+		gotThinking, _ = thinking["type"].(string)
 		w.Header().Set("Content-Type", "application/json")
-		if request.MaxTokens < observedCompleteNativeToolBudget {
-			_, _ = w.Write([]byte(`{
-				"model":"deepseek-v4-flash",
-				"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_auth","type":"function","function":{"name":"authorize_owner_action","arguments":"{\"decision\":"}}]}}],
-				"usage":{"prompt_tokens":514,"completion_tokens":32}
-			}`))
-			return
-		}
 		_, _ = w.Write([]byte(`{
 			"model":"deepseek-v4-flash",
 			"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_auth","type":"function","function":{"name":"authorize_owner_action","arguments":"{\"decision\":\"authorized\"}"}}]}}],
@@ -79,8 +65,8 @@ func TestModelOwnerActionAuthorizerBudgetsCompleteNativeToolCall(t *testing.T) {
 	if len(runner.refs) != 1 || runner.refs[0] != "task-kimi" || len(state.actionReceipts) != 1 {
 		t.Fatalf("runner refs=%v receipts=%d", runner.refs, len(state.actionReceipts))
 	}
-	if authorizationCalls != 1 || gotMaxTokens != observedCompleteNativeToolBudget || gotThinking != "disabled" {
-		t.Fatalf("calls=%d max_tokens=%d thinking=%q", authorizationCalls, gotMaxTokens, gotThinking)
+	if authorizationCalls != 1 || gotMaxTokensPresent || gotThinking != "disabled" {
+		t.Fatalf("calls=%d max_tokens_present=%v thinking=%q", authorizationCalls, gotMaxTokensPresent, gotThinking)
 	}
 }
 
