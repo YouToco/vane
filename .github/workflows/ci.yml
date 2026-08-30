@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VANE_TOOL_CACHE: ${{ github.workspace }}/.vane/tool-cache
+
+jobs:
+  test:
+    name: Fast tests (server/web/contract/ops/quick)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Provision locked toolchain (go, node)
+        run: |
+          mkdir -p "$VANE_TOOL_CACHE"
+          python3 tools/install/locked_tool.py go --lock tools/toolchain.lock.json --cache "$VANE_TOOL_CACHE"
+          python3 tools/install/locked_tool.py node --lock tools/toolchain.lock.json --cache "$VANE_TOOL_CACHE"
+          lock="$GITHUB_WORKSPACE/tools/toolchain.lock.json"
+          gover=$(python3 -c "import json;print(json.load(open('$lock'))['tools']['go']['version'])")
+          nodever=$(python3 -c "import json;print(json.load(open('$lock'))['tools']['node']['version'])")
+          echo "$VANE_TOOL_CACHE/go/$gover/bin" >> "$GITHUB_PATH"
+          echo "$VANE_TOOL_CACHE/node/$nodever/bin" >> "$GITHUB_PATH"
+
+      - name: Run fast tests
+        run: |
+          make test-server
+          make test-web
+          make test-contract
+          make test-release
+          make quick
+
+  gate:
+    name: Full Gate (make full)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: test
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install PostgreSQL 18 (native, from PGDG)
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /etc/apt/trusted.gpg.d/pgdg.asc >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Provision locked toolchain (full)
+        run: |
+          mkdir -p "$VANE_TOOL_CACHE"
+          for tool in go node temporal_cli shellcheck govulncheck; do
+            python3 tools/install/locked_tool.py "$tool" --lock tools/toolchain.lock.json --cache "$VANE_TOOL_CACHE"
+          done
+
+      - name: Run full Gate
+        run: make full SHA="${{ github.sha }}"
