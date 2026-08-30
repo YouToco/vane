@@ -14,7 +14,7 @@ env:
 
 jobs:
   test:
-    name: Fast tests (server/web/contract/ops/quick)
+    name: Fast tests (server/web/contract)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -41,13 +41,14 @@ jobs:
           npm ci --prefix web
           make test-web
           make test-contract
-          make test-release
-          make quick
 
   gate:
+    # Vane's ops publish tests and the full Gate are darwin-arm64 only
+    # (publish_web.machine_arch() hard-requires darwin-arm64), so the Gate runs
+    # on a macOS arm64 GitHub-hosted runner, free on public repos.
     name: Full Gate (make full)
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    runs-on: macos-15
+    timeout-minutes: 150
     needs: test
     steps:
       - name: Check out exact revision
@@ -56,15 +57,13 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Install PostgreSQL 18 (native, from PGDG)
+      - name: Install native PostgreSQL 18
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /etc/apt/trusted.gpg.d/pgdg.asc >/dev/null
-          sudo apt-get update -y
-          sudo apt-get install -y postgresql-18
-          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+          brew install postgresql@18
+          brew link --force postgresql@18 >/dev/null 2>&1 || true
+          echo "/opt/homebrew/opt/postgresql@18/bin" >> "$GITHUB_PATH"
 
-      - name: Provision locked toolchain (full)
+      - name: Provision locked toolchain (darwin-arm64)
         run: |
           mkdir -p "$VANE_TOOL_CACHE"
           for tool in go node temporal_cli shellcheck govulncheck; do
