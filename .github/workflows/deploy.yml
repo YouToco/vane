@@ -31,6 +31,7 @@ concurrency:
 
 env:
   VANE_TOOL_CACHE: ${{ github.workspace }}/.vane/tool-cache
+  VANE_WORK_ROOT: ${{ github.workspace }}/.vane/work
   VPS_HOST: 188.253.125.238
   VPS_PORT: "10058"
   OSS_BUCKET: zhuoqidev-vane-web
@@ -117,6 +118,7 @@ jobs:
 
       - name: Install pinned web publication tools (aliyun, ossutil)
         run: |
+          mkdir -p "$VANE_WORK_ROOT"
           tools/install/install-aliyun.sh
           tools/install/install-ossutil.sh
           lock="$GITHUB_WORKSPACE/tools/toolchain.lock.json"
