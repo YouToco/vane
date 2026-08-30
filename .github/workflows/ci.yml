@@ -38,6 +38,7 @@ jobs:
       - name: Run fast tests
         run: |
           make test-server
+          npm ci --prefix web
           make test-web
           make test-contract
           make test-release
