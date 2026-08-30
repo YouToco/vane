@@ -55,15 +55,23 @@ class GeneratedContractsTest(unittest.TestCase):
 
 
 class RepositoryPolicyTest(unittest.TestCase):
-    def test_no_github_actions(self) -> None:
-        tracked = subprocess.run(
-            ["git", "ls-files", "*/.github/workflows/*", ".github/workflows/*"],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
-        self.assertEqual(tracked, [])
+    def test_github_actions_are_immutable_and_release_labeled(self) -> None:
+        """GitHub Actions are allowed (owner decision to override the former
+        no-GitHub-Actions contract), but every `uses:` must be a pinned 40-char
+        SHA with a release-tag comment, matching the toolchain-lock policy.
+        """
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
+        for path in workflows:
+            text = path.read_text(encoding="utf-8")
+            refs = re.findall(
+                r"^\s*uses:\s+([^@\s]+)@([^\s#]+)(?:\s+#\s+([^\s]+))?\s*$",
+                text,
+                flags=re.MULTILINE,
+            )
+            for action, revision, release in refs:
+                with self.subTest(workflow=path.name, action=action):
+                    self.assertRegex(revision, r"^[0-9a-f]{40}$")
+                    self.assertRegex(release or "", r"^v\d+(?:\.\d+){1,2}$")
 
     def test_module_and_lockfile_authorities(self) -> None:
         files = repository_files()
