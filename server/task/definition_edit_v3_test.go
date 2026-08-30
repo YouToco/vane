@@ -67,10 +67,13 @@ func TestBuildResearchV3DefinitionEditTargetReplacesCompleteOwnerSurfaceOnly(
 	}
 	if target.TenantID != base.TenantID || target.UserID != base.UserID ||
 		target.TaskID != base.TaskID || target.ExecutionMode != base.ExecutionMode ||
-		!reflect.DeepEqual(target.PlannerBudget, base.PlannerBudget) ||
 		target.DeliveryPolicy != base.DeliveryPolicy ||
 		target.TenantBudgetPolicy != base.TenantBudgetPolicy {
 		t.Fatalf("trusted V3 policy changed: base=%+v target=%+v", base, target)
+	}
+	if target.PlannerBudget != taskstate.ResearchPlannerBudgetPolicy() {
+		t.Fatalf("edit did not refresh planner budget to deployment policy: %+v",
+			target.PlannerBudget)
 	}
 	raw, err := taskstate.EncodeApprovedDefinitionV3(target)
 	if err != nil {
@@ -271,10 +274,13 @@ func TestApplyResearchV3DefinitionChangesPreservesUnmentionedOwnerPolicy(t *test
 		!bytesEqual(target.SpecJSON, base.SpecJSON) ||
 		!reflect.DeepEqual(target.Notification, base.Notification) ||
 		!reflect.DeepEqual(target.Output, base.Output) ||
-		!reflect.DeepEqual(target.PlannerBudget, base.PlannerBudget) ||
 		target.DeliveryPolicy != base.DeliveryPolicy ||
 		target.TenantBudgetPolicy != base.TenantBudgetPolicy {
 		t.Fatalf("unmentioned V3 policy changed: base=%+v target=%+v", base, target)
+	}
+	if target.PlannerBudget != taskstate.ResearchPlannerBudgetPolicy() {
+		t.Fatalf("edit did not refresh planner budget to deployment policy: %+v",
+			target.PlannerBudget)
 	}
 	if _, err := ApplyResearchV3DefinitionChanges(
 		base, ResearchV3DefinitionChanges{}); !errors.Is(err, types.ErrValidation) {

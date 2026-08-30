@@ -1,0 +1,7 @@
+{
+  "name": "vane-wrangler-pin",
+  "private": true,
+  "dependencies": {
+    "wrangler": "4.115.0"
+  }
+}

@@ -28,9 +28,9 @@ const (
 
 	maxPlannerRounds       = 8
 	maxPlannerToolCalls    = 16
-	maxPlannerTokens       = 32_768
-	maxPlannerCostMicroUSD = 1_000_000
-	maxPlannerDurationMs   = 300_000
+	maxPlannerTokens       = 1_000_000
+	maxPlannerCostMicroUSD = 1_000_000_000
+	maxPlannerDurationMs   = 3_600_000
 )
 
 // RunSnapshotKind identifies how a snapshotted run was started. C0/C1 only

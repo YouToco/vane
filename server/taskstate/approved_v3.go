@@ -134,6 +134,21 @@ func BuildApprovedDefinitionV3(input ApprovedDefinitionInputV3) (ApprovedDefinit
 	return definition, nil
 }
 
+// ResearchPlannerBudgetPolicy is the deployment-wide planner allowance frozen
+// into every DiscoverAtRun V3 definition. Task creation and every definition
+// edit freeze this single policy, so raising ceilings here reaches existing
+// tasks on their next edit; tenant quota remains the independent spend
+// authority.
+func ResearchPlannerBudgetPolicy() types.PlannerBudget {
+	return types.PlannerBudget{
+		MaxPlannerRounds: 8,
+		MaxToolCalls:     16,
+		MaxTokens:        1_000_000,
+		MaxCostMicroUSD:  1_000_000_000,
+		DurationMs:       3_600_000,
+	}
+}
+
 func (d ApprovedDefinitionV3) Validate() error {
 	_, err := normalizeApprovedDefinitionV3(d)
 	return err

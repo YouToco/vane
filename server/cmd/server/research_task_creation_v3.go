@@ -6,6 +6,7 @@ import (
 
 	"github.com/YouToco/vane/server/config"
 	"github.com/YouToco/vane/server/task"
+	"github.com/YouToco/vane/server/taskstate"
 	"github.com/YouToco/vane/server/types"
 )
 
@@ -27,13 +28,9 @@ func requireOwnerAgentResearchV3Runtime(cfg *config.Config) error {
 // input. These bounded defaults match the V3 workflow's production-tested
 // envelope; tenant quota remains the independent spend authority.
 func nativeResearchV3CreationPolicy() task.CreationV3ServerPolicy {
-	return task.CreationV3ServerPolicy{PlannerBudget: types.PlannerBudget{
-		MaxPlannerRounds: 8,
-		MaxToolCalls:     16,
-		MaxTokens:        32_768,
-		MaxCostMicroUSD:  1_000_000,
-		DurationMs:       300_000,
-	}}
+	return task.CreationV3ServerPolicy{
+		PlannerBudget: taskstate.ResearchPlannerBudgetPolicy(),
+	}
 }
 
 func shouldInitializeResearchV3Runtime(cfg *config.Config) bool {

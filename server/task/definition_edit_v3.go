@@ -75,8 +75,10 @@ func ApplyResearchV3DefinitionChanges(
 }
 
 // BuildResearchV3DefinitionEditTarget preserves every trusted server policy
-// from the exact base and replaces the complete owner-visible target. This is
-// a full-definition writer: omitted/zero fields fail validation instead of
+// from the exact base and replaces the complete owner-visible target. The
+// planner budget is the one exception: every edit refreshes it to the current
+// deployment-wide policy so ceiling raises reach existing tasks. This is a
+// full-definition writer: omitted/zero fields fail validation instead of
 // inheriting a model-guessed partial patch.
 func BuildResearchV3DefinitionEditTarget(
 	base taskstate.ApprovedDefinitionV3,
@@ -102,7 +104,7 @@ func BuildResearchV3DefinitionEditTarget(
 			TaskName: in.TaskName, TaskManual: in.TaskManual,
 			SpecJSON: in.SpecJSON, ExecutionMode: base.ExecutionMode,
 			Notification: in.Notification, Output: in.Output,
-			PlannerBudget:      base.PlannerBudget,
+			PlannerBudget:      taskstate.ResearchPlannerBudgetPolicy(),
 			DeliveryPolicy:     base.DeliveryPolicy,
 			TenantBudgetPolicy: base.TenantBudgetPolicy,
 			ResearchScope:      base.ResearchScope,

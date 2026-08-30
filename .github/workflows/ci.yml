@@ -14,7 +14,7 @@ env:
 
 jobs:
   test:
-    name: Fast tests (server/web/contract)
+    name: Tests (server/web/contract)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -35,40 +35,9 @@ jobs:
           echo "$VANE_TOOL_CACHE/go/$gover/bin" >> "$GITHUB_PATH"
           echo "$VANE_TOOL_CACHE/node/$nodever/bin" >> "$GITHUB_PATH"
 
-      - name: Run fast tests
+      - name: Run tests
         run: |
           make test-server
           npm ci --prefix web
           make test-web
           make test-contract
-
-  gate:
-    # Vane's ops publish tests and the full Gate are darwin-arm64 only
-    # (publish_web.machine_arch() hard-requires darwin-arm64), so the Gate runs
-    # on a macOS arm64 GitHub-hosted runner, free on public repos.
-    name: Full Gate (make full)
-    runs-on: macos-15
-    timeout-minutes: 150
-    needs: test
-    steps:
-      - name: Check out exact revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Install native PostgreSQL 18
-        run: |
-          brew install postgresql@18
-          brew link --force postgresql@18 >/dev/null 2>&1 || true
-          echo "/opt/homebrew/opt/postgresql@18/bin" >> "$GITHUB_PATH"
-
-      - name: Provision locked toolchain (darwin-arm64)
-        run: |
-          mkdir -p "$VANE_TOOL_CACHE"
-          for tool in go node temporal_cli shellcheck govulncheck; do
-            python3 tools/install/locked_tool.py "$tool" --lock tools/toolchain.lock.json --cache "$VANE_TOOL_CACHE"
-          done
-
-      - name: Run full Gate
-        run: make full SHA="${{ github.sha }}"

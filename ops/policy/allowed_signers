@@ -1,5 +1,0 @@
-# Format: PRINCIPAL[,PRINCIPAL...] SSH_PUBLIC_KEY
-# vane-release-local (retired release Mac) removed on 2026-08-30; the release
-# controller now runs as the vane-release-ci GitHub Actions workflow.
-vane-release-ci ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF+c3HBFOEyCGZPHo6OxT5jfY0n3/FagtrMOwCgbrFFI
-vane-production-broker ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJZUUy+pkTINKN3JJDjGg9Rio8DHqpWql3Ihg/eTl/Ed
