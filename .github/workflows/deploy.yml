@@ -76,15 +76,15 @@ jobs:
       - name: Assemble atomic-release payload
         run: |
           stage="$RUNNER_TEMP/stage"
-          mkdir -p "$stage/bin" "$stage/deploy/dynamicconfig"
+          mkdir -p "$stage/bin" "$stage/dynamicconfig"
           for binary in vane vane-research-gateway vane-migrate gate agentfirstretention; do
             install -m 0755 "server/bin/$binary" "$stage/bin/$binary"
           done
-          install -m 0644 infra/production/caddy/Caddyfile "$stage/deploy/Caddyfile"
-          install -m 0644 infra/production/compose/docker-compose.yml "$stage/deploy/docker-compose.yml"
-          install -m 0644 infra/production/temporal/development-sql.yaml "$stage/deploy/dynamicconfig/development-sql.yaml"
+          install -m 0644 infra/production/caddy/Caddyfile "$stage/Caddyfile"
+          install -m 0644 infra/production/compose/docker-compose.yml "$stage/docker-compose.yml"
+          install -m 0644 infra/production/temporal/development-sql.yaml "$stage/dynamicconfig/development-sql.yaml"
           for unit in vane.service vane-research-gateway.service vane-research-gateway.socket; do
-            install -m 0644 "infra/production/systemd/$unit" "$stage/deploy/$unit"
+            install -m 0644 "infra/production/systemd/$unit" "$stage/$unit"
           done
           printf '%s\n' "$SHA" > "$stage/monorepo-revision"
           printf '%s\n' "{\"schema\":\"vane.release-receipt/v3\",\"revision\":\"$SHA\",\"built_by\":\"github-actions\",\"run_id\":\"$GITHUB_RUN_ID\",\"run_attempt\":$GITHUB_RUN_ATTEMPT}" > "$stage/release-receipt.json"
