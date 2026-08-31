@@ -31,8 +31,9 @@ services:
       - POSTGRES_SEEDS=postgres
       - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
     volumes:
-      # The broker installs the release-bound canonical file at this fixed,
-      # root-owned runtime path before applying an infra digest change.
+      # tools/release/remote-atomic-release.sh installs the release-bound
+      # canonical file at this fixed, root-owned runtime path before applying
+      # an infra digest change.
       - /opt/vane/dynamicconfig/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
     ports:
       - "127.0.0.1:7233:7233"

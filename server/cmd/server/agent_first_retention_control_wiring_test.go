@@ -9,17 +9,16 @@ import (
 )
 
 func TestPreparedRetentionControlPrimesThenDrainsBeforeEvidence(t *testing.T) {
-	payload, err := os.ReadFile("../../../ops/release/agent-first-retention-prepared-control.sh")
+	payload, err := os.ReadFile("../../../tools/release/agent-first-retention-prepared-control.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	script := string(payload)
 	for _, exact := range []string{
-		"exec 8>\"$broker_work/release.lock\"",
+		"exec 8>/opt/vane/.release.lock",
 		"flock 8",
 		`"$collector" "$phase"`,
 		`--operation-id "$operation_id"`,
-		`$(readlink -f "$0") == "$control"`,
 		"run_collector prime-clock \"$prime_output\"",
 		"stop_attempted=true",
 		"systemctl stop vane.service",
@@ -47,7 +46,7 @@ func TestPreparedRetentionControlPrimesThenDrainsBeforeEvidence(t *testing.T) {
 }
 
 func TestPreparedRetentionControlReportsStopThatCompletedWithError(t *testing.T) {
-	payload, err := os.ReadFile("../../../ops/release/agent-first-retention-prepared-control.sh")
+	payload, err := os.ReadFile("../../../tools/release/agent-first-retention-prepared-control.sh")
 	if err != nil {
 		t.Fatal(err)
 	}

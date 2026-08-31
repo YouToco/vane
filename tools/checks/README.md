@@ -11,4 +11,4 @@ passed before the profile was frozen. The same rehearsal later stopped at the
 separate production-history replay gate because three Temporal histories had
 already expired from the production namespace; that refusal does not turn the
 completed test coverage into release evidence. A release remains blocked until
-every other full-gate stage also succeeds.
+the remaining verification stages also succeed.

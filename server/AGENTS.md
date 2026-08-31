@@ -19,7 +19,7 @@
 
 - `make build` / `make test`（全仓 -race）/ `make lint` 是合并与发布入口；开发过程中按下方 S/A/B
   风险分级先跑受影响包，不得每次小改都机械重跑全仓。
-- GitHub Actions 已退役；根 `./ops/bin/vane release --sha <origin/main SHA>` 提交 exact-main 发布，VPS root-owned broker 才拥有最终 mutation 权限。
+- 部署走 GitHub Actions `Deploy` workflow（push main 自动触发，也可手动 dispatch 指定 ref）；仓库 secrets 存 SSH deploy key，`tools/release/remote-atomic-release.sh` 在 VPS 上做 CAS 校验、在线迁移、原子切换与失败自动回滚。
 - VPS：ssh alias `vane`（凭证在 my-credentials，不在本仓库）；域名 https://vane.zhuoqidev.com
 - 每日推送调度：00:30 UTC（北京 08:30；VPS 本地 EDT 为前一天 20:30）
 - LLM 调用明细（打分 prompt/completion/token）落 DB `llm_calls` 表，不在系统日志里

@@ -82,12 +82,12 @@ func TestProductionHistoryTypeBinding(t *testing.T) {
 }
 
 // TestProductionHistoryReplay is deliberately behind an explicit build tag.
-// The full gate obtains histories through the read-only broker into a private
+// The gate consumes exported production histories placed in a private
 // temporary directory. Production payloads must never be checked into Git.
 func TestProductionHistoryReplay(t *testing.T) {
 	directory := os.Getenv("VANE_TEMPORAL_HISTORY_DIR")
 	if directory == "" || !filepath.IsAbs(directory) {
-		t.Fatal("VANE_TEMPORAL_HISTORY_DIR must name the broker-provided absolute directory")
+		t.Fatal("VANE_TEMPORAL_HISTORY_DIR must name an absolute directory of exported production histories")
 	}
 	contractPath := filepath.Join("..", "..", "..", "contracts", "temporal", "production-history-replay.json")
 	raw, err := os.ReadFile(contractPath)

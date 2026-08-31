@@ -1,0 +1,4 @@
+# Normalize every text file to LF. Byte-exact contracts (migration and
+# toolchain hashes) and the Linux CI/production runners depend on LF working
+# trees; a CRLF checkout would break the generated-contract drift check.
+* text=auto eol=lf

@@ -1,6 +1,6 @@
 # Agent Tool Inventory
 
-Generated from `server/` by `GOWORK=off go run ./cmd/agenttoolinventory`; the local full gate rejects drift. Provider routing, HTTP paths and internal versions are intentionally excluded from this model-facing inventory.
+Generated from `server/` by `GOWORK=off go run ./cmd/agenttoolinventory`; the contract tests reject drift. Provider routing, HTTP paths and internal versions are intentionally excluded from this model-facing inventory.
 
 ## Static production tools
 

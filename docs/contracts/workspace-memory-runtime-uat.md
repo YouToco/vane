@@ -13,14 +13,14 @@ The command requires all of the following:
 - a canonical non-zero retryable correlation UUID;
 - distinct migration-owner and `vane_server_runtime` database authorities.
 
-The operator wrapper at `ops/audit/workspace-memory-runtime-uat.py` additionally
-pins `/opt/vane/current` to the expected release, verifies the established
-`vane-migrate:vane-migrate:0400` migration credential and root-owned immutable
-binary/config paths, and runs the command as a hardened transient
-`vane-migrate` systemd unit with a six-minute start deadline. The trusted
-wrapper reads only `VANE_DB_URL` from the root-owned server environment into a
-short-lived dedicated `runtime_db_url` systemd credential; the UAT process does
-not receive the server environment's provider keys or application secrets.
+The operator additionally pins `/opt/vane/current` to the expected release,
+verifies the established `vane-migrate:vane-migrate:0400` migration credential
+and root-owned immutable binary/config paths, and runs the command as a
+hardened transient `vane-migrate` systemd unit with a six-minute start
+deadline. The operator reads only `VANE_DB_URL` from the root-owned server
+environment into a short-lived dedicated `runtime_db_url` systemd credential;
+the UAT process does not receive the server environment's provider keys or
+application secrets.
 
 Each run serializes on a database advisory lock, removes residue from an
 interrupted earlier run, and creates synthetic identities whose external IDs

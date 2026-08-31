@@ -89,7 +89,7 @@ class RepositoryPolicyTest(unittest.TestCase):
         )
         self.assertEqual(
             lockfiles,
-            ["ops/release/wrangler/package-lock.json", "web/package-lock.json"],
+            ["tools/wrangler/package-lock.json", "web/package-lock.json"],
         )
 
     def test_no_ambiguous_root_directories(self) -> None:
@@ -110,15 +110,6 @@ class RepositoryPolicyTest(unittest.TestCase):
             path.relative_to(ROOT).as_posix()
             for path in (ROOT / "infra").glob("**/*")
             if path.is_file() and path.suffix in {".py", ".sh"}
-        ]
-        self.assertEqual(offenders, [])
-
-    def test_ops_does_not_duplicate_runtime_config(self) -> None:
-        forbidden = {"Caddyfile", "docker-compose.yml", "docker-compose.yaml"}
-        offenders = [
-            path.relative_to(ROOT).as_posix()
-            for path in (ROOT / "ops").glob("**/*")
-            if path.is_file() and (path.name in forbidden or path.suffix in {".service", ".socket"})
         ]
         self.assertEqual(offenders, [])
 
@@ -183,8 +174,7 @@ class RepositoryPolicyTest(unittest.TestCase):
         self.assertEqual(services, {"postgres", "temporal", "temporal-ui", "caddy"})
         operations = "\n".join(
             path.read_text(encoding="utf-8", errors="replace")
-            for directory in (ROOT / "ops/release", ROOT / "ops/rollback")
-            for path in directory.glob("**/*")
+            for path in (ROOT / "tools/release").glob("**/*")
             if path.is_file()
         )
         self.assertNotIn("docker build", operations)

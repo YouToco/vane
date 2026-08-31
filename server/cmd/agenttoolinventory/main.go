@@ -55,7 +55,7 @@ func render() []byte {
 	assertStaticCatalogMatchesOwnerBuilder()
 	var b strings.Builder
 	b.WriteString("# Agent Tool Inventory\n\n")
-	b.WriteString("Generated from `server/` by `GOWORK=off go run ./cmd/agenttoolinventory`; the local full gate rejects drift. Provider routing, HTTP paths and internal versions are intentionally excluded from this model-facing inventory.\n\n")
+	b.WriteString("Generated from `server/` by `GOWORK=off go run ./cmd/agenttoolinventory`; the contract tests reject drift. Provider routing, HTTP paths and internal versions are intentionally excluded from this model-facing inventory.\n\n")
 	b.WriteString("## Static production tools\n\n")
 	b.WriteString("| Tool | Capability | Parameters | Risk | Exposure | Execution | Production |\n")
 	b.WriteString("|---|---|---|---|---|---|---|\n")

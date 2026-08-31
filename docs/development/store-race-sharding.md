@@ -5,7 +5,7 @@ concurrent manifests, each backed by a fresh PostgreSQL 18 instance. The
 remaining package race tests, Temporal recovery gate, vet, inventory check,
 vulnerability scan, coverage merge, and builds run in the same exact-SHA gate.
 The disposable test environment has no production credentials; production
-mutation remains behind the external root-owned broker.
+mutation happens only in the GitHub Actions `Deploy` workflow.
 
 Non-Store race tests are split by resource ownership. Packages with no
 PostgreSQL capability run together with bounded package/test concurrency and

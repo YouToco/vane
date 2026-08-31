@@ -9,9 +9,8 @@ production control-plane code share a revision, but they do not share trust.
 - `web/`: the only browser application and Node lockfile.
 - `contracts/`: machine-readable HTTP, Temporal, and release contracts.
 - `infra/`: declarative desired state only; no deployment state machine or credentials.
-- `ops/`: release, recovery, certificate, and audit state machines.
 - `tests/`: cross-component black-box tests only.
-- `tools/`: development/build checks with no production permission.
+- `tools/`: development/build checks and release scripts with no embedded credentials.
 - `docs/`: human explanation; it is never a second executable authority.
 
 Do not create root `scripts/`, `deploy/`, `common/`, `utils/`, `pkg/`, or
@@ -21,32 +20,21 @@ checks in the same change.
 
 ## Commands and release boundary
 
-Use the root Makefile for checks and `./ops/bin/vane` for operations. GitHub
-Actions are intentionally absent. A production release must name an exact
-40-character `origin/main` SHA and pass the signed manifest chain:
+Use the root Makefile for checks. Production deployment is the GitHub Actions
+`Deploy` workflow (`.github/workflows/deploy.yml`): it builds both components
+from an exact revision with the pinned toolchain, ships the payload to the VPS
+over SSH using a repository-secret deploy key, and runs
+`tools/release/remote-atomic-release.sh` (CAS check, online migrate, atomic
+symlink switch, service restart, `/readyz` plus live-binary verification,
+automatic rollback). It then publishes the verified web `dist/` to Cloudflare
+Pages and to OSS plus Ali CDN. Web files never pass through or reside on the
+VPS.
 
-`plan -> gate -> artifact -> deploy -> verify -> finalize`
-
-Feature code and tests have no production credentials. Build and Gate run
-directly on the release Mac without a VM or build container. Server mutation,
-the global lock, CAS state, and durable evidence belong to the root-owned VPS
-broker installed outside this checkout. Web publication is the one exception:
-the local release command uses isolated Aliyun and Cloudflare credentials to
-publish one already verified `dist/` to Cloudflare Pages for the overseas DNS
-line and to OSS plus Ali CDN for the default/domestic line. Web files never
-pass through or reside on the VPS. Neither provider is allowed to finalize as
-the sole Web authority; the combined receipt exists only after both providers
-serve the same exact artifact and the GeoDNS route contract is revalidated.
-
-The local Mac intentionally uses one ordinary OS account, so same-UID code is
-not claimed as a hostile-code security boundary. Exact merged main is the local
-trust root. Gate subprocesses receive a sanitized environment with no release,
-broker, SSH, or provider credentials; the VPS forced-command broker remains the
-boundary that must withstand a compromised local client.
-
-Controller changes are tested in their introducing release but cannot activate
-themselves. The installed controller revision may advance only after the
-current release is finalized, for use by a later release.
+Feature code and tests have no production credentials; they exist only as
+GitHub Actions repository secrets. Every `uses:` action reference must be a
+pinned 40-character SHA with a release-tag comment. The workflow is the only
+path that mutates production, and the root-owned VPS remains the boundary
+that must withstand a compromised runner.
 
 ## Risk gates
 

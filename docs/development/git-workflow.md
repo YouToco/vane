@@ -7,9 +7,9 @@
 
 参考 React / Next.js / Go：`main` 单主干常绿，短命功能分支，不用 Git Flow。
 
-- **`main`**：永远可部署。合入前在无生产凭证的环境执行 `make full`；
-  发布时以 `./ops/bin/vane release --sha <exact-origin-main-sha>` 重跑 exact-SHA Gate。
-  只有 VPS 上 root-owned broker 可取得全局锁、读凭证和修改生产状态。
+- **`main`**：永远可部署。合入前本地跑受影响的 `make test-server` / `make test-web` /
+  `make test-contract`；push 到 main 后由 GitHub Actions `Deploy` workflow 自动部署
+  （也可手动 dispatch 指定 ref）。生产凭证只存在于仓库 secrets 与 VPS，代码和测试环境均不可见。
 - **功能分支**：从 main 切出，命名 `<type>/<slug>`：
   - `feat/agent-loop-policy`、`fix/rss-timeout`、`chore/bump-deps`、`docs/api-schema`
 - **合并方式**：**squash merge**（保持 main 线性历史，React/Next.js 实践），
@@ -51,14 +51,14 @@ chore(deps): bump pgx to v5.8
 
 - 标题即 squash 后的 commit message（Conventional Commits 格式）。
 - 描述三段：**做了什么 / 为什么 / 怎么验证的**（附命令或截图）。
-- 本地 exact-SHA Gate + self-review 后合并；GitHub 免费版私有仓库无强制
-  branch protection，因此 broker 仍必须独立重验 revision、manifest、锁和 CAS。
+- self-review 后合并；部署 workflow 在远端做 exact-SHA CAS 校验、在线迁移、
+  原子切换与失败自动回滚。
 
-### 本地构建缓存
+### 构建环境
 
-- exact-SHA Gate 直接在当前 Mac 运行固定版本 Go/Node；不经过 runner、VM、构建容器或远端构建机。
-- `GOMODCACHE` / `GOCACHE` 只用于提速，不是制品 authority；发布二进制仍从 clean exact-main
-  交叉编译，并用 Go release build ID 证明精确 monorepo SHA 与 clean Gate。
+- 部署构建在 GitHub Actions ubuntu runner 上执行，Go/Node 版本由
+  `tools/toolchain.lock.json` 锁定；发布二进制从 clean exact-main 编译，
+  构建与部署在同一 workflow 内完成，不经本地机器。
 
 ## 与里程碑排期的对应
 

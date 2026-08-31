@@ -17,5 +17,7 @@ server repository. It is not an executable deployment authority.
   must be proven compatible with the already-migrated schema; otherwise recover
   by roll-forward.
 
-Use `../../ops/bin/vane` for current operational commands. Human documentation
-must not duplicate the release shell/state machine maintained in `ops/`.
+Production deployment is the GitHub Actions `Deploy` workflow
+(`../../.github/workflows/deploy.yml`) running
+`../../tools/release/remote-atomic-release.sh`; human documentation must not
+duplicate the release shell state machine.

@@ -1,7 +1,7 @@
 # Development Temporal replay gate
 
-The root-owned read-only broker exports one recent, representative JSON history
-that still exists for every entry in
+An operator with root SSH access to the VPS exports one recent, representative
+JSON history that still exists for every entry in
 `../../contracts/temporal/production-history-replay.json` into a private
 temporary directory. Histories may contain customer payloads and are never
 stored in Git or general build caches.
@@ -10,7 +10,7 @@ The exact candidate source runs:
 
 ```bash
 cd server
-VANE_TEMPORAL_HISTORY_DIR=/absolute/broker/export \
+VANE_TEMPORAL_HISTORY_DIR=/absolute/history-export \
   GOWORK=off go test -tags productionreplay ./cmd/server \
   -run '^TestProductionHistoryReplay$' -count=1
 ```
@@ -27,4 +27,4 @@ frozen separately in `../../contracts/temporal/production-registration.json`.
 Real-Temporal integration tests cover the retention-clock and periodic paths.
 The retired `PushPipelineWorkflow` generations remain as deterministic Go
 fixtures under `../../server/workflow`; an expired server history is neither
-fabricated nor treated as broker evidence.
+fabricated nor treated as authentic server evidence.

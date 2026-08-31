@@ -22,12 +22,14 @@ temporal_task_queue=$5
 }
 
 command -v flock >/dev/null
-broker_work=/var/lib/vane-broker/state/broker-work
-[[ -d $broker_work && ! -L $broker_work ]] || {
-  echo "broker work authority is unavailable" >&2
+[[ -d /opt/vane && ! -L /opt/vane ]] || {
+  echo "release authority is unavailable" >&2
   exit 1
 }
-exec 8>"$broker_work/release.lock"
+# Serialize with atomic releases, which take the same lock in
+# tools/release/remote-atomic-release.sh: prepared collection stops the
+# service, so it must never overlap a deployment cutover.
+exec 8>/opt/vane/.release.lock
 flock 8
 
 current_release=/opt/vane/current
@@ -45,16 +47,12 @@ release_revision=$(basename -- "$release_dir")
 }
 collector=$release_dir/bin/agentfirstretention
 receipt=$release_dir/release-receipt.json
-control=/opt/vane-control/current/ops/release/agent-first-retention-prepared-control.sh
 [[ -d $release_dir && ! -L $release_dir &&
    -f $collector && ! -L $collector && -x $collector &&
    -f $receipt && ! -L $receipt &&
-   -f $control && ! -L $control && -x $control &&
-   $(readlink -f "$0") == "$control" &&
    $(stat -c '%U:%G:%a' "$release_dir") == root:root:755 &&
    $(stat -c '%U:%G:%a' "$collector") == root:root:755 &&
    $(stat -c '%U:%G:%a' "$receipt") == root:root:644 &&
-   $(stat -c '%U:%G:%a' "$control") == root:root:755 &&
    -x "$current_release/bin/vane" && ! -L "$current_release/bin/vane" ]] || {
   echo "active retention release files are unsafe" >&2
   exit 1
