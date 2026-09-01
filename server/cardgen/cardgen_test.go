@@ -241,7 +241,7 @@ func TestGenerateWithPolicyV1UsesFrozenRequestAndInstructionDecision(t *testing.
 		t.Fatalf("GenerateWithPolicyV1() error = %v", err)
 	}
 	maxTokens, temperature, thinking := captured.paramsSnapshot()
-	if captured.modelSnapshot() != "frozen-card-model" || maxTokens == nil || *maxTokens != 321 ||
+	if captured.modelSnapshot() != "frozen-card-model" || maxTokens != nil ||
 		temperature == nil || *temperature != float32(1.25) || thinking != "disabled" {
 		t.Fatalf(
 			"snapshot request parameters not consumed: model=%q max=%v temp=%v thinking=%q",
@@ -439,8 +439,8 @@ func TestGenerate_AppendsTaskInstructionWithoutChangingSystem(t *testing.T) {
 		t.Fatalf("任务手册未经过不可见字符剥除与定界符消毒: %q", user)
 	}
 	maxTokens, temperature, thinkingType := prompts.paramsSnapshot()
-	if maxTokens == nil || *maxTokens != 400 {
-		t.Fatalf("任务手册路径不得改变 max_tokens=400，实际 %v", maxTokens)
+	if maxTokens != nil {
+		t.Fatalf("任务手册路径不得携带 wire max_tokens（400 仅用于配额预留），实际 %v", maxTokens)
 	}
 	if temperature == nil || *temperature != 0.7 {
 		t.Fatalf("任务手册路径不得改变 temperature=0.7，实际 %v", temperature)

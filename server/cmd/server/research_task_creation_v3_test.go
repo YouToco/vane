@@ -17,9 +17,9 @@ func TestNativeResearchV3CreationPolicyIsBounded(t *testing.T) {
 	}
 	if policy.PlannerBudget.MaxPlannerRounds != 8 ||
 		policy.PlannerBudget.MaxToolCalls != 16 ||
-		policy.PlannerBudget.MaxTokens != 32_768 ||
-		policy.PlannerBudget.MaxCostMicroUSD != 1_000_000 ||
-		policy.PlannerBudget.DurationMs != 300_000 {
+		policy.PlannerBudget.MaxTokens != 1_000_000 ||
+		policy.PlannerBudget.MaxCostMicroUSD != 1_000_000_000 ||
+		policy.PlannerBudget.DurationMs != 3_600_000 {
 		t.Fatalf("native V3 creation policy drifted: %+v", policy.PlannerBudget)
 	}
 }

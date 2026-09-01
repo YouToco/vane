@@ -104,7 +104,8 @@ func TestHandleDeepDive_GenerateInsertSendNotify(t *testing.T) {
 	}
 }
 
-// 生成参数纪律（契约 §10.4）：v4-pro 档 + 1600 tokens + 0.3 + thinking disabled。
+// 生成参数纪律（契约 §10.4）：v4-pro 档 + 0.3 + thinking disabled；
+// 1600 tokens 只作为配额预留，不得进入 wire 请求。
 // DisableThinking 是红线：思维链与长文共享输出预算，开着可能整段空输出。
 func TestHandleDeepDive_RequestParamsAndDelimiters(t *testing.T) {
 	h := newHarness(t)
@@ -119,8 +120,8 @@ func TestHandleDeepDive_RequestParamsAndDelimiters(t *testing.T) {
 	if c.Model != "deepseek-v4-pro" {
 		t.Fatalf("model = %q, 期望注入的 DeepDiveModel deepseek-v4-pro", c.Model)
 	}
-	if c.MaxTokens == nil || *c.MaxTokens != 1600 {
-		t.Fatalf("max_tokens = %v, 期望 1600", c.MaxTokens)
+	if c.MaxTokens != nil {
+		t.Fatalf("max_tokens = %v, wire 层不得携带 max_tokens（1600 仅用于配额预留）", c.MaxTokens)
 	}
 	if c.Temperature == nil || *c.Temperature != 0.3 {
 		t.Fatalf("temperature = %v, 期望 0.3", c.Temperature)

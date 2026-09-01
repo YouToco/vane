@@ -155,7 +155,7 @@ func TestGenerateStructuredWithPolicyV2UsesOneFrozenCall(t *testing.T) {
 		t.Fatalf("unexpected frozen prompts:\nsystem=%q\nuser=%q", system, user)
 	}
 	maxTokens, temperature, thinking := captured.paramsSnapshot()
-	if maxTokens == nil || *maxTokens != 900 ||
+	if maxTokens != nil ||
 		temperature == nil || *temperature != 0.2 || thinking != "disabled" {
 		t.Fatalf("unexpected request params: max=%v temp=%v thinking=%q",
 			maxTokens, temperature, thinking)
