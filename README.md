@@ -24,14 +24,16 @@ make test-web
 make test-contract
 ```
 
-Production deployment is the manually dispatched `Deploy` workflow
-(`.github/workflows/deploy.yml`). It builds both components from an exact
-revision with the pinned toolchain, ships the payload to the VPS over SSH
-using a repository-secret deploy key, and runs
-`tools/release/remote-atomic-release.sh` (CAS check, online migrate, atomic symlink
-switch, service restart, `/readyz` plus live-binary verification, automatic
-rollback). It then publishes the verified web `dist/` to Cloudflare Pages and
-to OSS plus Ali CDN. Web files never pass through or reside on the VPS.
+Production deployment is the `deploy` job of the `CI` workflow
+(`.github/workflows/ci.yml`). It runs only after the `test` and `build` jobs
+pass on the same revision (the payload is built once and reused), requires
+approval on the `production` GitHub environment, and is restricted to `main`.
+It ships the payload to the VPS over SSH using a repository-secret deploy key
+and runs `tools/release/remote-atomic-release.sh` (CAS check, online migrate,
+atomic symlink switch, service restart, `/readyz` plus live-binary
+verification, automatic rollback). It then publishes the verified web `dist/`
+to Cloudflare Pages and to OSS plus Ali CDN. Web files never pass through or
+reside on the VPS.
 
 The single VPS runs every Vane server release as native Go binaries supervised
 by systemd under `/opt/vane/releases/<sha>/`; the `current` symlink is the

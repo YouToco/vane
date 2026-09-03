@@ -20,10 +20,11 @@ checks in the same change.
 
 ## Commands and release boundary
 
-Use the root Makefile for checks. Production deployment is the GitHub Actions
-`Deploy` workflow (`.github/workflows/deploy.yml`): it builds both components
-from an exact revision with the pinned toolchain, ships the payload to the VPS
-over SSH using a repository-secret deploy key, and runs
+Use the root Makefile for checks. Production deployment is the `deploy` job of
+the `CI` workflow (`.github/workflows/ci.yml`); it runs only after the `test`
+and `build` jobs pass on the same revision (build once), requires approval on
+the `production` GitHub environment, and is restricted to `main`. It ships the
+payload to the VPS over SSH using a repository-secret deploy key and runs
 `tools/release/remote-atomic-release.sh` (CAS check, online migrate, atomic
 symlink switch, service restart, `/readyz` plus live-binary verification,
 automatic rollback). It then publishes the verified web `dist/` to Cloudflare
